@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# .githooks/pre-push — fast subset of CI's lint+test gate, run before
+# pushing to GitHub so CI failure emails for "perfectly valid code
+# fails a check we could have caught locally" stop happening.
+#
+# Installed via scripts/install-git-hooks.sh (`git config core.hooksPath
+# .githooks`). Opt-in per-clone; both code-Jimmys + qarl should run the
+# installer once after clone.
+#
+# Mirrors the FAST steps from .github/workflows/ci.yml:
+#   - backend: ruff check + ruff format --check + pytest
+#   - ui: npm test (vitest)
+#   - renderer: cargo test  (no --lib; matches ci.yml exactly so a
+#     future renderer/tests/*.rs integration crate doesn't pass
+#     locally but fail CI)
+#
+# DELIBERATELY SKIPS:
+#   - build-wasm (3-5 min cold; CI-only)
+#   - playwright e2e (minutes; CI-only)
+#   - pip-audit (network; runs fine on CI; slow locally)
+#   - lock-drift / pip-compile (slow + needs pip-tools)
+#
+# Modified-paths gate: if a push only touches files under one of
+# `backend/`, `ui/`, `renderer/`, the other areas' steps are skipped.
+# Any root-level file or cross-area change runs everything (defensive
+# default).
+#
+# Emergency bypass: `git push --no-verify` skips this hook. Use
+# sparingly + document the reason in the commit msg.
+#
+# Wall-clock budget (warm, on my dev Mac):
+#   - backend only: ~25-40s (ruff 3s + pytest 20-35s)
+#   - renderer only: ~5-30s (cargo test; incremental cache)
+#   - ui only: ~90s (vitest's jsdom env setup dominates)
+#   - all (root-level change): ~3 min
+# The ui case is the long pole and is hard to shrink without refactor-
+# ing the test architecture. For area-scoped commits the gate keeps
+# the typical run well under 60s.
+
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# ---- Color helpers ----
+if [ -t 1 ]; then
+    GREEN=$'\033[0;32m'
+    RED=$'\033[0;31m'
+    YELLOW=$'\033[0;33m'
+    BOLD=$'\033[1m'
+    RESET=$'\033[0m'
+else
+    GREEN=""
+    RED=""
+    YELLOW=""
+    BOLD=""
+    RESET=""
+fi
+
+ok()   { echo "${GREEN}✓${RESET} $*"; }
+warn() { echo "${YELLOW}⚠${RESET} $*"; }
+fail() {
+    echo
+    echo "${RED}${BOLD}✗ PUSH ABORTED:${RESET} $*"
+    echo
+    echo "  Fix the failure above + retry, or in emergencies bypass with:"
+    echo "    ${BOLD}git push --no-verify${RESET}"
+    echo
+    exit 1
+}
+
+# ---- Modified-paths gate ----
+# Compare against origin/main since the pre-push stdin format is
+# fiddly; this works for both feature-branch + main-push workflows.
+# If origin/main can't be resolved (fresh clone with no remote tracking
+# yet), default to "run everything."
+CHANGED_PATHS=""
+if git rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+    # Refresh origin/main first -- a stale local ref under-reports
+    # changed paths + would skip areas CI then runs. Silent failure
+    # (offline / network blip) falls through to the defensive
+    # "run everything" path via the existing rev-parse check.
+    git fetch --quiet origin main 2>/dev/null || true
+    CHANGED_PATHS="$(git diff --name-only origin/main...HEAD 2>/dev/null || true)"
+fi
+
+run_backend=1
+run_ui=1
+run_renderer=1
+if [ -n "$CHANGED_PATHS" ]; then
+    # Default to "skip all", then re-enable per area as paths appear.
+    run_backend=0
+    run_ui=0
+    run_renderer=0
+    while IFS= read -r path; do
+        case "$path" in
+            backend/*)  run_backend=1 ;;
+            ui/*)       run_ui=1 ;;
+            renderer/*) run_renderer=1 ;;
+            "")         ;;  # skip blank lines from the diff
+            # Any other path (root config, .github/, scripts/, qa/,
+            # CHANGELOG.md, etc.) is treated as cross-cutting -- run
+            # every area's tests defensively. This is the "shared dep
+            # change shouldn't skip" rule from the dispatch.
+            *)          run_backend=1; run_ui=1; run_renderer=1 ;;
+        esac
+    done <<< "$CHANGED_PATHS"
+fi
+
+echo "${BOLD}pre-push:${RESET} backend=$run_backend ui=$run_ui renderer=$run_renderer"
+echo "  (typical: backend ~30s, ui ~90s, renderer ~5-30s; bypass: git push --no-verify)"
+echo
+
+# ---- Backend: ruff + pytest ----
+if [ "$run_backend" = "1" ]; then
+    # Pick ruff from PATH, ~/.local/bin (pipx), or the project venv.
+    RUFF=""
+    for candidate in ruff "$HOME/.local/bin/ruff" "$HOME/tmp/venv/openmarquee/bin/ruff"; do
+        if command -v "$candidate" >/dev/null 2>&1 || [ -x "$candidate" ]; then
+            RUFF="$candidate"
+            break
+        fi
+    done
+    if [ -z "$RUFF" ]; then
+        warn "backend lint: ruff not found on PATH or in venv; skipping (install via \`pip install -e backend[dev]\`)"
+    else
+        ( cd backend && "$RUFF" check . ) || fail "backend ruff check"
+        ok "backend ruff check"
+        ( cd backend && "$RUFF" format --check . ) || fail "backend ruff format --check"
+        ok "backend ruff format"
+    fi
+
+    PYTEST=""
+    for candidate in pytest "$HOME/tmp/venv/openmarquee/bin/pytest"; do
+        if command -v "$candidate" >/dev/null 2>&1 || [ -x "$candidate" ]; then
+            PYTEST="$candidate"
+            break
+        fi
+    done
+    if [ -z "$PYTEST" ]; then
+        warn "backend tests: pytest not found; skipping (run \`bash scripts/setup.sh\` first)"
+    else
+        ( cd backend && "$PYTEST" -q ) || fail "backend pytest"
+        ok "backend pytest"
+    fi
+fi
+
+# ---- UI: vitest ----
+if [ "$run_ui" = "1" ]; then
+    if ! command -v npm >/dev/null 2>&1; then
+        warn "UI tests: npm not found; skipping"
+    elif [ ! -d ui/node_modules ]; then
+        warn "UI tests: ui/node_modules missing; skipping (run \`bash scripts/setup.sh\` first)"
+    else
+        ( cd ui && npm test --silent ) || fail "ui vitest"
+        ok "ui vitest"
+    fi
+fi
+
+# ---- Renderer: cargo test ----
+# Mirrors ci.yml:159 exactly (no --lib). --quiet keeps output to
+# failures only. If a future renderer/tests/*.rs integration crate
+# lands, this runs it instead of silently skipping (which would let
+# "passes locally, fails CI" through).
+if [ "$run_renderer" = "1" ]; then
+    if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+        warn "renderer tests: cargo not found; skipping (install Rust toolchain)"
+    else
+        CARGO="cargo"
+        if ! command -v cargo >/dev/null 2>&1; then
+            CARGO="$HOME/.cargo/bin/cargo"
+        fi
+        ( cd renderer && "$CARGO" test --quiet ) || fail "renderer cargo test"
+        ok "renderer cargo test"
+    fi
+fi
+
+echo
+echo "${GREEN}${BOLD}pre-push: all checks passed${RESET}"
+exit 0
