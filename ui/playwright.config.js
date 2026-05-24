@@ -33,6 +33,15 @@ export default defineConfig({
     workers: 1,
     timeout: 30_000,
     expect: { timeout: 5_000 },
+    // Reporter: dot/list interactive (low-noise local dev); HTML report
+    // on CI so failed runs upload an inspectable report alongside the
+    // -actual.png snapshots in test-results/. `open: 'never'` keeps CI
+    // from trying to spawn a browser to view the report after the run.
+    // Without an HTML reporter the `playwright-report/` directory never
+    // gets created and the CI upload-artifact step has nothing to upload.
+    reporter: process.env.CI
+        ? [["list"], ["html", { open: "never" }]]
+        : [["list"]],
     use: {
         baseURL: "http://localhost:8765",
         trace: "on-first-retry",
