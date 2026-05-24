@@ -78,6 +78,12 @@ def test_put_then_get_round_trip(client: TestClient):
         "tailscale_enabled": False,
         "tailscale_auth_key": None,
         "tailscale_hostname": None,
+        # HTTPS Phase 1 (commit 97d36fc, 2026-05-24): new
+        # tailscale_https_enabled field on Settings — default True.
+        # Including it explicitly in the PUT payload to keep this
+        # round-trip test exhaustive, and so the expected-dict check
+        # below sees the field on the response side too.
+        "tailscale_https_enabled": True,
         "flock_sync_enabled": True,
         "ui_first_run_seen": False,
     }

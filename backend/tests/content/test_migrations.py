@@ -103,3 +103,98 @@ def test_migration_skips_items_without_background_color_attr(tmp_path: Path):
     slide = _make_slide(bg="#123456")
     storage.save_text_slide(slide, png=b"\x89PNG")
     assert migrate_050608_bg_to_000000(storage) == 0
+
+
+# ---- 2026-05-24 widen: background_pattern.color_a + color_b also
+# ---- carry #050608 and must be migrated.
+
+
+def _make_slide_with_pattern(
+    *,
+    bg: str = "#000000",
+    pattern_kind: str = "solid",
+    color_a: str = "#FFFFFF",
+    color_b: str = "#000000",
+) -> TextSlide:
+    """Build a slide with an explicit background_pattern. The pattern's
+    color_a/color_b take precedence over slide.background_color when
+    the pattern kind is anything other than None — so a pattern with
+    color_a=#050608 produces the same lifted-black on glass even if
+    slide.background_color is #000000."""
+    from openmarquee.content import BackgroundPattern
+
+    pattern = BackgroundPattern(pattern=pattern_kind, color_a=color_a, color_b=color_b)
+    return TextSlide(
+        name="pattern-probe",
+        text_layers=[TextLayer(text="x")],
+        background_color=bg,
+        background_pattern=pattern,
+    )
+
+
+def test_migration_rewrites_pattern_color_a(tmp_path: Path):
+    """A slide with `background_pattern.color_a = "#050608"` (the
+    original migration's miss — surfaced by the live-fire
+    intermittent-black-not-black observation on FYS 2026-05-24 15:40)
+    must get the pattern color rewritten. The slide-level
+    background_color was already #000000 on this item; only the
+    pattern field was carrying #050608."""
+    storage = ContentStorage(tmp_path)
+    slide = _make_slide_with_pattern(bg="#000000", color_a="#050608", color_b="#FFB43C")
+    storage.save_text_slide(slide, png=b"\x89PNG")
+
+    n = migrate_050608_bg_to_000000(storage)
+    assert n == 1
+
+    loaded = storage.load(slide.id)
+    assert loaded.background_color == "#000000"  # already clean
+    assert loaded.background_pattern.color_a == "#000000"  # newly migrated
+    assert loaded.background_pattern.color_b == "#FFB43C"  # untouched
+
+
+def test_migration_rewrites_pattern_color_b(tmp_path: Path):
+    """Same shape for color_b — second-fill in two-color patterns
+    (grid, stripes, dots). Less common in seeds but must be covered
+    by the same single-pass migration."""
+    storage = ContentStorage(tmp_path)
+    slide = _make_slide_with_pattern(bg="#000000", color_a="#FFB43C", color_b="#050608")
+    storage.save_text_slide(slide, png=b"\x89PNG")
+
+    n = migrate_050608_bg_to_000000(storage)
+    assert n == 1
+
+    loaded = storage.load(slide.id)
+    assert loaded.background_pattern.color_a == "#FFB43C"  # untouched
+    assert loaded.background_pattern.color_b == "#000000"  # migrated
+
+
+def test_migration_rewrites_both_bg_and_pattern_in_one_pass(tmp_path: Path):
+    """When a slide has #050608 in BOTH background_color AND
+    pattern.color_a (a clean seed pre-migration), one save() call
+    handles both — must not be counted as 2 items."""
+    storage = ContentStorage(tmp_path)
+    slide = _make_slide_with_pattern(bg="#050608", color_a="#050608", color_b="#FFFFFF")
+    storage.save_text_slide(slide, png=b"\x89PNG")
+
+    n = migrate_050608_bg_to_000000(storage)
+    assert n == 1  # single item, all dirty fields rewritten in one save()
+
+    loaded = storage.load(slide.id)
+    assert loaded.background_color == "#000000"
+    assert loaded.background_pattern.color_a == "#000000"
+    assert loaded.background_pattern.color_b == "#FFFFFF"
+
+
+def test_migration_skips_items_with_pattern_but_no_050608(tmp_path: Path):
+    """A slide with a background_pattern whose colors are NOT
+    #050608 must NOT be touched — defensive against a future
+    "always-rewrite-pattern" simplification."""
+    storage = ContentStorage(tmp_path)
+    slide = _make_slide_with_pattern(bg="#000000", color_a="#FF5FA7", color_b="#5AF095")
+    storage.save_text_slide(slide, png=b"\x89PNG")
+
+    assert migrate_050608_bg_to_000000(storage) == 0
+
+    loaded = storage.load(slide.id)
+    assert loaded.background_pattern.color_a == "#FF5FA7"
+    assert loaded.background_pattern.color_b == "#5AF095"
