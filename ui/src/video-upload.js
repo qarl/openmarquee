@@ -52,6 +52,22 @@ import {
     transcodeToH264,
 } from "./ffmpeg-pipelines.js";
 import { mountSlideBrowser, nextAutoName } from "./slide-browser.js";
+import {
+    drawFirstFrameToCanvas,
+    fileToBase64,
+    peekVideoDims,
+} from "./video-frame-helpers.js";
+
+// Re-export so existing consumers (rotation-rerender.js +
+// video-upload.test.js's pure-function tests pre-extract) keep
+// working without an import-path change. Extract was driven by
+// testability (vi.mock can replace external imports but not same-
+// module locals); the helpers' surface is unchanged.
+export {
+    drawFirstFrameToCanvas,
+    fileToBase64,
+    peekVideoDims,
+} from "./video-frame-helpers.js";
 
 // Tiny pre-encoded H.264 MP4 (128×96, ~0.5s, all-black) used as the
 // placeholder bytes when +New creates a fresh video slide. The backend
@@ -466,134 +482,10 @@ function drawUrlToCanvas(url, canvas) {
     });
 }
 
-/**
- * Load `file` into an offscreen <video>, seek to the first visible frame,
- * paint it onto `canvas` (letterbox-fit to canvas dimensions), and resolve
- * with the detected duration.
- */
-export function drawFirstFrameToCanvas(file, canvas) {
-    return new Promise((resolve, reject) => {
-        const url = URL.createObjectURL(file);
-        const video = document.createElement("video");
-        video.muted = true;
-        video.playsInline = true;
-        // `auto` (vs `metadata`) ensures the browser actually buffers
-        // a frame; without it the seek can complete before any pixel
-        // data exists and the canvas reads black.
-        video.preload = "auto";
-        video.crossOrigin = "anonymous";
-
-        const cleanup = () => URL.revokeObjectURL(url);
-        let drew = false;
-
-        function paint() {
-            if (drew) return;
-            // Need at least HAVE_CURRENT_DATA so the video's texture has
-            // a frame for drawImage to read.
-            if (video.readyState < 2 || !video.videoWidth) return;
-            drew = true;
-            try {
-                const ctx = canvas.getContext("2d");
-                ctx.save();
-                try {
-                    ctx.fillStyle = "#000000";
-                    ctx.fillRect(0, 0, canvas.width, canvas.height);
-                    // Cover-fit so the thumbnail matches what plays.
-                    const scale = Math.max(
-                        canvas.width / video.videoWidth,
-                        canvas.height / video.videoHeight,
-                    );
-                    const drawW = video.videoWidth * scale;
-                    const drawH = video.videoHeight * scale;
-                    const drawX = (canvas.width - drawW) / 2;
-                    const drawY = (canvas.height - drawH) / 2;
-                    ctx.drawImage(video, drawX, drawY, drawW, drawH);
-                } finally {
-                    ctx.restore();
-                }
-                cleanup();
-                resolve({ durationSeconds: video.duration });
-            } catch (err) {
-                cleanup();
-                reject(err);
-            }
-        }
-
-        // Seek only after `loadeddata` — guarantees at least one frame
-        // exists, so the subsequent `seeked` event isn't firing on an
-        // empty video texture.
-        video.addEventListener("loadeddata", () => {
-            video.currentTime = Math.min(0.1, video.duration / 10 || 0.1);
-        });
-        video.addEventListener("seeked", () => {
-            // Some browsers fire `seeked` before the new frame is
-            // composited into the video element's texture. One rAF
-            // is enough breathing room for drawImage to read the
-            // post-seek pixels instead of the prior frame's (often
-            // black) backing store.
-            requestAnimationFrame(paint);
-        });
-        video.addEventListener("error", () => {
-            cleanup();
-            reject(new Error("browser could not decode video"));
-        });
-        video.src = url;
-    });
-}
-
-/**
- * Read `file` as a base64-encoded string (no data: prefix). Uses FileReader
- * because videos can be tens of MB and we don't want to hold two copies
- * (ArrayBuffer + base64) in memory longer than needed.
- */
-export function fileToBase64(file) {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-            const result = reader.result;
-            if (typeof result !== "string") {
-                reject(new Error("FileReader produced non-string result"));
-                return;
-            }
-            // result is "data:<mime>;base64,<body>"; strip the prefix.
-            const comma = result.indexOf(",");
-            resolve(comma >= 0 ? result.slice(comma + 1) : result);
-        };
-        reader.onerror = () => reject(new Error("file read failed"));
-        reader.readAsDataURL(file);
-    });
-}
-
-/**
- * Probe a source file's video dimensions via a hidden <video> element.
- * Used to pick the transcode target size (source dims, capped at the
- * Pi's 1080p H.264 decoder envelope). Resolves with {width, height};
- * rejects on any decode failure so the caller surfaces a clean error.
- */
-export function peekVideoDims(file) {
-    return new Promise((resolve, reject) => {
-        const url = URL.createObjectURL(file);
-        const video = document.createElement("video");
-        video.muted = true;
-        video.playsInline = true;
-        video.preload = "metadata";
-        video.addEventListener("loadedmetadata", () => {
-            const w = video.videoWidth;
-            const h = video.videoHeight;
-            URL.revokeObjectURL(url);
-            if (!w || !h) {
-                reject(new Error("could not read video dimensions"));
-                return;
-            }
-            resolve({ width: w, height: h });
-        });
-        video.addEventListener("error", () => {
-            URL.revokeObjectURL(url);
-            reject(new Error("browser could not decode video"));
-        });
-        video.src = url;
-    });
-}
+// drawFirstFrameToCanvas / fileToBase64 / peekVideoDims moved to
+// video-frame-helpers.js (testability extract, 2026-05-24). Re-
+// exported above for back-compat with consumers that import from
+// "./video-upload.js".
 
 function clearCanvas(canvas) {
     const ctx = canvas.getContext("2d");
