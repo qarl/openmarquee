@@ -2851,7 +2851,7 @@ void main() {
 }
 "#;
 
-/// V4L2 piece 3d (2026-05-14) -- BT.601 limited-range NV12 -> RGB
+/// V4L2 piece 3d (2026-05-14) -- BT.709 limited-range NV12 -> RGB
 /// fragment shader. Pairs with `VS_TEXTURED_QUAD`.
 ///
 /// bcm2835-codec emits NV12 with **limited-range** quantization
