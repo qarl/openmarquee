@@ -61,6 +61,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 STATE_FILE=/var/run/wifi-watchdog.fails
 RESTARTS_FILE=/var/run/wifi-watchdog.restarts
+MODPROBE_LEDGER=/var/run/wifi-watchdog.modprobe
 LOG=/var/log/wifi-watchdog.log
 THRESHOLD=2
 # Burst-ping check (2026-05-24): instead of a single ping per
@@ -96,6 +97,21 @@ PING_BURST_OK_MIN=3
 # out a degraded RF window before triggering a kernel-level reset.
 REBOOT_AFTER_N_RESTARTS=5
 REBOOT_WINDOW_SECONDS=1800
+# Modprobe escalation tier (Path 2 of the wifi-wedge dispatch,
+# 2026-05-24): between the NM-restart tier and the reboot tier,
+# attempt a `rmmod brcmfmac && modprobe brcmfmac` cycle ONCE per
+# REBOOT_WINDOW_SECONDS window. Resets just the wifi chip rather
+# than the whole system — ~5-15s of downtime vs ~30-60s for a
+# full reboot, and the chromium-headless-shell + Rust renderer
+# subprocesses keep running. If modprobe doesn't help, two more
+# NM-restart cycles eventually trip the reboot tier as before.
+#
+# Fires when the ledger reaches MODPROBE_AFTER_N_RESTARTS — i.e.
+# after the 3rd NM-restart in the window, but before
+# REBOOT_AFTER_N_RESTARTS=5. Gives the modprobe-cycle one ledger
+# slot of headroom to take effect (the cron's next 30s firing
+# will burst-ping the link before any further NM-restart escalates).
+MODPROBE_AFTER_N_RESTARTS=3
 
 ts() { date -u -Iseconds; }
 
@@ -129,6 +145,48 @@ note() {
 # Minimum theoretical reboot interval under the 2026-05-24 widen-
 # envelope (5 strikes × ~75s per strike) is ~6 min, enough for ops
 # to intervene and for transient bad-RF pockets to clear.
+# Returns 0 (yes) if a modprobe-cycle was performed inside the
+# current REBOOT_WINDOW_SECONDS window — used to gate the modprobe
+# tier so it fires at most once per window. Returns 1 (no) if the
+# ledger is empty or all entries are outside the window.
+modprobe_done_in_window() {
+    local now cutoff ts
+    [ -f "$MODPROBE_LEDGER" ] || return 1
+    now=$(date +%s)
+    cutoff=$((now - REBOOT_WINDOW_SECONDS))
+    while IFS= read -r ts; do
+        case "$ts" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        if [ "$ts" -ge "$cutoff" ]; then
+            return 0
+        fi
+    done < "$MODPROBE_LEDGER"
+    return 1
+}
+
+# rmmod + modprobe the brcmfmac driver. Returns 0 if BOTH commands
+# succeeded; 1 otherwise. The 1-second sleep between gives the
+# kernel time to release the wifi-related sysfs entries before the
+# re-probe. stderr from both commands captured + routed through
+# note() so it lands in BOTH $LOG AND journal (per
+# [[feedback_never_swallow_stderr_in_ci]]) — the kernel's
+# explanation of a failed unload ("Module brcmfmac is in use by:
+# cfg80211") is the most diagnostic piece, and forcing it into
+# journal so `journalctl -t wifi-watchdog` shows it is what
+# operators reach for first.
+try_modprobe_cycle() {
+    local rmmod_rc modprobe_rc rmmod_err modprobe_err
+    rmmod_err=$(rmmod brcmfmac 2>&1 >/dev/null)
+    rmmod_rc=$?
+    [ -n "$rmmod_err" ] && note "rmmod brcmfmac stderr: $rmmod_err"
+    sleep 1
+    modprobe_err=$(modprobe brcmfmac 2>&1 >/dev/null)
+    modprobe_rc=$?
+    [ -n "$modprobe_err" ] && note "modprobe brcmfmac stderr: $modprobe_err"
+    [ "$rmmod_rc" -eq 0 ] && [ "$modprobe_rc" -eq 0 ]
+}
+
 record_nm_restart_and_maybe_reboot() {
     local now cutoff ts_line kept count
     now=$(date +%s)
@@ -160,14 +218,33 @@ record_nm_restart_and_maybe_reboot() {
 
     if [ "$count" -ge "$REBOOT_AFTER_N_RESTARTS" ]; then
         note "rebooting: $count NM-restarts within ${REBOOT_WINDOW_SECONDS}s window — kernel-level brcmfmac wedge suspected"
-        # Wipe the ledger BEFORE the reboot so a post-reboot Pi
-        # cannot inherit a "we already rebooted 3 times" state.
-        # tmpfs would clear it on reboot anyway; the explicit
+        # Wipe both ledgers BEFORE the reboot so a post-reboot Pi
+        # cannot inherit "we already escalated N times" state.
+        # tmpfs would clear them on reboot anyway; the explicit
         # wipe is belt-and-suspenders for the (impossible-on-
         # tmpfs but defensive) case where /var/run were ever
         # relocated to a persistent fs.
         : > "$RESTARTS_FILE"
+        : > "$MODPROBE_LEDGER"
         systemctl reboot
+        return
+    fi
+
+    # Modprobe escalation tier (Path 2): if we've accumulated
+    # MODPROBE_AFTER_N_RESTARTS in the window AND haven't already
+    # tried a modprobe-cycle this window, cycle the brcmfmac driver
+    # before letting the next NM-restart push us toward reboot.
+    # Cheaper than reboot + leaves the renderer + backend running.
+    # The modprobe-cycle is recorded whether it succeeds or fails
+    # so we don't loop on it — at most one attempt per window.
+    if [ "$count" -ge "$MODPROBE_AFTER_N_RESTARTS" ] && ! modprobe_done_in_window; then
+        note "modprobe-cycle: $count NM-restarts in window, trying rmmod+modprobe brcmfmac before reboot escalation"
+        if try_modprobe_cycle; then
+            note "modprobe-cycle: rmmod+modprobe brcmfmac succeeded; next 30s burst-ping will verify"
+        else
+            note "modprobe-cycle: rmmod or modprobe brcmfmac FAILED — continuing toward reboot escalation"
+        fi
+        echo "$now" >> "$MODPROBE_LEDGER"
     fi
 }
 

@@ -628,3 +628,236 @@ def test_degraded_log_message_includes_fraction() -> None:
         "degraded-link note() must include the (X/N received) "
         "fraction for forensics — see test docstring for why."
     )
+
+
+# ---- 2026-05-24: modprobe escalation tier (Path 2) ----
+
+
+def test_modprobe_threshold_constant_present() -> None:
+    """MODPROBE_AFTER_N_RESTARTS=3 — pins the tier between
+    REBOOT_AFTER_N_RESTARTS=5 (reboot) and the THRESHOLD=2 ping-burst
+    fail count that triggers an NM-restart. Order matters: NM-restart
+    must come first (cheapest), then modprobe-cycle (medium —
+    resets just the wifi chip, leaves renderer + backend running),
+    then reboot (most disruptive). A refactor that flattens the
+    tiers loses the recovery hierarchy."""
+    source = _read_script_source()
+    assert re.search(
+        r"^\s*MODPROBE_AFTER_N_RESTARTS=3\s*$",
+        source,
+        flags=re.MULTILINE,
+    ), (
+        "MODPROBE_AFTER_N_RESTARTS must be 3 — pinned between "
+        "THRESHOLD=2 (NM-restart) and REBOOT_AFTER_N_RESTARTS=5 "
+        "(reboot)."
+    )
+
+
+def test_modprobe_ledger_path_constant_present() -> None:
+    """MODPROBE_LEDGER=/var/run/wifi-watchdog.modprobe — must be on
+    tmpfs (matches RESTARTS_FILE convention) so a reboot wipes it
+    by side-effect, preventing modprobe-cycle ledgers from carrying
+    across boot transitions."""
+    source = _read_script_source()
+    assert re.search(
+        r"^\s*MODPROBE_LEDGER=/var/run/wifi-watchdog\.modprobe\s*$",
+        source,
+        flags=re.MULTILINE,
+    ), (
+        "MODPROBE_LEDGER must be /var/run/wifi-watchdog.modprobe — "
+        "/var/run is tmpfs on the Pi so reboot wipes the ledger "
+        "and the next post-reboot escalation starts fresh."
+    )
+
+
+def test_try_modprobe_cycle_function_present() -> None:
+    """`try_modprobe_cycle` must exist + do exactly rmmod brcmfmac
+    + 1-second sleep + modprobe brcmfmac, returning success only if
+    BOTH commands succeed. The sleep gives the kernel time to
+    release wifi sysfs entries before re-probe — without it the
+    modprobe race-attaches against in-cleanup state."""
+    source = _read_script_source()
+    match = re.search(
+        r"try_modprobe_cycle\(\)\s*\{(.*?)\n\}",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match, "try_modprobe_cycle() function not found"
+    body = match.group(1)
+    assert "rmmod brcmfmac" in body, (
+        "try_modprobe_cycle must call `rmmod brcmfmac` — the cycle "
+        "requires unloading the module before re-probing."
+    )
+    assert "sleep 1" in body, (
+        "try_modprobe_cycle must `sleep 1` between rmmod + modprobe "
+        "to let kernel release wifi sysfs entries before re-probe; "
+        "without it, modprobe race-attaches against in-cleanup state."
+    )
+    assert "modprobe brcmfmac" in body, (
+        "try_modprobe_cycle must call `modprobe brcmfmac` to re-load "
+        "the driver — that's the entire point of the cycle."
+    )
+
+
+def test_modprobe_done_in_window_function_present() -> None:
+    """`modprobe_done_in_window` gates the cycle to at most once per
+    REBOOT_WINDOW_SECONDS — without it we'd retry modprobe on every
+    cron firing once the threshold is crossed, which would either
+    burn the cron budget on rmmod/modprobe or thrash the chip. Must
+    use the same `[ ts -ge cutoff ]` keep-criterion pattern as the
+    main ledger prune so an NTP backward-jump doesn't produce
+    surprising negative-delta behavior."""
+    source = _read_script_source()
+    match = re.search(
+        r"modprobe_done_in_window\(\)\s*\{(.*?)\n\}",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match, "modprobe_done_in_window() function not found"
+    body = match.group(1)
+    assert re.search(
+        r'\[\s*"\$ts"\s*-ge\s*"\$cutoff"\s*\]',
+        body,
+    ), (
+        "modprobe_done_in_window must gate on `[ \"$ts\" -ge "
+        "\"$cutoff\" ]` keep-criterion — same shape as the main "
+        "ledger prune, NTP-backward-jump safe."
+    )
+
+
+def test_modprobe_tier_fires_below_reboot_threshold() -> None:
+    """The modprobe-tier branch in record_nm_restart_and_maybe_reboot
+    must check `$count -ge $MODPROBE_AFTER_N_RESTARTS` AND that
+    `modprobe_done_in_window` returns false. Both gates must be
+    present — without the "done in window" gate, we'd fire modprobe
+    on every cron firing past the threshold. Without the "count >="
+    gate, modprobe would fire on EVERY NM-restart (which is too
+    eager: NM-restart alone fixes most cases)."""
+    source = _read_script_source()
+    # Match the modprobe-tier conditional anywhere in
+    # record_nm_restart_and_maybe_reboot's body.
+    assert re.search(
+        r'\[\s*"\$count"\s*-ge\s*"\$MODPROBE_AFTER_N_RESTARTS"\s*\]'
+        r'\s*&&\s*!\s*modprobe_done_in_window',
+        source,
+    ), (
+        "modprobe-tier branch must gate on BOTH `[ \"$count\" -ge "
+        "\"$MODPROBE_AFTER_N_RESTARTS\" ]` AND "
+        "`! modprobe_done_in_window` — see test docstring for the "
+        "consequence of dropping either gate."
+    )
+
+
+def test_modprobe_tier_fires_before_reboot_in_control_flow() -> None:
+    """The modprobe branch must come AFTER the reboot-threshold
+    check in record_nm_restart_and_maybe_reboot — otherwise a count
+    of 5+ would fire modprobe + then reboot, when the intent is to
+    skip modprobe entirely if we're already at reboot threshold (the
+    chip needs more than a re-init). The reboot's `return` ensures
+    the modprobe branch is unreachable when count >= 5."""
+    source = _read_script_source()
+    match = re.search(
+        r"record_nm_restart_and_maybe_reboot\(\)\s*\{(.*?)\n\}",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match, "record_nm_restart_and_maybe_reboot() not found"
+    body = match.group(1)
+    reboot_pos = body.find('"$REBOOT_AFTER_N_RESTARTS"')
+    modprobe_pos = body.find('"$MODPROBE_AFTER_N_RESTARTS"')
+    assert reboot_pos != -1, "reboot threshold check missing"
+    assert modprobe_pos != -1, "modprobe threshold check missing"
+    assert reboot_pos < modprobe_pos, (
+        "REBOOT check must precede MODPROBE check in the body — "
+        "if a count of 5+ hits the modprobe branch first, the "
+        "intent (skip modprobe when chip needs kernel-level reset) "
+        "is violated."
+    )
+    # And the reboot branch must `return` after `systemctl reboot`
+    # so the modprobe branch below is unreachable when count >=
+    # REBOOT_AFTER_N_RESTARTS. Look at the slice between the reboot
+    # check and the modprobe check (the reboot if-block sits there).
+    reboot_block = body[reboot_pos:modprobe_pos]
+    assert "return" in reboot_block, (
+        "reboot block must `return` after `systemctl reboot` so "
+        "the modprobe branch below is unreachable; otherwise a "
+        "5-restart-count fires BOTH reboot AND modprobe."
+    )
+
+
+def test_modprobe_ledger_recorded_unconditionally() -> None:
+    """The `echo "$now" >> "$MODPROBE_LEDGER"` MUST run regardless
+    of whether `try_modprobe_cycle` succeeded or failed — otherwise
+    a persistent kernel-busy "Module in use" failure would loop
+    forever (cron fires every 30s, ledger stays empty so the gate
+    keeps opening, modprobe keeps failing, no progress toward the
+    reboot tier that would actually recover). The ledger append
+    being OUTSIDE the if/else of the success branch is the safety
+    fence."""
+    source = _read_script_source()
+    match = re.search(
+        r"record_nm_restart_and_maybe_reboot\(\)\s*\{(.*?)\n\}",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match
+    body = match.group(1)
+    # Ledger append must exist + structurally land AFTER the
+    # try_modprobe_cycle's if/else block (i.e. unconditional from
+    # success/failure perspective). Easiest robust check: find
+    # both anchors in source order.
+    ledger_append_pos = body.find('echo "$now" >> "$MODPROBE_LEDGER"')
+    assert ledger_append_pos != -1, (
+        'modprobe-tier must contain `echo "$now" >> "$MODPROBE_LEDGER"`'
+        " to fence the no-retry-loop invariant — see test docstring."
+    )
+    try_cycle_pos = body.find("try_modprobe_cycle")
+    assert try_cycle_pos != -1 and try_cycle_pos < ledger_append_pos, (
+        "ledger append must follow `try_modprobe_cycle` invocation "
+        "in source order."
+    )
+    # And the ledger append must NOT be inside the `then` arm —
+    # check by ensuring no `then` keyword appears between the LAST
+    # `try_modprobe_cycle` text and the ledger append (which would
+    # indicate the append is inside a success-only branch).
+    between = body[try_cycle_pos:ledger_append_pos]
+    # The expected shape has exactly one `then` (the
+    # `if try_modprobe_cycle; then`) and one `else` and one `fi`
+    # in `between`. If a `then` appears after the `fi`, the append
+    # is in a different branch.
+    last_fi = between.rfind("\n        fi\n")
+    after_fi = between[last_fi + 1:] if last_fi != -1 else between
+    assert "then" not in after_fi, (
+        "ledger append appears AFTER an unclosed `then` — it's "
+        "inside a success-only branch. Loop hazard: a persistent "
+        "kernel-busy modprobe failure never records to the ledger, "
+        "so the cycle retries forever."
+    )
+
+
+def test_modprobe_ledger_wiped_before_reboot() -> None:
+    """When the reboot tier fires, BOTH the restarts ledger AND the
+    modprobe ledger must be wiped — symmetric with RESTARTS_FILE
+    (anti-reboot-loop). If MODPROBE_LEDGER persists across a
+    reboot-tier escalation (impossible on tmpfs but defensive),
+    a post-reboot watchdog would see a stale modprobe entry and
+    skip the modprobe tier in the next window."""
+    source = _read_script_source()
+    match = re.search(
+        r"record_nm_restart_and_maybe_reboot\(\)\s*\{(.*?)\n\}",
+        source,
+        flags=re.DOTALL,
+    )
+    assert match
+    body = match.group(1)
+    # Find the reboot block (between the threshold check + systemctl reboot)
+    assert re.search(
+        r':\s*>\s*"\$MODPROBE_LEDGER"',
+        body,
+    ), (
+        "reboot tier must wipe MODPROBE_LEDGER with `: > "
+        "\"$MODPROBE_LEDGER\"` symmetric to RESTARTS_FILE wipe. "
+        "Defensive: tmpfs clears it on reboot, but explicit wipe "
+        "covers the edge case where /var/run is ever moved to a "
+        "persistent fs."
+    )
