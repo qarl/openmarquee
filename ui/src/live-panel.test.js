@@ -274,6 +274,7 @@ describe("mountLivePanel", () => {
         const container = document.createElement("div");
         const opts = defaultMounts({
             hasGetUserMedia: () => false,
+            getHostname: () => "fireplacesign",
         });
         const handle = mountLivePanel(container, opts);
 
@@ -284,12 +285,15 @@ describe("mountLivePanel", () => {
         await tick();
         expect(opts.getUserMedia).not.toHaveBeenCalled();
         expect(handle.getState()).toBe("idle");
-        expect(container.querySelector(".live-status").textContent).toContain(
-            "Camera unavailable",
-        );
-        expect(container.querySelector(".live-status").textContent).toContain(
-            "Try HTTPS or use a Stream URL",
-        );
+        const statusText = container.querySelector(".live-status").textContent;
+        expect(statusText).toContain("Camera unavailable");
+        // Hostname-aware banner names the current host so the operator
+        // can identify which URL tripped the secure-context check.
+        expect(statusText).toContain("fireplacesign");
+        // Workaround menu: IP-fallback (LAN/Tailscale), HTTPS, Stream URL.
+        expect(statusText).toContain("LAN IP or Tailscale IP");
+        expect(statusText).toContain("HTTPS");
+        expect(statusText).toContain("Stream URL");
         // Button stays visible (idle is in the `ready` set) so the
         // click-time defensive guard is exercisable.
         expect(container.querySelector(".live-go-live").hidden).toBe(false);
@@ -304,6 +308,7 @@ describe("mountLivePanel", () => {
         const container = document.createElement("div");
         const opts = defaultMounts({
             hasGetUserMedia: () => false,
+            getHostname: () => "fireplacesign",
         });
         const handle = mountLivePanel(container, opts);
         // Settle mount-init's /status round-trip + predicate short-
@@ -318,6 +323,7 @@ describe("mountLivePanel", () => {
         expect(opts.apiStartLive).not.toHaveBeenCalled();
         const statusText = container.querySelector(".live-status").textContent;
         expect(statusText).toContain("Camera unavailable");
+        expect(statusText).toContain("fireplacesign");
         // Absence assertion: no "Stream failed:" prefix double-stutter,
         // and no raw "undefined is not an object" TypeError leak.
         expect(statusText).not.toContain("Stream failed:");
