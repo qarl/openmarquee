@@ -24,6 +24,7 @@ from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
 from openmarquee.api_system import router as system_router
 from openmarquee.auth_middleware import AuthMiddleware
+from openmarquee.csp_middleware import CSPMiddleware
 from openmarquee.dependencies import (
     get_auth_storage,
     get_content_storage,
@@ -188,20 +189,39 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="openMarquee", version=__version__, lifespan=lifespan)
 
+# Middleware stack note: Starlette's add_middleware inserts at the
+# front of user_middleware, then build_middleware_stack wraps in
+# reversed() order -- net effect is the LAST add_middleware call
+# becomes the OUTERMOST wrapper. With the order below the runtime
+# stack is (outer -> inner): CSP -> Auth -> Perf -> app.
+#
+# CSP outer-most so it stamps headers on every response, including
+# Auth's 401s. Auth wraps Perf so the auth gate runs first; Perf
+# only records requests that pass the gate (a pre-existing
+# limitation of this ordering, tracked separately).
+
 # Perf middleware -- timestamps each HTTP request, logs slow ones,
 # and pushes records into the in-memory ring exposed at
-# /api/system/perf-stats. Mount BEFORE routers so it wraps them.
+# /api/system/perf-stats.
 app.add_middleware(PerfMiddleware)
 
-# Batch 20.1 / phase A.1: bearer-token gate. add_middleware stacks
-# outer-most-first, so PerfMiddleware (added first) wraps
-# AuthMiddleware -- perf records still cover auth-rejected 401s
-# (useful for "are we 401-ing a lot?" observability). AuthMiddleware
-# fails closed: requests not on the whitelist need a valid token.
-# Pass a callable resolver -- the middleware looks up the storage
+# Batch 20.1 / phase A.1: bearer-token gate. AuthMiddleware fails
+# closed: requests not on the whitelist need a valid token. Pass a
+# callable resolver -- the middleware looks up the storage
 # per-request so the singleton's lru_cache can be cleared between
 # tests (tests point OPENMARQUEE_AUTH_PATH at a tmp dir).
 app.add_middleware(AuthMiddleware, auth_storage_resolver=get_auth_storage)
+
+# Content-Security-Policy header stamper. Outer-most middleware so
+# the header is added to EVERY response, including AuthMiddleware's
+# 401s (proves out via test_csp_header_present_on_401_when_auth_
+# enabled). Set OPENMARQUEE_CSP_REPORT_ONLY=1 to emit the
+# report-only variant during policy tuning -- production default is
+# enforce.
+app.add_middleware(
+    CSPMiddleware,
+    report_only=os.environ.get("OPENMARQUEE_CSP_REPORT_ONLY") == "1",
+)
 
 
 @app.exception_handler(RequestValidationError)
