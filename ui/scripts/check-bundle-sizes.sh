@@ -147,7 +147,7 @@ if [ "$DASHBOARD_BUILT" -eq 1 ]; then
         18000
         60600
         3600
-        1400
+        1700
     )
     LABELS+=(
         "dist-dashboard/main.js"
