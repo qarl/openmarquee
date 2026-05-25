@@ -111,9 +111,30 @@ export async function withProgressListener(ff, onProgress, fn) {
     }
 }
 
+// Round 24: ffmpeg.wasm is single-threaded — concurrent transcodes
+// share one exec queue + one MEMFS namespace on the singleton `ff`.
+// Pre-fix, operator-driven concurrency (drag-drops B before A's 30s
+// transcode finishes, or a retry fires before settle) interleaved
+// writeFile/exec across calls and produced corrupted output silently.
+//
+// Serialize via a module-level promise chain (`_transcodeChain`).
+// Each call appends its job to the chain and returns the chained
+// promise. `.then(myJob, myJob)` resumes after BOTH success and
+// failure of a prior job, so a single failed transcode doesn't
+// wedge subsequent ones (B doesn't inherit A's error; B's caller
+// gets B's own outcome).
+//
+// Filenames now use `++_transcodeSeq` (monotonic counter) instead
+// of `Date.now()` — even at sub-ms cadence, no two jobs collide.
+let _transcodeChain = Promise.resolve();
+let _transcodeSeq = 0;
+
 /**
  * Transcode a source video to H.264 MP4 at the target panel dims.
  * Returned bytes are the MP4 ready to upload.
+ *
+ * Concurrent calls SERIALIZE (r24) — ffmpeg.wasm's single-threaded
+ * core can't run two execs in parallel without corrupting MEMFS.
  *
  * @param {object} opts
  * @param {object} [hooks]
@@ -121,38 +142,46 @@ export async function withProgressListener(ff, onProgress, fn) {
  * @param {(pct: number) => void} [hooks.onProgress] — 0..100, fires repeatedly.
  * @returns {Uint8Array}
  */
-export async function transcodeToH264(
+export function transcodeToH264(
     { file, width, height },
     { onStatus, onProgress } = {},
 ) {
-    const ff = await getFfmpeg();
-    const { fetchFile } = await _getFfmpegUtil();
-    const inName = `input-${Date.now()}`;
-    const outName = `output-${Date.now()}.mp4`;
-    await ff.writeFile(inName, await fetchFile(file));
-    onStatus?.("transcoding to H.264 MP4…");
-    await withProgressListener(ff, onProgress, () => ff.exec([
-        "-i", inName,
-        // scale= + force-even-dimensions via the round-down trick; libx264
-        // with yuv420p hates odd dimensions.
-        "-vf", `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-pix_fmt", "yuv420p",
-        "-an", // drop audio — signs don't speak
-        outName,
-    ]));
-    onProgress?.(100);
-    const data = await ff.readFile(outName);
-    // Best-effort cleanup — ffmpeg.wasm's virtual FS can accumulate.
-    try {
-        await ff.deleteFile(inName);
-        await ff.deleteFile(outName);
-    } catch {
-        // ignore
-    }
-    return data;
+    const myJob = async () => {
+        const seq = ++_transcodeSeq;
+        const inName = `input-${seq}`;
+        const outName = `output-${seq}.mp4`;
+        const ff = await getFfmpeg();
+        const { fetchFile } = await _getFfmpegUtil();
+        await ff.writeFile(inName, await fetchFile(file));
+        onStatus?.("transcoding to H.264 MP4…");
+        await withProgressListener(ff, onProgress, () => ff.exec([
+            "-i", inName,
+            // scale= + force-even-dimensions via the round-down trick; libx264
+            // with yuv420p hates odd dimensions.
+            "-vf", `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-an", // drop audio — signs don't speak
+            outName,
+        ]));
+        onProgress?.(100);
+        const data = await ff.readFile(outName);
+        // Best-effort cleanup — ffmpeg.wasm's virtual FS can accumulate.
+        try {
+            await ff.deleteFile(inName);
+            await ff.deleteFile(outName);
+        } catch {
+            // ignore
+        }
+        return data;
+    };
+    // Both arms run myJob so a prior job's rejection doesn't wedge
+    // the chain. Each caller's awaited promise reflects ITS own job.
+    const next = _transcodeChain.then(myJob, myJob);
+    _transcodeChain = next;
+    return next;
 }
 
 /** Best-effort stringify for ffmpeg.wasm's occasional non-Error throws. */

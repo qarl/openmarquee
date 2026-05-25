@@ -315,3 +315,99 @@ describe("withProgressListener cleanup", () => {
         expect(offCalls).toHaveLength(0);
     });
 });
+
+// --- r24 serialization ---------------------------------------------------
+
+describe("transcodeToH264 serialization (r24)", () => {
+    // Round-24 regression-locks: ffmpeg.wasm is single-threaded;
+    // concurrent transcodes pre-fix shared one exec queue + MEMFS,
+    // producing corrupted output silently. The fix uses a module-
+    // level promise chain so B's exec runs strictly after A's
+    // cleanup completes.
+
+    it("B's exec runs only after A's cleanup completes when both fire concurrently", async () => {
+        const { transcodeToH264 } = await import("./ffmpeg-pipelines.js");
+        // Hold A's exec on a gate so we can prove B doesn't start.
+        let releaseGate;
+        ffmpegState.execGate = new Promise((r) => { releaseGate = r; });
+
+        // Fire A; it'll hang on the gate after writeFile + exec push.
+        const pipelineA = transcodeToH264({
+            file: new Blob(["A"], { type: "video/mp4" }),
+            width: 320, height: 240,
+        });
+
+        // Drain microtasks until the mock instance is loaded + A's
+        // exec is queued. The Batch 7.4 dynamic-import hops add a
+        // few extra microtasks before the exec push lands.
+        for (let i = 0; i < 30 && (!ffmpegState.instance || ffmpegState.instance.calls.exec.length === 0); i++) {
+            await new Promise((r) => setTimeout(r, 0));
+        }
+        const ff = ffmpegState.instance;
+        expect(ff.calls.exec).toHaveLength(1);
+        expect(ff.calls.writeFile).toHaveLength(1);
+
+        // Fire B while A is in-flight (gated).
+        const pipelineB = transcodeToH264({
+            file: new Blob(["B"], { type: "video/mp4" }),
+            width: 320, height: 240,
+        });
+
+        // Drain more microtasks. B's writeFile + exec should NOT have
+        // run yet — serialization keeps B waiting on A's chain link.
+        for (let i = 0; i < 30; i++) {
+            await new Promise((r) => setTimeout(r, 0));
+        }
+        expect(ff.calls.exec).toHaveLength(1);  // only A's
+        expect(ff.calls.writeFile).toHaveLength(1);  // only A's
+
+        // Release A. Now B's chain link resolves and B runs.
+        releaseGate();
+        ffmpegState.execGate = null;
+        await pipelineA;
+        await pipelineB;
+
+        // Both have completed.
+        expect(ff.calls.exec).toHaveLength(2);
+        expect(ff.calls.writeFile).toHaveLength(2);
+        // Monotonic counter: A's and B's writeFile names differ.
+        expect(ff.calls.writeFile[0].name).not.toBe(ff.calls.writeFile[1].name);
+        expect(ff.calls.writeFile[0].name).toMatch(/^input-\d+$/);
+        expect(ff.calls.writeFile[1].name).toMatch(/^input-\d+$/);
+    });
+
+    it("a failed prior transcode does NOT wedge the chain — B still runs", async () => {
+        const { transcodeToH264 } = await import("./ffmpeg-pipelines.js");
+        // A's exec throws once.
+        const origExec = ffmpegState;  // capture for restoration
+        let aExecFired = false;
+        ffmpegState.execGate = new Promise((_, reject) => {
+            // Reject immediately when A's exec awaits the gate. The
+            // mock's exec does `await ffmpegState.execGate`, so a
+            // rejected gate makes exec throw → myJob throws → A's
+            // promise rejects.
+            setTimeout(() => reject(new Error("A failed")), 0);
+        });
+        // Suppress unhandled-rejection from the gate itself (vitest
+        // is strict). We attach a no-op .catch.
+        ffmpegState.execGate.catch(() => {});
+
+        const pipelineA = transcodeToH264({
+            file: new Blob(["A"], { type: "video/mp4" }),
+            width: 320, height: 240,
+        }).catch(() => "A-failed");
+
+        await pipelineA;
+        // Clear the rejected gate so B's exec succeeds.
+        ffmpegState.execGate = null;
+
+        const pipelineB = await transcodeToH264({
+            file: new Blob(["B"], { type: "video/mp4" }),
+            width: 320, height: 240,
+        });
+        expect(pipelineB).toBeInstanceOf(Uint8Array);
+        // The chain ran B even after A's rejection.
+        const ff = ffmpegState.instance;
+        expect(ff.calls.exec.length).toBeGreaterThanOrEqual(1);
+    });
+});
