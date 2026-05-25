@@ -103,6 +103,14 @@ where
     /// capacity AND the key is new) and the replaced value (if
     /// the key already existed). Caller owns dropping any
     /// external resources tied to those values.
+    ///
+    /// Existing-key path moves the K already in `order` to the
+    /// back without cloning it — at 30 fps with a warm
+    /// ImageBgCache (cap=6) that is the hot path, and the prior
+    /// touch(&key) clone was a PathBuf::clone (heap alloc + OS-
+    /// string byte copy) per frame for no semantic reason. New-
+    /// key path still needs an owned copy: one goes into `order`,
+    /// the other into `map`'s key slot.
     pub fn insert(&mut self, key: K, value: V) -> InsertOutcome<V> {
         let mut evicted_lru: Option<V> = None;
         let key_existed = self.map.contains_key(&key);
@@ -111,7 +119,20 @@ where
                 evicted_lru = self.map.remove(&lru_key);
             }
         }
-        self.touch(&key);
+        if key_existed {
+            // Move the existing K within `order` to the back
+            // without cloning. position+remove+push_back mirrors
+            // touch() but reuses the owned K already in the deque.
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                if let Some(k) = self.order.remove(pos) {
+                    self.order.push_back(k);
+                }
+            }
+        } else {
+            // New key needs an owned copy for `order`; another
+            // copy goes into `map` below.
+            self.order.push_back(key.clone());
+        }
         let replaced = self.map.insert(key, value);
         InsertOutcome { evicted_lru, replaced }
     }
@@ -121,11 +142,6 @@ where
     pub fn drain(&mut self) -> std::collections::hash_map::Drain<'_, K, V> {
         self.order.clear();
         self.map.drain()
-    }
-
-    fn touch(&mut self, key: &K) {
-        self.order.retain(|k| k != key);
-        self.order.push_back(key.clone());
     }
 }
 
@@ -180,11 +196,18 @@ mod tests {
         c.insert("a", 1);
         c.insert("b", 2);
         c.insert("c", 3);
-        // Replace c at capacity -- no eviction (key already there).
-        let o = c.insert("c", 30);
+        // Replace b at capacity -- no eviction (key already there).
+        // Picking b (not c) so the move-to-back assertion below has
+        // a meaningful effect (c is already at back; b is in middle).
+        let o = c.insert("b", 20);
         assert!(o.evicted_lru.is_none());
-        assert_eq!(o.replaced, Some(3));
+        assert_eq!(o.replaced, Some(2));
         assert_eq!(c.len(), 3);
+        // Existing-key insert must still move the key to back-of-
+        // order (most-recent) so the next eviction targets the
+        // truly-stalest entry. Locks the no-clone branch in insert.
+        assert_eq!(c.order.back(), Some(&"b"));
+        assert_eq!(c.order.front(), Some(&"a"));
     }
 
     #[test]
