@@ -82,10 +82,24 @@ export function setupFontPicker(layerEl) {
         if (!byCategory.has(f.category)) byCategory.set(f.category, []);
         byCategory.get(f.category).push(f);
     }
+    // Build the whole section tree into a DocumentFragment first, then
+    // append once. 5 sections * ~26 tiles was 31 live-DOM mutations
+    // per layer-card insert; with the fragment it's 1. Reflow-heavy on
+    // slide-load with multiple text layers; measurable on Pi-class.
+    const frag = document.createDocumentFragment();
     for (const [cat, fonts] of byCategory) {
         const section = document.createElement("div");
         section.className = "font-picker-section";
-        section.innerHTML = `<div class="font-picker-section-head">${cat}</div>`;
+        // createElement + textContent rather than innerHTML even though
+        // `cat` is from the FONT_FAMILIES constant today. The rest of
+        // this loop already uses the safe shape; mixing in one
+        // template-literal innerHTML teaches the wrong pattern to a
+        // future contributor adding a user-supplied category / i18n
+        // label.
+        const head = document.createElement("div");
+        head.className = "font-picker-section-head";
+        head.textContent = cat;
+        section.appendChild(head);
         const grid = document.createElement("div");
         grid.className = "font-picker-grid";
         for (const f of fonts) {
@@ -100,8 +114,9 @@ export function setupFontPicker(layerEl) {
             grid.appendChild(tile);
         }
         section.appendChild(grid);
-        popover.appendChild(section);
+        frag.appendChild(section);
     }
+    popover.appendChild(frag);
 
     function syncTrigger() {
         const value = selectEl.value || FONT_FAMILIES[0].value;
