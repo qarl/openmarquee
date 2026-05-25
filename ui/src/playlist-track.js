@@ -344,9 +344,19 @@ export function mountPlaylistTrack(container, options) {
                 // Sortable instances intact. autoSave + statusEl reset
                 // still need to happen (refresh is a "loaded fresh from
                 // server" reset signal, not just a render trigger).
-                nameEl.value = activeName;
+                // Guard the name-field clobber + autosave-cancel when
+                // the operator is mid-edit on the name input — an
+                // external refresh in the 400ms debounce window would
+                // otherwise wipe in-flight keystrokes AND drop the
+                // pending save. applyDefaultPlaylistNameHints stays
+                // unconditional (only matters when activeName=='default'
+                // which makes the input disabled — operator can't
+                // realistically be editing in that case).
+                if (document.activeElement !== nameEl) {
+                    nameEl.value = activeName;
+                    autoSave.cancel();
+                }
                 applyDefaultPlaylistNameHints(nameEl, activeName);
-                autoSave.cancel();
                 statusEl.dataset.state = "idle";
                 return;
             }
@@ -384,10 +394,14 @@ export function mountPlaylistTrack(container, options) {
 
             // Sync the name input to the freshly-loaded playlist. Refresh
             // is not an edit, so cancel any pending auto-save and clear
-            // the status pill.
-            nameEl.value = activeName;
+            // the status pill. Guard both clobber-name + cancel when
+            // the operator is mid-edit on the name input; see the
+            // memo-hit branch above for the same reasoning.
+            if (document.activeElement !== nameEl) {
+                nameEl.value = activeName;
+                autoSave.cancel();
+            }
             applyDefaultPlaylistNameHints(nameEl, activeName);
-            autoSave.cancel();
             statusEl.textContent = "";
             statusEl.dataset.state = "idle";
 
