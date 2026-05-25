@@ -375,10 +375,20 @@ export function mountFlock(
         // fetch — our token wouldn't authenticate against a peer's
         // AuthState; the peer-side whitelist (auth_middleware.py's
         // _WHITELIST_EXACT) is what lets cross-flock reads succeed.
+        //
+        // Round 16: AbortController closes the last r8-flagged race
+        // window — a fetch resolving AFTER render()'s innerHTML severs
+        // the img would otherwise set dataset.blobUrl on a now-orphan
+        // element, leaking the blob until GC. abortInFlightFetches()
+        // (called from render() pre-innerHTML and stop() teardown)
+        // cancels these in-flight requests so they bail out via the
+        // AbortError branch below instead of mutating an orphan.
+        const controller = new AbortController();
+        img._thumbFetchAbort = controller;
         try {
             const r = selfOrigin
-                ? await apiFetch(url, { skipAuth401Redirect: true })
-                : await fetch(url);
+                ? await apiFetch(url, { skipAuth401Redirect: true, signal: controller.signal })
+                : await fetch(url, { signal: controller.signal });
             if (r.status !== 200) throw new Error(`HTTP ${r.status}`);
             const blob = await r.blob();
             const prev = img.dataset.blobUrl;
@@ -386,12 +396,37 @@ export function mountFlock(
             img.dataset.blobUrl = objUrl;
             img.src = objUrl;
             if (prev) URL.revokeObjectURL(prev);
-        } catch {
+        } catch (err) {
+            // AbortError → render-boundary cancelled us. The img is
+            // about to be wiped by innerHTML anyway, so no error event,
+            // no DOM mutation. Silent unwind.
+            if (err?.name === "AbortError") return;
             const prev = img.dataset.blobUrl;
             delete img.dataset.blobUrl;
             img.removeAttribute("src");
             img.dispatchEvent(new Event("error"));
             if (prev) URL.revokeObjectURL(prev);
+        } finally {
+            // Only clear the ref if it's still ours — a concurrent
+            // second loadThumbViaFetch on the same img would have
+            // replaced it with a newer controller. Don't clobber.
+            if (img._thumbFetchAbort === controller) {
+                img._thumbFetchAbort = null;
+            }
+        }
+    }
+
+    // Round 16: cancel any loadThumbViaFetch still in flight on a
+    // thumbnail <img> in the grid. Called BEFORE render() overwrites
+    // gridEl.innerHTML so a still-pending fetch can't resolve after
+    // innerHTML severs the img and set dataset.blobUrl on the orphan.
+    // Also called from stop() for panel-close teardown.
+    function abortInFlightFetches() {
+        for (const img of gridEl.querySelectorAll(".om-peer-thumb-img")) {
+            if (img._thumbFetchAbort) {
+                img._thumbFetchAbort.abort();
+                img._thumbFetchAbort = null;
+            }
         }
     }
 
@@ -511,6 +546,7 @@ export function mountFlock(
         }
 
         paintEyebrow(peers);
+        abortInFlightFetches();
         revokeAllThumbs();
         gridEl.innerHTML =
             selfCardHTML({
@@ -774,6 +810,7 @@ export function mountFlock(
         refresh: render,
         stop: () => {
             stopPolling();
+            abortInFlightFetches();
             revokeAllThumbs();
             peerDimsCache.clear();
             if (pendingAddRender !== null) {
