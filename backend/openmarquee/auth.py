@@ -174,15 +174,40 @@ def verify_password(stored_hash: str, plaintext: str) -> bool:
 # --- token mint + verify ---
 
 
+# Round-26 token expiry. Pre-r26 tokens never expired -- once issued, a
+# token verified forever unless password rotation bumped token_version or
+# a fresh login overwrote issued_token_hash. Operator-typical: log in
+# once at setup -> token valid for device lifetime. Two-year-old phone
+# backup leak -> recovered token still authenticated over Tailscale.
+#
+# Token format changed from `<version>.<secret>` to
+# `<version>.<issued_at_unix>.<secret>`. verify_token enforces age <=
+# MAX_TOKEN_AGE_SECONDS + future-stamp <= _CLOCK_SKEW_TOLERANCE_SECONDS.
+#
+# 30 days chosen as the conservative middle: long enough that active
+# operators rarely re-login, short enough that an old backup leak has a
+# tight window.
+MAX_TOKEN_AGE_SECONDS = 30 * 24 * 3600  # 30 days
+# Tolerate small clock skew between mint and verify (e.g., NTP just
+# converged). 60s is small enough to bound forward-stamp attacks
+# (attacker can't claim a token issued 1 hour in the future to extend
+# its window) but generous against legitimate skew.
+_CLOCK_SKEW_TOLERANCE_SECONDS = 60
+
+
 def mint_token(state: AuthState) -> tuple[str, AuthState]:
     """Return (fresh_token, updated_state) where the new state carries
-    an argon2 hash of the token's secret part.
+    an argon2 hash binding `issued_at` to the token's secret part.
 
-    Shape: `<version>.<32-byte-urlsafe-secret>`. The version prefix is
-    the rotation lever; the secret part is what verify_token argon2-
-    verifies against state.issued_token_hash. Each mint OVERWRITES
-    the previous hash -- the prior-issued token stops verifying as
-    soon as the new state is persisted.
+    Shape: `<version>.<issued_at_unix>.<32-byte-urlsafe-secret>`. The
+    version prefix is the rotation lever; issued_at is the wall-clock
+    UNIX timestamp at mint time; the secret part is what verify_token
+    argon2-verifies (with issued_at bound into the hash so an attacker
+    can't substitute a fresh issued_at on a captured secret to bypass
+    the age check).
+
+    Each mint OVERWRITES the previous hash -- the prior-issued token
+    stops verifying as soon as the new state is persisted.
 
     Callers MUST persist the returned state via AuthStorage.save()
     before returning the token to the client; otherwise a server
@@ -200,17 +225,29 @@ def mint_token(state: AuthState) -> tuple[str, AuthState]:
     any previously-cached entry for a now-invalid token would still
     short-circuit positive for up to its TTL. Flushing on mint
     closes that window (subagent code review 2026-05-24).
+
+    Round-26 security: the argon2 hash is over `f"{issued_at}.{secret}"`,
+    NOT just the secret. This binds the timestamp to the cryptographic
+    proof -- without binding, an attacker who captured a token could
+    construct `<version>.<new_canonical_issued_at>.<captured_secret>`,
+    pass the canonical-form + age checks, and argon2-verify the (still-
+    valid) secret successfully. Binding closes that bypass: any
+    issued_at substitution causes argon2_verify to fail.
     """
     clear_verified_token_cache()
+    issued_at = int(time.time())
     secret = secrets.token_urlsafe(32)
-    secret_hash = _HASHER.hash(secret)
+    # Bind issued_at into the hashed material so the timestamp can't
+    # be substituted on a captured secret (see Round-26 security note
+    # above).
+    secret_hash = _HASHER.hash(f"{issued_at}.{secret}")
     updated = state.model_copy(
         update={
             "issued_token_hash": secret_hash,
             "updated_at": datetime.now(UTC),
         }
     )
-    return f"{state.token_version}.{secret}", updated
+    return f"{state.token_version}.{issued_at}.{secret}", updated
 
 
 # ---- Verified-token cache (2026-05-24 security audit finding 1 Path A) ----
@@ -263,22 +300,35 @@ def clear_verified_token_cache() -> None:
 
 async def verify_token(token: str, state: AuthState | None) -> bool:
     """True iff `token` is well-formed, its version prefix matches the
-    stored state's current `token_version`, AND its secret part argon2-
-    verifies against `state.issued_token_hash` (constant-time-compared
-    by argon2-cffi).
+    stored state's current `token_version`, its issued_at is within the
+    MAX_TOKEN_AGE_SECONDS window, AND its secret part argon2-verifies
+    against `state.issued_token_hash` (with issued_at bound into the
+    hashed input; constant-time-compared by argon2-cffi).
 
     Returns False when:
       - state is None (auth not configured)
       - state.issued_token_hash is None (mint hasn't been persisted yet)
-      - token is empty / malformed (no dot, wrong-shape secret part)
-      - version prefix doesn't parse as int
+      - token is empty / malformed (wrong dot count, wrong-shape secret)
+      - version prefix doesn't parse as int OR isn't canonical
+      - issued_at doesn't parse as int OR isn't canonical
+      - issued_at older than MAX_TOKEN_AGE_SECONDS (30 days)
+      - issued_at more than _CLOCK_SKEW_TOLERANCE_SECONDS (60s) in
+        the future
       - version prefix doesn't match state.token_version
-      - argon2-verify of secret vs issued_token_hash fails
+      - argon2-verify of `f"{issued_at}.{secret}"` vs issued_token_hash
+        fails
+
+    Pre-r26 the format was `<version>.<secret>` and tokens never
+    expired. Old 2-part tokens fail the 3-part split here and reject
+    immediately -- forced re-login at the upgrade is the documented
+    migration.
 
     Cache: a positive verify result is cached for 10min, keyed by the
     full bearer token string. Subsequent calls with the same token
     short-circuit to a dict lookup (sub-µs). Cache invalidates on
-    change_password via clear_verified_token_cache().
+    change_password via clear_verified_token_cache(). Note: cache key
+    includes issued_at, so a re-issued token (different issued_at) has
+    a different cache key -- no stale-positive risk.
 
     Async: argon2.verify is wrapped via asyncio.to_thread to keep the
     event loop responsive -- a single ~250ms argon2 call would
@@ -286,10 +336,12 @@ async def verify_token(token: str, state: AuthState | None) -> bool:
     """
     if state is None or not token:
         return False
-    parts = token.split(".", 1)
-    if len(parts) != 2:
+    # Round-26: 3-part format <version>.<issued_at>.<secret>. Old
+    # 2-part tokens have len(parts) == 2 and reject here.
+    parts = token.split(".")
+    if len(parts) != 3:
         return False
-    version_str, secret = parts
+    version_str, issued_at_str, secret = parts
     try:
         version = int(version_str)
     except ValueError:
@@ -301,10 +353,32 @@ async def verify_token(token: str, state: AuthState | None) -> bool:
     # holding ONE valid token could send sustained requests varying
     # only the version prefix, inflating _VERIFIED_TOKEN_CACHE
     # unboundedly until the 512MB Pi Zero 2 W OOMs. mint_token emits
-    # `f"{state.token_version}.{secret}"` which always produces the
-    # canonical decimal str of an int (no leading zeros, no sign, no
-    # underscores), so this reject can't break a legitimate token.
+    # the canonical decimal str of an int (no leading zeros, no sign,
+    # no underscores), so this reject can't break a legitimate token.
     if version_str != str(version):
+        return False
+    # Round-26: same canonical-form check for issued_at. Without it,
+    # `1.+1700000000.SECRET`, `1.01700000000.SECRET`, etc. would each
+    # produce a distinct cache key for the same logical token -- same
+    # cache-inflation attack vector as the version field had pre-r10.
+    try:
+        issued_at = int(issued_at_str)
+    except ValueError:
+        return False
+    if issued_at_str != str(issued_at):
+        return False
+    # Round-26 age check: reject tokens older than the 30-day window.
+    # Wall-clock time.time() (not monotonic) because issued_at is a
+    # persisted timestamp that must survive process restarts. NTP
+    # skew at boot is bounded by _CLOCK_SKEW_TOLERANCE_SECONDS on
+    # the future side.
+    now_wall = int(time.time())
+    if now_wall - issued_at > MAX_TOKEN_AGE_SECONDS:
+        return False
+    # Future-stamped tokens: bounded clock-skew tolerance only. A
+    # token claiming to be issued 1 hour in the future is either a
+    # forgery or a deeply broken NTP -- either way, reject.
+    if issued_at > now_wall + _CLOCK_SKEW_TOLERANCE_SECONDS:
         return False
     # Secret part must be 43 chars (token_urlsafe(32) -> 43-char b64).
     if len(secret) != 43:
@@ -333,7 +407,17 @@ async def verify_token(token: str, state: AuthState | None) -> bool:
     # loop stays responsive. The thread pool default (min(32, cpu+4))
     # is fine; concurrent verifies stack up to that limit.
     try:
-        ok = await asyncio.to_thread(_argon2_verify_secret, state.issued_token_hash, secret)
+        # Round-26 security: argon2 input binds issued_at to the
+        # secret -- without this, an attacker who captured a token
+        # could substitute a fresh canonical issued_at to bypass the
+        # age check while still passing argon2 verify on the (still-
+        # known) secret. The hash mint side uses the same
+        # `f"{issued_at}.{secret}"` composition.
+        ok = await asyncio.to_thread(
+            _argon2_verify_secret,
+            state.issued_token_hash,
+            f"{issued_at}.{secret}",
+        )
     except VerifyMismatchError:
         return False
     except Exception:

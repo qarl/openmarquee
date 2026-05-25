@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -95,10 +96,16 @@ def test_corrupt_auth_json_recovers_to_not_configured(tmp_path: Path):
 def test_mint_token_includes_version_prefix():
     state = AuthState(password_hash=hash_password("pw"), token_version=7)
     token, updated = mint_token(state)
+    # Round-26: format is `<version>.<issued_at>.<secret>` (3 parts).
     assert token.startswith("7.")
+    parts = token.split(".")
+    assert len(parts) == 3, f"expected 3-part token, got {len(parts)} parts"
     # secret part is token_urlsafe(32) -> 43 b64 chars
-    assert len(token.split(".", 1)[1]) == 43
-    # New state carries the argon2 hash of the issued secret.
+    assert len(parts[2]) == 43
+    # issued_at is a canonical decimal int
+    assert parts[1] == str(int(parts[1]))
+    # New state carries the argon2 hash of issued_at+secret (binding
+    # prevents issued_at substitution attacks; see mint_token doc).
     assert updated.issued_token_hash is not None
 
 
@@ -165,11 +172,12 @@ async def test_verify_token_rejects_forged_secret_with_correct_version_prefix():
     clear_verified_token_cache()
     state = AuthState(password_hash=hash_password("pw"), token_version=3)
     real_token, updated = mint_token(state)
-    real_version, _real_secret = real_token.split(".", 1)
-    # Forge a token: same version prefix, 43-char b64-safe random secret
-    # the attacker generated themselves.
+    # Round-26: 3-part format <version>.<issued_at>.<secret>. Reuse
+    # the real version + real issued_at; substitute the secret with a
+    # well-formed-shape but wrong value.
+    real_version, real_issued_at, _real_secret = real_token.split(".")
     forged_secret = "Z" * 43  # well-formed shape, not the real secret
-    forged_token = f"{real_version}.{forged_secret}"
+    forged_token = f"{real_version}.{real_issued_at}.{forged_secret}"
     assert forged_token != real_token
     assert await verify_token(forged_token, updated) is False
 
@@ -184,7 +192,9 @@ async def test_verify_token_rejects_unknown_version():
     state = AuthState(password_hash=hash_password("pw"), token_version=3)
     _, updated = mint_token(state)
     # Reuse the valid hash's secret but lie about the version prefix.
-    fake = f"99.{'a' * 43}"
+    # Round-26: 3-part format with a current issued_at so this rejects
+    # at the version-mismatch check (not the parts-count check).
+    fake = f"99.{int(time.time())}.{'a' * 43}"
     assert await verify_token(fake, updated) is False
 
 
@@ -198,7 +208,9 @@ async def test_verify_token_rejects_when_no_hash_persisted_yet():
 
     clear_verified_token_cache()
     state = AuthState(password_hash=hash_password("pw"), token_version=3)
-    token = f"3.{'x' * 43}"
+    # Round-26: 3-part format with current issued_at so this rejects
+    # at the issued_token_hash-None check (not the parts-count check).
+    token = f"3.{int(time.time())}.{'x' * 43}"
     assert state.issued_token_hash is None
     assert await verify_token(token, state) is False
 
@@ -279,7 +291,9 @@ async def test_verify_token_cache_capped_at_lru_limit():
             # there's only one valid secret, but our monkeypatched
             # verify is unconditional -- the test is about the cache
             # accounting, not the verify logic).
-            tokens = [f"1.{chr(ord('a') + i)}{'b' * 42}" for i in range(7)]
+            # Round-26: 3-part format with current issued_at for each.
+            _now = int(time.time())
+            tokens = [f"1.{_now}.{chr(ord('a') + i)}{'b' * 42}" for i in range(7)]
             for t in tokens:
                 assert await verify_token(t, updated) is True
             # Cap holds: never exceeds 4 regardless of input volume.
@@ -325,10 +339,12 @@ async def test_verify_token_cache_hit_moves_entry_to_recent():
         original_verify = auth_module._argon2_verify_secret
         auth_module._argon2_verify_secret = always_true
         try:
-            t1 = f"1.{'a' + 'b' * 42}"
-            t2 = f"1.{'c' + 'b' * 42}"
-            t3 = f"1.{'d' + 'b' * 42}"
-            t4 = f"1.{'e' + 'b' * 42}"
+            # Round-26: 3-part format with current issued_at for each.
+            _now = int(time.time())
+            t1 = f"1.{_now}.{'a' + 'b' * 42}"
+            t2 = f"1.{_now}.{'c' + 'b' * 42}"
+            t3 = f"1.{_now}.{'d' + 'b' * 42}"
+            t4 = f"1.{_now}.{'e' + 'b' * 42}"
             assert await verify_token(t1, updated) is True
             assert await verify_token(t2, updated) is True
             assert await verify_token(t3, updated) is True
@@ -351,6 +367,203 @@ async def test_verify_token_cache_hit_moves_entry_to_recent():
     finally:
         auth_module._VERIFIED_TOKEN_CACHE_CAP = original_cap
         clear_verified_token_cache()
+
+
+# ---- Round-26: token expiry (issued_at embed + 30-day window) ----
+
+
+@pytest.mark.asyncio
+async def test_verify_token_fresh_token_verifies_in_3_part_format():
+    """Round-26 happy path: a freshly-minted token in the new 3-part
+    format (<version>.<issued_at>.<secret>) verifies. Sanity baseline
+    for the expiry tests below."""
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=1)
+    token, updated = mint_token(state)
+    assert len(token.split(".")) == 3
+    assert await verify_token(token, updated) is True
+
+
+@pytest.mark.asyncio
+async def test_verify_token_29_day_old_token_verifies(monkeypatch):
+    """Round-26: tokens within the 30-day window verify. A 29-day-old
+    token is still inside the window (1 day before the cutoff)."""
+    from openmarquee import auth as auth_module
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=1)
+    # Mint at t=now; the token's issued_at = now.
+    real_now = int(time.time())
+    token, updated = mint_token(state)
+    # Now FAST-FORWARD verify-time clock by 29 days.
+    monkeypatch.setattr(
+        auth_module.time,
+        "time",
+        lambda: real_now + 29 * 24 * 3600,
+    )
+    clear_verified_token_cache()
+    assert await verify_token(token, updated) is True, (
+        "29-day-old token must verify (within 30-day window)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_token_31_day_old_token_rejected(monkeypatch):
+    """Round-26 core invariant: tokens past the 30-day window reject
+    without touching argon2. Pre-r26 tokens never expired."""
+    from openmarquee import auth as auth_module
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=1)
+    real_now = int(time.time())
+    token, updated = mint_token(state)
+    # Fast-forward 31 days -- past the 30-day cutoff.
+    monkeypatch.setattr(
+        auth_module.time,
+        "time",
+        lambda: real_now + 31 * 24 * 3600,
+    )
+    clear_verified_token_cache()
+    assert await verify_token(token, updated) is False, (
+        "31-day-old token MUST reject (past the 30-day window). "
+        "Pre-r26 it would have verified -- the operator's expired "
+        "phone backup leak would still authenticate."
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_token_future_stamped_rejected_past_clock_skew(monkeypatch):
+    """Round-26: a token claiming to be issued more than
+    _CLOCK_SKEW_TOLERANCE_SECONDS (60s) in the future is a forgery
+    OR a deeply broken NTP -- either way, reject. Bounds the
+    forward-stamp attack (attacker claims a token issued 1 hour in
+    the future to extend its effective window)."""
+    from openmarquee import auth as auth_module
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=1)
+    real_now = int(time.time())
+    # Mint at t = real_now + 5min (way past the 60s tolerance).
+    monkeypatch.setattr(auth_module.time, "time", lambda: real_now + 300)
+    token, updated = mint_token(state)
+    # Verify-time clock is back at real_now (mint clock was the
+    # forgery / NTP-broken side).
+    monkeypatch.setattr(auth_module.time, "time", lambda: real_now)
+    clear_verified_token_cache()
+    assert await verify_token(token, updated) is False, (
+        "future-stamped (5min) token must reject (past 60s clock-skew tolerance)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_token_rejects_non_canonical_issued_at_variants():
+    """Round-26: same canonical-form check as version (mirror r10).
+    Without it, an attacker holding a captured valid token could
+    spam non-canonical issued_at variants (same int value, different
+    string) and each populates a distinct cache entry --
+    cache-inflation attack vector identical to r10's version field."""
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=1)
+    real_token, updated = mint_token(state)
+    real_version, real_issued_at, real_secret = real_token.split(".")
+
+    # Canonical form first: sanity baseline (rejection isn't over-zealous).
+    assert await verify_token(real_token, updated) is True
+
+    noncanonical_issued_at_forms = [
+        f"+{real_issued_at}",  # leading + sign
+        f"0{real_issued_at}",  # leading zero
+        f"00{real_issued_at}",
+        f" {real_issued_at}",  # leading whitespace
+        f"{real_issued_at} ",  # trailing whitespace
+        f"{real_issued_at}_0",  # underscore separator (Python int literal)
+    ]
+    for bad_at in noncanonical_issued_at_forms:
+        bad_token = f"{real_version}.{bad_at}.{real_secret}"
+        assert await verify_token(bad_token, updated) is False, (
+            f"non-canonical issued_at must reject: {bad_at!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_verify_token_rejects_old_2_part_token_format():
+    """Round-26 migration: pre-r26 tokens are 2-part
+    (<version>.<secret>). split(".") gives 2 parts, len != 3 rejects
+    them at the format gate. Documented migration: one-time forced
+    re-login at the upgrade per operator."""
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=1)
+    _, updated = mint_token(state)
+    # Pre-r26 2-part token: `<version>.<43-char-secret>`.
+    legacy_token = f"1.{'a' * 43}"
+    assert legacy_token.count(".") == 1
+    assert await verify_token(legacy_token, updated) is False, (
+        "legacy 2-part token must reject (forces re-login on upgrade)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_token_rejects_issued_at_substitution_attack(monkeypatch):
+    """Round-26 CRITICAL security: argon2 binds issued_at into the
+    hashed input so an attacker who captured a token can't substitute
+    a fresh issued_at on the captured secret to bypass the age check.
+
+    Pre-binding: attacker captures `1.OLD.SECRET`, waits 31 days,
+    constructs `1.NEW.SECRET` (canonical issued_at, fresh enough to
+    pass the age check). The canonical-form check passes (NEW is a
+    valid int decimal); the age check passes (NEW is recent); argon2
+    verifies SECRET against the stored hash and SUCCEEDS (because
+    pre-binding the hash was just over SECRET). Attack succeeds:
+    token validity extended beyond the 30-day window indefinitely.
+
+    Post-binding: argon2 verifies `f"{NEW}.{SECRET}"` against the
+    stored hash of `f"{OLD}.{SECRET}"`. Mismatch. Attack fails.
+    """
+    from openmarquee import auth as auth_module
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=1)
+    real_now = int(time.time())
+    # Step 1: mint a token at real_now.
+    captured_token, updated = mint_token(state)
+    real_version, captured_issued_at, captured_secret = captured_token.split(".")
+    # Sanity: the captured token verifies right now (baseline).
+    clear_verified_token_cache()
+    assert await verify_token(captured_token, updated) is True
+
+    # Step 2: 31 days pass. The captured token is now expired.
+    monkeypatch.setattr(
+        auth_module.time,
+        "time",
+        lambda: real_now + 31 * 24 * 3600,
+    )
+    clear_verified_token_cache()
+    assert await verify_token(captured_token, updated) is False, (
+        "captured token must expire (30-day baseline)"
+    )
+
+    # Step 3: ATTACK -- substitute a fresh canonical issued_at on
+    # the captured secret. Without hash-binding, this would bypass
+    # the age check + argon2 verify on the (still-known) secret.
+    fresh_issued_at = real_now + 31 * 24 * 3600  # = "now" per the
+    # monkeypatched clock, well within the 30-day window.
+    attack_token = f"{real_version}.{fresh_issued_at}.{captured_secret}"
+    assert await verify_token(attack_token, updated) is False, (
+        "issued_at substitution must NOT bypass the age check. "
+        "Without argon2 binding to issued_at, this is the worst-"
+        "case bypass: captured tokens stay valid forever via "
+        "rolling issued_at substitutions. The bind closes it."
+    )
 
 
 @pytest.mark.asyncio
