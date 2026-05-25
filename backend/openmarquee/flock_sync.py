@@ -505,8 +505,30 @@ class FlockSync:
             local_ts = self.content.read_updated_at(content_id)
             if local_ts > deleted_at:
                 return
+            # Round-20 rollback: mirrors r16's _ingest_delete fix
+            # (5481eae). Tombstone-add BEFORE content.delete protects
+            # against silent-delete-with-no-record races; if
+            # content.delete fails (NFS hiccup, etc.) after the
+            # tombstone landed, roll the tombstone back so the next
+            # pull pass can restart cleanly. Pre-r20 the tombstone got
+            # committed while the local content stayed on disk -- the
+            # next manifest serve included a "deleted" tombstone for
+            # content this device still served, re-propagating a
+            # stale delete through the flock; peers that re-pulled the
+            # live copy mid-window flapped.
             self.tombstones.add(content_id, now=deleted_at)
-            self.content.delete(content_id)
+            try:
+                self.content.delete(content_id)
+            except Exception:
+                try:
+                    self.tombstones.remove(content_id)
+                except Exception:
+                    logger.exception(
+                        "_apply_pulled_tombstone tombstone rollback failed for %s "
+                        "(original exception below will still propagate)",
+                        content_id,
+                    )
+                raise
         else:
             # Only record if we don't already have a fresher tombstone —
             # avoids flapping the on-disk log on every pull round.

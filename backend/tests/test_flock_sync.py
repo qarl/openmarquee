@@ -580,6 +580,68 @@ def _pull_tombstone_handler(request):
 
 
 @pytest.mark.asyncio
+async def test_apply_pulled_tombstone_rolls_back_on_content_delete_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Round-20 correctness regression: mirrors r16's _ingest_delete
+    fix on the PULL applier. If self.content.delete raises mid-flight
+    (NFS hiccup) after the tombstone is committed,
+    _apply_pulled_tombstone MUST roll the tombstone back so the next
+    pull pass can restart cleanly.
+
+    Pre-fix the tombstone stayed committed and the local content
+    stayed on disk -- the next manifest serve included a `deleted`
+    tombstone for content this device still served, re-propagating
+    a stale delete through the flock; peers that re-pulled the
+    live copy mid-window flapped.
+
+    Test shape: pre-seed local content stamped OLDER than the pulled
+    delete (so LWW skip doesn't fire); monkeypatch content.delete to
+    raise OSError; call _apply_pulled_tombstone directly (so we
+    isolate the rollback contract from the rest of pull_from_peer's
+    error-handling); assert OSError propagates AND tombstone is
+    absent post-rollback AND local content still present.
+    """
+    sync, content, tombstones, _ = _build_sync(
+        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
+    )
+    remote_delete_at = datetime.now(UTC) - timedelta(days=2)
+    local_updated_at = remote_delete_at - timedelta(days=5)
+    local_cid = uuid4()
+    local_slide = TextSlide(id=local_cid, name="will fail mid-pull-delete", text="x")
+    content.save(local_slide, _make_png_bytes(), updated_at=local_updated_at)
+    assert content.exists(local_cid)
+
+    # Pre-condition: no tombstone for this id.
+    assert not any(t.content_id == local_cid for t in tombstones.load().tombstones)
+
+    # Force content.delete to raise mid-flight.
+    def raising_delete(item_id):
+        raise OSError("simulated mid-pull-delete storage failure")
+
+    monkeypatch.setattr(content, "delete", raising_delete)
+
+    # _apply_pulled_tombstone should propagate the OSError after
+    # rolling the tombstone back.
+    with pytest.raises(OSError, match="simulated mid-pull-delete"):
+        sync._apply_pulled_tombstone(local_cid, remote_delete_at)
+
+    # CRITICAL ASSERTION: tombstone was rolled back. Pre-fix this
+    # would FAIL -- tombstone committed before the destructive step,
+    # never removed on partial failure -- and the next manifest
+    # serve would re-propagate the stale delete.
+    assert not any(t.content_id == local_cid for t in tombstones.load().tombstones), (
+        "tombstone must be rolled back when content.delete fails "
+        "(otherwise stale delete re-propagates through the flock)"
+    )
+
+    # Sanity: local content still present since the delete failed.
+    monkeypatch.undo()
+    assert content.exists(local_cid), "local content must remain since the simulated delete failed"
+
+
+@pytest.mark.asyncio
 async def test_pull_from_peer_skips_when_local_newer(tmp_path: Path):
     cid = uuid4()
     remote_ts = datetime(2026, 4, 10, tzinfo=UTC)
