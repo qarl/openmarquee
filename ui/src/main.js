@@ -638,9 +638,23 @@ async function boot() {
             outputMode,
         });
 
-        const editorSlot = root.querySelector(".editor-slot");
-        editorSlot.innerHTML = "";
-        editor = mountEditor(editorSlot, {
+        // Shared 3-line scaffold for the 5 uploader mounts below:
+        // each does querySelector(selector) + innerHTML="" + mount(slot,
+        // props). Lifted into a helper so the 5 call sites focus on
+        // their unique props rather than 3 lines of identical
+        // boilerplate. Tried a UPLOADERS-table-driven loop + an
+        // object-indirection-with-destructure variant; both obscured
+        // the 5 named mounts more than they saved. This shape (1
+        // line per uploader, props inline) keeps the bare-assignment
+        // pattern that the rest of boot() reads `editor` /
+        // `imageUploader` / etc with -- per the survey 680cd55
+        // target #5 caveat "could end up more lines than it saves."
+        function clearAndMount(selector, mountFn, props) {
+            const slot = root.querySelector(selector);
+            slot.innerHTML = "";
+            return mountFn(slot, props);
+        }
+        editor = clearAndMount(".editor-slot", mountEditor, {
             width,
             height,
             rotation,
@@ -649,20 +663,14 @@ async function boot() {
             onSaveExisting: onSaveWithRefresh(updateTextSlide),
             onGenerateBackground: onSaveWithRefresh(generateBackground),
         });
-
-        const imageSlot = root.querySelector(".image-upload-slot");
-        imageSlot.innerHTML = "";
-        imageUploader = mountImageUploader(imageSlot, {
+        imageUploader = clearAndMount(".image-upload-slot", mountImageUploader, {
             width,
             height,
             fetchItems: listContent,
             onSave: onSaveWithRefresh(saveImage),
             onSaveExisting: onSaveWithRefresh(updateImage),
         });
-
-        const videoSlot = root.querySelector(".video-upload-slot");
-        videoSlot.innerHTML = "";
-        videoUploader = mountVideoUploader(videoSlot, {
+        videoUploader = clearAndMount(".video-upload-slot", mountVideoUploader, {
             width,
             height,
             outputMode,
@@ -670,24 +678,15 @@ async function boot() {
             onSave: onSaveWithRefresh(saveVideo),
             onSaveExisting: onSaveWithRefresh(updateVideo),
         });
-
-        // Stream slide editor — pure metadata, no canvas, so it
-        // ignores width/height (mounted here alongside the others for
-        // a consistent re-mount lifecycle).
-        const streamSlot = root.querySelector(".stream-upload-slot");
-        streamSlot.innerHTML = "";
-        streamUploader = mountStreamUploader(streamSlot, {
+        // Stream + web slide editors -- pure metadata, no canvas, so
+        // they omit width/height (mounted here alongside the others
+        // for a consistent re-mount lifecycle).
+        streamUploader = clearAndMount(".stream-upload-slot", mountStreamUploader, {
             fetchItems: listContent,
             onSave: onSaveWithRefresh(saveStream),
             onSaveExisting: onSaveWithRefresh(updateStream),
         });
-
-        // Web slide editor — pure metadata, no canvas, so it ignores
-        // width/height (mounted here alongside the others for a
-        // consistent re-mount lifecycle).
-        const webSlot = root.querySelector(".web-slide-slot");
-        webSlot.innerHTML = "";
-        webSlideEditor = mountWebSlideEditor(webSlot, {
+        webSlideEditor = clearAndMount(".web-slide-slot", mountWebSlideEditor, {
             fetchItems: listContent,
             onSave: onSaveWithRefresh(saveWeb),
             onSaveExisting: onSaveWithRefresh(updateWeb),
