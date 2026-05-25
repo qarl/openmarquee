@@ -181,59 +181,91 @@ async def get_wifi_station_state() -> dict[str, Any]:
 
 @router.get("")
 async def get_settings(storage: SettingsDep) -> dict[str, Any]:
-    """Load current settings, applying first-run wifi prefill on the
-    very first GET when the device hasn't completed first-run setup.
+    """Load current settings (pure read; no side effects).
 
-    Prefill conditions (all must hold for the side-effect to fire):
-      - ui_first_run_seen is False (haven't completed first-run yet)
-      - wifi_station_ssid is empty (no operator-set creds yet)
-      - read_system_wifi() returns non-None (Pi has an active wifi
-        connection AND we can read its creds from
-        /etc/wpa_supplicant/wpa_supplicant.conf or the /var fallback)
-
-    On match, the settings are mutated + persisted with wifi_station_
-    enabled=true, ssid, and password populated. Subsequent GETs see
-    the saved values (idempotent — read_system_wifi only fires when
-    the SSID field is empty). The first-run UI then renders the
-    welcome form with wifi pre-populated; the operator can override
-    or accept and tap "Make it mine".
+    Bundle C item 1 (2026-05-25): the first-run wifi prefill side-
+    effect that used to live here is now an explicit opt-in via
+    `POST /api/settings/wifi-prefill`. The threat: a pre-shipment
+    attacker between device-power-on and the operator's home-WiFi
+    handshake could set a captive-portal password, then GET
+    /api/settings to harvest the operator's home PSK that the Pi
+    had already persisted from /etc/wpa_supplicant/wpa_supplicant.
+    conf. Making the prefill explicit (the operator must call POST)
+    closes that window.
     """
     settings = storage.load()
-    if not settings.ui_first_run_seen and not (settings.wifi_station_ssid or "").strip():
-        # Batch 6.2: read_system_wifi spawns iwgetid (up to 2s) and
-        # reads /etc/wpa_supplicant -- both blocking. Offload to a
-        # worker thread so the first-run GET doesn't stall the loop
-        # for any concurrent /api/playback/state poll.
-        creds = await asyncio.to_thread(read_system_wifi)
-        if creds is not None:
-            ssid, psk = creds
-            try:
-                # Build a copy with the wifi fields populated. Pydantic
-                # validates the new values against the same constraints
-                # as a PUT — invalid creds (somehow) raise ValidationError
-                # and we fall through with original settings.
-                updated = settings.model_copy(
-                    update={
-                        "wifi_station_enabled": True,
-                        "wifi_station_ssid": ssid,
-                        "wifi_station_password": psk,
-                    }
-                )
-                # Round-trip through the storage validator so any
-                # field-level rules (length, charset) get enforced
-                # before we persist.
-                SystemSettings.model_validate(updated.model_dump())
-                storage.save(updated)
-                settings = updated
-                log.info(
-                    "first-run: pre-filled wifi creds for SSID %r from system wpa_supplicant.conf",
-                    ssid,
-                )
-            except Exception:
-                log.exception(
-                    "first-run: wifi prefill failed validation; leaving settings untouched",
-                )
     return _redact_secrets(settings.model_dump())
+
+
+@router.post("/wifi-prefill")
+async def post_wifi_prefill(storage: SettingsDep) -> dict[str, Any]:
+    """Pull the operator's saved home-WiFi creds from
+    /etc/wpa_supplicant/wpa_supplicant.conf into settings.
+
+    Explicit replacement for the prior `GET /api/settings` side-
+    effect (Bundle C item 1, 2026-05-25). Auth: inherits the
+    middleware's bearer-token gate via the `/api/settings/*` path
+    (NOT whitelisted in auth_middleware.py). The operator must
+    deliberately call this; passive harvesting is closed.
+
+    Responses:
+      - 200 + {"prefilled": true, "wifi_station_ssid": "..."} on
+        success. Password is NOT echoed -- this endpoint persists
+        it but never returns it on the wire.
+      - 404 if `read_system_wifi()` returns None (no readable
+        wpa_supplicant.conf, no active connection, or unrecognized
+        format).
+      - 409 if `wifi_station_ssid` is already set -- don't clobber
+        operator-configured values.
+      - 422 if the prefilled values fail SystemSettings validation
+        (charset / length / etc).
+    """
+    settings = storage.load()
+    if (settings.wifi_station_ssid or "").strip():
+        raise HTTPException(
+            status_code=409,
+            detail="wifi_station_ssid is already configured; refusing to clobber",
+        )
+    # Batch 6.2: read_system_wifi spawns iwgetid (up to 2s) and
+    # reads /etc/wpa_supplicant -- both blocking. Offload to a
+    # worker thread so the POST doesn't stall the event loop for
+    # any concurrent /api/playback/state poll.
+    creds = await asyncio.to_thread(read_system_wifi)
+    if creds is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no saved wifi credentials found on the device",
+        )
+    ssid, psk = creds
+    try:
+        updated = settings.model_copy(
+            update={
+                "wifi_station_enabled": True,
+                "wifi_station_ssid": ssid,
+                "wifi_station_password": psk,
+            }
+        )
+        # Round-trip through the validator so field-level rules
+        # (length, charset) get enforced before we persist.
+        SystemSettings.model_validate(updated.model_dump())
+    except Exception as exc:
+        log.exception(
+            "wifi-prefill: validation failed for SSID %r; leaving settings untouched",
+            ssid,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="prefilled credentials failed validation",
+        ) from exc
+    storage.save(updated)
+    log.info(
+        "wifi-prefill: applied SSID %r from system wpa_supplicant.conf",
+        ssid,
+    )
+    # Password deliberately NOT in the response -- caller doesn't
+    # need it back, and not echoing keeps it out of any caller-side
+    # log / network trace.
+    return {"prefilled": True, "wifi_station_ssid": ssid}
 
 
 # 20.4: PUT accepts a raw dict so we can substitute the redaction

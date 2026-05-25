@@ -263,17 +263,58 @@ def test_put_dim_change_with_no_text_slides_is_a_clean_noop(
     assert response.status_code == 200
 
 
-# --- first-run wifi prefill ---
+# --- Bundle C item 1 (2026-05-25): wifi-prefill is now explicit POST ---
+#
+# Per qa/reports/2026-05-25/low-security-scope-2026-05-25.md item 1:
+# the prior `GET /api/settings` side-effect that auto-prefilled
+# wifi_station_ssid+password from /etc/wpa_supplicant/wpa_supplicant.
+# conf gave a pre-shipment attacker a passive harvesting path. The
+# fix moves prefill to `POST /api/settings/wifi-prefill` so the
+# operator must explicitly opt in. The 4 prior GET-side-effect
+# tests are obsolete (vacuously true since GET no longer prefills);
+# replaced by the 5 tests below covering the new POST surface +
+# the GET-purity regression-lock.
 
 
-def test_get_prefills_wifi_on_first_run_when_system_creds_available(
-    client: TestClient, storage: SettingsStorage, monkeypatch
-):
-    """First GET on a fresh device with ui_first_run_seen=False AND
-    no operator wifi creds yet AND a readable system wpa_supplicant.
-    conf with active connection → the response carries the prefilled
-    SSID/password and the persisted settings have wifi_station_enabled
-    flipped to True."""
+def test_get_is_pure_read_no_side_effect_on_wifi_prefill(client: TestClient, monkeypatch):
+    """Bundle C item 1: GET must NOT call read_system_wifi (the
+    side-effect that used to live in the GET handler is moved to
+    POST /api/settings/wifi-prefill). Regression-lock via a
+    monkeypatched read_system_wifi that flips a counter -- if a
+    future refactor accidentally restores the side-effect, the
+    counter trips."""
+    import openmarquee.api_settings as api_settings_mod
+
+    call_count = {"n": 0}
+
+    def _counting_read():
+        call_count["n"] += 1
+        return ("ShouldNotBeCalled", "shouldnotpass")
+
+    monkeypatch.setattr(api_settings_mod, "read_system_wifi", _counting_read)
+
+    # Two GETs -- catches both "first GET prefills" and "every GET
+    # re-reads" regressions in one shot.
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+    response = client.get("/api/settings")
+    assert response.status_code == 200
+
+    assert call_count["n"] == 0, (
+        "GET /api/settings called read_system_wifi -- the Bundle C "
+        "item 1 fix has regressed; prefill must be POST-only now."
+    )
+    # And the wifi_station fields stayed empty (the side-effect would
+    # have populated them with "ShouldNotBeCalled").
+    body = response.json()
+    assert body["wifi_station_enabled"] is False
+    assert body["wifi_station_ssid"] is None or body["wifi_station_ssid"] == ""
+
+
+def test_post_wifi_prefill_happy_path(client: TestClient, storage: SettingsStorage, monkeypatch):
+    """Operator explicitly calls POST /api/settings/wifi-prefill;
+    backend reads wpa_supplicant.conf, persists the SSID +
+    password, returns the SSID (but NOT the password) on the wire."""
     import openmarquee.api_settings as api_settings_mod
 
     monkeypatch.setattr(
@@ -282,76 +323,31 @@ def test_get_prefills_wifi_on_first_run_when_system_creds_available(
         lambda: ("MyHomeWifi", "abcdefgh"),
     )
 
-    response = client.get("/api/settings")
+    response = client.post("/api/settings/wifi-prefill")
     assert response.status_code == 200
     body = response.json()
-    assert body["wifi_station_enabled"] is True
-    assert body["wifi_station_ssid"] == "MyHomeWifi"
-    # Batch 20.4: secret redaction on GET. The PSK was prefilled but
-    # the wire shape returns the sentinel; the actual value lives on
-    # disk for hostapd / wpa_supplicant rewrites.
-    assert body["wifi_station_password"] == "<set>"
+    assert body == {"prefilled": True, "wifi_station_ssid": "MyHomeWifi"}
+    # Password deliberately NOT echoed -- the operator already has
+    # it (it lives on their Pi); the response only confirms what
+    # got persisted.
+    assert "wifi_station_password" not in body
+    assert "abcdefgh" not in response.text
 
-    # Persisted: subsequent GET (even if read_system_wifi later returns
-    # different creds) returns the saved values.
-    monkeypatch.setattr(
-        api_settings_mod,
-        "read_system_wifi",
-        lambda: ("DifferentNet", "differentpass"),
-    )
-    response = client.get("/api/settings")
-    body = response.json()
-    assert body["wifi_station_ssid"] == "MyHomeWifi"  # persisted, not re-prefilled
+    # Persisted on disk so a follow-up GET sees the new state.
+    persisted = storage.load()
+    assert persisted.wifi_station_enabled is True
+    assert persisted.wifi_station_ssid == "MyHomeWifi"
+    assert persisted.wifi_station_password == "abcdefgh"
 
 
-def test_get_does_not_prefill_when_system_creds_unavailable(
-    client: TestClient, storage: SettingsStorage, monkeypatch
+def test_post_wifi_prefill_returns_409_when_ssid_already_configured(
+    client: TestClient, monkeypatch
 ):
-    """No active connection / unreadable conf / etc. → read_system_wifi
-    returns None → settings come back unchanged with empty wifi fields."""
-    import openmarquee.api_settings as api_settings_mod
-
-    monkeypatch.setattr(api_settings_mod, "read_system_wifi", lambda: None)
-
-    response = client.get("/api/settings")
-    assert response.status_code == 200
-    body = response.json()
-    assert body["wifi_station_enabled"] is False
-    assert body["wifi_station_ssid"] is None or body["wifi_station_ssid"] == ""
-
-
-def test_get_does_not_prefill_after_first_run_completed(
-    client: TestClient, storage: SettingsStorage, monkeypatch
-):
-    """Once ui_first_run_seen flips to True, prefill must not fire —
-    even if read_system_wifi has fresh creds. The operator owns the
-    field after first-run."""
-    # Persist ui_first_run_seen=True via a PUT first.
-    response = client.put(
-        "/api/settings",
-        json={"ui_first_run_seen": True},
-    )
-    assert response.status_code == 200
-
-    import openmarquee.api_settings as api_settings_mod
-
-    monkeypatch.setattr(
-        api_settings_mod,
-        "read_system_wifi",
-        lambda: ("ShouldNotPrefill", "shouldnotpass"),
-    )
-
-    response = client.get("/api/settings")
-    body = response.json()
-    assert body["wifi_station_ssid"] is None or body["wifi_station_ssid"] == ""
-    assert body["wifi_station_enabled"] is False
-
-
-def test_get_does_not_prefill_when_operator_already_set_ssid(
-    client: TestClient, storage: SettingsStorage, monkeypatch
-):
-    """If the operator pre-filled the SSID some other way (manual
-    edit, prior GUI), don't clobber it — even on first run."""
+    """If the operator already set wifi_station_ssid (manually OR via
+    a prior prefill), the POST refuses to clobber + returns 409.
+    Closes the "rerun the prefill after operator has manually edited"
+    foot-gun."""
+    # Pre-populate via PUT.
     response = client.put(
         "/api/settings",
         json={
@@ -364,15 +360,60 @@ def test_get_does_not_prefill_when_operator_already_set_ssid(
 
     import openmarquee.api_settings as api_settings_mod
 
-    monkeypatch.setattr(
-        api_settings_mod,
-        "read_system_wifi",
-        lambda: ("SystemNet", "systempass"),
+    # Even if read_system_wifi has fresh creds, the 409 fires before
+    # the read (the read shouldn't even happen since the SSID-already-
+    # set check is first).
+    call_count = {"n": 0}
+
+    def _counting_read():
+        call_count["n"] += 1
+        return ("SystemNet", "systempass")
+
+    monkeypatch.setattr(api_settings_mod, "read_system_wifi", _counting_read)
+
+    response = client.post("/api/settings/wifi-prefill")
+    assert response.status_code == 409
+    assert "already configured" in response.json()["detail"].lower()
+    assert call_count["n"] == 0, (
+        "POST should short-circuit on ssid-already-set BEFORE touching "
+        "read_system_wifi (avoids unnecessary iwgetid + file IO)."
     )
 
-    response = client.get("/api/settings")
-    body = response.json()
-    assert body["wifi_station_ssid"] == "OperatorChose"
+
+def test_post_wifi_prefill_returns_404_when_no_system_creds(client: TestClient, monkeypatch):
+    """No active wifi connection / unreadable wpa_supplicant.conf /
+    unrecognized format → read_system_wifi returns None → 404."""
+    import openmarquee.api_settings as api_settings_mod
+
+    monkeypatch.setattr(api_settings_mod, "read_system_wifi", lambda: None)
+
+    response = client.post("/api/settings/wifi-prefill")
+    assert response.status_code == 404
+    assert "no saved wifi" in response.json()["detail"].lower()
+
+
+def test_post_wifi_prefill_requires_bearer_token(auth_client: TestClient, monkeypatch):
+    """The endpoint inherits the AuthMiddleware bearer-token gate via
+    `/api/settings/*` (NOT in the whitelist). Without a bearer header,
+    the middleware returns 401 BEFORE our handler runs. Lock this
+    contract so a future whitelist edit that accidentally exempts
+    /api/settings/wifi-prefill would trip here."""
+    import openmarquee.api_settings as api_settings_mod
+
+    # If the middleware ever DID let the call through, read_system_wifi
+    # would run + this counter would flag the breach.
+    call_count = {"n": 0}
+
+    def _counting_read():
+        call_count["n"] += 1
+        return ("LeakedNet", "leakedpass")
+
+    monkeypatch.setattr(api_settings_mod, "read_system_wifi", _counting_read)
+
+    response = auth_client.post("/api/settings/wifi-prefill")
+    # No Authorization header -> middleware rejects.
+    assert response.status_code == 401
+    assert call_count["n"] == 0
 
 
 # --- Batch 20.4: secret redaction + PATCH endpoints ---
