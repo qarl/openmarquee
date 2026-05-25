@@ -21,12 +21,37 @@ from __future__ import annotations
 
 import contextlib
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 # Owner-only read+write. World-readable would expose the AP
 # password / station password / Tailscale auth key in
 # openmarquee-settings.json on disk.
 DEFAULT_MODE = 0o600
+
+
+def _atomic_write(
+    path: Path,
+    writer: Callable[[Path], None],
+    *,
+    mode: int,
+) -> None:
+    """Shared write-then-rename ladder for atomic_write_text +
+    atomic_write_bytes. `writer(tmp)` does the payload-shaped write
+    (text vs bytes); this function owns tmp naming, chmod, rename,
+    and cleanup-on-failure. Keeping all three behaviors in one place
+    means any future storage class that wraps these helpers inherits
+    the same discipline -- and a future hardening pass only has one
+    site to touch."""
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        writer(tmp)
+        os.chmod(tmp, mode)
+        tmp.replace(path)
+    except Exception:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
 
 
 def atomic_write_text(
@@ -39,15 +64,7 @@ def atomic_write_text(
     on rename failure; sets the target file mode (default 0600)
     before the replace so the brief window when the file exists
     under its final name is never wider-than-intended."""
-    tmp = path.with_name(path.name + ".tmp")
-    try:
-        tmp.write_text(text, encoding="utf-8")
-        os.chmod(tmp, mode)
-        tmp.replace(path)
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-        raise
+    _atomic_write(path, lambda tmp: tmp.write_text(text, encoding="utf-8"), mode=mode)
 
 
 def atomic_write_bytes(
@@ -59,12 +76,4 @@ def atomic_write_bytes(
     """Same shape as atomic_write_text, for binary payloads
     (PNG / MP4 asset bytes). Default 0600 still applies -- the
     on-device venv user is the only consumer."""
-    tmp = path.with_name(path.name + ".tmp")
-    try:
-        tmp.write_bytes(data)
-        os.chmod(tmp, mode)
-        tmp.replace(path)
-    except Exception:
-        with contextlib.suppress(FileNotFoundError):
-            tmp.unlink()
-        raise
+    _atomic_write(path, lambda tmp: tmp.write_bytes(data), mode=mode)
