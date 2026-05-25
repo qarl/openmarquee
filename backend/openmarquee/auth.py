@@ -34,6 +34,7 @@ import json
 import logging
 import secrets
 import time
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -229,7 +230,16 @@ def mint_token(state: AuthState) -> tuple[str, AuthState]:
 # change_password() so a token-version bump can't leave a stale
 # "previously verified" entry behind. On process restart the dict is
 # empty -- everyone re-verifies once, acceptable.
-_VERIFIED_TOKEN_CACHE: dict[str, float] = {}
+#
+# Round-10 DiD: capped at _VERIFIED_TOKEN_CACHE_CAP via OrderedDict
+# LRU eviction. Bounds the blast radius of any future cache-key-
+# mangling attack (the closed canonical-int issue in round 10 was
+# one such mangling vector; capacity-bounded cache is defense-in-
+# depth against future analogues). Cache HIT moves the entry to the
+# tail (most-recent); cache INSERT at cap evicts the head (least-
+# recent) before adding. Both are O(1) on OrderedDict.
+_VERIFIED_TOKEN_CACHE: OrderedDict[str, float] = OrderedDict()
+_VERIFIED_TOKEN_CACHE_CAP = 1024
 _VERIFIED_TOKEN_TTL_SECONDS = 10 * 60  # 10 min
 
 
@@ -284,6 +294,18 @@ async def verify_token(token: str, state: AuthState | None) -> bool:
         version = int(version_str)
     except ValueError:
         return False
+    # Round-10 security DiD: reject non-canonical version prefixes.
+    # int("+1") / int("01") / int("1_0") / int(" 1 ") / int("٠١")
+    # all parse to the same integer but produce distinct cache keys
+    # (cache is keyed on the full token string). Pre-fix, an attacker
+    # holding ONE valid token could send sustained requests varying
+    # only the version prefix, inflating _VERIFIED_TOKEN_CACHE
+    # unboundedly until the 512MB Pi Zero 2 W OOMs. mint_token emits
+    # `f"{state.token_version}.{secret}"` which always produces the
+    # canonical decimal str of an int (no leading zeros, no sign, no
+    # underscores), so this reject can't break a legitimate token.
+    if version_str != str(version):
+        return False
     # Secret part must be 43 chars (token_urlsafe(32) -> 43-char b64).
     if len(secret) != 43:
         return False
@@ -301,6 +323,9 @@ async def verify_token(token: str, state: AuthState | None) -> bool:
     cached_expiry = _VERIFIED_TOKEN_CACHE.get(token)
     if cached_expiry is not None:
         if cached_expiry >= now:
+            # LRU touch: a fresh hit moves the entry to the tail so
+            # eviction targets the truly-stalest entry next.
+            _VERIFIED_TOKEN_CACHE.move_to_end(token)
             return True
         # Expired -- drop it lazily so the dict doesn't grow forever.
         _VERIFIED_TOKEN_CACHE.pop(token, None)
@@ -322,6 +347,11 @@ async def verify_token(token: str, state: AuthState | None) -> bool:
         # means a bool-returning shim somewhere. Defensive: treat as
         # mismatch.
         return False
+    # LRU insert: at-capacity bump evicts the oldest entry before
+    # adding the new one. Caps the dict's growth at _CAP entries
+    # regardless of input pressure.
+    if len(_VERIFIED_TOKEN_CACHE) >= _VERIFIED_TOKEN_CACHE_CAP:
+        _VERIFIED_TOKEN_CACHE.popitem(last=False)
     _VERIFIED_TOKEN_CACHE[token] = now + _VERIFIED_TOKEN_TTL_SECONDS
     return True
 

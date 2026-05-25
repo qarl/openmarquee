@@ -204,6 +204,156 @@ async def test_verify_token_rejects_when_no_hash_persisted_yet():
 
 
 @pytest.mark.asyncio
+async def test_verify_token_rejects_noncanonical_version_prefix():
+    """Round-10 security DiD: int() accepts '+1', '01', '001', '1_0',
+    ' 1 ', '٠١' (Arabic-Indic), etc. -- all decode to the same int.
+    Pre-fix, each non-canonical prefix populated its own cache entry
+    after argon2-verifying. Attacker with a leaked valid token could
+    sustain requests varying ONLY the version prefix and inflate
+    _VERIFIED_TOKEN_CACHE unboundedly until OOM. mint_token emits
+    canonical decimal str of an int via f-string, so legitimate tokens
+    are never non-canonical.
+    """
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    state = AuthState(password_hash=hash_password("pw"), token_version=3)
+    real_token, updated = mint_token(state)
+    _, real_secret = real_token.split(".", 1)
+    # Canonical form first: this MUST verify (sanity baseline that the
+    # rejection isn't over-zealous).
+    assert await verify_token(real_token, updated) is True
+    # Each of these is a different STRING but int() of the version
+    # prefix decodes to 3. Pre-fix all would have argon2-verified +
+    # cached. Post-fix they all reject at the canonical-form check
+    # before reaching argon2.
+    noncanonical_forms = [
+        f"+3.{real_secret}",  # leading + sign
+        f"03.{real_secret}",  # leading zero (2-char)
+        f"003.{real_secret}",  # leading zeros (3-char)
+        f"0003.{real_secret}",
+        f"1_3.{real_secret}",  # underscore separator (Python 3 int literal)
+        f" 3.{real_secret}",  # leading whitespace
+        f"3 .{real_secret}",  # trailing whitespace in version part
+        f"\t3.{real_secret}",  # tab prefix
+        f"٠٠٣.{real_secret}",  # Arabic-Indic 003 -- isdigit() True but
+        # str(int(...)) != original
+    ]
+    for bad in noncanonical_forms:
+        assert await verify_token(bad, updated) is False, (
+            f"non-canonical version prefix must reject: {bad!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_verify_token_cache_capped_at_lru_limit():
+    """Round-10 security DiD: cache is bounded by _VERIFIED_TOKEN_CACHE_CAP
+    via OrderedDict LRU eviction. Even if an attacker found a NEW
+    cache-key-mangling vector, the dict can't exceed the cap.
+
+    Test: monkeypatch the cap to a small number, fill with distinct
+    tokens (forcing distinct argon2-verify-then-insert paths), assert
+    the dict stays at the cap AND the oldest entries are evicted.
+    """
+    from openmarquee import auth as auth_module
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    original_cap = auth_module._VERIFIED_TOKEN_CACHE_CAP
+    auth_module._VERIFIED_TOKEN_CACHE_CAP = 4
+    try:
+        state = AuthState(password_hash=hash_password("pw"), token_version=1)
+        # Mint once to get a real issued_token_hash; monkeypatch
+        # _argon2_verify_secret to always-True so we can stuff distinct
+        # tokens without 43 real argon2 verifies (~10s on Mac).
+        _, updated = mint_token(state)
+
+        def always_true(_h, _s):
+            return True
+
+        original_verify = auth_module._argon2_verify_secret
+        auth_module._argon2_verify_secret = always_true
+        try:
+            # Insert cap + 3 distinct tokens. token_version is 1 for
+            # all (real auth would reject the version mismatch since
+            # there's only one valid secret, but our monkeypatched
+            # verify is unconditional -- the test is about the cache
+            # accounting, not the verify logic).
+            tokens = [f"1.{chr(ord('a') + i)}{'b' * 42}" for i in range(7)]
+            for t in tokens:
+                assert await verify_token(t, updated) is True
+            # Cap holds: never exceeds 4 regardless of input volume.
+            assert len(auth_module._VERIFIED_TOKEN_CACHE) == 4
+            # Oldest 3 evicted (LRU: insertion order = access order
+            # since each was a fresh insert with no re-touch).
+            for evicted in tokens[:3]:
+                assert evicted not in auth_module._VERIFIED_TOKEN_CACHE, (
+                    f"oldest entry should have been LRU-evicted: {evicted!r}"
+                )
+            # Most-recent 4 retained.
+            for retained in tokens[3:]:
+                assert retained in auth_module._VERIFIED_TOKEN_CACHE, (
+                    f"recent entry should be cached: {retained!r}"
+                )
+        finally:
+            auth_module._argon2_verify_secret = original_verify
+    finally:
+        auth_module._VERIFIED_TOKEN_CACHE_CAP = original_cap
+        clear_verified_token_cache()
+
+
+@pytest.mark.asyncio
+async def test_verify_token_cache_hit_moves_entry_to_recent():
+    """Round-10 security DiD: cache HIT must move_to_end so eviction
+    targets the truly-stalest entry, not the most-touched. Without
+    this LRU touch, a hot token would be evicted first when newer
+    cold tokens stream in.
+    """
+    from openmarquee import auth as auth_module
+    from openmarquee.auth import clear_verified_token_cache
+
+    clear_verified_token_cache()
+    original_cap = auth_module._VERIFIED_TOKEN_CACHE_CAP
+    auth_module._VERIFIED_TOKEN_CACHE_CAP = 3
+    try:
+        state = AuthState(password_hash=hash_password("pw"), token_version=1)
+        _, updated = mint_token(state)
+
+        def always_true(_h, _s):
+            return True
+
+        original_verify = auth_module._argon2_verify_secret
+        auth_module._argon2_verify_secret = always_true
+        try:
+            t1 = f"1.{'a' + 'b' * 42}"
+            t2 = f"1.{'c' + 'b' * 42}"
+            t3 = f"1.{'d' + 'b' * 42}"
+            t4 = f"1.{'e' + 'b' * 42}"
+            assert await verify_token(t1, updated) is True
+            assert await verify_token(t2, updated) is True
+            assert await verify_token(t3, updated) is True
+            # Touch t1 (the original oldest) — move-to-end should
+            # shift the cold-end from t1 to t2.
+            assert await verify_token(t1, updated) is True
+            # Now insert t4 at capacity: t2 (post-touch coldest) must
+            # evict, NOT t1 (which is now the most-recent).
+            assert await verify_token(t4, updated) is True
+            assert t1 in auth_module._VERIFIED_TOKEN_CACHE, (
+                "re-touched t1 must NOT be evicted (LRU bug if it is)"
+            )
+            assert t2 not in auth_module._VERIFIED_TOKEN_CACHE, (
+                "coldest-after-touch t2 must be evicted"
+            )
+            assert t3 in auth_module._VERIFIED_TOKEN_CACHE
+            assert t4 in auth_module._VERIFIED_TOKEN_CACHE
+        finally:
+            auth_module._argon2_verify_secret = original_verify
+    finally:
+        auth_module._VERIFIED_TOKEN_CACHE_CAP = original_cap
+        clear_verified_token_cache()
+
+
+@pytest.mark.asyncio
 async def test_verify_token_cache_short_circuits_second_call(monkeypatch):
     """Second verify with the same token must skip argon2 (cache hit).
     Functional check via monkeypatching the _HASHER.verify call --
