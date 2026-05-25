@@ -451,6 +451,18 @@ export function mountVideoUploader(
         createNew,
         refreshBrowser: () => browser?.refresh(),
         flushAutoSave: () => autoSave.flush(),
+        // Round 18: SPA-remount teardown. clearPreview() revokes
+        // currentPreviewObjectUrl (the source-MP4 blob URL set when
+        // the operator picks a new file — tens of MB per 1080p clip).
+        // Without this, every remount left the previous blob pinned
+        // in the URL registry until tab close; ~10 swaps on a
+        // demo-prep run added up to hundreds of MB. autoSave.cancel()
+        // drops any pending debounce so a remount-mid-save doesn't
+        // fire stale.
+        destroy: () => {
+            clearPreview();
+            autoSave.cancel();
+        },
     };
 }
 
