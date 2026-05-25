@@ -846,3 +846,108 @@ def test_full_lifecycle_through_the_api(client: TestClient):
     assert len(body["peers"]) == 1
     assert body["peers"][0]["id"] == a["id"]
     assert body["peers"][0]["sync"] is True
+
+
+# --- Bundle C item 4 (2026-05-25): tailnet HostName sanitize -----------
+# Low-security-DiD per qa/reports/2026-05-25/low-security-scope-2026-05-25.md.
+# Lock _sanitize_hostname behavior against the deception vectors:
+# Unicode lookalikes, zero-width pads, length-padding for layout
+# hijack. DNSName is NOT sanitized through this -- it's tailscale's
+# authoritative identifier; the operator-deception vector is the
+# HostName field only.
+
+
+def test_sanitize_hostname_passes_ascii_unchanged():
+    """Happy path: a legitimate ASCII hostname survives unchanged.
+    Lock the no-op contract for the common case."""
+    from openmarquee.api_flock import _sanitize_hostname
+
+    assert _sanitize_hostname("openmarquee-dev") == "openmarquee-dev"
+    assert _sanitize_hostname("lobby") == "lobby"
+    assert _sanitize_hostname("sign-7") == "sign-7"
+    # Trailing dash, dots, digits all in printable-ASCII range.
+    assert _sanitize_hostname("cafe.tn-01") == "cafe.tn-01"
+
+
+def test_sanitize_hostname_strips_cyrillic_lookalike():
+    """Deception vector A: a Cyrillic `е` (U+0435) visually
+    identical to ASCII `e` (U+0065). The malicious hostname
+    `opеnmarquee-prod` displays identically to `openmarquee-prod`
+    to an operator scanning the discover list. Sanitize must strip
+    the non-ASCII codepoint so the impostor renders visibly
+    different (`opnmarquee-prod`)."""
+    from openmarquee.api_flock import _sanitize_hostname
+
+    # The `е` between `op` and `nmarquee` is Cyrillic U+0435.
+    impostor = "opеnmarquee-prod"
+    sanitized = _sanitize_hostname(impostor)
+    # The Cyrillic char is gone; remaining is pure ASCII.
+    assert sanitized == "opnmarquee-prod"
+    assert all(ord(c) < 128 for c in sanitized)
+    assert "е" not in sanitized
+
+
+def test_sanitize_hostname_strips_zero_width_pad():
+    """Deception vector B: zero-width joiners (U+200B, U+FEFF,
+    etc.) padded inside an otherwise-legitimate hostname. The
+    rendered glyph sequence looks identical to the un-padded form
+    but the actual string differs -- a malicious peer could claim
+    to be `openmarquee-prod` while not matching the operator's
+    expected exact-match against the trusted name."""
+    from openmarquee.api_flock import _sanitize_hostname
+
+    # Zero-width space (U+200B) inserted between `openmarquee` and `-prod`.
+    padded = "openmarquee​-prod"
+    assert _sanitize_hostname(padded) == "openmarquee-prod"
+    # Zero-width joiner (U+200D) variant.
+    padded_zwj = "open‍marquee"
+    assert _sanitize_hostname(padded_zwj) == "openmarquee"
+    # Byte-order mark (U+FEFF) leading -- common in copy-paste from
+    # text editors that auto-insert BOM.
+    bom_prefixed = "﻿openmarquee"
+    assert _sanitize_hostname(bom_prefixed) == "openmarquee"
+
+
+def test_sanitize_hostname_truncates_at_64():
+    """Deception vector C: a malicious peer pads with leading spaces
+    + 200 chars of payload to push the discover-tile layout out of
+    frame OR truncate adjacent UI. Cap at 64 (matching
+    FlockPeer.name's max_length) so the rendered tile size stays
+    bounded regardless of upstream HostName length."""
+    from openmarquee.api_flock import _sanitize_hostname
+
+    # 100 ASCII chars -- should land at exactly 64.
+    long_name = "a" * 100
+    assert _sanitize_hostname(long_name) == "a" * 64
+    # Exactly 64 -- passes through unchanged.
+    sixty_four = "x" * 64
+    assert _sanitize_hostname(sixty_four) == sixty_four
+    # 63 -- under threshold, unchanged.
+    sixty_three = "y" * 63
+    assert _sanitize_hostname(sixty_three) == sixty_three
+
+
+def test_sanitize_hostname_empty_string_passes_through():
+    """Defensive: an empty input shouldn't blow up. _discover_
+    tailnet_candidates filters empty hostnames out with `if not
+    hostname or not dns_name: continue` so an empty return here is
+    operationally safe."""
+    from openmarquee.api_flock import _sanitize_hostname
+
+    assert _sanitize_hostname("") == ""
+
+
+def test_sanitize_hostname_all_non_ascii_returns_empty():
+    """Edge case: a hostname composed entirely of non-printable or
+    non-ASCII codepoints returns an empty string. _discover_
+    tailnet_candidates then filters it out via the same empty-
+    string check, so a fully-malicious HostName never reaches the
+    operator's discover list at all."""
+    from openmarquee.api_flock import _sanitize_hostname
+
+    # Pure Cyrillic.
+    assert _sanitize_hostname("опен") == ""
+    # Pure control chars (U+0001-U+001F are all non-printable).
+    assert _sanitize_hostname("\x01\x02\x03") == ""
+    # Emoji.
+    assert _sanitize_hostname("\U0001f4a9\U0001f680") == ""

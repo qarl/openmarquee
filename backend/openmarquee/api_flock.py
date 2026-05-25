@@ -349,6 +349,33 @@ async def discover_tailnet_peers(storage: FlockDep) -> DiscoverResult:
     return DiscoverResult(candidates=out, source=source)
 
 
+def _sanitize_hostname(name: str) -> str:
+    """Strip non-printable + non-ASCII codepoints from a tailnet
+    HostName for display.
+
+    A malicious tailnet member can set their Tailscale HostName to a
+    Unicode lookalike (e.g. `opеnmarquee-prod` with Cyrillic `е`) or
+    pad with zero-width chars to deceive the operator's discover-
+    peers UI. We strip everything outside printable ASCII so an
+    impostor name renders visibly stripped (`opnmarquee-prod`)
+    rather than visually identical to a legitimate device.
+
+    Truncates at 64 chars to match FlockPeer.name's max_length so a
+    malicious peer can't pad with leading whitespace + 200 chars of
+    payload to push the discover-tile layout. Low-security-DiD
+    Bundle C item 4 from qa/reports/2026-05-25/.
+
+    DNSName is intentionally NOT sanitized through this -- it comes
+    from tailscale's own DNS resolution + is the authoritative
+    machine identifier; the operator-visible deception vector is
+    the HostName field only.
+    """
+    # Keep printable ASCII (0x20-0x7E); strip everything else
+    # (control chars, all non-ASCII Unicode, zero-width joiners).
+    cleaned = "".join(c for c in name if 0x20 <= ord(c) <= 0x7E)
+    return cleaned[:64]
+
+
 async def _discover_tailnet_candidates() -> tuple[list[tuple[str, str]], str]:
     """Shell out to `tailscale status --json` and parse the Peer
     table. Returns (list_of_(hostname, address), source). Source is
@@ -399,7 +426,12 @@ async def _discover_tailnet_candidates() -> tuple[list[tuple[str, str]], str]:
             continue
         if not peer.get("Online"):
             continue
-        hostname = (peer.get("HostName") or "").strip()
+        # _sanitize_hostname strips non-printable + non-ASCII so a
+        # malicious tailnet member can't deceive the operator via
+        # Unicode lookalikes (Bundle C item 4). DNSName stays raw --
+        # it's tailscale's authoritative identifier, not deception-
+        # prone.
+        hostname = _sanitize_hostname((peer.get("HostName") or "").strip())
         dns_name = (peer.get("DNSName") or "").strip().rstrip(".")
         if not hostname or not dns_name:
             continue

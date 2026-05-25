@@ -2224,6 +2224,20 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     gap: 0.5rem;
 }
 
+/* Bundle C item 4 (2026-05-25): backend _sanitize_hostname is the
+   primary defense against malicious tailnet HostName padding;
+   this CSS is defense-in-depth -- bounds the rendered hostname
+   width + ellipsis-truncates so even a 64-char ASCII name (the
+   post-sanitize max) can't push the modal layout out of frame. */
+.flock-discover-pick b {
+    display: inline-block;
+    max-width: 30em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: bottom;
+}
+
 
 /* ═══════════════════════════════════════════════════════════════════
    NEW DESIGN SYSTEM — om-* prefix
