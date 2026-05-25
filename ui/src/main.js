@@ -179,6 +179,44 @@ async function fetchResolvedPlaylist(playlistId) {
     return { items: resolved };
 }
 
+// Topbar breadcrumb. The `slides/*` keys live here on purpose: we
+// read the *raw* hash (not the nav-resolved section), so deep-link
+// URLs like `#/slides/image` produce a tab-specific breadcrumb even
+// though they resolve to the parent `slides` section in nav.js.
+//
+// Module-scope (was boot()-closure-scope) to unblock unit-test
+// access -- target #7 slice 1 from the main.js survey (680cd55).
+export const SECTION_TITLES = {
+    slides: "Slides",
+    "slides/text": "Text slides",
+    "slides/image": "Image slides",
+    "slides/video": "Video slides",
+    "slides/stream": "Streams",
+    "slides/web": "Web slides",
+    playlists: "Playlists",
+    live: "Live",
+    flock: "Flock",
+    schedule: "Schedule",
+    settings: "Settings",
+};
+
+// Reads the current window.location.hash + paints the matching
+// SECTION_TITLES entry into [data-section-title]. Unknown / empty
+// hashes fall back to the "Slides" title. Defensive no-op when the
+// slot isn't in the DOM (early boot before chrome mounts, tests
+// that don't include a slot, etc.).
+//
+// Closure-capture footprint pre-extraction: ZERO. The function used
+// only global `document` + global `window.location.hash` + the
+// now-module-scope SECTION_TITLES constant. Moving to module scope
+// is structurally transparent.
+export function refreshSectionTitle() {
+    const slot = document.querySelector("[data-section-title]");
+    if (!slot) return;
+    const hash = (window.location.hash || "").replace(/^#\/?/, "");
+    slot.textContent = SECTION_TITLES[hash] || SECTION_TITLES.slides;
+}
+
 async function boot() {
     const root = document.getElementById("app");
 
@@ -873,30 +911,9 @@ async function boot() {
 
     // Topbar breadcrumb: read the current route and convert to a label.
     // Updates on every hashchange via the existing nav so the title
-    // tracks what the operator is looking at.
-    // The `slides/*` keys still live here on purpose: we read the *raw*
-    // hash (not the nav-resolved section), so deep-link URLs like
-    // `#/slides/image` produce a tab-specific breadcrumb even though
-    // they resolve to the parent `slides` section in nav.js.
-    const SECTION_TITLES = {
-        slides: "Slides",
-        "slides/text": "Text slides",
-        "slides/image": "Image slides",
-        "slides/video": "Video slides",
-        "slides/stream": "Streams",
-        "slides/web": "Web slides",
-        playlists: "Playlists",
-        live: "Live",
-        flock: "Flock",
-        schedule: "Schedule",
-        settings: "Settings",
-    };
-    function refreshSectionTitle() {
-        const slot = document.querySelector("[data-section-title]");
-        if (!slot) return;
-        const hash = (window.location.hash || "").replace(/^#\/?/, "");
-        slot.textContent = SECTION_TITLES[hash] || SECTION_TITLES.slides;
-    }
+    // tracks what the operator is looking at. The function +
+    // SECTION_TITLES table live at module scope (above) -- closure-
+    // capture footprint was zero, so the extraction is transparent.
     window.addEventListener("hashchange", refreshSectionTitle);
     refreshSectionTitle();
 
