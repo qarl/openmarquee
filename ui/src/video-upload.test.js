@@ -146,6 +146,40 @@ describe("mountVideoUploader", () => {
         expect(onSave).not.toHaveBeenCalled();
     });
 
+    it("exposes a destroy() that's callable + idempotent (regression-lock for SPA-remount teardown)", async () => {
+        // Round-18 regression-lock: SPA remount (settings change
+        // re-derives width/height → all editors re-mount) used to
+        // orphan video-upload's currentPreviewObjectUrl blob (tens of
+        // MB per 1080p clip), pinning it in the URL registry until
+        // tab close. The fix: mountVideoUploader exposes destroy(),
+        // and main.js calls `videoUploader?.destroy?.()` before
+        // remount.
+        //
+        // Driving the full transcode pipeline (so
+        // currentPreviewObjectUrl is populated and destroy actually
+        // has something to revoke) isn't reachable in jsdom (no
+        // ffmpeg.wasm + no real Blob URL registry — jsdom's URL
+        // lacks createObjectURL / revokeObjectURL). This test locks
+        // the contract instead: destroy exists, is callable, is
+        // idempotent, doesn't throw on a fresh-mount where no blob
+        // URL is held. Production happy path is exercised by the
+        // setPreviewSrc(null, false) wrapper which has existed since
+        // the file was written and is implicitly covered by every
+        // other test that drives loadForEdit + autoSave.
+        const container = document.createElement("div");
+        const handle = mountVideoUploader(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+        });
+        await tick();
+
+        expect(typeof handle.destroy).toBe("function");
+        expect(() => handle.destroy()).not.toThrow();
+        // Idempotent: destroy-after-destroy is safe.
+        expect(() => handle.destroy()).not.toThrow();
+    });
+
     it("isStale guard prevents canvas-poison + stale preview when operator switches slide mid-load", async () => {
         // Round-17 regression-lock for the slide-switch race:
         // operator clicks A (slow load), then B; A's image onload

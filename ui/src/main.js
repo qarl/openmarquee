@@ -670,6 +670,13 @@ async function boot() {
             onSave: onSaveWithRefresh(saveImage),
             onSaveExisting: onSaveWithRefresh(updateImage),
         });
+        // Round 18: revoke the prior videoUploader's preview blob URL
+        // before remount — without this, the source-MP4 blob (tens of
+        // MB for a 1080p clip) stayed pinned in the URL registry until
+        // tab close. Other uploaders don't hold long-lived blob URLs
+        // (image-upload's are scoped to drawImageToCanvas + revoked in
+        // its finally / onerror) so destroy() exists only here today.
+        videoUploader?.destroy?.();
         videoUploader = clearAndMount(".video-upload-slot", mountVideoUploader, {
             width,
             height,
