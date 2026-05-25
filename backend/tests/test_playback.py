@@ -1392,3 +1392,114 @@ async def test_wait_propagates_cancellation(renderer):
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
+
+
+@pytest.mark.asyncio
+async def test_begin_transition_unsupported_slide_blames_next_not_current(renderer, caplog):
+    """Round-23 correctness regression: when the Rust sidecar raises
+    RustRendererUnsupportedSlideError from begin_transition (because
+    the NEXT slide is a kind it can't paint), pre-fix the error
+    escaped to _loop's broad except which:
+      - logged ERROR naming the CURRENT slide (which played fine)
+      - added the CURRENT slide id to _failed_slide_ids throttle set
+      - throttled later real failures of the (innocent) current slide
+
+    The throttle set pollution is the worst part -- a later actual
+    failure on the current slide drops to DEBUG and is invisible in
+    the journal.
+
+    Post-fix: blame next_item.id, throttle next_item.id in
+    _skipped_slide_ids (NOT _failed_slide_ids), log INFO not ERROR
+    (this isn't a current-slide failure), return True so the current
+    slide completes cleanly.
+
+    Test: 2-slide playlist with current set to fade-transition into
+    next; monkeypatch renderer.begin_transition to raise
+    UnsupportedSlide when called with next.id. Run loop long enough
+    to fire begin_transition. Assert:
+      - next.id is in loop._skipped_slide_ids
+      - current.id is NOT in loop._failed_slide_ids (innocent)
+      - log line names next.id (not current.id)
+    """
+    import logging
+
+    from openmarquee.rendering.rust_renderer import (
+        RustRendererUnsupportedSlideError,
+    )
+
+    current_slide, current_png = _make_slide("current-A", (10, 20, 30))
+    next_slide, next_png = _make_slide("next-B-unsupported", (40, 50, 60))
+    # Force current to fade-transition into next so begin_transition
+    # actually fires. Short duration_ms so the transition is reached
+    # quickly within the test's sleep budget.
+    current_slide = current_slide.model_copy(
+        update={
+            "transition": "fade",
+            "transition_ms": 200,
+            "duration_ms": 100,
+        }
+    )
+    assets = {current_slide.id: current_png, next_slide.id: next_png}
+
+    original_begin_transition = renderer.begin_transition
+
+    def patched_begin_transition(to_slide_id, to_duration_ms, kind, transition_ms, t0_ms):
+        if to_slide_id == next_slide.id:
+            raise RustRendererUnsupportedSlideError(
+                "simulated: next slide kind unsupported by sidecar"
+            )
+        return original_begin_transition(to_slide_id, to_duration_ms, kind, transition_ms, t0_ms)
+
+    renderer.begin_transition = patched_begin_transition  # type: ignore[method-assign]
+
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [current_slide, next_slide],
+        read_asset=lambda i: assets[i],
+    )
+
+    with caplog.at_level(logging.INFO, logger="openmarquee.playback"):
+        await loop.start()
+        # current plays (100ms), then begin_transition for next fires
+        # and raises. Allow a generous budget for the loop to hit that
+        # path at least once.
+        await asyncio.sleep(0.5)
+        await loop.stop()
+
+    # CRITICAL ASSERTION 1: next_slide.id was added to the
+    # _skipped_slide_ids throttle set (not _failed_slide_ids).
+    assert next_slide.id in loop._skipped_slide_ids, (
+        f"next slide id must be added to _skipped_slide_ids "
+        f"(skipped-kind throttle); got skipped={loop._skipped_slide_ids}"
+    )
+
+    # CRITICAL ASSERTION 2: current_slide.id was NOT polluted into
+    # _failed_slide_ids. Pre-fix this set would contain current.id
+    # because the uncaught error landed at _loop's broad except and
+    # named the current item (the wrong slide).
+    assert current_slide.id not in loop._failed_slide_ids, (
+        f"current slide id must NOT be in _failed_slide_ids "
+        f"(it played fine; the issue was the NEXT slide). "
+        f"Got failed={loop._failed_slide_ids}"
+    )
+
+    # CRITICAL ASSERTION 3: log line names next.id, not current.id.
+    # Pre-fix the journal would say "IPC playback failed for slide
+    # id=<current>" which mis-attributed the failure.
+    relevant_msgs = [
+        r.getMessage()
+        for r in caplog.records
+        if "begin_transition" in r.getMessage().lower() or "unsupported" in r.getMessage().lower()
+    ]
+    assert any(str(next_slide.id) in msg for msg in relevant_msgs), (
+        f"log must mention next slide id {next_slide.id}; got messages: {relevant_msgs}"
+    )
+    # Defensive: the current slide's id must NOT appear in any of
+    # the begin_transition / unsupported log lines (would imply
+    # pre-fix attribution leaked through).
+    assert not any(
+        str(current_slide.id) in msg and "begin_transition" in msg.lower() for msg in relevant_msgs
+    ), (
+        f"current slide id must NOT appear in begin_transition log "
+        f"lines (the issue was the NEXT slide). Got: {relevant_msgs}"
+    )

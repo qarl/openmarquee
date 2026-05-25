@@ -1007,6 +1007,45 @@ class PlaybackLoop:
                     e.message,
                 )
                 return True
+            except RustRendererUnsupportedSlideError as e:
+                # Round-23 attribution fix: begin_transition handed
+                # next_item.id to the sidecar; if the sidecar can't
+                # paint THAT slide (kind it doesn't know yet -- Stream,
+                # future variant), pre-r23 the error escaped uncaught
+                # to _loop's broad except which logged ERROR naming
+                # the CURRENT slide (which played fine) and added
+                # CURRENT's id to _failed_slide_ids, throttling later
+                # real failures of the innocent current slide.
+                #
+                # Correct attribution: blame next_item.id, throttle
+                # next_item.id in _skipped_slide_ids (same set the
+                # current-slide unsupported-kind branch at line ~916
+                # uses), return True so the current slide completes
+                # cleanly. The outer iteration's begin_slide for the
+                # next item will hit the existing skip path at L916
+                # (which logs INFO first then DEBUG on repeats) --
+                # but we add to _skipped_slide_ids here too so the
+                # double-log doesn't fire (the L916 throttle check
+                # short-circuits on the first encounter via this set).
+                if next_item.id in self._skipped_slide_ids:
+                    log.debug(
+                        "playback: begin_transition to slide %s (unsupported kind; throttled): %s",
+                        next_item.id,
+                        e.message,
+                    )
+                else:
+                    self._skipped_slide_ids.add(next_item.id)
+                    log.info(
+                        "playback: begin_transition target slide %s "
+                        "is unsupported (Rust sidecar doesn't yet "
+                        "support this kind; further skips for this id "
+                        "throttled to DEBUG). Current slide played "
+                        "fine -- outer iter will re-decide on the "
+                        "next slide: %s",
+                        next_item.id,
+                        e.message,
+                    )
+                return True
             # Drive the transition window. Exit on:
             #   (a) advance returns PaintSlide(next_item) -- state machine
             #       promoted the to-slide; visible result is identical
@@ -1038,6 +1077,30 @@ class PlaybackLoop:
                         transition_kind,
                         e.message,
                     )
+                    break
+                except RustRendererUnsupportedSlideError as e:
+                    # Round-23 attribution fix: same shape as the
+                    # begin_transition catch above. Mid-window advance
+                    # surfaced UnsupportedSlide -- target is next_item,
+                    # not the current slide that played fine. Throttle
+                    # per next_item.id in _skipped_slide_ids, break
+                    # the transition window cleanly so the outer iter
+                    # advances normally.
+                    if next_item.id in self._skipped_slide_ids:
+                        log.debug(
+                            "playback: transition advance to slide %s unsupported (throttled): %s",
+                            next_item.id,
+                            e.message,
+                        )
+                    else:
+                        self._skipped_slide_ids.add(next_item.id)
+                        log.info(
+                            "playback: transition advance surfaced "
+                            "UnsupportedSlide for next slide %s "
+                            "(further skips throttled to DEBUG): %s",
+                            next_item.id,
+                            e.message,
+                        )
                     break
                 if not isinstance(result, PaintTransition):
                     # Sidecar promoted out of the transition state into
