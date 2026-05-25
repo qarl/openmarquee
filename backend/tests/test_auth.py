@@ -369,6 +369,103 @@ def test_set_password_fails_when_too_short(client: TestClient):
     assert response.status_code == 422
 
 
+@pytest.mark.asyncio
+async def test_set_password_concurrent_race_serialized_first_writer_wins(
+    tmp_path: Path,
+):
+    """Round-9 set-password serialization behavior pin.
+
+    The asyncio.Lock added in api_auth.py wraps the load->check->save
+    trio in set_password. This test verifies the OBSERVABLE behavior
+    under concurrent POSTs: exactly one 200 + one 409, and the on-disk
+    hash matches the WINNER's password (not silently overwritten by
+    the loser's later-arriving save).
+
+    Honest caveat on bug-fix-tests-the-bug: under the current
+    single-worker uvicorn + fully-sync handler body, removing the
+    asyncio.Lock does NOT make this test fail. Python's asyncio
+    serializes handler bodies at completion granularity (no await
+    point exists between auth.load() and auth.save() in the
+    pre-fix code), so the two coroutines never interleave inside
+    the critical section. The TOCTOU race becomes exploitable in
+    two future scenarios this test protects against:
+      1. Multi-worker uvicorn (separate processes; each has its own
+         _SET_PASSWORD_LOCK -- the file-system layer would need an
+         O_EXCL or fcntl.flock fix as documented in the Lock comment)
+      2. A future code change introducing an `await` between the
+         load() check and the save() commit (e.g., async hash_password
+         or async auth.save) -- then the lock becomes load-bearing
+         and removing it would make this test fail.
+
+    Test serves as the regression fence for both scenarios + pins the
+    current observable behavior so a future code change can't silently
+    drift it.
+    """
+    import asyncio
+
+    import httpx
+
+    from openmarquee.app import app
+    from openmarquee.dependencies import _auth_storage_singleton, get_auth_storage
+
+    auth_path = tmp_path / "auth.json"
+    _auth_storage_singleton.cache_clear()
+    with patch.dict(os.environ, {"OPENMARQUEE_AUTH_PATH": str(auth_path)}):
+        os.environ.pop("OPENMARQUEE_DISABLE_AUTH", None)
+        # Build an AuthStorage bound to tmp_path and override the
+        # dependency so both async requests see the same backing file.
+        auth = AuthStorage(auth_path)
+        app.dependency_overrides[get_auth_storage] = lambda: auth
+        try:
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver"
+            ) as client:
+                payload_a = {
+                    "password": "operator-password-A",
+                    "password_confirm": "operator-password-A",
+                }
+                payload_b = {
+                    "password": "attacker-password-B",
+                    "password_confirm": "attacker-password-B",
+                }
+                results = await asyncio.gather(
+                    client.post("/api/auth/set-password", json=payload_a),
+                    client.post("/api/auth/set-password", json=payload_b),
+                )
+            # Exactly one 200 and one 409 -- never two 200s (would mean
+            # the race wasn't serialized).
+            status_codes = sorted(r.status_code for r in results)
+            assert status_codes == [200, 409], (
+                f"expected one 200 + one 409 (serialized), got {status_codes}"
+            )
+            # The on-disk hash must match the WINNER's password, never
+            # the loser's. Pre-fix the loser's hash would overwrite the
+            # winner's via last-write-wins rename.
+            persisted = auth.load()
+            assert persisted is not None, "winner should have persisted state"
+            winner_password = (
+                "operator-password-A"
+                if results[0].status_code == 200
+                else "attacker-password-B"
+            )
+            loser_password = (
+                "attacker-password-B"
+                if winner_password == "operator-password-A"
+                else "operator-password-A"
+            )
+            assert verify_password(persisted.password_hash, winner_password), (
+                "persisted hash must verify the winner's password"
+            )
+            assert not verify_password(persisted.password_hash, loser_password), (
+                "persisted hash must NOT verify the loser's password "
+                "(would mean last-write-wins overwrite)"
+            )
+        finally:
+            app.dependency_overrides.pop(get_auth_storage, None)
+    _auth_storage_singleton.cache_clear()
+
+
 def test_login_succeeds_with_correct_password(client: TestClient):
     client.post(
         "/api/auth/set-password",

@@ -20,6 +20,7 @@ bearer token lives in `auth_middleware.py`.
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Annotated
 
@@ -67,6 +68,25 @@ _SET_PASSWORD_GRACE_SECONDS: float = 30.0
 def _set_password_grace_active() -> bool:
     """True iff the boot-grace window is still open."""
     return (time.monotonic() - _BOOT_MONOTONIC) < _SET_PASSWORD_GRACE_SECONDS
+
+
+# Bundle B2 / round-9 TOCTOU fix: serialize the set-password
+# load->check->save trio across concurrent FastAPI handlers.
+#
+# Pre-fix, two concurrent POST /api/auth/set-password requests could
+# both observe `auth.load() is None`, both compute their own AuthState,
+# and atomic_write_text's tmp+rename would be last-write-wins. On a
+# fresh-boot device an attacker on the same RFC1918/Tailscale source
+# could race the legitimate operator and overwrite the operator's
+# password hash with the attacker's.
+#
+# This Lock is sufficient under the current deploy posture: openmarquee-
+# backend.service launches a SINGLE uvicorn worker (no --workers flag).
+# If a future deploy moves to multi-worker uvicorn, this single-process
+# Lock is no longer sufficient and the fix needs to be at the file-
+# system layer (O_CREAT | O_EXCL on a sentinel, or fcntl.flock around
+# the load+check+save sequence in AuthStorage itself).
+_SET_PASSWORD_LOCK = asyncio.Lock()
 
 
 AuthDep = Annotated[AuthStorage, Depends(get_auth_storage)]
@@ -131,16 +151,24 @@ async def set_password(
             )
     if payload.password != payload.password_confirm:
         raise HTTPException(status_code=422, detail="passwords do not match")
-    if auth.load() is not None:
-        raise HTTPException(status_code=409, detail="password already configured")
     from openmarquee.auth import AuthState
 
-    state = AuthState(password_hash=hash_password(payload.password))
-    token, state = mint_token(state)
-    # Persist AFTER mint so the issued_token_hash is on disk before
-    # we hand the token back to the client; otherwise a server crash
-    # between mint + save would invalidate the just-returned token.
-    auth.save(state)
+    # Round-9 TOCTOU fix: serialize the load->check->save trio so two
+    # concurrent set-password POSTs during the grace window can't both
+    # observe "not configured" and last-write-wins the rename. See
+    # _SET_PASSWORD_LOCK module-level comment for the multi-worker
+    # caveat.
+    async with _SET_PASSWORD_LOCK:
+        if auth.load() is not None:
+            raise HTTPException(
+                status_code=409, detail="password already configured"
+            )
+        state = AuthState(password_hash=hash_password(payload.password))
+        token, state = mint_token(state)
+        # Persist AFTER mint so the issued_token_hash is on disk before
+        # we hand the token back to the client; otherwise a server crash
+        # between mint + save would invalidate the just-returned token.
+        auth.save(state)
     return _TokenResponse(token=token)
 
 
