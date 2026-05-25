@@ -251,7 +251,7 @@ describe("mountSchedule", () => {
         expect(nowEl.textContent.length).toBeGreaterThan(0);
     });
 
-    it("Auto-save error message surfaces in the status", async () => {
+    it("Auto-save error message surfaces in the status AND flush rejects (r20)", async () => {
         const container = document.createElement("div");
         const handle = mountSchedule(container, {
             fetchSchedule: async () => ({ rules: [], default_playlist_id: DEFAULT_PLAYLIST_ID }),
@@ -262,7 +262,10 @@ describe("mountSchedule", () => {
         });
         await tick();
 
-        await handle.flushAutoSave();
+        // r20: flush now rejects on save error rather than resolving
+        // silently. The status pill assertion still holds — both
+        // observables are regression-locked.
+        await expect(handle.flushAutoSave()).rejects.toThrow("backend rejected");
         expect(container.querySelector(".schedule-status").textContent).toContain(
             "backend rejected",
         );

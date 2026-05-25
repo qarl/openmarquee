@@ -178,6 +178,55 @@ describe("attachAutoSave -- status transitions", () => {
     });
 });
 
+describe("attachAutoSave -- flush() error semantics (r20)", () => {
+    // r20: pre-fix, the IIFE catch swallowed save errors and flush()
+    // resolved (not rejected) on save failure — contradicting the
+    // docstring "resolve once the server has confirmed the write."
+    // Operator scenario: a beforeunload handler awaits flush() to
+    // be sure work is persisted; PUT 500s; flush resolves;
+    // navigation proceeds; edit lost. Fix: lastError tracking +
+    // flush throws on drained-attempt failure.
+
+    it("flush() rejects with the save error instead of resolving silently", async () => {
+        const form = makeForm();
+        const status = makeStatus();
+        const save = vi.fn().mockRejectedValue(new Error("server 500"));
+        const handle = attachAutoSave(form, { save, status, debounceMs: 50 });
+
+        form.dispatchEvent(new Event("input"));
+        await expect(handle.flush()).rejects.toThrow("server 500");
+        // The pill ALSO shows the error — both observables coupled.
+        expect(status.dataset.state).toBe("error");
+        expect(status.textContent).toBe("Couldn't save · server 500");
+    });
+
+    it("flush() consumes lastError so a second flush after a successful retry doesn't re-throw", async () => {
+        const form = makeForm();
+        const save = vi.fn()
+            .mockRejectedValueOnce(new Error("transient"))
+            .mockResolvedValueOnce(undefined);
+        const handle = attachAutoSave(form, { save, debounceMs: 50 });
+
+        form.dispatchEvent(new Event("input"));
+        await expect(handle.flush()).rejects.toThrow("transient");
+
+        // Retry: schedule a fresh save that succeeds.
+        form.dispatchEvent(new Event("input"));
+        // No throw expected this time — the successful save also
+        // clears lastError (see the IIFE's success branch).
+        await expect(handle.flush()).resolves.toBeUndefined();
+    });
+
+    it("flush() with no pending work resolves cleanly when nothing has errored", async () => {
+        const form = makeForm();
+        const save = vi.fn().mockResolvedValue(undefined);
+        const handle = attachAutoSave(form, { save, debounceMs: 50 });
+        // No form event → nothing to flush → flush resolves (and
+        // happens to fire one save() through attempt()).
+        await expect(handle.flush()).resolves.toBeUndefined();
+    });
+});
+
 describe("attachAutoSave -- coalescing in-flight saves", () => {
     it("event during in-flight save re-enqueues a single follow-up", async () => {
         const form = makeForm();
