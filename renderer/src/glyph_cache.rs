@@ -463,10 +463,19 @@ impl GlyphCache {
     /// Idempotent across calls — second-call for an in-flight or resolved
     /// key returns the existing state (does NOT re-enqueue).
     ///
-    /// `font_path` is the TTF file the worker should rasterize from. The
+    /// `font_path` is a thunk that materializes the TTF file path. The
     /// dispatch hook resolves it from the atlas manifest's font stem +
-    /// the renderer's fonts_dir.
-    pub fn get_or_request(&self, key: GlyphKey, font_path: PathBuf) -> Option<SlotState> {
+    /// the renderer's fonts_dir. We accept a closure rather than an
+    /// already-built PathBuf because the per-call materialization
+    /// (`fonts_dir.join(format!("{}.ttf", stem))`) heap-allocates a
+    /// String + a PathBuf; on the steady-state Ready hit path that
+    /// PathBuf was previously dropped unread. Deferring to the miss
+    /// branch eliminates those allocs per char on every layout pass.
+    pub fn get_or_request(
+        &self,
+        key: GlyphKey,
+        font_path: impl FnOnce() -> PathBuf,
+    ) -> Option<SlotState> {
         let mut slots = self.slots.lock().unwrap();
         if let Some(state) = slots.get(&key).cloned() {
             drop(slots);
@@ -483,8 +492,10 @@ impl GlyphCache {
         slots.insert(key, SlotState::Requested);
         // Send is unbounded so this never blocks; ignore the result
         // because send-error only happens if all workers panicked,
-        // which we'd surface via panic-handler elsewhere.
-        let _ = self.work_tx.send(MissRequest { key, font_path });
+        // which we'd surface via panic-handler elsewhere. Only NOW
+        // do we materialize the PathBuf — the hit branch above
+        // returned without paying the alloc cost.
+        let _ = self.work_tx.send(MissRequest { key, font_path: font_path() });
         None
     }
 
@@ -828,17 +839,17 @@ mod tests {
     fn glyph_cache_first_get_returns_none_and_enqueues_request() {
         // 0 workers: state stays Requested forever, no FontMissing race.
         let cache = GlyphCache::new(0);
-        let state = cache.get_or_request(k(0x25CF), nonexistent_font_path());
+        let state = cache.get_or_request(k(0x25CF), nonexistent_font_path);
         assert!(state.is_none());
     }
 
     #[test]
     fn glyph_cache_second_get_returns_resolved_state_does_not_re_enqueue() {
         let cache = GlyphCache::new(1);
-        let _ = cache.get_or_request(k(0x25CF), nonexistent_font_path());
+        let _ = cache.get_or_request(k(0x25CF), nonexistent_font_path);
         // give the worker a moment to drain + record FontMissing
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let state = cache.get_or_request(k(0x25CF), nonexistent_font_path());
+        let state = cache.get_or_request(k(0x25CF), nonexistent_font_path);
         assert!(state.is_some());
         match state.unwrap() {
             SlotState::Requested => {}    // worker hasn't reached it yet
@@ -851,9 +862,9 @@ mod tests {
     #[test]
     fn glyph_cache_request_count_increments_per_unique_key() {
         let cache = GlyphCache::new(1);
-        cache.get_or_request(k(0x25CF), nonexistent_font_path());
-        cache.get_or_request(k(0x221E), nonexistent_font_path());
-        cache.get_or_request(k(0x25CF), nonexistent_font_path()); // duplicate, NOT counted again
+        cache.get_or_request(k(0x25CF), nonexistent_font_path);
+        cache.get_or_request(k(0x221E), nonexistent_font_path);
+        cache.get_or_request(k(0x25CF), nonexistent_font_path); // duplicate, NOT counted again
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(cache.request_count(), 2);
     }
@@ -871,8 +882,8 @@ mod tests {
             codepoint: 0x25CF,
             render_mode: RenderMode::Colr,
         };
-        cache.get_or_request(k_msdf, nonexistent_font_path());
-        cache.get_or_request(k_colr, nonexistent_font_path());
+        cache.get_or_request(k_msdf, nonexistent_font_path);
+        cache.get_or_request(k_colr, nonexistent_font_path);
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(cache.request_count(), 2);
     }
@@ -890,8 +901,8 @@ mod tests {
             codepoint: 0x41,
             render_mode: RenderMode::Msdf,
         };
-        cache.get_or_request(k0, nonexistent_font_path());
-        cache.get_or_request(k1, nonexistent_font_path());
+        cache.get_or_request(k0, nonexistent_font_path);
+        cache.get_or_request(k1, nonexistent_font_path);
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(cache.request_count(), 2);
     }
@@ -902,21 +913,21 @@ mod tests {
         // queue. get_or_request still works; state stays Requested
         // forever (or until cache is dropped).
         let cache = GlyphCache::new(0);
-        cache.get_or_request(k(0x25CF), nonexistent_font_path());
-        let s = cache.get_or_request(k(0x25CF), nonexistent_font_path()).unwrap();
+        cache.get_or_request(k(0x25CF), nonexistent_font_path);
+        let s = cache.get_or_request(k(0x25CF), nonexistent_font_path).unwrap();
         assert!(matches!(s, SlotState::Requested));
     }
 
     #[test]
     fn worker_records_font_missing_on_unreadable_path() {
         let cache = GlyphCache::new(2);
-        cache.get_or_request(k(0x25CF), nonexistent_font_path());
+        cache.get_or_request(k(0x25CF), nonexistent_font_path);
         // Worker reads "/nonexistent/...", fails, inserts FontMissing.
         // 200 ms should be more than enough on any host.
         for _ in 0..40 {
             std::thread::sleep(std::time::Duration::from_millis(5));
             if matches!(
-                cache.get_or_request(k(0x25CF), nonexistent_font_path()),
+                cache.get_or_request(k(0x25CF), nonexistent_font_path),
                 Some(SlotState::FontMissing)
             ) {
                 return; // pass
@@ -944,7 +955,7 @@ mod tests {
             return;
         }
         let cache = GlyphCache::new(1);
-        cache.get_or_request(k(0x41), font_path.clone()); // 'A'
+        cache.get_or_request(k(0x41), || font_path.clone()); // 'A'
         // Wait up to ~2 s for the worker to rasterize. msdfgen on Mac
         // takes <30 ms per cell; the longer ceiling is for the slowest
         // CI worker class.
@@ -1001,11 +1012,11 @@ mod tests {
             return;
         }
         let cache = GlyphCache::new(1);
-        cache.get_or_request(k(0x2603), font_path.clone()); // snowman
+        cache.get_or_request(k(0x2603), || font_path.clone()); // snowman
         for _ in 0..200 {
             std::thread::sleep(std::time::Duration::from_millis(5));
             if matches!(
-                cache.get_or_request(k(0x2603), font_path.clone()),
+                cache.get_or_request(k(0x2603), || font_path.clone()),
                 Some(SlotState::FontMissing)
             ) {
                 return; // pass
@@ -1018,7 +1029,7 @@ mod tests {
     fn inject_completion_marks_slot_ready() {
         let cache = GlyphCache::new(1);
         let key = k(0x25CF);
-        cache.get_or_request(key, nonexistent_font_path());
+        cache.get_or_request(key, nonexistent_font_path);
         cache.inject_completion_for_test(
             key,
             vec![0; 48 * 48 * 4],
@@ -1031,7 +1042,7 @@ mod tests {
                 pl_bottom: -0.1,
             },
         );
-        let state = cache.get_or_request(key, nonexistent_font_path()).unwrap();
+        let state = cache.get_or_request(key, nonexistent_font_path).unwrap();
         match state {
             SlotState::Ready { advance_em, plane_bounds, .. } => {
                 assert!((advance_em - 0.5).abs() < 1e-6);
@@ -1047,7 +1058,7 @@ mod tests {
         // Make sure Drop doesn't hang when workers have unread queue.
         let cache = GlyphCache::new(4);
         for i in 0..100 {
-            cache.get_or_request(k(0x2500 + i), nonexistent_font_path());
+            cache.get_or_request(k(0x2500 + i), nonexistent_font_path);
         }
         drop(cache); // should join all workers cleanly
     }
@@ -1125,7 +1136,7 @@ mod tests {
             return;
         }
         let cache = GlyphCache::new(1);
-        cache.get_or_request(k(0x25CF), font_path); // ●
+        cache.get_or_request(k(0x25CF), move || font_path); // ●
         let mut got = None;
         for _ in 0..400 {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1173,7 +1184,7 @@ mod tests {
         // completion channel so the render-thread's poll can
         // observe the transition and invalidate slide_caches.
         let cache = GlyphCache::new(1);
-        cache.get_or_request(k(0x25CF), nonexistent_font_path());
+        cache.get_or_request(k(0x25CF), nonexistent_font_path);
         let mut got = None;
         for _ in 0..400 {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1336,7 +1347,7 @@ mod tests {
         inject_ready(&cache, &mut page, key);
         // Pre-eviction: a lookup is a Ready hit.
         assert!(matches!(
-            cache.get_or_request(key, nonexistent_font_path()),
+            cache.get_or_request(key, nonexistent_font_path),
             Some(SlotState::Ready { .. }),
         ));
         // Evict it.
@@ -1344,7 +1355,7 @@ mod tests {
         // Post-eviction: the lookup misses → None → re-Requested.
         assert!(
             cache
-                .get_or_request(key, nonexistent_font_path())
+                .get_or_request(key, nonexistent_font_path)
                 .is_none(),
             "an evicted glyph must miss + re-request",
         );

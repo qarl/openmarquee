@@ -753,14 +753,13 @@ pub fn layout_text_to_quads(
                     let stem = crate::glyph_cache::COLR_EMOJI_FONT_STEM;
                     let font_id =
                         crate::glyph_cache::font_family_id_from_stem(stem);
-                    let font_path = rt.fonts_dir.join(format!("{}.ttf", stem));
                     let state = rt.cache.get_or_request(
                         crate::glyph_cache::GlyphKey {
                             font_family_id: font_id,
                             codepoint: cp,
                             render_mode: crate::glyph_cache::RenderMode::Colr,
                         },
-                        font_path,
+                        || rt.fonts_dir.join(format!("{}.ttf", stem)),
                     );
                     match state {
                         Some(crate::glyph_cache::SlotState::Ready {
@@ -865,14 +864,13 @@ pub fn layout_text_to_quads(
                         } else {
                             crate::glyph_cache::font_family_id_from_stem(stem)
                         };
-                        let font_path = rt.fonts_dir.join(format!("{}.ttf", stem));
                         let state = rt.cache.get_or_request(
                             crate::glyph_cache::GlyphKey {
                                 font_family_id: font_id,
                                 codepoint: cp,
                                 render_mode: crate::glyph_cache::RenderMode::Msdf,
                             },
-                            font_path,
+                            || rt.fonts_dir.join(format!("{}.ttf", stem)),
                         );
                         match state {
                             Some(crate::glyph_cache::SlotState::Ready {
