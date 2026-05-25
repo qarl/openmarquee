@@ -500,16 +500,23 @@ fn err(msg: impl Into<String>) -> IpcResponse {
 pub fn run_ipc_sidecar() -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
-    let stdin_lock = stdin.lock();
-    let mut lines = stdin_lock.lines();
+    let mut stdin_lock = stdin.lock();
 
-    // clippy::while_let_on_iterator suggests `for line in lines.by_ref()`,
-    // but the inner Open handler below passes `&mut lines` to the inner
-    // loop function — `for` + `by_ref()` would hold a borrow across that
-    // call (E0499). Keep the while-let form for the outer dispatch.
-    #[allow(clippy::while_let_on_iterator)]
-    while let Some(line) = lines.next() {
-        let line = line?;
+    // One reusable String for the entire outer (pre-Open) loop. The
+    // BufRead::lines() shape we used to use heap-allocated a fresh
+    // String per message; reading into a cleared buffer keeps a
+    // single allocation whose capacity grows once to the longest
+    // message. The hot path is the inner loop (which has its own
+    // buffer) -- this outer one matters less but keeps the signature
+    // story consistent (no Lines<...> threading).
+    let mut line = String::with_capacity(2048);
+    loop {
+        line.clear();
+        match stdin_lock.read_line(&mut line) {
+            Ok(0) => return Ok(()), // EOF
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
         let req: IpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -519,7 +526,7 @@ pub fn run_ipc_sidecar() -> Result<()> {
         };
         match req {
             IpcRequest::Open(params) => {
-                match run_open_and_inner_loop(params, &mut lines, &mut stdout) {
+                match run_open_and_inner_loop(params, &mut stdin_lock, &mut stdout) {
                     Ok(()) => return Ok(()),
                     Err(e) => {
                         emit_response(&mut stdout, &err(format!("open failed: {e:#}")))?;
@@ -543,7 +550,6 @@ pub fn run_ipc_sidecar() -> Result<()> {
             }
         }
     }
-    Ok(())
 }
 
 /// Inner loop body invoked after Open succeeds. Slice (d)
@@ -552,13 +558,13 @@ pub fn run_ipc_sidecar() -> Result<()> {
 /// across Advance calls + actual GL paint fires; on Mac
 /// (cargo test only), run state-machine-only mode (slice c
 /// behavior).
-fn run_open_and_inner_loop<I, W>(
+fn run_open_and_inner_loop<R, W>(
     params: OpenParams,
-    lines: &mut I,
+    stdin: &mut R,
     stdout: &mut W,
 ) -> Result<()>
 where
-    I: Iterator<Item = std::io::Result<String>>,
+    R: BufRead,
     W: Write,
 {
     if params.output != "hdmi" {
@@ -581,11 +587,11 @@ where
 
     #[cfg(target_os = "linux")]
     {
-        return run_open_and_inner_loop_linux(params, lines, stdout, &content_root);
+        return run_open_and_inner_loop_linux(params, stdin, stdout, &content_root);
     }
     #[cfg(not(target_os = "linux"))]
     {
-        return run_open_and_inner_loop_state_only(lines, stdout, &content_root);
+        return run_open_and_inner_loop_state_only(stdin, stdout, &content_root);
     }
 }
 
@@ -594,13 +600,13 @@ where
 /// Mirrors slice (c) behavior: emit placeholder OpenOk, run
 /// the state machine, ignore paint hooks.
 #[cfg(not(target_os = "linux"))]
-fn run_open_and_inner_loop_state_only<I, W>(
-    lines: &mut I,
+fn run_open_and_inner_loop_state_only<R, W>(
+    stdin: &mut R,
     stdout: &mut W,
     content_root: &Path,
 ) -> Result<()>
 where
-    I: Iterator<Item = std::io::Result<String>>,
+    R: BufRead,
     W: Write,
 {
     emit_response(
@@ -611,8 +617,14 @@ where
     )?;
     let mut state = PlaybackState::new();
     let mut cache = SlideCache::new();
-    for line in lines.by_ref() {
-        let line = line?;
+    let mut line = String::with_capacity(2048);
+    loop {
+        line.clear();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
         let req: IpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
@@ -797,14 +809,14 @@ fn run_external_frame_pump(
 /// continues so the caller can recover (e.g., re-BeginSlide
 /// after a transient FBO failure).
 #[cfg(target_os = "linux")]
-fn run_open_and_inner_loop_linux<I, W>(
+fn run_open_and_inner_loop_linux<R, W>(
     params: OpenParams,
-    lines: &mut I,
+    stdin: &mut R,
     stdout: &mut W,
     content_root: &Path,
 ) -> Result<()>
 where
-    I: Iterator<Item = std::io::Result<String>>,
+    R: BufRead,
     W: Write,
 {
     use crate::hdmi;
@@ -896,7 +908,14 @@ where
         if let Some(initial) = settings_watcher.check() {
             session.apply_settings(initial);
         }
-        while let Some(line) = lines.next() {
+        // Reusable per-message buffer. Replaces a BufRead::lines()
+        // iterator that heap-allocated a fresh String per message --
+        // i.e. once per Advance at 30 Hz + every BeginSlide /
+        // BeginTransition between paints. One persistent String for
+        // the entire session; capacity grows once to the longest
+        // message and stays there.
+        let mut line = String::with_capacity(2048);
+        loop {
             // Opportunistic settings poll. Cheap stat() call
             // per iteration; the watcher returns None when
             // mtime is unchanged.
@@ -908,7 +927,12 @@ where
                 );
                 session.apply_settings(updated);
             }
-            let line = line?;
+            line.clear();
+            match stdin.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {}
+                Err(e) => return Err(e.into()),
+            }
             let req: IpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(e) => {
