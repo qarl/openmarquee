@@ -26,6 +26,7 @@ edit bumps it.
 
 import json
 import shutil
+import threading
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
@@ -269,6 +270,38 @@ class ContentStorage:
         # loaded items returns no mutation sites; document this here
         # so a future contributor adding one gets caught in review.)
         self._cache: dict[UUID, tuple[int, ContentItem]] = {}
+        # Round-29 concurrency: serialize mutator methods (save /
+        # save_video / delete). FastAPI sync handlers run on the
+        # threadpool; two concurrent PUT /api/content/text-slides/
+        # {X} requests (e.g. operator with two tabs open, both
+        # autoSave-debounces firing within ~1 second) could otherwise
+        # race in ContentStorage.save's two-file write
+        # (envelope + asset). Pre-r29's _atomic.py also used a fixed
+        # ".tmp" filename, so both writes shared the SAME staging
+        # file -- byte interleaving in the staging buffer + last
+        # rename wins with mashed bytes. Silent slide corruption;
+        # operator sees 200 OK on both saves; renderer fails to
+        # decode the asset at next playback.
+        #
+        # Part A of the r29 fix (this lock). Part B (per-call
+        # ".tmp.<pid>.<hex>" suffix in _atomic.py) defends even when
+        # a future caller forgets the lock.
+        #
+        # RLock (not Lock) because save_video acquires the lock at
+        # its own level and then calls save() internally, which also
+        # acquires -- threading.Lock would deadlock on re-entry from
+        # the same thread; RLock is reentrant. Save sites that don't
+        # re-enter (delete, save called directly) pay only a tiny
+        # extra cost vs Lock for the reentry-tracking.
+        #
+        # Same caveat as r25/r27: the methods are sync and may be
+        # called from async paths (flock_sync._ingest_update is
+        # async). threading.RLock acquired from a coroutine briefly
+        # blocks the event loop during contention; acceptable for
+        # microsecond-scale ops (atomic_write is io-bound but short
+        # per file); switching to asyncio.Lock would cascade
+        # sync->async through every caller.
+        self._lock = threading.RLock()
 
     @classmethod
     def stats_snapshot(cls) -> dict[str, int]:
@@ -295,25 +328,28 @@ class ContentStorage:
         original stamp travels with the content.
         """
         type(self)._stats["save_calls"] += 1
-        item_dir = self.root / str(item.id)
-        item_dir.mkdir(parents=True, exist_ok=True)
+        # Round-29: lock-protect the envelope+asset write pair so two
+        # concurrent saves to the same id can't interleave.
+        with self._lock:
+            item_dir = self.root / str(item.id)
+            item_dir.mkdir(parents=True, exist_ok=True)
 
-        stamp = updated_at or datetime.now(UTC)
-        envelope = {
-            "schema_version": SCHEMA_VERSION,
-            "updated_at": stamp.isoformat(),
-            # Exclude the model's updated_at mirror — the envelope is the
-            # authoritative source. Two stamps for the same fact would
-            # drift the moment someone hand-edits item.json.
-            "item": item.model_dump(mode="json", exclude={"updated_at"}),
-        }
-        # Drop the cache entry BEFORE the disk write so an IO error
-        # (atomic-rename failure on full disk) doesn't leave the cache
-        # holding pre-save state that diverges from disk on retry.
-        # Next load() repopulates with the canonical re-decoded shape.
-        self._cache.pop(item.id, None)
-        self._atomic_write_text(item_dir / _ENVELOPE_FILENAME, json.dumps(envelope, indent=2))
-        self._atomic_write_bytes(item_dir / _ASSET_FILENAME, png)
+            stamp = updated_at or datetime.now(UTC)
+            envelope = {
+                "schema_version": SCHEMA_VERSION,
+                "updated_at": stamp.isoformat(),
+                # Exclude the model's updated_at mirror — the envelope is the
+                # authoritative source. Two stamps for the same fact would
+                # drift the moment someone hand-edits item.json.
+                "item": item.model_dump(mode="json", exclude={"updated_at"}),
+            }
+            # Drop the cache entry BEFORE the disk write so an IO error
+            # (atomic-rename failure on full disk) doesn't leave the cache
+            # holding pre-save state that diverges from disk on retry.
+            # Next load() repopulates with the canonical re-decoded shape.
+            self._cache.pop(item.id, None)
+            self._atomic_write_text(item_dir / _ENVELOPE_FILENAME, json.dumps(envelope, indent=2))
+            self._atomic_write_bytes(item_dir / _ASSET_FILENAME, png)
 
     def save_text_slide(self, slide: TextSlide, png: bytes) -> None:
         """Persist a text slide — convenience wrapper for save()."""
@@ -346,17 +382,26 @@ class ContentStorage:
         edits, accepts an explicit value so peer-ingest preserves the
         originating stamp.
         """
-        item_dir = self.root / str(video.id)
-        preexisting = item_dir.exists()
-        try:
-            self.save(video, thumbnail_png, updated_at=updated_at)
-            self._atomic_write_bytes(item_dir / _VIDEO_FILENAME, video_bytes)
-        except Exception:
-            # Only rm if this save created the dir — don't blow away another
-            # item if the id collision were hypothetical.
-            if not preexisting and item_dir.exists():
-                shutil.rmtree(item_dir, ignore_errors=True)
-            raise
+        # Round-29: lock-protect the THREE-file write trio (envelope
+        # via save(), thumbnail via save(), video bytes via the
+        # _atomic_write_bytes here). RLock allows save()'s inner
+        # acquire on the same thread without deadlock. Without this,
+        # a concurrent save_video to the same id could interleave its
+        # video-bytes write with our envelope+png write -- partial
+        # save_video state on disk (envelope/png from one operator,
+        # video bytes from another) is unrenderable.
+        with self._lock:
+            item_dir = self.root / str(video.id)
+            preexisting = item_dir.exists()
+            try:
+                self.save(video, thumbnail_png, updated_at=updated_at)
+                self._atomic_write_bytes(item_dir / _VIDEO_FILENAME, video_bytes)
+            except Exception:
+                # Only rm if this save created the dir — don't blow away another
+                # item if the id collision were hypothetical.
+                if not preexisting and item_dir.exists():
+                    shutil.rmtree(item_dir, ignore_errors=True)
+                raise
 
     def save_stream(
         self,
@@ -550,12 +595,18 @@ class ContentStorage:
 
         Uses shutil.rmtree so it's safe when the item grows into a subtree
         (e.g. HUB75 raw-frame sequences store many files under assets/).
+
+        Round-29: lock-protected so a concurrent save() to the same
+        id can't race (save creates the dir + writes files; delete
+        rm-rfs the dir). Without the lock, save could land bytes in
+        a dir that delete then wipes out partway through.
         """
-        item_dir = self.root / str(item_id)
-        if not item_dir.exists():
-            raise FileNotFoundError(f"no content item at {item_dir}")
-        shutil.rmtree(item_dir)
-        self._cache.pop(item_id, None)
+        with self._lock:
+            item_dir = self.root / str(item_id)
+            if not item_dir.exists():
+                raise FileNotFoundError(f"no content item at {item_dir}")
+            shutil.rmtree(item_dir)
+            self._cache.pop(item_id, None)
 
     # --- internals ---
 

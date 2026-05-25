@@ -731,3 +731,130 @@ def test_list_all_surfaces_web_items(tmp_path: Path):
     by_type = {item.type: item for item in storage.list_all()}
     assert isinstance(by_type["web"], WebSlide)
     assert isinstance(by_type["text_slide"], TextSlide)
+
+
+def test_atomic_write_uses_per_call_tmp_filename(tmp_path: Path, monkeypatch):
+    """Round-29 Part B: each _atomic._atomic_write call must use a
+    distinct staging filename so concurrent writers can't share one.
+
+    Pre-r29 the suffix was a fixed ".tmp". Even with a future caller
+    that forgets the lock (Part A), two concurrent writers to the
+    same target would trample each other's bytes in the staging
+    file. The per-call ".tmp.<pid>.<hex>" suffix defends by
+    construction.
+
+    Test: call atomic_write_text twice on the same target; intercept
+    the os.chmod call (which the helper runs on the staging path
+    just before rename) to capture the staging filename each time.
+    Assert the two filenames are DISTINCT.
+    """
+    import os
+
+    from openmarquee._atomic import atomic_write_text
+
+    tmp_paths_seen: list[str] = []
+    original_chmod = os.chmod
+
+    def track_chmod(path, mode):
+        # The helper chmods the staging path right before rename;
+        # capture the name on each call.
+        tmp_paths_seen.append(Path(path).name)
+        return original_chmod(path, mode)
+
+    monkeypatch.setattr(os, "chmod", track_chmod)
+
+    target = tmp_path / "out.txt"
+    atomic_write_text(target, "content-a")
+    atomic_write_text(target, "content-b")
+
+    assert len(tmp_paths_seen) == 2
+    assert tmp_paths_seen[0] != tmp_paths_seen[1], (
+        f"atomic_write must use distinct tmp filenames per call so "
+        f"concurrent writers can't share a staging file. Got two "
+        f"identical names: {tmp_paths_seen[0]!r}"
+    )
+    # Both should follow the .tmp.<pid>.<hex> pattern.
+    for name in tmp_paths_seen:
+        assert ".tmp." in name, f"expected per-call tmp suffix '.tmp.<pid>.<hex>', got {name!r}"
+
+
+def test_concurrent_save_same_item_id_does_not_corrupt_envelope(tmp_path: Path):
+    """Round-29 concurrency regression: two concurrent ContentStorage.save
+    calls on the same item id must serialize so neither operator's
+    edit lands as corrupted JSON.
+
+    Pre-r29 (no lock + fixed ".tmp" staging filename), two threads
+    writing to <id>/item.json.tmp simultaneously trampled each other's
+    bytes mid-write_text. The atomic-rename then promoted whichever
+    bytes happened to be present -- potentially a mash of fragment-A
+    + fragment-B, producing unparseable JSON.
+
+    Test: N concurrent threads call save() with distinct TextSlide
+    payloads sharing the same id. Final on-disk item.json MUST parse
+    as valid JSON AND match ONE of the inputs cleanly (not a partial
+    mash). Pre-r29 fails ~10-30% of runs depending on scheduling
+    (sometimes parses, sometimes not -- mashed JSON is a function of
+    interleave timing).
+    """
+    import json
+    import threading
+
+    storage = ContentStorage(tmp_path)
+    shared_id = uuid4()
+    # Seed an initial slide so the dir exists (matches the operator
+    # scenario where the slide already exists and both tabs are
+    # editing it).
+    storage.save_text_slide(
+        TextSlide(id=shared_id, name="initial", text_layers=[TextLayer(text="i")]),
+        png=b"\x89PNG\r\nseed",
+    )
+
+    n_concurrent = 30
+    # Distinct names so we can verify ONE win cleanly (no half-merge).
+    valid_names = {f"v{i:03d}" for i in range(n_concurrent)}
+    barrier = threading.Barrier(n_concurrent)
+
+    def save_one(idx: int):
+        barrier.wait()
+        slide = TextSlide(
+            id=shared_id,
+            name=f"v{idx:03d}",
+            text_layers=[TextLayer(text=f"text-{idx:03d}")],
+        )
+        storage.save(slide, png=f"\x89PNG\r\nv{idx}".encode())
+
+    threads = [threading.Thread(target=save_one, args=(i,)) for i in range(n_concurrent)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # CRITICAL ASSERTION: the on-disk envelope MUST parse as valid
+    # JSON. Pre-r29 the file could be a mash of byte fragments from
+    # multiple writers and json.loads would raise.
+    envelope_path = tmp_path / str(shared_id) / "item.json"
+    raw = envelope_path.read_text()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(
+            f"item.json must be valid JSON after concurrent saves; "
+            f"got JSONDecodeError: {exc}. Raw (first 300 chars): "
+            f"{raw[:300]!r}"
+        ) from exc
+
+    # CRITICAL ASSERTION 2: the persisted name is ONE of the input
+    # names (not a half-merged value). Last writer wins is fine; a
+    # mash is NOT fine.
+    persisted_name = parsed["item"]["name"]
+    assert persisted_name in valid_names, (
+        f"persisted name must be one of the N inputs; got "
+        f"{persisted_name!r} (would be a mash of two writers if it "
+        f"doesn't match any input cleanly)"
+    )
+
+    # CRITICAL ASSERTION 3: load() returns a valid ContentItem
+    # (Pydantic validates the round-trip).
+    loaded = storage.load(shared_id)
+    assert loaded.id == shared_id
+    assert loaded.name == persisted_name

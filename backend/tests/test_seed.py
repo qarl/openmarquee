@@ -687,11 +687,13 @@ def test_write_marker_rollback_on_replace_failure(
     _write_marker(marker_path, created=2, reason="initial")
     assert marker_path.exists()
 
-    # Monkeypatch Path.replace to raise OSError on .tmp paths.
+    # Monkeypatch Path.replace to raise OSError on atomic-write
+    # staging paths. Round-29: staging suffix is per-call
+    # ".tmp.<pid>.<hex>" (not just ".tmp"), so match the substring.
     original_replace = Path.replace
 
     def _raise_if_tmp(self: Path, target):
-        if self.name.endswith(".tmp"):
+        if ".tmp." in self.name:
             raise OSError(28, "simulated disk full")
         return original_replace(self, target)
 
@@ -702,5 +704,7 @@ def test_write_marker_rollback_on_replace_failure(
 
     # Original marker intact (replace never landed).
     assert marker_path.exists()
-    # No orphan .tmp left behind.
-    assert not any(p.name.endswith(".tmp") for p in tmp_path.rglob("*"))
+    # No orphan staging file left behind. Round-29: check substring
+    # (".tmp." matches the new ".tmp.<pid>.<hex>" shape AND any
+    # legacy ".tmp" leftovers from older test fixtures).
+    assert not any(".tmp" in p.name for p in tmp_path.rglob("*"))

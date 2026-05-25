@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 
@@ -42,8 +43,24 @@ def _atomic_write(
     and cleanup-on-failure. Keeping all three behaviors in one place
     means any future storage class that wraps these helpers inherits
     the same discipline -- and a future hardening pass only has one
-    site to touch."""
-    tmp = path.with_name(path.name + ".tmp")
+    site to touch.
+
+    Round-29: per-call tmp filename suffix (".tmp.<pid>.<uuid12>").
+    Pre-r29 the suffix was the fixed string ".tmp" -- two concurrent
+    callers writing to the same path would share the SAME staging
+    file. Even with serialized callers at the storage-class layer
+    (ContentStorage threading.Lock added in r29 part A), a future
+    caller that forgets the lock would corrupt the staging bytes.
+    The per-call unique suffix makes the staging files trample-free
+    by construction.
+
+    Orphan .tmp.<pid>.<hex> files from a crashed write can be swept
+    at boot via _storage_recovery (TODO: add a per-storage sweep on
+    lifespan startup; out of scope for this commit). Unlike the
+    fixed-".tmp" pre-r29 shape, orphans here don't block the next
+    write -- they're cosmetic clutter only.
+    """
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:12]}")
     try:
         writer(tmp)
         os.chmod(tmp, mode)

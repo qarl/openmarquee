@@ -52,19 +52,25 @@ def _fake_png() -> bytes:
 
 
 def _no_leftover_tmp_files(root: Path) -> bool:
-    """True if there's no `.tmp` file anywhere under `root`."""
-    return not any(p.name.endswith(".tmp") for p in root.rglob("*"))
+    """True if there's no atomic-write staging file anywhere under
+    `root`. Round-29: the staging-file suffix changed from a fixed
+    ".tmp" to per-call ".tmp.<pid>.<hex>" so the matcher checks
+    `.tmp` SUBSTRING (rather than endswith) to catch both old and
+    new shapes."""
+    return not any(".tmp" in p.name for p in root.rglob("*"))
 
 
 def _patch_replace_to_raise(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Patch Path.replace to raise OSError only when invoked on a
-    .tmp path (which is the atomic-rename step). Saves to other
-    paths (e.g. tmp_path/seed_marker writes via different APIs)
-    aren't affected."""
+    """Patch Path.replace to raise OSError only when invoked on an
+    atomic-write staging path. Saves to other paths (e.g.
+    tmp_path/seed_marker writes via different APIs) aren't affected.
+
+    Round-29: staging suffix is per-call ".tmp.<pid>.<hex>", so we
+    match the .tmp SUBSTRING rather than endswith."""
     original_replace = Path.replace
 
     def _raise_if_tmp(self: Path, target):
-        if self.name.endswith(".tmp"):
+        if ".tmp." in self.name:
             raise OSError(28, "simulated disk full (errno=ENOSPC)")
         return original_replace(self, target)
 
