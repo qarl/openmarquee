@@ -347,7 +347,26 @@ async def upload_text_slide(
         raise _validation_error_422(exc) from exc
 
     storage.save_text_slide(slide, png)
-    _append_to_playlist(playlist_storage, slide.id)
+    # Round-17 rollback: _append_to_playlist's load+save round-trip
+    # has its own NFS exposure. Pre-r17 a save+append where append
+    # raised left the asset on disk but the playlist had no
+    # reference -- the operator's UI retry would create a SECOND
+    # asset with a fresh UUID, and the orphan would surface in the
+    # pallet via list_full_library forever. Roll back the just-
+    # written asset on append failure so retry restarts cleanly.
+    # Matches the r16 delete_content_item rollback shape.
+    try:
+        _append_to_playlist(playlist_storage, slide.id)
+    except Exception:
+        try:
+            storage.delete(slide.id)
+        except Exception:
+            log.exception(
+                "create_text_slide rollback failed for %s "
+                "(original exception below will still propagate)",
+                slide.id,
+            )
+        raise
     background.add_task(flock_sync.notify_peers, slide.id, "updated")
     return slide
 
@@ -594,7 +613,19 @@ async def upload_video(
     except ValidationError as exc:
         raise _validation_error_422(exc) from exc
     storage.save_video(video, thumbnail, mp4)
-    _append_to_playlist(playlist_storage, video.id)
+    # Round-17 rollback: see create_text_slide for rationale.
+    try:
+        _append_to_playlist(playlist_storage, video.id)
+    except Exception:
+        try:
+            storage.delete(video.id)
+        except Exception:
+            log.exception(
+                "create_video rollback failed for %s (original "
+                "exception below will still propagate)",
+                video.id,
+            )
+        raise
     background.add_task(flock_sync.notify_peers, video.id, "updated")
     return video
 
@@ -638,7 +669,19 @@ async def upload_image(
         raise _validation_error_422(exc) from exc
 
     storage.save_image(image, image_bytes)
-    _append_to_playlist(playlist_storage, image.id)
+    # Round-17 rollback: see create_text_slide for rationale.
+    try:
+        _append_to_playlist(playlist_storage, image.id)
+    except Exception:
+        try:
+            storage.delete(image.id)
+        except Exception:
+            log.exception(
+                "create_image rollback failed for %s (original "
+                "exception below will still propagate)",
+                image.id,
+            )
+        raise
     background.add_task(flock_sync.notify_peers, image.id, "updated")
     return image
 
@@ -736,7 +779,19 @@ async def upload_stream(
     except ValidationError as exc:
         raise _validation_error_422(exc) from exc
     storage.save_stream(slide)
-    _append_to_playlist(playlist_storage, slide.id)
+    # Round-17 rollback: see create_text_slide for rationale.
+    try:
+        _append_to_playlist(playlist_storage, slide.id)
+    except Exception:
+        try:
+            storage.delete(slide.id)
+        except Exception:
+            log.exception(
+                "create_stream rollback failed for %s (original "
+                "exception below will still propagate)",
+                slide.id,
+            )
+        raise
     background.add_task(flock_sync.notify_peers, slide.id, "updated")
     return slide
 
@@ -832,7 +887,21 @@ async def upload_web(
     except ValidationError as exc:
         raise _validation_error_422(exc) from exc
     storage.save_web(slide)
-    _append_to_playlist(playlist_storage, slide.id)
+    # Round-17 rollback: see create_text_slide for rationale.
+    # kick_web_screenshot stays AFTER the try block (alongside
+    # notify_peers) so it only fires on full success -- otherwise
+    # we'd kick a screenshot for a slide that just got rolled back.
+    try:
+        _append_to_playlist(playlist_storage, slide.id)
+    except Exception:
+        try:
+            storage.delete(slide.id)
+        except Exception:
+            log.exception(
+                "create_web rollback failed for %s (original exception below will still propagate)",
+                slide.id,
+            )
+        raise
     background.add_task(flock_sync.notify_peers, slide.id, "updated")
     # Bug W1: a brand-new Web slide only has the synthetic placeholder
     # asset until its first playback slot — its dashboard thumbnail /

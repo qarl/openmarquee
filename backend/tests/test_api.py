@@ -387,6 +387,114 @@ def test_delete_content_item_404_when_missing(client: TestClient):
     assert response.status_code == 404
 
 
+@pytest.mark.parametrize(
+    "route,payload_factory",
+    [
+        ("/api/content/text-slides", lambda: _upload_payload()),
+        (
+            "/api/content/images",
+            lambda: {
+                "name": "Logo",
+                "image_base64": base64.b64encode(_FAKE_PNG).decode(),
+            },
+        ),
+        (
+            "/api/content/streams",
+            lambda: {
+                "name": "Live",
+                "stream_url": "rtsp://laptop:8554/live",
+                "duration_ms": 15_000,
+                "on_unreachable": "black",
+                "transition": "fade",
+                "transition_ms": 300,
+            },
+        ),
+        (
+            "/api/content/web",
+            lambda: {
+                "name": "Status",
+                "url": "https://status.example.com",
+                "refresh_interval_s": 600,
+                "duration_ms": 15_000,
+                "transition": "fade",
+                "transition_ms": 300,
+            },
+        ),
+        # Video uses a separate fixture (needs the real MP4 payload) --
+        # handled in a sibling test below so we don't have to import
+        # _fake_mp4 at module scope here.
+    ],
+)
+def test_upload_rolls_back_asset_on_append_to_playlist_failure(
+    route: str,
+    payload_factory,
+    client: TestClient,
+    storage: ContentStorage,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Round-17 correctness regression: when _append_to_playlist
+    raises after storage.save_* succeeded, the just-written asset
+    must be rolled back so the operator's UI retry doesn't end up
+    with two tiles for one intended upload (list_full_library
+    surfaces orphans in the pallet).
+
+    Test shape: monkeypatch _append_to_playlist to raise OSError,
+    POST the upload, assert 500 surfaces AND the asset is NOT on
+    disk afterward (rollback worked).
+    """
+    from openmarquee import api as api_module
+
+    def raising_append(*args, **kwargs):
+        raise OSError("simulated NFS hiccup mid-playlist-save")
+
+    monkeypatch.setattr(api_module, "_append_to_playlist", raising_append)
+
+    client_no_raise = TestClient(app, raise_server_exceptions=False)
+    response = client_no_raise.post(route, json=payload_factory())
+    assert response.status_code == 500, (
+        f"{route}: expected 500 from simulated playlist failure, got {response.status_code}"
+    )
+
+    # CRITICAL: no orphan asset on disk. Pre-fix the asset would
+    # remain in storage (orphan in list_full_library) since the
+    # error happened AFTER storage.save_*.
+    monkeypatch.undo()
+    all_items = storage.list_all()
+    assert all_items == [], (
+        f"{route}: expected zero stored items after rollback, got "
+        f"{[type(i).__name__ for i in all_items]}"
+    )
+
+
+def test_upload_video_rolls_back_assets_on_append_to_playlist_failure(
+    client: TestClient,
+    storage: ContentStorage,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Round-17 regression (video flavor): video uploads write TWO
+    files (thumbnail PNG + asset MP4). Rollback must clean up the
+    whole item directory, not just one file. Same shape as the
+    parametrized test above, factored out because the payload
+    construction needs the _video_payload helper / _fake_mp4 bytes."""
+    from openmarquee import api as api_module
+
+    def raising_append(*args, **kwargs):
+        raise OSError("simulated NFS hiccup mid-playlist-save")
+
+    monkeypatch.setattr(api_module, "_append_to_playlist", raising_append)
+
+    client_no_raise = TestClient(app, raise_server_exceptions=False)
+    response = client_no_raise.post("/api/content/videos", json=_video_payload())
+    assert response.status_code == 500
+
+    monkeypatch.undo()
+    all_items = storage.list_all()
+    assert all_items == [], (
+        f"expected zero stored items after video rollback, got "
+        f"{[type(i).__name__ for i in all_items]}"
+    )
+
+
 def test_delete_content_item_rolls_back_tombstone_on_storage_failure(
     client: TestClient,
     storage: ContentStorage,
