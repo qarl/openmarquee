@@ -874,13 +874,32 @@ async function boot() {
         // uploader slots even though nothing relevant had changed.
         // 5 fields gate the remount; see priorDims declaration above
         // for the parallel-site future-reader anchor.
-        const dimsChanged =
+        //
+        // Round 31: split the gate so a rotation change SKIPS the
+        // early mount. Pre-r31, the early mount fired with new dims
+        // (including new rotation) but OLD asset.png thumbnails —
+        // operator saw stale-aspect thumbnails crammed into the
+        // new-rotation tile shape for ~1-3s while rerenderAllSlides
+        // ForRotation ran, then a flicker as the post-rerender mount
+        // landed. The `!rotationChanged && (...)` short-circuit on
+        // otherDimsChanged is intentional: a rotation flip already
+        // swaps width/height via effectiveDisplayDims (api.js:624-
+        // 626), so "rotation only" operator actions ALSO change
+        // width + height. Concurrent rotation + other-dim changes
+        // (rare — operator would need to change two settings in one
+        // save) skip the early mount too; the brightness/outputMode
+        // change becomes observable only after the post-rerender
+        // mount lands. Acceptable tradeoff: rotation events are
+        // infrequent, and stale-aspect-thumbnail flash is the
+        // worse operator experience.
+        const rotationChanged = priorDims.rotation !== dims.rotation;
+        const otherDimsChanged = !rotationChanged && (
             priorDims.width      !== dims.width ||
             priorDims.height     !== dims.height ||
-            priorDims.rotation   !== dims.rotation ||
             priorDims.outputMode !== dims.outputMode ||
-            priorDims.brightness !== dims.brightness;
-        if (dimsChanged) {
+            priorDims.brightness !== dims.brightness
+        );
+        if (otherDimsChanged) {
             mountDimensionedPanels(dims);
         }
         priorDims = dims;
