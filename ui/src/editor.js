@@ -633,64 +633,66 @@ export function mountEditor(
         drawCanvas(canvas, state);
     }
 
-    function syncLayerFromForm(groupEl) {
-        // The UI renders layers in reverse-array order, so DOM-child
-        // position ≠ array index. Read both off the group element to
-        // avoid the mix-up.
-        const arrayIdx = layerIndexOfGroup(groupEl);
-        if (arrayIdx < 0) return;
-        const layer = state.layers[arrayIdx];
-        if (!layer) return;
-        layer.text = groupEl.querySelector(".field-text").value;
-        layer.name = groupEl.querySelector(".field-layer-name").value;
-        layer.textColor = groupEl.querySelector(".field-text-color").value;
-        layer.fontFamily = groupEl.querySelector(".field-font-family").value;
-        const sizeEl = groupEl.querySelector(".field-font-size");
-        const parsedSize = Number(sizeEl.value);
+    // Pure: read form fields out of groupEl, return a SPARSE layer-
+    // shape object. Numeric fields are omitted from the result if the
+    // input is non-finite, so Object.assign-into-state preserves the
+    // last good value (matches the operator-typing-partial-input case).
+    // Always-present fields (text/name/colors/enums) are written every
+    // time. Read by syncLayerFromForm; not used by buildLayerGroupEl
+    // (which hydrates DOM .value attrs from layer state — the inverse
+    // direction).
+    function readLayerFromGroup(groupEl) {
+        const fields = {};
+        fields.text = groupEl.querySelector(".field-text").value;
+        fields.name = groupEl.querySelector(".field-layer-name").value;
+        fields.textColor = groupEl.querySelector(".field-text-color").value;
+        fields.fontFamily = groupEl.querySelector(".field-font-family").value;
+        const parsedSize = Number(groupEl.querySelector(".field-font-size").value);
         if (Number.isFinite(parsedSize) && parsedSize > 0) {
-            layer.fontSizePct = parsedSize;
+            fields.fontSizePct = parsedSize;
         }
-        // Live numeric readout next to the range slider's label, so the
-        // operator sees the current % without having to inspect the
-        // slider thumb.
+        fields.autoMode = groupEl.querySelector(".field-auto-mode").value || null;
+        const fmtEl = groupEl.querySelector(".field-auto-format");
+        fields.autoFormat = fields.autoMode ? fmtEl.value || null : null;
+        const textAlignEl = groupEl.querySelector(".field-text-align");
+        fields.textAlign = textAlignEl ? textAlignEl.value || "center" : "center";
+        const motionEl = groupEl.querySelector(".field-motion");
+        fields.motion = motionEl ? motionEl.value || "static" : "static";
+        const blendEl = groupEl.querySelector(".field-blend");
+        fields.blend = blendEl ? blendEl.value || "normal" : "normal";
+        const parsedOpacity = Number(groupEl.querySelector(".field-opacity")?.value);
+        if (Number.isFinite(parsedOpacity)) {
+            fields.opacity = Math.max(0, Math.min(1, parsedOpacity / 100));
+        }
+        const parsedIntensity = Number(groupEl.querySelector(".field-motion-intensity")?.value);
+        if (Number.isFinite(parsedIntensity)) {
+            fields.motionIntensity = Math.max(0, Math.min(100, Math.round(parsedIntensity)));
+        }
+        const parsedPhase = Number(groupEl.querySelector(".field-motion-phase")?.value);
+        if (Number.isFinite(parsedPhase)) {
+            fields.motionPhase = Math.max(0, Math.min(1, parsedPhase));
+        }
+        const parsedSpeed = Number(groupEl.querySelector(".field-motion-speed")?.value);
+        if (Number.isFinite(parsedSpeed)) {
+            fields.motionSpeed = Math.max(0, Math.min(2, parsedSpeed / 100));
+        }
+        return fields;
+    }
+
+    // Pure: write the 5 inline-readout textContent values from a layer
+    // object. No state mutation. Called by syncLayerFromForm (live
+    // updates while operator types) and buildLayerGroupEl (initial
+    // hydration on layer-card mount). Previously the formatting was
+    // duplicated in both call sites; this is the canonical source.
+    function paintLayerReadouts(groupEl, layer) {
         const sizeDisplayEl = groupEl.querySelector(".field-font-size-display");
         if (sizeDisplayEl) {
             sizeDisplayEl.textContent = `(${Math.round(layer.fontSizePct ?? pickFontSizePct())}%)`;
-        }
-        layer.autoMode = groupEl.querySelector(".field-auto-mode").value || null;
-        const fmtEl = groupEl.querySelector(".field-auto-format");
-        layer.autoFormat = layer.autoMode ? fmtEl.value || null : null;
-        const textAlignEl = groupEl.querySelector(".field-text-align");
-        layer.textAlign = textAlignEl ? textAlignEl.value || "center" : "center";
-        const motionEl = groupEl.querySelector(".field-motion");
-        layer.motion = motionEl ? motionEl.value || "static" : "static";
-        const blendEl = groupEl.querySelector(".field-blend");
-        layer.blend = blendEl ? blendEl.value || "normal" : "normal";
-        const opacityEl = groupEl.querySelector(".field-opacity");
-        const parsedOpacity = Number(opacityEl?.value);
-        if (Number.isFinite(parsedOpacity)) {
-            layer.opacity = Math.max(0, Math.min(1, parsedOpacity / 100));
         }
         const opacityDisplayEl = groupEl.querySelector(".field-opacity-display");
         if (opacityDisplayEl) {
             opacityDisplayEl.textContent = `(${Math.round((layer.opacity ?? 1) * 100)}%)`;
         }
-        const intensityEl = groupEl.querySelector(".field-motion-intensity");
-        const parsedIntensity = Number(intensityEl?.value);
-        if (Number.isFinite(parsedIntensity)) {
-            layer.motionIntensity = Math.max(0, Math.min(100, Math.round(parsedIntensity)));
-        }
-        const phaseEl = groupEl.querySelector(".field-motion-phase");
-        const parsedPhase = Number(phaseEl?.value);
-        if (Number.isFinite(parsedPhase)) {
-            layer.motionPhase = Math.max(0, Math.min(1, parsedPhase));
-        }
-        const speedEl = groupEl.querySelector(".field-motion-speed");
-        const parsedSpeed = Number(speedEl?.value);
-        if (Number.isFinite(parsedSpeed)) {
-            layer.motionSpeed = Math.max(0, Math.min(2, parsedSpeed / 100));
-        }
-        // Update the inline numeric readouts next to the slider labels.
         const intensityDisplayEl = groupEl.querySelector(".field-motion-intensity-display");
         if (intensityDisplayEl) {
             intensityDisplayEl.textContent = `(${layer.motionIntensity ?? 50})`;
@@ -701,8 +703,24 @@ export function mountEditor(
         }
         const phaseDisplayEl = groupEl.querySelector(".field-motion-phase-display");
         if (phaseDisplayEl) {
-            phaseDisplayEl.textContent = `(${(layer.motionPhase ?? 0).toFixed(2)})`;
+            // Number(...) wrap: defensive coercion adopted from the
+            // buildLayerGroupEl version. Sync's original bare .toFixed
+            // would TypeError on a stringly-typed motionPhase (which
+            // shouldn't occur in practice but defends the corner).
+            phaseDisplayEl.textContent = `(${Number(layer.motionPhase ?? 0).toFixed(2)})`;
         }
+    }
+
+    function syncLayerFromForm(groupEl) {
+        // The UI renders layers in reverse-array order, so DOM-child
+        // position ≠ array index. Read both off the group element to
+        // avoid the mix-up.
+        const arrayIdx = layerIndexOfGroup(groupEl);
+        if (arrayIdx < 0) return;
+        const layer = state.layers[arrayIdx];
+        if (!layer) return;
+        Object.assign(layer, readLayerFromGroup(groupEl));
+        paintLayerReadouts(groupEl, layer);
         // Hide the intensity+phase row when motion=static — those knobs
         // have no meaning without a non-static effect picked.
         const motionControlsEl = groupEl.querySelector(".field-motion-controls");
@@ -1063,10 +1081,6 @@ export function mountEditor(
         fontFamilyEl.value = layer.fontFamily || FONT_FAMILIES[0].value;
         fontFamilyEl.dispatchEvent(new Event("font-picker-sync"));
         fontSizeEl.value = String(layer.fontSizePct ?? pickFontSizePct());
-        const sizeDisplayEl = groupEl.querySelector(".field-font-size-display");
-        if (sizeDisplayEl) {
-            sizeDisplayEl.textContent = `(${Math.round(layer.fontSizePct ?? pickFontSizePct())}%)`;
-        }
         autoModeEl.value = layer.autoMode || "";
         autoModeHintEl.hidden = !layer.autoMode;
         populateAutoFormatOptions(groupEl, layer.autoMode || "", layer.autoFormat || null);
@@ -1085,27 +1099,14 @@ export function mountEditor(
         const blendEl = groupEl.querySelector(".field-blend");
         if (blendEl) blendEl.value = layer.blend || "normal";
         const opacityEl = groupEl.querySelector(".field-opacity");
-        const opacityVal = Math.round((layer.opacity ?? 1) * 100);
-        if (opacityEl) opacityEl.value = String(opacityVal);
-        const opacityDisplayEl = groupEl.querySelector(".field-opacity-display");
-        if (opacityDisplayEl) opacityDisplayEl.textContent = `(${opacityVal}%)`;
+        if (opacityEl) opacityEl.value = String(Math.round((layer.opacity ?? 1) * 100));
         const intensityEl = groupEl.querySelector(".field-motion-intensity");
         const phaseEl = groupEl.querySelector(".field-motion-phase");
         const speedEl = groupEl.querySelector(".field-motion-speed");
-        const intensityVal = layer.motionIntensity ?? 50;
-        const phaseVal = layer.motionPhase ?? 0;
-        const speedVal = layer.motionSpeed ?? 1.0;
-        intensityEl.value = String(intensityVal);
-        phaseEl.value = String(phaseVal);
-        if (speedEl) speedEl.value = String(Math.round(speedVal * 100));
-        groupEl.querySelector(".field-motion-intensity-display").textContent =
-            `(${intensityVal})`;
-        groupEl.querySelector(".field-motion-phase-display").textContent =
-            `(${Number(phaseVal).toFixed(2)})`;
-        const speedDisplayEl = groupEl.querySelector(".field-motion-speed-display");
-        if (speedDisplayEl) {
-            speedDisplayEl.textContent = `(${Math.round(speedVal * 100)}%)`;
-        }
+        intensityEl.value = String(layer.motionIntensity ?? 50);
+        phaseEl.value = String(layer.motionPhase ?? 0);
+        if (speedEl) speedEl.value = String(Math.round((layer.motionSpeed ?? 1) * 100));
+        paintLayerReadouts(groupEl, layer);
         groupEl.querySelector(".field-motion-controls").hidden =
             (layer.motion || "static") === "static";
         refreshLayerHeader(groupEl, layer, idx);
