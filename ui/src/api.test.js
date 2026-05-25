@@ -547,7 +547,13 @@ describe("extractDetailMessage (15.3)", () => {
         expect(await extractDetailMessage(response)).toBe("peer already exists");
     });
 
-    it("returns the first msg from a 422 ValidationError array", async () => {
+    it("returns the first msg + field path from a 422 ValidationError array", async () => {
+        // Updated assertion to lock the loc-prefix behavior added
+        // alongside this test edit. The fuller loc-handling contract
+        // (body. filter, nested paths, missing loc fallback) is
+        // covered in api-extract-detail-loc.test.js (separate file
+        // because that suite runs in node env to dodge the jsdom
+        // virtiofs wedge).
         const response = {
             status: 422,
             statusText: "Unprocessable Entity",
@@ -558,7 +564,7 @@ describe("extractDetailMessage (15.3)", () => {
                 ],
             }),
         };
-        expect(await extractDetailMessage(response)).toBe("string too long");
+        expect(await extractDetailMessage(response)).toBe("name: string too long");
     });
 
     it("falls back to '<status> <statusText>' when body isn't JSON", async () => {
