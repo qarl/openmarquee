@@ -221,6 +221,14 @@ export function mountInlinePreview(container, options) {
             if (stopped) return;
             textOverlayKey = null;
             renderOnce();
+        }).catch((err) => {
+            // document.fonts.ready itself shouldn't reject, but a sync
+            // throw in renderOnce (transient teardown layout state,
+            // font-substitution edge cases) would surface only as
+            // "Uncaught (in promise)" without this. Defensive logging
+            // only — no recovery; thumbnails stay on fallback-font
+            // until the next refresh().
+            console.error("[inline-preview] fonts.ready handler:", err);
         });
     }
 
