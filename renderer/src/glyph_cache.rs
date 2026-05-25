@@ -41,7 +41,7 @@
 // for Slice 1; LRU eviction or page-grow is a Slice 1.x follow-up
 // triggered by first observed pressure).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -224,9 +224,35 @@ enum Completion {
 /// `slots`-then-`recency` lock order used by `evict_lru_ready`,
 /// `get_or_request` (Ready-hit), and `poll_completions` (Ready
 /// upload) has no second contender and cannot deadlock.
+///
+/// Round 8 (2026-05-25): added per-render-mode `BTreeMap<tick,
+/// GlyphKey>` reverse index so eviction picks the coldest entry
+/// in O(log N) via `first_key_value()` instead of O(N) HashMap
+/// scan. Two maps (one per RenderMode) avoid the "walk past the
+/// wrong mode" scan; eviction is mode-specific (the page that
+/// just filled). Maintenance: every touch removes the old tick
+/// from the appropriate map and inserts the new tick; eviction
+/// pops the front and also removes from `last_used`.
 struct RecencyState {
     clock: u64,
     last_used: HashMap<GlyphKey, u64>,
+    /// MSDF Ready glyphs sorted by recency tick (ascending — front
+    /// is coldest). Invariant: every key whose `last_used` value is
+    /// `t` AND whose `render_mode == Msdf` appears here as
+    /// `(t -> key)`. Maintained by `touch_recency` (insert/remove)
+    /// and `evict_lru_ready` (remove).
+    by_tick_msdf: BTreeMap<u64, GlyphKey>,
+    /// Same shape, COLR Ready glyphs.
+    by_tick_colr: BTreeMap<u64, GlyphKey>,
+}
+
+impl RecencyState {
+    fn by_tick_mut(&mut self, mode: RenderMode) -> &mut BTreeMap<u64, GlyphKey> {
+        match mode {
+            RenderMode::Msdf => &mut self.by_tick_msdf,
+            RenderMode::Colr => &mut self.by_tick_colr,
+        }
+    }
 }
 
 pub struct GlyphCache {
@@ -380,6 +406,8 @@ impl GlyphCache {
             recency: Mutex::new(RecencyState {
                 clock: 0,
                 last_used: HashMap::new(),
+                by_tick_msdf: BTreeMap::new(),
+                by_tick_colr: BTreeMap::new(),
             }),
             work_tx,
             completion_rx,
@@ -399,11 +427,24 @@ impl GlyphCache {
     /// already held (nested slots-then-recency lock order, matching
     /// evict_lru_ready). Workers never lock `recency` so this nesting
     /// cannot deadlock.
+    ///
+    /// Round 8: also maintains the per-render-mode `by_tick_*`
+    /// reverse index. On re-touch of an existing key we remove the
+    /// old (old_tick -> key) entry before inserting the fresh
+    /// (new_tick -> key); on first-touch we just insert. Eviction's
+    /// O(log N) BTreeMap.first_key_value() depends on this invariant
+    /// — a stale (tick -> key) for an evicted/already-re-touched key
+    /// would silently mis-pick the victim.
     fn touch_recency(&self, key: GlyphKey) {
         let mut r = self.recency.lock().unwrap();
         r.clock += 1;
         let tick = r.clock;
-        r.last_used.insert(key, tick);
+        let old_tick = r.last_used.insert(key, tick);
+        let by_tick = r.by_tick_mut(key.render_mode);
+        if let Some(old) = old_tick {
+            by_tick.remove(&old);
+        }
+        by_tick.insert(tick, key);
     }
 
     /// Slice 3C: evict the least-recently-used `Ready` slot of the
@@ -426,35 +467,61 @@ impl GlyphCache {
     /// the worker re-rasterizes into a fresh slot. That re-raster
     /// cost is the expected, correct price of a bounded atlas.
     ///
-    /// Lock order: `slots` then `recency`. Workers only ever lock
-    /// `slots`, never `recency`, so this nesting cannot deadlock.
+    /// Lock order: `recency` first to pull the victim key out of the
+    /// per-mode BTreeMap, then `slots` for the actual remove +
+    /// SlotPos retrieval. This INVERTS the pre-r8 slots-then-recency
+    /// order — safe because workers still never touch `recency`, so
+    /// no opposite-direction nesting exists anywhere in the cache.
+    /// `get_or_request` and `poll_completions` still acquire
+    /// slots-then-recency on their NESTED hit/upload path; this
+    /// function holds them sequentially (release recency before
+    /// acquiring slots), so there is no actual nested-order conflict
+    /// between the two call families.
+    ///
+    /// Round 8: O(log N) eviction via BTreeMap.pop_first(). Pre-r8
+    /// was O(N) linear scan over the entire slots HashMap, holding
+    /// both mutexes the whole time -- with worker contention on
+    /// `slots`, that was a worker-stall window proportional to cache
+    /// size. The BTreeMap reverse index maintained by touch_recency
+    /// reduces eviction to a single pop_first + a scoped slots
+    /// remove.
     fn evict_lru_ready(
         &self,
         page: &mut crate::atlas_page::AtlasPage,
         render_mode: RenderMode,
     ) -> bool {
-        let mut slots = self.slots.lock().unwrap();
-        let mut recency = self.recency.lock().unwrap();
-        // Coldest Ready entry of this render_mode: the one with the
-        // smallest last-used tick. A Ready key with no recency
-        // entry (shouldn't happen — poll stamps one on Ready) is
-        // treated as tick 0 = coldest, so it evicts first.
-        let victim: Option<(GlyphKey, SlotPos)> = slots
-            .iter()
-            .filter_map(|(k, st)| match st {
-                SlotState::Ready { slot, .. } if k.render_mode == render_mode => {
-                    Some((*k, *slot))
+        let victim_key = {
+            let mut recency = self.recency.lock().unwrap();
+            let by_tick = recency.by_tick_mut(render_mode);
+            match by_tick.pop_first() {
+                Some((_, key)) => {
+                    recency.last_used.remove(&key);
+                    key
                 }
-                _ => None,
-            })
-            .min_by_key(|(k, _)| recency.last_used.get(k).copied().unwrap_or(0));
-        let Some((victim_key, victim_slot)) = victim else {
-            return false;
+                None => return false,
+            }
         };
-        page.free_slot(victim_slot);
-        slots.remove(&victim_key);
-        recency.last_used.remove(&victim_key);
-        true
+        // recency lock released; now acquire slots only for the
+        // SlotPos read + remove. SlotState::Ready invariant holds
+        // because by_tick only ever contains keys inserted via
+        // touch_recency, which is called only when the slots entry
+        // is in SlotState::Ready (get_or_request gate via the
+        // `matches!(state, SlotState::Ready)` check; poll_completions
+        // calls touch_recency right after inserting Ready).
+        let mut slots = self.slots.lock().unwrap();
+        match slots.remove(&victim_key) {
+            Some(SlotState::Ready { slot, .. }) => {
+                page.free_slot(slot);
+                true
+            }
+            // Defensive: a key was popped from by_tick but the slots
+            // entry is gone (or in another state). Under the current
+            // invariant this shouldn't happen, but treat it as
+            // "victim was already cleaned up" rather than panicking.
+            // Returns false so the caller's allocate-retry loop bails
+            // cleanly instead of looping.
+            _ => false,
+        }
     }
 
     /// Look up a glyph by key. Returns:
@@ -1355,6 +1422,62 @@ mod tests {
             slots.contains_key(&msdf_glyph),
             "an MSDF glyph must survive a COLR-page eviction",
         );
+    }
+
+    /// Round 8 tripwire: eviction's O(log N) BTreeMap path picks the
+    /// truly-coldest entry even when there are many entries AND when
+    /// re-touched entries shift the cold-end. Pre-r8 was O(N) HashMap
+    /// scan -- this lock-in regression-fences the BTreeMap reverse
+    /// index against silent staleness (e.g., touch_recency forgetting
+    /// to remove the old tick from by_tick would leave a stale
+    /// (old_tick -> key) at the front of the map, mis-picking a
+    /// previously-hot key as the victim).
+    #[test]
+    fn evict_lru_ready_btreemap_picks_coldest_among_many_and_after_retouch() {
+        let cache = GlyphCache::new(0);
+        let mut page = crate::atlas_page::AtlasPage::new(96);
+        // 8 entries: 0..8, touched in insertion order so tick = 1..8.
+        let keys: Vec<GlyphKey> = (0..8).map(|i| colr_key(0x100 + i)).collect();
+        for k in &keys {
+            inject_ready(&cache, &mut page, *k);
+        }
+        // Re-touch keys[0] (the originally coldest). Now its tick is
+        // 9 (post the 8 inserts). The new coldest is keys[1].
+        cache.touch_recency(keys[0]);
+        // Confirm the BTreeMap reflects the re-touch (no stale tick
+        // remains for keys[0]) -- this is the precise invariant the
+        // r8 refactor depends on.
+        {
+            let r = cache.recency.lock().unwrap();
+            let by_tick: Vec<GlyphKey> =
+                r.by_tick_colr.values().copied().collect();
+            // by_tick is sorted by tick ascending; the front should
+            // now be keys[1] (originally tick=2 after inject_ready),
+            // and keys[0] should be at the back (tick=9, the most
+            // recent re-touch).
+            assert_eq!(by_tick.first().copied(), Some(keys[1]));
+            assert_eq!(by_tick.last().copied(), Some(keys[0]));
+            // No stale (old_tick=1 -> keys[0]) entry surviving the
+            // re-touch.
+            assert_eq!(by_tick.len(), 8);
+        }
+        // Evict: must pick keys[1] (the post-re-touch coldest),
+        // NOT keys[0] (which would be the pre-fix HashMap-scan
+        // victim if the BTreeMap held stale ticks).
+        assert!(cache.evict_lru_ready(&mut page, RenderMode::Colr));
+        let slots = cache.slots.lock().unwrap();
+        assert!(
+            !slots.contains_key(&keys[1]),
+            "coldest after re-touch (keys[1]) must be the victim",
+        );
+        assert!(
+            slots.contains_key(&keys[0]),
+            "re-touched keys[0] must NOT be evicted (no stale tick)",
+        );
+        // The other 6 keys also survive.
+        for k in keys.iter().skip(2) {
+            assert!(slots.contains_key(k), "key {k:?} should remain cached");
+        }
     }
 
     #[test]
