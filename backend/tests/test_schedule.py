@@ -410,9 +410,7 @@ def test_v1_migration_preserves_unknown_top_level_fields(tmp_path: Path):
     reloaded = storage2.load()
     # Pydantic v2 with extra="allow" exposes extras via model_extra.
     assert reloaded.model_extra is not None
-    assert reloaded.model_extra.get("future_v3_field") == (
-        "hypothetical-forward-compat-value"
-    )
+    assert reloaded.model_extra.get("future_v3_field") == ("hypothetical-forward-compat-value")
     assert reloaded.model_extra.get("future_v3_nested") == {"hint": "preserve me too"}
 
 
@@ -436,8 +434,8 @@ def test_v1_migration_explicit_kwargs_not_shadowed_by_extras_splat(tmp_path: Pat
     playlist_storage.set_by_id(lunch)
 
     data = {
-        "schema_version": 1,           # v1; default of 2 must win post-migration
-        "rules": [                     # v1 array; replaced by migrated_rules
+        "schema_version": 1,  # v1; default of 2 must win post-migration
+        "rules": [  # v1 array; replaced by migrated_rules
             {
                 "name": "weekday lunch",
                 "days": ["mon"],
@@ -449,7 +447,7 @@ def test_v1_migration_explicit_kwargs_not_shadowed_by_extras_splat(tmp_path: Pat
         ],
         "default_playlist_name": "lunch",  # v1 string; resolved to lunch.id
         "default_playlist_id": str(uuid4()),  # mixed-shape junk; carve-out drops
-        "tz": "America/New_York",      # passed explicitly; carve-out drops from extras
+        "tz": "America/New_York",  # passed explicitly; carve-out drops from extras
         "future_v3_field": "preserve me",
     }
     schedule, was_migrated = _coerce_to_schedule(data, playlist_storage)
