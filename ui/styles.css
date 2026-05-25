@@ -2726,6 +2726,46 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
   cursor: pointer; border: 0;
 }
 
+/* Global error-boundary backstop (audit finding #8, 2026-05-25).
+   Fixed-position overlay so a long error message doesn't disrupt
+   topbar layout. Stays distinguishable from the existing status
+   pills via the bad-state palette + the dismiss button + the
+   hard-edge banner shape. aria-live="assertive" on the element
+   itself (in index.html) drives screen-reader announcement. */
+.om-error-banner {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  background: var(--om-bad);
+  color: #fff;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 13px;
+  z-index: 9999;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+.om-error-banner[hidden] { display: none; }
+.om-error-banner-message {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.om-error-banner-dismiss {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  color: #fff;
+  border-radius: 4px;
+  width: 28px; height: 28px;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0;
+  flex-shrink: 0;
+}
+.om-error-banner-dismiss:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
 /* Pill */
 .om-pill {
   display: inline-flex; align-items: center; gap: 6px;

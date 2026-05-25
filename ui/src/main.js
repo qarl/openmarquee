@@ -1091,6 +1091,81 @@ async function boot() {
     // Silence unused-var; `nav` is the mount's return value in case a
     // caller later wants to trigger navigation programmatically.
     void nav;
+
+    // Closes finding #8 from the 2026-05-25 error-boundary audit.
+    // Panel-level status pills (the minors-fix surfaces; finding
+    // #3-#7) already handle context-specific messages; this is the
+    // global catch-all backstop for uncaught errors + unhandled
+    // promise rejections that would otherwise console-log silently.
+    installGlobalErrorBanner();
+}
+
+// Idempotency guard: if boot() is invoked twice (test re-mount,
+// dev-reload edge cases), the global handlers register once.
+let _errorBannerInstalled = false;
+
+function installGlobalErrorBanner() {
+    if (_errorBannerInstalled) return;
+    _errorBannerInstalled = true;
+
+    const banner = document.querySelector("[data-error-banner]");
+    if (!banner) {
+        // index.html didn't ship the slot (older bundle, test env
+        // without the topbar) -- nothing to do. Fail silent rather
+        // than throwing from the very handler that's supposed to
+        // catch throws.
+        return;
+    }
+    const messageEl = banner.querySelector("[data-error-banner-message]");
+    const dismissBtn = banner.querySelector("[data-error-banner-dismiss]");
+
+    function show(msg) {
+        if (messageEl) {
+            messageEl.textContent = msg || "Something went wrong";
+        }
+        banner.hidden = false;
+    }
+    function hide() {
+        banner.hidden = true;
+        if (messageEl) messageEl.textContent = "";
+    }
+
+    if (dismissBtn) {
+        dismissBtn.addEventListener("click", hide);
+    }
+
+    function extractMessage(value) {
+        if (!value) return "";
+        if (typeof value === "string") return value;
+        if (typeof value.message === "string") return value.message;
+        try {
+            return String(value);
+        } catch {
+            return "";
+        }
+    }
+
+    window.addEventListener("error", (ev) => {
+        try {
+            const msg = extractMessage(ev?.error) || extractMessage(ev?.message);
+            show(msg);
+            console.error("[openmarquee] uncaught error:", ev?.error ?? ev?.message);
+        } catch {
+            // The backstop handler must not itself throw. If anything
+            // here errors (e.g. show() reaches a banner that was
+            // removed from the DOM after init), swallow silently.
+        }
+    });
+
+    window.addEventListener("unhandledrejection", (ev) => {
+        try {
+            const reason = ev?.reason;
+            show(extractMessage(reason));
+            console.error("[openmarquee] unhandled rejection:", reason);
+        } catch {
+            // See above -- backstop must not throw.
+        }
+    });
 }
 
 if (typeof window !== "undefined") {

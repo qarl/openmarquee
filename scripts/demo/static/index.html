@@ -132,6 +132,11 @@
                 <span data-peer-pill-text>– / –</span>
             </span>
         </div>
+        <!-- Global error-boundary backstop (audit finding #8, 2026-05-25). -->
+        <div class="om-error-banner" data-error-banner role="alert" aria-live="assertive" hidden>
+            <span class="om-error-banner-message" data-error-banner-message></span>
+            <button class="om-error-banner-dismiss" data-error-banner-dismiss type="button" aria-label="Dismiss error">×</button>
+        </div>
 
         <div class="om-scroll" id="app">
             <p class="status">Loading…</p>
