@@ -135,6 +135,16 @@ jobs:
       - name: Vitest
         working-directory: ui
         run: npm test --silent
+      # Captive-portal bundle-size watchlist. Builds the 3 captive
+      # entries fresh (no trust of npm-run-build's dist/) + measures
+      # gz per file + fails if any threshold breached. Thresholds
+      # live in the script (single source of truth + auditable in
+      # the same commit a tighten/loosen happens). Placed after
+      # vitest so a size breach doesn't mask a test failure: each
+      # check is independently visible in the job log.
+      - name: Captive-portal bundle-size gate
+        working-directory: ui
+        run: bash scripts/check-bundle-sizes.sh
 
   renderer:
     # 16.4 / sweep #8 B6: cargo test for the host-portable surfaces
