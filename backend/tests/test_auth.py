@@ -283,6 +283,28 @@ def test_change_password_bumps_token_version():
 # --- api_auth endpoints (TestClient against the FastAPI app) ---
 
 
+@pytest.fixture(autouse=True)
+def _expire_set_password_grace(monkeypatch):
+    """Default the Bundle B2 item 7 set-password grace to ALREADY
+    EXPIRED for every test in this module. Reason: TestClient sends
+    from `("testclient", 50000)` which `ipaddress.ip_address` rejects
+    with ValueError, so `_is_private_or_loopback_ip` returns False
+    -- which means EVERY test would 403 during the grace window
+    (active for the first 30s of the process, which always covers
+    the pytest run).
+
+    Tests that want to exercise the grace explicitly (the four
+    test_set_password_*_grace_* cases) re-open the window in their
+    own monkeypatch + force the IP check too."""
+    from openmarquee import api_auth
+
+    monkeypatch.setattr(
+        api_auth,
+        "_BOOT_MONOTONIC",
+        api_auth.time.monotonic() - api_auth._SET_PASSWORD_GRACE_SECONDS - 1.0,
+    )
+
+
 @pytest.fixture
 def client(tmp_path: Path) -> TestClient:
     """TestClient with an isolated AuthStorage path. Each test gets
@@ -391,6 +413,129 @@ def test_login_fails_with_wrong_password(client: TestClient):
 def test_login_fails_when_not_configured(client: TestClient):
     response = client.post("/api/auth/login", json={"password": "anything-ok"})
     assert response.status_code == 404
+
+
+# ---- 2026-05-25 Bundle B2 item 7: set-password loopback grace ----
+
+
+def test_set_password_grace_helper_reports_active_at_module_import(monkeypatch):
+    """The module-level _BOOT_MONOTONIC capture means the grace is
+    active from process import. A bare assertion right after import
+    confirms the helper returns True when called in the first 30s of
+    the process's life -- which is always-true in pytest fast-loop
+    runs."""
+    from openmarquee import api_auth
+
+    # In a long pytest run this could conceivably be False; force the
+    # window open by resetting the boot time to "just now."
+    monkeypatch.setattr(api_auth, "_BOOT_MONOTONIC", api_auth.time.monotonic())
+    assert api_auth._set_password_grace_active() is True
+
+
+def test_set_password_grace_helper_closes_after_window(monkeypatch):
+    """After _SET_PASSWORD_GRACE_SECONDS the helper returns False.
+    Monkeypatch _BOOT_MONOTONIC to be 31s ago so the 30s window has
+    elapsed without needing to actually sleep."""
+    from openmarquee import api_auth
+
+    monkeypatch.setattr(
+        api_auth,
+        "_BOOT_MONOTONIC",
+        api_auth.time.monotonic() - api_auth._SET_PASSWORD_GRACE_SECONDS - 1.0,
+    )
+    assert api_auth._set_password_grace_active() is False
+
+
+def test_set_password_during_grace_rejects_public_ip(monkeypatch, tmp_path):
+    """During grace, a request from a public IP must 403 BEFORE the
+    handler does anything. TestClient sends from `testclient` /
+    `127.0.0.1` by default -- monkeypatch the IP check to return
+    False so we simulate a public-IP source.
+
+    The realistic threat scenario this closes: a fresh-boot device
+    on the operator's LAN, where a malicious LAN device races the
+    operator to POST set-password. The grace narrows the attack
+    surface to trusted-network sources only during the boot window."""
+    monkeypatch.setenv("OPENMARQUEE_AUTH_PATH", str(tmp_path / "auth.json"))
+    # Force grace active.
+    from openmarquee import api_auth
+
+    monkeypatch.setattr(api_auth, "_BOOT_MONOTONIC", api_auth.time.monotonic())
+    # Force the IP check to return False (simulating a public IP).
+    monkeypatch.setattr(api_auth, "_is_private_or_loopback_ip", lambda host: False)
+
+    from openmarquee.app import app
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    assert response.status_code == 403, (
+        f"expected 403 during grace from public IP; got {response.status_code}"
+    )
+    body = response.json()
+    assert "trusted-network" in body.get("detail", "").lower()
+
+
+def test_set_password_during_grace_accepts_loopback(monkeypatch, tmp_path):
+    """During grace, a request from loopback / RFC1918 / Tailscale
+    CGNAT must pass through to the handler. TestClient's default
+    client IP is `testclient` which gets parsed via _is_private_or_
+    loopback_ip; force the helper to return True to simulate the
+    intended trusted-network source."""
+    monkeypatch.setenv("OPENMARQUEE_AUTH_PATH", str(tmp_path / "auth.json"))
+    from openmarquee.dependencies import _auth_storage_singleton
+
+    _auth_storage_singleton.cache_clear()
+    from openmarquee import api_auth
+
+    monkeypatch.setattr(api_auth, "_BOOT_MONOTONIC", api_auth.time.monotonic())
+    monkeypatch.setattr(api_auth, "_is_private_or_loopback_ip", lambda host: True)
+
+    from openmarquee.app import app
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    assert response.status_code == 200, (
+        f"expected 200 during grace from trusted IP; got {response.status_code}"
+    )
+
+
+def test_set_password_after_grace_accepts_public_ip(monkeypatch, tmp_path):
+    """After grace expires, the endpoint reverts to its pre-fix
+    posture (reachable from any IP). Otherwise an operator who
+    doesn't set the password within the 30s window would be locked
+    out forever from non-loopback access."""
+    monkeypatch.setenv("OPENMARQUEE_AUTH_PATH", str(tmp_path / "auth.json"))
+    from openmarquee.dependencies import _auth_storage_singleton
+
+    _auth_storage_singleton.cache_clear()
+    from openmarquee import api_auth
+
+    # Force grace EXPIRED.
+    monkeypatch.setattr(
+        api_auth,
+        "_BOOT_MONOTONIC",
+        api_auth.time.monotonic() - api_auth._SET_PASSWORD_GRACE_SECONDS - 1.0,
+    )
+    # IP check would return False (public IP), but since grace is
+    # expired the check shouldn't even run.
+    monkeypatch.setattr(api_auth, "_is_private_or_loopback_ip", lambda host: False)
+
+    from openmarquee.app import app
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    assert response.status_code == 200, (
+        f"expected 200 after grace from any IP; got {response.status_code}"
+    )
 
 
 def test_change_password_requires_auth(client: TestClient):

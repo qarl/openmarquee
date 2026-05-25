@@ -261,16 +261,29 @@ app.add_middleware(
 # value for high-loss diagnostics depends on it seeing everything.
 app.add_middleware(PerfMiddleware)
 
-# Content-Security-Policy header stamper. Outer-most middleware so
-# the header is added to EVERY response, including AuthMiddleware's
-# 401s (proves out via test_csp_header_present_on_401_when_auth_
-# enabled). Set OPENMARQUEE_CSP_REPORT_ONLY=1 to emit the
-# report-only variant during policy tuning -- production default is
-# enforce.
+# Content-Security-Policy header stamper. Sits outside Auth/Fqdn so
+# the header is added to EVERY response those middlewares can return
+# (AuthMiddleware's 401s, Fqdn's 301s, healthz 200s) -- proves out
+# via test_csp_header_present_on_401_when_auth_enabled. The only
+# layer above CSP is BodyCapMiddleware (below) whose 413 is a JSON
+# error response, so CSP-stamping it would add no defensive value.
+# Set OPENMARQUEE_CSP_REPORT_ONLY=1 to emit the report-only variant
+# during policy tuning -- production default is enforce.
 app.add_middleware(
     CSPMiddleware,
     report_only=os.environ.get("OPENMARQUEE_CSP_REPORT_ONLY") == "1",
 )
+
+# 2026-05-25 Bundle B2 piece 3: ASGI body-cap. OUTERMOST middleware
+# (added LAST per Starlette's reversed-stack semantics) so a 413
+# fires BEFORE any other middleware reads the body. Closes the gap
+# B1's Pydantic Field(max_length=...) left open -- max_length
+# rejects at validation time but Starlette buffers the full body
+# first. This gate rejects at Content-Length read so a hostile
+# multi-MB POST never allocates the body buffer at all.
+from openmarquee._body_cap_middleware import BodyCapMiddleware  # noqa: E402
+
+app.add_middleware(BodyCapMiddleware)
 
 
 @app.exception_handler(RequestValidationError)

@@ -1221,13 +1221,13 @@ def test_put_web_metadata_only_edit_does_not_kick_a_fetch(client: TestClient):
 
 
 def test_upload_text_slide_rejects_oversize_png_base64(client: TestClient):
-    """A 20 MB base64 png_base64 (above the 14 MB cap) must 422 at
+    """A png_base64 string above the 14 MB Pydantic cap must 422 at
     validation, BEFORE the handler tries to b64decode + open as PNG.
-    Pin the cap as a regression lock -- loosening it without a
-    matching threat-model update silently widens the unauth-write
-    surface."""
+    Sized at 14.5 MB so it passes the OUTER ASGI body-cap (15 MB,
+    Bundle B2) but trips the INNER Pydantic Field max_length. This
+    pins the inner gate; B2's body-cap tests pin the outer."""
     payload = _upload_payload(name="Oversize")
-    payload["png_base64"] = "A" * 20_000_000
+    payload["png_base64"] = "A" * 14_500_000
     response = client.post("/api/content/text-slides", json=payload)
     assert response.status_code == 422
     # The Pydantic error must reference the field so operators
@@ -1248,11 +1248,12 @@ def test_upload_text_slide_accepts_payload_under_cap(client: TestClient):
 
 
 def test_upload_image_rejects_oversize_image_base64(client: TestClient):
-    """ImageSlide image_base64 cap is 27 MB (~20 MB raw). 40 MB
-    base64 must 422 at validation."""
+    """ImageSlide image_base64 Pydantic cap is 27 MB. Sized at 27.5
+    MB to pass the OUTER ASGI body-cap (28 MB, Bundle B2) but trip
+    the INNER Pydantic Field max_length."""
     payload = {
         "name": "OversizeImage",
-        "image_base64": "A" * 40_000_000,
+        "image_base64": "A" * 27_500_000,
     }
     response = client.post("/api/content/images", json=payload)
     assert response.status_code == 422
@@ -1260,12 +1261,13 @@ def test_upload_image_rejects_oversize_image_base64(client: TestClient):
 
 
 def test_upload_video_rejects_oversize_mp4_base64(client: TestClient):
-    """VideoSlide mp4_base64 cap is 270 MB (~200 MB raw H.264).
-    A 300 MB base64 payload must 422 at validation."""
+    """VideoSlide mp4_base64 Pydantic cap is 270 MB. Sized at 275 MB
+    to pass the OUTER ASGI body-cap (290 MB, Bundle B2) but trip the
+    INNER Pydantic Field max_length."""
     payload = {
         "name": "OversizeVideo",
         "png_base64": base64.b64encode(_FAKE_PNG).decode(),
-        "mp4_base64": "A" * 300_000_000,
+        "mp4_base64": "A" * 275_000_000,
     }
     response = client.post("/api/content/videos", json=payload)
     assert response.status_code == 422
@@ -1273,12 +1275,13 @@ def test_upload_video_rejects_oversize_mp4_base64(client: TestClient):
 
 
 def test_upload_video_rejects_oversize_thumbnail_png(client: TestClient):
-    """VideoSlide.png_base64 (thumbnail) shares the same 14 MB cap
-    as TextSlide.png_base64. 20 MB thumbnail must 422 even if
-    mp4_base64 is well-formed."""
+    """VideoSlide.png_base64 (thumbnail) shares the same 14 MB
+    Pydantic cap as TextSlide.png_base64. Sized at 14.5 MB to pass
+    the OUTER body-cap (290 MB for videos, plenty of room) but trip
+    the INNER Pydantic Field max_length."""
     payload = {
         "name": "OversizeThumbnail",
-        "png_base64": "A" * 20_000_000,
+        "png_base64": "A" * 14_500_000,
         "mp4_base64": "AAAA",  # bogus but small (test isolates png_base64 cap)
     }
     response = client.post("/api/content/videos", json=payload)

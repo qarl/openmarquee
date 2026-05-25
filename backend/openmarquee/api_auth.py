@@ -20,11 +20,13 @@ bearer token lives in `auth_middleware.py`.
 
 from __future__ import annotations
 
+import time
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from openmarquee._rate_limit import LOGIN_BUCKET, client_ip_or_unknown
 from openmarquee.auth import (
     MIN_PASSWORD_LEN,
     AuthStorage,
@@ -35,8 +37,37 @@ from openmarquee.auth import (
     verify_token,
 )
 from openmarquee.dependencies import get_auth_storage
+from openmarquee.fqdn_redirect_middleware import _is_private_or_loopback_ip
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+# 2026-05-25 Bundle B2 item 7: set-password loopback-grace boot timer.
+#
+# Captured at module-import time (i.e., process boot). For the first
+# _SET_PASSWORD_GRACE_SECONDS of the process's life, /api/auth/set-
+# password is reachable ONLY from loopback / RFC1918 / Tailscale CGNAT
+# source IPs (trusted-peer-shaped). After the grace expires, the
+# endpoint reverts to its prior behavior (reachable from any IP,
+# returns 409 once configured).
+#
+# Threat closed: a fresh-boot device with no password is vulnerable
+# to a LAN-attacker race -- whoever POSTs set-password first sets
+# the password. The grace narrows the attack window to "trusted-
+# network sources only" during the period when the operator is
+# physically present and just-now booted the device. After grace
+# expires, if the operator hasn't set a password, the device is
+# back to the pre-fix posture; but real operators set the password
+# within seconds, not 30s.
+#
+# time.monotonic per dispatch: immune to wall-clock drift / NTP step.
+_BOOT_MONOTONIC: float = time.monotonic()
+_SET_PASSWORD_GRACE_SECONDS: float = 30.0
+
+
+def _set_password_grace_active() -> bool:
+    """True iff the boot-grace window is still open."""
+    return (time.monotonic() - _BOOT_MONOTONIC) < _SET_PASSWORD_GRACE_SECONDS
+
 
 AuthDep = Annotated[AuthStorage, Depends(get_auth_storage)]
 
@@ -75,10 +106,29 @@ async def auth_status(auth: AuthDep) -> _StatusResponse:
 async def set_password(
     payload: _SetPasswordRequest,
     auth: AuthDep,
+    request: Request,
 ) -> _TokenResponse:
     """First-time password set (welcome flow). 409 once configured --
     subsequent password changes go through /api/auth/change-password
-    which requires the current password."""
+    which requires the current password.
+
+    Bundle B2 item 7: during the first _SET_PASSWORD_GRACE_SECONDS
+    after process boot, the endpoint is reachable ONLY from loopback
+    / RFC1918 / Tailscale CGNAT. After grace, behavior reverts to
+    "reachable from any IP" (the pre-fix posture). Narrows the LAN-
+    attacker-races-the-operator window without blocking the
+    legitimate operator-on-physical-LAN case.
+    """
+    if _set_password_grace_active():
+        client_host = request.client.host if request.client else None
+        if not client_host or not _is_private_or_loopback_ip(client_host):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "set-password is restricted to trusted-network sources "
+                    "during the post-boot grace window"
+                ),
+            )
     if payload.password != payload.password_confirm:
         raise HTTPException(status_code=422, detail="passwords do not match")
     if auth.load() is not None:
@@ -98,10 +148,29 @@ async def set_password(
 async def login(
     payload: _LoginRequest,
     auth: AuthDep,
+    request: Request,
 ) -> _TokenResponse:
     """Mint a fresh token if the provided password matches. 404 if not
     yet configured (UI should redirect to welcome flow). 401 on wrong
-    password."""
+    password. 429 if the source IP has exceeded the rate-limit budget
+    (Bundle B2 item 7: 5 attempts per 60s window per IP, fail-closed
+    to a shared bucket if the IP can't be identified).
+
+    The throttle gate fires BEFORE the argon2 verify so a hostile
+    client can't burn server CPU at the argon2 cost (~250ms/attempt)
+    just by knowing the device exists. With uvicorn --proxy-headers
+    --forwarded-allow-ips 127.0.0.1 (Bundle B2 piece 1, set in the
+    systemd unit) request.client.host correctly reflects the real
+    client IP through tailscale-serve; without that config every
+    tailscale-served request would share the 127.0.0.1 bucket and
+    legitimate operators would be locked out alongside attackers.
+    """
+    client_ip = client_ip_or_unknown(request.client.host if request.client else None)
+    if not LOGIN_BUCKET.try_take(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="too many login attempts; try again in a minute",
+        )
     state = auth.load()
     if state is None:
         raise HTTPException(status_code=404, detail="password not yet configured")
