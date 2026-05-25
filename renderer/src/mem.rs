@@ -58,54 +58,49 @@ fn read_linux() -> Option<MemSnapshot> {
     })
 }
 
+/// Parse `key: value [kB]`-shaped lines out of a /proc text file,
+/// extracting just the values for `keys` (in the order given). Used
+/// by both parse_status and parse_meminfo -- the only differences
+/// between those two pre-2026-05-25 were the key set + the output
+/// tuple arity. Both call sites still get a fixed-arity output via
+/// the const generic.
+///
+/// Missing keys stay at 0 so a kernel without one of them (rare;
+/// ancient) degrades to a partial sample rather than failing.
+/// Garbled values (non-u64 second token) are skipped. Duplicate
+/// keys: last wins, but /proc files don't emit duplicates so that
+/// case is academic.
+fn parse_kv_kb_lines<const N: usize>(s: &str, keys: [&str; N]) -> [u64; N] {
+    let mut out = [0_u64; N];
+    for line in s.lines() {
+        let mut it = line.split_whitespace();
+        let key = match it.next() {
+            Some(k) => k.trim_end_matches(':'),
+            None => continue,
+        };
+        let val = match it.next().and_then(|v| v.parse::<u64>().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        if let Some(i) = keys.iter().position(|k| *k == key) {
+            out[i] = val;
+        }
+    }
+    out
+}
+
 /// Parse VmRSS / VmData / VmSwap (in KB) out of /proc/self/status
 /// content. Lines look like "VmRSS:    12345 kB". Missing keys
 /// stay at 0 so a kernel without one of these (rare; ancient)
 /// degrades to a partial sample rather than failing.
 pub fn parse_status(s: &str) -> (u64, u64, u64) {
-    let mut rss = 0_u64;
-    let mut data = 0_u64;
-    let mut swap = 0_u64;
-    for line in s.lines() {
-        let mut it = line.split_whitespace();
-        let key = match it.next() {
-            Some(k) => k.trim_end_matches(':'),
-            None => continue,
-        };
-        let val = match it.next().and_then(|v| v.parse::<u64>().ok()) {
-            Some(v) => v,
-            None => continue,
-        };
-        match key {
-            "VmRSS" => rss = val,
-            "VmData" => data = val,
-            "VmSwap" => swap = val,
-            _ => {}
-        }
-    }
+    let [rss, data, swap] = parse_kv_kb_lines(s, ["VmRSS", "VmData", "VmSwap"]);
     (rss, data, swap)
 }
 
 /// Parse CmaTotal / CmaFree (in KB) out of /proc/meminfo content.
 pub fn parse_meminfo(s: &str) -> (u64, u64) {
-    let mut total = 0_u64;
-    let mut free = 0_u64;
-    for line in s.lines() {
-        let mut it = line.split_whitespace();
-        let key = match it.next() {
-            Some(k) => k.trim_end_matches(':'),
-            None => continue,
-        };
-        let val = match it.next().and_then(|v| v.parse::<u64>().ok()) {
-            Some(v) => v,
-            None => continue,
-        };
-        match key {
-            "CmaTotal" => total = val,
-            "CmaFree" => free = val,
-            _ => {}
-        }
-    }
+    let [total, free] = parse_kv_kb_lines(s, ["CmaTotal", "CmaFree"]);
     (total, free)
 }
 
