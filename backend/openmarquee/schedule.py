@@ -222,6 +222,37 @@ class ScheduleStorage:
         atomic_write_text(self.path, schedule.model_dump_json(indent=2))
 
 
+def _resolve_legacy_name(
+    name: str | None,
+    name_to_id: dict[str, UUID],
+    *,
+    context: str,
+) -> UUID:
+    """Resolve a v1 playlist name to its v2 UUID; fall back to DEFAULT.
+
+    Hoisted from `_coerce_to_schedule`'s inner closure so unit tests can
+    assert the resolution + log-line shape without constructing a full
+    v1 payload. The operator-visibility warning fires only when `name`
+    is truthy AND unresolvable — known names + empty names are both
+    silent (the latter is the legacy "no playlist set" shape and
+    routes silently to DEFAULT).
+    """
+    if name and name in name_to_id:
+        return name_to_id[name]
+    if name:
+        # Operator visibility: if a v1 rule references a playlist
+        # that no longer exists by name, log it. The migrated
+        # schedule still loads (rule routes to default), but the
+        # log line tells the operator which rules need attention.
+        log.warning(
+            "schedule v1→v2 migration: %s references playlist_name=%r "
+            "which doesn't resolve; falling back to DEFAULT_PLAYLIST_ID",
+            context,
+            name,
+        )
+    return DEFAULT_PLAYLIST_ID
+
+
 def _coerce_to_schedule(
     data: dict,
     playlist_storage: PlaylistStorage | None,
@@ -251,34 +282,22 @@ def _coerce_to_schedule(
             # First-write-wins on duplicate names — `by_name` semantics.
             name_to_id.setdefault(p.name, p.id)
 
-    def resolve(name: str | None, *, context: str) -> UUID:
-        if name and name in name_to_id:
-            return name_to_id[name]
-        if name:
-            # Operator visibility: if a v1 rule references a playlist
-            # that no longer exists by name, log it. The migrated
-            # schedule still loads (rule routes to default), but the
-            # log line tells the operator which rules need attention.
-            log.warning(
-                "schedule v1→v2 migration: %s references playlist_name=%r "
-                "which doesn't resolve; falling back to DEFAULT_PLAYLIST_ID",
-                context,
-                name,
-            )
-        return DEFAULT_PLAYLIST_ID
-
     migrated_rules = []
     for raw in data.get("rules", []):
         rule_data = dict(raw)
         legacy_name = rule_data.pop("playlist_name", None)
-        rule_data["playlist_id"] = resolve(legacy_name, context=f"rule {raw.get('name', '?')!r}")
+        rule_data["playlist_id"] = _resolve_legacy_name(
+            legacy_name, name_to_id, context=f"rule {raw.get('name', '?')!r}"
+        )
         migrated_rules.append(ScheduleRule.model_validate(rule_data))
 
     return (
         Schedule(
             rules=migrated_rules,
-            default_playlist_id=resolve(
-                data.get("default_playlist_name"), context="default_playlist_name"
+            default_playlist_id=_resolve_legacy_name(
+                data.get("default_playlist_name"),
+                name_to_id,
+                context="default_playlist_name",
             ),
             tz=data.get("tz"),
         ),
