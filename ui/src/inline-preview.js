@@ -1011,7 +1011,10 @@ export function mountInlinePreview(container, options) {
         const cached = imageCache.get(item.id);
         if (cached) return cached;
         const img = new Image();
-        img.addEventListener("load", () => renderOnce());
+        img.addEventListener("load", () => {
+            if (stopped) return;
+            renderOnce();
+        });
         // Cachebust uses item.updated_at when present (storage envelope
         // stamp from the backend) so a re-render bump (settings dim flip
         // → text_rerender) invalidates the browser cache cleanly. Falls
@@ -1042,8 +1045,14 @@ export function mountInlinePreview(container, options) {
         video.preload = "auto";
         const v = encodeURIComponent(stamp);
         video.src = mediaSrc(`/api/content/${videoId}/video?v=${v}`);
-        video.addEventListener("seeked", () => renderOnce());
-        video.addEventListener("loadeddata", () => renderOnce());
+        video.addEventListener("seeked", () => {
+            if (stopped) return;
+            renderOnce();
+        });
+        video.addEventListener("loadeddata", () => {
+            if (stopped) return;
+            renderOnce();
+        });
         videoCache.set(key, video);
         return video;
     }
@@ -1076,7 +1085,13 @@ export function mountInlinePreview(container, options) {
         // and the cached check below kept it stuck there even after
         // layout settled.
         if (rect.width < 2 || rect.height < 2) {
-            requestAnimationFrame(renderOnce);
+            // Untracked rAF — guard against post-stop teardown so a stray
+            // detached-stage retry (rect=0x0 persists after panel close)
+            // doesn't self-amplify into an unkillable loop.
+            requestAnimationFrame(() => {
+                if (stopped) return;
+                renderOnce();
+            });
             return false;
         }
         const w = Math.round(rect.width);
@@ -1129,7 +1144,13 @@ export function mountInlinePreview(container, options) {
             // so window.__perf doesn't accumulate an unclosed mark.
             markEnd("inline-preview.tick");
         }
-        rafId = requestAnimationFrame(tick);
+        // Defense-in-depth: the `!playing` early-return at the top of
+        // tick() already terminates the chain when stop() flips state.
+        // Gate the reschedule on stopped + playing anyway, matching the
+        // team-style guard pattern on the load-listeners + retry-rAF.
+        if (!stopped && playing) {
+            rafId = requestAnimationFrame(tick);
+        }
     }
 
     playBtn.addEventListener("click", () => setPlaying(!playing));
