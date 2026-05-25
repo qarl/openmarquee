@@ -145,4 +145,91 @@ describe("mountVideoUploader", () => {
         await handle.flushAutoSave();
         expect(onSave).not.toHaveBeenCalled();
     });
+
+    it("isStale guard prevents canvas-poison + stale preview when operator switches slide mid-load", async () => {
+        // Round-17 regression-lock for the slide-switch race:
+        // operator clicks A (slow load), then B; A's image onload
+        // resolves AFTER B's loadForEdit completed and would
+        // otherwise (a) ctx.drawImage(A) over B's pixels in the
+        // canvas (next autoSave's canvasToBase64 would PATCH B's
+        // record with A's PNG) and (b) setPreviewSrc(A) reverting
+        // videoEl.src to A's MP4.
+        const drawImageMock = vi.fn();
+        vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(() => ({
+            save: () => {},
+            restore: () => {},
+            fillRect: () => {},
+            drawImage: drawImageMock,
+            set fillStyle(_v) {},
+        }));
+
+        const RealImage = window.Image;
+        // Test-controlled Image.onload firing keyed on URL substring.
+        const triggers = {};
+        window.Image = class {
+            constructor() {
+                this.width = 128;
+                this.height = 96;
+            }
+            set crossOrigin(_) {}
+            set onload(fn) { this._onload = fn; }
+            get onload() { return this._onload; }
+            onerror = null;
+            set src(url) {
+                if (url.includes("/api/content/A/asset")) {
+                    triggers.A = () => this._onload?.();
+                } else if (url.includes("/api/content/B/asset")) {
+                    triggers.B = () => this._onload?.();
+                }
+            }
+        };
+
+        try {
+            const container = document.createElement("div");
+            const handle = mountVideoUploader(container, {
+                width: 128,
+                height: 96,
+                onSave: vi.fn(),
+                onSaveExisting: vi.fn(),
+            });
+            await tick();
+
+            // Start A; don't await; A's image stays pending.
+            const aPromise = handle.loadForEdit({
+                type: "video",
+                id: "A",
+                name: "Slide A",
+                duration_ms: 5000,
+            });
+            await tick();
+
+            // Switch to B mid-flight. B's image will resolve immediately
+            // below; A's is still pending.
+            const bPromise = handle.loadForEdit({
+                type: "video",
+                id: "B",
+                name: "Slide B",
+                duration_ms: 5000,
+            });
+            await tick();
+            triggers.B();
+            await bPromise;
+
+            const drawImageCallsAfterB = drawImageMock.mock.calls.length;
+            const videoElAfterB = container.querySelector("video").src;
+            expect(videoElAfterB).toContain("/api/content/B/video");
+
+            // Now A's late onload fires. isStale === true →
+            // ctx.drawImage(A) SKIPPED; after-await guard → setPreviewSrc
+            // for A SKIPPED. Both observables stay at B.
+            triggers.A();
+            await aPromise;
+
+            expect(drawImageMock).toHaveBeenCalledTimes(drawImageCallsAfterB);
+            expect(container.querySelector("video").src).toBe(videoElAfterB);
+            expect(container.querySelector("video").src).not.toContain("/api/content/A/video");
+        } finally {
+            window.Image = RealImage;
+        }
+    });
 });

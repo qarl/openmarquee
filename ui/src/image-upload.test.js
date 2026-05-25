@@ -185,6 +185,78 @@ describe("mountImageUploader", () => {
             container.querySelector(".image-upload-status").textContent,
         ).toMatch(/Only image slides/);
     });
+
+    it("isStale guard prevents canvas-poison when operator switches slide mid-load", async () => {
+        // Round-17 regression-lock for the image-upload slide-switch
+        // race: operator clicks A (slow load), then B; A's image
+        // onload resolves AFTER B's loadForEdit completed and would
+        // otherwise ctx.drawImage(A) over B's pixels — a subsequent
+        // autoSave's canvasToBase64 would PATCH B's record with A's
+        // PNG (silent thumbnail corruption).
+        const ctx = patchCanvasPrototype();
+
+        const RealImage = window.Image;
+        const triggers = {};
+        window.Image = class {
+            constructor() {
+                this.width = 64;
+                this.height = 32;
+            }
+            set crossOrigin(_) {}
+            set onload(fn) { this._onload = fn; }
+            get onload() { return this._onload; }
+            onerror = null;
+            set src(url) {
+                if (url.includes("/api/content/img-A/asset")) {
+                    triggers.A = () => this._onload?.();
+                } else if (url.includes("/api/content/img-B/asset")) {
+                    triggers.B = () => this._onload?.();
+                }
+            }
+        };
+
+        try {
+            const container = document.createElement("div");
+            const handle = mountImageUploader(container, {
+                width: 64,
+                height: 32,
+                onSave: vi.fn(),
+                onSaveExisting: vi.fn(),
+            });
+            await tick();
+
+            // Start A; don't await; A's image stays pending.
+            const aPromise = handle.loadForEdit({
+                type: "image",
+                id: "img-A",
+                name: "Image A",
+                duration_ms: 5000,
+            });
+            await tick();
+
+            // Switch to B mid-flight. Resolve B's image immediately.
+            const bPromise = handle.loadForEdit({
+                type: "image",
+                id: "img-B",
+                name: "Image B",
+                duration_ms: 5000,
+            });
+            await tick();
+            triggers.B();
+            await bPromise;
+
+            const drawImageCallsAfterB = ctx.drawImage.mock.calls.length;
+
+            // Now A's late onload fires. isStale === true →
+            // ctx.drawImage(A) SKIPPED. drawImage count unchanged.
+            triggers.A();
+            await aPromise;
+
+            expect(ctx.drawImage).toHaveBeenCalledTimes(drawImageCallsAfterB);
+        } finally {
+            window.Image = RealImage;
+        }
+    });
 });
 
 describe("canvasToBase64", () => {

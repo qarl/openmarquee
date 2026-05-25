@@ -363,12 +363,26 @@ export function mountVideoUploader(
         // the save-time `asset.png` if the operator never re-picks a
         // file) and point the preview <video> at the server's MP4 so
         // they can play it back inline.
+        //
+        // Round 17 slide-switch race: capture editingId before the
+        // await + pass isStale into drawUrlToCanvas so a stale onload
+        // doesn't mutate the canvas. After-await check then bails
+        // before setPreviewSrc + autoSave.cancel (these would
+        // otherwise revert the video preview to A's MP4 and drop B's
+        // pending autoSave).
+        const myEditId = state.editingId;
         try {
-            await drawUrlToCanvas(mediaSrc(`/api/content/${slide.id}/asset`), canvas);
+            await drawUrlToCanvas(
+                mediaSrc(`/api/content/${slide.id}/asset`),
+                canvas,
+                { isStale: () => state.editingId !== myEditId },
+            );
         } catch (err) {
+            if (state.editingId !== myEditId) return;
             statusEl.textContent = `Could not load thumbnail: ${err.message}`;
             statusEl.dataset.state = "error";
         }
+        if (state.editingId !== myEditId) return;
         setPreviewSrc(mediaSrc(`/api/content/${slide.id}/video`), /* revokeOnSwap */ false);
         // Loading is not an edit — drop any auto-save scheduled by the
         // field mutations above.
@@ -442,11 +456,26 @@ export function mountVideoUploader(
 
 // Duplicated in image-upload.js — deliberately, so neither uploader
 // imports the other. Small helper, not worth a shared module.
-function drawUrlToCanvas(url, canvas) {
+function drawUrlToCanvas(url, canvas, { isStale } = {}) {
     return new Promise((resolve, reject) => {
         const img = new Image();
         img.crossOrigin = "anonymous";
         img.onload = () => {
+            // Round 17 stale-canvas guard: when the operator clicks
+            // slide B while A's load is in flight, A's onload will
+            // fire AFTER B's loadForEdit completed. Without this
+            // check, ctx.drawImage(A) below would overwrite the
+            // canvas (which now should show B's pixels), and a
+            // subsequent autoSave-read of canvasToBase64 would
+            // PATCH B's record with A's PNG. isStale returns true
+            // when state.editingId changed during the load → bail
+            // BEFORE the canvas mutation. Resolve (not reject) so
+            // the caller's after-await staleness guard handles the
+            // post-draw mutations symmetrically.
+            if (isStale && isStale()) {
+                resolve();
+                return;
+            }
             try {
                 const ctx = canvas.getContext("2d");
                 ctx.save();
