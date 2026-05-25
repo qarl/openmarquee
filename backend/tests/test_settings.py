@@ -135,9 +135,34 @@ def test_ssid_accepts_hyphens_and_digits():
     assert s.wifi_ssid == "openMarquee-A3F7"
 
 
-def test_wifi_password_default_matches_system_spec():
-    """SYSTEM_SPEC §4.1 pins the shipped default to 'openmarquee'."""
-    assert SystemSettings().wifi_password == "openmarquee"
+def test_wifi_password_default_is_not_the_legacy_literal():
+    """Bundle C item 5 (2026-05-25): the legacy literal default
+    'openmarquee' was a free re-auth target within RF range of any
+    dev-Pi that hadn't run the Phase B firstboot rotation. The new
+    default_factory generates a per-process random via
+    secrets.token_urlsafe(16). Lock the regression so a future
+    refactor that re-introduces the literal trips here."""
+    assert SystemSettings().wifi_password != "openmarquee"
+
+
+def test_wifi_password_default_factory_fires_per_instance():
+    """default_factory should produce a fresh random per
+    SystemSettings instance -- if it ever degrades to a process-
+    level cached value (e.g. someone replacing default_factory with
+    default=<computed-once>), two instances would share the same
+    password + a previously-leaked dev-Pi default would persist
+    across reboots."""
+    a = SystemSettings().wifi_password
+    b = SystemSettings().wifi_password
+    assert a != b
+
+
+def test_wifi_password_default_factory_has_sane_entropy():
+    """token_urlsafe(16) produces ~22 base64url chars (16 bytes of
+    entropy). Sanity-check the factory wasn't downgraded to a
+    smaller token size that would weaken the residual."""
+    pw = SystemSettings().wifi_password
+    assert len(pw) >= 22
 
 
 def test_wifi_password_rejects_empty():
@@ -432,10 +457,12 @@ def test_legacy_settings_with_web_helper_keys_loads(tmp_path: Path):
 
 def test_storage_load_returns_defaults_when_file_absent(tmp_path: Path):
     # sign_name is minted randomly per device; wifi_ssid + tailscale_hostname
-    # both derive from it (different format each) — compare everything else.
+    # both derive from it (different format each); wifi_password is a
+    # per-instance random token_urlsafe(16) (Bundle C item 5 2026-05-25,
+    # previously the literal "openmarquee"). Compare everything else.
     storage = SettingsStorage(tmp_path / "settings.json")
     loaded = storage.load()
-    skip = {"sign_name", "wifi_ssid", "tailscale_hostname"}
+    skip = {"sign_name", "wifi_ssid", "tailscale_hostname", "wifi_password"}
     assert loaded.model_dump(exclude=skip) == SystemSettings(sign_name="ignored").model_dump(
         exclude=skip
     )

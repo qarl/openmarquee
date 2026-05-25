@@ -48,8 +48,10 @@ def test_get_returns_defaults_when_nothing_persisted(client: TestClient):
     assert body["display_width"] == 1920
     assert body["display_height"] == 1080
     assert body["brightness"] == 80
-    # Batch 20.4: GET redacts the 3 secret fields. wifi_password is the
-    # SYSTEM_SPEC §4.1 default "openmarquee" -- redacted -> "<set>".
+    # Batch 20.4: GET redacts the 3 secret fields. wifi_password is
+    # the per-process random token_urlsafe(16) (Bundle C item 5
+    # 2026-05-25; previously the SYSTEM_SPEC §4.1 literal default
+    # "openmarquee") -- still non-empty -> redacted -> "<set>".
     # wifi_station_password + tailscale_auth_key default to None ->
     # passed through as None.
     assert body["wifi_password"] == "<set>"
@@ -433,7 +435,9 @@ def auth_client(
 def test_get_redacts_three_secret_fields(client: TestClient):
     """GET returns <set> for non-empty secrets + None for unset.
 
-    The default SystemSettings has wifi_password="openmarquee" (set);
+    The default SystemSettings has wifi_password=<random per-process
+    token via secrets.token_urlsafe(16)> (set; Bundle C item 5
+    2026-05-25 replaced the prior literal "openmarquee");
     wifi_station_password=None (unset); tailscale_auth_key=None (unset).
     """
     body = client.get("/api/settings").json()
@@ -470,8 +474,10 @@ def test_put_substitutes_set_sentinel_with_stored_value(client: TestClient):
     """UI's GET-mutate-PUT round-trip carries '<set>' back for redacted
     secrets. PUT must substitute the stored value for the sentinel so
     the real password isn't replaced with the literal string '<set>'."""
-    # Initial state: defaults -- wifi_password="openmarquee" (8 chars,
-    # passes the regex).
+    # Initial state: defaults -- wifi_password is a random
+    # token_urlsafe(16) (~22 chars per Bundle C item 5 2026-05-25;
+    # previously the literal "openmarquee"). Still passes the
+    # 8-63-char regex either way.
     client.put(
         "/api/settings",
         json={"wifi_password": "actually-real-pw"},
