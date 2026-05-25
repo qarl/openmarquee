@@ -536,6 +536,31 @@ async def test_aiortc_client_round_trips_real_sdp_through_api_live_start(
 # immediately with a pointer at the comment block that explains why.
 
 
+def test_systemd_unit_passes_proxy_headers_to_uvicorn():
+    """Bundle B2 piece 1: the systemd unit must invoke uvicorn with
+    `--proxy-headers --forwarded-allow-ips 127.0.0.1` so request.
+    client.host correctly reflects the real client IP when behind
+    tailscale-serve (which proxies HTTPS-on-443 to plain-HTTP-on-80
+    from 127.0.0.1). Without --proxy-headers, ALL tailscale-served
+    traffic appears as 127.0.0.1 and per-IP rate-limiting (item 7)
+    puts everyone in one bucket. --forwarded-allow-ips=127.0.0.1
+    narrows the XFF trust to ONLY loopback peer IPs so an external
+    client can't spoof XFF and bypass the throttle.
+    """
+    unit = Path(__file__).resolve().parent.parent.parent / "system" / "openmarquee-backend.service"
+    assert unit.is_file()
+    text = unit.read_text()
+    assert "--proxy-headers" in text, (
+        "openmarquee-backend.service must pass --proxy-headers to uvicorn "
+        "(Bundle B2 piece 1 -- enables Starlette's X-Forwarded-* parsing)"
+    )
+    assert "--forwarded-allow-ips 127.0.0.1" in text, (
+        "openmarquee-backend.service must restrict XFF trust to loopback "
+        "(127.0.0.1) only; without this, any external client could spoof "
+        "X-Forwarded-For and bypass per-IP rate limiting"
+    )
+
+
 def test_systemd_unit_whitelists_af_netlink():
     """The canonical openmarquee-backend.service must include
     AF_NETLINK in RestrictAddressFamilies. aiortc's aioice opens an

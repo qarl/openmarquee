@@ -85,7 +85,8 @@ Environment="OPENMARQUEE_RENDERER_BINARY=/usr/local/bin/openmarquee-render"
 # Bind to all interfaces on port 80 — the device is its own captive-portal
 # WiFi so this is the primary UI.
 ExecStart=/opt/openmarquee/venv/bin/uvicorn openmarquee.app:app \
-    --host 0.0.0.0 --port 80
+    --host 0.0.0.0 --port 80 \
+    --proxy-headers --forwarded-allow-ips 127.0.0.1
 
 # Restart on crash; brief backoff to avoid hammering systemd if something
 # is persistently wrong (config error, missing asset, etc).
