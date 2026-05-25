@@ -310,7 +310,18 @@ class TextSlideUpload(BaseModel):
     transition: str = "cut"
     transition_ms: int = 500
     text_layers: list[TextLayerUpload]
-    png_base64: str = Field(description="Base64-encoded PNG of the rendered slide.")
+    # 2026-05-25 Bundle B item 9: defense-in-depth body cap. Text-slide
+    # cover PNGs are server-side-rendered thumbnails -- typically
+    # <100 KB even at large dimensions. 10 MB raw -> ~14 MB base64 cap
+    # is ~140x the realistic ceiling, large enough that no legitimate
+    # operator upload hits it but small enough to bound the unauth-
+    # write surface a malicious LAN/tailnet attacker could exploit
+    # (auth-required route, but defense-in-depth against a future
+    # bug that exposes it).
+    png_base64: str = Field(
+        max_length=14_000_000,
+        description="Base64-encoded PNG of the rendered slide.",
+    )
 
 
 @router.post("/text-slides", response_model=TextSlide)
@@ -535,8 +546,21 @@ class VideoUpload(BaseModel):
     duration_ms: int = 5000
     transition: str = "cut"
     transition_ms: int = 500
-    png_base64: str = Field(description="Thumbnail PNG (first frame).")
-    mp4_base64: str = Field(description="H.264 MP4 bytes, ≤ 1080p.")
+    # 2026-05-25 Bundle B item 9: body cap (see TextSlideUpload comment
+    # block for the full rationale). Video thumbnails are first-frame
+    # PNGs ~same size as text-slide covers.
+    png_base64: str = Field(
+        max_length=14_000_000,
+        description="Thumbnail PNG (first frame).",
+    )
+    # 200 MB raw -> ~267 MB base64 cap. 1080p H.264 at typical
+    # bitrates fits this with headroom; oversized uploads 422 at the
+    # validation boundary instead of buffering hundreds of MB into RAM
+    # for nothing.
+    mp4_base64: str = Field(
+        max_length=270_000_000,
+        description="H.264 MP4 bytes, ≤ 1080p.",
+    )
 
 
 class VideoUpdate(BaseModel):
@@ -585,7 +609,14 @@ class ImageUpload(BaseModel):
     duration_ms: int = 5000
     transition: str = "cut"
     transition_ms: int = 500
-    image_base64: str = Field(description="Base64-encoded source image (PNG or JPG, verbatim).")
+    # 2026-05-25 Bundle B item 9: body cap. ImageSlide stores the
+    # operator's source verbatim (no re-encoding); 20 MB raw -> ~27 MB
+    # base64. Generous enough for high-res phone photos + occasional
+    # poster-print PNGs while bounding the unauth-write surface.
+    image_base64: str = Field(
+        max_length=27_000_000,
+        description="Base64-encoded source image (PNG or JPG, verbatim).",
+    )
 
 
 @router.post("/images", response_model=ImageSlide)

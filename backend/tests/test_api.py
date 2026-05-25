@@ -1207,3 +1207,80 @@ def test_put_web_metadata_only_edit_does_not_kick_a_fetch(client: TestClient):
     assert response.status_code == 200
     # url unchanged — no re-shot.
     assert kicked == []
+
+
+# ---- 2026-05-25 Bundle B item 9: per-route body caps ----
+#
+# Pydantic Field(max_length=N) on the base64 string field rejects
+# oversize uploads with 422 at validation time, bounding RAM
+# allocation on a hostile multi-MB POST. Caps are sized per content
+# type: text-slide PNGs (~14 MB base64), video MP4s (~270 MB
+# base64), image PNGs/JPGs (~27 MB base64). Generous enough that
+# no legitimate operator upload hits the cap, tight enough that a
+# malicious LAN/tailnet POST can't blow RAM via unauth-write surface.
+
+
+def test_upload_text_slide_rejects_oversize_png_base64(client: TestClient):
+    """A 20 MB base64 png_base64 (above the 14 MB cap) must 422 at
+    validation, BEFORE the handler tries to b64decode + open as PNG.
+    Pin the cap as a regression lock -- loosening it without a
+    matching threat-model update silently widens the unauth-write
+    surface."""
+    payload = _upload_payload(name="Oversize")
+    payload["png_base64"] = "A" * 20_000_000
+    response = client.post("/api/content/text-slides", json=payload)
+    assert response.status_code == 422
+    # The Pydantic error must reference the field so operators
+    # debugging an "upload failed" message can find the culprit.
+    body_text = response.text
+    assert "png_base64" in body_text, (
+        f"422 detail should reference png_base64 field; got: {body_text[:300]}"
+    )
+
+
+def test_upload_text_slide_accepts_payload_under_cap(client: TestClient):
+    """Belt-and-suspenders: a payload comfortably under the 14 MB
+    cap still works. Without this, a future tightening of the cap
+    that broke real uploads would only surface via the operator
+    noticing -- this test fences the floor."""
+    response = client.post("/api/content/text-slides", json=_upload_payload(name="Normal"))
+    assert response.status_code == 200, response.text
+
+
+def test_upload_image_rejects_oversize_image_base64(client: TestClient):
+    """ImageSlide image_base64 cap is 27 MB (~20 MB raw). 40 MB
+    base64 must 422 at validation."""
+    payload = {
+        "name": "OversizeImage",
+        "image_base64": "A" * 40_000_000,
+    }
+    response = client.post("/api/content/images", json=payload)
+    assert response.status_code == 422
+    assert "image_base64" in response.text
+
+
+def test_upload_video_rejects_oversize_mp4_base64(client: TestClient):
+    """VideoSlide mp4_base64 cap is 270 MB (~200 MB raw H.264).
+    A 300 MB base64 payload must 422 at validation."""
+    payload = {
+        "name": "OversizeVideo",
+        "png_base64": base64.b64encode(_FAKE_PNG).decode(),
+        "mp4_base64": "A" * 300_000_000,
+    }
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 422
+    assert "mp4_base64" in response.text
+
+
+def test_upload_video_rejects_oversize_thumbnail_png(client: TestClient):
+    """VideoSlide.png_base64 (thumbnail) shares the same 14 MB cap
+    as TextSlide.png_base64. 20 MB thumbnail must 422 even if
+    mp4_base64 is well-formed."""
+    payload = {
+        "name": "OversizeThumbnail",
+        "png_base64": "A" * 20_000_000,
+        "mp4_base64": "AAAA",  # bogus but small (test isolates png_base64 cap)
+    }
+    response = client.post("/api/content/videos", json=payload)
+    assert response.status_code == 422
+    assert "png_base64" in response.text
