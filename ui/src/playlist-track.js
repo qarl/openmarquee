@@ -482,9 +482,27 @@ async function bindTrackSortable(trackEl, markDirty, itemByIdRef, rebindButtons,
             // *immediately*.
             const dropped = evt.item;
             const id = dropped?.dataset?.id;
-            if (!id) return;
+            // Defensive: malformed pallet tile with no dataset.id.
+            // Shouldn't happen — but if it does, remove the orphan
+            // before bailing so it doesn't sit unstyled in the track.
+            if (!id) {
+                dropped?.remove();
+                return;
+            }
+            // Race: pallet still shows a tile for an item another
+            // session just deleted. Pallet's itemByIdRef is stale until
+            // the next refresh fires; meanwhile the operator dropped
+            // it. Without remove(), the orphan would sit as a bare
+            // .pallet-tile-shaped element in the track (no controls,
+            // confusing but harmless — collectTrackEntries filters on
+            // .track-block[data-id] so saves stay clean). Silent
+            // remove: bindTrackSortable doesn't have statusEl in scope
+            // and threading it through would be scope creep here.
             const item = itemByIdRef.get(id);
-            if (!item) return;
+            if (!item) {
+                dropped.remove();
+                return;
+            }
             const rebuilt = renderTrackBlock(
                 item,
                 { item_id: id, transition: "cut", transition_ms: 500 },
