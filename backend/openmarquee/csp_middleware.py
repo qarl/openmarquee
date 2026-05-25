@@ -38,6 +38,13 @@ from typing import Any
 # Single source of truth for the default policy. Tests + app.py
 # both import this constant so the directive set has exactly one
 # place to update.
+#
+# `report-uri /api/system/csp-report` (2026-05-25 Bundle A item 3)
+# lights up future CSP violations in the device journal instead of
+# leaving them visible only in a connected browser's devtools. The
+# endpoint is unauth-whitelisted in auth_middleware.py + logs the
+# report body at WARNING via api_system.py's POST handler. No
+# persistence -- journald rotation handles retention.
 DEFAULT_CSP_POLICY = (
     "default-src 'self'; "
     "script-src 'self' 'wasm-unsafe-eval' blob:; "
@@ -50,7 +57,28 @@ DEFAULT_CSP_POLICY = (
     "object-src 'none'; "
     "frame-ancestors 'none'; "
     "base-uri 'self'; "
-    "form-action 'self'"
+    "form-action 'self'; "
+    "report-uri /api/system/csp-report"
+)
+
+# 2026-05-25 Bundle A item 8: response-header defense-in-depth.
+#
+# X-Content-Type-Options: nosniff blocks browser MIME-sniffing that
+# could reinterpret a same-origin response (e.g., a JSON blob with
+# user-supplied content) as an executable type. We always set
+# Content-Type explicitly, so this is belt-and-suspenders.
+#
+# Referrer-Policy: strict-origin-when-cross-origin prevents
+# operator-visible URLs (which may contain content IDs or other
+# session-meaningful path components) from leaking to off-origin
+# destinations on click-through. Same-origin navigation still gets
+# the full Referer for in-app analytics affordances.
+#
+# These two never need per-request variance, so they're a single
+# pre-encoded byte tuple appended in the response-start handler.
+_DEFENSE_IN_DEPTH_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"strict-origin-when-cross-origin"),
 )
 
 
@@ -92,6 +120,17 @@ class CSPMiddleware:
                 # mutate state the inner code might reuse.
                 headers = list(message.get("headers") or [])
                 headers.append((self._header_name, self._header_value))
+                # Bundle A item 8: nosniff + Referrer-Policy as
+                # DEFAULTS. If an inner middleware or handler already
+                # set a value (e.g., AuthMiddleware's query-auth wrap
+                # sets Referrer-Policy: no-referrer, which is stricter
+                # than our default), preserve it -- downstream wins so
+                # specific-case hardening doesn't get clobbered by the
+                # outer baseline.
+                existing_names = {name.lower() for (name, _) in headers}
+                for name, value in _DEFENSE_IN_DEPTH_HEADERS:
+                    if name not in existing_names:
+                        headers.append((name, value))
                 message = {**message, "headers": headers}
             await send(message)
 

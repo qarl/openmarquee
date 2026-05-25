@@ -720,19 +720,23 @@ def test_header_auth_response_does_not_include_query_hardening(client: TestClien
         f"/api/content/{bogus}/asset",
         headers={"Authorization": f"Bearer {token}"},
     )
-    # The handler's natural response shouldn't carry these headers.
-    # (FastAPI's default 404 doesn't add them; our wrap only fires on
-    # query-auth.) If a future handler decides to set them deliberately,
-    # this test will need an exempt list -- for now, none of the media
-    # routes do.
-    assert "cache-control" not in {k.lower() for k in response.headers}, (
-        "header-bearer request unexpectedly carries Cache-Control "
-        "(the wrap fired without query-auth)"
+    # The query-auth wrap should NOT have fired (no token in URL).
+    # Cache-Control should NOT be the wrap's `no-store` value.
+    # Referrer-Policy IS now set globally by the CSP middleware's
+    # Bundle A item 8 defense-in-depth headers (2026-05-25) -- but
+    # to the GLOBAL default `strict-origin-when-cross-origin`, NOT
+    # the stricter `no-referrer` the auth wrap would have set.
+    assert response.headers.get("cache-control") != "no-store", (
+        "header-bearer request unexpectedly carries Cache-Control: no-store "
+        "(the auth wrap fired without query-auth)"
     )
-    assert "referrer-policy" not in {k.lower() for k in response.headers}, (
-        "header-bearer request unexpectedly carries Referrer-Policy "
-        "(the wrap fired without query-auth)"
+    assert response.headers.get("referrer-policy") != "no-referrer", (
+        "header-bearer request unexpectedly carries Referrer-Policy: no-referrer "
+        "(the auth wrap fired without query-auth; should be the CSP global default)"
     )
+    # Belt-and-suspenders: confirm the GLOBAL default IS the one the
+    # CSP middleware set (Bundle A item 8 regression-lock).
+    assert response.headers.get("referrer-policy") == "strict-origin-when-cross-origin"
 
 
 def test_header_wins_query_token_present_response_has_no_query_hardening(

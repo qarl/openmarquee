@@ -90,6 +90,17 @@ _WHITELIST_EXACT: frozenset[str] = frozenset(
         # token isn't signed against a peer's AuthState.
         "/api/playback/current-thumbnail",
         "/api/playback/current-frame",
+        # 2026-05-25 Bundle A item 3: CSP report-uri target. The
+        # browser POSTs CSP violation reports unauth (the report
+        # fires from the same browsing context that triggered the
+        # violation, but the report itself can't carry the operator's
+        # Authorization header -- browsers stuff a `report-uri` POST
+        # with the violation JSON, no app-level headers). Carve-out
+        # scope is narrow: this single endpoint only, not the wider
+        # /api/system/ prefix. The handler in api_system.py logs the
+        # body at WARNING + nothing else (no persistence, no DB write,
+        # so unauth-write surface is bounded to journald-spam).
+        "/api/system/csp-report",
     }
 )
 

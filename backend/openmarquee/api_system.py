@@ -592,3 +592,48 @@ async def perf_stats() -> PerfStats:
         auto_render=auto_render.stats_snapshot(),
         request_log=recent_requests(),
     )
+
+
+# 2026-05-25 Bundle A item 3 (security DiD): CSP report-uri sink.
+#
+# csp_middleware.DEFAULT_CSP_POLICY ends with `report-uri /api/system/
+# csp-report`. Browsers POST a JSON body shaped like
+# `{"csp-report": {"violated-directive": "...", "blocked-uri": "...",
+# ...}}` (Content-Type: application/csp-report on modern browsers, or
+# application/json on older ones) to that URL when CSP rejects a
+# resource. The carve-out for unauth access lives in
+# auth_middleware._WHITELIST_EXACT (narrow: this single endpoint).
+#
+# The handler does only one thing: log the body at WARNING level so
+# operators see the violation in journald. NO persistence (no DB
+# write, no file write -- journald rotation handles retention) and
+# NO response-shape surface beyond 204. Read the body raw and json-
+# parse defensively; malformed reports must not throw because the
+# browser sent them, not the operator, and the operator can't fix
+# a malformed CSP report client-side.
+@router.post("/csp-report", status_code=204)
+async def csp_report(request: Request) -> Response:
+    try:
+        body_bytes = await request.body()
+    except Exception:
+        log.warning("csp-report: failed to read request body")
+        return Response(status_code=204)
+    if not body_bytes:
+        log.warning("csp-report: empty body")
+        return Response(status_code=204)
+    try:
+        # Browsers may post bytes-with-BOM, oddly-cased keys, or
+        # nested-under-"csp-report" envelope; just log the raw text
+        # rather than trying to schema-validate (a hostile bug-class
+        # is exactly what we want to surface, not silence).
+        text = body_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        text = repr(body_bytes[:512])
+    # 1024-char cap on the log line; CSP reports are usually small but
+    # an attacker with the unauth POST surface could try to log-flood.
+    # Truncate defensively; the directive name is always near the
+    # front so the truncation doesn't hide the actionable bit.
+    if len(text) > 1024:
+        text = text[:1024] + "...(truncated)"
+    log.warning("csp-report: %s", text)
+    return Response(status_code=204)
