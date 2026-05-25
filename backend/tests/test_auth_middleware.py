@@ -31,6 +31,7 @@ from openmarquee.auth_middleware import (
     _is_media_route,
     _is_whitelisted,
     _token_from_query,
+    _wrap_send_no_store_no_referrer,
 )
 
 # --- _is_whitelisted ------------------------------------------------
@@ -250,3 +251,223 @@ def test_bearer_from_headers_rejects_missing_or_malformed(
     headers: list[tuple[bytes, bytes]],
 ):
     assert _bearer_from_headers(headers) == ""
+
+
+# --- _wrap_send_no_store_no_referrer --------------------------------
+#
+# Round-15 test-gap coverage (closes the test-gap audit series). This
+# response-hardening wrap is installed when query-string token auth
+# was used (auth_middleware.py:235 -- the ?token=... fallback for
+# <img>/<video> src). Its docstring documents that it MUST strip any
+# pre-existing Cache-Control / Referrer-Policy headers from the
+# inner handler BEFORE appending the canonical safe values, so a
+# misconfigured intermediary that picks first-or-last can't honor a
+# permissive directive over no-store.
+#
+# Pre-r15 coverage: existing tests only hit routes that don't set
+# these headers themselves; the strip-then-append branch was never
+# exercised. A refactor that silently switched to
+# "append-without-stripping" would ship a token-bearing URL with two
+# contradictory Cache-Control directives -- an intermediary picking
+# the permissive one (RFC 7234 §5.2 says compliant caches honor the
+# most-restrictive, but misconfigured ones in the wild don't always)
+# caches the bearer. The token has been a real argon2-verified secret
+# since 2026-05-24 (audit Path A), so the leak is no longer inert.
+
+
+@pytest.mark.asyncio
+async def test_wrap_strips_pre_existing_cache_control():
+    """Inner handler emits Cache-Control: public, max-age=3600 on its
+    response (e.g. a future media-route adding caching). The wrap
+    must REPLACE that with the single canonical no-store, not append
+    a second header line."""
+    captured: list[dict] = []
+
+    async def inner_send(msg: dict) -> None:
+        captured.append(msg)
+
+    wrapped = _wrap_send_no_store_no_referrer(inner_send)
+    await wrapped(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"cache-control", b"public, max-age=3600"),
+                (b"content-type", b"image/png"),
+            ],
+        }
+    )
+    start = captured[0]
+    cc_values = [v for k, v in start["headers"] if k.lower() == b"cache-control"]
+    assert cc_values == [b"no-store"], (
+        f"expected exactly one Cache-Control: no-store, got {cc_values!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_wrap_strips_pre_existing_referrer_policy():
+    """Inner handler emits Referrer-Policy: unsafe-url. The wrap must
+    REPLACE that with the single canonical no-referrer, not append a
+    second header line."""
+    captured: list[dict] = []
+
+    async def inner_send(msg: dict) -> None:
+        captured.append(msg)
+
+    wrapped = _wrap_send_no_store_no_referrer(inner_send)
+    await wrapped(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"referrer-policy", b"unsafe-url"),
+                (b"content-type", b"image/png"),
+            ],
+        }
+    )
+    start = captured[0]
+    rp_values = [v for k, v in start["headers"] if k.lower() == b"referrer-policy"]
+    assert rp_values == [b"no-referrer"], (
+        f"expected exactly one Referrer-Policy: no-referrer, got {rp_values!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_wrap_strips_both_pre_existing_headers():
+    """When BOTH permissive headers are present on the inner response,
+    both get stripped and both get replaced with the canonical
+    safe values. Exactly one of each survives."""
+    captured: list[dict] = []
+
+    async def inner_send(msg: dict) -> None:
+        captured.append(msg)
+
+    wrapped = _wrap_send_no_store_no_referrer(inner_send)
+    await wrapped(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"cache-control", b"public, max-age=86400"),
+                (b"referrer-policy", b"unsafe-url"),
+                (b"content-type", b"image/png"),
+            ],
+        }
+    )
+    start = captured[0]
+    cc_values = [v for k, v in start["headers"] if k.lower() == b"cache-control"]
+    rp_values = [v for k, v in start["headers"] if k.lower() == b"referrer-policy"]
+    assert cc_values == [b"no-store"]
+    assert rp_values == [b"no-referrer"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "header_name",
+    [
+        b"Cache-Control",  # title-case
+        b"CACHE-CONTROL",  # upper-case
+        b"cAcHe-CoNtRoL",  # mixed-case
+        b"cache-control",  # already-lower baseline
+    ],
+)
+async def test_wrap_strips_case_variants_of_cache_control(header_name: bytes):
+    """RFC 7230 §3.2 says header names are case-insensitive. ASGI
+    convention is lowercased bytes, but a handler that emits an
+    upper/mixed-case Cache-Control still needs to be stripped --
+    otherwise a refactor that switches to an exact `== b"cache-
+    control"` comparison would let a Title-Case pre-existing header
+    slip through alongside the appended no-store."""
+    captured: list[dict] = []
+
+    async def inner_send(msg: dict) -> None:
+        captured.append(msg)
+
+    wrapped = _wrap_send_no_store_no_referrer(inner_send)
+    await wrapped(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [(header_name, b"public, max-age=3600")],
+        }
+    )
+    start = captured[0]
+    # Count Cache-Control occurrences case-insensitively (matching the
+    # impl's case-folded compare). Should be exactly ONE, with the
+    # canonical lowercase name and the no-store value.
+    cc_entries = [(k, v) for k, v in start["headers"] if k.lower() == b"cache-control"]
+    assert cc_entries == [(b"cache-control", b"no-store")], (
+        f"variant {header_name!r}: expected one canonical no-store, got {cc_entries!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_wrap_passes_through_non_start_messages_unchanged():
+    """The wrap is documented to only mutate http.response.start --
+    body messages (chunks, trailers) must pass through byte-identical
+    so the inner handler's payload reaches the client unchanged."""
+    captured: list[dict] = []
+
+    async def inner_send(msg: dict) -> None:
+        captured.append(msg)
+
+    wrapped = _wrap_send_no_store_no_referrer(inner_send)
+    body_msg = {
+        "type": "http.response.body",
+        "body": b"<binary blob>",
+        "more_body": False,
+    }
+    await wrapped(body_msg)
+    assert captured == [body_msg], "http.response.body must pass through unchanged (byte-identical)"
+
+    # A future ASGI message type (e.g. http.response.trailers) should
+    # also pass through unchanged -- the wrap's mutation is scoped
+    # specifically to the start message.
+    trailers_msg = {
+        "type": "http.response.trailers",
+        "headers": [(b"x-trace-id", b"abc123")],
+    }
+    await wrapped(trailers_msg)
+    assert captured[-1] == trailers_msg
+
+
+@pytest.mark.asyncio
+async def test_wrap_preserves_other_inner_handler_headers():
+    """The wrap MUST only strip Cache-Control + Referrer-Policy. Every
+    other header from the inner handler (content-type, etag,
+    set-cookie, custom headers) survives alongside the appended
+    canonical no-store + no-referrer values."""
+    captured: list[dict] = []
+
+    async def inner_send(msg: dict) -> None:
+        captured.append(msg)
+
+    wrapped = _wrap_send_no_store_no_referrer(inner_send)
+    await wrapped(
+        {
+            "type": "http.response.start",
+            "status": 200,
+            "headers": [
+                (b"cache-control", b"public"),  # will be stripped
+                (b"content-type", b"image/png"),  # survives
+                (b"etag", b'"abc123"'),  # survives
+                (b"x-custom-header", b"keep-me"),  # survives
+                (b"referrer-policy", b"unsafe-url"),  # will be stripped
+            ],
+        }
+    )
+    start = captured[0]
+    surviving = {(k, v) for k, v in start["headers"]}
+    # Non-stripped headers must all be present.
+    assert (b"content-type", b"image/png") in surviving
+    assert (b"etag", b'"abc123"') in surviving
+    assert (b"x-custom-header", b"keep-me") in surviving
+    # Stripped + replaced headers carry the canonical values, not the
+    # inner handler's permissive ones.
+    assert (b"cache-control", b"no-store") in surviving
+    assert (b"referrer-policy", b"no-referrer") in surviving
+    # Sanity: no leftover permissive values.
+    cc_values = [v for k, v in start["headers"] if k.lower() == b"cache-control"]
+    rp_values = [v for k, v in start["headers"] if k.lower() == b"referrer-policy"]
+    assert cc_values == [b"no-store"]
+    assert rp_values == [b"no-referrer"]
