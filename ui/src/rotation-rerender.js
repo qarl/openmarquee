@@ -143,7 +143,21 @@ export async function rerenderAllSlidesForRotation(rotation, deps = {}) {
     if (!Array.isArray(items)) return summary;
     summary.total = items.length;
 
+    // Round 23: caller may pass `isStale` to abort mid-loop when a
+    // newer rotation event preempts this one. Without it, two rapid
+    // settings-updated events (e.g., flip 0→90→0 within 2s) spawned
+    // concurrent loops, and per-slide PUT ordering was nondeterministic
+    // — final stored thumbnails were a random mix of orientations.
+    // We check at TWO points per iteration: top-of-loop (cheapest exit)
+    // AND after the fetchItem await (covers the staleness window
+    // between iterations).
+    const isStale = deps.isStale || (() => false);
+
     for (const listItem of items) {
+        if (isStale()) {
+            summary.aborted = true;
+            break;
+        }
         const id = listItem && listItem.id;
         const type = listItem && listItem.type;
         if (!id) {
@@ -162,6 +176,10 @@ export async function rerenderAllSlidesForRotation(rotation, deps = {}) {
             // copy (a concurrent edit between list + rerender is rare but
             // cheap to guard against).
             const item = await fetchItem(String(id));
+            if (isStale()) {
+                summary.aborted = true;
+                break;
+            }
             if (item.type === "text_slide") {
                 await rerenderText(item, rotation);
             } else if (item.type === "video") {

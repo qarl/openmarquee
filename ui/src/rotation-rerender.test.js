@@ -104,4 +104,82 @@ describe("rerenderAllSlidesForRotation", () => {
         expect(summary.rerendered).toBe(1);
         expect(summary.skipped).toBe(1);
     });
+
+    // Round 23 regression-locks for the concurrent-rerender race. The
+    // driver in main.js bumps a generation counter on each rotation-
+    // change settings-updated event and passes an isStale closure into
+    // this function. Pre-fix, two rapid events spawned concurrent loops
+    // and per-slide PUT ordering was nondeterministic.
+    it("aborts mid-loop when isStale flips true between iterations", async () => {
+        const items = [
+            { id: "a", type: "text_slide" },
+            { id: "b", type: "text_slide" },
+            { id: "c", type: "text_slide" },
+        ];
+        // Become stale after the first item completes.
+        let processed = 0;
+        const rerenderTextSlide = vi.fn(async () => {
+            processed += 1;
+        });
+        const deps = makeDeps(items, { rerenderTextSlide });
+        let stale = false;
+        deps.isStale = () => stale;
+
+        // Wire the stale flag to flip after the first slide's rerender.
+        const origRerender = rerenderTextSlide;
+        deps.rerenderTextSlide = vi.fn(async (item, rotation) => {
+            await origRerender(item, rotation);
+            if (processed === 1) stale = true;
+        });
+
+        const summary = await rerenderAllSlidesForRotation(90, deps);
+
+        expect(summary.aborted).toBe(true);
+        // Item a was processed; b's isStale check at top-of-loop fires
+        // → bail. c never touched.
+        expect(summary.rerendered).toBe(1);
+        expect(deps.rerenderTextSlide).toHaveBeenCalledTimes(1);
+    });
+
+    it("aborts after fetchItem if isStale flips during the fetch await", async () => {
+        const items = [
+            { id: "a", type: "text_slide" },
+            { id: "b", type: "text_slide" },
+        ];
+        let stale = false;
+        const rerenderTextSlide = vi.fn(async () => {});
+        // fetchContentItem on item "b" flips stale BEFORE returning —
+        // simulates the case where a newer rotation event preempted
+        // us mid-fetch. The post-fetch isStale check must catch this.
+        const fetchContentItem = vi.fn(async (id) => {
+            if (id === "b") stale = true;
+            return items.find((i) => String(i.id) === String(id));
+        });
+        const deps = makeDeps(items, { rerenderTextSlide, fetchContentItem });
+        deps.isStale = () => stale;
+
+        const summary = await rerenderAllSlidesForRotation(90, deps);
+
+        expect(summary.aborted).toBe(true);
+        // Item a processed normally. Item b's fetch succeeded then
+        // post-fetch isStale check bailed BEFORE rerenderText fired.
+        expect(rerenderTextSlide).toHaveBeenCalledTimes(1);
+        expect(rerenderTextSlide.mock.calls[0][0].id).toBe("a");
+    });
+
+    it("does NOT abort when isStale always returns false (happy path)", async () => {
+        const items = [
+            { id: "a", type: "text_slide" },
+            { id: "b", type: "video" },
+        ];
+        const deps = makeDeps(items);
+        deps.isStale = () => false;
+
+        const summary = await rerenderAllSlidesForRotation(90, deps);
+
+        expect(summary.aborted).toBeUndefined();
+        expect(summary.rerendered).toBe(2);
+        expect(deps.rerenderTextSlide).toHaveBeenCalledTimes(1);
+        expect(deps.rerenderVideoSlide).toHaveBeenCalledTimes(1);
+    });
 });
