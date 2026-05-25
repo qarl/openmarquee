@@ -701,4 +701,89 @@ describe("mountPlaylistTrack — Sortable bind-generation guard", () => {
         expect(createsAfterRaces).toBe(createsAfterMount + 4);
         expect(destroyCalls).toHaveLength(4);
     });
+
+    it("preserves operator's in-flight name edit when refresh fires while focused", async () => {
+        const container = document.createElement("div");
+        // The activeElement guard requires the element to be in the
+        // document so document.activeElement can track it.
+        document.body.appendChild(container);
+        try {
+            const NON_DEFAULT_ID = "00000000-0000-4000-8000-000000000002";
+            let serverName = "original-name";
+            const fetchPlaylists = async () => ({
+                schema_version: 4,
+                playlists: [{
+                    id: NON_DEFAULT_ID,
+                    name: serverName,
+                    items: [{ item_id: "a" }],
+                }],
+            });
+            const handle = mountPlaylistTrack(container, {
+                fetchItems: async () => ITEMS,
+                fetchPlaylists,
+                getCurrentPlaylistId: () => NON_DEFAULT_ID,
+                onReorder: vi.fn(),
+            });
+            await tick();
+
+            const nameEl = container.querySelector(".field-playlist-name");
+            expect(nameEl.value).toBe("original-name");
+            expect(nameEl.disabled).toBe(false);
+
+            // Operator focuses + types. Server-side, an unrelated thing
+            // happened (e.g., a sibling block's duration save returned a
+            // payload with a different name) — refresh fires.
+            nameEl.focus();
+            nameEl.value = "operator-typing-in-progress";
+            expect(document.activeElement).toBe(nameEl);
+
+            serverName = "server-renamed-it";
+            await handle.refresh();
+
+            // Operator's typed value preserved; NOT clobbered back to
+            // server-renamed-it. The pending autosave is NOT cancelled.
+            expect(nameEl.value).toBe("operator-typing-in-progress");
+        } finally {
+            document.body.removeChild(container);
+        }
+    });
+
+    it("syncs name from server when refresh fires and name input is NOT focused", async () => {
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        try {
+            const NON_DEFAULT_ID = "00000000-0000-4000-8000-000000000002";
+            let serverName = "original-name";
+            const fetchPlaylists = async () => ({
+                schema_version: 4,
+                playlists: [{
+                    id: NON_DEFAULT_ID,
+                    name: serverName,
+                    items: [{ item_id: "a" }],
+                }],
+            });
+            const handle = mountPlaylistTrack(container, {
+                fetchItems: async () => ITEMS,
+                fetchPlaylists,
+                getCurrentPlaylistId: () => NON_DEFAULT_ID,
+                onReorder: vi.fn(),
+            });
+            await tick();
+
+            const nameEl = container.querySelector(".field-playlist-name");
+            // Simulate a stale local value, e.g. from a previous session.
+            // Crucially: do NOT focus the input.
+            nameEl.value = "stale-local-value";
+            expect(document.activeElement).not.toBe(nameEl);
+
+            serverName = "server-renamed-it";
+            await handle.refresh();
+
+            // Happy path regression-lock: name DOES sync to server when
+            // the operator isn't editing.
+            expect(nameEl.value).toBe("server-renamed-it");
+        } finally {
+            document.body.removeChild(container);
+        }
+    });
 });
