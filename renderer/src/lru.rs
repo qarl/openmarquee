@@ -99,6 +99,33 @@ where
         self.map.get(key)
     }
 
+    /// Lookup WITHOUT touching the LRU order. Takes `&self` so
+    /// multiple peeks (or a peek under a `&SlideCache` borrow) can
+    /// coexist. The trade-off vs `get`: an entry only ever surfaced
+    /// via `peek` won't be marked warm, so it can be evicted on the
+    /// next at-capacity insert even though it was just used.
+    ///
+    /// Round-18 use case: callers that need TWO simultaneous borrows
+    /// from the same LruMap (e.g. ipc_main.rs
+    /// `run_paint_hook` transition arm builds endpoint_a + endpoint_b
+    /// from `cache.items.get(&from_id)` AND `cache.items.get(&to_id)`
+    /// concurrently). Two `&mut self` borrows from `get` would
+    /// conflict; `peek` lets both coexist. Touch-on-get is restored
+    /// by an explicit pre-borrow `get` call sequence per id when the
+    /// access-recency semantic still matters.
+    ///
+    /// Also useful for snapshot / inspection paths that read the
+    /// cache from a `&self` context (e.g. `capture_current_scene_to_
+    /// png` for the Capture IPC op) where mutating the LRU order on
+    /// a one-off operator action would be unwelcome.
+    pub fn peek<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.get(key)
+    }
+
     /// Insert. Returns the evicted LRU entry's value (if at
     /// capacity AND the key is new) and the replaced value (if
     /// the key already existed). Caller owns dropping any
@@ -266,6 +293,32 @@ mod tests {
         assert!(c.get(&8).is_some());
         assert!(c.get(&9).is_some());
         assert!(c.get(&0).is_none());
+    }
+
+    #[test]
+    fn peek_does_not_touch_lru_order() {
+        // Round-18: peek returns the value WITHOUT marking the entry
+        // warm. The next at-capacity insert must evict the peeked
+        // entry if it was the coldest -- proves peek didn't promote
+        // it to most-recent.
+        let mut c: LruMap<&'static str, u32> = LruMap::with_capacity(2);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        // Peek a (would-be-touched by get) -- LRU should still be a
+        // because peek doesn't touch.
+        assert_eq!(c.peek(&"a"), Some(&1));
+        let o = c.insert("c", 3);
+        // a evicted (peek didn't promote it); b retained.
+        assert_eq!(o.evicted_lru, Some(1));
+        assert!(c.peek(&"a").is_none());
+        assert!(c.peek(&"b").is_some());
+        assert!(c.peek(&"c").is_some());
+    }
+
+    #[test]
+    fn peek_missing_key_returns_none() {
+        let c: LruMap<&'static str, u32> = LruMap::with_capacity(2);
+        assert_eq!(c.peek(&"missing"), None);
     }
 
     #[test]

@@ -172,6 +172,39 @@ if [ "$run_renderer" = "1" ]; then
         fi
         ( cd renderer && "$CARGO" test --quiet ) || fail "renderer cargo test"
         ok "renderer cargo test"
+
+        # Round-18: aarch64 cross-build gate. cargo test runs Mac-
+        # native code, which compiles only `#[cfg(target_os = "macos")]`
+        # paths. Linux-only code (capture_current_scene_to_png, the
+        # transition endpoint borrows in run_paint_hook, the entire
+        # hdmi/v4l2 stack) is invisible to `cargo test --release` --
+        # which is how the r8 LruMap borrow regression at
+        # ipc_main.rs:1135 + 1497 + 1518 slipped past pre-push and
+        # blocked tonight's Pi deploy.
+        #
+        # `cargo zigbuild --target aarch64-unknown-linux-gnu` runs
+        # rustc against the Linux target so cfg-gated code IS
+        # compiled. The link step then fails locally with a missing-
+        # libgbm error (the Pi's /usr/lib/aarch64-linux-gnu/libgbm.so
+        # isn't on a Mac), but the rustc-compile diagnostics arrive
+        # first -- so we gate on the presence of any `error[E<NNNN>]`
+        # in the output, not on the overall exit code. This catches
+        # borrow-check / type / cfg-gated-compile errors without
+        # requiring a working Linux sysroot on the developer's Mac.
+        if command -v zig >/dev/null 2>&1 && rustup target list --installed 2>/dev/null | grep -q "aarch64-unknown-linux-gnu"; then
+            ZIGBUILD_OUT="$(mktemp -t openmarquee-zigbuild.XXXXXX)"
+            ( cd renderer && "$CARGO" zigbuild --release --target aarch64-unknown-linux-gnu 2>&1 ) >"$ZIGBUILD_OUT"
+            if grep -E "error\[E[0-9]+\]" "$ZIGBUILD_OUT" >/dev/null; then
+                # Surface the rustc diagnostics for the developer.
+                grep -B 1 -A 10 "error\[E[0-9]+\]" "$ZIGBUILD_OUT" | head -50
+                rm -f "$ZIGBUILD_OUT"
+                fail "renderer aarch64 cross-compile (rustc errors)"
+            fi
+            rm -f "$ZIGBUILD_OUT"
+            ok "renderer aarch64 cross-compile (rustc clean; link-stage skipped)"
+        else
+            warn "renderer aarch64 cross-compile: zig or aarch64-unknown-linux-gnu target missing; skipping (install zig + 'rustup target add aarch64-unknown-linux-gnu' to gate Linux-only cfg-paths)"
+        fi
     fi
 fi
 

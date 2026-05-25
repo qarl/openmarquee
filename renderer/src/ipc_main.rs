@@ -1132,7 +1132,13 @@ fn capture_current_scene_to_png(
         None => return err("Capture: no current slide (begin_slide first?)"),
     };
     let slide_id = slide.slide_id;
-    let item = match cache.items.get(&slide_id) {
+    // Round-18: peek (no LRU touch) -- (a) cache parameter is
+    // `&SlideCache` (immutable) and LruMap::get takes &mut self
+    // post-r8, so a `get` here would E0596; (b) Capture is a one-
+    // off operator IPC op, not a per-frame paint -- touching the
+    // LRU order on a snapshot would unhelpfully promote whatever
+    // slide happens to be on-screen at capture time.
+    let item = match cache.items.peek(&slide_id) {
         Some(i) => i,
         None => return err(format!("Capture: slide {slide_id} not in cache")),
     };
@@ -1494,7 +1500,21 @@ fn run_paint_hook(
             // shared borrow on cache.items (field-disjoint from the
             // &mut video_decoders borrows above). Demuxer samples
             // come from a shared borrow on cache.video_demuxers.
-            let endpoint_a = match cache.items.get(&from_id) {
+            //
+            // Round-18: endpoint_a + endpoint_b both borrow from
+            // cache.items simultaneously (held through the paint call
+            // below). Post-r8 LruMap::get takes &mut self for the LRU
+            // touch -- two concurrent &mut self.items borrows would
+            // E0499. So: (1) touch the LRU order ONCE per id via
+            // dropped `get` calls (the borrow ends at the statement's
+            // end, so the second touch is sequenced safely), (2) build
+            // the actual endpoint borrows via `peek` (&self, no LRU
+            // touch) so they can coexist. Net semantic: from_id + to_id
+            // each get a single LRU touch per paint frame -- same as
+            // pre-r8 except now explicitly sequenced.
+            cache.items.get(&from_id);
+            cache.items.get(&to_id);
+            let endpoint_a = match cache.items.peek(&from_id) {
                 Some(ContentItem::Text(s)) => hdmi::TransitionEndpoint::Text(s),
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
                 Some(ContentItem::Video(_)) => {
@@ -1515,7 +1535,7 @@ fn run_paint_hook(
                 }
                 None => unreachable!("from_id presence verified above"),
             };
-            let endpoint_b = match cache.items.get(&to_id) {
+            let endpoint_b = match cache.items.peek(&to_id) {
                 Some(ContentItem::Text(s)) => hdmi::TransitionEndpoint::Text(s),
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
                 Some(ContentItem::Video(_)) => {
