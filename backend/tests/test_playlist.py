@@ -754,3 +754,59 @@ def test_prune_dangling_does_not_write_when_nothing_changes(tmp_path: Path):
 
     assert pruned == 0
     assert (tmp_path / "playlist.json").stat().st_mtime == mtime_before
+
+
+def test_concurrent_appends_dont_lose_items(tmp_path: Path):
+    """Round-27 concurrency regression: PlaylistStorage's
+    append_item_to_default does load+mutate+save. Pre-r27 (when the
+    helper lived in api.py as load+append+save at the call layer) two
+    concurrent POST /api/content/images requests could interleave:
+
+      T1 load_all -> T2 load_all (both see N items)
+      T1 mutate (append T1_id; N+1 items in T1's copy)
+      T2 mutate (append T2_id; N+1 items in T2's copy -- T1_id NOT in it)
+      T1 save_all (writes N+1 with T1_id)
+      T2 save_all (writes N+1 with T2_id -- T1_id WIPED FROM DISK)
+
+    The lost item means the operator's just-uploaded slide vanishes
+    from the playlist (content envelope still on disk, just
+    unreferenced). Permanent corruption, invisible until somebody
+    notices the slide isn't showing.
+
+    Note on PUT-vs-POST: the dispatch also describes a "Tab 1
+    drag-reorder PUT vs Tab 2 POST append" scenario, but PUT
+    semantics are wholesale-replace -- the lock can't prevent
+    Tab 1's PUT (built from a minutes-old browser view) from
+    overwriting Tab 2's just-appended item. That's a different
+    bug-class (needs optimistic-concurrency via If-Match etag),
+    out of scope for the lock fix. The lock DOES prevent the
+    concurrent-load+mutate+save race tested here.
+
+    Test: fire N concurrent append_item_to_default calls with
+    distinct ids. All N must land on disk. Pre-r27 ~30-50% are lost
+    to the race depending on thread scheduling.
+    """
+    import threading
+
+    storage = PlaylistStorage(tmp_path / "playlist.json")
+    n_concurrent = 30
+    item_ids = [uuid4() for _ in range(n_concurrent)]
+    barrier = threading.Barrier(n_concurrent)
+
+    def append_one(item_id):
+        barrier.wait()
+        storage.append_item_to_default(item_id)
+
+    threads = [threading.Thread(target=append_one, args=(i,)) for i in item_ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    persisted = set(storage.load().item_ids)
+    missing = set(item_ids) - persisted
+    assert not missing, (
+        f"{len(missing)}/{n_concurrent} items lost to the "
+        f"load-mutate-save race. Sample missing: "
+        f"{list(missing)[:5]}"
+    )

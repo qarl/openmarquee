@@ -54,6 +54,7 @@ All legacy forms migrate transparently on load.
 """
 
 import json
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID, uuid4
@@ -266,6 +267,38 @@ class PlaylistStorage:
         # _coerce_to_collection (Pydantic validate over every
         # Playlist + every PlaylistItem) when the file hasn't moved.
         self._cache: tuple[int, PlaylistCollection] | None = None
+        # Round-27 concurrency: serialize the load+mutate+save trios
+        # in set_by_id / delete_by_id / prune_dangling_refs / the new
+        # append_item_to_default / remove_item_from_default. FastAPI
+        # sync handlers run on a threadpool; two concurrent edits
+        # (e.g. Tab 1 PUT /api/playlists/{id} drag-reorder + Tab 2
+        # POST /api/content/images that triggers server-side
+        # _append_to_playlist) would otherwise interleave their
+        # load+save and lose one operator's edit on disk.
+        # Operator-visible: slides created during a drag-reorder
+        # window vanish from the playlist (content envelope still
+        # on disk, just unreferenced). Permanent corruption,
+        # invisible until somebody notices.
+        #
+        # Same threading.Lock vs asyncio.Lock caveat as
+        # TombstoneStorage (r25 5e0fcf4) and FlockStorage (also
+        # r25): the mutator methods are sync and may be called from
+        # async paths, where the lock briefly blocks the event loop
+        # during contention. Acceptable for microsecond-scale ops;
+        # asyncio.Lock would cascade through every caller.
+        #
+        # IMPORTANT: threading.Lock is NOT reentrant. The mutator
+        # methods below do load_all + mutate + save_all inside the
+        # lock; they MUST NOT call other locked methods (which would
+        # double-acquire and deadlock). Specifically:
+        #   - set_by_id / delete_by_id / prune_dangling_refs each do
+        #     their own load_all+save_all under the lock.
+        #   - append_item_to_default / remove_item_from_default
+        #     bypass set_by_id and use load_all+save_all directly.
+        #   - The legacy save() (line ~399) calls set_by_id; it
+        #     stays UNLOCKED at its own level so the inner
+        #     set_by_id acquires once (no reentry).
+        self._lock = threading.Lock()
 
     @classmethod
     def stats_snapshot(cls) -> dict[str, int]:
@@ -322,28 +355,36 @@ class PlaylistStorage:
 
     def set_by_id(self, playlist: Playlist) -> None:
         """Create or replace a playlist by id. The playlist's `id` field
-        is the lookup key; `name` and `items` are the writable fields."""
-        collection = self.load_all()
-        existing = collection.by_id(playlist.id)
-        if existing is not None:
-            idx = collection.playlists.index(existing)
-            collection.playlists[idx] = playlist
-        else:
-            collection.playlists.append(playlist)
-        self.save_all(collection)
+        is the lookup key; `name` and `items` are the writable fields.
+
+        Round-27: lock-protected load+mutate+save (see __init__ for
+        the race rationale).
+        """
+        with self._lock:
+            collection = self.load_all()
+            existing = collection.by_id(playlist.id)
+            if existing is not None:
+                idx = collection.playlists.index(existing)
+                collection.playlists[idx] = playlist
+            else:
+                collection.playlists.append(playlist)
+            self.save_all(collection)
 
     def delete_by_id(self, playlist_id: UUID) -> bool:
         """Remove a playlist by id. Returns True if it existed.
 
         The default playlist can be deleted but will be recreated empty
         (with the same DEFAULT_PLAYLIST_ID) on the next content upload.
+
+        Round-27: lock-protected.
         """
-        collection = self.load_all()
-        target = collection.by_id(playlist_id)
-        if target is None:
-            return False
-        collection.playlists.remove(target)
-        self.save_all(collection)
+        with self._lock:
+            collection = self.load_all()
+            target = collection.by_id(playlist_id)
+            if target is None:
+                return False
+            collection.playlists.remove(target)
+            self.save_all(collection)
         return True
 
     def all_ids(self) -> list[UUID]:
@@ -357,17 +398,63 @@ class PlaylistStorage:
         Useful at lifespan startup to recover from a dev-style wipe of
         content/ that left the playlist JSON intact — the pallet /
         playback loop would otherwise serve dangling references.
+
+        Round-27: lock-protected.
         """
-        collection = self.load_all()
-        pruned_count = 0
-        for playlist in collection.playlists:
-            kept = [it for it in playlist.items if it.item_id in valid_ids]
-            if len(kept) != len(playlist.items):
-                pruned_count += len(playlist.items) - len(kept)
-                playlist.items = kept
-        if pruned_count:
-            self.save_all(collection)
+        with self._lock:
+            collection = self.load_all()
+            pruned_count = 0
+            for playlist in collection.playlists:
+                kept = [it for it in playlist.items if it.item_id in valid_ids]
+                if len(kept) != len(playlist.items):
+                    pruned_count += len(playlist.items) - len(kept)
+                    playlist.items = kept
+            if pruned_count:
+                self.save_all(collection)
         return pruned_count
+
+    def append_item_to_default(self, item_id: UUID) -> None:
+        """Idempotent append of `item_id` to the default playlist.
+
+        Round-27: moved INTO PlaylistStorage from api.py's
+        _append_to_playlist helper. The helper did
+        `load() + append + save()` -- three separate calls -- which
+        couldn't be lock-protected at the call layer without exposing
+        every API caller to the race. Moving the trio into one
+        lock-protected method here closes the race + makes future
+        callers unable to bypass the lock by mistake.
+
+        Behavior preserved: creates a fresh default playlist if none
+        exists (DEFAULT_PLAYLIST_ID + DEFAULT_PLAYLIST_NAME), appends
+        the item id, persists.
+        """
+        with self._lock:
+            collection = self.load_all()
+            target = collection.by_id(DEFAULT_PLAYLIST_ID)
+            if target is None:
+                target = Playlist(id=DEFAULT_PLAYLIST_ID, name=DEFAULT_PLAYLIST_NAME)
+                collection.playlists.append(target)
+            target.append(item_id)
+            self.save_all(collection)
+
+    def remove_item_from_default(self, item_id: UUID) -> None:
+        """Idempotent remove of `item_id` from the default playlist.
+
+        Round-27: moved INTO PlaylistStorage from api.py's
+        _remove_from_playlist helper (same race rationale as
+        append_item_to_default above). Behavior preserved: removes
+        only from the default playlist; OTHER playlists referencing
+        the same item are unchanged (this matches the pre-r27
+        helper's exact behavior -- a separate cleanup sweep across
+        all playlists is out of scope for this concurrency fix).
+        """
+        with self._lock:
+            collection = self.load_all()
+            target = collection.by_id(DEFAULT_PLAYLIST_ID)
+            if target is None:
+                return
+            target.remove(item_id)
+            self.save_all(collection)
 
     # --- legacy single-playlist API (operates on DEFAULT_PLAYLIST_ID) ---
 

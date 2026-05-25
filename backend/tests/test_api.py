@@ -430,24 +430,28 @@ def test_upload_rolls_back_asset_on_append_to_playlist_failure(
     payload_factory,
     client: TestClient,
     storage: ContentStorage,
+    playlist_storage: PlaylistStorage,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """Round-17 correctness regression: when _append_to_playlist
+    """Round-17 correctness regression: when the playlist append
     raises after storage.save_* succeeded, the just-written asset
     must be rolled back so the operator's UI retry doesn't end up
     with two tiles for one intended upload (list_full_library
     surfaces orphans in the pallet).
 
-    Test shape: monkeypatch _append_to_playlist to raise OSError,
+    Round-27 update: the helper moved INTO PlaylistStorage as
+    append_item_to_default. Monkeypatch the method on the storage
+    instance the dependency-override fixture has wired up.
+
+    Test shape: monkeypatch append_item_to_default to raise OSError,
     POST the upload, assert 500 surfaces AND the asset is NOT on
     disk afterward (rollback worked).
     """
-    from openmarquee import api as api_module
 
     def raising_append(*args, **kwargs):
         raise OSError("simulated NFS hiccup mid-playlist-save")
 
-    monkeypatch.setattr(api_module, "_append_to_playlist", raising_append)
+    monkeypatch.setattr(playlist_storage, "append_item_to_default", raising_append)
 
     client_no_raise = TestClient(app, raise_server_exceptions=False)
     response = client_no_raise.post(route, json=payload_factory())
@@ -469,19 +473,22 @@ def test_upload_rolls_back_asset_on_append_to_playlist_failure(
 def test_upload_video_rolls_back_assets_on_append_to_playlist_failure(
     client: TestClient,
     storage: ContentStorage,
+    playlist_storage: PlaylistStorage,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Round-17 regression (video flavor): video uploads write TWO
     files (thumbnail PNG + asset MP4). Rollback must clean up the
     whole item directory, not just one file. Same shape as the
     parametrized test above, factored out because the payload
-    construction needs the _video_payload helper / _fake_mp4 bytes."""
-    from openmarquee import api as api_module
+    construction needs the _video_payload helper / _fake_mp4 bytes.
+
+    Round-27 update: same monkeypatch shift as the parametrized test
+    above (helper moved INTO PlaylistStorage)."""
 
     def raising_append(*args, **kwargs):
         raise OSError("simulated NFS hiccup mid-playlist-save")
 
-    monkeypatch.setattr(api_module, "_append_to_playlist", raising_append)
+    monkeypatch.setattr(playlist_storage, "append_item_to_default", raising_append)
 
     client_no_raise = TestClient(app, raise_server_exceptions=False)
     response = client_no_raise.post("/api/content/videos", json=_video_payload())

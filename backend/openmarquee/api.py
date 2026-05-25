@@ -157,18 +157,12 @@ def cors_headers_for_origin(origin: str, flock_storage: FlockStorage) -> dict[st
     return {}
 
 
-def _append_to_playlist(playlist_storage: PlaylistStorage, item_id) -> None:
-    """Idempotent append: load → append → save."""
-    playlist = playlist_storage.load()
-    playlist.append(item_id)
-    playlist_storage.save(playlist)
-
-
-def _remove_from_playlist(playlist_storage: PlaylistStorage, item_id) -> None:
-    """Idempotent remove: load → remove → save (no-op if absent)."""
-    playlist = playlist_storage.load()
-    playlist.remove(item_id)
-    playlist_storage.save(playlist)
+# Round-27: _append_to_playlist + _remove_from_playlist moved INTO
+# PlaylistStorage as lock-protected methods (append_item_to_default,
+# remove_item_from_default). The pre-r27 helpers did load+mutate+save
+# at the call layer, which couldn't be lock-protected without
+# exposing every API caller to the race. See PlaylistStorage.__init__
+# for the full rationale.
 
 
 def _decode_image_payload(b64: str) -> bytes:
@@ -356,7 +350,7 @@ async def upload_text_slide(
     # written asset on append failure so retry restarts cleanly.
     # Matches the r16 delete_content_item rollback shape.
     try:
-        _append_to_playlist(playlist_storage, slide.id)
+        playlist_storage.append_item_to_default(slide.id)
     except Exception:
         try:
             storage.delete(slide.id)
@@ -615,7 +609,7 @@ async def upload_video(
     storage.save_video(video, thumbnail, mp4)
     # Round-17 rollback: see create_text_slide for rationale.
     try:
-        _append_to_playlist(playlist_storage, video.id)
+        playlist_storage.append_item_to_default(video.id)
     except Exception:
         try:
             storage.delete(video.id)
@@ -671,7 +665,7 @@ async def upload_image(
     storage.save_image(image, image_bytes)
     # Round-17 rollback: see create_text_slide for rationale.
     try:
-        _append_to_playlist(playlist_storage, image.id)
+        playlist_storage.append_item_to_default(image.id)
     except Exception:
         try:
             storage.delete(image.id)
@@ -781,7 +775,7 @@ async def upload_stream(
     storage.save_stream(slide)
     # Round-17 rollback: see create_text_slide for rationale.
     try:
-        _append_to_playlist(playlist_storage, slide.id)
+        playlist_storage.append_item_to_default(slide.id)
     except Exception:
         try:
             storage.delete(slide.id)
@@ -892,7 +886,7 @@ async def upload_web(
     # notify_peers) so it only fires on full success -- otherwise
     # we'd kick a screenshot for a slide that just got rolled back.
     try:
-        _append_to_playlist(playlist_storage, slide.id)
+        playlist_storage.append_item_to_default(slide.id)
     except Exception:
         try:
             storage.delete(slide.id)
@@ -1101,7 +1095,7 @@ async def delete_content_item(
     # shadow the original exception (re-raised below).
     try:
         storage.delete(item_id)
-        _remove_from_playlist(playlist_storage, item_id)
+        playlist_storage.remove_item_from_default(item_id)
     except Exception:
         try:
             tombstones.remove(item_id)
