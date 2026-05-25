@@ -209,13 +209,25 @@ export function mountImageUploader(
         durationEl.value = String(
             Math.max(1, (slide.duration_ms || 5000) / 1000),
         );
+        // Round 17 slide-switch race: capture editingId before await
+        // + pass isStale to drawUrlToCanvas. If the operator clicks
+        // a different slide during the load, a late-arriving onload
+        // won't ctx.drawImage onto the now-active slide's canvas;
+        // the after-await check then bails before autoSave.cancel.
+        const myEditId = state.editingId;
         try {
-            await drawUrlToCanvas(mediaSrc(`/api/content/${slide.id}/asset`), canvas);
+            await drawUrlToCanvas(
+                mediaSrc(`/api/content/${slide.id}/asset`),
+                canvas,
+                { isStale: () => state.editingId !== myEditId },
+            );
         } catch (err) {
+            if (state.editingId !== myEditId) return;
             clearCanvas();
             statusEl.textContent = `Could not load image: ${err.message}`;
             statusEl.dataset.state = "error";
         }
+        if (state.editingId !== myEditId) return;
         // Loading an existing slide is not a user edit — drop any pending
         // auto-save scheduled by the field-value mutations above.
         autoSave.cancel();
@@ -345,11 +357,23 @@ export function drawFileToCanvas(file, canvas) {
  * at panel resolution so this is mostly a faithful draw, but the
  * cover-fit path handles weird historical resize cases too.
  */
-export function drawUrlToCanvas(url, canvas) {
+export function drawUrlToCanvas(url, canvas, { isStale } = {}) {
     return new Promise((resolve, reject) => {
         const img = new Image();
         img.crossOrigin = "anonymous";
         img.onload = () => {
+            // Round 17 stale-canvas guard: see video-upload.js's
+            // drawUrlToCanvas for the full rationale. When the
+            // operator switches slides mid-load, isStale lets us
+            // bail BEFORE ctx.drawImage so the now-active slide's
+            // canvas pixels aren't overwritten by the late-arriving
+            // image. Resolve (not reject) so the caller's
+            // after-await guard handles post-draw mutations
+            // symmetrically.
+            if (isStale && isStale()) {
+                resolve();
+                return;
+            }
             try {
                 const ctx = canvas.getContext("2d");
                 ctx.save();
