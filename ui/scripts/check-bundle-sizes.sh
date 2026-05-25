@@ -52,30 +52,51 @@ if [ -z "$ESBUILD" ]; then
     exit 2
 fi
 
-# Fresh build of the 3 captive-portal entries into a tmp dir. Matches
-# the 2026-05-25 baseline measurement command exactly so thresholds
-# stay calibrated to the same shape. Excluding main.js here because
-# main.js needs renderer-wasm/pkg/ (built by the separate build-wasm
-# CI job) -- this gate runs against a captive-only subset.
-BUILD_DIR="$(mktemp -d -t omq-bundle-XXXXXX)"
-trap 'rm -rf "$BUILD_DIR"' EXIT
+# Fresh build of the 3 captive-portal entries + the dashboard
+# entrypoint into tmp dirs. Matches the 2026-05-25 baseline
+# measurement commands exactly so thresholds stay calibrated to the
+# same shape.
+#
+# The dashboard build (main.js) requires renderer-wasm/pkg/ to be
+# present so esbuild can resolve src/wasm-renderer.js's import. In
+# CI that's downloaded as an artifact from the build-wasm job before
+# this script runs; locally it's produced by
+# scripts/build_wasm_renderer.sh.
+CAPTIVE_DIR="$(mktemp -d -t omq-bundle-captive-XXXXXX)"
+DASHBOARD_DIR="$(mktemp -d -t omq-bundle-dashboard-XXXXXX)"
+trap 'rm -rf "$CAPTIVE_DIR" "$DASHBOARD_DIR"' EXIT
 
 "$ESBUILD" \
     src/welcome.js src/set-password.js src/login.js \
     --format=esm --bundle --splitting --minify \
     --loader:.wasm=binary \
-    --outdir="$BUILD_DIR"
+    --outdir="$CAPTIVE_DIR"
 
-# Watchlist thresholds (gzip-compressed bytes). Source:
-# qa/reports/2026-05-25/bundle-size-baseline-2026-05-25.md, the
-# corrected v2 watchlist table. ~15% above the 2026-05-25 baseline.
-# SI bytes (KB = 1000) per the report's units convention.
+if [ -d ../renderer-wasm/pkg ]; then
+    "$ESBUILD" \
+        src/main.js ffmpeg-worker=node_modules/@ffmpeg/ffmpeg/dist/esm/worker.js \
+        --format=esm --bundle --splitting --minify \
+        --loader:.wasm=binary \
+        --outdir="$DASHBOARD_DIR"
+    DASHBOARD_BUILT=1
+else
+    echo "WARN: ../renderer-wasm/pkg/ not present; skipping dashboard gate." >&2
+    echo "      Run scripts/build_wasm_renderer.sh first (local), OR ensure" >&2
+    echo "      the build-wasm CI job ran before this step (CI)." >&2
+    DASHBOARD_BUILT=0
+fi
+
+# Watchlist thresholds (gzip-compressed bytes). Sources:
+# - qa/reports/2026-05-25/bundle-size-baseline-2026-05-25.md (captive)
+# - qa/reports/2026-05-25/dashboard-bundle-baseline-2026-05-25.md (dashboard)
+# Both at ~15% above 2026-05-25 baseline. SI bytes (KB = 1000)
+# per the reports' units convention.
 #
 # Parallel arrays for bash 3.2 portability (no associative arrays).
 FILES=(
-    "$BUILD_DIR/welcome.js"
-    "$BUILD_DIR/login.js"
-    "$BUILD_DIR/set-password.js"
+    "$CAPTIVE_DIR/welcome.js"
+    "$CAPTIVE_DIR/login.js"
+    "$CAPTIVE_DIR/set-password.js"
     "welcome.html"
     "login.html"
     "set-password.html"
@@ -99,8 +120,50 @@ LABELS=(
     "ui/set-password.html"
 )
 
+# Dashboard files (added only if the dashboard build succeeded).
+# The sortable.esm-*.js name has a content-hash suffix esbuild assigns
+# per build; resolve it via glob at check-time + bail if it doesn't
+# match a single file (an upstream change splitting sortable across
+# multiple chunks should be a manual triage, not a silent SUM).
+if [ "$DASHBOARD_BUILT" -eq 1 ]; then
+    # Glob for the sortable chunk (esbuild's content-hash filename).
+    SORTABLE_GLOB=("$DASHBOARD_DIR"/sortable.esm-*.js)
+    if [ ${#SORTABLE_GLOB[@]} -ne 1 ] || [ ! -f "${SORTABLE_GLOB[0]}" ]; then
+        echo "ERROR: expected exactly 1 sortable.esm-*.js chunk in $DASHBOARD_DIR, found ${#SORTABLE_GLOB[@]}" >&2
+        echo "       (esbuild splitting may have changed; thresholds need re-baselining)" >&2
+        exit 2
+    fi
+    SORTABLE_CHUNK="${SORTABLE_GLOB[0]}"
+
+    FILES+=(
+        "$DASHBOARD_DIR/main.js"
+        "$SORTABLE_CHUNK"
+        "../renderer-wasm/pkg/renderer_wasm_bg.wasm"
+        "../renderer-wasm/pkg/renderer_wasm.js"
+        "index.html"
+    )
+    THRESHOLDS+=(
+        72000
+        18000
+        60600
+        3600
+        1400
+    )
+    LABELS+=(
+        "dist-dashboard/main.js"
+        "dist-dashboard/sortable.esm-*.js"
+        "renderer-wasm/pkg/renderer_wasm_bg.wasm"
+        "renderer-wasm/pkg/renderer_wasm.js"
+        "ui/index.html"
+    )
+fi
+
 violations=0
-echo "Captive-portal bundle-size gate (gzip bytes vs threshold):"
+if [ "$DASHBOARD_BUILT" -eq 1 ]; then
+    echo "Bundle-size gate -- captive-portal + dashboard (gzip bytes vs threshold):"
+else
+    echo "Bundle-size gate -- captive-portal ONLY (dashboard skipped, see WARN above):"
+fi
 echo ""
 printf "  %-32s %10s %10s %6s  %s\n" "FILE" "GZ BYTES" "THRESHOLD" "% USED" "STATUS"
 printf "  %-32s %10s %10s %6s  %s\n" "----" "--------" "---------" "------" "------"
