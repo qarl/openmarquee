@@ -51,7 +51,29 @@ export async function apiFetch(input, init = {}) {
     const skip401 = init.skipAuth401Redirect === true;
     const { skipAuth401Redirect: _skip, ...fetchInit } = init;
     const headers = new Headers(fetchInit.headers || {});
-    if (typeof localStorage !== "undefined") {
+    // Defense-in-depth: only stamp the bearer on same-origin requests.
+    // All current callers pass a relative /api/... path so this is a
+    // no-op today, but if any future caller (or a caller that takes
+    // a URL from remote config / user input) hands an absolute URL,
+    // this prevents the bearer from being exfiltrated to that origin.
+    // Cross-origin fetches still go through (fetch() receives the
+    // original input); they just don't carry the Authorization header.
+    // Note: parsed input is only used for the origin check; the
+    // ORIGINAL input is passed to fetch() to preserve relative-path
+    // semantics + any future Request-object support.
+    let isSameOrigin = true;
+    if (typeof window !== "undefined" && window.location) {
+        try {
+            isSameOrigin =
+                new URL(input, window.location.origin).origin ===
+                window.location.origin;
+        } catch {
+            // Malformed URL — fail-closed (don't stamp bearer). The
+            // fetch() call below will surface the URL error.
+            isSameOrigin = false;
+        }
+    }
+    if (isSameOrigin && typeof localStorage !== "undefined") {
         try {
             const token = localStorage.getItem(AUTH_TOKEN_KEY);
             if (token) {
