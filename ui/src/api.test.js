@@ -90,6 +90,28 @@ describe("apiFetch same-origin guard", () => {
             : new Headers(init.headers || {});
         expect(headers.has("Authorization")).toBe(false);
     });
+
+    it("does NOT attach Authorization when input is a malformed URL (fail-closed)", async () => {
+        // Round-29 regression-lock for the defense-in-depth fail-closed
+        // branch at api.js:70-74 — the try/catch around `new URL(input,
+        // origin)` sets isSameOrigin=false when the constructor throws.
+        // Without this, a refactor flipping the default to true (or
+        // removing the try/catch entirely) would silently leak the
+        // bearer on pathological URLs.
+        //
+        // `http://[invalid` is a real URL parser failure (unterminated
+        // IPv6 literal bracket) — new URL() throws TypeError.
+        localStorage.setItem(AUTH_TOKEN_KEY, "tok-must-not-leak");
+        const fetchMock = mockFetch({ ok: true, status: 200, json: async () => ({}) });
+        // fetch() is mocked so the malformed URL doesn't actually go
+        // out — the test asserts only on the header-stamping decision.
+        await apiFetch("http://[invalid");
+        const init = calledInit(fetchMock);
+        const headers = init.headers instanceof Headers
+            ? init.headers
+            : new Headers(init.headers || {});
+        expect(headers.has("Authorization")).toBe(false);
+    });
 });
 
 describe("saveTextSlide", () => {
