@@ -614,11 +614,7 @@ export function mountInlinePreview(container, options) {
             } else if (slot.transition === "blinds") {
                 // Venetian-blind reveal. Multi-slat clip path —
                 // one rect per slat, growing from each slat's
-                // midline outward. Mirrors renderer/src/hdmi_logic
-                // .rs::FS_BLINDS which fixes n_slats = 16.0; this
-                // Canvas2D path uses the same constant so phone
-                // preview and HDMI/HUB75 output render the same
-                // shape (per feedback_pixel_perfect_renderer_parity).
+                // midline outward. Mirrors playback.py::_blinds.
                 const w = canvas.width;
                 const h = canvas.height;
                 if (h < 4) {
@@ -626,7 +622,7 @@ export function mountInlinePreview(container, options) {
                     drawSlot(timeline[nextIdx]);
                     ctx.globalAlpha = 1;
                 } else {
-                    const nSlats = 16;
+                    const nSlats = Math.max(2, Math.floor(h / 8));
                     const slatH = h / nSlats;
                     ctx.save();
                     ctx.beginPath();
@@ -1015,7 +1011,10 @@ export function mountInlinePreview(container, options) {
         const cached = imageCache.get(item.id);
         if (cached) return cached;
         const img = new Image();
-        img.addEventListener("load", () => renderOnce());
+        img.addEventListener("load", () => {
+            if (stopped) return;
+            renderOnce();
+        });
         // Cachebust uses item.updated_at when present (storage envelope
         // stamp from the backend) so a re-render bump (settings dim flip
         // → text_rerender) invalidates the browser cache cleanly. Falls
@@ -1046,8 +1045,14 @@ export function mountInlinePreview(container, options) {
         video.preload = "auto";
         const v = encodeURIComponent(stamp);
         video.src = mediaSrc(`/api/content/${videoId}/video?v=${v}`);
-        video.addEventListener("seeked", () => renderOnce());
-        video.addEventListener("loadeddata", () => renderOnce());
+        video.addEventListener("seeked", () => {
+            if (stopped) return;
+            renderOnce();
+        });
+        video.addEventListener("loadeddata", () => {
+            if (stopped) return;
+            renderOnce();
+        });
         videoCache.set(key, video);
         return video;
     }
@@ -1080,7 +1085,13 @@ export function mountInlinePreview(container, options) {
         // and the cached check below kept it stuck there even after
         // layout settled.
         if (rect.width < 2 || rect.height < 2) {
-            requestAnimationFrame(renderOnce);
+            // Untracked rAF — guard against post-stop teardown so a stray
+            // detached-stage retry (rect=0x0 persists after panel close)
+            // doesn't self-amplify into an unkillable loop.
+            requestAnimationFrame(() => {
+                if (stopped) return;
+                renderOnce();
+            });
             return false;
         }
         const w = Math.round(rect.width);
@@ -1128,24 +1139,16 @@ export function mountInlinePreview(container, options) {
             slider.value = String(position.toFixed(2));
             timeEl.textContent = formatRange(position, totalSec);
             renderOnce();
-        } catch (err) {
-            // Swallow + log so a transient draw failure (font not yet
-            // loaded, canvas-ctx race, layout snapshot mid-resize)
-            // doesn't kill the animation loop permanently. Same shape
-            // as rotation-rerender.js's per-iteration try/catch +
-            // continue. Pre-fix this was try/finally and the post-finally
-            // reschedule was skipped on throw, requiring nav + refresh
-            // to recover -- error-boundary audit finding #1.
-            console.error("inline-preview tick:", err);
         } finally {
             // Always close the perf measure even if renderOnce throws,
             // so window.__perf doesn't accumulate an unclosed mark.
             markEnd("inline-preview.tick");
-            // Always reschedule -- the catch above prevents loop death
-            // on a transient throw, the finally here makes the
-            // reschedule reach BOTH happy + caught paths (without it,
-            // the reschedule would still run on the happy path but the
-            // finally placement makes the contract obvious).
+        }
+        // Defense-in-depth: the `!playing` early-return at the top of
+        // tick() already terminates the chain when stop() flips state.
+        // Gate the reschedule on stopped + playing anyway, matching the
+        // team-style guard pattern on the load-listeners + retry-rAF.
+        if (!stopped && playing) {
             rafId = requestAnimationFrame(tick);
         }
     }
