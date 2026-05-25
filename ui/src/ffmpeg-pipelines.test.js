@@ -411,3 +411,64 @@ describe("transcodeToH264 serialization (r24)", () => {
         expect(ff.calls.exec.length).toBeGreaterThanOrEqual(1);
     });
 });
+
+// --- r25 MEMFS cleanup on failure ----------------------------------------
+
+describe("transcodeToH264 MEMFS cleanup (r25)", () => {
+    // Round-25 regression-lock: pre-fix cleanup ran AFTER the
+    // exec/readFile chain — a thrown exec (bad codec, corrupt input,
+    // OOM) bypassed cleanup and left the input bytes resident in the
+    // singleton ffmpeg.wasm's MEMFS for the page lifetime. Combined
+    // with r24's serialized chain, repeated failures pile up
+    // monotonically. ~5-10 failed 50-100MB uploads OOM'd the tab.
+    //
+    // Fix: try/finally around the exec+readFile block; finally runs
+    // ff.deleteFile(inName) + ff.deleteFile(outName) with per-file
+    // try/catch suppressing "file not found" for the never-created
+    // outName.
+
+    it("calls deleteFile(inName) even when exec throws (counterfactual: pre-fix didn't)", async () => {
+        const { transcodeToH264 } = await import("./ffmpeg-pipelines.js");
+        // Reject the gate so the mock's exec throws.
+        ffmpegState.execGate = Promise.reject(new Error("bad codec"));
+        // Suppress unhandled-rejection on the gate itself.
+        ffmpegState.execGate.catch(() => {});
+
+        let caught = null;
+        try {
+            await transcodeToH264({
+                file: new Blob(["A"], { type: "video/mp4" }),
+                width: 320, height: 240,
+            });
+        } catch (err) {
+            caught = err;
+        }
+        // Function rejected as expected.
+        expect(caught).toBeInstanceOf(Error);
+        expect(caught.message).toBe("bad codec");
+
+        // Cleanup STILL ran. Pre-fix: deleteFile would not have been
+        // called at all because the cleanup block was AFTER the
+        // throw site (no try/finally).
+        const ff = ffmpegState.instance;
+        // At minimum the inName was deleted; outName attempt also
+        // fires (its try/catch absorbs the "not found" since exec
+        // never produced output).
+        const deletedNames = ff.calls.deleteFile;
+        expect(deletedNames).toContain("input-1");
+    });
+
+    it("happy path still cleans up both inName AND outName", async () => {
+        const { transcodeToH264 } = await import("./ffmpeg-pipelines.js");
+        const bytes = await transcodeToH264({
+            file: new Blob(["A"], { type: "video/mp4" }),
+            width: 320, height: 240,
+        });
+        expect(bytes).toBeInstanceOf(Uint8Array);
+        const ff = ffmpegState.instance;
+        // Both files cleaned. seq starts fresh per test (resetModules
+        // in beforeEach) so the first call gets seq=1.
+        expect(ff.calls.deleteFile).toContain("input-1");
+        expect(ff.calls.deleteFile).toContain("output-1.mp4");
+    });
+});
