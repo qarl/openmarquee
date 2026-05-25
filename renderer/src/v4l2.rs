@@ -19,8 +19,10 @@
 //!   [`Decoder::set_output_format`] / [`Decoder::set_capture_format`].
 //! - VIDIOC_REQBUFS + VIDIOC_QUERYBUF + mmap of all OUTPUT and
 //!   CAPTURE planes via [`Decoder::allocate_buffers`].
-//! - VIDIOC_STREAMON / STREAMOFF on both queues via
-//!   [`Decoder::start_streaming`] / [`Decoder::stop_streaming`].
+//! - VIDIOC_STREAMON on both queues via
+//!   [`Decoder::start_streaming`]. STREAMOFF runs automatically
+//!   on `Drop for DecoderInner` (calls the private
+//!   `stop_streaming_quiet` -- no explicit shutdown API needed).
 //! - The decode-loop API: [`Decoder::feed`] (queue an OUTPUT
 //!   buffer with H.264 NAL bytes) + [`Decoder::next_frame`]
 //!   (dequeue the next CAPTURE buffer as a [`Frame`]).
@@ -101,7 +103,6 @@ pub const V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE: u32 = 10;
 // ============================================================
 
 pub const V4L2_MEMORY_MMAP: u32 = 1;
-pub const V4L2_MEMORY_USERPTR: u32 = 2;
 pub const V4L2_MEMORY_DMABUF: u32 = 4;
 
 // ============================================================
@@ -848,17 +849,6 @@ impl Decoder {
         self.inner.lock().unwrap().capture_buffer_type = ty;
     }
 
-    pub fn capture_buffer_type(&self) -> CaptureBufferType {
-        self.inner.lock().unwrap().capture_buffer_type
-    }
-
-    /// V4L2 piece 3e: has the OUTPUT queue been signaled EOF via
-    /// `feed(&[])`? Lets per-advance callers avoid spurious extra
-    /// EOF feeds when a video has run out of samples.
-    pub fn is_output_eof_sent(&self) -> bool {
-        self.inner.lock().unwrap().output_eof_sent
-    }
-
     /// Verify the CAPTURE quantization the driver picked is
     /// compatible with the MMAP-path BT.601 limited-range shader.
     /// Call AFTER `set_capture_format`.
@@ -1170,13 +1160,6 @@ impl Decoder {
         unsafe { vidioc_streamon(inner.fd(), &bt_cap) }
             .with_context(|| "VIDIOC_STREAMON CAPTURE")?;
         inner.capture_streaming = true;
-        Ok(())
-    }
-
-    /// VIDIOC_STREAMOFF both queues.
-    pub fn stop_streaming(&self) -> Result<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.stop_streaming_quiet();
         Ok(())
     }
 
