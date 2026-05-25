@@ -1056,9 +1056,13 @@ where
             // PaintSlide / PaintTransition OpResult, fire the
             // actual GL paint. If paint errors, override the
             // response so the caller sees Err{message} rather
-            // than a fake-success response.
+            // than a fake-success response. resp is moved in (no
+            // other readers post-paint_kind extraction above);
+            // PaintTransition's kind String moves through the
+            // hook and back into the returned response with zero
+            // clones.
             let resp = run_paint_hook(
-                &resp,
+                resp,
                 session,
                 &card,
                 &mut cache,
@@ -1249,7 +1253,7 @@ fn validate_capture_inputs(item: &ContentItem) -> Result<(), &'static str> {
 /// already updated; this hook only paints.
 #[cfg(target_os = "linux")]
 fn run_paint_hook(
-    resp: &IpcResponse,
+    resp: IpcResponse,
     session: &mut crate::hdmi::EglSession,
     card: &crate::Card,
     cache: &mut SlideCache,
@@ -1259,10 +1263,15 @@ fn run_paint_hook(
     use crate::content::ContentItem;
     use crate::hdmi;
 
+    // Move-by-value: destructure resp into an owned OpResult so the
+    // success path can re-pack via field-init shorthand without
+    // cloning. Previously this took &IpcResponse and returned
+    // resp.clone() per arm, which for PaintTransition heap-allocated
+    // a fresh kind: String each frame (~30 Hz steady-state).
     let result = match resp {
         IpcResponse::Ok { result } => result,
         // Pass through errors unchanged.
-        IpcResponse::Err { .. } => return resp.clone(),
+        e @ IpcResponse::Err { .. } => return e,
     };
     match result {
         OpResult::PaintSlide { slide_id, t_in_slide_ms } => {
@@ -1270,7 +1279,7 @@ fn run_paint_hook(
             // mutable borrow on cache.video_decoders later for
             // the Video branch without re-entering the borrow.
             // Text/Image only need an immutable items lookup.
-            let item_kind = match cache.items.get(slide_id) {
+            let item_kind = match cache.items.get(&slide_id) {
                 Some(ContentItem::Text(_)) => "text",
                 Some(ContentItem::Image(_)) => "image",
                 Some(ContentItem::Video(_)) => "video",
@@ -1285,14 +1294,14 @@ fn run_paint_hook(
             // Pins the wire-format errors for the Python proxy's
             // error-class dispatch.
             {
-                let item = cache.items.get(slide_id).expect("checked above");
+                let item = cache.items.get(&slide_id).expect("checked above");
                 if let Err(msg) = validate_paint_slide_inputs(item, content_root) {
                     return err(msg);
                 }
             }
             match item_kind {
                 "text" => {
-                    let item = cache.items.get(slide_id).expect("checked above");
+                    let item = cache.items.get(&slide_id).expect("checked above");
                     let slide = match item {
                         ContentItem::Text(s) => s,
                         _ => unreachable!("item_kind matched text"),
@@ -1303,11 +1312,13 @@ fn run_paint_hook(
                         slide,
                         fonts,
                         content_root,
-                        *t_in_slide_ms,
+                        t_in_slide_ms,
                     ) {
                         return err(format!("paint_slide failed: {e:#}"));
                     }
-                    resp.clone()
+                    IpcResponse::Ok {
+                        result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
+                    }
                 }
                 "image" => {
                     // Validator above already enforced content_root
@@ -1315,7 +1326,7 @@ fn run_paint_hook(
                     let cr = content_root.expect(
                         "validate_paint_slide_inputs guarantees content_root for Image",
                     );
-                    let item = cache.items.get(slide_id).expect("checked above");
+                    let item = cache.items.get(&slide_id).expect("checked above");
                     let slide = match item {
                         ContentItem::Image(s) => s,
                         _ => unreachable!("item_kind matched image"),
@@ -1325,13 +1336,15 @@ fn run_paint_hook(
                     ) {
                         return err(format!("paint_slide (image) failed: {e:#}"));
                     }
-                    resp.clone()
+                    IpcResponse::Ok {
+                        result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
+                    }
                 }
                 "video" => {
                     // V4L2 piece 3e: drive one frame of decode +
                     // upload + paint per advance tick. Requires
                     // the demuxer + decoder primed in cache.load.
-                    let dem = match cache.video_demuxers.get(slide_id) {
+                    let dem = match cache.video_demuxers.get(&slide_id) {
                         Some(d) => d,
                         None => {
                             return err(format!(
@@ -1339,7 +1352,7 @@ fn run_paint_hook(
                             ));
                         }
                     };
-                    let dec_state = match cache.video_decoders.get_mut(slide_id) {
+                    let dec_state = match cache.video_decoders.get_mut(&slide_id) {
                         Some(d) => d,
                         None => {
                             return err(format!(
@@ -1372,7 +1385,9 @@ fn run_paint_hook(
                             );
                         }
                     }
-                    resp.clone()
+                    IpcResponse::Ok {
+                        result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
+                    }
                 }
                 _ => unreachable!("item_kind from match above"),
             }
@@ -1388,8 +1403,8 @@ fn run_paint_hook(
             // helper drains one V4L2 sample per call (Option D
             // cadence per `feedback_motion_through_transitions_
             // required`: video plays through the transition).
-            let from_id = *from;
-            let to_id = *to;
+            let from_id = from;
+            let to_id = to;
 
             // Determine endpoint kinds without holding borrows on
             // cache.items past the kind discriminator (so the
@@ -1529,15 +1544,21 @@ fn run_paint_hook(
                 endpoint_b,
                 fonts,
                 content_root,
-                kind,
-                *progress,
+                &kind,
+                progress,
             ) {
                 return err(format!("paint_transition failed: {e:#}"));
             }
-            resp.clone()
+            // Re-pack: from/to are Copy (Uuid), progress is Copy
+            // (f32), kind String moves back in without a heap alloc.
+            // This is the zero-clone path that motivated the
+            // move-by-value refactor.
+            IpcResponse::Ok {
+                result: OpResult::PaintTransition { from, to, kind, progress },
+            }
         }
         // Non-paint OpResults: pass through unchanged.
-        _ => resp.clone(),
+        other => IpcResponse::Ok { result: other },
     }
 }
 
