@@ -78,6 +78,13 @@ def test_put_then_get_round_trip(client: TestClient):
         "tailscale_enabled": False,
         "tailscale_auth_key": None,
         "tailscale_hostname": None,
+        # Pre-existing drift fix: tailscale_https_enabled landed in
+        # HTTPS Phase 1 (4f440a9 → main 97d36fc) with new tests in
+        # test_settings.py but this expected-dict snapshot was never
+        # updated. The response always included the field; without
+        # this line the assertion below failed with "Left contains
+        # 1 more item: {'tailscale_https_enabled': True}".
+        "tailscale_https_enabled": True,
         "flock_sync_enabled": True,
         "ui_first_run_seen": False,
     }
