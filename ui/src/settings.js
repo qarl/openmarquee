@@ -990,7 +990,15 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     // --- ticking device-time display ---
 
     function tickNow() {
-        if (!nowValueEl) return;
+        // Replaces the pre-fix `if (!nowValueEl) return;` defensive
+        // check, which was UNREACHABLE: nowValueEl is captured at
+        // mount time (line ~367) and never reassigned, so once it's
+        // non-null at mount, it stays non-null forever -- even after
+        // the element is detached from the DOM. Optional-chained
+        // .isConnected gives the check teeth: returns false when the
+        // node is detached, AND tolerates the (impossible-today-but-
+        // safe-anyway) nowValueEl === null path.
+        if (!nowValueEl?.isConnected) return;
         const now = new Date();
         const options = {
             hour: "2-digit",
@@ -1013,10 +1021,25 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             ).format(now);
         }
     }
-    setInterval(tickNow, 1000);
+    // Tracked for teardown via the destroy() handle below. Sibling
+    // contrast at settings.js:847 (pollTailscaleStatus, 3s) does the
+    // same dance via tsPollTimer + clearInterval at :779 -- the
+    // discipline was applied once in this module and missed here
+    // pre-fix.
+    let tickTimer = setInterval(tickNow, 1000);
 
     refresh();
-    return { refresh };
+    return {
+        refresh,
+        destroy() {
+            // Idempotent: calling twice is safe (the second call
+            // is a no-op because tickTimer is already null).
+            if (tickTimer !== null) {
+                clearInterval(tickTimer);
+                tickTimer = null;
+            }
+        },
+    };
 }
 
 function populateTimezoneSelect(selectEl) {
