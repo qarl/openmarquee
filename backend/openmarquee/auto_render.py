@@ -33,10 +33,43 @@ log = logging.getLogger(__name__)
 
 
 # Default auto_format per mode — used when the slide has auto_format=None.
+# Kept as a separate table from _FORMATTERS so a future UI surface that
+# needs to know "what's the default format for mode X" has a single
+# source of truth (rather than scraping it back out of the dispatch
+# fallback semantics).
 _DEFAULT_FORMAT = {
     "time": "time_hm",
     "date": "date_iso",
     "day": "day_long",
+}
+
+
+def _format_date_medium(n: datetime) -> str:
+    """e.g. "Apr 21" — strip the leading zero off %d without relying on
+    the %-d glibc extension (works on Linux + Mac but not portable to
+    Windows; tests run on Mac)."""
+    return n.strftime("%b ") + str(n.day)
+
+
+def _format_date_long(n: datetime) -> str:
+    """e.g. "April 21, 2026" -- the mode's default."""
+    return n.strftime("%B ") + f"{n.day}, {n.year}"
+
+
+# Dispatch table: (auto_mode, auto_format) -> formatter callable.
+# (mode, None) entries are the mode's default-format renderers; the
+# `_DEFAULT_FORMAT.get(mode)` resolution upstream still runs first so
+# the canonical default-format name is preserved for any caller that
+# inspects the resolved fmt, but lookup then falls through to the
+# None entry. Adding a new auto_format becomes a 1-line table edit.
+_FORMATTERS: dict[tuple[str, str | None], Callable[[datetime], str]] = {
+    ("time", "time_hms"): lambda n: n.strftime("%H:%M:%S"),
+    ("time", None): lambda n: n.strftime("%H:%M"),
+    ("date", "date_iso"): lambda n: n.strftime("%Y-%m-%d"),
+    ("date", "date_medium"): _format_date_medium,
+    ("date", None): _format_date_long,
+    ("day", "day_short"): lambda n: n.strftime("%a"),
+    ("day", None): lambda n: n.strftime("%A"),
 }
 
 
@@ -57,32 +90,16 @@ def render_auto_text_for_layer(layer, now: datetime) -> str:
     if not getattr(layer, "auto_mode", None):
         return getattr(layer, "text", "")
 
-    fmt = layer.auto_format or _DEFAULT_FORMAT.get(layer.auto_mode)
-
-    if layer.auto_mode == "time":
-        if fmt == "time_hms":
-            return now.strftime("%H:%M:%S")
-        return now.strftime("%H:%M")
-
-    if layer.auto_mode == "date":
-        if fmt == "date_iso":
-            return now.strftime("%Y-%m-%d")
-        if fmt == "date_medium":
-            # e.g. "Apr 21" — strip the leading zero off %d without
-            # relying on the %-d glibc extension (works on Linux + Mac
-            # but not portable to Windows; tests run on Mac).
-            return now.strftime("%b ") + str(now.day)
-        # date_long default: "April 21, 2026"
-        return now.strftime("%B ") + f"{now.day}, {now.year}"
-
-    if layer.auto_mode == "day":
-        if fmt == "day_short":
-            return now.strftime("%a")
-        return now.strftime("%A")
-
-    # Unknown mode — fall through to typed text so playback doesn't crash
-    # if a future mode ships ahead of this helper.
-    return layer.text
+    mode = layer.auto_mode
+    fmt = layer.auto_format or _DEFAULT_FORMAT.get(mode)
+    # Try explicit (mode, fmt); fall back to the mode's default-format
+    # entry at (mode, None). If both miss, mode is unknown -- fall
+    # through to typed text so playback doesn't crash if a future
+    # mode ships ahead of this helper.
+    formatter = _FORMATTERS.get((mode, fmt)) or _FORMATTERS.get((mode, None))
+    if formatter is None:
+        return layer.text
+    return formatter(now)
 
 
 def render_auto_text(slide: TextSlide, now: datetime) -> str:
