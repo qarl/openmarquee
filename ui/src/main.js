@@ -53,6 +53,7 @@ import {
 } from "./api.js";
 import { setSignTimezone } from "./auto-format.js";
 import { DEFAULT_PLAYLIST_ID } from "./constants.js";
+import { alertOperator, confirmAction } from "./dialog.js";
 import { mountEditor } from "./editor.js";
 import { mountImageUploader } from "./image-upload.js";
 import { mountInlinePreview } from "./inline-preview.js";
@@ -444,11 +445,11 @@ async function boot() {
     // back to the default.
     async function deletePlaylist(playlistId, displayName) {
         const label = displayName || "this playlist";
-        if (!window.confirm(`Delete "${label}"? This can't be undone.`)) return;
+        if (!confirmAction(`Delete "${label}"? This can't be undone.`)) return;
         try {
             await deletePlaylistById(playlistId);
         } catch (err) {
-            window.alert(`Could not delete: ${err?.message || err}`);
+            alertOperator(`Could not delete: ${err?.message || err}`);
             return;
         }
         if (currentPlaylistId === playlistId) {
@@ -1096,12 +1097,12 @@ async function boot() {
         const { id, name } = event.detail || {};
         if (!id) return;
         const label = name || "this slide";
-        if (!window.confirm(`Delete "${label}"? This can't be undone.`)) return;
+        if (!confirmAction(`Delete "${label}"? This can't be undone.`)) return;
         try {
             await deleteContent(id);
         } catch (err) {
             console.error("[openmarquee] delete failed:", err);
-            window.alert(`Could not delete: ${err?.message || err}`);
+            alertOperator(`Could not delete: ${err?.message || err}`);
             return;
         }
         // Refresh every surface that lists slides so the deleted tile
