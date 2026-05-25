@@ -56,6 +56,42 @@ function calledInit(fetchMock) {
     return fetchMock.mock.calls[0][1] || {};
 }
 
+describe("apiFetch same-origin guard", () => {
+    it("does NOT attach Authorization on a cross-origin URL even when a token is stored", async () => {
+        // Stash a token like a real authenticated session.
+        localStorage.setItem(AUTH_TOKEN_KEY, "tok-must-not-leak");
+        const fetchMock = mockFetch({ ok: true, status: 200, json: async () => ({}) });
+        await apiFetch("https://attacker.example/x");
+        const init = calledInit(fetchMock);
+        const headers = init.headers instanceof Headers
+            ? init.headers
+            : new Headers(init.headers || {});
+        expect(headers.has("Authorization")).toBe(false);
+    });
+
+    it("DOES attach Authorization on a relative /api/... path when token is stored", async () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "tok-on-same-origin");
+        const fetchMock = mockFetch({ ok: true, status: 200, json: async () => ({}) });
+        await apiFetch("/api/content");
+        const init = calledInit(fetchMock);
+        const headers = init.headers instanceof Headers
+            ? init.headers
+            : new Headers(init.headers || {});
+        expect(headers.get("Authorization")).toBe("Bearer tok-on-same-origin");
+    });
+
+    it("does NOT attach Authorization on protocol-relative //attacker.example/x", async () => {
+        localStorage.setItem(AUTH_TOKEN_KEY, "tok-must-not-leak");
+        const fetchMock = mockFetch({ ok: true, status: 200, json: async () => ({}) });
+        await apiFetch("//attacker.example/x");
+        const init = calledInit(fetchMock);
+        const headers = init.headers instanceof Headers
+            ? init.headers
+            : new Headers(init.headers || {});
+        expect(headers.has("Authorization")).toBe(false);
+    });
+});
+
 describe("saveTextSlide", () => {
     it("POSTs JSON to the text-slides endpoint and returns the new item", async () => {
         const fetchMock = mockFetch({
