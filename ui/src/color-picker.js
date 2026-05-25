@@ -102,14 +102,18 @@ export function mountColorPicker(inputEl, opts = {}) {
     // swatches are the focusable controls.
     inputEl.tabIndex = -1;
 
-    // Inline 8-swatch row.
+    // Inline 8-swatch row. Build the whole subtree detached, then
+    // attach to wrap in a single live-DOM mutation. Mirrors the
+    // DocumentFragment pattern used in setupFontPicker (e636eee) --
+    // 8 per-swatch appends on an already-live inlineRow was 8
+    // reflows; batched it's 1.
     const inlineRow = document.createElement("div");
     inlineRow.className = "om-color-picker-inline";
     inlineRow.setAttribute("role", "radiogroup");
     inlineRow.setAttribute("aria-label", "Color");
-    wrap.appendChild(inlineRow);
 
     const swatchEls = [];
+    const frag = document.createDocumentFragment();
     for (const sw of INLINE_SWATCHES) {
         const btn = document.createElement("button");
         btn.type = "button";
@@ -119,9 +123,11 @@ export function mountColorPicker(inputEl, opts = {}) {
         btn.dataset.hex = sw.hex;
         btn.style.setProperty("--om-swatch", sw.hex);
         btn.addEventListener("click", () => setValue(sw.hex));
-        inlineRow.appendChild(btn);
+        frag.appendChild(btn);
         swatchEls.push(btn);
     }
+    inlineRow.appendChild(frag);
+    wrap.appendChild(inlineRow);
 
     // "More…" button — paints itself in the current color when the
     // current value isn't one of the inline 8, so the operator always

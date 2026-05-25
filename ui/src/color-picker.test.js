@@ -243,4 +243,20 @@ describe("mountColorPicker", () => {
         ).click();
         expect(captured).toBe("#7fd2fb");
     });
+
+    it("a single swatch click fires BOTH the input event AND onChange in order", () => {
+        // Co-occurrence + ORDERING lock. Existing tests covered the
+        // input-event-fires and onChange-fires paths in isolation;
+        // this asserts both happen for the SAME click and that the
+        // `input` event lands first. Order matters: external
+        // autosave/redraw listeners attached to the input must see
+        // the new value before any onChange-triggered repaint runs.
+        const events = [];
+        input.addEventListener("input", () => events.push("input"));
+        mountColorPicker(input, { onChange: () => events.push("onChange") });
+        host.querySelector(
+            '.om-color-picker-swatch[data-hex="#F4B755"]',
+        ).click();
+        expect(events).toEqual(["input", "onChange"]);
+    });
 });
