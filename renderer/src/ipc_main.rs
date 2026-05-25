@@ -28,6 +28,7 @@ use crate::content::{
     find_image_slide, find_text_slide, find_video_slide, video_slide_asset_path,
     ContentItem, SettingsWatcher,
 };
+use crate::lru::LruMap;
 use crate::mp4_demux::Mp4Demuxer;
 use crate::playback::{
     advance_command_to_op_result, AdvanceCommand, IpcRequest, IpcResponse, OpResult,
@@ -209,15 +210,31 @@ impl IpcPaintMetrics {
 /// malformed, we log + continue with the cache populated only
 /// for `items`; the paint_slide "video slides TBD" path still
 /// triggers the Python proxy's PIL fallback.
+/// LRU cap on `SlideCache.items` + `SlideCache.item_mtimes`. Pre-cap
+/// these maps were insert-only -- every slide ever shown stayed
+/// resident, so a long playlist or operator-edit churn over hours/days
+/// grew memory without bound. Same latent-OOM shape as the V4L2
+/// decoder leak fixed in FYS bug 9 (2026-05-20), which only protected
+/// `video_demuxers` + `video_decoders` and left the `ContentItem`
+/// bodies + mtime stamps unbounded.
+///
+/// 32 is ~4x typical demo playlist length (so an entire short
+/// playlist stays warm), small enough that a pathological 100-slide
+/// case bounds memory to ~32 ContentItems (a couple MB worst case for
+/// Text slides with full body strings), and large enough that the
+/// touch-on-get behavior of LruMap keeps the actively-cycling slides
+/// resident even when intermittent BeginSlides bring in cold ones.
+const SLIDE_CACHE_CAP: usize = 32;
+
 struct SlideCache {
-    items: std::collections::HashMap<uuid::Uuid, ContentItem>,
+    items: LruMap<uuid::Uuid, ContentItem>,
     /// Bug 1 (qarl 2026-05-16): item.json mtime per cached slide.
-    /// `cache.load` short-circuits on `items.contains_key`, which means
+    /// `cache.load` short-circuits on `items` membership, which means
     /// a content edit (text change, image re-upload, etc.) never reaches
     /// the running show — the sidecar serves the pre-edit cached copy
     /// forever. Stamping the on-disk mtime here lets `load` detect drift
     /// and evict before the cached copy is reused.
-    item_mtimes: std::collections::HashMap<uuid::Uuid, std::time::SystemTime>,
+    item_mtimes: LruMap<uuid::Uuid, std::time::SystemTime>,
     video_demuxers: std::collections::HashMap<uuid::Uuid, Mp4Demuxer>,
     /// Bug 8 / Fix A (2026-05-17): video slide ids whose cache.load
     /// could NOT register a demuxer (multi-trak MP4, malformed file,
@@ -247,8 +264,8 @@ struct SlideCache {
 impl SlideCache {
     fn new() -> Self {
         Self {
-            items: std::collections::HashMap::new(),
-            item_mtimes: std::collections::HashMap::new(),
+            items: LruMap::with_capacity(SLIDE_CACHE_CAP),
+            item_mtimes: LruMap::with_capacity(SLIDE_CACHE_CAP),
             video_demuxers: std::collections::HashMap::new(),
             video_skip: std::collections::HashSet::new(),
             #[cfg(target_os = "linux")]
@@ -362,7 +379,11 @@ impl SlideCache {
         let on_disk_mtime = std::fs::metadata(&item_json_path)
             .ok()
             .and_then(|m| m.modified().ok());
-        if self.items.contains_key(&item_id) {
+        // LruMap.get touches access order, which is the right
+        // semantic here: load() is the canonical "this slide is
+        // being used right now" entry point, so a hit MUST mark
+        // the entry warm before any subsequent eviction-on-insert.
+        if self.items.get(&item_id).is_some() {
             if self.item_mtimes.get(&item_id).copied() == on_disk_mtime {
                 // FYS bug A (2026-05-21): the items+mtime short-
                 // circuit treats "item.json parsed" as "slide
@@ -1766,7 +1787,7 @@ mod tests {
         let resp = handle_with_text_slide_fixture(req, &mut state, &mut cache);
         assert_eq!(resp, IpcResponse::Ok { result: OpResult::Empty });
         // Cache should have the slide loaded.
-        assert!(cache.items.contains_key(&uuid(1)));
+        assert!(cache.items.get(&uuid(1)).is_some());
         // State should reflect the slide.
         assert!(state.current.is_some());
         assert_eq!(state.current.as_ref().unwrap().slide_id, uuid(1));
@@ -2257,6 +2278,73 @@ mod tests {
         }
     }
 
+    /// QA code-quality loop v2 round 3 tripwire: SlideCache.items +
+    /// item_mtimes are LRU-capped at SLIDE_CACHE_CAP, so a long
+    /// playlist or operator-edit churn over hours can't grow them
+    /// without bound. Pre-cap they were insert-only HashMaps -- same
+    /// latent-OOM shape as the V4L2 decoder leak fixed in FYS bug 9.
+    ///
+    /// Test: load SLIDE_CACHE_CAP + 4 distinct text slides; verify
+    /// `items` stays at the cap and the oldest entries (those not
+    /// recently touched) are evicted. Uses a real disk roundtrip
+    /// (matching cache_load_short_circuits_when_mtime_unchanged
+    /// style) so the production load() path is the test subject,
+    /// not just the underlying LruMap (which has its own tests in
+    /// lru.rs).
+    #[test]
+    fn cache_load_evicts_oldest_when_over_capacity() {
+        let td = tempfile::TempDir::new().unwrap();
+        let mut cache = SlideCache::new();
+        let n = SLIDE_CACHE_CAP + 4;
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            let id = uuid(i as u8);
+            ids.push(id);
+            let dir = td.path().join(id.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("item.json"),
+                format!(
+                    r##"{{
+                      "schema_version": 3,
+                      "item": {{
+                        "type": "text_slide",
+                        "id": "{}",
+                        "name": "slot-{}",
+                        "duration_ms": 5000,
+                        "text_layers": [],
+                        "background_color": "#222222",
+                        "background_pattern": null,
+                        "transition": "cut",
+                        "transition_ms": 500
+                      }}
+                    }}"##,
+                    id, i
+                ),
+            )
+            .unwrap();
+            cache.load(td.path(), id).expect("cache.load");
+        }
+        // Cap holds: no growth past SLIDE_CACHE_CAP regardless of
+        // how many distinct slides loaded.
+        assert_eq!(cache.items.len(), SLIDE_CACHE_CAP);
+        assert_eq!(cache.item_mtimes.len(), SLIDE_CACHE_CAP);
+        // Oldest 4 slides evicted (loaded first, never re-touched).
+        for evicted in ids.iter().take(4) {
+            assert!(
+                cache.items.get(evicted).is_none(),
+                "id {evicted} should have been LRU-evicted",
+            );
+        }
+        // Most-recent SLIDE_CACHE_CAP slides resident.
+        for retained in ids.iter().skip(4) {
+            assert!(
+                cache.items.get(retained).is_some(),
+                "id {retained} should still be cached",
+            );
+        }
+    }
+
     /// V4L2 piece 3b: when a VideoSlide loads + the asset.mp4 is
     /// present + parses cleanly, the SlideCache stores an
     /// Mp4Demuxer indexed by slide id. Piece 3c will consume it
@@ -2293,7 +2381,7 @@ mod tests {
         std::fs::copy(&fixture, dir.join("asset.mp4")).unwrap();
         let mut cache = SlideCache::new();
         cache.load(td.path(), id).expect("cache.load");
-        assert!(cache.items.contains_key(&id), "Video item must be in items");
+        assert!(cache.items.get(&id).is_some(), "Video item must be in items");
         let dem = cache.video_demuxers.get(&id)
             .expect("Mp4Demuxer must be in video_demuxers when asset present");
         assert_eq!(dem.width, 320);
@@ -2351,7 +2439,7 @@ mod tests {
             "demuxer evicted by evict_other_video_state",
         );
         assert!(
-            cache.items.contains_key(&id),
+            cache.items.get(&id).is_some(),
             "the lightweight `items` entry deliberately survives eviction",
         );
         // The playlist loop-back: cache.load for the evicted slide
@@ -2473,7 +2561,7 @@ mod tests {
         std::fs::copy(&fixture, dir.join("asset.mp4")).unwrap();
         let mut cache = SlideCache::new();
         cache.load(td.path(), id).expect("cache.load");
-        assert!(cache.items.contains_key(&id), "Video item must be in items");
+        assert!(cache.items.get(&id).is_some(), "Video item must be in items");
         assert!(cache.video_demuxers.contains_key(&id), "Demuxer must be in video_demuxers");
         let dec_state = cache.video_decoders.get(&id)
             .expect("Decoder must be primed in video_decoders on Linux");
@@ -2511,7 +2599,7 @@ mod tests {
         // Deliberately no asset.mp4.
         let mut cache = SlideCache::new();
         cache.load(td.path(), id).expect("cache.load should succeed without asset");
-        assert!(cache.items.contains_key(&id), "Video item still in items");
+        assert!(cache.items.get(&id).is_some(), "Video item still in items");
         assert!(!cache.video_demuxers.contains_key(&id),
             "video_demuxers must be empty when asset missing");
     }

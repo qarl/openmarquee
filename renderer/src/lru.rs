@@ -143,6 +143,25 @@ where
         self.order.clear();
         self.map.drain()
     }
+
+    /// Remove `key` if present; returns the value so the caller can
+    /// drop any external resource tied to it. O(capacity) per call
+    /// (linear retain over the deque), matching `get`'s cost.
+    ///
+    /// Generic over Borrow<Q> for the same reason `get` is.
+    pub fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let removed = self.map.remove(key);
+        if removed.is_some() {
+            if let Some(pos) = self.order.iter().position(|k| k.borrow() == key) {
+                self.order.remove(pos);
+            }
+        }
+        removed
+    }
 }
 
 #[cfg(test)]
@@ -247,6 +266,30 @@ mod tests {
         assert!(c.get(&8).is_some());
         assert!(c.get(&9).is_some());
         assert!(c.get(&0).is_none());
+    }
+
+    #[test]
+    fn remove_drops_entry_and_returns_value() {
+        let mut c: LruMap<&'static str, u32> = LruMap::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        assert_eq!(c.remove(&"b"), Some(2));
+        assert_eq!(c.len(), 2);
+        assert!(c.get(&"b").is_none());
+        // Subsequent insert past removed slot does NOT evict (we're
+        // under capacity now).
+        let o = c.insert("d", 4);
+        assert!(o.evicted_lru.is_none());
+        assert_eq!(c.len(), 3);
+    }
+
+    #[test]
+    fn remove_missing_key_returns_none() {
+        let mut c: LruMap<&'static str, u32> = LruMap::with_capacity(3);
+        c.insert("a", 1);
+        assert_eq!(c.remove(&"missing"), None);
+        assert_eq!(c.len(), 1);
     }
 
     #[test]
