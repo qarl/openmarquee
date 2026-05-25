@@ -400,6 +400,17 @@ def _bootstrap_default_collection() -> PlaylistCollection:
     )
 
 
+# Forward-compat carve-out for the v1/v2/v3 migration paths. Every key
+# this function explicitly consumes or that PlaylistCollection declares
+# as a field MUST be listed here so the `**extras` splat at the v1/v2/
+# v3 returns doesn't shadow an explicit kwarg or carry a legacy key
+# forward as a model_extra. `item_ids` is the v1 legacy top-level the
+# migration converts to a Playlist; v2/v3 only consume `playlists`
+# (already in model_fields). The set mirrors schedule.py's
+# MIGRATION_HANDLED_TOP_LEVEL pattern.
+MIGRATION_HANDLED_TOP_LEVEL = frozenset(PlaylistCollection.model_fields.keys()) | {"item_ids"}
+
+
 def _coerce_to_collection(data: dict) -> tuple[PlaylistCollection, bool]:
     """Accept the v4 envelope or migrate from v3 / v2 / v1.
 
@@ -432,6 +443,10 @@ def _coerce_to_collection(data: dict) -> tuple[PlaylistCollection, bool]:
     # v1: unnamed single playlist.
     if "item_ids" in data and "playlists" not in data:
         legacy = _playlist_items_from_legacy_item_ids(data.get("item_ids", []))
+        # Forward-compat: splat unknown top-level fields through **extras
+        # so a hypothetical future-v5 field on a v1 file survives migration.
+        # See MIGRATION_HANDLED_TOP_LEVEL comment for the carve-out rationale.
+        extras = {k: v for k, v in data.items() if k not in MIGRATION_HANDLED_TOP_LEVEL}
         return (
             PlaylistCollection(
                 playlists=[
@@ -440,7 +455,8 @@ def _coerce_to_collection(data: dict) -> tuple[PlaylistCollection, bool]:
                         name=DEFAULT_PLAYLIST_NAME,
                         items=legacy,
                     )
-                ]
+                ],
+                **extras,
             ),
             True,
         )
@@ -479,7 +495,10 @@ def _coerce_to_collection(data: dict) -> tuple[PlaylistCollection, bool]:
             0,
             Playlist(id=DEFAULT_PLAYLIST_ID, name=DEFAULT_PLAYLIST_NAME),
         )
-    return PlaylistCollection(playlists=migrated), True
+    # Forward-compat: same **extras splat as the v1 path -- unknown
+    # top-level fields on a v2/v3 file survive migration.
+    extras = {k: v for k, v in data.items() if k not in MIGRATION_HANDLED_TOP_LEVEL}
+    return PlaylistCollection(playlists=migrated, **extras), True
 
 
 def _playlist_items_from_legacy_item_ids(item_ids: list) -> list[PlaylistItem]:

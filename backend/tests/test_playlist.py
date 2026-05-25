@@ -429,6 +429,160 @@ def test_v1_unnamed_on_disk_migrates_to_default_playlist(tmp_path: Path):
     assert loaded.items[0].transition == "cut"
 
 
+# --- 2026-05-25: forward-compat extras preservation across migrations ---
+#
+# Mirrors schedule.py's MIGRATION_HANDLED_TOP_LEVEL + **extras splat
+# pattern (test_v1_migration_preserves_unknown_top_level_fields +
+# test_v1_migration_explicit_kwargs_not_shadowed_by_extras_splat in
+# test_schedule.py). PlaylistCollection has model_config =
+# ConfigDict(extra="allow") but Pydantic only preserves extras via
+# model_validate, NOT via direct __init__. The v1/v2/v3 migration
+# paths use explicit kwargs so without **extras splat any forward-
+# compat top-level field on a pre-v4 file was silently dropped.
+
+
+def test_v1_migration_preserves_unknown_top_level_fields(tmp_path: Path):
+    """Forward-compat lock: any unknown top-level field in a v1 file
+    (item_ids-only shape) must survive migration AND survive the
+    persist-to-disk + reload round-trip."""
+    path = tmp_path / "playlist.json"
+    a = str(uuid4())
+    path.write_text(
+        json.dumps(
+            {
+                "item_ids": [a],
+                "future_v5_field": "hypothetical-forward-compat-value",
+                "future_v5_nested": {"hint": "preserve me too"},
+            }
+        )
+    )
+    storage = PlaylistStorage(path)
+    storage.load_all()
+
+    # On-disk shape: extras survive AND legacy item_ids got cleaned.
+    on_disk = json.loads(path.read_text())
+    assert on_disk["schema_version"] == PLAYLIST_SCHEMA_VERSION
+    assert on_disk.get("future_v5_field") == "hypothetical-forward-compat-value"
+    assert on_disk.get("future_v5_nested") == {"hint": "preserve me too"}
+    # Legacy key cleaned (the v1->v4 transform converted it to playlists).
+    assert "item_ids" not in on_disk
+
+    # Reload round-trip: a SECOND load (now of the v4 file) must still
+    # surface the extras via PlaylistCollection.model_validate's extra="allow".
+    storage2 = PlaylistStorage(path)
+    reloaded = storage2.load_all()
+    assert reloaded.model_extra is not None
+    assert reloaded.model_extra.get("future_v5_field") == "hypothetical-forward-compat-value"
+    assert reloaded.model_extra.get("future_v5_nested") == {"hint": "preserve me too"}
+
+
+def test_v2_migration_preserves_unknown_top_level_fields(tmp_path: Path):
+    """Forward-compat lock for v2 (dict-keyed-by-name + item_ids per
+    playlist). Same shape as v1 but the migration path is different
+    (lines 448-482 of playlist.py, not the v1 branch at lines 432-446).
+    Both paths now share the same **extras splat carve-out."""
+    path = tmp_path / "playlist.json"
+    a = str(uuid4())
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "playlists": {
+                    "default": {"item_ids": [a]},
+                },
+                "future_v5_field": "v2 preserve",
+            }
+        )
+    )
+    storage = PlaylistStorage(path)
+    loaded = storage.load_all()
+
+    # Extra survived in-memory.
+    assert loaded.model_extra is not None
+    assert loaded.model_extra.get("future_v5_field") == "v2 preserve"
+
+    # And persisted to disk so the next read also surfaces it.
+    on_disk = json.loads(path.read_text())
+    assert on_disk["schema_version"] == PLAYLIST_SCHEMA_VERSION
+    assert on_disk.get("future_v5_field") == "v2 preserve"
+
+
+def test_v3_migration_preserves_unknown_top_level_fields(tmp_path: Path):
+    """Forward-compat lock for v3 (dict-keyed-by-name + items list
+    with item-side transitions). Same migration branch as v2 but
+    with the items-vs-item_ids distinction inside each playlist;
+    confirms the trailing `extras` splat applies regardless of which
+    sub-shape the v2-or-v3 branch took."""
+    path = tmp_path / "playlist.json"
+    a = str(uuid4())
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "playlists": {
+                    "default": {
+                        "items": [
+                            {
+                                "item_id": a,
+                                "transition": "fade",
+                                "transition_ms": 250,
+                            }
+                        ],
+                    },
+                },
+                "future_v5_field": "v3 preserve",
+            }
+        )
+    )
+    storage = PlaylistStorage(path)
+    loaded = storage.load_all()
+
+    assert loaded.model_extra is not None
+    assert loaded.model_extra.get("future_v5_field") == "v3 preserve"
+    on_disk = json.loads(path.read_text())
+    assert on_disk["schema_version"] == PLAYLIST_SCHEMA_VERSION
+    assert on_disk.get("future_v5_field") == "v3 preserve"
+
+
+def test_v1_migration_explicit_kwargs_not_shadowed_by_extras_splat(tmp_path: Path):
+    """Carve-out lock: the explicit kwargs we pass to PlaylistCollection
+    (playlists) plus the pre-v4 consumed fields (item_ids, schema_version,
+    playlists) must NOT end up in the **extras splat, otherwise we'd
+    get a Python double-kwarg TypeError on `playlists`, OR re-stamp
+    schema_version=1 onto the migrated collection, OR carry the legacy
+    `item_ids` forward as an extra on the v4 model.
+
+    Exercises a v1 payload that includes every shadow-risk field PLUS
+    an unknown extra, and asserts: (a) no exception, (b) extras carve-
+    out worked (unknown survives), (c) the v4 model has the
+    correctly-migrated schema_version (not the v1 leftover)."""
+    from openmarquee.playlist import _coerce_to_collection
+
+    a = str(uuid4())
+    data = {
+        "schema_version": 1,  # v1; default PLAYLIST_SCHEMA_VERSION must win
+        "item_ids": [a],  # v1 array; replaced by migrated default Playlist
+        "future_v5_field": "preserve me",
+    }
+    collection, was_migrated = _coerce_to_collection(data)
+    assert was_migrated is True
+    # Migration won: explicit + default values used, not the v1 leftovers.
+    assert collection.schema_version == PLAYLIST_SCHEMA_VERSION
+    assert len(collection.playlists) == 1
+    assert collection.playlists[0].id == DEFAULT_PLAYLIST_ID
+    assert len(collection.playlists[0].items) == 1
+    # Extra survived.
+    assert collection.model_extra is not None
+    assert collection.model_extra.get("future_v5_field") == "preserve me"
+    # Carve-out worked: the legacy item_ids + schema_version did NOT
+    # survive as extras (which would have been doubly-wrong because
+    # `playlists` is also explicit, and an extras-side `playlists`
+    # would have raised a TypeError on the splat).
+    assert "item_ids" not in collection.model_extra
+    assert "schema_version" not in collection.model_extra
+    assert "playlists" not in collection.model_extra
+
+
 def test_list_for_playback_patches_transitions_onto_items(tmp_path: Path):
     """The playlist owns transitions; the content item's own transition
     fields are legacy-ignored when the item appears via list_for_playback."""
