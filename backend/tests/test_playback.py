@@ -475,9 +475,10 @@ def test_scheduled_fetch_uses_default_when_schedule_is_empty(tmp_path):
     playlist_storage.set_by_id(lunch_pl)
 
     # Empty schedule → default → returns the default-playlist item.
-    items = scheduled_fetch_items(
+    active_id, items = scheduled_fetch_items(
         storage, playlist_storage, schedule_storage, datetime(2026, 4, 21, 12, 0)
     )
+    assert active_id == DEFAULT_PLAYLIST_ID
     assert [item.id for item in items] == [text_in_default.id]
 
 
@@ -538,15 +539,17 @@ def test_scheduled_fetch_picks_active_playlist_per_schedule(tmp_path):
     )
 
     # Tuesday 12:00 → lunch rule matches.
-    items = scheduled_fetch_items(
+    active_id, items = scheduled_fetch_items(
         storage, playlist_storage, schedule_storage, datetime(2026, 4, 21, 12, 0)
     )
+    assert active_id == lunch_pl.id
     assert [item.id for item in items] == [text_lunch.id]
 
     # Tuesday 09:00 → no rule matches, default plays.
-    items = scheduled_fetch_items(
+    active_id, items = scheduled_fetch_items(
         storage, playlist_storage, schedule_storage, datetime(2026, 4, 21, 9, 0)
     )
+    assert active_id == DEFAULT_PLAYLIST_ID
     assert [item.id for item in items] == [text_default.id]
 
 
@@ -585,34 +588,13 @@ def test_scheduled_fetch_returns_empty_for_unknown_playlist_id(tmp_path):
 
     schedule_storage.save(_Schedule(default_playlist_id=uuid4()))
 
-    items = scheduled_fetch_items(
+    active_id, items = scheduled_fetch_items(
         storage, playlist_storage, schedule_storage, datetime(2026, 4, 21, 12, 0)
     )
+    # active_id is the (deleted) playlist id from the schedule -- caller
+    # gets visibility into "what was selected" even when the resolution
+    # yields no items, so the stamp side-effect downstream still updates.
     assert items == []
-
-
-def test_scheduled_fetch_stamps_loop_with_active_playlist_id(tmp_path):
-    """When passed a PlaybackLoop, scheduled_fetch_items publishes the
-    active playlist id on it for the UI 'now playing' badge."""
-    from openmarquee.content.storage import ContentStorage
-    from openmarquee.playback import PlaybackLoop, scheduled_fetch_items
-    from openmarquee.playlist import DEFAULT_PLAYLIST_ID, PlaylistStorage
-    from openmarquee.rendering.mock import MockRenderer
-    from openmarquee.schedule import ScheduleStorage
-
-    storage = ContentStorage(tmp_path / "content")
-    playlist_storage = PlaylistStorage(tmp_path / "playlists.json")
-    schedule_storage = ScheduleStorage(tmp_path / "schedules.json")
-    renderer = MockRenderer(8, 8, tmp_path / "out.png")
-
-    loop = PlaybackLoop(renderer, fetch_items=lambda: [], read_asset=lambda _i: b"")
-    assert loop.current_playlist_id is None
-
-    scheduled_fetch_items(
-        storage, playlist_storage, schedule_storage, datetime(2026, 4, 21, 12, 0), loop=loop
-    )
-    # Default schedule, default fallback id.
-    assert loop.current_playlist_id == DEFAULT_PLAYLIST_ID
 
 
 # --- back to existing playback tests ---

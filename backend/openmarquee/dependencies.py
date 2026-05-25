@@ -788,18 +788,23 @@ def _playback_loop_singleton() -> PlaybackLoop:
     schedule_storage = _schedule_storage_singleton()
     settings_storage = _settings_storage_singleton()
 
-    # Closure deferred so we can pass `loop` into the fetch fn for the
-    # current-playlist-name stamp.
+    # Closure-side loop reference so the fetch wrapper can stamp the
+    # active playlist id back onto the loop (for the UI "now playing"
+    # badge + the throttle-clear-on-playlist-change behavior). Kept
+    # out of scheduled_fetch_items so that helper stays pure.
     loop_holder: dict = {}
 
     def fetch():
-        return scheduled_fetch_items(
+        active_id, items = scheduled_fetch_items(
             storage,
             playlist_storage,
             schedule_storage,
             datetime.now(),
-            loop=loop_holder.get("loop"),
         )
+        loop = loop_holder.get("loop")
+        if loop is not None:
+            loop._stamp_playlist_id(active_id)
+        return items
 
     def current_timezone() -> str | None:
         # Auto-mode slides render in this zone. Re-read each call so

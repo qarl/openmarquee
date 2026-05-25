@@ -1356,23 +1356,29 @@ def scheduled_fetch_items(
     playlist_storage: "PlaylistStorage",
     schedule_storage: "ScheduleStorage",
     now: datetime,
-    loop: PlaybackLoop | None = None,
-) -> list[ContentItem]:
-    """Return items in the order of the playlist active per the schedule at `now`.
+) -> tuple[UUID, list[ContentItem]]:
+    """Resolve the schedule-active playlist at `now` and return its items.
+
+    Returns: (active_playlist_id, items in playlist order). Items have
+    transitions patched from PlaylistItem (not the content model).
+
+    Strict: items referenced by the playlist but absent from storage are
+    silently dropped; orphan content NOT in the active playlist is excluded
+    (so it won't leak onto the sign).
+
+    Pure function -- no side effects. The dependencies.py closure that
+    wraps this for the live PlaybackLoop takes the returned active_id and
+    calls loop._stamp_playlist_id itself, keeping the throttle-clearing
+    logic colocated with the loop and this helper trivially testable
+    without instantiating PlaybackLoop + MockRenderer.
 
     Deferred imports inside the function dodge a content↔playlist↔schedule
-    circular at module load. The composition is small enough to inline; pulling
-    it into a separate "wiring" module would just hide it.
-
-    If `loop` is provided, stamps `_current_playlist_id` so the UI can show
-    which playlist is active. The PlaybackLoop's fetch_items closure passes
-    itself in via `partial`.
+    circular at module load.
     """
     from openmarquee.playlist import list_in_playlist_order
     from openmarquee.schedule import evaluate_schedule
 
     schedule = schedule_storage.load()
     active_id = evaluate_schedule(now, schedule)
-    if loop is not None:
-        loop._stamp_playlist_id(active_id)
-    return list_in_playlist_order(content_storage, playlist_storage, active_id)
+    items = list_in_playlist_order(content_storage, playlist_storage, active_id)
+    return active_id, items
