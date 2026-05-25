@@ -1296,16 +1296,24 @@ export function mountEditor(
     // via fetchItems so a first-mount doesn't burn a fetch on an operator
     // who's going to stick with the default pattern anyway.
     const bgGenerateWrap = container.querySelector(".editor-bg-generate");
+    // Owns the "show one bg-source panel, hide the others" toggle —
+    // including bgGenerateWrap, which is generate-button visibility and
+    // tracks bg-source=slide (gated on operator having passed
+    // onGenerateBackground). Closes over the 4 panel refs +
+    // onGenerateBackground. All 5 sites that pick a bg-source call this:
+    // radio-change handler, resetToBlank, and the 3 loadForEdit branches.
+    function showBgSource(name) {
+        bgSlideWrapEl.hidden = name !== "slide";
+        bgVideoWrapEl.hidden = name !== "video";
+        bgPatWrapEl.hidden = name !== "pattern";
+        bgGenerateWrap.hidden = name !== "slide" || !onGenerateBackground;
+    }
     let bgSlidePopulated = false;
     let bgVideoPopulated = false;
     for (const radio of container.querySelectorAll(".field-bg-source")) {
         radio.addEventListener("change", async () => {
             state.bgSource = radio.value;
-            bgSlideWrapEl.hidden = state.bgSource !== "slide";
-            bgVideoWrapEl.hidden = state.bgSource !== "video";
-            bgPatWrapEl.hidden = state.bgSource !== "pattern";
-            bgGenerateWrap.hidden =
-                state.bgSource !== "slide" || !onGenerateBackground;
+            showBgSource(state.bgSource);
             if (state.bgSource === "slide" && fetchItems && !bgSlidePopulated) {
                 await populateBgSlideOptions(bgSlideEl, fetchItems, statusEl);
                 bgSlidePopulated = true;
@@ -1541,10 +1549,8 @@ export function mountEditor(
             '.field-bg-source[value="pattern"]',
         );
         patternRadio.checked = true;
-        bgSlideWrapEl.hidden = true;
-        bgVideoWrapEl.hidden = true;
-        bgPatWrapEl.hidden = false;
         state.bgSource = "pattern";
+        showBgSource("pattern");
         state.bgPattern.pattern = "solid";
         renderPatternGrid();
         applyPatternTweakRowVisibility();
@@ -1686,9 +1692,7 @@ export function mountEditor(
                 await populateBgSlideOptions(bgSlideEl, fetchItems, statusEl);
                 bgSlidePopulated = true;
             }
-            bgSlideWrapEl.hidden = false;
-            bgVideoWrapEl.hidden = true;
-            bgPatWrapEl.hidden = true;
+            showBgSource("slide");
             bgSlideEl.value = String(slide.background_image_slide_id);
             state.bgSource = "slide";
             state.bgSlideId = String(slide.background_image_slide_id);
@@ -1705,9 +1709,7 @@ export function mountEditor(
                 await populateBgVideoOptions(bgVideoEl, fetchItems, statusEl);
                 bgVideoPopulated = true;
             }
-            bgSlideWrapEl.hidden = true;
-            bgVideoWrapEl.hidden = false;
-            bgPatWrapEl.hidden = true;
+            showBgSource("video");
             bgVideoEl.value = String(slide.background_video_slide_id);
             state.bgSource = "video";
             state.bgSlideId = null;
@@ -1724,9 +1726,7 @@ export function mountEditor(
                 '.field-bg-source[value="pattern"]',
             );
             patRadio.checked = true;
-            bgSlideWrapEl.hidden = true;
-            bgVideoWrapEl.hidden = true;
-            bgPatWrapEl.hidden = false;
+            showBgSource("pattern");
             state.bgSource = "pattern";
             state.bgSlideId = null;
             state.bgVideoId = null;

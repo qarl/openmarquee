@@ -904,6 +904,10 @@ describe("mountEditor — submit flow", () => {
             fetchItems: async () => [],
             onGenerateBackground: vi.fn(),
         });
+        // Drain mount-time IIFE (fetchItems → resetToBlank → showBgSource
+        // sync) so its bgGenerateWrap toggle doesn't race past the radio
+        // handler's toggle below.
+        await new Promise((r) => setTimeout(r, 0));
         // Solid-color default: generator hidden.
         expect(container.querySelector(".editor-bg-generate").hidden).toBe(true);
         // Switch bg source to "slide" → generator surfaces.
