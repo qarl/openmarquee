@@ -985,8 +985,8 @@
     }
 
     function orderedContent() {
-        // Mirror list_in_playlist_order(..., include_orphans=True) post
-        // the 9e7d7b7 backend fix: default playlist's items first (in
+        // Mirror list_full_library() post the 9e7d7b7 backend fix:
+        // default playlist's items first (in
         // playlist order, with patched transitions), then every storage
         // item not yet emitted (sorted by id) — items in OTHER playlists
         // AND true orphans alike. Pre-2026-04-28 this only added true

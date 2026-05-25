@@ -38,7 +38,7 @@ from openmarquee.dependencies import (
 )
 from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync
-from openmarquee.playlist import PlaylistStorage, list_in_playlist_order
+from openmarquee.playlist import PlaylistStorage, list_full_library
 from openmarquee.stream_consumer import validate_stream_url
 from openmarquee.tombstone import TombstoneStorage
 
@@ -906,11 +906,12 @@ async def list_content(storage: StorageDep, playlist_storage: PlaylistDep) -> li
     Same ordering used by the playback engine — UI list and what plays on the
     sign stay in sync.
     """
-    # UI pallets + bg-picker want the full library — orphans included —
-    # so bundled seed content (backgrounds, demo videos) is visible for
-    # the operator to drag into a playlist. Playback stays strict (see
-    # scheduled_fetch_items) so orphans don't leak onto the sign.
-    return list_in_playlist_order(storage, playlist_storage, include_orphans=True)
+    # UI pallets + bg-picker want the full library — every storage
+    # item shows up, so bundled seed content (backgrounds, demo
+    # videos) is visible for the operator to drag into a playlist.
+    # Playback stays strict (see list_for_playback + scheduled_fetch
+    # _items) so orphans don't leak onto the sign.
+    return list_full_library(storage, playlist_storage)
 
 
 @router.get("/{item_id}", response_model=ContentItem)

@@ -429,12 +429,12 @@ def test_v1_unnamed_on_disk_migrates_to_default_playlist(tmp_path: Path):
     assert loaded.items[0].transition == "cut"
 
 
-def test_list_in_playlist_order_patches_transitions_onto_items(tmp_path: Path):
+def test_list_for_playback_patches_transitions_onto_items(tmp_path: Path):
     """The playlist owns transitions; the content item's own transition
-    fields are legacy-ignored when the item appears via list_in_playlist_order."""
+    fields are legacy-ignored when the item appears via list_for_playback."""
     from openmarquee.content import TextSlide
     from openmarquee.content.storage import ContentStorage
-    from openmarquee.playlist import PlaylistItem, list_in_playlist_order
+    from openmarquee.playlist import PlaylistItem, list_for_playback
 
     storage = ContentStorage(tmp_path / "content")
     slide = TextSlide(name="x", text="x", transition="cut", transition_ms=500)
@@ -445,26 +445,62 @@ def test_list_in_playlist_order_patches_transitions_onto_items(tmp_path: Path):
         Playlist(items=[PlaylistItem(item_id=slide.id, transition="fade", transition_ms=250)])
     )
 
-    ordered = list_in_playlist_order(storage, playlist_storage)
+    ordered = list_for_playback(storage, playlist_storage)
     assert len(ordered) == 1
     # The playlist's transition wins over the content's.
     assert ordered[0].transition == "fade"
     assert ordered[0].transition_ms == 250
 
 
-def test_list_in_playlist_order_include_orphans_returns_items_from_non_default_playlists(
+def test_list_for_playback_silently_drops_stale_playlist_refs(tmp_path: Path):
+    """Load-bearing forgiveness: if a PlaylistItem.item_id no longer
+    has matching content in storage (operator deleted the slide, or
+    `rm -rf content/<uuid>/` happened mid-playlist), the stale ref is
+    silently skipped. Without this, the playback loop would KeyError
+    on the next fetch and crash. Lock the contract so a future
+    refactor of _playlist_ordered_prefix that swaps the
+    `in items_by_id` guard for an unconditional lookup can't
+    silently regress us back to brittleness."""
+    from uuid import uuid4
+
+    from openmarquee.content import TextSlide
+    from openmarquee.content.storage import ContentStorage
+    from openmarquee.playlist import PlaylistItem, list_for_playback
+
+    storage = ContentStorage(tmp_path / "content")
+    real = TextSlide(name="real", text="real")
+    storage.save_text_slide(real, b"\x89PNG")
+    # Stale ref: uuid that points to no saved content.
+    ghost_id = uuid4()
+
+    playlist_storage = PlaylistStorage(tmp_path / "playlist.json")
+    playlist_storage.save(
+        Playlist(
+            items=[
+                PlaylistItem(item_id=ghost_id),
+                PlaylistItem(item_id=real.id),
+            ]
+        )
+    )
+
+    ordered = list_for_playback(storage, playlist_storage)
+    # Ghost is dropped; real comes through. No exception raised.
+    assert [item.id for item in ordered] == [real.id]
+
+
+def test_list_full_library_returns_items_from_non_default_playlists(
     tmp_path: Path,
 ):
-    """Pre-2026-04-28 bug: include_orphans=True only added items NOT in
-    any playlist, so items in non-default playlists were invisible to
-    /api/content + the UI pallets. Surfaced when seed.py started
-    seeding the Freedom playlist alongside Welcome — Freedom's slides
-    were missing from /api/content. Fixed by treating "anything not
-    yet in `ordered`" as the extras pool.
+    """Pre-2026-04-28 bug: the trailing-items pool excluded items in
+    non-default playlists, so non-default-playlist content was
+    invisible to /api/content + the UI pallets. Surfaced when seed.py
+    started seeding the Freedom playlist alongside Welcome -- Freedom's
+    slides were missing from /api/content. Fixed by treating "anything
+    not yet in the anchor-playlist prefix" as the extras pool.
     """
     from openmarquee.content import TextSlide
     from openmarquee.content.storage import ContentStorage
-    from openmarquee.playlist import PlaylistItem, list_in_playlist_order
+    from openmarquee.playlist import PlaylistItem, list_full_library
 
     storage = ContentStorage(tmp_path / "content")
     in_default = TextSlide(name="d", text="d")
@@ -489,7 +525,7 @@ def test_list_in_playlist_order_include_orphans_returns_items_from_non_default_p
     )
     # true_orphan is in storage but in no playlist.
 
-    ordered = list_in_playlist_order(storage, playlist_storage, include_orphans=True)
+    ordered = list_full_library(storage, playlist_storage)
     ids = [item.id for item in ordered]
     # Default playlist's item comes first, in playlist order.
     assert ids[0] == in_default.id

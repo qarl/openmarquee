@@ -1375,10 +1375,10 @@ def scheduled_fetch_items(
     Deferred imports inside the function dodge a content↔playlist↔schedule
     circular at module load.
     """
-    from openmarquee.playlist import list_in_playlist_order
+    from openmarquee.playlist import list_for_playback
     from openmarquee.schedule import evaluate_schedule
 
     schedule = schedule_storage.load()
     active_id = evaluate_schedule(now, schedule)
-    items = list_in_playlist_order(content_storage, playlist_storage, active_id)
+    items = list_for_playback(content_storage, playlist_storage, active_id)
     return active_id, items

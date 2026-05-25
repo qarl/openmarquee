@@ -487,31 +487,24 @@ def _playlist_items_from_legacy_item_ids(item_ids: list) -> list[PlaylistItem]:
     return [PlaylistItem(item_id=UUID(str(i))) for i in item_ids]
 
 
-def list_in_playlist_order(
+def _playlist_ordered_prefix(
     content_storage: "ContentStorage",
     playlist_storage: PlaylistStorage,
-    playlist_id: UUID = DEFAULT_PLAYLIST_ID,
-    *,
-    include_orphans: bool = False,
-) -> list["ContentItem"]:
-    """Return content items, playlist order first.
-
-    Default (`include_orphans=False`) returns STRICTLY the items in
-    the named playlist — what the playback loop iterates, so bundled
-    library assets (seed backgrounds, demo videos) don't leak onto
-    the sign unless explicitly added to a playlist.
-
-    With `include_orphans=True`, every item in storage that wasn't
-    already returned by the target-playlist loop is appended at the
-    end (sorted by id). This includes both items in other playlists
-    AND items in no playlist at all — the parameter name is legacy
-    from the single-playlist era. The UI pallets + the text-editor's
-    background picker depend on this "full library" view, which has
-    to surface content from every playlist or non-default playlists
-    become invisible once they exist.
+    playlist_id: UUID,
+) -> tuple[list["ContentItem"], set[UUID], dict[UUID, "ContentItem"]]:
+    """Build the playlist-ordered prefix shared by both list_for_playback
+    and list_full_library. Returns (ordered_so_far, used_ids, items_by_id)
+    so the full-library composition can append remaining items without
+    re-walking storage.
 
     Items referenced by the playlist but missing from storage are
-    silently skipped.
+    silently skipped -- load-bearing forgiveness so an operator can
+    `rm -rf content/<uuid>/` without the renderer KeyError'ing on
+    the next fetch.
+
+    Patches each yielded item's transition + transition_ms from the
+    PlaylistItem since v3 (the content model's transition fields are
+    legacy-only).
     """
     items_by_id = {item.id: item for item in content_storage.list_all()}
     collection = playlist_storage.load_all()
@@ -521,9 +514,6 @@ def list_in_playlist_order(
     used: set[UUID] = set()
     for p_item in target.items:
         if p_item.item_id in items_by_id and p_item.item_id not in used:
-            # Patch the content item's transition fields with the playlist's
-            # values. Since v3 the playlist owns transitions — the content
-            # model's fields are legacy-only.
             content = items_by_id[p_item.item_id]
             ordered.append(
                 content.model_copy(
@@ -534,19 +524,54 @@ def list_in_playlist_order(
                 )
             )
             used.add(p_item.item_id)
+    return ordered, used, items_by_id
 
-    if include_orphans:
-        # Everything in storage NOT yet in `ordered` — items in other
-        # playlists AND true orphans alike. Pre-2026-04-28 this excluded
-        # items in other playlists, which made non-default playlist
-        # content invisible to the pallets / bg-picker / api/content.
-        extras = [item for item_id, item in items_by_id.items() if item_id not in used]
-        # Chronological order so newly-created items land at the end of
-        # the list (B19, 2026-05-05). Was sort-by-uuid (deterministic
-        # but effectively random). The frontend slide-browser re-sorts
-        # for its own display, but other API consumers see the same
-        # creation-order intent.
-        extras.sort(key=lambda item: (str(item.created_at or ""), str(item.id)))
-        ordered.extend(extras)
 
+def list_for_playback(
+    content_storage: "ContentStorage",
+    playlist_storage: PlaylistStorage,
+    playlist_id: UUID = DEFAULT_PLAYLIST_ID,
+) -> list["ContentItem"]:
+    """STRICT: items in `playlist_id` only, in playlist order, with
+    transitions patched from PlaylistItem.
+
+    What the playback loop iterates -- bundled library assets (seed
+    backgrounds, demo videos) don't leak onto the sign unless they're
+    explicitly added to a playlist.
+
+    Stale playlist refs (PlaylistItem.item_id with no matching content
+    in storage) are silently skipped. See _playlist_ordered_prefix.
+    """
+    ordered, _used, _items_by_id = _playlist_ordered_prefix(
+        content_storage, playlist_storage, playlist_id
+    )
+    return ordered
+
+
+def list_full_library(
+    content_storage: "ContentStorage",
+    playlist_storage: PlaylistStorage,
+    anchor_playlist_id: UUID = DEFAULT_PLAYLIST_ID,
+) -> list["ContentItem"]:
+    """UI library view: anchor playlist first (playlist-ordered, with
+    transitions patched), then every other storage item appended in
+    chronological order by created_at + id tiebreak.
+
+    The trailing items include BOTH content in non-anchor playlists
+    AND true orphans (content in no playlist at all). The UI pallets +
+    the text-editor's background picker depend on this "everything in
+    storage shows up" view -- pre-2026-04-28 this excluded other-
+    playlist content, which made non-default playlists invisible to
+    /api/content the moment a second playlist existed.
+
+    Chronological tail order (B19, 2026-05-05) so newly-created items
+    land at the end. The frontend slide-browser re-sorts for its own
+    display, but other API consumers see the creation-order intent.
+    """
+    ordered, used, items_by_id = _playlist_ordered_prefix(
+        content_storage, playlist_storage, anchor_playlist_id
+    )
+    extras = [item for item_id, item in items_by_id.items() if item_id not in used]
+    extras.sort(key=lambda item: (str(item.created_at or ""), str(item.id)))
+    ordered.extend(extras)
     return ordered
