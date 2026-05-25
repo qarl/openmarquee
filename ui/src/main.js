@@ -402,21 +402,61 @@ async function boot() {
         await refreshSidebarCounts();
     }
 
+    // Operator-visible surfacing helpers for the two panel surfaces
+    // that own multiple silent-failure paths (playlist track + the 5
+    // slide-edit destinations). Both query the relevant existing
+    // status pill via the file's documented class convention (-status
+    // suffix) rather than introducing a new banner/toast system.
+    // No-op-safe when the target element isn't mounted yet (early
+    // boot or in-flight re-mount).
+    function surfacePlaylistError(text) {
+        const el = root.querySelector(".playlist-track-status");
+        if (!el) return;
+        el.textContent = text;
+        el.dataset.state = "error";
+    }
+    const SLIDE_TYPE_STATUS_SELECTOR = {
+        text_slide: ".editor-status",
+        image: ".image-upload-status",
+        video: ".video-upload-status",
+        stream: ".stream-upload-status",
+        web: ".web-slide-status",
+    };
+    function surfaceSlideTypeError(type, text) {
+        const sel = SLIDE_TYPE_STATUS_SELECTOR[type];
+        if (!sel) return;
+        const el = root.querySelector(sel);
+        if (!el) return;
+        el.textContent = text;
+        el.dataset.state = "error";
+    }
+
     // Shared playlist-creation flow — invoked by both the playlist
     // browser's create row and the playlist page-head's + New button.
     async function createNewPlaylist() {
         playlistDraft = null;
-        const collection = await listPlaylists();
-        const names = (collection.playlists || []).map((p) => p.name);
-        const newName = nextPlaylistName(names);
-        const created = await createPlaylist({ name: newName, entries: [] });
-        currentPlaylistId = String(created.id);
-        await playlistBrowserHandle?.refresh();
-        playlistBrowserHandle?.highlight(currentPlaylistId);
-        await playlistTrack?.refresh();
-        await inlinePreviewHandle?.refresh();
-        await scheduleHandle?.refresh();
-        await refreshSidebarCounts();
+        try {
+            const collection = await listPlaylists();
+            const names = (collection.playlists || []).map((p) => p.name);
+            const newName = nextPlaylistName(names);
+            const created = await createPlaylist({ name: newName, entries: [] });
+            currentPlaylistId = String(created.id);
+            await playlistBrowserHandle?.refresh();
+            playlistBrowserHandle?.highlight(currentPlaylistId);
+            await playlistTrack?.refresh();
+            await inlinePreviewHandle?.refresh();
+            await scheduleHandle?.refresh();
+            await refreshSidebarCounts();
+        } catch (err) {
+            // Without the surface: an offline backend just made the +New
+            // button look broken (nothing happens). Now the playlist
+            // panel's existing status pill announces the failure so the
+            // operator knows to retry. Disable-button-while-in-flight
+            // skipped per dispatch (would require plumbing button refs
+            // from both call sites; out of scope).
+            console.error("[main] createNewPlaylist failed:", err);
+            surfacePlaylistError(`Couldn't create playlist · ${err?.message || err}`);
+        }
     }
 
     /**
@@ -506,10 +546,23 @@ async function boot() {
                             // stale draft could resurface if the
                             // operator navigated back before saving.
                             playlistDraft = null;
+                            const prevId = currentPlaylistId;
                             currentPlaylistId = String(playlistId);
                             playlistBrowserHandle.highlight(currentPlaylistId);
-                            await playlistTrack?.refresh();
-                            await inlinePreviewHandle?.refresh();
+                            try {
+                                await playlistTrack?.refresh();
+                                await inlinePreviewHandle?.refresh();
+                            } catch (err) {
+                                // Refresh failed — revert the highlight
+                                // + currentPlaylistId so the operator's
+                                // visible state matches what's actually
+                                // loaded. Surface via the playlist
+                                // panel's status pill.
+                                console.error("[main] onSelect playlist refresh failed:", err);
+                                currentPlaylistId = prevId;
+                                playlistBrowserHandle.highlight(currentPlaylistId);
+                                surfacePlaylistError(`Couldn't switch playlist · ${err?.message || err}`);
+                            }
                         },
                         onCreate: createNewPlaylist,
                         onDelete: deletePlaylist,
@@ -989,9 +1042,13 @@ async function boot() {
             window.location.hash = `#/${route.section}`;
             await route.load(slide);
         } catch (err) {
-            // Each uploader/editor surfaces its own status line; console
-            // makes the failure visible during development.
+            // The route resolved (so we know which uploader/editor the
+            // operator was navigating into) -- surface to THAT panel's
+            // status pill so the failure isn't a console-only silent
+            // drop. The section's pill is in DOM whether or not the
+            // navigation has completed yet.
             console.error("[openmarquee] failed to open slide for edit:", err);
+            surfaceSlideTypeError(type, `Couldn't open slide · ${err?.message || err}`);
         }
     });
 
@@ -1010,17 +1067,26 @@ async function boot() {
         // Refresh every surface that lists slides so the deleted tile
         // vanishes without a page reload. See slide-event-handlers.js
         // for the 9-target contract + parallel semantics.
-        await runDeleteCascade({
-            playlistTrack,
-            editor,
-            imageUploader,
-            videoUploader,
-            streamUploader,
-            webSlideEditor,
-            slidesShell,
-            refreshSidebarCounts,
-            inlinePreviewHandle,
-        });
+        try {
+            await runDeleteCascade({
+                playlistTrack,
+                editor,
+                imageUploader,
+                videoUploader,
+                streamUploader,
+                webSlideEditor,
+                slidesShell,
+                refreshSidebarCounts,
+                inlinePreviewHandle,
+            });
+        } catch (err) {
+            // The slide WAS deleted server-side (we're past deleteContent
+            // above). One refresh-target failing leaves the other panels
+            // possibly-stale. Tell the operator so they know to refresh
+            // by hand if a deleted tile lingers somewhere.
+            console.error("[openmarquee] delete-cascade refresh failed:", err);
+            surfacePlaylistError("Deleted, but some panels may need a refresh.");
+        }
     });
     // Silence unused-var; `nav` is the mount's return value in case a
     // caller later wants to trigger navigation programmatically.

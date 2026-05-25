@@ -284,7 +284,7 @@ export function mountPlaylistTrack(container, options) {
         // actions (remove × + transition chip) use markContentDirty
         // so the inline preview re-renders against the draft.
         bindTrackRemoveButtons(trackEl, markContentDirty);
-        bindTrackDurationButtons(trackEl, onUpdateDuration, refresh);
+        bindTrackDurationButtons(trackEl, onUpdateDuration, refresh, statusEl);
     }
 
     async function refresh() {
@@ -379,7 +379,7 @@ export function mountPlaylistTrack(container, options) {
             // Duration is a SLIDE attribute — auto-saves immediately
             // outside the playlist's draft flow.
             bindTrackDurationButtons(
-                trackEl, onUpdateDuration, refresh,
+                trackEl, onUpdateDuration, refresh, statusEl,
             );
 
             // Sync the name input to the freshly-loaded playlist. Refresh
@@ -569,7 +569,7 @@ function bindTrackRemoveButtons(trackEl, markDirty) {
     }
 }
 
-function bindTrackDurationButtons(trackEl, onUpdateDuration, refresh) {
+function bindTrackDurationButtons(trackEl, onUpdateDuration, refresh, statusEl) {
     if (!onUpdateDuration) return;
     for (const btn of trackEl.querySelectorAll(".track-block-duration")) {
         if (btn.dataset.bound === "1") continue;
@@ -597,6 +597,12 @@ function bindTrackDurationButtons(trackEl, onUpdateDuration, refresh) {
                 if (refresh) await refresh();
             } catch (err) {
                 console.error("[playlist-track] duration save failed:", err);
+                // Surface to operator via the panel's status pill so
+                // the failure isn't a console-only silent drop.
+                if (statusEl) {
+                    statusEl.textContent = `Couldn't save duration · ${err?.message || err}`;
+                    statusEl.dataset.state = "error";
+                }
             }
         });
     }
