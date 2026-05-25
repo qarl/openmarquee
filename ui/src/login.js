@@ -94,9 +94,39 @@ export function mountLoginForm(form, options = {}) {
                 return;
             }
             const body = await response.json();
-            if (storage && body.token) {
-                storage.setItem(TOKEN_KEY, body.token);
+            // Round 22 Bug A: validate token + try/catch setItem.
+            // Pre-fix this was `if (storage && body.token) storage.setItem(...)`
+            // with NO error path — a private-browsing browser (iOS
+            // Safari throws on localStorage access) or quota-exceeded
+            // setItem would silently leave no token, then the editor
+            // 401'd on its first authed call and bounced back to
+            // /login.html. Infinite loop with no error surface. Now
+            // we render formError + skip the redirect on either path.
+            let saved = false;
+            if (typeof body?.token === "string" && body.token && storage) {
+                try {
+                    storage.setItem(TOKEN_KEY, body.token);
+                    saved = true;
+                } catch {
+                    // Storage quota exceeded / blocked — fall through.
+                }
             }
+            if (!saved) {
+                if (formError) {
+                    formError.textContent =
+                        "Sign-in succeeded but browser storage is unavailable. " +
+                        "Disable private browsing or free up space, then retry.";
+                }
+                submit.disabled = pw.value.length === 0;
+                return;
+            }
+            // Round 22 Bug B: clear the password field before
+            // redirect so browser bfcache + form-restore on Back
+            // navigation doesn't repopulate the plaintext value
+            // (the Show reveal button would then expose it on a
+            // shared kiosk / family device).
+            pw.value = "";
+            form.reset();
             redirect("/");
         } catch (err) {
             if (formError) formError.textContent = "Network error — try again.";

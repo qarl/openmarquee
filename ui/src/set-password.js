@@ -134,9 +134,34 @@ export function mountSetPasswordForm(form, options = {}) {
                 return;
             }
             const body = await response.json();
-            if (storage && body.token) {
-                storage.setItem(TOKEN_KEY, body.token);
+            // Round 22 Bug A: validate token + try/catch setItem.
+            // See login.js for the full rationale (silent login-loop
+            // when storage is unavailable). Parallel fix here.
+            let saved = false;
+            if (typeof body?.token === "string" && body.token && storage) {
+                try {
+                    storage.setItem(TOKEN_KEY, body.token);
+                    saved = true;
+                } catch {
+                    // Storage quota exceeded / blocked — fall through.
+                }
             }
+            if (!saved) {
+                if (formError) {
+                    formError.textContent =
+                        "Password set but browser storage is unavailable. " +
+                        "Disable private browsing or free up space, then retry.";
+                }
+                submit.disabled = false;
+                return;
+            }
+            // Round 22 Bug B: clear both password fields before
+            // redirect so bfcache + form-restore on Back navigation
+            // doesn't repopulate plaintext. Show reveal button would
+            // otherwise expose them on a shared kiosk / family device.
+            pw.value = "";
+            pw2.value = "";
+            form.reset();
             redirect("/");
         } catch (err) {
             if (formError) {

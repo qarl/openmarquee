@@ -250,4 +250,88 @@ describe("mountSetPasswordForm — submit POST", () => {
         const submit = form.querySelector('button[type="submit"]');
         expect(submit.disabled).toBe(false);
     });
+
+    // Round 22 Bug A regression-locks: silent login-loop when token
+    // can't be persisted. See login.test.js for the full rationale.
+    it("does NOT redirect when storage.setItem throws (quota / blocked)", async () => {
+        const form = makeFormFixture();
+        const fetchMock = vi.fn().mockResolvedValue(
+            jsonResponse({ token: "1.fake-set-pw-token" }, 200),
+        );
+        const redirect = vi.fn();
+        const storage = {
+            setItem: () => { throw new Error("QuotaExceeded"); },
+            getItem: () => null,
+            removeItem: () => {},
+        };
+        mountSetPasswordForm(form, { fetch: fetchMock, redirect, storage });
+
+        const pw = form.querySelector('input[name="password"]');
+        const pw2 = form.querySelector('input[name="password_confirm"]');
+        pw.value = "hunter2hunter";
+        pw2.value = "hunter2hunter";
+        pw.dispatchEvent(new Event("input"));
+        pw2.dispatchEvent(new Event("input"));
+        form.dispatchEvent(new Event("submit", { cancelable: true }));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(redirect).not.toHaveBeenCalled();
+        expect(form.querySelector("[data-form-error]").textContent).toMatch(
+            /storage is unavailable/,
+        );
+    });
+
+    it("does NOT redirect when 200 response is missing body.token", async () => {
+        const form = makeFormFixture();
+        const fetchMock = vi.fn().mockResolvedValue(
+            jsonResponse({ /* no token field */ }, 200),
+        );
+        const redirect = vi.fn();
+        const storage = fakeStorage();
+        mountSetPasswordForm(form, { fetch: fetchMock, redirect, storage });
+
+        const pw = form.querySelector('input[name="password"]');
+        const pw2 = form.querySelector('input[name="password_confirm"]');
+        pw.value = "hunter2hunter";
+        pw2.value = "hunter2hunter";
+        pw.dispatchEvent(new Event("input"));
+        pw2.dispatchEvent(new Event("input"));
+        form.dispatchEvent(new Event("submit", { cancelable: true }));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(redirect).not.toHaveBeenCalled();
+        expect(storage.getItem(TOKEN_KEY)).toBeNull();
+        expect(form.querySelector("[data-form-error]").textContent).toMatch(
+            /storage is unavailable/,
+        );
+    });
+
+    // Round 22 Bug B regression-lock: bfcache / form-restore plaintext
+    // password leak. BOTH pw and pw2 must be cleared before redirect.
+    it("clears both password fields before redirecting (bfcache leak guard)", async () => {
+        const form = makeFormFixture();
+        const fetchMock = vi.fn().mockResolvedValue(
+            jsonResponse({ token: "1.fake-set-pw-token" }, 200),
+        );
+        let pwAtRedirect = null;
+        let pw2AtRedirect = null;
+        const redirect = vi.fn(() => {
+            pwAtRedirect = form.querySelector('input[name="password"]').value;
+            pw2AtRedirect = form.querySelector('input[name="password_confirm"]').value;
+        });
+        mountSetPasswordForm(form, { fetch: fetchMock, redirect, storage: fakeStorage() });
+
+        const pw = form.querySelector('input[name="password"]');
+        const pw2 = form.querySelector('input[name="password_confirm"]');
+        pw.value = "should-be-wiped";
+        pw2.value = "should-be-wiped";
+        pw.dispatchEvent(new Event("input"));
+        pw2.dispatchEvent(new Event("input"));
+        form.dispatchEvent(new Event("submit", { cancelable: true }));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(redirect).toHaveBeenCalledWith("/");
+        expect(pwAtRedirect).toBe("");
+        expect(pw2AtRedirect).toBe("");
+    });
 });
