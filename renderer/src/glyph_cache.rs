@@ -221,8 +221,9 @@ enum Completion {
 /// eviction. `clock` is a monotonically-rising tick; `last_used`
 /// maps each Ready glyph to the tick of its most recent use.
 /// Render-thread-only — the worker pool never touches it, so the
-/// `slots`-then-`recency` lock order used by `evict_lru_ready`
-/// has no second contender and cannot deadlock.
+/// `slots`-then-`recency` lock order used by `evict_lru_ready`,
+/// `get_or_request` (Ready-hit), and `poll_completions` (Ready
+/// upload) has no second contender and cannot deadlock.
 struct RecencyState {
     clock: u64,
     last_used: HashMap<GlyphKey, u64>,
@@ -393,6 +394,11 @@ impl GlyphCache {
     /// Called on a Ready cache hit (dispatch path) and when a Ready
     /// completion lands (a freshly-uploaded glyph starts hot, not
     /// instantly the coldest). A rising `clock` orders all uses.
+    ///
+    /// Round 7: called from BOTH call sites with the `slots` Mutex
+    /// already held (nested slots-then-recency lock order, matching
+    /// evict_lru_ready). Workers never lock `recency` so this nesting
+    /// cannot deadlock.
     fn touch_recency(&self, key: GlyphKey) {
         let mut r = self.recency.lock().unwrap();
         r.clock += 1;
@@ -478,15 +484,22 @@ impl GlyphCache {
     ) -> Option<SlotState> {
         let mut slots = self.slots.lock().unwrap();
         if let Some(state) = slots.get(&key).cloned() {
-            drop(slots);
             // Slice 3C: a Ready hit on the dispatch/layout path is a
             // USE — refresh recency so LRU eviction keeps hot glyphs
             // and discards cold ones. Requested / Generating /
             // FontMissing hold no atlas slot, so recency is moot for
             // them (they are never eviction candidates).
+            //
+            // Round 7 perf: nest the recency-lock acquisition UNDER
+            // the slots guard instead of dropping slots first. Same
+            // lock count but eliminates the drop-then-reacquire
+            // cache-transition window between the two mutexes. Lock
+            // order slots-then-recency matches evict_lru_ready;
+            // workers never lock recency so nesting cannot deadlock.
             if matches!(state, SlotState::Ready { .. }) {
                 self.touch_recency(key);
             }
+            drop(slots);
             return Some(state);
         }
         slots.insert(key, SlotState::Requested);
@@ -587,11 +600,19 @@ impl GlyphCache {
                         advance_em,
                         plane_bounds,
                     });
-                    drop(slots);
                     // Slice 3C: a just-uploaded glyph starts HOT —
                     // stamp recency now so it is not instantly the
                     // coldest candidate on the very next eviction.
+                    //
+                    // Round 7 perf: same nested-lock pattern as
+                    // get_or_request — bump recency UNDER the slots
+                    // guard to eliminate the drop-then-reacquire
+                    // cache-transition window. Slots-then-recency
+                    // lock order is consistent across this call site,
+                    // get_or_request, and evict_lru_ready; workers
+                    // never lock recency.
                     self.touch_recency(key);
+                    drop(slots);
                     *self.completion_count.lock().unwrap() += 1;
                     count += 1;
                 }
