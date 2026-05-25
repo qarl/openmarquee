@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 # Disable the first-boot content seeding for tests. The seed path runs
 # inside the FastAPI lifespan, which fires when a TestClient context is
 # entered — without this opt-out it would try to populate whatever
@@ -40,3 +42,26 @@ os.environ.setdefault("OPENMARQUEE_RENDERER", "mock")
 # unit never sets DISABLE_AUTH; the captive-portal threat model
 # assumes the gate is always on.
 os.environ.setdefault("OPENMARQUEE_DISABLE_AUTH", "1")
+
+
+@pytest.fixture(autouse=True)
+def _expire_set_password_grace(monkeypatch):
+    """Default the Bundle B2 item 7 set-password grace to ALREADY
+    EXPIRED for every test in the suite. Reason: TestClient sends
+    from `("testclient", 50000)` which `ipaddress.ip_address` rejects
+    with ValueError, so `_is_private_or_loopback_ip` returns False
+    -- which means EVERY test that POSTs /api/auth/set-password
+    would 403 during the grace window (active for the first 30s of
+    the process, which always covers the pytest run). Without this
+    autouse fixture, test ordering decides whether you see the bug.
+
+    Tests that want to exercise the grace explicitly (the four
+    test_set_password_*_grace_* cases in test_auth.py) re-open the
+    window in their own monkeypatch + force the IP check too."""
+    from openmarquee import api_auth
+
+    monkeypatch.setattr(
+        api_auth,
+        "_BOOT_MONOTONIC",
+        api_auth.time.monotonic() - api_auth._SET_PASSWORD_GRACE_SECONDS - 1.0,
+    )

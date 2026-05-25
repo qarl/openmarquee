@@ -155,20 +155,8 @@ def _client_with_configured_auth(tmp_path, monkeypatch):
     from openmarquee.dependencies import _auth_storage_singleton
 
     _auth_storage_singleton.cache_clear()
-    # Bundle B2 item 7 set-password grace would 403 the TestClient
-    # request below (TestClient sends from "testclient" which
-    # ipaddress.ip_address rejects -> _is_private_or_loopback_ip
-    # returns False -> grace gate rejects). Force-expire so
-    # set-password sets up the test's preconditions.
-    import time as _time
-
-    from openmarquee import api_auth
-
-    monkeypatch.setattr(
-        api_auth,
-        "_BOOT_MONOTONIC",
-        _time.monotonic() - api_auth._SET_PASSWORD_GRACE_SECONDS - 1.0,
-    )
+    # Set-password grace is force-expired suite-wide by the autouse
+    # _expire_set_password_grace fixture in conftest.py.
     from openmarquee.app import app
 
     client = TestClient(app)

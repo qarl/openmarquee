@@ -283,28 +283,6 @@ def test_change_password_bumps_token_version():
 # --- api_auth endpoints (TestClient against the FastAPI app) ---
 
 
-@pytest.fixture(autouse=True)
-def _expire_set_password_grace(monkeypatch):
-    """Default the Bundle B2 item 7 set-password grace to ALREADY
-    EXPIRED for every test in this module. Reason: TestClient sends
-    from `("testclient", 50000)` which `ipaddress.ip_address` rejects
-    with ValueError, so `_is_private_or_loopback_ip` returns False
-    -- which means EVERY test would 403 during the grace window
-    (active for the first 30s of the process, which always covers
-    the pytest run).
-
-    Tests that want to exercise the grace explicitly (the four
-    test_set_password_*_grace_* cases) re-open the window in their
-    own monkeypatch + force the IP check too."""
-    from openmarquee import api_auth
-
-    monkeypatch.setattr(
-        api_auth,
-        "_BOOT_MONOTONIC",
-        api_auth.time.monotonic() - api_auth._SET_PASSWORD_GRACE_SECONDS - 1.0,
-    )
-
-
 @pytest.fixture
 def client(tmp_path: Path) -> TestClient:
     """TestClient with an isolated AuthStorage path. Each test gets
