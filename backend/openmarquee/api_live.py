@@ -38,6 +38,34 @@ from openmarquee.live import (
     LiveStartBody,
 )
 
+# Low-security-DiD Bundle C item 6 (2026-05-25): on the wire we only
+# surface exception CLASS NAMES that are public-stdlib types
+# operators can self-diagnose against (a netlink OSError, a parse-
+# bad-int ValueError, etc.). Anything else -- crucially aiortc
+# internals like SdpParseError -- maps to "internal_error" so an
+# authed prober can't fingerprint the library version to chase CVEs.
+# The full traceback still lands in the backend log via the
+# log.exception calls below; operator-self-diagnosis through the
+# log path is unaffected.
+_DIAGNOSABLE_EXCEPTION_CLASSES = frozenset(
+    {
+        "OSError",  # netlink EAFNOSUPPORT (FYS 2026-05-23), socket errors
+        "ValueError",  # malformed-int / malformed-enum past Pydantic
+        "TimeoutError",  # ICE gather timeout, asyncio wait-for
+        "ConnectionError",  # peer-connection failures mid-negotiation
+    }
+)
+
+
+def _safe_error_class(exc: BaseException) -> str:
+    """Map an exception to a wire-safe class-name string. Whitelisted
+    public-stdlib names pass through; everything else (including
+    aiortc internals + custom backend exception classes) collapses
+    to "internal_error" to avoid library-identity leakage."""
+    name = type(exc).__name__
+    return name if name in _DIAGNOSABLE_EXCEPTION_CLASSES else "internal_error"
+
+
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/live", tags=["live"])
@@ -149,21 +177,26 @@ async def start_live(
         # full traceback goes to the backend log via log.exception
         # below — that's the operator's diagnosis path.
         #
-        # On the wire we surface only the exception CLASS NAME (e.g.
-        # "OSError", "ValueError", "SdpParseError"). Class names are
-        # safe identifiers; they don't carry the kind of internal
-        # detail message strings can. The reason this exists at all:
+        # On the wire we surface only the exception CLASS NAME, and
+        # only if it's in the public-stdlib whitelist at
+        # _DIAGNOSABLE_EXCEPTION_CLASSES (OSError / ValueError /
+        # TimeoutError / ConnectionError). Anything else -- aiortc
+        # internals like SdpParseError, custom backend classes --
+        # collapses to "internal_error" via _safe_error_class so an
+        # authed prober can't fingerprint the library version (Bundle
+        # C item 6, 2026-05-25). The reason class names ship at all:
         # without a class hint, a remote diagnoser (operator on a
         # phone, harness in a browser) sees just "live_negotiation_
         # failed" and has to ssh into the device to see the actual
         # exception — that cost 25 min of hunting for an OSError
-        # [Errno 97] (netlink-EAFNOSUPPORT, FYS 2026-05-23).
+        # [Errno 97] (netlink-EAFNOSUPPORT, FYS 2026-05-23). The
+        # whitelisted names preserve that operator-diagnosis value.
         log.exception("live negotiation failed")
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "live_negotiation_failed",
-                "error_class": type(exc).__name__,
+                "error_class": _safe_error_class(exc),
             },
         ) from exc
     started_at = live.active_session_started_at
@@ -204,7 +237,7 @@ async def takeover_live(
             status_code=400,
             detail={
                 "error": "live_takeover_failed",
-                "error_class": type(exc).__name__,
+                "error_class": _safe_error_class(exc),
             },
         ) from exc
     started_at = live.active_session_started_at

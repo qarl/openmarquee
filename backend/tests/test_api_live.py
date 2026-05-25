@@ -284,6 +284,94 @@ def test_takeover_400_surfaces_error_class_in_detail(client: TestClient):
     assert "Address family not supported" not in response.text
 
 
+# --- Bundle C item 6 (2026-05-25): exception-class whitelist for the
+# error_class field. Whitelisted public-stdlib classes (OSError /
+# ValueError / TimeoutError / ConnectionError) pass through verbatim
+# so operators still get the diagnosis-value those names carry.
+# Everything else -- crucially aiortc internals like SdpParseError --
+# collapses to "internal_error" so an authed prober can't fingerprint
+# the library version to chase CVEs. Lock the contract here so a
+# future drift either side of the whitelist surfaces as a test break.
+
+
+class _CustomNonWhitelistedError(Exception):
+    """Stand-in for any non-whitelisted exception class (e.g. the
+    real aiortc.SdpParseError, or any future backend custom class).
+    The test asserts the wire response collapses the class name to
+    "internal_error" rather than leaking this identifier."""
+
+
+class _RaisingPC_ValueError(_RaisingRTCPeerConnection):
+    """Whitelist-pass case: ValueError IS in
+    _DIAGNOSABLE_EXCEPTION_CLASSES, so the wire response surfaces
+    "ValueError" verbatim."""
+
+    async def setLocalDescription(self, desc):  # noqa: ANN001
+        raise ValueError("invalid SDP attribute count")
+
+
+class _RaisingPC_Custom(_RaisingRTCPeerConnection):
+    """Whitelist-miss case: a non-stdlib class name must collapse
+    to "internal_error" so authed probers can't fingerprint the
+    underlying library identity."""
+
+    async def setLocalDescription(self, desc):  # noqa: ANN001
+        raise _CustomNonWhitelistedError("library-identifying message")
+
+
+def test_start_400_whitelisted_class_passes_through(client: TestClient):
+    """Whitelisted public-stdlib class (ValueError here) surfaces
+    verbatim on the wire so the operator self-diagnosis value is
+    preserved."""
+    with patch("openmarquee.live.RTCPeerConnection", _RaisingPC_ValueError):
+        response = client.post(
+            "/api/live/start",
+            json={"sdp_offer": "v=0\r\noffer\r\n"},
+        )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["error"] == "live_negotiation_failed"
+    assert detail["error_class"] == "ValueError"
+    # Message body still must NOT leak.
+    assert "invalid SDP attribute count" not in response.text
+
+
+def test_start_400_non_whitelisted_class_collapses_to_internal_error(client: TestClient):
+    """Non-whitelisted class (a custom backend exception, or aiortc-
+    internal like SdpParseError) MUST collapse to "internal_error"
+    on the wire so an authed prober can't fingerprint the library
+    identity. Test class name ("_CustomNonWhitelistedError") is
+    distinctive enough that a leak would be unambiguous."""
+    with patch("openmarquee.live.RTCPeerConnection", _RaisingPC_Custom):
+        response = client.post(
+            "/api/live/start",
+            json={"sdp_offer": "v=0\r\noffer\r\n"},
+        )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["error"] == "live_negotiation_failed"
+    assert detail["error_class"] == "internal_error"
+    # Both the class name AND the message must NOT leak anywhere
+    # in the wire response.
+    assert "_CustomNonWhitelistedError" not in response.text
+    assert "library-identifying message" not in response.text
+
+
+def test_takeover_400_non_whitelisted_class_collapses_to_internal_error(client: TestClient):
+    """Symmetric assertion for /takeover -- the whitelist applies
+    on both endpoints (both use _safe_error_class)."""
+    with patch("openmarquee.live.RTCPeerConnection", _RaisingPC_Custom):
+        response = client.post(
+            "/api/live/takeover",
+            json={"sdp_offer": "v=0\r\noffer\r\n"},
+        )
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert detail["error"] == "live_takeover_failed"
+    assert detail["error_class"] == "internal_error"
+    assert "_CustomNonWhitelistedError" not in response.text
+
+
 # --- Slice 4 Test B (2026-05-23): real aiortc client SDP round-trip ---------
 #
 # Happy-path lock for the Live signaling path. Drives a REAL aiortc
