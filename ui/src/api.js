@@ -144,7 +144,16 @@ export async function extractDetailMessage(response) {
         const body = await response.json();
         if (typeof body.detail === "string") return body.detail;
         if (Array.isArray(body.detail) && body.detail[0]?.msg) {
-            return body.detail[0].msg;
+            // Pydantic 422 envelopes carry `loc` per error: the field
+            // path that failed validation. Surface it so multi-field
+            // forms ("name: string too long") don't leave the operator
+            // hunting. The "body" sentinel is FastAPI's outer wrapper
+            // for request-body payloads and adds no operator value,
+            // so it's filtered out before joining.
+            const first = body.detail[0];
+            const loc = Array.isArray(first.loc) ? first.loc.filter(p => p !== "body") : [];
+            const field = loc.length ? loc.join(".") : null;
+            return field ? `${field}: ${first.msg}` : first.msg;
         }
         // Slice 3 (2026-05-23): structured detail dict carrying an
         // `error` code + optional `error_class` (e.g. /api/live/start
@@ -153,9 +162,15 @@ export async function extractDetailMessage(response) {
         // operators see the class hint in toasts/UI instead of a bare
         // "400 Bad Request" fallback. error_class is the Python
         // exception class name; safe to surface (no message string).
+        //
+        // Bundle C item 6 narrowed error_class to a whitelist with
+        // "internal_error" as the "I won't tell you" sentinel for
+        // non-whitelisted exceptions (backend/openmarquee/api_live.py).
+        // Suppress that sentinel here -- it adds zero diagnostic value
+        // and operators read it as a real exception class name.
         if (body.detail && typeof body.detail === "object" && body.detail.error) {
             const cls = body.detail.error_class;
-            return cls
+            return cls && cls !== "internal_error"
                 ? `${body.detail.error} (${cls})`
                 : String(body.detail.error);
         }
