@@ -168,12 +168,11 @@ impl IpcPaintMetrics {
             0.0
         };
         // Reuse profile.rs percentile math (already cross-platform
-        // + unit-tested). Returns (sum, mean, p50, p95, p99, max);
-        // we keep p99 for the soak gate. Empty sample slice returns
-        // p99=0 -- correct "no data" sentinel for windows with no
-        // successful paints.
-        let (_, _, _, _, paint_us_p99, _) =
-            crate::profile::summarize_samples(&self.paint_us_samples);
+        // + unit-tested). Empty sample slice returns p99_ns=0 --
+        // correct "no data" sentinel for windows with no successful
+        // paints. _ns-suffixed PhaseStats field names anchor the
+        // unit-of-measure at the type level.
+        let stats = crate::profile::summarize_samples(&self.paint_us_samples);
         eprintln!(
             "ipc.soak window_s={} frames={} transitions={} fps_avg={:.1} paint_us=avg/{}/max/{} paint_us_p99={} session_frames={} session_transitions={}",
             elapsed.as_secs(),
@@ -182,7 +181,7 @@ impl IpcPaintMetrics {
             fps_avg,
             avg_us,
             self.max_paint_us,
-            paint_us_p99,
+            stats.p99_ns,
             self.session_frames,
             self.session_transitions,
         );
@@ -2597,27 +2596,36 @@ mod tests {
     /// the wrapper (it would catch a wire-up regression even if the
     /// inner math changed).
     fn p99_of(samples: &[u64]) -> u64 {
-        let (_, _, _, _, p99, _) = crate::profile::summarize_samples(samples);
-        p99
+        crate::profile::summarize_samples(samples).p99_ns
     }
 
     #[test]
     fn paint_metrics_p99_reflects_spike_tier() {
-        // 900-sample window per the dispatch spec: 891 fast paints
-        // (1000us = 1ms) + 9 slow paints (50000us = 50ms). p99 must
-        // land on the spike tier (>= 50000) because the top 1% of
-        // 900 samples = 9 entries, all of which are the spike.
+        // 900-sample window: 890 fast paints (1000us = 1ms) + 10 slow
+        // paints (50000us = 50ms). Spike count (10) strictly exceeds
+        // the top-1% boundary (9) so under nearest-rank, 0-indexed
+        // percentile math the p99 lands ON A SPIKE -- not on the last
+        // fast paint at the borderline.
+        //
+        // (Pre-2026-05-25 history: this test was 891+9 and read p99
+        // = 50000 because the buggy `s[(n*pct)/100]` formula was
+        // 1-position inflated -- it returned s[891] = first spike.
+        // Under the correct nearest-rank `s[ceil(pct/100*n)-1]` for
+        // n=900, p99 idx = 890; with the prior 891+9 split that would
+        // be the LAST fast paint = 1000us. Adding one more spike
+        // pushes the boundary into the spike tier where the test
+        // intent lives.)
         let mut m = IpcPaintMetrics::new();
-        for _ in 0..891 {
+        for _ in 0..890 {
             m.record(IpcPaintKind::Slide, 1000);
         }
-        for _ in 0..9 {
+        for _ in 0..10 {
             m.record(IpcPaintKind::Slide, 50_000);
         }
         let p99 = p99_of(&m.paint_us_samples);
         assert_eq!(
             p99, 50_000,
-            "p99 of 891x1ms + 9x50ms must report the spike tier, not the base; \
+            "p99 of 890x1ms + 10x50ms must report the spike tier, not the base; \
              a regression that under-counts spikes would show p99 in the 1ms range"
         );
     }
@@ -2638,12 +2646,17 @@ mod tests {
     fn paint_metrics_p99_underfull_window() {
         // Small windows (e.g. first emission after process start
         // with only a handful of paints) must still compute a
-        // sensible p99 without panicking on the .min(n-1) index.
+        // sensible p99 without panicking on the percentile index.
         let mut m = IpcPaintMetrics::new();
         for v in [10_u64, 20, 30, 40, 50] {
             m.record(IpcPaintKind::Slide, v);
         }
-        // 5 samples, p99 index = (5 * 99 / 100).min(4) = 4 -> 50us.
+        // n=5, nearest-rank p99 idx = ceil(99/100 * 5) - 1
+        //                            = ceil(4.95) - 1 = 5 - 1 = 4
+        // -> sorted[4] = 50us. Same answer as the pre-2026-05-25
+        // buggy formula gave for this borderline case; the bug
+        // surfaced at larger n where the off-by-one had room to
+        // grow.
         assert_eq!(p99_of(&m.paint_us_samples), 50);
     }
 

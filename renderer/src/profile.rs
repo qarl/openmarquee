@@ -75,22 +75,60 @@ pub fn frame_complete() {
     }
 }
 
-/// Compute (sum, mean, p50, p95, p99, max) for a sorted sample list.
-/// Returns ns. Empty list returns all zeros.
-pub fn summarize_samples(samples: &[u64]) -> (u64, u64, u64, u64, u64, u64) {
+/// Per-phase aggregate over a sample window. All fields are
+/// nanoseconds; the `_ns` suffix anchors units at the type level so
+/// downstream consumers don't have to remember (or guess) what the
+/// raw u64 means. Empty input maps to `PhaseStats::default()` (all
+/// zeros) -- callers treat that as the "no data" sentinel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PhaseStats {
+    pub sum_ns: u64,
+    pub mean_ns: u64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
+    pub max_ns: u64,
+}
+
+/// 0-indexed nearest-rank percentile (Wikipedia "Nearest-rank method"):
+/// rank = ceil(pct/100 * n), 0-indexed = rank - 1, clamped to n-1.
+///
+/// Integer-safe ceil via the (a + b - 1) / b idiom. saturating_sub
+/// guards the pct=0 / n=1 corner where rank would otherwise underflow.
+fn nearest_rank(sorted: &[u64], pct: u64) -> u64 {
+    let n = sorted.len();
+    let idx = ((pct * n as u64 + 99) / 100).saturating_sub(1) as usize;
+    sorted[idx.min(n - 1)]
+}
+
+/// Compute aggregate stats over a sample window. Returns ns in every
+/// field. Empty input returns `PhaseStats::default()` (all zeros).
+///
+/// Percentiles use nearest-rank, 0-indexed. The previous formula
+/// `s[(n * pct) / 100]` treated Rust's 0-based slice indexing as if
+/// it were 1-based rank, inflating every percentile reading by ~1
+/// position -- e.g. for sorted 1..=100, the old p99 returned the max
+/// (100) instead of the 99th-smallest (99); for small windows (n=20)
+/// p95 collapsed entirely into max. Downstream soak-gate decisions in
+/// ipc_main.rs were reading those inflated numbers; reported soak p99
+/// will be measurably lower post-fix without any underlying perf
+/// change.
+pub fn summarize_samples(samples: &[u64]) -> PhaseStats {
     if samples.is_empty() {
-        return (0, 0, 0, 0, 0, 0);
+        return PhaseStats::default();
     }
     let mut s = samples.to_vec();
     s.sort_unstable();
     let n = s.len();
-    let sum: u64 = s.iter().sum();
-    let mean = sum / n as u64;
-    let p50 = s[n / 2];
-    let p95 = s[(n * 95) / 100];
-    let p99 = s[((n * 99) / 100).min(n - 1)];
-    let max = *s.last().unwrap();
-    (sum, mean, p50, p95, p99, max)
+    let sum_ns: u64 = s.iter().sum();
+    PhaseStats {
+        sum_ns,
+        mean_ns: sum_ns / n as u64,
+        p50_ns: nearest_rank(&s, 50),
+        p95_ns: nearest_rank(&s, 95),
+        p99_ns: nearest_rank(&s, 99),
+        max_ns: *s.last().unwrap(),
+    }
 }
 
 /// Dump the accumulated histogram to stderr in markdown table form.
@@ -110,16 +148,16 @@ pub fn summarize() {
     eprintln!("[profile] | phase | n | sum | mean | p50 | p95 | p99 | max |");
     eprintln!("[profile] |-------|---|-----|------|-----|-----|-----|-----|");
     for (phase, samples) in &p.samples {
-        let (sum, mean, p50, p95, p99, max) = summarize_samples(samples);
+        let stats = summarize_samples(samples);
         eprintln!(
             "[profile] | {phase} | {} | {:.2} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |",
             samples.len(),
-            sum as f64 / 1e6,
-            mean as f64 / 1e6,
-            p50 as f64 / 1e6,
-            p95 as f64 / 1e6,
-            p99 as f64 / 1e6,
-            max as f64 / 1e6,
+            stats.sum_ns as f64 / 1e6,
+            stats.mean_ns as f64 / 1e6,
+            stats.p50_ns as f64 / 1e6,
+            stats.p95_ns as f64 / 1e6,
+            stats.p99_ns as f64 / 1e6,
+            stats.max_ns as f64 / 1e6,
         );
     }
 }
@@ -130,39 +168,75 @@ mod tests {
 
     #[test]
     fn summarize_empty_returns_zeros() {
-        assert_eq!(summarize_samples(&[]), (0, 0, 0, 0, 0, 0));
+        assert_eq!(summarize_samples(&[]), PhaseStats::default());
     }
 
     #[test]
     fn summarize_single_sample() {
-        let (sum, mean, p50, p95, p99, max) = summarize_samples(&[1000]);
-        assert_eq!(sum, 1000);
-        assert_eq!(mean, 1000);
-        assert_eq!(p50, 1000);
-        assert_eq!(p95, 1000);
-        assert_eq!(p99, 1000);
-        assert_eq!(max, 1000);
+        let stats = summarize_samples(&[1000]);
+        assert_eq!(stats.sum_ns, 1000);
+        assert_eq!(stats.mean_ns, 1000);
+        assert_eq!(stats.p50_ns, 1000);
+        assert_eq!(stats.p95_ns, 1000);
+        assert_eq!(stats.p99_ns, 1000);
+        assert_eq!(stats.max_ns, 1000);
     }
 
     #[test]
     fn summarize_sorted_percentiles() {
-        // 100 samples: 1..=100. p50 = 50, p95 = 95, p99 = 99,
-        // max = 100, mean = 50, sum = 5050.
+        // 100 samples: 1..=100. Nearest-rank, 0-indexed:
+        //   p50 idx = ceil(50/100 * 100) - 1 = 50 - 1 = 49 -> s[49] = 50
+        //   p95 idx = ceil(95/100 * 100) - 1 = 95 - 1 = 94 -> s[94] = 95
+        //   p99 idx = ceil(99/100 * 100) - 1 = 99 - 1 = 98 -> s[98] = 99
+        // (The pre-2026-05-25 buggy formula returned 51, 96, 100 here --
+        // it indexed into the 0-based slice as if positions were 1-based
+        // ranks, inflating every reading by one position.)
         let s: Vec<u64> = (1..=100).collect();
-        let (sum, mean, p50, p95, p99, max) = summarize_samples(&s);
-        assert_eq!(sum, 5050);
-        assert_eq!(mean, 50);
-        assert_eq!(p50, 51); // index 50 in 0-indexed
-        assert_eq!(p95, 96);
-        assert_eq!(p99, 100); // index 99
-        assert_eq!(max, 100);
+        let stats = summarize_samples(&s);
+        assert_eq!(stats.sum_ns, 5050);
+        assert_eq!(stats.mean_ns, 50);
+        assert_eq!(stats.p50_ns, 50);
+        assert_eq!(stats.p95_ns, 95);
+        assert_eq!(stats.p99_ns, 99);
+        assert_eq!(stats.max_ns, 100);
     }
 
     #[test]
     fn summarize_unsorted_input_sorts() {
+        // Nearest-rank p50 for n=5: idx = ceil(50/100 * 5) - 1 = 3-1 = 2
+        // -> sorted[2] = 3.
         let s = vec![5, 1, 3, 2, 4];
-        let (_, _, p50, _, _, max) = summarize_samples(&s);
-        assert_eq!(p50, 3);
-        assert_eq!(max, 5);
+        let stats = summarize_samples(&s);
+        assert_eq!(stats.p50_ns, 3);
+        assert_eq!(stats.max_ns, 5);
+    }
+
+    #[test]
+    fn summarize_n_eq_1_all_percentiles_collapse_to_sole_sample() {
+        // Edge: nearest-rank ceil((pct*1+99)/100).saturating_sub(1) = 0
+        // for every pct in [0, 99], so the lone sample IS every
+        // percentile. Locks the saturating_sub guard.
+        let stats = summarize_samples(&[42_000]);
+        assert_eq!(stats.p50_ns, 42_000);
+        assert_eq!(stats.p95_ns, 42_000);
+        assert_eq!(stats.p99_ns, 42_000);
+    }
+
+    #[test]
+    fn summarize_n_eq_20_no_collapse_into_max() {
+        // Regression-lock: the pre-fix formula s[(n*pct)/100] for n=20
+        // gave p50=s[10]=11, p95=s[19]=20=max, p99=s[19]=20=max -- p95
+        // and p99 collapsed into max, losing all signal. Nearest-rank
+        // (this fix) keeps them distinct:
+        //   p50 idx = ceil(0.50 * 20) - 1 = 10 - 1 = 9 -> s[9]  = 10
+        //   p95 idx = ceil(0.95 * 20) - 1 = 19 - 1 = 18 -> s[18] = 19
+        //   p99 idx = ceil(0.99 * 20) - 1 = 20 - 1 = 19 -> s[19] = 20
+        // p95 and p99 are now distinct AND p95 < max.
+        let s: Vec<u64> = (1..=20).collect();
+        let stats = summarize_samples(&s);
+        assert_eq!(stats.p50_ns, 10);
+        assert_eq!(stats.p95_ns, 19);
+        assert_eq!(stats.p99_ns, 20);
+        assert_ne!(stats.p95_ns, stats.max_ns, "p95 must not collapse into max");
     }
 }
