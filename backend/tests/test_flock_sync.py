@@ -642,6 +642,77 @@ async def test_apply_pulled_tombstone_rolls_back_on_content_delete_failure(
 
 
 @pytest.mark.asyncio
+async def test_pull_from_peer_tombstone_loop_continues_past_per_entry_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Round-21 correctness regression: pull_from_peer's tombstone
+    loop must guard each _apply_pulled_tombstone in try/except so a
+    single failure doesn't terminate the loop and skip every later
+    tombstone in the manifest.
+
+    Pre-fix a single raise (bad timestamp, transient storage error,
+    the unguarded content.delete from pre-r20, etc.) terminated the
+    loop -- subsequent tombstones in the manifest only landed on a
+    future tick AFTER the failing one cleared. Operator-visible:
+    deleted-on-peer slides kept showing up on this Pi for an
+    unbounded time.
+
+    Test: 3 tombstones in the manifest (A, B, C); monkeypatch
+    _apply_pulled_tombstone to raise on B specifically; assert A
+    and C BOTH landed on disk afterward (proving the loop didn't
+    abort at B).
+    """
+    cid_a = uuid4()
+    cid_b = uuid4()
+    cid_c = uuid4()
+    delete_at = datetime.now(UTC) - timedelta(days=2)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url).endswith("/api/flock/manifest"):
+            return httpx.Response(
+                200,
+                json=_manifest_with(
+                    tombstones=(
+                        (cid_a, delete_at),
+                        (cid_b, delete_at),
+                        (cid_c, delete_at),
+                    )
+                ),
+            )
+        return httpx.Response(404)
+
+    sync, _content, tombstones, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
+
+    # Wrap the real _apply_pulled_tombstone with a B-raising shim.
+    real_apply = sync._apply_pulled_tombstone
+
+    def shim(content_id, deleted_at):
+        if content_id == cid_b:
+            raise RuntimeError("simulated mid-tombstone failure on B")
+        return real_apply(content_id, deleted_at)
+
+    monkeypatch.setattr(sync, "_apply_pulled_tombstone", shim)
+
+    # Should NOT raise -- the per-entry guard catches B's failure and
+    # the loop continues to C.
+    await sync.pull_from_peer("peer.ts.net")
+
+    # CRITICAL ASSERTION: A AND C both landed despite B failing.
+    # Pre-fix only A would land (loop terminated at B before reaching
+    # C). The else-branch of _apply_pulled_tombstone (content doesn't
+    # exist locally) fires for these since we didn't seed any local
+    # content.
+    persisted = {t.content_id for t in tombstones.load().tombstones}
+    assert cid_a in persisted, "tombstone before the failing one must land"
+    assert cid_c in persisted, (
+        "tombstone AFTER the failing one must land too "
+        "(would NOT land pre-r21 since the loop aborted at the B failure)"
+    )
+    assert cid_b not in persisted, "the failing tombstone itself is correctly absent"
+
+
+@pytest.mark.asyncio
 async def test_pull_from_peer_skips_when_local_newer(tmp_path: Path):
     cid = uuid4()
     remote_ts = datetime(2026, 4, 10, tzinfo=UTC)

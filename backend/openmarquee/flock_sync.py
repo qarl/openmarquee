@@ -482,10 +482,23 @@ class FlockSync:
                 except Exception:
                     logger.exception("pull %s: fetch %s failed", peer_address, cid)
 
+            # Round-21 per-entry guard mirroring the content-fetch
+            # loop above. Pre-r21 a single _apply_pulled_tombstone
+            # failure (the unguarded content.delete from pre-r20, a
+            # bad ISO timestamp, or any other unexpected exception)
+            # terminated the loop, skipping every later tombstone in
+            # the manifest. Operator-visible: deleted-on-peer slides
+            # kept showing up on this Pi until the failing tombstone
+            # cleared on a future tick. Wrap per-entry so one bad
+            # tombstone doesn't block N siblings; eventual-consistency
+            # model handles the retry on the next pull tick.
             for stone in manifest.get("tombstones", []):
                 cid = UUID(stone["content_id"])
                 deleted_at = datetime.fromisoformat(stone["deleted_at"])
-                self._apply_pulled_tombstone(cid, deleted_at)
+                try:
+                    self._apply_pulled_tombstone(cid, deleted_at)
+                except Exception:
+                    logger.exception("pull %s: tombstone %s failed", peer_address, cid)
 
     def _record_items_behind(self, peer_address: str, count: int) -> None:
         """Stamp items_behind on the peer record matching peer_address.
