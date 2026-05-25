@@ -222,19 +222,25 @@ class ScheduleStorage:
         atomic_write_text(self.path, schedule.model_dump_json(indent=2))
 
 
-# Top-level fields the v1->v2 migration handles explicitly (consuming
-# v1 shape, building v2 shape, or already in the v2 kwargs we pass to
-# Schedule). Excluded from the **extras passthrough so we don't (a)
-# carry the legacy `default_playlist_name` key forward onto the new v2
-# model, (b) lock schema_version back to 1, or (c) double-kwarg-shadow
-# on fields we pass explicitly to Schedule(...).
-KNOWN_V1_TOP_LEVEL = frozenset({
-    "schema_version",         # v1 marker; default=SCHEDULE_SCHEMA_VERSION takes over
-    "rules",                  # v1 array; replaced with migrated_rules
-    "default_playlist_name",  # v1 string; resolved into default_playlist_id
-    "default_playlist_id",    # safety: don't double-kwarg on mixed v1/v2 files
-    "tz",                     # passed as explicit kwarg
-})
+# Top-level fields the v1->v2 migration handles explicitly. Excluded
+# from the **extras passthrough below so we don't (a) carry the legacy
+# `default_playlist_name` key forward onto the new v2 model, (b) lock
+# schema_version back to 1, or (c) Python-double-kwarg-shadow on
+# fields we pass explicitly to Schedule(...).
+#
+# Derived from Schedule.model_fields rather than hardcoded so that
+# adding a new Schedule field doesn't require also remembering to
+# update this set -- the previous hardcoded shape carried a dual-
+# maintenance failure mode where a forgotten update would let the new
+# field silently flow into the **extras splat and double-kwarg the
+# explicit Schedule(...) construction.
+#
+# `default_playlist_name` is the one v1-only legacy key the migration
+# consumes (v2 renamed it to default_playlist_id); union it in so it
+# also gets filtered from extras.
+MIGRATION_HANDLED_TOP_LEVEL = (
+    frozenset(Schedule.model_fields.keys()) | {"default_playlist_name"}
+)
 
 
 def _resolve_legacy_name(
@@ -313,7 +319,7 @@ def _coerce_to_schedule(
     # direct __init__. So we splat them in via **extras here, after
     # carving out the fields we already handle explicitly to avoid
     # double-kwarg shadowing on the explicit kwargs below.
-    extras = {k: v for k, v in data.items() if k not in KNOWN_V1_TOP_LEVEL}
+    extras = {k: v for k, v in data.items() if k not in MIGRATION_HANDLED_TOP_LEVEL}
     return (
         Schedule(
             rules=migrated_rules,
