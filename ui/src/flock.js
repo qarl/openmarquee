@@ -376,6 +376,19 @@ export function mountFlock(
         }
     }
 
+    // Revoke every blob URL currently held on a thumbnail <img> in the
+    // grid. Called before render() overwrites gridEl.innerHTML (which
+    // would otherwise detach the imgs WITHOUT revoking their blob URLs
+    // — the browser keeps the blobs in memory until document unload)
+    // and from stop() for the panel-close teardown path. The in-poll
+    // revoke at loadThumbViaFetch's `prev` lookup handles steady-state
+    // replacements where the img stays attached.
+    function revokeAllThumbs() {
+        for (const img of gridEl.querySelectorAll("img[data-blob-url]")) {
+            URL.revokeObjectURL(img.dataset.blobUrl);
+        }
+    }
+
     function refreshThumbnails() {
         const imgs = gridEl.querySelectorAll(".om-peer-thumb-img");
         for (const img of imgs) {
@@ -479,6 +492,7 @@ export function mountFlock(
         }
 
         paintEyebrow(peers);
+        revokeAllThumbs();
         gridEl.innerHTML =
             selfCardHTML({
                 name: selfName,
@@ -717,6 +731,9 @@ export function mountFlock(
 
     return {
         refresh: render,
-        stop: stopPolling,
+        stop: () => {
+            stopPolling();
+            revokeAllThumbs();
+        },
     };
 }
