@@ -743,6 +743,13 @@ async function boot() {
     // Initial mount.
     const _bootDims = await resolvePanelDims();
     mountDimensionedPanels(_bootDims);
+    // Round 23: generation counter bumped on every rotation-change
+    // settings-updated event. Each rerenderAllSlidesForRotation
+    // invocation captures the generation at its start; if a newer
+    // event has bumped the counter, the in-flight loop bails (via
+    // isStale closure) instead of competing with the new loop for
+    // per-slide PUT ordering. Last-rotation-wins; no interleaving.
+    let rotationGen = 0;
     // FYS bug 7: track the rotation across settings-updated events so a
     // rotation change can trigger the stored-thumbnail bulk re-render.
     let lastKnownRotation = _bootDims.rotation || 0;
@@ -858,13 +865,22 @@ async function boot() {
         const newRotation = dims.rotation || 0;
         if (newRotation !== lastKnownRotation) {
             lastKnownRotation = newRotation;
+            const myGen = ++rotationGen;
             try {
-                const summary = await rerenderAllSlidesForRotation(newRotation);
+                const summary = await rerenderAllSlidesForRotation(newRotation, {
+                    isStale: () => myGen !== rotationGen,
+                });
                 console.info("[bug7] rotation thumbnail re-render:", summary);
             } catch (err) {
                 console.warn("[bug7] rotation thumbnail re-render failed:", err);
             }
-            mountDimensionedPanels(dims);
+            // Round 23: skip the post-rerender remount if a newer
+            // rotation event has already started. That event's handler
+            // will mount with its own (correct) dims; mounting again
+            // with our stale dims would clobber it.
+            if (myGen === rotationGen) {
+                mountDimensionedPanels(dims);
+            }
         }
     });
 
