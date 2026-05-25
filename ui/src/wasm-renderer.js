@@ -37,6 +37,7 @@ import init, {
     register_font as wasmRegisterFont,
     rasterize_text_named as wasmRasterizeTextNamed,
 } from "../../renderer-wasm/pkg/renderer_wasm.js";
+import { LruByteCache } from "./lru-byte-cache.js";
 
 // Runtime fetch of the .wasm artifact (NOT bundle-inlined).
 //
@@ -151,29 +152,31 @@ export function isFontRegistered(name) {
 
 // Rasterized-bitmap cache. Keyed by `${text}|${font}|${size}|${color}`.
 // Avoids re-rasterizing the same string repeatedly across rAF ticks.
-// Bounded at 256 entries with LRU eviction so a slide with many
-// distinct strings doesn't grow memory unbounded.
-const CACHE_LIMIT = 256;
-const cache = new Map();
+//
+// r27: bounded by BYTE VOLUME, not entry count. Pre-r27 cap was 256
+// entries, each holding an OffscreenCanvas up to 8192×8192 = 256 MiB.
+// A long-ticker slide with frame-changing text (clock seconds,
+// counters, typewriter) populated 256 distinct multi-megapixel
+// canvases before LRU evicted — multi-GiB worst case on a low-RAM
+// Pi-class device that gets OOM-killed mid-show.
+//
+// Budget: 32 MiB total across all cached bitmaps. Per-entry cap of
+// 4 MiB rejects single huge bitmaps (1024×1024 RGBA) outright —
+// caching a single 16 MiB bitmap would force eviction of EVERY
+// smaller entry and still leave the cache above budget. The
+// rejected-entry's miss path re-rasterizes via the wasm side; not
+// caching it is cheaper than thrashing.
+//
+// The byte-arithmetic + LRU eviction loop is encapsulated in
+// LruByteCache (./lru-byte-cache.js) for testability — the original
+// inline cache lived behind the resolve.alias stub for jsdom.
+const CACHE_BYTE_BUDGET = 32 * 1024 * 1024;     // 32 MiB
+const CACHE_ENTRY_BYTE_CAP = 4 * 1024 * 1024;   // 4 MiB
 
-function cacheGet(key) {
-    const v = cache.get(key);
-    if (v !== undefined) {
-        // LRU: move to end.
-        cache.delete(key);
-        cache.set(key, v);
-    }
-    return v;
-}
-
-function cacheSet(key, value) {
-    if (cache.size >= CACHE_LIMIT) {
-        // Evict oldest (Map iteration order = insertion order).
-        const firstKey = cache.keys().next().value;
-        cache.delete(firstKey);
-    }
-    cache.set(key, value);
-}
+const cache = new LruByteCache({
+    byteBudget: CACHE_BYTE_BUDGET,
+    entryByteCap: CACHE_ENTRY_BYTE_CAP,
+});
 
 /**
  * Rasterize `text` at `sizePx` in `fontName` with `colorRgba`.
@@ -206,7 +209,7 @@ export function rasterizeText(text, fontName, sizePx, colorRgba) {
 
     const sizeKey = Math.round(sizePx * 100) / 100; // 2-decimal stable key
     const key = `${text}|${fontName}|${sizeKey}|${colorRgba.join(",")}`;
-    const cached = cacheGet(key);
+    const cached = cache.get(key);
     if (cached) return cached;
 
     const buf = wasmRasterizeTextNamed(
@@ -255,7 +258,11 @@ export function rasterizeText(text, fontName, sizePx, colorRgba) {
     canvas.getContext("2d").putImageData(imageData, 0, 0);
 
     const result = { image: canvas, width, height, ascent };
-    cacheSet(key, result);
+    // RGBA bitmap byte cost = width × height × 4. cache.set rejects
+    // single entries over the per-entry cap (their miss path re-
+    // rasterizes via the wasm side; not caching them keeps the rest
+    // of the cache from thrashing).
+    cache.set(key, result, width * height * 4);
     return result;
 }
 
