@@ -238,6 +238,28 @@ export function rasterizeText(text, fontName, sizePx, colorRgba) {
     // source-over composition.
     const pixelStart = buf.byteOffset + 12;
     const pixelLen = width * height * 4;
+    // Round 28 defense-in-depth: the Rust side currently emits
+    // header-consistent buffers (lib.rs:155 allocates exactly
+    // `12 + pixel_bytes`), but there's no defense if wasm-bindgen
+    // ever returns a shorter buffer (future Rust-side change for
+    // streaming, upstream bug, memory pressure). Without this
+    // bounds-check, the Uint8ClampedArray constructor below throws
+    // RangeError synchronously and aborts the frame's rAF callback
+    // — one bad layer would potentially kill the whole motion loop.
+    // Return null on truncation; caller's existing null path
+    // (rasterize.js:322 `if (!result) continue;`) skips the line
+    // gracefully. console.warn (not silent) because unlike the
+    // width=0 or width>8192 guards above, a header/buffer mismatch
+    // is upstream corruption — we want to know if it fires in prod.
+    if (buf.byteLength < 12 + pixelLen) {
+        console.warn(
+            "[wasm-renderer] buffer truncated: header reports",
+            `${width}×${height} (${pixelLen} px bytes)`,
+            "but buffer holds only", buf.byteLength - 12, "px bytes.",
+            "Returning null; line will be skipped.",
+        );
+        return null;
+    }
     const owned = new Uint8ClampedArray(
         new Uint8ClampedArray(buf.buffer, pixelStart, pixelLen),
     );
