@@ -73,8 +73,14 @@ const BUILDERS = {
     solid: (a /*, b, d */) => a,
 
     gradient: (a, b, d = 0.5) => {
-        // Density 0..1 → angle 0..270deg. CSS-like: 0deg = top→bot,
-        // 90deg = left→right, 180deg = bot→top, 270deg = right→left.
+        // Density 0..1 → angle 0..270deg. Per CSS spec
+        // `linear-gradient(<angle>deg, a, b)`: 0deg points the
+        // gradient UP (so a is at BOTTOM, b at TOP); 90deg points
+        // RIGHT (a left, b right); 180deg points DOWN (a top, b bot);
+        // 270deg points LEFT (a right, b left). The canvas painter
+        // below (paintPatternOnCanvas case "gradient") is calibrated
+        // to match — without `dy = -cos(rad)` the canvas Y axis is
+        // flipped from CSS, putting the wrong color on top/bottom.
         const angle = Math.round(lerp(0, 270, d));
         return `linear-gradient(${angle}deg, ${a}, ${b})`;
     },
@@ -253,7 +259,17 @@ export function paintPatternOnCanvas(
             const angleDeg = Math.round(lerp(0, 270, density));
             const rad = (angleDeg * Math.PI) / 180;
             const dx = Math.sin(rad);
-            const dy = Math.cos(rad);
+            // Negate cos: CSS `linear-gradient(0deg)` points UP (so
+            // start is at BOTTOM). Without the negation, canvas's Y-
+            // axis-down convention would put the gradient START at
+            // TOP, swapping a/b vertically (the picker thumbnail
+            // would show pink-on-top→blue-on-bottom but the device
+            // would render the opposite). Flipping the addColorStop
+            // pair WOULD NOT fix this — it'd correct 0/180deg but
+            // break 90/270deg by swapping their horizontal colors.
+            // Negating dy is the only fix that lands all 4 cardinals
+            // (and intermediate angles) correctly.
+            const dy = -Math.cos(rad);
             const cx = width / 2;
             const cy = height / 2;
             const half = Math.abs(dx) * (width / 2)
@@ -388,9 +404,17 @@ export function paintPatternOnCanvas(
             const maxR = Math.ceil(Math.sqrt(cx * cx + cy * cy)) + 1;
             ctx.fillStyle = b;
             const step = (Math.PI * 2) / slices;
+            // CSS conic-gradient `from 0deg` starts the first slice at
+            // 12 o'clock (UP) and sweeps clockwise. Canvas ctx.arc
+            // measures angles from the +x axis (3 o'clock). Subtract
+            // π/2 from a0/a1 so slice 0 starts at 12 o'clock too —
+            // matching the picker thumbnail's CSS render. Without
+            // this, a 4-slice rays render shows colors rotated 90°
+            // (the b-colored diagonal becomes the "/" instead of "\\").
+            const angleOffset = -Math.PI / 2;
             for (let i = 1; i < slices; i += 2) {
-                const a0 = i * step;
-                const a1 = (i + 1) * step;
+                const a0 = angleOffset + i * step;
+                const a1 = angleOffset + (i + 1) * step;
                 ctx.beginPath();
                 ctx.moveTo(cx, cy);
                 ctx.arc(cx, cy, maxR, a0, a1);
