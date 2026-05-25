@@ -332,6 +332,17 @@ export function mountFlock(
     const discoverList = modal.querySelector(".flock-discover-list");
 
     let pollTimer = null;
+    // Per-peer display-dim cache. Keyed on peer.id (the stable hardware
+    // identity — peer.address can churn on DHCP). Display dims are a
+    // property of the device, not the panel state, so first-sight fetch
+    // is enough; subsequent renders apply from cache without hitting
+    // the peer's /api/system/info (which costs a TCP slot up to 3s if
+    // the peer is black-holed). Instance-scoped (not module-scoped) so
+    // tests that inject their own fetchPeerSystemInfo don't bleed
+    // across mount-instances. Cleared in stop() for the panel-close
+    // teardown. Stale-on-hardware-swap is an acceptable tradeoff
+    // (operator-rare event).
+    const peerDimsCache = new Map();
 
     function setStatus(text, { error = false } = {}) {
         statusEl.textContent = text;
@@ -541,18 +552,30 @@ export function mountFlock(
             if (!isPeerOnline(peer)) continue;
             const peerIdSel = `.om-peer-card[data-peer-id="${escapeAttr(peer.id)}"]`;
             if (!gridEl.querySelector(peerIdSel)) continue;
+            // Re-resolve the thumb element rather than capture it —
+            // a re-render between fetch start + resolve replaces
+            // the DOM under us, so write to whatever is current.
+            const applyAspect = (dims) => {
+                const live = gridEl.querySelector(`${peerIdSel} .om-peer-thumb`);
+                if (live) {
+                    live.style.aspectRatio = `${dims.display_width} / ${dims.display_height}`;
+                }
+            };
+            const cached = peerDimsCache.get(peer.id);
+            if (cached) {
+                applyAspect(cached);
+                continue;
+            }
             fetchPeerSystemInfo(peer.address)
                 .then((info) => {
                     if (!info || !info.display_width || !info.display_height) {
                         return;
                     }
-                    // Re-resolve the thumb element rather than capture it —
-                    // a re-render between fetch start + resolve replaces
-                    // the DOM under us, so write to whatever is current.
-                    const live = gridEl.querySelector(`${peerIdSel} .om-peer-thumb`);
-                    if (live) {
-                        live.style.aspectRatio = `${info.display_width} / ${info.display_height}`;
-                    }
+                    peerDimsCache.set(peer.id, {
+                        display_width: info.display_width,
+                        display_height: info.display_height,
+                    });
+                    applyAspect(info);
                 })
                 .catch(() => {
                     // Fall back to --device-aspect.
@@ -734,6 +757,7 @@ export function mountFlock(
         stop: () => {
             stopPolling();
             revokeAllThumbs();
+            peerDimsCache.clear();
         },
     };
 }
