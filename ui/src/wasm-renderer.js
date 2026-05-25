@@ -74,6 +74,19 @@ export function initWasmRenderer() {
     if (initPromise) return initPromise;
     initPromise = init({ module_or_path: WASM_URL }).then(() => {
         initialized = true;
+    }).catch((err) => {
+        // Round 26: clear the cached promise BEFORE re-throwing so a
+        // transient init failure (network blip fetching the .wasm,
+        // MIME mismatch on a misconfigured server, OOM during
+        // instantiation) doesn't poison the slot for the rest of
+        // the page lifetime. Pre-fix every subsequent caller got
+        // the same rejected promise and slides fell back to
+        // ctx.fillText for the entire session even after the network
+        // recovered. The original caller still receives the
+        // rejection (re-thrown); the next caller gets a fresh
+        // init attempt.
+        initPromise = null;
+        throw err;
     });
     return initPromise;
 }
