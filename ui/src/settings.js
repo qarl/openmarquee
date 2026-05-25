@@ -197,6 +197,8 @@ const SECTION_TEMPLATE = `
                         <button type="button" class="om-btn sm settings-wifi-rescan field-hint-btn">
                             Rescan nearby networks
                         </button>
+                        <p class="settings-wifi-status" role="status" aria-live="polite" hidden
+                           style="margin: 6px 0 0; color: var(--om-text-dim); font-size: 12px;"></p>
                         <p class="field-hint" style="margin: 6px 0 0;">
                             Runs concurrently with the access point on the Pi's single
                             radio; both modes share the same channel. Disabling both
@@ -940,10 +942,35 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     // --- WiFi scan: populate the SSID picker so operator picks from
     //     nearby networks. "Other" reveals the manual text input. ---
 
+    // Helper for the two silent-fail paths in populateWifiScan. Same
+    // shape as bg-picker's statusEl pattern (7aeec9a). Console log
+    // preserved for devtools / journald correlation; operator gets a
+    // visible breadcrumb so the "(type manually)" fallback doesn't
+    // read as a missing feature.
+    function surfaceWifiScanError(reason) {
+        console.debug("[settings] wifi-scan failed:", reason);
+        const status = container.querySelector(".settings-wifi-status");
+        if (!status) return;
+        status.textContent = `WiFi scan unavailable: ${reason}`;
+        status.hidden = false;
+    }
+
     async function populateWifiScan() {
+        // Clear any prior failure breadcrumb at the start of each
+        // attempt -- the rescan button is the operator's "try again"
+        // affordance, and a stale message past a fresh success would
+        // mislead.
+        const status = container.querySelector(".settings-wifi-status");
+        if (status) {
+            status.textContent = "";
+            status.hidden = true;
+        }
         try {
             const res = await apiFetch("/api/system/wifi-scan");
-            if (!res.ok) return;
+            if (!res.ok) {
+                surfaceWifiScanError(`HTTP ${res.status}`);
+                return;
+            }
             const data = await res.json();
             const networks = Array.isArray(data?.networks) ? data.networks : [];
             const currentSsid = stationSsidEl.value;
@@ -969,8 +996,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             }
             stationSsidEl.hidden = stationSsidPickerEl.value !== "__other__";
         } catch (err) {
-            // Silent — picker stays as the "(type manually)" fallback.
-            console.debug("[settings] wifi-scan failed:", err);
+            surfaceWifiScanError(err.message || String(err));
         }
     }
     stationSsidPickerEl.addEventListener("change", () => {
