@@ -152,20 +152,33 @@ impl PlaybackState {
     /// Compute what to paint at wall-clock t_ms. Promotes
     /// to_slide on transition completion. Doesn't actually
     /// paint -- that's the GL-bound layer's job.
+    ///
+    /// Borrows self.pending / self.current rather than cloning
+    /// the whole context per frame -- the only branch that
+    /// needs ownership is promote-on-complete (which take()s),
+    /// and the PaintTransition return path clones only the
+    /// String it gives away. Pre-refactor (b3bb6e0) the
+    /// transition-active hot path was alloc'ing a kind String
+    /// up-front even when the promote branch then discarded it
+    /// without using it.
     pub fn advance(&mut self, t_ms: u64) -> AdvanceCommand {
         // Transition takes precedence during its blend window.
-        if let Some(transition) = self.pending.clone() {
+        if let Some(transition) = &self.pending {
             let elapsed = t_ms.saturating_sub(transition.t0_ms);
             if elapsed >= transition.transition_ms as u64 {
-                // Transition complete; promote to_slide.
-                self.current = Some(transition.to_slide.clone());
-                self.pending = None;
+                // Transition complete; take ownership of pending so
+                // to_slide moves into self.current without a clone,
+                // and the kind String simply drops (no PaintTransition
+                // return on this branch needs it).
+                let transition = self.pending.take().expect("just borrowed");
+                let slide_id = transition.to_slide.slide_id;
+                self.current = Some(transition.to_slide);
                 // Caller paints the new slide on its next advance
                 // call; this advance returns PaintSlide so the
                 // first frame of the new slide is rendered NOW
                 // without an extra round-trip.
                 return AdvanceCommand::PaintSlide {
-                    slide_id: transition.to_slide.slide_id,
+                    slide_id,
                     t_in_slide_ms: 0,
                 };
             }
@@ -173,11 +186,14 @@ impl PlaybackState {
             return AdvanceCommand::PaintTransition {
                 from: transition.from_slide_id,
                 to: transition.to_slide.slide_id,
-                kind: transition.kind,
+                // String clone only at the point of giving the value
+                // away to the caller. AdvanceCommand still owns String
+                // (scope-clamp: not adding lifetimes to the enum).
+                kind: transition.kind.clone(),
                 progress: progress.clamp(0.0, 1.0),
             };
         }
-        if let Some(slide) = self.current.clone() {
+        if let Some(slide) = &self.current {
             let elapsed = t_ms.saturating_sub(slide.t0_ms);
             if elapsed >= slide.duration_ms as u64 {
                 return AdvanceCommand::SlideComplete {
