@@ -756,6 +756,40 @@ async def test_gossip_add_excludes_self_from_forward_set(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_gossip_add_self_exclude_handles_mixed_case_self_address(tmp_path: Path):
+    """Stored peer addresses are lowercased on entry (flock.py::
+    _normalize_address). _resolve_self_address is case-preserving
+    (env override, socket.gethostname(), and the tailscale_hostname
+    validator do not lowercase). Without normalizing sender at the
+    comparison site, the defensive self-exclude guard silently
+    bypasses for any device whose self-address contains uppercase --
+    every gossip-add fan-out re-introduces this device to itself.
+
+    Setup: self-address is mixed-case "MyDevice.ts.net"; the lowercase
+    form "mydevice.ts.net" is in our flock (because operator-added
+    addresses get lowercased on store). Adding a new peer should NOT
+    gossip back to our own self entry.
+    """
+    calls: list[str] = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(204)
+
+    sync, _, _, flock = _build_sync(
+        tmp_path, httpx.MockTransport(handler), self_address="MyDevice.ts.net"
+    )
+    flock.add(address="MyDevice.ts.net")  # stored as "mydevice.ts.net"
+    flock.add(address="b.ts.net")  # new
+
+    await sync.gossip_add("b.ts.net")
+
+    # Just the reciprocal-add to B. Our own self entry (stored
+    # lowercase) must be excluded even though sender is mixed case.
+    assert calls == ["http://b.ts.net/api/flock/hello"]
+
+
+@pytest.mark.asyncio
 async def test_gossip_add_skips_when_no_self_address(tmp_path: Path):
     """A device without a configured tailnet hostname can't tell
     peers how to reach it. Skip gossip silently rather than send

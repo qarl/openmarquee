@@ -297,11 +297,19 @@ class FlockSync:
         # self-address (defensive: if the operator typo'd their own
         # tailnet hostname into the add field, we shouldn't gossip
         # the addition back to ourselves).
+        #
+        # sender must be normalized the same way stored peer addresses
+        # are (flock.py::_normalize_address strips+lowercases on entry).
+        # _resolve_self_address can return mixed-case strings (env
+        # override, socket.gethostname(), and the tailscale_hostname
+        # validator are all case-preserving), so an un-normalized
+        # equality check would silently bypass the self-exclude guard.
         new_peer_normalized = new_peer_address.strip().lower()
+        sender_normalized = sender.strip().lower()
         existing_peers = [
             p
             for p in self.flock.load().peers
-            if p.address != new_peer_normalized and p.address != sender
+            if p.address != new_peer_normalized and p.address != sender_normalized
         ]
         async with self._client_factory() as client:
             tasks = [
