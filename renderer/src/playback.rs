@@ -90,9 +90,13 @@ pub enum AdvanceCommand {
     },
     /// Current slide's duration_ms has elapsed; caller should
     /// either begin_transition or begin_slide the next item.
-    /// The PaintSlide for the final frame was already returned
-    /// on a prior advance; this command surfaces the boundary
-    /// without re-painting.
+    /// Caller may have painted the slide as recently as
+    /// duration_ms-1 (depending on advance cadence); no further
+    /// PaintSlide for this slide will be emitted. There is NO
+    /// guaranteed "final-frame PaintSlide at exactly duration_ms"
+    /// -- advance() returns SlideComplete on the FIRST observation
+    /// of elapsed >= duration_ms, skipping any synthetic paint at
+    /// the boundary (see slide_completes_at_or_after_duration test).
     SlideComplete {
         slide_id: Uuid,
     },
@@ -103,12 +107,15 @@ impl PlaybackState {
         Self::default()
     }
 
-    /// Begin a slide presentation. Drops any existing transition
-    /// (begin_transition is the slot for that) but is tolerant
-    /// of being called over a current slide -- previous slide is
-    /// simply replaced. Caller is responsible for ordering
-    /// (typically begin_transition first, then begin_slide as
-    /// the to_slide promotes).
+    /// Begin a slide presentation. Clears any in-flight transition
+    /// -- the canonical next-slide path is begin_transition; calling
+    /// begin_slide over an active transition or current slide is
+    /// the recovery path for a botched transition or an operator-
+    /// driven jump. Caller is responsible for ordering (typically
+    /// begin_transition first, then begin_slide as the to_slide
+    /// promotes -- though the promote-on-complete branch of
+    /// advance() handles that internally without needing an
+    /// explicit begin_slide).
     pub fn begin_slide(&mut self, slide_id: Uuid, t0_ms: u64, duration_ms: u32) {
         self.current = Some(SlideContext {
             slide_id,
@@ -170,7 +177,7 @@ impl PlaybackState {
                 // to_slide moves into self.current without a clone,
                 // and the kind String simply drops (no PaintTransition
                 // return on this branch needs it).
-                let transition = self.pending.take().expect("just borrowed");
+                let transition = self.pending.take().expect("checked Some above");
                 let slide_id = transition.to_slide.slide_id;
                 self.current = Some(transition.to_slide);
                 // Caller paints the new slide on its next advance
