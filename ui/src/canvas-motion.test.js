@@ -341,6 +341,38 @@ describe("paintLayerWithMotion", () => {
         expect(ctxA.translate.mock.calls).toEqual(ctxB.translate.mock.calls);
     });
 
+    it("shake step-stable frames produce identical translates (r21 memo lock)", () => {
+        // Round-21 regression-lock: shake's step = floor(phase * 10)
+        // quantizes to 10 distinct values per cycle. At 10 Hz / 60 Hz
+        // each step lasts ~6 frames. The r21 memo precomputes a
+        // 10-entry table per (layerKey, motionPhase); all frames
+        // within the same step must return the IDENTICAL translate.
+        // If the memo ever regresses, varying elapsed_s within a
+        // step's window would produce different outputs.
+        const layer = {
+            motion: "shake",
+            motion_intensity: 100,
+            motion_phase: 0,
+            box: { x: 0, y: 0, w: 1, h: 1 },
+        };
+        // Shake freq = 10 Hz. phase = elapsed * 10 (with phase=0).
+        // step 0 spans elapsed ∈ [0.000, 0.010). Sample 6 frames
+        // (60 fps) inside step 0.
+        const elapseds = [0.000, 0.001, 0.003, 0.005, 0.007, 0.009];
+        const translates = elapseds.map((elapsed_s) => {
+            const ctx = fakeCtx();
+            paintLayerWithMotion(ctx, fakeCanvas(100, 100), layer, vi.fn(), {
+                elapsed_s, layerKey: "memo-lock:0",
+            });
+            return ctx.translate.mock.calls[0];
+        });
+        // All 6 frames should produce the IDENTICAL (dx, dy) tuple.
+        const first = translates[0];
+        for (let i = 1; i < translates.length; i++) {
+            expect(translates[i]).toEqual(first);
+        }
+    });
+
     it("shake produces DIFFERENT offsets for different layerKey at the same phase", () => {
         const layer = {
             motion: "shake",

@@ -67,6 +67,49 @@ function gaussian(layerKey, motionPhase, step) {
     return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
 }
 
+// Round 21: shake's step = floor(phase * 10) quantizes to 10 distinct
+// values per cycle. At 10 Hz shake / 60 Hz rAF, each step lasts ~6
+// frames — 5 of every 6 frames re-derived the same 4 hashedUniform
+// strings + FNV walks. Memoize the 10-entry (dxG, dyG) gaussian table
+// per (layerKey, motionPhase) tuple so per-frame work is a single
+// Map.get + array index. ampPx multiplication stays at use-site
+// (intensity / bh can change between renders without invalidating
+// the cache).
+//
+// Bounded: a slide with N shake layers × M motion_phase variants
+// builds N×M tables; an LRU cap of 32 entries covers realistic
+// scenes (the FYS demo reel's heaviest multi-shake "Panic" slide
+// runs ~6 layers). Oldest insertion-order key evicts on overflow —
+// Map iteration is insertion order, so .keys().next().value gives
+// the oldest.
+const _shakeTables = new Map();
+const _SHAKE_TABLE_MAX = 32;
+
+function getShakeTable(layerKey, motionPhase) {
+    const tableKey = `${layerKey}:${motionPhase || 0}`;
+    let table = _shakeTables.get(tableKey);
+    if (table) return table;
+    if (_shakeTables.size >= _SHAKE_TABLE_MAX) {
+        // LRU-ish: drop the oldest insertion. Map preserves insertion
+        // order; first key returned by .keys() is the oldest.
+        const oldest = _shakeTables.keys().next().value;
+        _shakeTables.delete(oldest);
+    }
+    table = new Array(10);
+    for (let i = 0; i < 10; i++) {
+        table[i] = {
+            dxG: gaussian(layerKey, motionPhase, i),
+            // The +100000 offset on the dy seed matches the pre-memo
+            // call shape in the shake branch — keeps dx and dy
+            // independent draws (without the offset, both would seed
+            // off step ∈ [0, 9] and dy would equal dx).
+            dyG: gaussian(layerKey, motionPhase, i + 100000),
+        };
+    }
+    _shakeTables.set(tableKey, table);
+    return table;
+}
+
 // True if at least one visible layer in `layers` has motion != static.
 // The editor's rAF loop kicks ONLY when this is true and pauses when
 // the slide goes back to fully static — no idle CPU burn for static
@@ -201,10 +244,12 @@ export function paintLayerWithMotion(ctx, canvas, layer, paintFn, opts) {
             if (intensity > 0) {
                 const step = Math.floor(phase * 10);
                 const ampPx = (intensity / 100.0) * 0.04 * bh;
-                const dx = Math.round(gaussian(layerKey, motionPhase, step) * ampPx / 2);
-                const dy = Math.round(
-                    gaussian(layerKey, motionPhase, step + 100000) * ampPx / 2,
-                );
+                // Round 21: 10-entry precomputed gaussian table per
+                // (layerKey, motionPhase). Per-frame: one Map.get +
+                // one array index; no string-build, no FNV walk.
+                const { dxG, dyG } = getShakeTable(layerKey, motionPhase)[step];
+                const dx = Math.round(dxG * ampPx / 2);
+                const dy = Math.round(dyG * ampPx / 2);
                 ctx.translate(dx, dy);
             }
             paintFn();
