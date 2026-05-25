@@ -17,7 +17,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # `validate_stream_url` lives in stream_consumer alongside the ffmpeg
 # allowlist constant. A top-level import is safe: stream_consumer.py
@@ -128,6 +128,12 @@ class TextBox(BaseModel):
     error.
     """
 
+    # Round-11 forward-compat: preserve unknown fields across the
+    # load->mutate->save round-trip (PATCH /duration, flock-sync
+    # ingest). See ContentItem variant configs below for the full
+    # rationale.
+    model_config = ConfigDict(extra="allow")
+
     x: float = Field(default=0.1, ge=-2.0, le=3.0)
     y: float = Field(default=0.1, ge=-2.0, le=3.0)
     w: float = Field(default=0.8, ge=0.01, le=5.0)
@@ -158,6 +164,10 @@ class TextLayer(BaseModel):
     motion / opacity / anchor / blend lands in a later wave; until
     then the renderer treats them as static / 1.0 / center / normal.
     """
+
+    # Round-11 forward-compat: preserve unknown fields. See variant
+    # configs below for the full rationale.
+    model_config = ConfigDict(extra="allow")
 
     text: str = Field(max_length=10_000)
     # Operator-set short label — "Headline", "Hours", "Marquee" — that
@@ -316,6 +326,10 @@ class BackgroundPattern(BaseModel):
       - grid:      cell size lerp(120, 4) — color_a lines on color_b paper
     """
 
+    # Round-11 forward-compat: preserve unknown fields. See variant
+    # configs below for the full rationale.
+    model_config = ConfigDict(extra="allow")
+
     pattern: Literal[
         "solid",
         "gradient",
@@ -358,6 +372,35 @@ class TextSlide(BaseModel):
     once on rollout (clean cutover; no production installations to
     migrate per qarl).
     """
+
+    # Round-11 forward-compat fix (2026-05-25): preserve unknown
+    # fields across the storage round-trip.
+    #
+    # PATCH /api/content/{id}/duration is the highest-frequency
+    # operator action that does load->model_copy->save against this
+    # typed model (api.py:1043-1052). Pre-fix, _CONTENT_ADAPTER
+    # validated under default extra="ignore", so any field on the
+    # on-disk item.json that this build doesn't know about (e.g. from
+    # a forward-rollback scenario where backend N+1 had added a
+    # field, or from a flock-sync ingest of a peer carrying a newer
+    # field) was silently dropped on load. The next save then wrote
+    # the lossy model back to disk -- data gone forever.
+    #
+    # Same hazard applies to ImageSlide, VideoSlide, StreamSlide,
+    # WebSlide -- they each gain the same config. Nested types
+    # (TextLayer, TextBox, BackgroundPattern) also need it because
+    # extras can appear at any level of the model tree.
+    #
+    # In Pydantic v2:
+    #   - validate_python preserves extras into model_extra when
+    #     extra="allow"
+    #   - model_copy(update={...}) preserves extras
+    #   - model_dump(mode="json") emits extras alongside known fields
+    # So load->copy->save round-trips cleanly once this config is
+    # set, with no other code changes needed. Same shape as the
+    # Schedule + Playlist forward-compat fixes landed overnight;
+    # this closes the ContentItem leg.
+    model_config = ConfigDict(extra="allow")
 
     type: Literal["text_slide"] = "text_slide"
     id: UUID = Field(default_factory=uuid4)
@@ -495,6 +538,10 @@ class ImageSlide(BaseModel):
     housekeeping metadata.
     """
 
+    # Round-11 forward-compat: preserve unknown fields. See TextSlide
+    # for the full rationale.
+    model_config = ConfigDict(extra="allow")
+
     type: Literal["image"] = "image"
     id: UUID = Field(default_factory=uuid4)
     name: str = Field(max_length=200)
@@ -529,6 +576,10 @@ class VideoSlide(BaseModel):
     TextSlide / ImageSlide and a single ContentItem union works.
     """
 
+    # Round-11 forward-compat: preserve unknown fields. See TextSlide
+    # for the full rationale.
+    model_config = ConfigDict(extra="allow")
+
     type: Literal["video"] = "video"
     id: UUID = Field(default_factory=uuid4)
     name: str = Field(max_length=200)
@@ -561,6 +612,10 @@ class StreamSlide(BaseModel):
     playback loop does when the stream URL can't be reached when the slot
     fires.
     """
+
+    # Round-11 forward-compat: preserve unknown fields. See TextSlide
+    # for the full rationale.
+    model_config = ConfigDict(extra="allow")
 
     type: Literal["stream"] = "stream"
     id: UUID = Field(default_factory=uuid4)
@@ -617,6 +672,10 @@ class WebSlide(BaseModel):
     type. `refresh_interval_s` is how often a fresh screenshot of
     `url` is rendered.
     """
+
+    # Round-11 forward-compat: preserve unknown fields. See TextSlide
+    # for the full rationale.
+    model_config = ConfigDict(extra="allow")
 
     type: Literal["web"] = "web"
     id: UUID = Field(default_factory=uuid4)

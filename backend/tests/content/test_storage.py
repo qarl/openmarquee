@@ -68,6 +68,68 @@ def test_save_then_load_round_trips_text_slide(tmp_path: Path):
     assert loaded.updated_at is not None
 
 
+def test_text_slide_round_trip_preserves_unknown_fields_at_all_levels(
+    tmp_path: Path,
+):
+    """Round-11 forward-compat regression: extra fields on the on-disk
+    item.json (top-level on the variant model AND nested in TextLayer
+    / TextBox / BackgroundPattern) must SURVIVE the load->mutate->save
+    round-trip. Pre-fix, _CONTENT_ADAPTER validated under default
+    extra="ignore" so any unknown key was silently dropped on load;
+    the next save then wrote the lossy model back to disk -- data
+    gone forever.
+
+    Real-world scenario: backend N+1 ships a new TextSlide field X
+    (e.g. text_layers[].outline_width). Operator rolls back to N
+    (doesn't know X). Operator taps the duration chip ->
+    PATCH /api/content/{id}/duration -> X is gone from disk.
+
+    Test: seed item.json with unknown fields at three nesting levels
+    (top-level on TextSlide, nested inside TextLayer, deeper inside
+    TextBox), then exercise the load->model_copy->save path that
+    PATCH /duration uses (api.py:1043-1052), then re-read the raw
+    JSON and assert every unknown field survives unchanged.
+    """
+    storage = ContentStorage(tmp_path)
+    slide = _make_slide(name="With Extras", text="hi", duration_ms=3000)
+    storage.save_text_slide(slide, png=b"\x89PNG\r\nfake")
+
+    # Hand-seed the on-disk envelope with extras at three levels:
+    # variant-top, TextLayer-nested, TextBox-doubly-nested.
+    envelope_path = tmp_path / str(slide.id) / "item.json"
+    envelope = json.loads(envelope_path.read_text())
+    envelope["item"]["_forward_compat_top_level"] = {
+        "added_in": "N+1",
+        "value": 42,
+    }
+    envelope["item"]["text_layers"][0]["_forward_compat_layer_field"] = "outline_width=0.5"
+    envelope["item"]["text_layers"][0]["box"]["_forward_compat_box_field"] = True
+    envelope_path.write_text(json.dumps(envelope, indent=2))
+
+    # Exercise the exact PATCH /duration path: load + model_copy +
+    # save. patch_duration in api.py:1043-1052 does this verbatim.
+    loaded = storage.load(slide.id)
+    updated = loaded.model_copy(update={"duration_ms": 7777})
+    storage.save(updated, png=b"\x89PNG\r\nfake")
+
+    # Re-read raw JSON (NOT through the model) and assert every
+    # forward-compat field survived end-to-end.
+    persisted = json.loads(envelope_path.read_text())
+    assert persisted["item"]["duration_ms"] == 7777, (
+        "duration_ms update must take effect (positive baseline)"
+    )
+    assert persisted["item"]["_forward_compat_top_level"] == {
+        "added_in": "N+1",
+        "value": 42,
+    }, "top-level forward-compat field must survive"
+    assert (
+        persisted["item"]["text_layers"][0]["_forward_compat_layer_field"] == "outline_width=0.5"
+    ), "nested TextLayer forward-compat field must survive"
+    assert persisted["item"]["text_layers"][0]["box"]["_forward_compat_box_field"] is True, (
+        "doubly-nested TextBox forward-compat field must survive"
+    )
+
+
 def test_read_asset_returns_exact_bytes(tmp_path: Path):
     storage = ContentStorage(tmp_path)
     slide = _make_slide()
