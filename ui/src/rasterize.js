@@ -112,7 +112,16 @@ export function drawTextOnly(canvas, item, opts) {
         const slideKey = (item && (item.id || "?")) + "";
         for (let i = 0; i < layers.length; i++) {
             const layer = layers[i];
-            const paint = () => paintLayer(ctx, canvas, layer, /* fillBox */ null);
+            // Auto-mode resolution: mirror drawCanvas (line 510). Without
+            // this, a Text-over-Video slide with an auto_mode="time" /
+            // "date" / "day" layer rendered the placeholder token
+            // verbatim ({{time}}, ...) in the inline-preview path while
+            // drawCanvas (editor) AND the Rust device path resolved
+            // correctly. paintLayerWithMotion still receives the RAW
+            // layer so motion / blend / opacity metadata stays sourced
+            // from the wire shape; only the text content gets resolved.
+            const resolved = resolveLayerForDraw(layer);
+            const paint = () => paintLayer(ctx, canvas, resolved, /* fillBox */ null);
             if (elapsed === undefined || elapsed === null) {
                 // Static path — current behavior, no motion.
                 paint();

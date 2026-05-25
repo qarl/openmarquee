@@ -129,6 +129,39 @@ describe("drawCanvas — auto_mode dynamic text", () => {
     });
 });
 
+describe("drawTextOnly — auto_mode dynamic text", () => {
+    // Round-15 regression-lock: drawTextOnly used to call paintLayer
+    // directly with the raw wire-shape layer, bypassing the
+    // resolveLayerForDraw step that drawCanvas performs. Result:
+    // auto_mode layers on Text-over-Video slides rendered the
+    // placeholder token verbatim in the inline-preview path while
+    // editor + Rust device paths resolved correctly. Three render
+    // paths diverged. Fix mirrors drawCanvas's resolution step.
+    it("substitutes the formatted time when text_layers[0].auto_mode is 'time'", () => {
+        const canvas = mockCanvas(128, 96);
+        drawTextOnly(canvas, {
+            text_layers: [{
+                text: "ignored",
+                auto_mode: "time",
+                auto_format: "time_hm",
+            }],
+        });
+        const drawnText = canvas._ctx.fillText.mock.calls[0][0];
+        expect(drawnText).toMatch(/^\d\d:\d\d$/);
+    });
+
+    it("falls back to the operator's text when text_layers[0].auto_mode is null", () => {
+        const canvas = mockCanvas(128, 96);
+        drawTextOnly(canvas, {
+            text_layers: [{
+                text: "Hello",
+                auto_mode: null,
+            }],
+        });
+        expect(canvas._ctx.fillText.mock.calls[0][0]).toBe("Hello");
+    });
+});
+
 describe("pickFontSize", () => {
     it("scales with panel height", () => {
         expect(pickFontSize(96)).toBeGreaterThan(pickFontSize(32));
