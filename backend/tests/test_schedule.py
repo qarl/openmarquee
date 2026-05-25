@@ -369,18 +369,18 @@ def test_v1_migration_persists_to_disk(tmp_path: Path):
         assert "playlist_id" in rule
 
 
-def test_v1_migration_drops_unknown_top_level_fields(tmp_path: Path):
-    """The v1→v2 migration explicitly constructs Schedule from named
-    fields (rules / default_playlist_id / tz), so any extra top-level
-    field present in a v1 payload is DROPPED — model_config's
-    extra="allow" preserves extras only through model_validate, not
-    through direct __init__. Pin this behavior so a future refactor
-    that switches the migration to a "preserve-extras-then-validate"
-    shape (or vice-versa) surfaces here as a tripwire.
+def test_v1_migration_preserves_unknown_top_level_fields(tmp_path: Path):
+    """Forward-compat lock: any unknown top-level field in a v1 file
+    must survive migration AND survive the persist-to-disk + reload
+    round-trip. Pydantic's model_config = ConfigDict(extra="allow")
+    preserves extras only via model_validate; the migration now
+    routes them through **extras at Schedule(...) construction time
+    so the extra="allow" promise holds across the v1→v2 boundary.
 
-    If the migration is ever rebuilt to preserve extras (which would
-    make forward-compat extras survive a v1 load + save round-trip),
-    this test should flip to assert survival rather than be deleted.
+    Realistic motivation: a user-edited or downgrade-touched v1 file
+    might carry a future-v3 top-level field. Dropping it on the
+    floor at v1→v2 silently mutates the operator's file in a way
+    that loses data they cared about.
     """
     playlist_storage = PlaylistStorage(tmp_path / "playlist.json")
     schedule_path = tmp_path / "schedules.json"
@@ -391,20 +391,87 @@ def test_v1_migration_drops_unknown_top_level_fields(tmp_path: Path):
                 "rules": [],
                 "default_playlist_name": "default",
                 "future_v3_field": "hypothetical-forward-compat-value",
+                "future_v3_nested": {"hint": "preserve me too"},
             }
         )
     )
     storage = ScheduleStorage(schedule_path, playlist_storage=playlist_storage)
     storage.load()
 
+    # On-disk shape: extras survive AND legacy keys still get cleaned.
     on_disk = json.loads(schedule_path.read_text())
-    # Document the CURRENT behavior: v1 migration drops extras.
-    assert "future_v3_field" not in on_disk, (
-        "v1→v2 migration currently constructs Schedule from named "
-        "fields only; extras are lost. If this assertion flips, the "
-        "migration was rebuilt to preserve extras — update the "
-        "assertion to assert survival."
+    assert on_disk["schema_version"] == 2
+    assert on_disk.get("future_v3_field") == "hypothetical-forward-compat-value"
+    assert on_disk.get("future_v3_nested") == {"hint": "preserve me too"}
+    # Legacy keys still cleaned (the v1->v2 transform converted them).
+    assert "default_playlist_name" not in on_disk
+
+    # Reload round-trip: a SECOND load (now of the v2 file) must still
+    # surface the extras via Schedule.model_validate's extra="allow".
+    storage2 = ScheduleStorage(schedule_path, playlist_storage=playlist_storage)
+    reloaded = storage2.load()
+    # Pydantic v2 with extra="allow" exposes extras via model_extra.
+    assert reloaded.model_extra is not None
+    assert reloaded.model_extra.get("future_v3_field") == (
+        "hypothetical-forward-compat-value"
     )
+    assert reloaded.model_extra.get("future_v3_nested") == {"hint": "preserve me too"}
+
+
+def test_v1_migration_explicit_kwargs_not_shadowed_by_extras_splat(tmp_path: Path):
+    """Carve-out lock: the explicit kwargs we pass to Schedule(...)
+    (rules / default_playlist_id / tz) plus the v1-consumed fields
+    (schema_version / default_playlist_name) must NOT end up in the
+    **extras splat, otherwise we'd get a Python double-kwarg TypeError
+    on `rules` / `tz`, OR carry the legacy `default_playlist_name`
+    forward as an extra on the v2 model, OR re-stamp schema_version=1
+    onto the migrated schedule.
+
+    This test exercises a v1 payload that includes every shadow-risk
+    field PLUS an unknown extra, and asserts: (a) no exception, (b)
+    extras carve-out worked (unknown survives), (c) the v2 model has
+    the correctly-migrated values (not the v1 leftovers).
+    """
+    playlist_storage = PlaylistStorage(tmp_path / "playlist.json")
+    lunch = Playlist(name="lunch")
+    lunch.append(uuid4())
+    playlist_storage.set_by_id(lunch)
+
+    data = {
+        "schema_version": 1,           # v1; default of 2 must win post-migration
+        "rules": [                     # v1 array; replaced by migrated_rules
+            {
+                "name": "weekday lunch",
+                "days": ["mon"],
+                "start_time": "11:00",
+                "end_time": "14:00",
+                "playlist_name": "lunch",
+                "enabled": True,
+            }
+        ],
+        "default_playlist_name": "lunch",  # v1 string; resolved to lunch.id
+        "default_playlist_id": str(uuid4()),  # mixed-shape junk; carve-out drops
+        "tz": "America/New_York",      # passed explicitly; carve-out drops from extras
+        "future_v3_field": "preserve me",
+    }
+    schedule, was_migrated = _coerce_to_schedule(data, playlist_storage)
+    assert was_migrated is True
+    # Migration won: explicit values used, not the v1 leftovers.
+    assert schedule.schema_version == SCHEDULE_SCHEMA_VERSION
+    assert len(schedule.rules) == 1
+    assert schedule.rules[0].playlist_id == lunch.id
+    assert schedule.default_playlist_id == lunch.id  # resolved from name, NOT the junk id
+    assert schedule.tz == "America/New_York"
+    # Extra survived.
+    assert schedule.model_extra is not None
+    assert schedule.model_extra.get("future_v3_field") == "preserve me"
+    # Carve-out worked: the legacy default_playlist_name + mixed-shape
+    # default_playlist_id did NOT survive as extras.
+    assert "default_playlist_name" not in schedule.model_extra
+    assert "default_playlist_id" not in schedule.model_extra
+    assert "rules" not in schedule.model_extra
+    assert "tz" not in schedule.model_extra
+    assert "schema_version" not in schedule.model_extra
 
 
 # --- _resolve_legacy_name (hoisted from _coerce_to_schedule) ---
