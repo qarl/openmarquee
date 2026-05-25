@@ -599,4 +599,96 @@ describe("mountSettings", () => {
             /Couldn't save.*backend rejected/,
         );
     });
+
+    // --- tickNow timer lifecycle (round 11) ---
+    //
+    // Regression-locks the fix in this commit: pre-fix, mountSettings's
+    // setInterval(tickNow, 1000) had no teardown path, and the defensive
+    // `if (!nowValueEl) return;` at the top of tickNow was unreachable
+    // because nowValueEl is captured-once + never reassigned.
+
+    it("destroy() stops the tickNow timer (regression-locks the leak fix)", async () => {
+        vi.useFakeTimers();
+        try {
+            const container = document.createElement("div");
+            // Attach to document so nowValueEl.isConnected === true and
+            // the post-fix `if (!nowValueEl?.isConnected) return;` check
+            // doesn't no-op every tick.
+            document.body.appendChild(container);
+            const handle = mount(container, {
+                fetchSettings: async () => SAMPLE,
+                onSave: vi.fn(),
+            });
+            // Flush refresh()'s microtasks (await fetchSettings()).
+            // advanceTimersByTimeAsync(0) processes the microtask queue
+            // under fake timers.
+            await vi.advanceTimersByTimeAsync(0);
+            await vi.advanceTimersByTimeAsync(0);
+
+            const nowValueEl = container.querySelector(
+                '[data-field="device-now-value"]',
+            );
+            expect(nowValueEl).not.toBeNull();
+            const setSpy = vi.spyOn(nowValueEl, "textContent", "set");
+
+            // Advance well past one tick interval -- tickNow fires
+            // at least once. Don't pin an exact count: under fake
+            // timers the precise fire count can interact with the
+            // mount's own internal queued timers in ways that aren't
+            // the SUT here. The teardown assertion below is what
+            // locks the fix.
+            await vi.advanceTimersByTimeAsync(3500);
+            const beforeStop = setSpy.mock.calls.length;
+            expect(beforeStop).toBeGreaterThan(0);
+
+            // Tear down. Subsequent timer advance must NOT trigger ticks.
+            handle.destroy();
+            await vi.advanceTimersByTimeAsync(3500);
+            expect(setSpy.mock.calls.length).toBe(beforeStop);
+
+            // Idempotency: calling destroy() again is a no-op (no throw).
+            expect(() => handle.destroy()).not.toThrow();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("tickNow no-ops when its element is detached from the DOM", async () => {
+        // Pins the `if (!nowValueEl?.isConnected) return;` semantic.
+        // Before the fix this check was `if (!nowValueEl) return;`
+        // which was unreachable (nowValueEl was captured once at
+        // mount and never reassigned), so a detached element would
+        // silently keep getting textContent writes forever.
+        vi.useFakeTimers();
+        try {
+            const container = document.createElement("div");
+            document.body.appendChild(container);  // attach
+            const handle = mount(container, {
+                fetchSettings: async () => SAMPLE,
+                onSave: vi.fn(),
+            });
+            await vi.advanceTimersByTimeAsync(0);
+            await vi.advanceTimersByTimeAsync(0);
+
+            const nowValueEl = container.querySelector(
+                '[data-field="device-now-value"]',
+            );
+            const setSpy = vi.spyOn(nowValueEl, "textContent", "set");
+
+            // While connected: tick should write.
+            await vi.advanceTimersByTimeAsync(1100);
+            const beforeDetach = setSpy.mock.calls.length;
+            expect(beforeDetach).toBeGreaterThanOrEqual(1);
+
+            // Detach + advance: no further writes (no throw either).
+            container.remove();
+            expect(nowValueEl.isConnected).toBe(false);
+            await vi.advanceTimersByTimeAsync(2200);
+            expect(setSpy.mock.calls.length).toBe(beforeDetach);
+
+            handle.destroy();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
 });
