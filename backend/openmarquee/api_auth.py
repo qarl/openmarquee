@@ -160,9 +160,7 @@ async def set_password(
     # caveat.
     async with _SET_PASSWORD_LOCK:
         if auth.load() is not None:
-            raise HTTPException(
-                status_code=409, detail="password already configured"
-            )
+            raise HTTPException(status_code=409, detail="password already configured")
         state = AuthState(password_hash=hash_password(payload.password))
         token, state = mint_token(state)
         # Persist AFTER mint so the issued_token_hash is on disk before

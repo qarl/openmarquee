@@ -445,9 +445,7 @@ async def test_set_password_concurrent_race_serialized_first_writer_wins(
             persisted = auth.load()
             assert persisted is not None, "winner should have persisted state"
             winner_password = (
-                "operator-password-A"
-                if results[0].status_code == 200
-                else "attacker-password-B"
+                "operator-password-A" if results[0].status_code == 200 else "attacker-password-B"
             )
             loser_password = (
                 "attacker-password-B"
