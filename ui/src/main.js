@@ -753,6 +753,16 @@ async function boot() {
     // FYS bug 7: track the rotation across settings-updated events so a
     // rotation change can trigger the stored-thumbnail bulk re-render.
     let lastKnownRotation = _bootDims.rotation || 0;
+    // Round 30: track the last-mounted dims so settings-updated events
+    // that DON'T change a remount-relevant field (e.g., flock self-sync
+    // toggle) can skip the destructive re-mount. Pre-r30, every
+    // settings-updated wiped the editor / playlist-track / uploader
+    // slots — operator mid-edit who flipped flock sync lost their
+    // in-flight work. The 5 gate fields below match mountDimensionedPanels's
+    // 5 consumed fields (main.js:528-533) + resolvePanelDims's 5
+    // returned fields (main.js:126-132); a future field added to either
+    // site needs to be added to the gate too.
+    let priorDims = _bootDims;
 
     // Slides shell — wraps the 3 child panels under one nav entry. Mounts
     // once: child panels live in stable .tab-pane slots that survive a
@@ -855,8 +865,25 @@ async function boot() {
     // display config.
     document.addEventListener("openmarquee:settings-updated", async () => {
         const dims = await resolvePanelDims();
-        mountDimensionedPanels(dims);
         refreshBrandSignName();
+        // Round 30: gate the destructive re-mount on whether any
+        // remount-relevant field actually changed. Flock self-sync
+        // toggle (and other settings-emitting events that don't touch
+        // display config) dispatch the same event but with identical
+        // dims — pre-r30 the unconditional mount wiped editor /
+        // uploader slots even though nothing relevant had changed.
+        // 5 fields gate the remount; see priorDims declaration above
+        // for the parallel-site future-reader anchor.
+        const dimsChanged =
+            priorDims.width      !== dims.width ||
+            priorDims.height     !== dims.height ||
+            priorDims.rotation   !== dims.rotation ||
+            priorDims.outputMode !== dims.outputMode ||
+            priorDims.brightness !== dims.brightness;
+        if (dimsChanged) {
+            mountDimensionedPanels(dims);
+        }
+        priorDims = dims;
         // FYS bug 7: on a display-rotation change, every stored slide's
         // asset.png is now the wrong orientation for the reshaped
         // dashboard tiles. Bulk re-render them at the new rotation,
