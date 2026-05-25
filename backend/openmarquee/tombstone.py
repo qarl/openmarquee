@@ -94,6 +94,26 @@ class TombstoneStorage:
         self.save(log)
         return stone
 
+    def remove(self, content_id: UUID) -> bool:
+        """Drop a tombstone if present. Returns True if removed, False if
+        absent.
+
+        Round-16 rollback support: delete_content_item adds the tombstone
+        BEFORE the destructive storage.delete + playlist-remove steps
+        (so a tombstone-add failure aborts cleanly without losing the
+        delete intent). When a subsequent step fails, the caller calls
+        remove() to roll the tombstone back so a retry can restart from
+        scratch -- without rollback, the tombstone is committed while
+        the local asset/envelope + playlist refs remain stale forever.
+        """
+        log = self.load()
+        before = len(log.tombstones)
+        log.tombstones = [t for t in log.tombstones if t.content_id != content_id]
+        if len(log.tombstones) == before:
+            return False
+        self.save(log)
+        return True
+
     def list_active(self, *, now: datetime | None = None) -> list[Tombstone]:
         """Return tombstones still within the TTL window. Expired entries
         are filtered out but not pruned from disk — callers that want to

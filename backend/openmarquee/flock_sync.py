@@ -170,8 +170,27 @@ class FlockSync:
                     deleted_at,
                 )
                 return
+            # Round-16 rollback: parallel to api.py delete_content_item.
+            # Tombstone-add BEFORE content.delete protects against a
+            # silent-delete-with-no-record race; if content.delete
+            # fails (NFS hiccup, etc.) after the tombstone landed,
+            # roll the tombstone back so the next ingest pass can
+            # restart cleanly. Pre-r16 the tombstone got committed
+            # while the local content stayed on disk + peers learned
+            # `deleted` via the persisted tombstone on next sync.
             self.tombstones.add(content_id, now=deleted_at)
-            self.content.delete(content_id)
+            try:
+                self.content.delete(content_id)
+            except Exception:
+                try:
+                    self.tombstones.remove(content_id)
+                except Exception:
+                    logger.exception(
+                        "_ingest_delete tombstone rollback failed for %s "
+                        "(original exception below will still propagate)",
+                        content_id,
+                    )
+                raise
         else:
             self.tombstones.add(content_id, now=deleted_at)
 

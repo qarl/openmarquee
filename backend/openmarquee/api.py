@@ -8,6 +8,7 @@ content variants, post-demo.
 import base64
 import io
 import json
+import logging
 from collections.abc import Callable
 from typing import Annotated
 from uuid import UUID
@@ -41,6 +42,8 @@ from openmarquee.flock_sync import FlockSync
 from openmarquee.playlist import PlaylistStorage, list_full_library
 from openmarquee.stream_consumer import validate_stream_url
 from openmarquee.tombstone import TombstoneStorage
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/content", tags=["content"])
 
@@ -1015,8 +1018,32 @@ async def delete_content_item(
     # syncing peers can't learn about (resurrect-on-next-pull). The reverse
     # order is not self-healing.
     tombstones.add(item_id)
-    storage.delete(item_id)
-    _remove_from_playlist(playlist_storage, item_id)
+    # Round-16 rollback: the destructive steps below can each fail
+    # mid-flight (storage.delete on NFS hiccup; _remove_from_playlist
+    # on its own load+save round-trip). Pre-r16 a mid-flight failure
+    # committed the tombstone while leaving the asset / envelope /
+    # playlist refs stale on disk -- the operator's UI retry could
+    # not recover (the next 404-check at the top of this handler
+    # short-circuits "no content item" because storage.exists() may
+    # be partially-true; and peers would learn `deleted` via the
+    # tombstone on next sync while local stayed inconsistent).
+    # Wrap + roll back the tombstone on failure so retry restarts
+    # from a clean slate. Rollback failure is LOGGED but doesn't
+    # shadow the original exception (re-raised below).
+    try:
+        storage.delete(item_id)
+        _remove_from_playlist(playlist_storage, item_id)
+    except Exception:
+        try:
+            tombstones.remove(item_id)
+        except Exception:
+            log.exception(
+                "delete_content_item tombstone rollback failed for %s "
+                "(original exception below will still propagate; this "
+                "log entry records the rollback path's secondary failure)",
+                item_id,
+            )
+        raise
     background.add_task(flock_sync.notify_peers, item_id, "deleted")
 
 

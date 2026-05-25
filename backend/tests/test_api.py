@@ -387,6 +387,74 @@ def test_delete_content_item_404_when_missing(client: TestClient):
     assert response.status_code == 404
 
 
+def test_delete_content_item_rolls_back_tombstone_on_storage_failure(
+    client: TestClient,
+    storage: ContentStorage,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Round-16 correctness regression: if storage.delete raises mid-
+    flight (NFS hiccup, etc.) after the tombstone has already been
+    persisted, the rollback path MUST remove the tombstone so the
+    operator's retry restarts cleanly.
+
+    Pre-fix the tombstone stayed committed -- the local asset/envelope
+    remained on disk AND peers learned `deleted` on next sync via the
+    persisted tombstone. The operator's UI retry could not recover.
+    """
+    from openmarquee.dependencies import (
+        _tombstone_storage_singleton,
+        get_tombstone_storage,
+    )
+    from openmarquee.tombstone import TombstoneStorage
+
+    tombstones = TombstoneStorage(tmp_path / "tombstones.json")
+    _tombstone_storage_singleton.cache_clear()
+    app.dependency_overrides[get_tombstone_storage] = lambda: tombstones
+
+    try:
+        upload = client.post("/api/content/text-slides", json=_upload_payload())
+        item_id = UUID(upload.json()["id"])
+
+        # Pre-condition: no tombstone for this id yet.
+        pre = {t.content_id for t in tombstones.load().tombstones}
+        assert item_id not in pre
+
+        # Force storage.delete to raise mid-flight. This simulates the
+        # NFS-hiccup scenario the rollback path is for.
+        def raising_delete(*args, **kwargs):
+            raise OSError("simulated mid-delete storage failure")
+
+        monkeypatch.setattr(storage, "delete", raising_delete)
+
+        # The handler raises the underlying OSError; FastAPI converts to
+        # 500. (TestClient with raise_server_exceptions=True surfaces
+        # the exception directly; set to False so we observe the 500.)
+        client_no_raise = TestClient(app, raise_server_exceptions=False)
+        response = client_no_raise.delete(f"/api/content/{item_id}")
+        assert response.status_code == 500, (
+            f"expected 500 from the simulated storage failure, got {response.status_code}"
+        )
+
+        # CRITICAL ASSERTION: tombstone was rolled back. Pre-fix this
+        # would FAIL (tombstone was committed before the destructive
+        # steps started, never removed on partial failure).
+        post = {t.content_id for t in tombstones.load().tombstones}
+        assert item_id not in post, (
+            "tombstone must be rolled back when storage.delete fails "
+            "(otherwise peers learn `deleted` while local stays stale)"
+        )
+
+        # Sanity: content still on disk since delete failed.
+        monkeypatch.undo()
+        assert storage.exists(item_id), (
+            "content must remain on disk since the simulated delete failed"
+        )
+    finally:
+        app.dependency_overrides.pop(get_tombstone_storage, None)
+        _tombstone_storage_singleton.cache_clear()
+
+
 # --- POST /api/content/images ---
 
 

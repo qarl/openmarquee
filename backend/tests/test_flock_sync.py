@@ -187,6 +187,50 @@ async def test_ingest_delete_idempotent_when_content_absent(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_ingest_delete_rolls_back_tombstone_on_content_delete_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Round-16 correctness regression: parallel to api.py
+    delete_content_item rollback. If self.content.delete raises mid-
+    flight (NFS hiccup) after the tombstone is committed, _ingest_delete
+    MUST roll the tombstone back so the next ingest pass can restart
+    cleanly. Pre-fix the tombstone stayed committed and the local
+    content stayed on disk; peers learned `deleted` via the persisted
+    tombstone on next sync while local stayed inconsistent.
+    """
+    sync, content, tombstones, _ = _build_sync(
+        tmp_path, httpx.MockTransport(lambda r: httpx.Response(204))
+    )
+    slide = TextSlide(name="will fail mid-delete", text="x")
+    content.save(slide, _make_png_bytes(), updated_at=_NOW - timedelta(hours=1))
+    assert content.exists(slide.id)
+
+    # Pre-condition: no tombstone.
+    assert not any(t.content_id == slide.id for t in tombstones.load().tombstones)
+
+    # Force content.delete to raise mid-flight.
+    def raising_delete(item_id):
+        raise OSError("simulated mid-delete storage failure")
+
+    monkeypatch.setattr(content, "delete", raising_delete)
+
+    # ingest_push -> _ingest_delete should propagate the OSError after
+    # rolling the tombstone back.
+    with pytest.raises(OSError, match="simulated mid-delete"):
+        await sync.ingest_push(slide.id, "deleted", "peer.ts.net", _NOW)
+
+    # CRITICAL ASSERTION: tombstone was rolled back.
+    assert not any(t.content_id == slide.id for t in tombstones.load().tombstones), (
+        "tombstone must be rolled back when content.delete fails"
+    )
+
+    # Sanity: local content still present (the delete failed).
+    monkeypatch.undo()
+    assert content.exists(slide.id), "local content must remain since the simulated delete failed"
+
+
+@pytest.mark.asyncio
 async def test_ingest_delete_skipped_when_local_edit_is_newer(tmp_path: Path):
     # LWW: delete push stamped at T; local edit stamped at T+1. Keep the
     # edit, don't record a tombstone (would re-propagate the stale delete
