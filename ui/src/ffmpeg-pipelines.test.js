@@ -243,3 +243,75 @@ describe("transcodeToH264", () => {
         expect(onProgress).toHaveBeenCalledWith(100);
     });
 });
+
+// --- withProgressListener cleanup contract -------------------------------
+
+describe("withProgressListener cleanup", () => {
+    // Direct test of the wrapper. Uses an inline fakeFf with on/off
+    // recorders rather than the FFmpeg mock because the bug is
+    // invisible through transcodeToH264 -- the mock's exec() is async,
+    // so its throws are never SYNCHRONOUS, and only the sync-throw
+    // path bypasses the listener-detach in the pre-fix shape.
+    function makeFakeFf() {
+        const onCalls = [];
+        const offCalls = [];
+        return {
+            ff: {
+                on(event, listener) { onCalls.push({ event, listener }); },
+                off(event, listener) { offCalls.push({ event, listener }); },
+            },
+            onCalls,
+            offCalls,
+        };
+    }
+
+    it("removes progress listener when fn throws synchronously", async () => {
+        // Regression-lock for the bug fixed alongside this test: the
+        // pre-fix shape `return Promise.resolve(fn()).finally(detach)`
+        // never reached .finally() if fn() threw before being wrapped,
+        // leaving the listener attached on the ffmpeg.wasm singleton
+        // (and pinning the caller's onProgress closure forever).
+        const { withProgressListener } = await import("./ffmpeg-pipelines.js");
+        const { ff, onCalls, offCalls } = makeFakeFf();
+        await expect(
+            withProgressListener(ff, () => {}, () => { throw new Error("boom"); }),
+        ).rejects.toThrow("boom");
+        expect(onCalls).toHaveLength(1);
+        expect(onCalls[0].event).toBe("progress");
+        expect(offCalls).toHaveLength(1);
+        expect(offCalls[0].event).toBe("progress");
+        expect(offCalls[0].listener).toBe(onCalls[0].listener);
+    });
+
+    it("removes progress listener when fn rejects asynchronously", async () => {
+        // Companion lock: the async-rejection path was already correct
+        // pre-fix, but the new try/finally shape must preserve it.
+        const { withProgressListener } = await import("./ffmpeg-pipelines.js");
+        const { ff, onCalls, offCalls } = makeFakeFf();
+        await expect(
+            withProgressListener(ff, () => {}, async () => { throw new Error("async-boom"); }),
+        ).rejects.toThrow("async-boom");
+        expect(offCalls).toHaveLength(1);
+        expect(offCalls[0].listener).toBe(onCalls[0].listener);
+    });
+
+    it("removes progress listener after a successful sync return", async () => {
+        const { withProgressListener } = await import("./ffmpeg-pipelines.js");
+        const { ff, onCalls, offCalls } = makeFakeFf();
+        const result = await withProgressListener(ff, () => {}, () => "done");
+        expect(result).toBe("done");
+        expect(offCalls).toHaveLength(1);
+        expect(offCalls[0].listener).toBe(onCalls[0].listener);
+    });
+
+    it("skips listener attachment entirely when onProgress is null", async () => {
+        // Fast-path preservation. The wrapper short-circuits before
+        // any .on() call so the no-progress caller pays nothing.
+        const { withProgressListener } = await import("./ffmpeg-pipelines.js");
+        const { ff, onCalls, offCalls } = makeFakeFf();
+        const result = await withProgressListener(ff, null, () => "fast-path");
+        expect(result).toBe("fast-path");
+        expect(onCalls).toHaveLength(0);
+        expect(offCalls).toHaveLength(0);
+    });
+});

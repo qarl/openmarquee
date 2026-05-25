@@ -85,7 +85,16 @@ export async function getFfmpeg() {
 // Per-call progress wiring. The ffmpeg.wasm "progress" event handler
 // is global on the instance, so we attach + detach a one-off forwarder
 // for each pipeline call instead of leaking listeners.
-function withProgressListener(ff, onProgress, fn) {
+//
+// Async + try/finally so listener detachment is guaranteed on every
+// exit path -- including a synchronous throw out of fn(). The previous
+// shape used Promise.resolve(fn()).finally(...) which never reached
+// .finally() if fn() threw before being wrapped, leaving the listener
+// attached on the singleton (and pinning the caller's onProgress
+// closure for the singleton's lifetime). Exported for direct test
+// access; the bug is invisible through transcodeToH264 because the
+// mock's exec() is async so its throws are never synchronous.
+export async function withProgressListener(ff, onProgress, fn) {
     if (!onProgress) return fn();
     const listener = ({ progress }) => {
         // ffmpeg.wasm reports progress as a 0..1 fraction that can
@@ -95,9 +104,11 @@ function withProgressListener(ff, onProgress, fn) {
         try { onProgress(pct); } catch { /* never let UI errors abort the pipeline */ }
     };
     ff.on("progress", listener);
-    return Promise.resolve(fn()).finally(() => {
+    try {
+        return await fn();
+    } finally {
         try { ff.off?.("progress", listener); } catch { /* older ffmpeg.wasm exposes no off() */ }
-    });
+    }
 }
 
 /**
