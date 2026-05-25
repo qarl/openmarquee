@@ -608,6 +608,55 @@ function bindTrackDurationButtons(trackEl, onUpdateDuration, refresh, statusEl) 
     }
 }
 
+// Shared thumb-wrap builder for the two playlist-track renderers
+// (renderTrackBlock + renderPalletTile). Returns the thumb-wrap HTML
+// fragment as a string -- callers inline it into their li.innerHTML
+// template and then querySelector(`.${classPrefix}-thumb-wrap`) to
+// pass into attachAutoTextOverlay.
+//
+// Parameterized bits:
+//   classPrefix:   "track-block" | "pallet-tile" -- drives the
+//                  `${prefix}-thumb-wrap` + `${prefix}-thumb` +
+//                  `${prefix}-lock` class names.
+//   locked:        toggles the locked-badge "⚠" span.
+//   cacheBust:     fallback `?v=` for the asset URL when neither
+//                  updated_at nor created_at is set.
+//   draggable:     img-level drag attribute. true (default) leaves
+//                  the attribute off (HTML's img-default is
+//                  draggable=true); false stamps `draggable="false"`
+//                  so the img-level drag-ghost doesn't fight the
+//                  LI-level Sortable.js drag. Track-block omits the
+//                  attribute; pallet-tile sets it to false.
+//   extraChildren: extra HTML to inject INSIDE the thumb-wrap,
+//                  AFTER the locked-badge. Pallet-tile uses this for
+//                  the hover-revealed edit + delete buttons (which
+//                  reference the caller-side escaped name in
+//                  aria-label/title attributes); track-block leaves
+//                  it empty.
+//
+// Sister DRY commits this session: bg-picker.js (7aeec9a),
+// auto-text-overlay::renderOne (8b682b5).
+function renderThumbWrap(item, {
+    classPrefix,
+    locked = false,
+    cacheBust = 0,
+    draggable = true,
+    extraChildren = "",
+}) {
+    const lockedBadge = locked
+        ? `<span class="${classPrefix}-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
+        : "";
+    const draggableAttr = draggable ? "" : ` draggable="false"`;
+    const src = mediaSrc(
+        `/api/content/${item.id}/asset?v=${encodeURIComponent(item.updated_at || item.created_at || cacheBust)}`,
+    );
+    return `<div class="${classPrefix}-thumb-wrap">
+            <img class="${classPrefix}-thumb" alt=""${draggableAttr}
+                 src="${src}">
+            ${lockedBadge}${extraChildren}
+        </div>`;
+}
+
 function renderTrackBlock(
     item,
     entry = { transition: "cut", transition_ms: 500 },
@@ -627,18 +676,11 @@ function renderTrackBlock(
     const durationLabel = Number.isInteger(seconds)
         ? String(seconds)
         : seconds.toFixed(1);
-    const lockedBadge = locked
-        ? `<span class="track-block-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
-        : "";
     li.innerHTML = `
         <div class="track-grip" aria-hidden="true">
             <span class="track-grip-dots">⋮⋮</span>
         </div>
-        <div class="track-block-thumb-wrap">
-            <img class="track-block-thumb" alt=""
-                 src="${mediaSrc(`/api/content/${item.id}/asset?v=${encodeURIComponent(item.updated_at || item.created_at || cacheBust)}`)}">
-            ${lockedBadge}
-        </div>
+        ${renderThumbWrap(item, { classPrefix: "track-block", locked, cacheBust })}
         <div class="track-block-meta">
             <b class="track-block-name">${safeName}</b>
             <span class="track-block-sub">${safeType} · #${String(item.id).slice(0, 6)}</span>
@@ -663,21 +705,21 @@ function renderPalletTile(item, { locked = false, cacheBust = 0 } = {}) {
     li.dataset.id = String(item.id);
     li.dataset.type = item.type;
     const safeName = escapeHtml(item.name || "Untitled");
-    const lockedBadge = locked
-        ? `<span class="pallet-tile-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
-        : "";
     // Pallet cards: thumbnail on top (2:1 aspect, snap target) + name
     // bar below. Edit/delete buttons stay hover-revealed in the corners.
-    li.innerHTML = `
-        <div class="pallet-tile-thumb-wrap">
-            <img class="pallet-tile-thumb" alt="" draggable="false"
-                 src="${mediaSrc(`/api/content/${item.id}/asset?v=${encodeURIComponent(item.updated_at || item.created_at || cacheBust)}`)}">
-            ${lockedBadge}
+    const palletButtons = `
             <button type="button" class="pallet-tile-edit"
                     aria-label="Edit ${safeName}" title="Edit ${safeName}">✎</button>
             <button type="button" class="pallet-tile-delete"
-                    aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>
-        </div>
+                    aria-label="Delete ${safeName}" title="Delete ${safeName}">×</button>`;
+    li.innerHTML = `
+        ${renderThumbWrap(item, {
+            classPrefix: "pallet-tile",
+            locked,
+            cacheBust,
+            draggable: false,
+            extraChildren: palletButtons,
+        })}
         <div class="pallet-tile-name" title="${safeName}">${safeName}</div>
     `;
     attachAutoTextOverlay(li.querySelector(".pallet-tile-thumb-wrap"), item);
