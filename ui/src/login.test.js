@@ -159,4 +159,79 @@ describe("mountLoginForm — submit POST", () => {
         const submit = form.querySelector('button[type="submit"]');
         expect(submit.disabled).toBe(false);
     });
+
+    // Round 22 Bug A regression-locks: silent login-loop when token
+    // can't be persisted. Pre-fix, redirect fired unconditionally on
+    // 200; if storage was unavailable the editor 401'd on its first
+    // authed call and bounced back. Now: formError + no redirect.
+    it("does NOT redirect when storage.setItem throws (quota exceeded / blocked)", async () => {
+        const form = makeFormFixture();
+        const fetchMock = vi.fn().mockResolvedValue(
+            jsonResponse({ token: "1.fake-login-token" }, 200),
+        );
+        const redirect = vi.fn();
+        const storage = {
+            setItem: () => { throw new Error("QuotaExceeded"); },
+            getItem: () => null,
+            removeItem: () => {},
+        };
+        mountLoginForm(form, { fetch: fetchMock, redirect, storage });
+
+        const pw = form.querySelector('input[name="password"]');
+        pw.value = "hunter2hunter";
+        pw.dispatchEvent(new Event("input"));
+        form.dispatchEvent(new Event("submit", { cancelable: true }));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(redirect).not.toHaveBeenCalled();
+        expect(form.querySelector("[data-form-error]").textContent).toMatch(
+            /storage is unavailable/,
+        );
+    });
+
+    it("does NOT redirect when 200 response is missing body.token", async () => {
+        const form = makeFormFixture();
+        const fetchMock = vi.fn().mockResolvedValue(
+            jsonResponse({ /* no token field */ }, 200),
+        );
+        const redirect = vi.fn();
+        const storage = fakeStorage();
+        mountLoginForm(form, { fetch: fetchMock, redirect, storage });
+
+        const pw = form.querySelector('input[name="password"]');
+        pw.value = "hunter2";
+        pw.dispatchEvent(new Event("input"));
+        form.dispatchEvent(new Event("submit", { cancelable: true }));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(redirect).not.toHaveBeenCalled();
+        expect(storage.getItem(TOKEN_KEY)).toBeNull();
+        expect(form.querySelector("[data-form-error]").textContent).toMatch(
+            /storage is unavailable/,
+        );
+    });
+
+    // Round 22 Bug B regression-lock: bfcache / form-restore password
+    // leak. The pw field must be cleared BEFORE the redirect so a
+    // Back-nav repopulate doesn't expose plaintext via the Show toggle.
+    it("clears the password field before redirecting (bfcache leak guard)", async () => {
+        const form = makeFormFixture();
+        const fetchMock = vi.fn().mockResolvedValue(
+            jsonResponse({ token: "1.fake-login-token" }, 200),
+        );
+        let pwAtRedirect = null;
+        const redirect = vi.fn(() => {
+            pwAtRedirect = form.querySelector('input[name="password"]').value;
+        });
+        mountLoginForm(form, { fetch: fetchMock, redirect, storage: fakeStorage() });
+
+        const pw = form.querySelector('input[name="password"]');
+        pw.value = "should-be-wiped";
+        pw.dispatchEvent(new Event("input"));
+        form.dispatchEvent(new Event("submit", { cancelable: true }));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(redirect).toHaveBeenCalledWith("/");
+        expect(pwAtRedirect).toBe("");
+    });
 });
