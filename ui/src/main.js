@@ -95,7 +95,9 @@ const SECTIONS = [
 ];
 const DEFAULT_SECTION = "slides";
 
-async function resolvePanelDims() {
+// Exported for unit-test access; the function is a small pure-ish
+// helper otherwise consumed only by boot() in this file.
+export async function resolvePanelDims() {
     try {
         const settings = await getSettings();
         // Parity follow-up (2026-05-20): publish the sign's
