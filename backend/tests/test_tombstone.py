@@ -64,6 +64,72 @@ def test_list_active_filters_out_expired(tmp_path: Path):
     assert {t.content_id for t in active} == {fresh}
 
 
+def test_naive_deleted_at_coerces_to_utc_and_list_active_doesnt_raise(
+    tmp_path: Path,
+):
+    """Round-24 correctness regression: a naive (no-offset) deleted_at
+    in tombstones.json must coerce to aware UTC at load time.
+
+    Pre-fix the bare `datetime` field accepted naive ISO without
+    raising; list_active's `t.deleted_at >= cutoff` then raised
+    TypeError("can't compare offset-naive and offset-aware
+    datetimes") since cutoff is aware UTC. Operator scenario:
+    restored tombstones.json from a backup tool that strips offsets,
+    OR hand-edited, OR imported from an older/peer device that
+    wrote naive. Every subsequent sync round + prune call 500'd
+    silently.
+
+    Test: hand-write a tombstones.json with a NAIVE deleted_at;
+    load + list_active; assert no exception + the value is treated
+    as aware-UTC.
+    """
+    path = tmp_path / "tombstones.json"
+    cid = uuid4()
+    naive_iso = "2026-04-24T12:00:00"  # NO offset
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "tombstones": [
+                    {"content_id": str(cid), "deleted_at": naive_iso},
+                ],
+            }
+        )
+    )
+
+    storage = TombstoneStorage(path, ttl_days=30)
+    log = storage.load()
+    # Load succeeded (no ValidationError → quarantine).
+    assert len(log.tombstones) == 1
+    # Coerced to aware UTC at the field validator.
+    loaded_ts = log.tombstones[0].deleted_at
+    assert loaded_ts.tzinfo is not None, (
+        "naive deleted_at must be coerced to aware (else list_active "
+        "raises TypeError on the aware-vs-naive compare)"
+    )
+    assert loaded_ts == datetime(2026, 4, 24, 12, 0, 0, tzinfo=UTC), (
+        "coercion must interpret naive ISO as UTC (the only safe "
+        "default since the file is always WRITTEN as UTC by save())"
+    )
+
+    # CRITICAL ASSERTION: list_active doesn't raise. Pre-fix this
+    # raised TypeError("can't compare offset-naive and offset-aware
+    # datetimes"), 500'ing every sync round indefinitely.
+    now = datetime(2026, 4, 25, tzinfo=UTC)  # 1 day after the delete
+    active = storage.list_active(now=now)  # would raise pre-fix
+    assert {t.content_id for t in active} == {cid}, (
+        "freshly-coerced tombstone within TTL window must be active"
+    )
+
+    # CRITICAL ASSERTION 2: prune_expired also doesn't raise.
+    # Pre-fix this hit the same TypeError. Use a "now" past the TTL
+    # so the coerced tombstone should actually prune (confirms both
+    # the no-raise path AND the comparison-uses-coerced-tz behavior).
+    far_future = datetime(2026, 6, 1, tzinfo=UTC)  # > 30 days after
+    removed = storage.prune_expired(now=far_future)
+    assert removed == 1, "expired (coerced-tz) tombstone must prune"
+
+
 def test_prune_expired_removes_from_disk(tmp_path: Path):
     storage = TombstoneStorage(tmp_path / "t.json", ttl_days=30)
     now = datetime(2026, 4, 24, tzinfo=UTC)

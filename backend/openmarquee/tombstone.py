@@ -29,7 +29,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from openmarquee._atomic import atomic_write_text
 from openmarquee._storage_recovery import quarantine_corrupt_file
@@ -51,6 +51,36 @@ class Tombstone(BaseModel):
 
     content_id: UUID
     deleted_at: datetime
+
+    @field_validator("deleted_at", mode="after")
+    @classmethod
+    def _ensure_aware_utc(cls, value: datetime) -> datetime:
+        """Round-24 correctness fix: coerce naive datetimes to aware
+        UTC.
+
+        TombstoneStorage.save() always writes aware UTC (model_dump_
+        json on aware datetime). So a naive deleted_at can only land
+        in tombstones.json via external corruption: restore from a
+        backup tool that strips offsets, operator hand-edit, or
+        import from an older/peer device that wrote naive.
+
+        Pre-fix the bare `datetime` field accepted naive ISO without
+        raising, so quarantine_corrupt_file never triggered. Then
+        list_active / prune_expired's `t.deleted_at >= cutoff` (cutoff
+        is aware UTC from `_now() - timedelta(...)`) raised
+        TypeError("can't compare offset-naive and offset-aware
+        datetimes"). Every subsequent sync round AND prune call 500'd
+        silently. Deletions stopped propagating; the log grew
+        unbounded until a human investigated.
+
+        Coerce-to-UTC is safer than raising -- survives the data and
+        keeps sync working. Reasonable interpretation: "if you wrote
+        a naive ISO, you meant UTC." If the value is already aware,
+        pass through unchanged (no tz conversion).
+        """
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value
 
 
 class TombstoneLog(BaseModel):
