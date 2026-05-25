@@ -275,6 +275,62 @@ describe("paintPatternOnCanvas", () => {
         expect(ctx._gradient.addColorStop).toHaveBeenNthCalledWith(2, 1, "#FFFFFF");
     });
 
+    it("gradient at angleDeg=0: line goes BOTTOM→TOP, matching CSS (a@bottom, b@top)", () => {
+        // Round-19 regression-lock for the gradient direction fix
+        // (`dy = -Math.cos(rad)`). At density=0 the angleDeg is
+        // round(lerp(0, 270, 0)) = 0deg. Per CSS spec,
+        // `linear-gradient(0deg, a, b)` puts a at BOTTOM, b at TOP
+        // (gradient line points up). createLinearGradient endpoints
+        // must therefore be (cx, BOTTOM)→(cx, TOP) so stop 0 (=a)
+        // lands at the bottom and stop 1 (=b) at the top.
+        //
+        // Pre-fix (dy = +cos(rad)): the line went (cx, TOP)→(cx,
+        // BOTTOM), putting a@TOP/b@BOTTOM. The CSS picker thumbnail
+        // showed the opposite of the canvas slide → operator-visible
+        // WYSIWYG break.
+        const ctx = makeCtx();
+        paintPatternOnCanvas(ctx, 200, 100, "gradient", "#AA0000", "#0000BB", 0);
+        const [x0, y0, x1, y1] = ctx.createLinearGradient.mock.calls[0];
+        // Vertical line through center: x0 === x1 === 100.
+        expect(x0).toBeCloseTo(100, 5);
+        expect(x1).toBeCloseTo(100, 5);
+        // y0 (stop 0 / a) at BOTTOM (y=100), y1 (stop 1 / b) at TOP (y=0).
+        expect(y0).toBeCloseTo(100, 5);
+        expect(y1).toBeCloseTo(0, 5);
+    });
+
+    it("rays at slices=4: ctx.arc starts at 12 o'clock (-π/2 offset), matching CSS conic", () => {
+        // Round-19 regression-lock for the rays angle-origin fix.
+        // CSS `conic-gradient(from 0deg)` starts the first slice at
+        // 12 o'clock and sweeps clockwise. Canvas ctx.arc measures
+        // from +x (3 o'clock); without the -π/2 offset, slice 0
+        // would start at 3 o'clock, rotating the pattern 90° from
+        // CSS.
+        //
+        // At density=0, slices = 2*round(lerp(2, 24, 0)) = 4 total.
+        // The paint loop fills the ODD-indexed slices only (1 and
+        // 3); slices 0 and 2 stay color_a from the initial fillRect.
+        // Each step = 2π/4 = π/2. With angleOffset = -π/2:
+        //   i=1: a0=-π/2 + π/2 = 0 (3 o'clock); a1=-π/2 + π = π/2 (6 o'clock)
+        //   i=3: a0=-π/2 + 3π/2 = π (9 o'clock); a1=-π/2 + 2π = 3π/2 (12 o'clock)
+        // Equivalently in CSS terms: slice 0 (a) spans 12→3 o'clock;
+        // slice 1 (b) 3→6; slice 2 (a) 6→9; slice 3 (b) 9→12. The
+        // -π/2 offset is what makes "slice 0 starts at 12" hold.
+        const ctx = makeCtx();
+        paintPatternOnCanvas(ctx, 200, 200, "rays", "#000000", "#FFFFFF", 0);
+        expect(ctx.arc).toHaveBeenCalledTimes(2);
+        const step = Math.PI / 2;
+        const offset = -Math.PI / 2;
+        // i=1: a0 = offset + 1*step = 0; a1 = offset + 2*step = π/2.
+        const [, , , a0_1, a1_1] = ctx.arc.mock.calls[0];
+        expect(a0_1).toBeCloseTo(offset + 1 * step, 5);
+        expect(a1_1).toBeCloseTo(offset + 2 * step, 5);
+        // i=3: a0 = offset + 3*step = π; a1 = offset + 4*step = 3π/2.
+        const [, , , a0_3, a1_3] = ctx.arc.mock.calls[1];
+        expect(a0_3).toBeCloseTo(offset + 3 * step, 5);
+        expect(a1_3).toBeCloseTo(offset + 4 * step, 5);
+    });
+
     it("dots path: arc() called for every dot in the grid", () => {
         // d=0.5 (curved 0.25) -> tile=37. Canvas 100x100, dots
         // stride starts at tile/2=18 -> grid positions 18, 55, 92
