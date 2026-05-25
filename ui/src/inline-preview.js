@@ -614,7 +614,11 @@ export function mountInlinePreview(container, options) {
             } else if (slot.transition === "blinds") {
                 // Venetian-blind reveal. Multi-slat clip path —
                 // one rect per slat, growing from each slat's
-                // midline outward. Mirrors playback.py::_blinds.
+                // midline outward. Mirrors renderer/src/hdmi_logic
+                // .rs::FS_BLINDS which fixes n_slats = 16.0; this
+                // Canvas2D path uses the same constant so phone
+                // preview and HDMI/HUB75 output render the same
+                // shape (per feedback_pixel_perfect_renderer_parity).
                 const w = canvas.width;
                 const h = canvas.height;
                 if (h < 4) {
@@ -622,7 +626,7 @@ export function mountInlinePreview(container, options) {
                     drawSlot(timeline[nextIdx]);
                     ctx.globalAlpha = 1;
                 } else {
-                    const nSlats = Math.max(2, Math.floor(h / 8));
+                    const nSlats = 16;
                     const slatH = h / nSlats;
                     ctx.save();
                     ctx.beginPath();
