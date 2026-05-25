@@ -148,6 +148,17 @@ export function mountInlinePreview(container, options) {
     const previewBrightness = PREVIEW_APPLIES_BRIGHTNESS.has(outputMode)
         ? Math.max(0, Math.min(1, brightness / 100))
         : 1.0;
+    // Reusable drawCanvas opts bag for drawTextSlideAnimated (called
+    // per-frame at 60Hz during playback via renderOnce → drawSlot).
+    // brightness + gamma are const for the lifetime of this mount;
+    // only elapsed_s changes per call. drawCanvas reads opts
+    // synchronously (rasterize.js:111+502+563-565) and doesn't retain
+    // the reference, so mutate-in-place is safe.
+    const drawCanvasOpts = {
+        elapsed_s: 0,
+        brightness: previewBrightness,
+        gamma: previewGamma,
+    };
 
     // Playlist → ranged timeline. Each entry is { item, startSec, endSec,
     // transition, transition_ms }.
@@ -892,11 +903,8 @@ export function mountInlinePreview(container, options) {
             }
         }
         const state = stateFromItem(item, resolvedBg);
-        drawCanvas(sampler, state, {
-            elapsed_s,
-            brightness: previewBrightness,
-            gamma: previewGamma,
-        });
+        drawCanvasOpts.elapsed_s = elapsed_s;
+        drawCanvas(sampler, state, drawCanvasOpts);
 
         const srcData = samplerCtx.getImageData(0, 0, srcW, srcH);
         drawForSkin(skin, canvasCtx, canvas.width, canvas.height, srcData, srcW, srcH);

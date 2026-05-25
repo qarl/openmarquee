@@ -527,6 +527,12 @@ export function mountEditor(
         const doc = canvas.ownerDocument;
         if (!doc || !doc.contains(canvas)) return;
         motionT0 = performance.now();
+        // Reusable opts bag — drawCanvas reads opts.elapsed_s
+        // synchronously (rasterize.js:111 + 502) and doesn't retain
+        // the reference, so mutating the field instead of allocating
+        // a fresh object each frame is safe and saves ~60
+        // short-lived object allocs/sec while motion is running.
+        const tickOpts = { elapsed_s: 0 };
         const tick = (now) => {
             // Same guard at tick time — covers the case where the
             // editor was unmounted (DOM detached) between scheduling
@@ -540,8 +546,8 @@ export function mountEditor(
                 drawCanvas(canvas, state); // settle on a static final frame
                 return;
             }
-            const elapsed = (now - motionT0) / 1000;
-            drawCanvas(canvas, state, { elapsed_s: elapsed });
+            tickOpts.elapsed_s = (now - motionT0) / 1000;
+            drawCanvas(canvas, state, tickOpts);
             motionRafId = requestAnimationFrame(tick);
         };
         motionRafId = requestAnimationFrame(tick);
