@@ -713,6 +713,77 @@ async def test_pull_from_peer_tombstone_loop_continues_past_per_entry_failure(
 
 
 @pytest.mark.asyncio
+async def test_pull_from_peer_isolates_items_behind_stamp_failure_from_sync_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Round-22 correctness regression: items_behind is a UI-cosmetic
+    stat (flock-panel badge). Pre-r22 a transient _record_items_behind
+    write failure (NFS hiccup on flock.json, disk full, fsync) raised
+    BEFORE the content-fetch + tombstone loops ran -- a stat-write
+    fault blocked all content reconciliation indefinitely. Now the
+    stamp is wrapped in try/except + logged; sync work continues.
+
+    Test: manifest carries 1 content entry + 1 tombstone; monkeypatch
+    _record_items_behind to raise OSError; call pull_from_peer; assert
+    BOTH the content fetch AND the tombstone application still ran
+    (proving the load-bearing loops survive the stat-write fault).
+    """
+    cid_to_pull = uuid4()
+    cid_to_tomb = uuid4()
+    remote_ts = datetime.now(UTC) - timedelta(days=1)
+    delete_at = datetime.now(UTC) - timedelta(days=2)
+
+    fetched_asset = _make_png_bytes((50, 100, 150))
+    remote_slide = TextSlide(id=cid_to_pull, name="Pull me", text="x")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url.endswith("/api/flock/manifest"):
+            return httpx.Response(
+                200,
+                json=_manifest_with(
+                    (cid_to_pull, remote_ts),
+                    tombstones=((cid_to_tomb, delete_at),),
+                ),
+            )
+        if url.endswith(f"/api/content/{cid_to_pull}"):
+            return httpx.Response(
+                200,
+                json=json.loads(remote_slide.model_dump_json()),
+            )
+        if url.endswith(f"/api/content/{cid_to_pull}/asset"):
+            return httpx.Response(200, content=fetched_asset)
+        return httpx.Response(404)
+
+    sync, content, tombstones, _ = _build_sync(tmp_path, httpx.MockTransport(handler))
+
+    # Force the items_behind stamp to fail.
+    def raising_stamp(peer_address, count):
+        raise OSError("simulated flock.json write failure")
+
+    monkeypatch.setattr(sync, "_record_items_behind", raising_stamp)
+
+    # pull_from_peer should NOT propagate -- the stamp failure must
+    # be caught by the r22 guard, and the content-fetch + tombstone
+    # loops must still run.
+    await sync.pull_from_peer("peer.ts.net")
+
+    # CRITICAL ASSERTIONS: load-bearing sync work happened despite
+    # the cosmetic stat failure.
+    assert content.exists(cid_to_pull), (
+        "content-fetch loop must run even when items_behind stamp fails "
+        "(pre-r22: stamp failure aborted pull_from_peer before reaching "
+        "this loop)"
+    )
+    persisted_tombs = {t.content_id for t in tombstones.load().tombstones}
+    assert cid_to_tomb in persisted_tombs, (
+        "tombstone loop must run even when items_behind stamp fails "
+        "(pre-r22: stamp failure aborted before reaching this loop too)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_pull_from_peer_skips_when_local_newer(tmp_path: Path):
     cid = uuid4()
     remote_ts = datetime(2026, 4, 10, tzinfo=UTC)

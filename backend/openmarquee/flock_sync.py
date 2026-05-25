@@ -472,7 +472,20 @@ class FlockSync:
             missing = sum(
                 1 for entry in entries if not self.content.exists(UUID(entry["content_id"]))
             )
-            self._record_items_behind(peer_address, missing)
+            # Round-22 isolation: _record_items_behind writes flock.json
+            # (load + update + atomic save). Pre-r22 a transient write
+            # failure (NFS hiccup, disk full, fsync) raised here and
+            # escaped pull_from_peer BEFORE the content-fetch loop AND
+            # the tombstone loop ran this tick. items_behind is a UI-
+            # cosmetic stat in the Flock panel; the content-fetch +
+            # tombstone-apply loops are the load-bearing work. A
+            # cosmetic stat failure must not block the actual sync.
+            # PullWorker retries on the next interval, so a one-tick
+            # skip of the stat update is harmless.
+            try:
+                self._record_items_behind(peer_address, missing)
+            except Exception:
+                logger.exception("pull %s: items_behind stamp failed", peer_address)
 
             for entry in entries:
                 cid = UUID(entry["content_id"])
