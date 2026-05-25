@@ -524,7 +524,7 @@ describe("mountEditor — submit flow", () => {
         expect(onSave).toHaveBeenCalledOnce();
     });
 
-    it("surfaces the error message when onSave rejects", async () => {
+    it("surfaces the error message when onSave rejects (status + flush rejects, r20)", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");
         const onSave = vi.fn().mockRejectedValue(new Error("backend boom"));
@@ -534,7 +534,9 @@ describe("mountEditor — submit flow", () => {
         const textEl = container.querySelector(".field-text");
         textEl.value = "Hi";
         textEl.dispatchEvent(new Event("input"));
-        await handle.flushAutoSave();
+        // r20: flush now rejects on save error rather than resolving
+        // silently. Both observables regression-locked.
+        await expect(handle.flushAutoSave()).rejects.toThrow("backend boom");
 
         const status = container.querySelector(".editor-status").textContent;
         expect(status).toContain("backend boom");

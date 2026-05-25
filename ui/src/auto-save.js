@@ -40,12 +40,25 @@ const DEFAULT_DEBOUNCE_MS = 600;
  *   so a known-invalid form never round-trips through the server. Distinct
  *   from `canSave` (silent suppression for "nothing to do").
  * @returns {{ kick: () => void, flush: () => Promise<void>, cancel: () => void }}
+ *   `flush()` drains pending + in-flight saves and REJECTS with the
+ *   most recent save error if any drained attempt failed (r20). It
+ *   consumes the error on each call, so a second flush after a
+ *   successful retry won't re-throw a stale failure.
  */
 export function attachAutoSave(form, { save, status, debounceMs, canSave, validate }) {
     const wait = Number.isFinite(debounceMs) ? debounceMs : DEFAULT_DEBOUNCE_MS;
     let timer = null;
     let pending = false;
     let inFlight = null;
+    // Last error from the most recent save() attempt. Cleared on a
+    // subsequent successful save. flush() surfaces this on its
+    // resolved-or-rejected boundary so callers awaiting flush get a
+    // truthful "did the work persist" signal (pre-r20 the IIFE
+    // swallowed errors and flush always resolved — operator scenario:
+    // beforeunload awaits flush, PUT 500s, navigation proceeds,
+    // edit lost). flush() consumes the value on each call so a
+    // follow-up flush doesn't double-surface a stale error.
+    let lastError = null;
 
     // FYS bug 6 — saving is implicit: no "Saving…" / "Saved"
     // confirmation copy on any panel (qarl: no save-confirmation
@@ -89,8 +102,17 @@ export function attachAutoSave(form, { save, status, debounceMs, canSave, valida
             try {
                 await save();
                 setStatus("saved");
+                // Success consumes any prior error so the next flush
+                // doesn't surface a stale failure from a previous
+                // attempt that was retried (and succeeded).
+                lastError = null;
             } catch (err) {
                 setStatus("error", `Couldn't save · ${err?.message || err}`);
+                lastError = err;
+                // Don't rethrow here — preserves the per-debounce-tick
+                // observer contract that pre-r20 callers (just the
+                // status pill) relied on. flush() surfaces the error
+                // when it's the right boundary to do so.
             } finally {
                 inFlight = null;
                 if (pending) {
@@ -126,7 +148,16 @@ export function attachAutoSave(form, { save, status, debounceMs, canSave, valida
                 await attempt();
             }
             if (inFlight) await inFlight;
-            if (!timer && !inFlight && !pending) return;
+            if (!timer && !inFlight && !pending) break;
+        }
+        // Surface any save error from the drained attempts so callers
+        // awaiting flush() get a truthful "did the work persist?"
+        // signal. Consume the value so a follow-up flush after a
+        // successful retry doesn't double-throw a stale error.
+        if (lastError) {
+            const err = lastError;
+            lastError = null;
+            throw err;
         }
     }
 
