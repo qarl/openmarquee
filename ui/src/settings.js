@@ -567,21 +567,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                         // inline rather than redirecting to /login.html.
                         skipAuth401Redirect: true,
                     });
-                    if (response.status === 401) {
-                        errorEl.textContent = "Incorrect current password.";
-                        saveBtn.disabled = false;
-                        return;
-                    }
-                    if (!response.ok) {
-                        let detail = `HTTP ${response.status}`;
-                        try {
-                            const body = await response.json();
-                            if (typeof body.detail === "string") detail = body.detail;
-                        } catch { /* ignore */ }
-                        errorEl.textContent = detail;
-                        saveBtn.disabled = false;
-                        return;
-                    }
+                    if (!(await handleSecretResponseError(response, errorEl, saveBtn))) return;
                     // 200: refresh the settings panel so the indicator
                     // updates to reflect the new redacted state.
                     close();
@@ -665,21 +651,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                     // surface inline rather than bouncing to /login.
                     skipAuth401Redirect: true,
                 });
-                if (response.status === 401) {
-                    errorEl.textContent = "Incorrect current password.";
-                    saveBtn.disabled = false;
-                    return;
-                }
-                if (!response.ok) {
-                    let detail = `HTTP ${response.status}`;
-                    try {
-                        const body = await response.json();
-                        if (typeof body.detail === "string") detail = body.detail;
-                    } catch { /* ignore */ }
-                    errorEl.textContent = detail;
-                    saveBtn.disabled = false;
-                    return;
-                }
+                if (!(await handleSecretResponseError(response, errorEl, saveBtn))) return;
                 // 200: backend bumped token_version + returned a new
                 // token. Stash it so the next apiFetch carries it
                 // instead of the now-invalidated old one.
@@ -1066,6 +1038,33 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             }
         },
     };
+}
+
+// Shared response-error handler for the two secret-bearing save flows
+// (wireSecretFields + wireChangePasswordCard). Both endpoints use
+// skipAuth401Redirect, so 401 here means "wrong current_password" not
+// "session expired" — surface inline with a specific message.
+//
+// Returns true if the response was OK (caller proceeds); false if an
+// error was surfaced inline (caller returns). The caller pattern is:
+//   if (!(await handleSecretResponseError(response, errorEl, saveBtn))) return;
+async function handleSecretResponseError(response, errorEl, saveBtn) {
+    if (response.status === 401) {
+        errorEl.textContent = "Incorrect current password.";
+        saveBtn.disabled = false;
+        return false;
+    }
+    if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        try {
+            const body = await response.json();
+            if (typeof body.detail === "string") detail = body.detail;
+        } catch { /* ignore */ }
+        errorEl.textContent = detail;
+        saveBtn.disabled = false;
+        return false;
+    }
+    return true;
 }
 
 function populateTimezoneSelect(selectEl) {
