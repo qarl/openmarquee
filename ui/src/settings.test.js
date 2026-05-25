@@ -600,6 +600,55 @@ describe("mountSettings", () => {
         );
     });
 
+    // --- populateWifiScan operator-visible failure (round 13) ---
+    //
+    // Regression-locks: catch path (apiFetch threw) AND !res.ok early-
+    // return path (apiFetch resolved with a non-2xx). Both paths
+    // pre-fix went silent; operator saw the "(type manually)" SSID
+    // picker fallback with no idea WHY. Sibling of bg-picker's
+    // statusEl pattern (7aeec9a).
+
+    it("populateWifiScan surfaces network failure to .settings-wifi-status", async () => {
+        const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(
+            new Error("network drop"),
+        );
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        await tick();
+        const status = container.querySelector(".settings-wifi-status");
+        expect(status).not.toBeNull();
+        expect(status.hidden).toBe(false);
+        expect(status.textContent).toContain("WiFi scan unavailable");
+        expect(status.textContent).toContain("network drop");
+        fetchSpy.mockRestore();
+    });
+
+    it("populateWifiScan surfaces non-2xx HTTP responses too", async () => {
+        // Covers the `if (!res.ok) return;` early-return path that
+        // also went silent pre-fix. Real-world triggers: 401 auth-
+        // required, 403 permission denied, 500 backend exception,
+        // 503 wifi card unavailable.
+        const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+            new Response("", { status: 503 }),
+        );
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        await tick();
+        const status = container.querySelector(".settings-wifi-status");
+        expect(status.hidden).toBe(false);
+        expect(status.textContent).toContain("WiFi scan unavailable");
+        expect(status.textContent).toContain("503");
+        fetchSpy.mockRestore();
+    });
+
     // --- tickNow timer lifecycle (round 11) ---
     //
     // Regression-locks the fix in this commit: pre-fix, mountSettings's
