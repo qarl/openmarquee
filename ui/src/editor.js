@@ -439,7 +439,7 @@ export function mountEditor(
     const DRAG_THRESHOLD_PX = 5;
 
     function activeLayer() {
-        return state.layers[state.activeLayerIndex] || state.layers[0];
+        return state.layers[state.activeLayerIndex] ?? null;
     }
 
     function positionBoxOverlay() {
@@ -593,6 +593,7 @@ export function mountEditor(
         const dx = dxPx / activeDrag.canvasW;
         const dy = dyPx / activeDrag.canvasH;
         const layer = activeLayer();
+        if (!layer) return;
         layer.box = applyHandleDrag(activeDrag.startBox, activeDrag.mode, dx, dy);
         positionBoxOverlay();
         drawCanvas(canvas, state);
