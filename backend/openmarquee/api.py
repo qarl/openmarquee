@@ -1081,21 +1081,32 @@ async def delete_content_item(
     # syncing peers can't learn about (resurrect-on-next-pull). The reverse
     # order is not self-healing.
     tombstones.add(item_id)
-    # Round-16 rollback: the destructive steps below can each fail
-    # mid-flight (storage.delete on NFS hiccup; _remove_from_playlist
-    # on its own load+save round-trip). Pre-r16 a mid-flight failure
-    # committed the tombstone while leaving the asset / envelope /
-    # playlist refs stale on disk -- the operator's UI retry could
-    # not recover (the next 404-check at the top of this handler
-    # short-circuits "no content item" because storage.exists() may
-    # be partially-true; and peers would learn `deleted` via the
-    # tombstone on next sync while local stayed inconsistent).
-    # Wrap + roll back the tombstone on failure so retry restarts
-    # from a clean slate. Rollback failure is LOGGED but doesn't
-    # shadow the original exception (re-raised below).
+    # Round-28 asymmetric rollback: split the two destructive steps
+    # so the tombstone rollback only fires on storage.delete failure
+    # -- NOT on playlist-update failure. Rationale (r16 fix-of-fix):
+    #
+    # storage.delete failure: content still on disk. Rolling back
+    #   the tombstone is correct -- operator's retry sees no content
+    #   removed + no tombstone, can restart from scratch.
+    #
+    # playlist-update failure (AFTER storage.delete succeeded):
+    #   content is GONE. The tombstone has already done its job
+    #   (peer-sync will propagate the deletion next round). Rolling
+    #   back the tombstone here would be WORSE than pre-r16: content
+    #   gone + tombstone gone + playlist references dead UUID + peers
+    #   NEVER learn about the deletion. Operator's retry hits the
+    #   `if not storage.exists(item_id): raise 404` short-circuit at
+    #   the top of this handler and the dangling playlist ref is
+    #   never cleaned.
+    #
+    # So: rollback on storage.delete failure; log + return 200 on
+    # playlist-update failure. The dangling playlist ref is cleaned
+    # at the next operator-side prune (lifespan startup) or the next
+    # edit through the playlist. r16's single-try-block was caught by
+    # QA's deep-audit of today's commits; r16's test only mocked
+    # storage.delete and missed the second-step path.
     try:
         storage.delete(item_id)
-        playlist_storage.remove_item_from_default(item_id)
     except Exception:
         try:
             tombstones.remove(item_id)
@@ -1107,6 +1118,24 @@ async def delete_content_item(
                 item_id,
             )
         raise
+
+    # storage.delete succeeded -- content is gone. From here on,
+    # tombstone STAYS regardless of subsequent failures.
+    try:
+        playlist_storage.remove_item_from_default(item_id)
+    except Exception:
+        log.exception(
+            "delete_content_item: playlist update failed for %s "
+            "(content already deleted from disk; tombstone persists "
+            "so peer-sync will propagate the deletion). Dangling "
+            "playlist reference will be cleaned on the next operator-"
+            "side prune (lifespan startup) or the next playlist edit. "
+            "Returning 200 because the deletion is otherwise complete.",
+            item_id,
+        )
+        # DON'T raise -- content is gone, tombstone is set, peers will
+        # learn. The dangling playlist ref is recoverable; rolling back
+        # the tombstone here would lose the deletion silently.
     background.add_task(flock_sync.notify_peers, item_id, "deleted")
 
 

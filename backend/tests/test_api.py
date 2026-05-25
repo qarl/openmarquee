@@ -570,6 +570,90 @@ def test_delete_content_item_rolls_back_tombstone_on_storage_failure(
         _tombstone_storage_singleton.cache_clear()
 
 
+def test_delete_content_item_keeps_tombstone_when_playlist_update_fails(
+    client: TestClient,
+    storage: ContentStorage,
+    playlist_storage: PlaylistStorage,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Round-28 correctness regression (the path r16 missed). When
+    storage.delete SUCCEEDS but the subsequent playlist-update FAILS,
+    the tombstone MUST stay on disk (don't roll it back).
+
+    Rationale: storage.delete succeeded -> content is gone from disk
+    -> peer-sync MUST learn about the deletion via the tombstone,
+    otherwise peers re-propagate the content. Rolling back the
+    tombstone in this path (r16's behavior) would silently lose the
+    deletion: content gone + tombstone gone + dangling playlist ref +
+    peer-sync NEVER hears about it.
+
+    Operator-visible after the fix: 204 (deletion is otherwise
+    complete), dangling playlist ref logged + cleaned on next prune.
+    Pre-r28 (r16's single try-block): 500 + tombstone rolled back +
+    peers re-propagate the content + operator's retry hits 404 (the
+    handler's `if not storage.exists` short-circuit) -- dangling ref
+    never cleaned.
+
+    Test mocks playlist_storage.remove_item_from_default to raise;
+    asserts 204 returned + tombstone STAYS (so peer-sync can
+    propagate).
+    """
+    from openmarquee.dependencies import (
+        _tombstone_storage_singleton,
+        get_tombstone_storage,
+    )
+    from openmarquee.tombstone import TombstoneStorage
+
+    tombstones = TombstoneStorage(tmp_path / "tombstones.json")
+    _tombstone_storage_singleton.cache_clear()
+    app.dependency_overrides[get_tombstone_storage] = lambda: tombstones
+
+    try:
+        upload = client.post("/api/content/text-slides", json=_upload_payload())
+        item_id = UUID(upload.json()["id"])
+        assert storage.exists(item_id)
+
+        # Pre-condition: no tombstone for this id yet.
+        pre = {t.content_id for t in tombstones.load().tombstones}
+        assert item_id not in pre
+
+        # Force playlist-update to raise mid-flight. storage.delete
+        # will succeed first; then this fires.
+        def raising_remove(item_id_arg):
+            raise OSError("simulated NFS hiccup on playlist update")
+
+        monkeypatch.setattr(playlist_storage, "remove_item_from_default", raising_remove)
+
+        response = client.delete(f"/api/content/{item_id}")
+        # r28 contract: 204 because the deletion is otherwise complete
+        # (content gone + tombstone set + peers will learn). The
+        # dangling playlist ref is recoverable on next prune.
+        assert response.status_code == 204, (
+            f"expected 204 (deletion otherwise complete), got {response.status_code}"
+        )
+
+        # CRITICAL ASSERTION: tombstone STAYS so peer-sync propagates
+        # the deletion. Pre-r28 (r16's single try-block) the rollback
+        # would have removed the tombstone here -- content gone,
+        # tombstone gone, peer-sync silently loses the deletion.
+        post = {t.content_id for t in tombstones.load().tombstones}
+        assert item_id in post, (
+            "tombstone must STAY when only playlist-update fails "
+            "(content is already gone; peer-sync needs the tombstone "
+            "to propagate the deletion). Pre-r28 the tombstone got "
+            "rolled back here and the deletion was silently lost."
+        )
+
+        # Sanity: content really is gone from disk.
+        assert not storage.exists(item_id), (
+            "storage.delete should have succeeded before the playlist-update failure"
+        )
+    finally:
+        app.dependency_overrides.pop(get_tombstone_storage, None)
+        _tombstone_storage_singleton.cache_clear()
+
+
 # --- POST /api/content/images ---
 
 
