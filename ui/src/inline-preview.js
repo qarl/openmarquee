@@ -1191,14 +1191,35 @@ function drawPlain(ctx, w, h, srcData, signW, signH) {
     ctx.drawImage(tmp, offX, offY, drawW, drawH);
 }
 
+// --- skin-draw tuning constants ---
+//
+// HUB75 panel-simulation tuning. The captive-portal preview is the only
+// consumer; there is no Rust simulator to mirror. Changing any of these
+// is a visual change and must be re-blessed against the boundary tests
+// in inline-preview-skin.test.js.
+const HUB75_BACKDROP   = "#0a0a0a"; // unlit panel substrate
+const HUB75_CELL_GAP   = 0.18;      // fraction of cell reserved for LED bezel
+const HUB75_DARK_COLOR = "#111113"; // color drawn for "off" LEDs
+
+// WS281x stranded-LED simulation tuning. Same parity caveat as HUB75.
+const WS281X_BACKDROP    = "#050505";
+const WS281X_CORE_FRAC   = 0.28; // LED core radius as fraction of cell
+const WS281X_GLOW_FRAC   = 0.55; // outer glow radius
+const WS281X_GLOW_ALPHA  = 0.75; // inner glow opacity
+const WS281X_DARK_COLOR  = "#0f0f12";
+
+// Shared: pixel is "off" when R+G+B sum below this. Used by both skins;
+// keeping it shared prevents silent drift if a future contrast tweak
+// touches only one.
+const LED_DARK_SUM = 18;
+
 function drawHub75(ctx, w, h, srcData, signW, signH) {
-    ctx.fillStyle = "#0a0a0a";
+    ctx.fillStyle = HUB75_BACKDROP;
     ctx.fillRect(0, 0, w, h);
     const cellW = w / signW;
     const cellH = h / signH;
-    const gap = 0.18;
-    const drawW = Math.max(1, cellW * (1 - gap));
-    const drawH = Math.max(1, cellH * (1 - gap));
+    const drawW = Math.max(1, cellW * (1 - HUB75_CELL_GAP));
+    const drawH = Math.max(1, cellH * (1 - HUB75_CELL_GAP));
     const offX = (cellW - drawW) / 2;
     const offY = (cellH - drawH) / 2;
     const px = srcData.data;
@@ -1206,20 +1227,20 @@ function drawHub75(ctx, w, h, srcData, signW, signH) {
         for (let x = 0; x < signW; x++) {
             const i = (y * signW + x) * 4;
             const r = px[i], g = px[i + 1], b = px[i + 2];
-            ctx.fillStyle = r + g + b < 18 ? "#111113" : `rgb(${r},${g},${b})`;
+            ctx.fillStyle = r + g + b < LED_DARK_SUM ? HUB75_DARK_COLOR : `rgb(${r},${g},${b})`;
             ctx.fillRect(x * cellW + offX, y * cellH + offY, drawW, drawH);
         }
     }
 }
 
 function drawWs281x(ctx, w, h, srcData, signW, signH) {
-    ctx.fillStyle = "#050505";
+    ctx.fillStyle = WS281X_BACKDROP;
     ctx.fillRect(0, 0, w, h);
     const cellW = w / signW;
     const cellH = h / signH;
     const cell = Math.min(cellW, cellH);
-    const coreR = cell * 0.28;
-    const glowR = cell * 0.55;
+    const coreR = cell * WS281X_CORE_FRAC;
+    const glowR = cell * WS281X_GLOW_FRAC;
     const px = srcData.data;
     for (let y = 0; y < signH; y++) {
         for (let x = 0; x < signW; x++) {
@@ -1227,15 +1248,15 @@ function drawWs281x(ctx, w, h, srcData, signW, signH) {
             const r = px[i], g = px[i + 1], b = px[i + 2];
             const cx = x * cellW + cellW / 2;
             const cy = y * cellH + cellH / 2;
-            if (r + g + b < 18) {
-                ctx.fillStyle = "#0f0f12";
+            if (r + g + b < LED_DARK_SUM) {
+                ctx.fillStyle = WS281X_DARK_COLOR;
                 ctx.beginPath();
                 ctx.arc(cx, cy, coreR, 0, Math.PI * 2);
                 ctx.fill();
                 continue;
             }
             const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, glowR);
-            grad.addColorStop(0, `rgba(${r},${g},${b},0.75)`);
+            grad.addColorStop(0, `rgba(${r},${g},${b},${WS281X_GLOW_ALPHA})`);
             grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
             ctx.fillStyle = grad;
             ctx.fillRect(cx - glowR, cy - glowR, glowR * 2, glowR * 2);
@@ -1255,5 +1276,14 @@ export {
     drawPlain,
     drawWs281x,
     formatSec,
+    HUB75_BACKDROP,
+    HUB75_CELL_GAP,
+    HUB75_DARK_COLOR,
+    LED_DARK_SUM,
     pickSkin,
+    WS281X_BACKDROP,
+    WS281X_CORE_FRAC,
+    WS281X_DARK_COLOR,
+    WS281X_GLOW_ALPHA,
+    WS281X_GLOW_FRAC,
 };
