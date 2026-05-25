@@ -104,6 +104,124 @@ def test_load_parses_hand_written_file(tmp_path: Path):
     assert flock.peers[0].name == "Lobby Sign"
 
 
+def test_flock_round_trip_preserves_unknown_envelope_and_peer_fields(
+    tmp_path: Path,
+):
+    """Round-13 forward-compat regression (closes the backend
+    forward-compat series). Unknown ENVELOPE-LEVEL fields (e.g. a
+    future top-level stat from backend N+1) AND unknown PER-PEER
+    fields (e.g. a future capabilities list) must SURVIVE the
+    FlockStorage.add / remove / update cycle.
+
+    Pre-fix, Flock.model_validate ran under default extra="ignore"
+    so both kinds of unknown were silently dropped on every load.
+    Operator clicked remove-peer once -> every OTHER peer lost the
+    forward-compat field too (and the envelope-level unknown was
+    gone) because the whole list re-serialized via model_dump_json.
+
+    Test: seed flock.json with an envelope-level unknown + two peers
+    each carrying a different per-peer unknown. Exercise an add()
+    cycle (which triggers the full load+save round-trip), assert
+    every unknown survives. Then exercise remove() + update() cycles
+    and re-assert.
+    """
+    path = tmp_path / "flock.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                # Envelope-level forward-compat field.
+                "_future_envelope_field": {
+                    "added_in": "N+1",
+                    "feature_flag": "flock_v2_health_summary",
+                },
+                "peers": [
+                    {
+                        "id": "11111111-1111-1111-1111-111111111111",
+                        "address": "lobby.ts.net",
+                        "name": "Lobby Sign",
+                        "sync": True,
+                        "added_at": "2026-04-22T12:00:00+00:00",
+                        "last_seen_at": None,
+                        # Per-peer forward-compat field (object shape).
+                        "_future_capabilities": ["hdr", "p3", "60fps"],
+                    },
+                    {
+                        "id": "22222222-2222-2222-2222-222222222222",
+                        "address": "kitchen.ts.net",
+                        "name": "Kitchen Sign",
+                        "sync": False,
+                        "added_at": "2026-04-22T12:01:00+00:00",
+                        "last_seen_at": None,
+                        # Per-peer forward-compat field (scalar shape).
+                        "_future_pixel_density": 2.5,
+                    },
+                ],
+            }
+        )
+    )
+    storage = FlockStorage(path)
+
+    # Cycle 1: add() triggers full load+save round-trip.
+    storage.add(address="garage.ts.net")
+    persisted = json.loads(path.read_text())
+    assert persisted["_future_envelope_field"] == {
+        "added_in": "N+1",
+        "feature_flag": "flock_v2_health_summary",
+    }, "envelope-level forward-compat field must survive add()"
+    by_addr = {p["address"]: p for p in persisted["peers"]}
+    assert by_addr["lobby.ts.net"]["_future_capabilities"] == [
+        "hdr",
+        "p3",
+        "60fps",
+    ], "per-peer forward-compat field must survive add() (object shape)"
+    assert by_addr["kitchen.ts.net"]["_future_pixel_density"] == 2.5, (
+        "per-peer forward-compat field must survive add() (scalar shape)"
+    )
+    assert "garage.ts.net" in by_addr, "the newly-added peer must be present (positive baseline)"
+
+    # Cycle 2: remove() — the dispatch's documented attack on the
+    # bug ("click remove-peer once -> all OTHER peers lose the
+    # field"). Remove the garage peer just added; both lobby +
+    # kitchen forward-compat fields must STILL be there afterwards.
+    garage_peer_id = next(p.id for p in storage.load().peers if p.address == "garage.ts.net")
+    storage.remove(garage_peer_id)
+    persisted = json.loads(path.read_text())
+    by_addr = {p["address"]: p for p in persisted["peers"]}
+    assert persisted["_future_envelope_field"] == {
+        "added_in": "N+1",
+        "feature_flag": "flock_v2_health_summary",
+    }, "envelope-level forward-compat must survive remove()"
+    assert by_addr["lobby.ts.net"]["_future_capabilities"] == [
+        "hdr",
+        "p3",
+        "60fps",
+    ], "per-peer forward-compat must survive remove() (the bug scenario)"
+    assert by_addr["kitchen.ts.net"]["_future_pixel_density"] == 2.5
+
+    # Cycle 3: update() — touches a single peer's known fields but
+    # round-trips the whole list, so unknowns must still survive.
+    lobby_peer_id = next(p.id for p in storage.load().peers if p.address == "lobby.ts.net")
+    storage.update(lobby_peer_id, name="Lobby Display")
+    persisted = json.loads(path.read_text())
+    by_addr = {p["address"]: p for p in persisted["peers"]}
+    assert by_addr["lobby.ts.net"]["name"] == "Lobby Display", (
+        "update() must take effect (positive baseline)"
+    )
+    assert by_addr["lobby.ts.net"]["_future_capabilities"] == [
+        "hdr",
+        "p3",
+        "60fps",
+    ], "per-peer forward-compat must survive update()"
+    assert by_addr["kitchen.ts.net"]["_future_pixel_density"] == 2.5, (
+        "OTHER peer's forward-compat must survive update() too"
+    )
+    assert persisted["_future_envelope_field"] == {
+        "added_in": "N+1",
+        "feature_flag": "flock_v2_health_summary",
+    }, "envelope-level forward-compat must survive update()"
+
+
 def test_add_then_load_round_trips(storage: FlockStorage):
     peer = storage.add(address="lobby.ts.net")
     loaded = storage.load()

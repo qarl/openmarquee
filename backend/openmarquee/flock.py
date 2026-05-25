@@ -33,7 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from openmarquee._atomic import atomic_write_text
 from openmarquee._storage_recovery import quarantine_corrupt_file
@@ -152,6 +152,23 @@ def _normalize_address(address: str) -> str:
 class FlockPeer(BaseModel):
     """One remote openMarquee device in this device's flock."""
 
+    # Round-13 forward-compat fix (2026-05-25): preserve unknown
+    # per-peer fields across the FlockStorage round-trip. Pre-fix,
+    # Flock.model_validate ran under default extra="ignore", so any
+    # forward-compat per-peer field (e.g. a future capabilities list,
+    # or a new health-probe stat from backend N+1) was silently
+    # dropped on every load. add/remove/update then save() rewrote
+    # the lossy peer list -- a single click on remove-peer would
+    # strip the field from EVERY OTHER peer too.
+    #
+    # In Pydantic v2 with extra="allow", model_dump_json (used by
+    # FlockStorage.save at flock.py:337) emits extras alongside known
+    # fields. No save-handler changes needed.
+    #
+    # Same shape as the SystemSettings fix (r12) -- model IS the
+    # on-disk shape, no envelope-vs-inner split.
+    model_config = ConfigDict(extra="allow")
+
     id: UUID = Field(default_factory=uuid4)
     address: str = Field(
         min_length=1,
@@ -265,6 +282,13 @@ class FlockPeer(BaseModel):
 
 class Flock(BaseModel):
     """Envelope wrapping the peer list + schema version for on-disk storage."""
+
+    # Round-13 forward-compat fix: preserve unknown ENVELOPE-LEVEL
+    # fields (e.g. a future top-level stat or feature flag stored
+    # alongside the peer list) across the load->mutate->save trio.
+    # Same rationale as FlockPeer above; see also r11 ContentItem +
+    # r12 SystemSettings.
+    model_config = ConfigDict(extra="allow")
 
     schema_version: int = FLOCK_SCHEMA_VERSION
     peers: list[FlockPeer] = Field(default_factory=list)
