@@ -871,3 +871,37 @@ export async function stopLive(sessionId) {
         throw new Error(`Live stop failed (${response.status}): ${detail}`);
     }
 }
+
+/**
+ * Pause the named live session. Frame on the sign freezes; the
+ * upstream source (phone camera or VLC publisher) stays alive. 404
+ * on stale-session-id is swallowed (the caller is racing against a
+ * naturally-ended session); other non-2xx surfaces as Error.
+ */
+export async function pauseLive(sessionId) {
+    const response = await apiFetch("/api/live/pause", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+    });
+    if (!response.ok && response.status !== 404) {
+        const detail = await extractDetailMessage(response);
+        throw new Error(`Live pause failed (${response.status}): ${detail}`);
+    }
+}
+
+/**
+ * Resume the named live session — pump renders the next live frame.
+ * Same 404-tolerant shape as pauseLive.
+ */
+export async function resumeLive(sessionId) {
+    const response = await apiFetch("/api/live/resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId }),
+    });
+    if (!response.ok && response.status !== 404) {
+        const detail = await extractDetailMessage(response);
+        throw new Error(`Live resume failed (${response.status}): ${detail}`);
+    }
+}
