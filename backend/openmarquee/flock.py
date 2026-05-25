@@ -29,6 +29,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import re
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -325,6 +326,16 @@ class FlockStorage:
         self.path = Path(path)
         # mtime-keyed cache (Batch 7.2). See PlaylistStorage._cache.
         self._cache: tuple[int, Flock] | None = None
+        # Round-25 concurrency: serialize the load+mutate+save trios
+        # in add/remove/update. Same race + fix shape as
+        # TombstoneStorage (see that __init__ comment for the full
+        # rationale). Two concurrent POST /api/flock or PUT /api/
+        # flock/{id} requests could otherwise interleave their
+        # load+save and lose one peer add or one sync-flag flip.
+        # threading.Lock chosen over asyncio.Lock for the same
+        # reason as TombstoneStorage: mutator signatures stay sync,
+        # contended-acquire is microseconds.
+        self._lock = threading.Lock()
 
     @classmethod
     def stats_snapshot(cls) -> dict[str, int]:
@@ -364,23 +375,32 @@ class FlockStorage:
 
     def add(self, address: str) -> FlockPeer:
         """Add a peer by address. Raises ValueError if the address is
-        already present (addresses are the uniqueness key)."""
-        flock = self.load()
-        if flock.find_by_address(address) is not None:
-            raise ValueError(f"peer with address {address!r} already in flock")
-        peer = FlockPeer(address=address)
-        flock.peers.append(peer)
-        self.save(flock)
+        already present (addresses are the uniqueness key).
+
+        Round-25: lock-protected load+mutate+save (see __init__ for
+        the race rationale).
+        """
+        with self._lock:
+            flock = self.load()
+            if flock.find_by_address(address) is not None:
+                raise ValueError(f"peer with address {address!r} already in flock")
+            peer = FlockPeer(address=address)
+            flock.peers.append(peer)
+            self.save(flock)
         return peer
 
     def remove(self, peer_id: UUID) -> bool:
-        """Forget a peer. Returns True if removed, False if absent."""
-        flock = self.load()
-        before = len(flock.peers)
-        flock.peers = [p for p in flock.peers if p.id != peer_id]
-        if len(flock.peers) == before:
-            return False
-        self.save(flock)
+        """Forget a peer. Returns True if removed, False if absent.
+
+        Round-25: lock-protected load+mutate+save.
+        """
+        with self._lock:
+            flock = self.load()
+            before = len(flock.peers)
+            flock.peers = [p for p in flock.peers if p.id != peer_id]
+            if len(flock.peers) == before:
+                return False
+            self.save(flock)
         return True
 
     def update(
@@ -398,18 +418,21 @@ class FlockStorage:
         `items_behind` uses sentinel -1 to mean "leave unchanged" (since
         None is a meaningful value — "never pulled / sync off"). Pass an
         int to set, None to explicitly clear.
+
+        Round-25: lock-protected load+mutate+save.
         """
-        flock = self.load()
-        peer = flock.find(peer_id)
-        if peer is None:
-            return None
-        if sync is not None:
-            peer.sync = sync
-        if name is not None:
-            peer.name = name
-        if mark_seen:
-            peer.last_seen_at = _now()
-        if items_behind != -1:
-            peer.items_behind = items_behind
-        self.save(flock)
+        with self._lock:
+            flock = self.load()
+            peer = flock.find(peer_id)
+            if peer is None:
+                return None
+            if sync is not None:
+                peer.sync = sync
+            if name is not None:
+                peer.name = name
+            if mark_seen:
+                peer.last_seen_at = _now()
+            if items_behind != -1:
+                peer.items_behind = items_behind
+            self.save(flock)
         return peer

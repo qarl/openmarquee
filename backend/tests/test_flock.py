@@ -229,6 +229,39 @@ def test_add_then_load_round_trips(storage: FlockStorage):
     assert loaded.peers[0].address == "lobby.ts.net"
 
 
+def test_concurrent_add_does_not_lose_peers(storage: FlockStorage):
+    """Round-25 concurrency regression: FlockStorage.add does load+
+    mutate+save (same shape as TombstoneStorage.add). Pre-fix two
+    concurrent POST /api/flock requests on the threadpool could
+    interleave their load+save and lose one peer.
+
+    Test: fire N concurrent add() calls with distinct addresses from
+    threads. Assert all N peers land.
+    """
+    import threading
+
+    n_concurrent = 30
+    addresses = [f"peer{i:03d}.ts.net" for i in range(n_concurrent)]
+    barrier = threading.Barrier(n_concurrent)
+
+    def add_one(address):
+        barrier.wait()
+        storage.add(address=address)
+
+    threads = [threading.Thread(target=add_one, args=(a,)) for a in addresses]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    persisted_addresses = {p.address for p in storage.load().peers}
+    missing = set(addresses) - persisted_addresses
+    assert not missing, (
+        f"{len(missing)}/{n_concurrent} peers lost to the "
+        f"load-mutate-save race. Sample missing: {list(missing)[:5]}"
+    )
+
+
 def test_add_rejects_duplicate_address(storage: FlockStorage):
     storage.add(address="lobby.ts.net")
     with pytest.raises(ValueError, match="already in flock"):

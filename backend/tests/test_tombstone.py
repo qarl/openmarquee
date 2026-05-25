@@ -130,6 +130,55 @@ def test_naive_deleted_at_coerces_to_utc_and_list_active_doesnt_raise(
     assert removed == 1, "expired (coerced-tz) tombstone must prune"
 
 
+def test_concurrent_add_does_not_lose_tombstones(tmp_path: Path):
+    """Round-25 concurrency regression: TombstoneStorage.add does
+    load+mutate+save. Pre-fix two concurrent threads (FastAPI's sync
+    handlers run on a threadpool; operator batch-selecting + deleting
+    rapidly fires multiple DELETE /api/content/{id} near-
+    simultaneously) could interleave their load+save and lose one
+    tombstone:
+      T1.load (N) -> T2.load (N) -> T1.save (N+1, T1's) ->
+      T2.save (N+1, T2's, T1's wiped)
+
+    The lost tombstone means peers don't learn the delete on the next
+    sync round; content silently resurrects in the operator's
+    playlist via flock pull.
+
+    Test: fire N concurrent add() calls with distinct content_ids
+    from threads. Assert all N tombstones are on disk afterward.
+    Pre-fix, ~30-50% of tombstones disappear under thread-scheduler
+    interleaving.
+    """
+    import threading
+
+    storage = TombstoneStorage(tmp_path / "tombstones.json")
+    n_concurrent = 50
+    cids = [uuid4() for _ in range(n_concurrent)]
+    barrier = threading.Barrier(n_concurrent)
+
+    def add_one(cid):
+        # Sync all threads at the barrier so the racing window is as
+        # wide as possible. Without the barrier, thread-start overhead
+        # serializes the calls and the race rarely fires even pre-fix.
+        barrier.wait()
+        storage.add(cid)
+
+    threads = [threading.Thread(target=add_one, args=(cid,)) for cid in cids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # All N tombstones must be present. Pre-fix ~half are lost.
+    persisted = {t.content_id for t in storage.load().tombstones}
+    missing = set(cids) - persisted
+    assert not missing, (
+        f"{len(missing)}/{n_concurrent} tombstones lost to the "
+        f"load-mutate-save race. Sample missing: "
+        f"{list(missing)[:5]}"
+    )
+
+
 def test_prune_expired_removes_from_disk(tmp_path: Path):
     storage = TombstoneStorage(tmp_path / "t.json", ttl_days=30)
     now = datetime(2026, 4, 24, tzinfo=UTC)
