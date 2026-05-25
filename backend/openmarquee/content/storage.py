@@ -33,9 +33,10 @@ from pathlib import Path
 from uuid import UUID
 
 from PIL import Image, ImageDraw, ImageFont
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from openmarquee._atomic import atomic_write_bytes, atomic_write_text
+from openmarquee._storage_recovery import quarantine_corrupt_file
 from openmarquee.content import (
     ContentItem,
     ImageSlide,
@@ -475,7 +476,12 @@ class ContentStorage:
         return (self.root / str(item_id) / _ENVELOPE_FILENAME).exists()
 
     def load(self, item_id: UUID) -> ContentItem:
-        """Load a content item by id. Raises FileNotFoundError if missing."""
+        """Load a content item by id. Raises FileNotFoundError if missing
+        OR if the envelope is corrupt (Round-30 -- corruption is converted
+        to FileNotFoundError after the bad file is quarantined aside, so
+        list_all's existing missing-envelope skip path handles both
+        shapes uniformly).
+        """
         type(self)._stats["load_calls"] += 1
         envelope_path = self.root / str(item_id) / _ENVELOPE_FILENAME
         if not envelope_path.exists():
@@ -490,23 +496,53 @@ class ContentStorage:
         if cached is not None and cached[0] == mtime_ns:
             return cached[1]
 
-        data = json.loads(envelope_path.read_text())
-        version = data.get("schema_version")
-        if version != SCHEMA_VERSION:
-            raise ValueError(
-                f"item {item_id} has schema_version {version}, "
-                f"expected {SCHEMA_VERSION} — migration needed"
-            )
-
-        # Remap any legacy `vlc_stream` item to the current `stream`
-        # shape BEFORE validation — the ContentItem union discriminates
-        # on `type`, so the rename has to land on the raw dict (a
-        # model_validator would never see an unmatched union member).
-        data["item"] = _migrate_legacy_stream_item(data["item"])
-        # TypeAdapter dispatches to the right ContentItem variant based on
-        # the `type` literal. Unknown types surface as validation errors.
-        type(self)._stats["envelope_validates"] += 1
-        item = _CONTENT_ADAPTER.validate_python(data["item"])
+        # Round-30 corruption recovery: ContentStorage was the lone
+        # storage class missing this guard. PlaylistStorage,
+        # TombstoneStorage, ScheduleStorage, FlockStorage, SettingsStorage,
+        # AuthStorage all wrap their load() in the same shape -- catch
+        # parse/validation errors, quarantine the bad file aside, return
+        # defaults. Pre-r30 a single truncated item.json (power-yank
+        # mid-save) would crash list_all on the next boot ->
+        # systemd crash-loop on openmarquee-backend.service -> sign goes
+        # dark; recovery requires SSH + `rm -rf content/<bad-uuid>/`.
+        #
+        # Strategy here: convert corruption -> FileNotFoundError so
+        # list_all's existing "skip if envelope missing" branch
+        # transparently handles corruption-recovered items the same
+        # way it already handles never-saved-fully items. The bad
+        # envelope is renamed to a `.corrupt-<UTC>` sibling for
+        # forensics. KeyError + TypeError caught because the post-
+        # parse `data["item"]` lookup can fail on a partially-truncated
+        # envelope whose JSON IS parseable but missing the "item" key
+        # (e.g. just `{"schema_version": 3}` if the write was cut
+        # mid-stream after the version was written).
+        try:
+            data = json.loads(envelope_path.read_text())
+            version = data.get("schema_version")
+            if version != SCHEMA_VERSION:
+                raise ValueError(
+                    f"item {item_id} has schema_version {version}, "
+                    f"expected {SCHEMA_VERSION} — migration needed"
+                )
+            # Remap any legacy `vlc_stream` item to the current `stream`
+            # shape BEFORE validation — the ContentItem union discriminates
+            # on `type`, so the rename has to land on the raw dict (a
+            # model_validator would never see an unmatched union member).
+            data["item"] = _migrate_legacy_stream_item(data["item"])
+            # TypeAdapter dispatches to the right ContentItem variant
+            # based on the `type` literal. Unknown types surface as
+            # validation errors.
+            type(self)._stats["envelope_validates"] += 1
+            item = _CONTENT_ADAPTER.validate_python(data["item"])
+        except (json.JSONDecodeError, ValidationError, KeyError, TypeError) as exc:
+            quarantine_corrupt_file(envelope_path, exc)
+            # Drop the cache entry too -- a hand-restore of the bad
+            # envelope from the quarantine sibling shouldn't load stale.
+            self._cache.pop(item_id, None)
+            raise FileNotFoundError(
+                f"item {item_id} envelope corrupted; quarantined sibling at "
+                f"{envelope_path.name}.corrupt-<UTC>: {exc!r}"
+            ) from exc
         # Populate the output-only updated_at mirror so API consumers can
         # cachebust asset URLs (`?v=${updated_at}`) and pick up new bytes
         # after a re-render. Envelope is the authoritative source; falling
@@ -551,16 +587,27 @@ class ContentStorage:
         envelope_path = self.root / str(item_id) / _ENVELOPE_FILENAME
         if not envelope_path.exists():
             raise FileNotFoundError(f"no content item at {envelope_path}")
-        data = json.loads(envelope_path.read_text())
-        # Mirror load()'s schema check so a future v2 envelope doesn't let
-        # read_updated_at silently return stamps while load() would refuse.
-        version = data.get("schema_version")
-        if version != SCHEMA_VERSION:
-            raise ValueError(
-                f"item {item_id} has schema_version {version}, "
-                f"expected {SCHEMA_VERSION} — migration needed"
-            )
-        stamp = data.get("updated_at")
+        # Round-30: same corruption-recovery shape as load(). pre-r30
+        # this method also did unguarded json.loads; flock-sync push
+        # callers would have crashed if they hit a corrupt envelope.
+        # Quarantine + FileNotFoundError -- caller treats as missing.
+        try:
+            data = json.loads(envelope_path.read_text())
+            # Mirror load()'s schema check so a future v2 envelope doesn't let
+            # read_updated_at silently return stamps while load() would refuse.
+            version = data.get("schema_version")
+            if version != SCHEMA_VERSION:
+                raise ValueError(
+                    f"item {item_id} has schema_version {version}, "
+                    f"expected {SCHEMA_VERSION} — migration needed"
+                )
+            stamp = data.get("updated_at")
+        except (json.JSONDecodeError, ValidationError, KeyError, TypeError) as exc:
+            quarantine_corrupt_file(envelope_path, exc)
+            self._cache.pop(item_id, None)
+            raise FileNotFoundError(
+                f"item {item_id} envelope corrupted; quarantined: {exc!r}"
+            ) from exc
         if stamp is None:
             return datetime.fromtimestamp(envelope_path.stat().st_mtime, tz=UTC)
         parsed = datetime.fromisoformat(stamp)
@@ -587,7 +634,22 @@ class ContentStorage:
                 continue  # skip non-UUID dirs (could be editor scratch, etc.)
             if not (child / _ENVELOPE_FILENAME).exists():
                 continue
-            items.append(self.load(item_id))
+            # Round-30: load() converts corruption to FileNotFoundError
+            # after quarantining the bad envelope. Skip silently --
+            # same shape as the missing-envelope branch above. Pre-r30
+            # corruption propagated uncaught here and crashed the
+            # lifespan boot path (prune_dangling_refs -> list_full_
+            # library -> list_all -> raise). Without this skip the
+            # quarantine alone wouldn't unblock boot.
+            try:
+                items.append(self.load(item_id))
+            except FileNotFoundError:
+                # Envelope was either deleted between iterdir + load
+                # OR quarantined by load()'s corruption-recovery path.
+                # Either way, the operator's playlist will reference a
+                # now-missing item; the next prune_dangling_refs sweep
+                # cleans the ref.
+                continue
         return items
 
     def delete(self, item_id: UUID) -> None:

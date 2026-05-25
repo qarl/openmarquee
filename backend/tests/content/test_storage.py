@@ -733,6 +733,77 @@ def test_list_all_surfaces_web_items(tmp_path: Path):
     assert isinstance(by_type["text_slide"], TextSlide)
 
 
+def test_corrupt_item_json_quarantined_and_list_all_skips(tmp_path: Path):
+    """Round-30 robustness regression: ContentStorage was the lone
+    storage class missing the corruption-recovery path. Power-yank
+    mid-save -> truncated item.json -> pre-r30 next boot crashed
+    via prune_dangling_refs -> list_full_library -> list_all() ->
+    JSONDecodeError uncaught -> systemd crash-loop on
+    openmarquee-backend.service -> sign goes dark.
+
+    Post-r30: corruption is caught at load(); the bad envelope is
+    quarantined to a `.corrupt-<UTC>` sibling; FileNotFoundError
+    raised; list_all() skips the bad item like it already skips
+    items with missing envelopes.
+
+    Test: seed 2 good items + 1 bad (hand-written truncated JSON).
+    Call list_all(). Assert:
+      (a) returns 2 items (bad one skipped, not raised)
+      (b) bad envelope renamed to .corrupt-<UTC> sibling
+      (c) good items still load
+    Bug-fix-tests-the-bug: pre-r30 step (a) raises JSONDecodeError
+    instead of returning 2 items.
+    """
+    storage = ContentStorage(tmp_path)
+    good_a = _make_slide(name="good-A", text="alpha")
+    good_b = _make_slide(name="good-B", text="bravo")
+    storage.save_text_slide(good_a, b"\x89PNG\r\nA")
+    storage.save_text_slide(good_b, b"\x89PNG\r\nB")
+
+    # Hand-write a third item dir with a TRUNCATED item.json (the
+    # power-yank scenario: a partial write landed before the rename
+    # finished, OR the rename completed but the underlying bytes
+    # were never flushed before crash).
+    bad_id = uuid4()
+    bad_dir = tmp_path / str(bad_id)
+    bad_dir.mkdir()
+    bad_envelope = bad_dir / "item.json"
+    # Just enough to be valid-shaped JSON-prefix but truncate mid-
+    # value. json.loads will raise JSONDecodeError on this.
+    bad_envelope.write_text('{"schema_version": 3, "updated_at": "2026-04-24T12:00:0')
+
+    # CRITICAL ASSERTION 1: list_all returns 2 items, doesn't raise.
+    # Pre-r30 this raises JSONDecodeError uncaught -> the lifespan
+    # boot path crashes -> systemd restart loop.
+    items = storage.list_all()
+    item_names = {i.name for i in items}
+    assert item_names == {"good-A", "good-B"}, (
+        f"list_all must skip the corrupt item; got names {item_names}"
+    )
+
+    # CRITICAL ASSERTION 2: bad envelope was renamed aside.
+    quarantine_siblings = list(bad_dir.glob("item.json.corrupt-*"))
+    assert len(quarantine_siblings) == 1, (
+        f"corrupt envelope must be renamed to .corrupt-<UTC> sibling; got {list(bad_dir.iterdir())}"
+    )
+    # Original path is gone (rename consumed it).
+    assert not bad_envelope.exists(), (
+        "the original item.json path should be gone after quarantine (rename consumed it)"
+    )
+
+    # CRITICAL ASSERTION 3: good items still load cleanly.
+    loaded_a = storage.load(good_a.id)
+    assert loaded_a.name == "good-A"
+    loaded_b = storage.load(good_b.id)
+    assert loaded_b.name == "good-B"
+
+    # CRITICAL ASSERTION 4: a direct load on the bad id raises
+    # FileNotFoundError (envelope no longer exists at the canonical
+    # path post-quarantine).
+    with pytest.raises(FileNotFoundError):
+        storage.load(bad_id)
+
+
 def test_atomic_write_uses_per_call_tmp_filename(tmp_path: Path, monkeypatch):
     """Round-29 Part B: each _atomic._atomic_write call must use a
     distinct staging filename so concurrent writers can't share one.
