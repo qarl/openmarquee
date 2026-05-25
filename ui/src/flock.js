@@ -343,6 +343,14 @@ export function mountFlock(
     // teardown. Stale-on-hardware-swap is an acceptable tradeoff
     // (operator-rare event).
     const peerDimsCache = new Map();
+    // Handle for the deferred-rerender setTimeout scheduled after a
+    // successful add-peer (so the card flips from raw address to
+    // friendly sign_name once the backend's name-probe settles).
+    // Tracked so teardown can cancel — otherwise the timer fires
+    // 1.5s post-close, render() runs against a detached container,
+    // and the orphan render re-allocates blob URLs that the
+    // (no-longer-in-scope) revokeAllThumbs can't see.
+    let pendingAddRender = null;
 
     function setStatus(text, { error = false } = {}) {
         statusEl.textContent = text;
@@ -669,8 +677,18 @@ export function mountFlock(
             await render();
             // The backend probes the new peer for sign_name in the
             // background; re-render after a beat so the card flips
-            // from "raw address" to the friendly name.
-            setTimeout(() => { render().catch(() => {}); }, 1500);
+            // from "raw address" to the friendly name. Tracked in
+            // pendingAddRender so stop() can cancel a still-pending
+            // fire when the operator closes the panel within 1.5s.
+            // Cancel any prior pending fire too — back-to-back adds
+            // would otherwise leak the earlier handle (pendingAddRender
+            // would point at the LATER timer, leaving the earlier one
+            // unreachable to stop()).
+            if (pendingAddRender !== null) clearTimeout(pendingAddRender);
+            pendingAddRender = setTimeout(() => {
+                pendingAddRender = null;
+                render().catch(() => {});
+            }, 1500);
         } catch (err) {
             modalError.textContent = err.message || "Couldn't add device.";
         }
@@ -758,6 +776,10 @@ export function mountFlock(
             stopPolling();
             revokeAllThumbs();
             peerDimsCache.clear();
+            if (pendingAddRender !== null) {
+                clearTimeout(pendingAddRender);
+                pendingAddRender = null;
+            }
         },
     };
 }
