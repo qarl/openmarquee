@@ -1124,12 +1124,26 @@ export function mountInlinePreview(container, options) {
             slider.value = String(position.toFixed(2));
             timeEl.textContent = formatRange(position, totalSec);
             renderOnce();
+        } catch (err) {
+            // Swallow + log so a transient draw failure (font not yet
+            // loaded, canvas-ctx race, layout snapshot mid-resize)
+            // doesn't kill the animation loop permanently. Same shape
+            // as rotation-rerender.js's per-iteration try/catch +
+            // continue. Pre-fix this was try/finally and the post-finally
+            // reschedule was skipped on throw, requiring nav + refresh
+            // to recover -- error-boundary audit finding #1.
+            console.error("inline-preview tick:", err);
         } finally {
             // Always close the perf measure even if renderOnce throws,
             // so window.__perf doesn't accumulate an unclosed mark.
             markEnd("inline-preview.tick");
+            // Always reschedule -- the catch above prevents loop death
+            // on a transient throw, the finally here makes the
+            // reschedule reach BOTH happy + caught paths (without it,
+            // the reschedule would still run on the happy path but the
+            // finally placement makes the contract obvious).
+            rafId = requestAnimationFrame(tick);
         }
-        rafId = requestAnimationFrame(tick);
     }
 
     playBtn.addEventListener("click", () => setPlaying(!playing));

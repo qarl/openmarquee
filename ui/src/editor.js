@@ -537,11 +537,28 @@ export function mountEditor(
             }
             if (!anyLayerAnimated(state.layers)) {
                 motionRafId = null;
-                drawCanvas(canvas, state); // settle on a static final frame
+                // Settle on a static final frame; wrap so a transient
+                // draw throw doesn't bubble (one-shot exit; nothing
+                // to reschedule).
+                try {
+                    drawCanvas(canvas, state);
+                } catch (err) {
+                    console.error("editor motion settle:", err);
+                }
                 return;
             }
             const elapsed = (now - motionT0) / 1000;
-            drawCanvas(canvas, state, { elapsed_s: elapsed });
+            try {
+                drawCanvas(canvas, state, { elapsed_s: elapsed });
+            } catch (err) {
+                // Swallow + log so a transient draw failure (font not
+                // yet loaded, canvas-ctx race, layout snapshot mid-
+                // resize) doesn't kill the motion loop permanently.
+                // Pre-fix the reschedule below was unreachable on
+                // throw, requiring nav-away + back to recover --
+                // error-boundary audit finding #2.
+                console.error("editor motion tick:", err);
+            }
             motionRafId = requestAnimationFrame(tick);
         };
         motionRafId = requestAnimationFrame(tick);
