@@ -526,29 +526,10 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             const newValueEl = row.querySelector(".secret-new-value");
             const errorEl = row.querySelector(".secret-error");
 
-            function open() {
-                display.hidden = true;
-                formEl.hidden = false;
-                currentPwEl.value = "";
-                newValueEl.value = "";
-                errorEl.textContent = "";
-                currentPwEl.focus();
-            }
-            function close() {
-                formEl.hidden = true;
-                display.hidden = false;
-                currentPwEl.value = "";
-                newValueEl.value = "";
-                errorEl.textContent = "";
-                // 20.4 subagent: saveBtn gets .disabled=true on submit
-                // entry; the error paths re-enable but the success path
-                // calls close() before resetting it. Reset here so a
-                // second rotation in the same session isn't dead.
-                saveBtn.disabled = false;
-            }
-
-            changeBtn.addEventListener("click", open);
-            cancelBtn.addEventListener("click", close);
+            const { close } = wireRevealForm({
+                display, formEl, changeBtn, cancelBtn, saveBtn, errorEl,
+                inputs: [currentPwEl, newValueEl],
+            });
 
             saveBtn.addEventListener("click", async () => {
                 errorEl.textContent = "";
@@ -604,28 +585,10 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         const confirmEl = card.querySelector(".change-pw-confirm");
         const errorEl = card.querySelector(".change-pw-error");
 
-        function open() {
-            display.hidden = true;
-            formEl.hidden = false;
-            currentEl.value = "";
-            newEl.value = "";
-            confirmEl.value = "";
-            errorEl.textContent = "";
-            saveBtn.disabled = false;
-            currentEl.focus();
-        }
-        function close() {
-            formEl.hidden = true;
-            display.hidden = false;
-            currentEl.value = "";
-            newEl.value = "";
-            confirmEl.value = "";
-            errorEl.textContent = "";
-            saveBtn.disabled = false;
-        }
-
-        changeBtn.addEventListener("click", open);
-        cancelBtn.addEventListener("click", close);
+        const { close } = wireRevealForm({
+            display, formEl, changeBtn, cancelBtn, saveBtn, errorEl,
+            inputs: [currentEl, newEl, confirmEl],
+        });
 
         saveBtn.addEventListener("click", async () => {
             errorEl.textContent = "";
@@ -1038,6 +1001,51 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             }
         },
     };
+}
+
+// Shared reveal-form lifecycle for the two secret-bearing forms
+// (wireSecretFields per-row + wireChangePasswordCard). Each form has
+// a display row (with the redacted indicator + a Change button) and
+// a hidden form (with the current_password + new_value(+confirm)
+// inputs + Cancel/Save buttons).
+//
+// open() and close() toggle the display/form visibility, clear all
+// inputs, clear the inline error, and (in clear()) reset
+// saveBtn.disabled. The shared `clear()` keeps the saveBtn reset
+// invariant in one place — pre-extract, Site 1 (wireSecretFields)
+// reset it only on close(), while Site 2 (wireChangePasswordCard)
+// reset it on BOTH open() and close(). Unified to reset on both via
+// clear(); Site 1's open() gains a redundant reset that's a no-op in
+// practice (saveBtn would already be false at open-time because
+// close() runs before any subsequent open()).
+//
+// The saveBtn-disabled gotcha: saveBtn gets .disabled=true on submit
+// entry; the error paths re-enable but the success path calls close()
+// before resetting it. Reset in clear() so a second submit in the
+// same session isn't dead.
+//
+// Returns { open, close } so the caller's submit-success path can
+// invoke close() directly.
+function wireRevealForm({ display, formEl, changeBtn, cancelBtn, saveBtn, inputs, errorEl }) {
+    function clear() {
+        for (const el of inputs) el.value = "";
+        errorEl.textContent = "";
+        saveBtn.disabled = false;
+    }
+    function open() {
+        display.hidden = true;
+        formEl.hidden = false;
+        clear();
+        inputs[0].focus();
+    }
+    function close() {
+        formEl.hidden = true;
+        display.hidden = false;
+        clear();
+    }
+    changeBtn.addEventListener("click", open);
+    cancelBtn.addEventListener("click", close);
+    return { open, close };
 }
 
 // Shared response-error handler for the two secret-bearing save flows
