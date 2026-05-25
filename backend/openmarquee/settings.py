@@ -26,7 +26,14 @@ import secrets
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from openmarquee._atomic import atomic_write_text
 from openmarquee._storage_recovery import quarantine_corrupt_file
@@ -79,6 +86,47 @@ def _default_sign_name() -> str:
 
 class SystemSettings(BaseModel):
     """Device-wide configuration. One per device; persisted as a single file."""
+
+    # Round-12 forward-compat fix (2026-05-25): preserve unknown
+    # top-level fields across the storage round-trip.
+    #
+    # PUT /api/settings reads JSON, redaction-substitutes the three
+    # secret fields, then SystemSettings.model_validate(payload)
+    # (api_settings.py:305). The UI's Save button does GET -> mutate
+    # -> PUT; without extra="allow" the validate step silently
+    # dropped any field this build didn't know about. SettingsStorage.
+    # save then wrote the lossy model back to disk via
+    # model_dump_json -- data gone forever.
+    #
+    # Operator scenario: downgrade to older bundle; settings.json
+    # carries a forward-compat field from N+1 (e.g.
+    # display_color_profile="p3"); operator nudges brightness + Save;
+    # the field is gone; on re-upgrade it defaults and operator
+    # re-tunes from scratch.
+    #
+    # In Pydantic v2 with extra="allow":
+    #   - validate_python / model_validate preserve extras into
+    #     model_extra
+    #   - model_copy(update={...}) preserves extras
+    #   - model_dump / model_dump_json emit extras alongside known
+    #     fields
+    # So load -> mutate -> save round-trips cleanly with no other
+    # code changes (the PUT handler at api_settings.py:287-345 needs
+    # zero changes; same shape as the r11 ContentItem fix).
+    #
+    # The existing _coerce_legacy_output_mode model_validator
+    # (mode="before") below still removes the 3 retired keys
+    # (ws281x_pixel_order, web_helper_url, web_helper_token) BEFORE
+    # validation runs -- so those don't end up in model_extra and
+    # don't get re-emitted by save. Forward-compat keys pass through
+    # the strip + land in model_extra + get persisted. The strip was
+    # documentary-only before (extra="ignore" would drop them anyway);
+    # post-r12 it is load-bearing.
+    #
+    # Same shape as the Schedule + Playlist + ContentItem forward-
+    # compat fixes; this closes the SystemSettings leg. Flock is the
+    # last one in the series (r13).
+    model_config = ConfigDict(extra="allow")
 
     schema_version: int = Field(default=SETTINGS_SCHEMA_VERSION)
 

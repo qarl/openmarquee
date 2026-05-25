@@ -425,6 +425,71 @@ def test_tailscale_hostname_rejects_spaces():
 # --- legacy / dropped settings keys ---
 
 
+def test_settings_round_trip_preserves_unknown_top_level_fields(tmp_path: Path):
+    """Round-12 forward-compat regression: extra top-level fields on
+    the on-disk settings.json (forward-compat fields from a newer
+    backend bundle) must SURVIVE the load->mutate->save round-trip.
+
+    Pre-fix, SystemSettings.model_validate ran under default
+    extra="ignore", so any unknown key was silently dropped on load;
+    the next save then wrote the lossy model back to disk via
+    model_dump_json -- data gone forever.
+
+    Operator scenario: downgrade to older backend bundle; settings.json
+    still carries a forward-compat field from N+1 (e.g.
+    display_color_profile="p3"); operator nudges brightness + Save ->
+    field gone; re-upgrade defaults the field and operator re-tunes
+    from scratch.
+
+    Test: pre-seed settings.json with both a known field and an
+    unknown forward-compat field; load via SettingsStorage (mirroring
+    the GET path); model_copy with a brightness change (mirroring
+    the UI's GET-mutate-PUT sequence); save back via the storage
+    (mirroring the PUT handler's storage.save); re-read raw JSON and
+    assert the forward-compat field survived.
+    """
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "sign_name": "Lobby Sign",
+                "output_mode": "hdmi",
+                "display_width": 1920,
+                "display_height": 1080,
+                "brightness": 50,
+                # Forward-compat field from a future backend bundle. This
+                # bundle doesn't know about it; must NOT silently drop.
+                "display_color_profile": "p3",
+                # Nested-shaped forward-compat to cover a richer payload
+                # (some future field might be an object, not a scalar).
+                "_future_calibration": {
+                    "white_point": [0.95, 1.0, 1.09],
+                    "version": "draft-2026-Q3",
+                },
+            }
+        )
+    )
+
+    storage = SettingsStorage(path)
+    loaded = storage.load()
+    # Mirror the PUT handler's load->mutate->save trio (api_settings.py
+    # :294-345 does this via model_validate; same effect for the
+    # extras-preservation invariant).
+    mutated = loaded.model_copy(update={"brightness": 80})
+    storage.save(mutated)
+
+    # Re-read raw JSON (NOT through the model) and assert the
+    # forward-compat fields survived end-to-end.
+    persisted = json.loads(path.read_text())
+    assert persisted["brightness"] == 80, "brightness update must take effect (positive baseline)"
+    assert persisted["display_color_profile"] == "p3", "scalar forward-compat field must survive"
+    assert persisted["_future_calibration"] == {
+        "white_point": [0.95, 1.0, 1.09],
+        "version": "draft-2026-Q3",
+    }, "object-shaped forward-compat field must survive"
+
+
 def test_legacy_settings_with_web_helper_keys_loads(tmp_path: Path):
     """A settings.json written while the Web slide used an external
     render helper carries web_helper_url / web_helper_token. After the
