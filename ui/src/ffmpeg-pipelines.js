@@ -154,28 +154,37 @@ export function transcodeToH264(
         const { fetchFile } = await _getFfmpegUtil();
         await ff.writeFile(inName, await fetchFile(file));
         onStatus?.("transcoding to H.264 MP4…");
-        await withProgressListener(ff, onProgress, () => ff.exec([
-            "-i", inName,
-            // scale= + force-even-dimensions via the round-down trick; libx264
-            // with yuv420p hates odd dimensions.
-            "-vf", `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-an", // drop audio — signs don't speak
-            outName,
-        ]));
-        onProgress?.(100);
-        const data = await ff.readFile(outName);
-        // Best-effort cleanup — ffmpeg.wasm's virtual FS can accumulate.
         try {
-            await ff.deleteFile(inName);
-            await ff.deleteFile(outName);
-        } catch {
-            // ignore
+            await withProgressListener(ff, onProgress, () => ff.exec([
+                "-i", inName,
+                // scale= + force-even-dimensions via the round-down trick; libx264
+                // with yuv420p hates odd dimensions.
+                "-vf", `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-an", // drop audio — signs don't speak
+                outName,
+            ]));
+            onProgress?.(100);
+            return await ff.readFile(outName);
+        } finally {
+            // Round 25: cleanup ALWAYS runs, even when exec or
+            // readFile throws. Pre-fix the cleanup ran after the
+            // readFile await — a thrown exec (bad codec / corrupt
+            // input / OOM) skipped cleanup and left the input
+            // bytes resident in the singleton ffmpeg.wasm's MEMFS
+            // for the page lifetime. ~5-10 failed 50-100MB
+            // uploads OOM'd the tab.
+            //
+            // Per-file try/catch suppresses the "file not found"
+            // case (outName never created when exec failed before
+            // producing output; inName never created if writeFile
+            // itself threw and we somehow reached here — defensive).
+            try { await ff.deleteFile(inName); } catch { /* not found */ }
+            try { await ff.deleteFile(outName); } catch { /* never created if exec failed */ }
         }
-        return data;
     };
     // Both arms run myJob so a prior job's rejection doesn't wedge
     // the chain. Each caller's awaited promise reflects ITS own job.
