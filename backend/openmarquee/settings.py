@@ -22,6 +22,7 @@ of settings.json instead of inventing its own ad-hoc config path.
 
 import json
 import re
+import secrets
 from pathlib import Path
 from typing import Literal
 
@@ -172,10 +173,17 @@ class SystemSettings(BaseModel):
         default="openMarquee-SETUP",
         description="Access-point SSID (1-32 printable ASCII chars).",
     )
-    # SYSTEM_SPEC §4.1 specifies "openmarquee" as the default passphrase;
-    # Phase 7's first-boot rotation swaps it for a per-device random string.
+    # Per-process random AP passphrase. SYSTEM_SPEC §4.1 originally
+    # specified the literal "openmarquee" as the default + had Phase 7's
+    # first-boot rotation swap it for a per-device random string. Bundle
+    # C item 5 (2026-05-25): a dev-Pi that hasn't run the firstboot
+    # rotation was a free re-auth target within RF range of the literal
+    # default. token_urlsafe(16) closes the residual so the default is
+    # NEVER the literal on any boot path. Production firstboot still
+    # overwrites this with its own per-device persisted random; this
+    # factory only changes the PRE-firstboot exposure window.
     wifi_password: str = Field(
-        default="openmarquee",
+        default_factory=lambda: secrets.token_urlsafe(16),
         description="WPA2 passphrase (8-63 printable ASCII chars).",
     )
 
