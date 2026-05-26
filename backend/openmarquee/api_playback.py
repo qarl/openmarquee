@@ -293,6 +293,18 @@ async def get_loop_stats(loop: LoopDep) -> PythonLoopStats:
     return PythonLoopStats(**loop.get_loop_stats())
 
 
+# r15 (2026-05-26) robustness: cap perf-stats.json read at 64 KB.
+# The emitted JSON is a fixed 12-field shape that serializes to <1 KB
+# in practice (mostly small integers + a couple of f64s). A defensive
+# 64× headroom guards against:
+#   - renderer-side bug emitting an unexpectedly large payload
+#   - file replaced by a non-renderer writer (root-shell mistake, disk
+#     corruption that doubles content, etc.)
+# Without the cap, `path.read_text()` would happily allocate gigabytes
+# into the request handler before Pydantic gets to reject the schema.
+_PERF_STATS_MAX_BYTES = 65536
+
+
 @router.get("/perf/stats", response_model=RendererPerfStats)
 async def get_perf_stats() -> RendererPerfStats:
     """Return the latest perf-stats sidecar emitted by the renderer.
@@ -301,6 +313,8 @@ async def get_perf_stats() -> RendererPerfStats:
       - renderer hasn't emitted its first ipc.soak window yet
         (file missing — first 30s after session start)
       - file unreadable (permissions, FS error)
+      - file exceeds `_PERF_STATS_MAX_BYTES` (defensive cap; the
+        emitted JSON is <1 KB in practice)
       - JSON parse failed (corrupted write — shouldn't happen with the
         atomic-write helper but defended against)
       - schema mismatch (renderer side renamed a field without backend
@@ -308,7 +322,7 @@ async def get_perf_stats() -> RendererPerfStats:
     """
     path = _perf_stats_path()
     try:
-        raw = path.read_text()
+        st = path.stat()
     except FileNotFoundError:
         raise HTTPException(
             status_code=503,
@@ -317,6 +331,27 @@ async def get_perf_stats() -> RendererPerfStats:
                 "(renderer hasn't emitted an ipc.soak window yet)"
             ),
         )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"perf stats sidecar stat failed: {exc}",
+        )
+    if st.st_size > _PERF_STATS_MAX_BYTES:
+        # Defensive cap: refuse to read a file that's larger than
+        # any reasonable renderer emit. The renderer's typical write
+        # is <1 KB; anything past 64 KB is a bug somewhere upstream
+        # OR an attacker-replaced file. Either way we don't want the
+        # handler to allocate it just to find out.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"perf stats sidecar size {st.st_size} bytes exceeds "
+                f"the {_PERF_STATS_MAX_BYTES}-byte cap "
+                "(corrupted or attacker-replaced file)"
+            ),
+        )
+    try:
+        raw = path.read_text()
     except OSError as exc:
         raise HTTPException(
             status_code=503,
