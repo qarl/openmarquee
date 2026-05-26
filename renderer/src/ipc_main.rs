@@ -1269,6 +1269,16 @@ fn run_paint_hook(
     use crate::content::ContentItem;
     use crate::hdmi;
 
+    // perf-night r1.1 hotfix (2026-05-26): IPC mode bypasses the
+    // standalone slide-loop's record_phase/frame_complete wrappers
+    // (those live in hdmi.rs's hold loops, exercised only by
+    // --profile-frames). Without these wrappers, profile_dump only
+    // captured commit_fb's internal phases and frames_remaining never
+    // decremented (auto-end never fired). Wrap each arm here with a
+    // phase tag + frame_complete so an IPC-driven session emits
+    // useful per-frame stats.
+    let t_hook = std::time::Instant::now();
+
     // Move-by-value: destructure resp into an owned OpResult so the
     // success path can re-pack via field-init shorthand without
     // cloning. Previously this took &IpcResponse and returned
@@ -1279,7 +1289,7 @@ fn run_paint_hook(
         // Pass through errors unchanged.
         e @ IpcResponse::Err { .. } => return e,
     };
-    match result {
+    let out = match result {
         OpResult::PaintSlide { slide_id, t_in_slide_ms } => {
             // Clone the borrow shape we need so we can take a
             // mutable borrow on cache.video_decoders later for
@@ -1579,7 +1589,19 @@ fn run_paint_hook(
         }
         // Non-paint OpResults: pass through unchanged.
         other => IpcResponse::Ok { result: other },
+    };
+
+    // perf-night r1.1 hotfix: emit per-IPC-paint phase + advance the
+    // frame budget so capture auto-ends after N frames. Only fires on
+    // Ok results -- error paths don't count toward the budget.
+    if matches!(out, IpcResponse::Ok { .. }) {
+        crate::profile::record_phase(
+            "ipc_paint_total",
+            t_hook.elapsed().as_nanos() as u64,
+        );
+        crate::profile::frame_complete();
     }
+    out
 }
 
 /// Per-request dispatch. Returns the response to emit. State-
