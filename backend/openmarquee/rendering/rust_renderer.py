@@ -616,9 +616,7 @@ class RustRenderer:
         Mutex's critical section is microsecond-scale.
         """
         if int(frames) <= 0:
-            raise RustRendererOpError(
-                f"profile_start: frames must be > 0 (got {frames!r})"
-            )
+            raise RustRendererOpError(f"profile_start: frames must be > 0 (got {frames!r})")
         self._send_op("profile_start", {"frames": int(frames)})
 
     def profile_dump(self) -> str:
@@ -634,9 +632,7 @@ class RustRenderer:
         """
         body = self._send_op("profile_dump", None)
         if body is None or "text" not in body:
-            raise RustRendererProtocolError(
-                f"ProfileDump OK response missing text: {body!r}"
-            )
+            raise RustRendererProtocolError(f"ProfileDump OK response missing text: {body!r}")
         return str(body["text"])
 
     def close(self) -> None:

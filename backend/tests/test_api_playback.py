@@ -332,9 +332,7 @@ def test_perf_start_rejects_too_many_frames(client: TestClient):
     assert response.status_code == 422  # Pydantic le=100_000 violation
 
 
-def test_perf_round_trip_with_profile_capable_renderer(
-    storage: ContentStorage, tmp_path: Path
-):
+def test_perf_round_trip_with_profile_capable_renderer(storage: ContentStorage, tmp_path: Path):
     """Wire-shape test: profile_start forwards frames to the renderer;
     profile_dump returns text + a derived `ready` flag (True when
     `frames_remaining=0` substring is present)."""
