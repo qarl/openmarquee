@@ -14,7 +14,7 @@
 // this file -- vitest 1.6's parser picks it up from inside `//`
 // comments + backtick spans + would trigger jsdom loading, which is
 // not needed here since resolvePanelDims touches no DOM).
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Stub the api.js imports resolvePanelDims uses. Other api.js exports
 // stay live via importOriginal so main.js's top-level imports don't
@@ -51,6 +51,27 @@ const SAMPLE_SETTINGS = {
     display_rotation: 90,
     brightness: 65,
 };
+
+// r11 (2026-05-26): pre-warm main.js's module cache to dodge the
+// cold-load tax on the FIRST it() in this describe. main.js +
+// transitive imports (~1500 LOC across api.js / dialog.js /
+// editor.js / image-upload.js / etc.) cold-loads inside vitest's
+// default 5s per-test timeout window — under full-suite load on
+// the Mac dev box, the first `await import("./main.js")` blows
+// past the budget and the first it fails with a timeout. Every
+// subsequent test hits the module cache; only the first
+// it pays the cold-load. Hoisting the import to beforeAll
+// (default 10s+ budget) amortizes the cost across the describe
+// without bumping any per-test timeout.
+//
+// vi.mock hoists ABOVE this beforeAll, so the api.js + auto-
+// format.js stubs are in place when the pre-warm import resolves.
+// Per-test mockResolvedValue / mockReturnValue updates still work
+// normally; they tweak the mock's return value, not the mock
+// module identity.
+beforeAll(async () => {
+    await import("./main.js");
+});
 
 beforeEach(() => {
     vi.clearAllMocks();

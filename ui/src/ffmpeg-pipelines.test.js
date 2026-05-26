@@ -8,6 +8,35 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+// r11 (2026-05-26): replace clock-poll-as-side-effect-proxy with a
+// deadline-bounded side-effect poll. The 4 sites below previously
+// used fixed-iteration `for (i = 0; i < N; i++) await
+// setTimeout(0)` to wait for a mock side-effect (listener
+// attachment, exec push). Under full-suite load on the Mac dev box,
+// vitest's per-test environment slows past N microtask hops and
+// the assertion fires before the side-effect lands. Same anti-
+// pattern shape as r9's pytest fix (02a08fa: clock-poll vs side-
+// effect-await); same fix shape ported to JS.
+//
+// Returns true iff `predicate()` evaluated truthy within the
+// timeout window. Caller asserts the truth value AND the side-
+// effect — the latter gives the post-mortem the right diagnostic
+// shape (which mock field was null) on a real regression. 5ms
+// poll cadence avoids busy-wait at sub-microtask precision; 1s
+// outer deadline absorbs jitter while keeping a true regression
+// fast-to-fail (vs. silently chewing the 5s test timeout).
+async function waitForCondition(
+    predicate,
+    { timeoutMs = 1000, intervalMs = 5 } = {},
+) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (predicate()) return true;
+        await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    return Boolean(predicate());
+}
+
 // --- @ffmpeg/ffmpeg + @ffmpeg/util mocks ----------------------------------
 // The mocked FFmpeg instance records writeFile/exec/readFile/
 // deleteFile calls and exposes the .on('progress', ...) listener
@@ -220,12 +249,14 @@ describe("transcodeToH264", () => {
             { onProgress },
         );
 
-        // Drain microtasks until the listener attaches. Batch 7.4
-        // made the FFmpeg + util imports dynamic, adding ~2 extra
-        // microtask hops before instance.on() runs.
-        for (let i = 0; i < 20 && !ffmpegState.progressListener; i++) {
-            await new Promise(r => setTimeout(r, 0));
-        }
+        // r11: wait for the listener to attach. Batch 7.4 made the
+        // FFmpeg + util imports dynamic; under suite load the
+        // attachment can take more than the original fixed 20
+        // microtask hops. waitForCondition with a 1s deadline
+        // eliminates the race surface vs the old fixed-iteration
+        // poll. See helper at the top of this file for rationale.
+        const attached = await waitForCondition(() => ffmpegState.progressListener);
+        expect(attached).toBe(true);
         expect(ffmpegState.progressListener).toBeTypeOf("function");
 
         ffmpegState.progressListener({ progress: 0.5 });
@@ -277,9 +308,11 @@ describe("transcodeToH264", () => {
             { file: new Blob([]), width: 320, height: 240 },
             { onProgress },
         );
-        for (let i = 0; i < 20 && !ffmpegState.progressListener; i++) {
-            await new Promise(r => setTimeout(r, 0));
-        }
+        // r11: deadline-bounded side-effect-await (helper at top
+        // of file); same rationale as the listener-attach wait
+        // above.
+        await waitForCondition(() => ffmpegState.progressListener);
+        expect(ffmpegState.progressListener).toBeTypeOf("function");
         ffmpegState.progressListener({ progress: 0.3 });  // throws, swallowed
         releaseExec();
 
@@ -382,12 +415,13 @@ describe("transcodeToH264 serialization (r24)", () => {
             width: 320, height: 240,
         });
 
-        // Drain microtasks until the mock instance is loaded + A's
-        // exec is queued. The Batch 7.4 dynamic-import hops add a
-        // few extra microtasks before the exec push lands.
-        for (let i = 0; i < 30 && (!ffmpegState.instance || ffmpegState.instance.calls.exec.length === 0); i++) {
-            await new Promise((r) => setTimeout(r, 0));
-        }
+        // r11: wait for the mock instance + A's exec to be queued.
+        // Replaces fixed 30-iteration microtask poll which flaked
+        // under suite load when the Batch 7.4 dynamic-import hops
+        // exceeded the budget. See waitForCondition helper at top.
+        await waitForCondition(
+            () => ffmpegState.instance && ffmpegState.instance.calls.exec.length > 0,
+        );
         const ff = ffmpegState.instance;
         expect(ff.calls.exec).toHaveLength(1);
         expect(ff.calls.writeFile).toHaveLength(1);
@@ -398,10 +432,18 @@ describe("transcodeToH264 serialization (r24)", () => {
             width: 320, height: 240,
         });
 
-        // Drain more microtasks. B's writeFile + exec should NOT have
-        // run yet — serialization keeps B waiting on A's chain link.
-        for (let i = 0; i < 30; i++) {
-            await new Promise((r) => setTimeout(r, 0));
+        // r11: spin the microtask queue for a bounded window to
+        // PROVE B's writeFile + exec did NOT run (negative-result
+        // wait — predicate stays false through the whole window).
+        // Different shape than the positive-result waits above:
+        // here we're confirming the absence of a side-effect by
+        // exhausting the queue. 100ms is well past any reasonable
+        // mock-resolution latency under suite load + matches the
+        // "30 microtask hops" original intent without the
+        // hop-count cliff.
+        const negativeWindowEnd = Date.now() + 100;
+        while (Date.now() < negativeWindowEnd) {
+            await new Promise((r) => setTimeout(r, 5));
         }
         expect(ff.calls.exec).toHaveLength(1);  // only A's
         expect(ff.calls.writeFile).toHaveLength(1);  // only A's
