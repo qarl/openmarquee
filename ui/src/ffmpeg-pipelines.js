@@ -161,8 +161,55 @@ export function transcodeToH264(
                 // with yuv420p hates odd dimensions.
                 "-vf", `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
                 "-c:v", "libx264",
+                // Perf-night r4 (2026-05-26): VPU-friendly profile.
+                // Pi Zero 2 W VC4 hardware H.264 decoder (v4l2 path,
+                // renderer/src/v4l2.rs + video_decode.rs) is happiest
+                // on Baseline-profile content. Renderer's hand-rolled
+                // mp4_demux.rs:6 documents the same expectation:
+                // "baseline-profile H.264 video authored by ffmpeg's
+                // libx264 output". libx264's CRF default lands at
+                // High profile, which the decoder accepts but with
+                // higher per-frame cost (CABAC entropy decode +
+                // 8x8 DCT). Baseline drops both.
+                "-profile:v", "baseline",
+                // Cap level at 4.0. libx264 would otherwise pick a
+                // level matching dims+bitrate (can land at 4.2+ on
+                // borderline content); 4.2+ stresses the VC4 chip's
+                // decode budget. 4.0 is the documented Pi Zero 2 W
+                // comfort zone for 1080p30.
+                "-level", "4.0",
                 "-preset", "veryfast",
                 "-crf", "23",
+                // Zero B-frames. libx264's default `bframes=3` blows
+                // up the VC4 decoder's reference-frame buffer pool at
+                // 1080p — visible as decoder stalls under motion-
+                // heavy content. The Baseline profile already
+                // disallows B-frames, but the explicit `-bf 0` is
+                // belt-and-suspenders + makes the intent obvious to
+                // a future reader who might switch to Main.
+                "-bf", "0",
+                // GOP = 30 frames = 1 second at 30fps. libx264's
+                // default `keyint=250` (8.3s) means a seek/cut/glitch
+                // needs up to 8s to re-sync. The renderer's playback
+                // model does pre-roll on slide transitions, so a
+                // short GOP keeps that pre-roll cheap.
+                "-g", "30",
+                // Cap output to 30fps. Source may be 60fps (phone
+                // video); the Pi VPU can decode 1080p30 comfortably
+                // but 1080p60 lives on the edge of the documented
+                // budget. Frame-rate down-conversion in ffmpeg is
+                // cheap (frame drop) compared with the decoder
+                // savings on the Pi.
+                "-r", "30",
+                // Cap peak bitrate at 8 Mbps + a 16 Mbps VBV buffer.
+                // CRF-only encoding can spike to 12+ Mbps on motion-
+                // heavy content — past the VC4's comfortable
+                // sustained-decode bitrate. The cap is invisible on
+                // typical signage content (logos / talking-head /
+                // simple animations) but kicks in on the worst-case
+                // fast-motion uploads.
+                "-maxrate", "8M",
+                "-bufsize", "16M",
                 "-pix_fmt", "yuv420p",
                 "-an", // drop audio — signs don't speak
                 outName,

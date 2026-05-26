@@ -151,6 +151,51 @@ describe("transcodeToH264", () => {
         expect(args.find(a => a.startsWith("scale=1920:1080"))).toBeTruthy();
     });
 
+    // Perf-night r4 (2026-05-26): VPU-friendly preset pin. Each flag
+    // pinned here is rationalized in ffmpeg-pipelines.js's transcodeToH264
+    // body; the test catches an accidental flag removal that would
+    // re-introduce VPU-stalling output.
+    it("emits VPU-friendly H.264 flags (baseline / level 4.0 / bf=0 / g=30 / r=30 / maxrate 8M)", async () => {
+        const { transcodeToH264 } = await import("./ffmpeg-pipelines.js");
+        await transcodeToH264({
+            file: new Blob(["fake mp4"], { type: "video/mp4" }),
+            width: 1920,
+            height: 1080,
+        });
+        const args = ffmpegState.instance.calls.exec[0];
+
+        // Baseline profile — Pi VC4 decoder's documented comfort zone
+        // (mp4_demux.rs:6 + renderer/src/v4l2.rs).
+        expect(args).toContain("-profile:v");
+        expect(args[args.indexOf("-profile:v") + 1]).toBe("baseline");
+
+        // Level 4.0 — caps the decoder's per-frame budget at the
+        // documented Pi Zero 2 W ceiling for 1080p30.
+        expect(args).toContain("-level");
+        expect(args[args.indexOf("-level") + 1]).toBe("4.0");
+
+        // No B-frames — VC4's reference-frame buffer pool stalls
+        // under bframes>=1 at 1080p (libx264 default is 3).
+        expect(args).toContain("-bf");
+        expect(args[args.indexOf("-bf") + 1]).toBe("0");
+
+        // 1s GOP at 30fps — keeps slide-transition pre-roll cheap.
+        expect(args).toContain("-g");
+        expect(args[args.indexOf("-g") + 1]).toBe("30");
+
+        // 30fps cap — VC4 sustains 1080p30 cleanly; 1080p60 from
+        // phone uploads is at the edge of the budget.
+        expect(args).toContain("-r");
+        expect(args[args.indexOf("-r") + 1]).toBe("30");
+
+        // 8 Mbps peak / 16 Mbps VBV buffer — caps motion-heavy
+        // content from spiking past the VC4's sustained-decode rate.
+        expect(args).toContain("-maxrate");
+        expect(args[args.indexOf("-maxrate") + 1]).toBe("8M");
+        expect(args).toContain("-bufsize");
+        expect(args[args.indexOf("-bufsize") + 1]).toBe("16M");
+    });
+
     it("calls onStatus with the transcoding phase message", async () => {
         const { transcodeToH264 } = await import("./ffmpeg-pipelines.js");
         const onStatus = vi.fn();
