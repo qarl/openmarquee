@@ -480,6 +480,43 @@ pub struct EglSession<'a> {
     /// the natural blocking point is when we WANT to advance, not
     /// when we just told the kernel "go."
     flip_pending: bool,
+    /// `[perf]` r1 (2026-05-26): timestamp of the most-recent
+    /// successful commit. `commit_fb` stamps this after every
+    /// successful present (SetCrtc OR page_flip path), then on
+    /// the NEXT call consults `frame_pacing::over_budget_ms` to
+    /// detect deadline misses (delta > 36ms at 30fps target).
+    /// `None` on the very first commit of the session (no prior
+    /// baseline) — first-frame is skipped from observation.
+    /// Field is private; mutation is funneled through
+    /// `record_present` so the bookkeeping invariants stay
+    /// co-located. Read via accessor on the impl block.
+    last_present_at: Option<std::time::Instant>,
+    /// `[perf]` r1: session-cumulative count of commits with a
+    /// non-`None` `last_present_at` baseline (i.e. excluding
+    /// frame 0). Paired with `frames_over_budget_total` so the
+    /// IPC summary emitter can report the rate.
+    frames_observed_total: u64,
+    /// `[perf]` r1: session-cumulative count of commits whose
+    /// delta-from-prior-present exceeded `FRAME_BUDGET_MS`.
+    /// Monotonically non-decreasing across the session lifetime;
+    /// surfaced via the IPC summary every 30s.
+    frames_over_budget_total: u64,
+    /// `[perf]` r1: rate-limit gate for the `[perf] frame over
+    /// budget` warn-log. If the device is fully wedged and missing
+    /// every frame, the counter still increments every frame but
+    /// the warn fires at most once per second (cf. the dispatch's
+    /// "don't spam 100x/s" hard rule). `None` before the first
+    /// over-budget event.
+    last_over_budget_warn_at: Option<std::time::Instant>,
+    /// `[perf]` r1: IPC-dispatcher-set hint indicating whether
+    /// the most-recent paint hook ran a transition (true) or
+    /// a slide (false). Standalone non-IPC render paths don't
+    /// touch this field — it stays `false`. Logged inside the
+    /// rate-limited warn so operators can differentiate
+    /// "video glitching" from "transition heavy" without needing
+    /// per-slide context threaded through `commit_fb` (Option A
+    /// per QA's r1 decision). Mutated via `set_in_transition`.
+    in_transition: bool,
 }
 
 /// v1-spec-delta #5 (slice a) -- bring up GBM + EGL + GLES2,
@@ -640,6 +677,14 @@ where
         rotation,
         modeset_done: false,
         flip_pending: false,
+        // `[perf]` r1: missed-deadline counter state. last_present_at
+        // = None means "first commit has no baseline" — first frame
+        // is skipped from the over-budget check. Counters start at 0.
+        last_present_at: None,
+        frames_observed_total: 0,
+        frames_over_budget_total: 0,
+        last_over_budget_warn_at: None,
+        in_transition: false,
         image_bg_cache: ImageBgCache::with_capacity(IMAGE_BG_CACHE_CAPACITY),
         image_slide_tex_cache: crate::image_slide_tex::ImageSlideTextureCache::with_capacity(
             crate::image_slide_tex::IMAGE_SLIDE_TEX_CACHE_CAPACITY,
@@ -1030,6 +1075,11 @@ fn commit_fb(
             t_setcrtc.elapsed().as_nanos() as u64,
         );
         session.modeset_done = true;
+        // `[perf]` r1: stamp the present time so the next frame's
+        // delta has a baseline. First-frame is skipped from the
+        // over-budget check (record_present's `if let Some(prev)`
+        // guard handles that).
+        session.record_present(std::time::Instant::now());
         return Ok(());
     }
 
@@ -1059,6 +1109,11 @@ fn commit_fb(
         t_pageflip.elapsed().as_nanos() as u64,
     );
     session.flip_pending = true;
+    // `[perf]` r1: every successful page_flip is a "present" from
+    // the renderer's perspective (the kernel scans the new FB on
+    // the next vblank, modulo the ASYNC flip tear-window). Stamp
+    // here so the NEXT commit_fb measures the inter-present delta.
+    session.record_present(std::time::Instant::now());
     Ok(())
 }
 
@@ -5498,6 +5553,71 @@ impl<'a> EglSession<'a> {
     /// own from a call-local clock.
     pub fn motion_tick_seconds(&self) -> f64 {
         self.session_start.elapsed().as_secs_f64()
+    }
+
+    /// `[perf]` r1 (2026-05-26): per-commit deadline-miss bookkeeping.
+    /// Called from `commit_fb` after every successful commit (both
+    /// the SetCrtc and page_flip branches). Steady-state cost is one
+    /// subtract + one millisecond cast + one compare — sub-µs.
+    ///
+    /// On the very first commit (`last_present_at.is_none()`) we
+    /// just seed the baseline; the over-budget check is skipped
+    /// because there's no prior frame to diff against. The warn-log
+    /// is rate-limited to at most once per second so a fully-wedged
+    /// device missing every frame doesn't spam the journal — the
+    /// counter still increments every frame, so the IPC summary
+    /// emitter sees the true rate.
+    fn record_present(&mut self, now: std::time::Instant) {
+        if let Some(prev) = self.last_present_at {
+            self.frames_observed_total = self.frames_observed_total.saturating_add(1);
+            if let Some(delta_ms) = crate::frame_pacing::over_budget_ms(
+                prev, now, crate::frame_pacing::FRAME_BUDGET_MS,
+            ) {
+                self.frames_over_budget_total =
+                    self.frames_over_budget_total.saturating_add(1);
+                let should_log = self
+                    .last_over_budget_warn_at
+                    .map(|t| now.saturating_duration_since(t).as_secs() >= 1)
+                    .unwrap_or(true);
+                if should_log {
+                    eprintln!(
+                        "[perf] frame over budget: delta_ms={} in_transition={} over_budget_total={} observed_total={}",
+                        delta_ms,
+                        self.in_transition,
+                        self.frames_over_budget_total,
+                        self.frames_observed_total,
+                    );
+                    self.last_over_budget_warn_at = Some(now);
+                }
+            }
+        }
+        self.last_present_at = Some(now);
+    }
+
+    /// `[perf]` r1: IPC-dispatcher hint setter for the per-warn
+    /// in_transition flag. Set once per paint hook (before
+    /// run_paint_hook fires) so the over-budget log on the
+    /// FOLLOWING `commit_fb` sees the right value. Standalone
+    /// non-IPC render paths never touch this — the field stays
+    /// `false`, which is the correct "unknown / not-a-transition"
+    /// default for the warn log.
+    pub fn set_in_transition(&mut self, in_transition: bool) {
+        self.in_transition = in_transition;
+    }
+
+    /// `[perf]` r1: snapshot accessors for the IPC summary
+    /// emitter. Returns the current cumulative counters at
+    /// snapshot time. The summary emitter diffs against its
+    /// previous snapshot to compute per-window over-budget rate
+    /// (mirroring the existing window-vs-session split for
+    /// frames/transitions).
+    pub fn frames_observed_total(&self) -> u64 {
+        self.frames_observed_total
+    }
+
+    /// See [`Self::frames_observed_total`].
+    pub fn frames_over_budget_total(&self) -> u64 {
+        self.frames_over_budget_total
     }
 
     /// FYS bug 5 -- the PHYSICAL panel dims (the scanout buffer
