@@ -409,18 +409,22 @@ async def get_perf_stats() -> RendererPerfStats:
     try:
         st = path.stat()
     except FileNotFoundError:
+        # `from None`: the missing-file case is operator-expected
+        # (first 30s of session before the renderer's first ipc.soak
+        # emit). Suppress the FileNotFoundError chain so the response
+        # body stays clean.
         raise HTTPException(
             status_code=503,
             detail=(
                 "perf stats sidecar not yet written "
                 "(renderer hasn't emitted an ipc.soak window yet)"
             ),
-        )
+        ) from None
     except OSError as exc:
         raise HTTPException(
             status_code=503,
             detail=f"perf stats sidecar stat failed: {exc}",
-        )
+        ) from exc
     if st.st_size > _PERF_STATS_MAX_BYTES:
         # Defensive cap: refuse to read a file that's larger than
         # any reasonable renderer emit. The renderer's typical write
@@ -441,18 +445,18 @@ async def get_perf_stats() -> RendererPerfStats:
         raise HTTPException(
             status_code=503,
             detail=f"perf stats sidecar read failed: {exc}",
-        )
+        ) from exc
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise HTTPException(
             status_code=503,
             detail=f"perf stats sidecar parse failed: {exc}",
-        )
+        ) from exc
     try:
         return RendererPerfStats(**data)
     except ValidationError as exc:
         raise HTTPException(
             status_code=503,
             detail=f"perf stats sidecar schema mismatch: {exc}",
-        )
+        ) from exc
