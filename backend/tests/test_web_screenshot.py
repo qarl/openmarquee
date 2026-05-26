@@ -274,3 +274,73 @@ async def test_success_clears_the_failure_throttle(tmp_path, monkeypatch, caplog
     with caplog.at_level(logging.DEBUG, logger="openmarquee.web_screenshot"):
         await fetch_web_screenshot(slide, storage, 1360, 768)
     assert any(r.levelno == logging.WARNING and "down again" in r.message for r in caplog.records)
+
+
+# r12 (2026-05-26) memory audit: the throttle map went from bare
+# `set` to `dict[UUID, float]` + TTL prune-on-access. These tests
+# pin the new bounding behavior so a future refactor that drops
+# the prune resurrects the leak.
+
+
+def test_failed_slide_throttle_prunes_entries_older_than_ttl(monkeypatch):
+    """Entries with a timestamp older than _FAILED_SLIDE_TTL_SECONDS
+    drop from the throttle map on the next prune call. Pre-r12 the
+    set was unbounded; failing slides accumulated entries forever."""
+    import time as _real_time
+
+    # Seed the throttle map with 3 entries: 2 stale (older than the
+    # TTL), 1 fresh. _prune_failed_slide_ids should drop the 2.
+    now = 1_000_000.0
+    ttl = web_screenshot._FAILED_SLIDE_TTL_SECONDS
+    stale_a = uuid.uuid4()
+    stale_b = uuid.uuid4()
+    fresh = uuid.uuid4()
+    web_screenshot._failed_slide_ids[stale_a] = now - ttl - 1
+    web_screenshot._failed_slide_ids[stale_b] = now - ttl - 60
+    web_screenshot._failed_slide_ids[fresh] = now - ttl + 60  # within TTL
+
+    web_screenshot._prune_failed_slide_ids(now=now)
+
+    assert stale_a not in web_screenshot._failed_slide_ids
+    assert stale_b not in web_screenshot._failed_slide_ids
+    assert fresh in web_screenshot._failed_slide_ids
+
+
+@pytest.mark.asyncio
+async def test_failed_slide_throttle_refreshes_timestamp_on_repeated_failure(
+    tmp_path, monkeypatch
+):
+    """A repeat failure for the SAME id refreshes the timestamp,
+    keeping the entry within the TTL window. This is the
+    'persistently broken slide stays throttled' contract — without
+    the refresh, a long-broken slide would WARN every TTL period.
+
+    Pin the refresh by stamping a fake `time.monotonic()` so the
+    test doesn't depend on real wall-clock + verify the entry's
+    timestamp moves forward across two failures."""
+    storage = ContentStorage(tmp_path)
+    slide = _web_slide()
+    storage.save_web(slide)
+
+    fake_clock = [1000.0]
+    monkeypatch.setattr(
+        web_screenshot.time, "monotonic", lambda: fake_clock[0]
+    )
+    _install_render(monkeypatch, raise_exc=WebRenderError("down"))
+
+    # First failure at t=1000.
+    await fetch_web_screenshot(slide, storage, 1360, 768)
+    t1 = web_screenshot._failed_slide_ids[slide.id]
+    assert t1 == 1000.0
+
+    # Second failure at t=2000 — entry should refresh, not duplicate.
+    fake_clock[0] = 2000.0
+    await fetch_web_screenshot(slide, storage, 1360, 768)
+    t2 = web_screenshot._failed_slide_ids[slide.id]
+    assert t2 == 2000.0
+    assert t2 > t1
+    # Map size stays at 1 across both failures (refresh, not append).
+    assert len(web_screenshot._failed_slide_ids) == 1
+
+
+import uuid  # noqa: E402  (bottom to avoid disturbing existing import order)

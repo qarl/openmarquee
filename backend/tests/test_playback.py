@@ -1226,6 +1226,51 @@ async def test_web_last_fetch_pruned_when_slide_leaves_playlist(renderer):
 
 
 @pytest.mark.asyncio
+async def test_prune_web_tracking_drops_entries_older_than_24h(renderer):
+    """r12 (2026-05-26) memory audit: _prune_web_tracking now ALSO
+    drops entries older than 24h, even if the slide is still in the
+    playlist. The original playlist-only prune leaks under playlist
+    churn — entries persist across different playlists keyed by the
+    same slide id. With the time-based prune, the dict is bounded
+    to a 24h sliding window regardless.
+
+    Pin the contract: an entry with a timestamp > 24h ago is
+    removed by _prune_web_tracking even when its slide id IS in
+    the current playlist.
+
+    Test is async so `asyncio.get_event_loop()` reads the running
+    loop (Python 3.11+: no deprecation; 3.14+ future-safe). The
+    production prune at playback.py:_prune_web_tracking uses the
+    same `asyncio.get_event_loop().time()` clock; both ends agree."""
+    web = WebSlide(
+        name="long-lived",
+        url="https://h/x",
+        duration_ms=_FAST_DURATION_MS,
+        refresh_interval_s=10,
+    )
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [web],
+        read_asset=lambda _id: _png_bytes(8, 8, (1, 2, 3)),
+    )
+    # Seed the tracking dict directly with a stale timestamp (25h
+    # ago). asyncio.get_event_loop().time() returns the running
+    # event-loop's monotonic clock — the same clock production's
+    # prune reads.
+    now = asyncio.get_event_loop().time()
+    loop._web_last_fetch[web.id] = now - 25 * 3600  # 25h ago
+
+    # Slide is still in the playlist — the playlist-only prune
+    # would KEEP this entry. The time-based prune drops it.
+    loop._prune_web_tracking([web])
+
+    assert web.id not in loop._web_last_fetch, (
+        "_prune_web_tracking should drop entries older than 24h even "
+        "when the slide is still in the playlist (r12 time-based prune)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_inflight_id_not_pruned_when_slide_leaves_playlist(renderer):
     """C3/M1: a Web slide id whose fetch is still IN FLIGHT must NOT be
     pruned from _web_inflight even after it leaves the playlist —

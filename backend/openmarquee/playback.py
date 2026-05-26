@@ -928,8 +928,26 @@ class PlaybackLoop:
         if not self._web_last_fetch:
             return
         current_ids = {item.id for item in items}
+        # Playlist-pruned (original C3/M1 semantic): drop entries for
+        # ids no longer in the playlist.
         stale = self._web_last_fetch.keys() - current_ids
         for slide_id in stale:
+            del self._web_last_fetch[slide_id]
+        # r12 (2026-05-26) memory audit follow-up: ALSO prune by time.
+        # The playlist-only prune above leaks under playlist churn —
+        # if an operator rotates through different playlists weekly,
+        # each playlist's slide ids land in _web_last_fetch and only
+        # get removed when a NEW playlist evicts them via current_ids
+        # subtraction. Sub-1MB/year under realistic churn (audit-
+        # tagged SLOW LEAK), but architecturally unbounded. Adding a
+        # 24h-TTL prune bounds the dict regardless of playlist churn:
+        # an entry whose slide was last fetched > 24h ago is dropped.
+        # A re-added slide whose entry expired re-populates on next
+        # web_refresh_due check via the missing-key=None path (line
+        # 916-917 comment above) — correct semantic.
+        cutoff = asyncio.get_event_loop().time() - 24 * 60 * 60
+        expired = [k for k, t in self._web_last_fetch.items() if t < cutoff]
+        for slide_id in expired:
             del self._web_last_fetch[slide_id]
 
     async def _play_via_rust_ipc(
