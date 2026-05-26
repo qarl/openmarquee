@@ -252,7 +252,21 @@ async def test_schedule_switch_preempts_running_playlist(renderer):
 @pytest.mark.asyncio
 async def test_fetch_items_raising_does_not_kill_the_loop(renderer):
     """An exception from fetch_items shouldn't terminate playback —
-    the loop should treat the iteration as empty and try again."""
+    the loop should treat the iteration as empty and try again.
+
+    r9 (2026-05-26) flake fix: pre-fix used `await asyncio.sleep(0.1)`
+    as the wait-for-recovery boundary, which assumes 3 fetch_items
+    calls + 2×10ms empty-polls + 1 paint fit inside 100ms. Under
+    full-backend-suite load on the Mac dev box, asyncio scheduling
+    jitter stretches each empty-poll's `_wait` past the budget and
+    the assertion fired before the recovery paint happened. The fix
+    polls for the side effect (calls["n"] >= 3 AND
+    renderer.last_frame is not None) with a generous outer timeout
+    — completes as soon as the recovery is observable, but doesn't
+    falsely fail under jitter. See r9 commit body for the full
+    rationale; cost was 3 --no-verify slips on code1's r1 push chain
+    tonight.
+    """
     calls = {"n": 0}
 
     def flaky_fetch():
@@ -271,10 +285,33 @@ async def test_fetch_items_raising_does_not_kill_the_loop(renderer):
         read_asset=lambda _id: flaky_fetch.png,
     )
     await loop.start()
-    await asyncio.sleep(0.1)  # several poll iterations including failures
-    await loop.stop()
+    try:
+        # Wait for the recovery cycle to complete: 3 fetch_items calls
+        # (2 raise + 1 success) AND a paint that populates
+        # renderer.last_frame. 1s outer timeout is the regression
+        # guard — if the loop genuinely fails to recover (a real bug),
+        # the test still fails with a useful AssertionError; under
+        # any healthy environment the recovery is observable in
+        # ~30-50ms regardless of how long pytest's full-suite jitter
+        # stretches each sleep slice.
+        deadline = asyncio.get_event_loop().time() + 1.0
+        while asyncio.get_event_loop().time() < deadline:
+            if calls["n"] >= 3 and renderer.last_frame is not None:
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError(
+                "playback loop did not recover within 1s: "
+                f"calls={calls['n']} "
+                f"last_frame={'set' if renderer.last_frame is not None else 'None'}"
+            )
+    finally:
+        await loop.stop()
 
-    # The loop survived the failures and ultimately rendered.
+    # The loop survived the failures and ultimately rendered. These
+    # assertions are now redundant in the happy path (the while-loop
+    # already required them to break) but stay for documentation +
+    # to lock the post-stop state.
     assert calls["n"] >= 3
     assert renderer.last_frame is not None
 
