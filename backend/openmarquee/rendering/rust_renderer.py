@@ -889,10 +889,33 @@ class RustRenderer:
             # draining; they don't block the main IPC pipe.
             log.debug("stderr drainer exited", exc_info=True)
 
-    # TODO(slice 2): wrap _send_op calls in asyncio.to_thread() (or run
-    # via a dedicated executor) when the proxy is consumed from FastAPI
-    # request handlers. The blocking readline() will wedge the event loop
-    # otherwise.
+    # r4 + r5 + r6 (2026-05-26 perf-night) RESOLVED. The original
+    # TODO at this site flagged that `_send_op`'s blocking
+    # `subprocess.stdout.readline()` would wedge the asyncio event
+    # loop when called from an async caller. The wraps now live at
+    # every known async-context callsite (search via filename +
+    # method name; literal line refs go stale fast):
+    #
+    #   playback.py::_play_via_rust_ipc        begin_slide       (r4 d356587)
+    #   playback.py::_play_via_rust_ipc        advance × 2       (r4 — slide + transition windows)
+    #   playback.py::_play_via_rust_ipc        begin_transition  (r4)
+    #   playback.py::_play_stream_slide        render_frame      (r5 44b013e — stream pump)
+    #   playback.py::_play_stream_slide        end_external_frames (r5 — takedown)
+    #   playback.py::_apply_stream_on_unreachable end_external_frames (r5 — unreachable fallback)
+    #   playback.py::_apply_stream_on_unreachable render_frame   (r5 — unreachable black-paint)
+    #   live.py::_pump                          render_frame      (r6 66d9964 — live-takeover pump)
+    #   live.py::_pump                          end_external_frames (r6 — live-takeover takedown)
+    #   api_settings.py::set_settings           reopen            (pre-r4)
+    #   playback.py::_capture_current_frame_sync capture (via outer await asyncio.to_thread) (pre-r4)
+    #
+    # `_send_op` itself stays sync (the API surface is unchanged); the
+    # caller-side wraps push the blocking readline onto an executor
+    # worker so the asyncio event loop stays responsive.
+    #
+    # The r6 AST walker (tests/test_async_sync_audit.py) pins the
+    # property: any future `async def` adding a bare call to one of
+    # these IPC methods on a known renderer-receiver trips CI with a
+    # pointer to the canonical r4/r5 pattern.
     def _send_op(
         self,
         op: str,
