@@ -15,6 +15,7 @@
 import { apiFetch } from "./api.js";
 import { attachAutoSave } from "./auto-save.js";
 import { listTimezones, US_COMMON_TIMEZONES } from "./iana-timezones.js";
+import { mountPerfHistogramControl } from "./perf-histogram.js";
 
 const OUTPUT_MODES = [
     { value: "hdmi", label: "HDMI" },
@@ -285,6 +286,16 @@ const SECTION_TEMPLATE = `
                     Floats a small panel in the corner with the renderer's last 30s window stats.
                     Threshold-coded color: green &lt;5%, yellow &lt;15%, red &gt;=15% frames over the 30fps budget.
                 </p>
+                <!-- Perf-night r8 (2026-05-26, r2.5 follow-up): phase
+                     histogram capture button. Mounts independently of
+                     the corner-overlay toggle (operator may want to
+                     capture without showing the overlay). The output
+                     <pre> is rendered inline in this card rather than
+                     in the corner overlay: ~30 lines of histogram text
+                     are too big for the corner widget. Backed by
+                     code1's /api/playback/perf/start + dump endpoints
+                     (commit dbca3e2 on origin/main). -->
+                <div class="settings-perf-histogram-slot" style="margin-top: 12px;"></div>
             </div>
 
             <div class="om-card settings-operator-password">
@@ -687,6 +698,22 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     }
     wirePerfOverlayToggle();
 
+    // Perf-night r8 (r2.5 follow-up): mount the histogram capture
+    // control inside the Diagnostics card. Independent of the
+    // perf-overlay toggle — operator can capture a histogram
+    // without showing the corner overlay. Handle stored at
+    // module-scope so a Settings panel un-mount destroys it
+    // cleanly.
+    let perfHistogramHandle = null;
+    function wirePerfHistogramControl() {
+        const slot = container.querySelector(".settings-perf-histogram-slot");
+        if (!slot) return;
+        perfHistogramHandle = mountPerfHistogramControl({
+            container: slot,
+        });
+    }
+    wirePerfHistogramControl();
+
     async function refresh() {
         statusEl.textContent = "";
         try {
@@ -1051,6 +1078,14 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             if (tickTimer !== null) {
                 clearInterval(tickTimer);
                 tickTimer = null;
+            }
+            // Perf-night r8: tear down the histogram capture control
+            // so any in-flight fetch is aborted + the DOM is cleaned.
+            // The control's own destroy() is idempotent; clearing the
+            // handle prevents a second destroy() call from re-entering.
+            if (perfHistogramHandle !== null) {
+                perfHistogramHandle.destroy();
+                perfHistogramHandle = null;
             }
         },
     };

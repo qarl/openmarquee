@@ -825,4 +825,43 @@ describe("mountSettings", () => {
             document.removeEventListener("openmarquee:perf-overlay-toggle", listener);
         }
     });
+
+    // Perf-night r8 (r2.5 follow-up): histogram capture control
+    // mounts inside the Diagnostics card.
+
+    it("perf-histogram capture button mounts in the Diagnostics card", async () => {
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        // The Diagnostics card carries both the perf-overlay toggle
+        // AND the histogram capture control's slot.
+        const card = container.querySelector(".settings-perf-overlay");
+        expect(card).not.toBeNull();
+        const slot = card.querySelector(".settings-perf-histogram-slot");
+        expect(slot).not.toBeNull();
+        // mountPerfHistogramControl populates the slot with the
+        // perf-histogram root element.
+        const histogramRoot = slot.querySelector("[data-perf-histogram]");
+        expect(histogramRoot).not.toBeNull();
+        // Button defaults to enabled + "Capture phase histogram".
+        const btn = slot.querySelector("[data-perf-histogram-capture]");
+        expect(btn).not.toBeNull();
+        expect(btn.disabled).toBe(false);
+        expect(btn.textContent).toBe("Capture phase histogram");
+    });
+
+    it("perf-histogram capture control destroys cleanly on Settings teardown", async () => {
+        const container = document.createElement("div");
+        const handle = mount(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        expect(container.querySelector("[data-perf-histogram]")).not.toBeNull();
+        handle.destroy();
+        expect(container.querySelector("[data-perf-histogram]")).toBeNull();
+    });
 });
