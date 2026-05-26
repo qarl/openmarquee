@@ -54,6 +54,7 @@ DEFAULT_PERF_STATS_PATH = "/var/openmarquee/perf-stats.json"
 def _perf_stats_path() -> Path:
     return Path(os.environ.get("OPENMARQUEE_PERF_STATS_PATH", DEFAULT_PERF_STATS_PATH))
 
+
 LoopDep = Annotated[PlaybackLoop, Depends(get_playback_loop)]
 ContentDep = Annotated[ContentStorage, Depends(get_content_storage)]
 PlaylistDep = Annotated[PlaylistStorage, Depends(get_playlist_storage)]

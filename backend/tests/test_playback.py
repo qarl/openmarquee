@@ -786,12 +786,15 @@ async def test_stream_slide_render_frame_off_loop_allows_concurrent_progress(
     _patch_stream_ffmpeg(monkeypatch, mock, source_size=(8, 8))
 
     real_render_frame = renderer.render_frame
+
     def slow_render_frame(d, **kwargs):
         _time.sleep(0.03)  # 30ms sync wedge per frame
         return real_render_frame(d, **kwargs)
+
     renderer.render_frame = slow_render_frame
 
     counter = 0
+
     async def tick_counter():
         nonlocal counter
         try:
@@ -1706,9 +1709,9 @@ def test_loop_stats_percentile_math_matches_renderer_profile_rs(renderer):
     loop._record_tick(50_000_000, slide_id, "advance")
     stats = loop.get_loop_stats()
     assert stats["ticks_observed"] == 100
-    assert stats["p50_us"] == 1000        # median is in the fast tier
-    assert stats["p95_us"] == 1000        # 95th still in fast tier (95 < 99)
-    assert stats["p99_us"] == 50_000      # 99th hits the spike
+    assert stats["p50_us"] == 1000  # median is in the fast tier
+    assert stats["p95_us"] == 1000  # 95th still in fast tier (95 < 99)
+    assert stats["p99_us"] == 50_000  # 99th hits the spike
     assert stats["max_us"] == 50_000
     assert stats["ticks_over_budget"] == 1  # 50ms > 33ms threshold
 
@@ -1742,11 +1745,14 @@ def test_record_tick_under_budget_does_not_warn(renderer, caplog):
     )
     slide_id = uuid4()
     import logging as _logging
+
     with caplog.at_level(_logging.WARNING, logger="openmarquee.playback"):
         for _ in range(100):
             loop._record_tick(5_000_000, slide_id, "advance")  # 5ms — well under
     # Filter to just the playback logger so other loggers don't trip the assert.
-    warns = [r for r in caplog.records if r.name == "openmarquee.playback" and r.levelname == "WARNING"]
+    warns = [
+        r for r in caplog.records if r.name == "openmarquee.playback" and r.levelname == "WARNING"
+    ]
     assert warns == []
 
 
@@ -1765,15 +1771,16 @@ def test_record_tick_over_budget_warns_once_then_rate_limits(renderer, caplog, m
     # MUST be rate-limited.
     fixed_monotonic = [100.0]
     import time as _time
+
     monkeypatch.setattr(_time, "monotonic", lambda: fixed_monotonic[0])
     import logging as _logging
+
     with caplog.at_level(_logging.WARNING, logger="openmarquee.playback"):
         loop._record_tick(50_000_000, slide_id, "advance")  # 50ms — over
         loop._record_tick(60_000_000, slide_id, "advance")  # 60ms — over
         loop._record_tick(70_000_000, slide_id, "advance")  # 70ms — over
     warns = [
-        r for r in caplog.records
-        if r.name == "openmarquee.playback" and r.levelname == "WARNING"
+        r for r in caplog.records if r.name == "openmarquee.playback" and r.levelname == "WARNING"
     ]
     assert len(warns) == 1
     assert "tick over budget" in warns[0].message
@@ -1796,15 +1803,16 @@ def test_record_tick_warn_fires_again_after_5s_window(renderer, caplog, monkeypa
     slide_id = uuid4()
     fixed_monotonic = [100.0]
     import time as _time
+
     monkeypatch.setattr(_time, "monotonic", lambda: fixed_monotonic[0])
     import logging as _logging
+
     with caplog.at_level(_logging.WARNING, logger="openmarquee.playback"):
         loop._record_tick(50_000_000, slide_id, "advance")  # first warn
         fixed_monotonic[0] = 100.0 + 5.5  # advance past rate-limit gate
         loop._record_tick(50_000_000, slide_id, "advance")  # second warn
     warns = [
-        r for r in caplog.records
-        if r.name == "openmarquee.playback" and r.levelname == "WARNING"
+        r for r in caplog.records if r.name == "openmarquee.playback" and r.levelname == "WARNING"
     ]
     assert len(warns) == 2
 
@@ -1930,9 +1938,11 @@ async def test_playback_loop_advance_off_loop_in_full_run(renderer):
     # coroutines using asyncio.sleep are unaffected) — only the
     # specific renderer instance's advance does the sync block.
     real_advance = renderer.advance
+
     def slow_advance(t_ms):
         _time.sleep(0.03)  # 30ms sync wedge per call
         return real_advance(t_ms)
+
     renderer.advance = slow_advance
 
     counter_task = asyncio.create_task(tick_counter())
@@ -1983,13 +1993,14 @@ def test_record_tick_first_warn_fires_during_startup_window(renderer, caplog, mo
     # edit, gate evaluated to `1.5 - 0.0 < 5.0` → True → return →
     # warn suppressed. Post-edit, gate sees None sentinel → fires.
     import time as _time
+
     monkeypatch.setattr(_time, "monotonic", lambda: 1.5)
     import logging as _logging
+
     with caplog.at_level(_logging.WARNING, logger="openmarquee.playback"):
         loop._record_tick(50_000_000, slide_id, "advance")
     warns = [
-        r for r in caplog.records
-        if r.name == "openmarquee.playback" and r.levelname == "WARNING"
+        r for r in caplog.records if r.name == "openmarquee.playback" and r.levelname == "WARNING"
     ]
     assert len(warns) == 1
     assert "tick over budget" in warns[0].message

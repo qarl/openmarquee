@@ -49,8 +49,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
-from typing import Iterator
-
+from collections.abc import Iterator
 
 # ---------------------------------------------------------------
 # Allowlist
@@ -327,16 +326,12 @@ def test_walker_flags_annotated_empty_dict():
 
 
 def test_walker_flags_defaultdict():
-    findings = _collect_findings(
-        "from collections import defaultdict\n_foo = defaultdict(list)\n"
-    )
+    findings = _collect_findings("from collections import defaultdict\n_foo = defaultdict(list)\n")
     assert findings == [("_foo", 2)]
 
 
 def test_walker_flags_collections_defaultdict_attr():
-    findings = _collect_findings(
-        "import collections\n_foo = collections.defaultdict(int)\n"
-    )
+    findings = _collect_findings("import collections\n_foo = collections.defaultdict(int)\n")
     assert findings == [("_foo", 2)]
 
 
@@ -361,16 +356,12 @@ def test_walker_does_not_flag_frozenset():
 
 
 def test_walker_does_not_flag_function_scope_empty_dict():
-    findings = _collect_findings(
-        "def f():\n    local = {}\n    return local\n"
-    )
+    findings = _collect_findings("def f():\n    local = {}\n    return local\n")
     assert findings == []
 
 
 def test_walker_does_not_flag_class_scope_empty_dict():
-    findings = _collect_findings(
-        "class C:\n    shared = {}\n"
-    )
+    findings = _collect_findings("class C:\n    shared = {}\n")
     assert findings == []
 
 
