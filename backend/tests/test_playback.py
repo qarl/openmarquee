@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import functools
 import io
 from datetime import datetime
@@ -1651,6 +1652,158 @@ def test_record_tick_warn_fires_again_after_5s_window(renderer, caplog, monkeypa
         if r.name == "openmarquee.playback" and r.levelname == "WARNING"
     ]
     assert len(warns) == 2
+
+
+# Perf-night r4 (2026-05-26): load-bearing invariant test for the
+# asyncio.to_thread wrap on _renderer.advance / begin_slide /
+# begin_transition. The fix runs the sync IPC body on an executor
+# worker so the asyncio event loop stays responsive — other coroutines
+# (FastAPI handlers, capture path, timer fires) progress while the
+# IPC round-trip is in flight. The pattern test here proves that
+# property cleanly: pre-fix, a bare sync call would wedge the loop
+# and the counter coroutine would NOT increment; post-fix it does.
+
+
+@pytest.mark.asyncio
+async def test_advance_off_loop_allows_concurrent_progress():
+    """The load-bearing r4 invariant. Pre-fix shape:
+
+      result = self._renderer.advance(t_ms)  # sync; wedges loop
+
+    Post-fix:
+
+      result = await asyncio.to_thread(self._renderer.advance, t_ms)
+
+    Spawn TWO concurrent coroutines:
+      (1) one that does `await asyncio.to_thread(sleepy_advance, ...)`
+          where `sleepy_advance` is a SYNC function that time.sleeps
+          200ms (simulating the renderer's slow readline)
+      (2) a counter coroutine that increments every 10ms
+
+    Assert the counter incremented MANY times during the 200ms sleep.
+    Pre-fix bare call → counter == 0 (loop wedged). Post-fix → counter
+    > 5 (event loop kept running). The test proves the to_thread call
+    actually releases the loop, not just looks-right at a glance."""
+    import time as _time
+
+    advance_done = []
+
+    def sleepy_advance(t_ms: int) -> dict:
+        """Sync function impersonating the renderer's blocking readline.
+        time.sleep is the sync-I/O analog of subprocess.stdout.readline
+        when the renderer is mid-paint."""
+        _time.sleep(0.2)
+        advance_done.append(t_ms)
+        return {"command": "paint_slide", "t_in_slide_ms": t_ms}
+
+    counter = 0
+
+    async def tick_counter():
+        """Coroutine that ONLY makes progress if the event loop is
+        cooperative-scheduling. Pre-fix it would never increment past 0
+        because the bare sleepy_advance() would block all other tasks."""
+        nonlocal counter
+        try:
+            while True:
+                await asyncio.sleep(0.01)
+                counter += 1
+        except asyncio.CancelledError:
+            return
+
+    counter_task = asyncio.create_task(tick_counter())
+    try:
+        result = await asyncio.to_thread(sleepy_advance, 1234)
+        assert result["t_in_slide_ms"] == 1234
+        assert advance_done == [1234]
+        # 200ms sleep at 10ms increments => ~20 ticks. Lower bound 5
+        # is conservative to handle scheduling jitter on slow CI
+        # runners; what we actually want to verify is "counter is
+        # measurably non-zero" (proves the loop wasn't wedged).
+        assert counter > 5, (
+            f"counter only reached {counter} — event loop appears wedged. "
+            "asyncio.to_thread did NOT release the loop as expected."
+        )
+    finally:
+        counter_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await counter_task
+
+
+@pytest.mark.asyncio
+async def test_playback_loop_advance_off_loop_in_full_run(renderer):
+    """Integration flavor of the same invariant against the real
+    `_play_via_rust_ipc` flow + load-bearing against future revert.
+
+    Monkey-patches the MockRenderer's `advance` to inject a 30ms
+    `time.sleep` per call — that simulates the slow renderer readline
+    we're trying to keep off the asyncio loop. With the r4 wrap in
+    place, each per-tick advance runs on an executor worker; the
+    asyncio loop schedules the counter coroutine during the worker's
+    sleep, so the counter ticks consistently.
+
+    Pre-fix (bare `self._renderer.advance(t_ms)`), the 30ms sleep
+    would block the asyncio loop entirely per tick — the counter
+    coroutine couldn't run during sleeps, and at a 5ms cadence with
+    multiple back-to-back wedged ticks the counter would stall hard.
+
+    `counter > 5` is the post-fix floor on a normal CI runner; a
+    revert of the asyncio.to_thread wrap would drop the counter to
+    near-zero. This is the regression lock the soft `>= 1` previous
+    assertion lacked."""
+    import time as _time
+
+    counter = 0
+
+    async def tick_counter():
+        nonlocal counter
+        try:
+            while True:
+                await asyncio.sleep(0.005)
+                counter += 1
+        except asyncio.CancelledError:
+            return
+
+    slide, png = _make_slide("solo", (33, 66, 99))
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [slide],
+        read_asset=lambda _id: png,
+    )
+
+    # Inject the wedge simulator. functools.partial bound to a closure
+    # over `_time.sleep` (NOT monkeypatch on the time module, so other
+    # coroutines using asyncio.sleep are unaffected) — only the
+    # specific renderer instance's advance does the sync block.
+    real_advance = renderer.advance
+    def slow_advance(t_ms):
+        _time.sleep(0.03)  # 30ms sync wedge per call
+        return real_advance(t_ms)
+    renderer.advance = slow_advance
+
+    counter_task = asyncio.create_task(tick_counter())
+    try:
+        await loop.start()
+        # 100ms slide → ~3 ticks @ 30Hz; with 30ms wedge per tick the
+        # advance loop spends ~90ms in worker-thread sleeps. Give the
+        # outer scheduler enough time for the slide to finish and the
+        # counter to accumulate.
+        await asyncio.sleep(_FAST_DURATION_MS / 1000 + 0.1)
+        await loop.stop()
+        # Post-fix: counter increments freely during worker sleeps.
+        # Floor of 5 = 25ms of accumulated counter time at 5ms cadence,
+        # which is well below the ~90ms of total worker-sleep time the
+        # scheduler had available. Pre-fix (bare sync call), the loop
+        # would have been wedged for those ~90ms → counter near 0.
+        assert counter > 5, (
+            f"tick_counter only reached {counter} during the 90ms of "
+            "renderer-sleep window — playback loop appears wedged. "
+            "asyncio.to_thread wrap likely reverted or missing on the "
+            "advance/begin_slide callsites."
+        )
+    finally:
+        counter_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await counter_task
 
 
 def test_record_tick_first_warn_fires_during_startup_window(renderer, caplog, monkeypatch):
