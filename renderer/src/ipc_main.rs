@@ -101,6 +101,13 @@ struct IpcPaintMetrics {
     // Session-cumulative stats (never reset).
     session_frames: u64,
     session_transitions: u64,
+    // `[perf]` r2: latch so the warn about a failing perf-stats
+    // sidecar write (permission denied on a dev box, /var/openmarquee
+    // missing, disk full, etc.) fires at most once per session
+    // lifetime instead of every 30s window. The eprintln line is the
+    // canonical operational signal — the JSON sidecar is an
+    // operator-affordance, best-effort.
+    perf_json_write_warned: bool,
 }
 
 /// Bound for `IpcPaintMetrics::paint_us_samples`. 2048 entries at
@@ -108,6 +115,79 @@ struct IpcPaintMetrics {
 /// budget (§8.1) and gives 2.3× headroom over the expected
 /// 30 fps × 30 s = 900 samples per window.
 const PAINT_SAMPLE_CAP: usize = 2048;
+
+/// `[perf]` r2 (2026-05-26): canonical path for the perf-stats JSON
+/// sidecar written every 30s alongside the `ipc.soak` eprintln. Same
+/// `/var/openmarquee/` parent as `settings.json` (see
+/// `[[project_dev_pi_provisioned]]`). The backend's
+/// `/api/playback/perf/stats` route reads this file and forwards the
+/// content to the UI perf overlay.
+const PERF_STATS_JSON_PATH: &str = "/var/openmarquee/perf-stats.json";
+
+/// `[perf]` r2: shape of the perf-stats sidecar written by
+/// `maybe_emit_summary`. Mirrors the keys of the `ipc.soak` eprintln
+/// line for parity (operator can grep journalctl for the same field
+/// names) and adds `timestamp_unix_s` so a downstream reader (backend
+/// endpoint, UI overlay) can detect staleness against wall clock.
+///
+/// The shape is the wire contract with the backend's
+/// `/api/playback/perf/stats` route and the UI's `perf-overlay`
+/// module — changing a field name here requires updating both
+/// consumers in lockstep.
+#[derive(serde::Serialize)]
+struct PerfStatsJson {
+    window_s: u64,
+    frames: u64,
+    transitions: u64,
+    fps_avg: f64,
+    paint_us_avg: u64,
+    paint_us_max: u64,
+    paint_us_p99: u64,
+    session_frames: u64,
+    session_transitions: u64,
+    frames_observed_total: u64,
+    frames_over_budget_total: u64,
+    timestamp_unix_s: u64,
+}
+
+/// `[perf]` r2: atomic write via `.tmp` + rename. The rename is
+/// atomic on the same filesystem (POSIX), so the backend reader will
+/// never observe a partial JSON file even if the renderer crashes
+/// mid-write. The `.tmp` is co-located in the same directory as the
+/// target so the rename stays atomic.
+fn write_perf_stats_json_atomic(
+    path: &Path,
+    json: &str,
+) -> std::io::Result<()> {
+    let mut tmp_str = path.as_os_str().to_owned();
+    tmp_str.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_str);
+    std::fs::write(&tmp_path, json)?;
+    // If the rename fails (e.g. EXDEV from a cross-filesystem bind
+    // mount, or a permission flip on the parent dir between write
+    // and rename), best-effort remove the orphaned `.tmp` so it
+    // doesn't pile up across retries. Ignore the removal result —
+    // we're already returning an Err on the rename.
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// `[perf]` r2: wall-clock unix epoch seconds for the sidecar
+/// `timestamp_unix_s` field. `SystemTime` (NOT `Instant`) because
+/// the consumer cares about absolute wall time for staleness
+/// computation. Saturating-to-0 on a system clock anomaly (would
+/// only happen if the Pi's RTC is unset and the system thinks it's
+/// pre-1970 — rare; the field would read as 0 which the backend can
+/// treat as "unknown freshness").
+fn current_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[allow(dead_code)]
 enum IpcPaintKind {
@@ -128,6 +208,7 @@ impl IpcPaintMetrics {
             paint_us_samples: Vec::with_capacity(PAINT_SAMPLE_CAP),
             session_frames: 0,
             session_transitions: 0,
+            perf_json_write_warned: false,
         }
     }
 
@@ -202,6 +283,56 @@ impl IpcPaintMetrics {
             frames_observed_total,
             frames_over_budget_total,
         );
+
+        // `[perf]` r2 (2026-05-26): write the same fields to the JSON
+        // sidecar at /var/openmarquee/perf-stats.json so the backend's
+        // /api/playback/perf/stats route can surface the data to the
+        // operator-facing UI perf overlay. Atomic write (.tmp +
+        // rename) — backend never reads a partial file.
+        //
+        // Best-effort: on dev boxes (path missing, perms wrong) the
+        // write fails; we latch a single warn-line per session and
+        // continue. The eprintln above is the canonical operational
+        // signal — the JSON sidecar is an operator-affordance, not
+        // load-bearing for renderer correctness.
+        let perf_json = PerfStatsJson {
+            window_s: elapsed.as_secs(),
+            frames: self.frames,
+            transitions: self.transitions,
+            fps_avg,
+            paint_us_avg: avg_us,
+            paint_us_max: self.max_paint_us,
+            paint_us_p99,
+            session_frames: self.session_frames,
+            session_transitions: self.session_transitions,
+            frames_observed_total,
+            frames_over_budget_total,
+            timestamp_unix_s: current_unix_seconds(),
+        };
+        match serde_json::to_string(&perf_json) {
+            Ok(json) => {
+                let path = Path::new(PERF_STATS_JSON_PATH);
+                if let Err(e) = write_perf_stats_json_atomic(path, &json) {
+                    if !self.perf_json_write_warned {
+                        eprintln!(
+                            "warn: failed to write perf stats sidecar {}: {}; suppressing further warnings this session",
+                            PERF_STATS_JSON_PATH, e,
+                        );
+                        self.perf_json_write_warned = true;
+                    }
+                }
+            }
+            Err(e) => {
+                if !self.perf_json_write_warned {
+                    eprintln!(
+                        "warn: failed to serialize perf stats sidecar: {}; suppressing further warnings this session",
+                        e,
+                    );
+                    self.perf_json_write_warned = true;
+                }
+            }
+        }
+
         self.last_summary = now;
         self.frames = 0;
         self.transitions = 0;
@@ -3000,5 +3131,135 @@ mod tests {
         assert_eq!(m.paint_us_samples, vec![0, 100]);
         assert_eq!(m.max_paint_us, 100);
         assert_eq!(m.total_paint_us, 100);
+    }
+
+    // `[perf]` r2 (2026-05-26) — PerfStatsJson wire-shape tests. The
+    // backend's /api/playback/perf/stats route and the UI's
+    // perf-overlay both consume this shape; renaming a field here is
+    // a breaking change for both consumers.
+
+    #[test]
+    fn perf_stats_json_serializes_all_documented_keys() {
+        // Wire-contract test: every key the backend + UI rely on must
+        // be present in the serialized output. Use a recognizable
+        // sentinel value per field so a rename or accidental field
+        // removal shows up as a missing-key assert.
+        let p = super::PerfStatsJson {
+            window_s: 30,
+            frames: 900,
+            transitions: 50,
+            fps_avg: 29.8,
+            paint_us_avg: 5000,
+            paint_us_max: 33000,
+            paint_us_p99: 28000,
+            session_frames: 12000,
+            session_transitions: 600,
+            frames_observed_total: 18000,
+            frames_over_budget_total: 234,
+            timestamp_unix_s: 1748275200,
+        };
+        let json = serde_json::to_string(&p).expect("serialize must succeed");
+        // Each key must appear verbatim. The wire contract is the
+        // backend reads these field names directly into a Pydantic
+        // model + the UI reads them by key from the JSON response.
+        for key in [
+            "\"window_s\":30",
+            "\"frames\":900",
+            "\"transitions\":50",
+            "\"fps_avg\":29.8",
+            "\"paint_us_avg\":5000",
+            "\"paint_us_max\":33000",
+            "\"paint_us_p99\":28000",
+            "\"session_frames\":12000",
+            "\"session_transitions\":600",
+            "\"frames_observed_total\":18000",
+            "\"frames_over_budget_total\":234",
+            "\"timestamp_unix_s\":1748275200",
+        ] {
+            assert!(
+                json.contains(key),
+                "expected key fragment {} missing in JSON: {}",
+                key,
+                json,
+            );
+        }
+    }
+
+    #[test]
+    fn perf_stats_json_fps_avg_finite_for_zero_window() {
+        // Guards against serde_json's NaN/Infinity panic. The
+        // production maybe_emit_summary already pre-clamps fps_avg to
+        // 0.0 when elapsed is 0, but this test pins that a 0.0
+        // serializes cleanly (not "NaN" or "Infinity").
+        let p = super::PerfStatsJson {
+            window_s: 0,
+            frames: 0,
+            transitions: 0,
+            fps_avg: 0.0,
+            paint_us_avg: 0,
+            paint_us_max: 0,
+            paint_us_p99: 0,
+            session_frames: 0,
+            session_transitions: 0,
+            frames_observed_total: 0,
+            frames_over_budget_total: 0,
+            timestamp_unix_s: 0,
+        };
+        let json = serde_json::to_string(&p).expect("zero-window serialize must succeed");
+        assert!(json.contains("\"fps_avg\":0.0"), "fps_avg should be 0.0: {}", json);
+        // Defense in depth: confirm no Infinity/NaN sentinels leak in.
+        assert!(!json.contains("Infinity"), "no Infinity tokens: {}", json);
+        assert!(!json.contains("NaN"), "no NaN tokens: {}", json);
+    }
+
+    #[test]
+    fn perf_stats_json_atomic_write_round_trips() {
+        // End-to-end test for the .tmp+rename path. Uses a temp dir
+        // (tempfile not in deps; use a deterministic per-process path
+        // under std::env::temp_dir).
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "om-perf-r2-roundtrip-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        // Best-effort cleanup at end.
+        let _guard = scopeguard_like::cleanup_at_drop(path.clone());
+
+        let payload = r#"{"frames_observed_total":42}"#;
+        super::write_perf_stats_json_atomic(&path, payload)
+            .expect("atomic write must succeed on temp_dir");
+        let read = std::fs::read_to_string(&path).expect("read back must succeed");
+        assert_eq!(read, payload);
+
+        // .tmp must NOT linger after the rename.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp_path = std::path::PathBuf::from(tmp);
+        assert!(
+            !tmp_path.exists(),
+            ".tmp must be renamed away, not lingering: {:?}",
+            tmp_path,
+        );
+    }
+
+    // Tiny RAII cleanup so the round-trip test doesn't leak temp
+    // files across test runs. Inlined here rather than pulling in
+    // the `scopeguard` crate as a dev-dep for a single use.
+    mod scopeguard_like {
+        pub struct Guard {
+            path: std::path::PathBuf,
+        }
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+        pub fn cleanup_at_drop(path: std::path::PathBuf) -> Guard {
+            Guard { path }
+        }
     }
 }

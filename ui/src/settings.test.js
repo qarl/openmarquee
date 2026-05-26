@@ -740,4 +740,89 @@ describe("mountSettings", () => {
             vi.useRealTimers();
         }
     });
+
+    // Perf-night r2 (2026-05-26): Diagnostics sub-section toggle.
+    // Pins the wire contract between the Settings checkbox + main.js's
+    // perf-overlay lifecycle listener (via the custom event +
+    // localStorage). Two ends of the contract get separate coverage:
+    // here we test that Settings WRITES the right state; perf-overlay.test.js
+    // covers the overlay's READ side.
+
+    it("perf-overlay toggle: initializes unchecked when localStorage is empty", async () => {
+        try { localStorage.removeItem("om.perf.show"); } catch {}
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const checkbox = container.querySelector(".field-perf-overlay-toggle");
+        expect(checkbox).not.toBeNull();
+        expect(checkbox.checked).toBe(false);
+    });
+
+    it("perf-overlay toggle: initializes checked when localStorage flag is set", async () => {
+        try { localStorage.setItem("om.perf.show", "1"); } catch {}
+        try {
+            const container = document.createElement("div");
+            mount(container, {
+                fetchSettings: async () => SAMPLE,
+                onSave: vi.fn(),
+            });
+            await tick();
+            const checkbox = container.querySelector(".field-perf-overlay-toggle");
+            expect(checkbox.checked).toBe(true);
+        } finally {
+            try { localStorage.removeItem("om.perf.show"); } catch {}
+        }
+    });
+
+    it("perf-overlay toggle: ON dispatches openmarquee:perf-overlay-toggle{enabled:true} + sets localStorage", async () => {
+        try { localStorage.removeItem("om.perf.show"); } catch {}
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+
+        const events = [];
+        const listener = (e) => events.push(e.detail);
+        document.addEventListener("openmarquee:perf-overlay-toggle", listener);
+        try {
+            const checkbox = container.querySelector(".field-perf-overlay-toggle");
+            checkbox.checked = true;
+            checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+            expect(events).toEqual([{ enabled: true }]);
+            expect(localStorage.getItem("om.perf.show")).toBe("1");
+        } finally {
+            document.removeEventListener("openmarquee:perf-overlay-toggle", listener);
+            try { localStorage.removeItem("om.perf.show"); } catch {}
+        }
+    });
+
+    it("perf-overlay toggle: OFF dispatches openmarquee:perf-overlay-toggle{enabled:false} + clears localStorage", async () => {
+        try { localStorage.setItem("om.perf.show", "1"); } catch {}
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+
+        const events = [];
+        const listener = (e) => events.push(e.detail);
+        document.addEventListener("openmarquee:perf-overlay-toggle", listener);
+        try {
+            const checkbox = container.querySelector(".field-perf-overlay-toggle");
+            // Was initialized checked from localStorage.
+            expect(checkbox.checked).toBe(true);
+            checkbox.checked = false;
+            checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+            expect(events).toEqual([{ enabled: false }]);
+            expect(localStorage.getItem("om.perf.show")).toBe(null);
+        } finally {
+            document.removeEventListener("openmarquee:perf-overlay-toggle", listener);
+        }
+    });
 });

@@ -3722,3 +3722,76 @@ section.live {
         opacity: 1;
     }
 }
+
+/* --- Perf overlay (Perf-night r2, 2026-05-26) ---------------------------
+   Floating operator-facing perf overlay. Fixed top-right; semi-transparent
+   so it doesn't fully occlude the panel underneath. Threshold-coded
+   left border tint:
+     green  → < 5%   over-budget — Pi is hitting 30fps
+     yellow → < 15%  over-budget — degraded but usable
+     red    → ≥ 15%  over-budget — investigate
+
+   Lives on body (not inside a panel slot) so it survives panel
+   navigation; hidden-by-default via the localStorage toggle in the
+   Settings → Diagnostics card. pointer-events: none so the overlay
+   never blocks operator clicks on the panel beneath. */
+.perf-overlay {
+    position: fixed;
+    top: 12px;
+    right: 12px;
+    z-index: 9999;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: rgba(20, 20, 20, 0.88);
+    color: #eaeaea;
+    font-family: var(--om-mono, ui-monospace, "SF Mono", monospace);
+    font-size: 12px;
+    line-height: 1.3;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+    pointer-events: none;
+    border-left: 3px solid var(--om-perf-tier, #3a9b3a);
+}
+.perf-overlay--green  { --om-perf-tier: #3a9b3a; }
+.perf-overlay--yellow { --om-perf-tier: #c4a000; }
+.perf-overlay--red    { --om-perf-tier: #c43a3a; }
+
+.perf-overlay__header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 4px;
+}
+.perf-overlay__title {
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #aaa;
+}
+.perf-overlay__age {
+    font-size: 10px;
+    color: #888;
+}
+.perf-overlay__body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.perf-overlay__metric {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+}
+.perf-overlay__label {
+    color: #999;
+}
+.perf-overlay__value {
+    font-weight: 600;
+    color: #f0f0f0;
+}
+.perf-overlay__sparkline {
+    display: block;
+    margin-top: 4px;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 2px;
+}

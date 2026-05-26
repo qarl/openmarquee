@@ -6,6 +6,9 @@ GET  /api/playback/state — { is_running, current_item_id, current_item_type,
                             current_item_transition, current_item_transition_ms,
                             current_item_auto_mode, current_item_auto_format,
                             current_playlist_id }
+GET  /api/playback/perf/stats — renderer perf JSON sidecar. Perf-night
+                            r2: surfaces the 30s ipc.soak window data
+                            to the operator-facing UI perf overlay.
 
 The loop drives the device's renderer (MockRenderer in dev, HUB75/HDMI/etc.
 on the device once those land). Replaced the Phase 2 manual
@@ -13,12 +16,15 @@ on the device once those land). Replaced the Phase 2 manual
 """
 
 import asyncio
+import json
+import os
+from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from openmarquee.api import cors_headers_for_origin
 from openmarquee.content.storage import ContentStorage
@@ -33,6 +39,17 @@ from openmarquee.playback import PlaybackLoop
 from openmarquee.playlist import PlaylistStorage
 
 router = APIRouter(prefix="/api/playback", tags=["playback"])
+
+# Perf-night r2 (2026-05-26): renderer emits the per-30s perf-stats
+# JSON sidecar to this path (see renderer/src/ipc_main.rs
+# PERF_STATS_JSON_PATH). Env-overridable so tests + dev runs can point
+# at a tmp file. Mirrors the OPENMARQUEE_IDENTITY_PATH convention in
+# identity.py:33-41.
+DEFAULT_PERF_STATS_PATH = "/var/openmarquee/perf-stats.json"
+
+
+def _perf_stats_path() -> Path:
+    return Path(os.environ.get("OPENMARQUEE_PERF_STATS_PATH", DEFAULT_PERF_STATS_PATH))
 
 LoopDep = Annotated[PlaybackLoop, Depends(get_playback_loop)]
 ContentDep = Annotated[ContentStorage, Depends(get_content_storage)]
@@ -280,3 +297,81 @@ async def perf_dump(loop: LoopDep) -> PerfDumpResponse:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     ready = "frames_remaining=0" in text
     return PerfDumpResponse(ready=ready, text=text)
+
+
+# ---------------------------------------------------------------------
+# Renderer perf-stats sidecar reader (perf-night r2 from code2,
+# cherry-picked into main 2026-05-26).
+# ---------------------------------------------------------------------
+
+
+class RendererPerfStats(BaseModel):
+    # 30s window the renderer last emitted. NOT a sliding window — the
+    # renderer resets its counters at each emit; the UI computes
+    # window-deltas itself from consecutive polls if it wants a finer
+    # cadence than 30s.
+    window_s: int
+    frames: int
+    transitions: int
+    fps_avg: float
+    paint_us_avg: int
+    paint_us_max: int
+    paint_us_p99: int
+    session_frames: int
+    session_transitions: int
+    # Session-cumulative deadline-miss counters from r1
+    # (renderer/src/hdmi.rs EglSession::record_present). Monotonically
+    # non-decreasing across the session lifetime; UI can diff
+    # consecutive polls to compute a per-window over-budget rate.
+    frames_observed_total: int
+    frames_over_budget_total: int
+    # Wall-clock unix epoch seconds of the renderer-side write. UI uses
+    # this to detect staleness (renderer crashed, journald drift, etc.).
+    # Backend doesn't gate on staleness — the operator sees both the
+    # data and the age and makes the call.
+    timestamp_unix_s: int
+
+
+@router.get("/perf/stats", response_model=RendererPerfStats)
+async def get_perf_stats() -> RendererPerfStats:
+    """Return the latest perf-stats sidecar emitted by the renderer.
+
+    503 cases:
+      - renderer hasn't emitted its first ipc.soak window yet
+        (file missing — first 30s after session start)
+      - file unreadable (permissions, FS error)
+      - JSON parse failed (corrupted write — shouldn't happen with the
+        atomic-write helper but defended against)
+      - schema mismatch (renderer side renamed a field without backend
+        catching up)
+    """
+    path = _perf_stats_path()
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "perf stats sidecar not yet written "
+                "(renderer hasn't emitted an ipc.soak window yet)"
+            ),
+        )
+    except OSError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"perf stats sidecar read failed: {exc}",
+        )
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"perf stats sidecar parse failed: {exc}",
+        )
+    try:
+        return RendererPerfStats(**data)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"perf stats sidecar schema mismatch: {exc}",
+        )
