@@ -9,6 +9,9 @@ GET  /api/playback/state — { is_running, current_item_id, current_item_type,
 GET  /api/playback/perf/stats — renderer perf JSON sidecar. Perf-night
                             r2: surfaces the 30s ipc.soak window data
                             to the operator-facing UI perf overlay.
+GET  /api/playback/loop_stats — Python playback-loop tick stats. Perf-
+                            night r3: complementary to perf/stats —
+                            answers "is Python the slow path?"
 
 The loop drives the device's renderer (MockRenderer in dev, HUB75/HDMI/etc.
 on the device once those land). Replaced the Phase 2 manual
@@ -330,6 +333,49 @@ class RendererPerfStats(BaseModel):
     # Backend doesn't gate on staleness — the operator sees both the
     # data and the age and makes the call.
     timestamp_unix_s: int
+
+
+class PythonLoopStats(BaseModel):
+    """Perf-night r3 (2026-05-26): Python playback-loop tick stats.
+
+    Complementary to /api/playback/perf/stats (renderer-side counters):
+    that one says "is Rust meeting 30fps?"; this one says "is Python's
+    playback loop staying under its 33ms tick budget?".
+
+    A high `ticks_over_budget` here points at Python-side blocking
+    (sync I/O on the tick path, slow JSON load, sync IPC readline)
+    rather than renderer-side paint cost. The dispatch's r4 candidate
+    is the asyncio.to_thread wrap of `_send_op` — if these numbers
+    show consistent tick > 5ms, that's the fix.
+
+    All time fields are MICROSECONDS (the inner ring stores nanoseconds
+    for measurement precision; the endpoint exposes us for operator
+    readability — same convention as the renderer's paint_us_p99).
+    `ticks_over_budget` is the count whose work-time exceeded 33000us.
+    """
+
+    ticks_observed: int
+    p50_us: int
+    p95_us: int
+    p99_us: int
+    max_us: int
+    ticks_over_budget: int
+
+
+@router.get("/loop_stats", response_model=PythonLoopStats)
+async def get_loop_stats(loop: LoopDep) -> PythonLoopStats:
+    """Snapshot of the playback loop's per-tick work-time ring buffer.
+
+    Returns all-zero when the ring is empty (no playback has run yet
+    since this PlaybackLoop instance was constructed — common at boot
+    or in a freshly-spawned dev process).
+
+    Auth-gated by AuthMiddleware (auth_middleware.py:141-) like every
+    /api/* route not on the whitelist. The whitelist (auth_middleware.py:
+    50-93) carves out unauthenticated routes; /api/playback/loop_stats
+    is NOT on it.
+    """
+    return PythonLoopStats(**loop.get_loop_stats())
 
 
 @router.get("/perf/stats", response_model=RendererPerfStats)
