@@ -6696,12 +6696,19 @@ unsafe fn bake_video_slide_to_current_fbo(
         eprintln!("[firstframe] feed={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
     }
     let t_dqbuf_start = if profile_first { Some(std::time::Instant::now()) } else { None };
-    // Drain a frame with a small EAGAIN budget so transient codec
-    // back-pressure doesn't lose us a frame. Budget of 5 retries
-    // × 2ms = 10ms max per paint; we have ~33ms total at 30fps so
-    // this leaves ample slack for the actual GL work.
+    // perf-night r5 (2026-05-26): boost EAGAIN budget from 5*2ms=10ms
+    // to 10*3ms=30ms. r3 baseline showed cold-start ticks exhaust the
+    // 10ms budget then early-return wasted (no paint, no decode
+    // progress). 30ms covers bcm2835-codec's slow path AND still
+    // leaves 3ms inside the 33ms 30fps frame budget for GL work
+    // (r4 DMABUF data: compose+present p99 ~1.9ms). Tradeoff:
+    // occasional 30ms ticks during warmup window vs. fewer wasted
+    // advances. Combined with prime-time warmup pre-feed in
+    // video_decode.rs, steady-state should rarely exceed 5*3ms=15ms
+    // (decoder pipeline pre-filled, dqbuf wakes on first/second
+    // retry).
     let mut frame_opt: Option<crate::v4l2::Frame> = None;
-    for _ in 0..5 {
+    for _ in 0..10 {
         match decoder.next_frame() {
             Ok(Some(f)) => {
                 frame_opt = Some(f);
@@ -6709,7 +6716,7 @@ unsafe fn bake_video_slide_to_current_fbo(
             }
             Ok(None) => break,
             Err(e) if e.to_string().contains("EAGAIN") => {
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                std::thread::sleep(std::time::Duration::from_millis(3));
             }
             Err(e) => return Err(e).context("next_frame"),
         }

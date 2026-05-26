@@ -154,9 +154,56 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
     primer.extend_from_slice(&header);
     primer.extend_from_slice(first_sample);
     dec.feed(&primer).context("feed SPS+PPS+IDR primer")?;
+    let mut next_sample_idx: usize = 1;
+
+    // perf-night r5 (2026-05-26): warmup pre-feed -- push samples 1..N
+    // into the decoder pipeline NOW so the kernel has B-frame lookahead
+    // by the time the playback loop's first advance() ticks for this
+    // slide. Without this, every video slide cold-started for ~10s
+    // (operator-visible) because the decoder needs ~4 input samples
+    // before its first decoded NV12 frame comes out. The PRE-r5 prime
+    // fed only sample 0; advances 1..4 each fed one sample + waited the
+    // 10ms EAGAIN budget = wasted ~10s per video slide start. r3
+    // baseline journal: 'first frame painted (sample idx 4)' after a
+    // 10670ms over-budget delta_ms.
+    //
+    // Why this works with feed()'s single-buffer (buffer 0 only) shape:
+    // feed() internally calls drain_output_quiet which dequeues any
+    // completed OUTPUT buffer before QBUF-ing the new sample. With a
+    // sleep between successive feeds, the kernel has time to consume
+    // sample N before sample N+1 is QBUF'd. The free-list refactor that
+    // v4l2.rs:1184-1191 mentions (piece 3's "real driver loop") is the
+    // proper long-term fix but is out of scope for r5; the sleep here
+    // is a workaround that costs ~25ms at prime time AND saves ~10s
+    // per slide at runtime -- net win by ~400x.
+    let warmup_count = 4.min(dem.samples.len().saturating_sub(1));
+    for _ in 0..warmup_count {
+        // Give the kernel ~6ms to consume the previous OUTPUT buffer.
+        // bcm2835-codec on Pi Zero 2 W decodes a 1280x720 sample in
+        // ~5ms; 6ms is one extra ms of safety. Total warmup overhead
+        // ~24ms at prime, paid once per slide attach.
+        std::thread::sleep(std::time::Duration::from_millis(6));
+        let s = &dem.samples[next_sample_idx];
+        match dec.feed(s) {
+            Ok(()) => {
+                next_sample_idx += 1;
+            }
+            Err(e) => {
+                // Don't fail the whole prime on warmup error -- worst
+                // case we revert to cold-start behavior. Log + bail
+                // the warmup loop; caller still gets a usable decoder.
+                eprintln!(
+                    "warn: prime warmup feed sample {} failed: {} (continuing without warmup)",
+                    next_sample_idx, e
+                );
+                break;
+            }
+        }
+    }
+
     Ok(VideoDecoderState {
         decoder: dec,
-        next_sample_idx: 1,
+        next_sample_idx,
         frames_decoded: 0,
         capture_w: cap_fmt.width,
         capture_h: cap_fmt.height,
