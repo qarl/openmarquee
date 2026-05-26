@@ -997,7 +997,15 @@ class PlaybackLoop:
         t0_ms = int(t0 * 1000)
         duration_ms = int(item.duration_ms)
         try:
-            self._renderer.begin_slide(item.id, t0_ms, duration_ms)
+            # Perf-night r4 (2026-05-26): `_renderer.begin_slide` does a
+            # sync subprocess.stdout.readline (rust_renderer.py:843-891
+            # TODO). Bare-call would wedge the asyncio event loop for the
+            # full IPC round-trip. asyncio.to_thread runs it on an
+            # executor worker so other coroutines (FastAPI handlers,
+            # capture path, etc.) keep progressing.
+            await asyncio.to_thread(
+                self._renderer.begin_slide, item.id, t0_ms, duration_ms
+            )
         except RustRendererUnsupportedSlideError as e:
             # Bug 8 gap (2026-05-20): throttle per slide id. First skip
             # logs INFO; subsequent skips for the SAME id log DEBUG —
@@ -1036,15 +1044,20 @@ class PlaybackLoop:
             #
             # Note: `_renderer.advance` does a blocking readline on
             # the renderer subprocess's stdout (rust_renderer.py:843-
-            # 891) which wedges the asyncio event loop for the
-            # duration of the IPC round-trip. This counter will reveal
-            # how often that wedge exceeds budget. The asyncio.to_thread
-            # fix to release the event loop is a separate dispatch.
+            # 891 TODO). Perf-night r4 (2026-05-26) wraps the call in
+            # asyncio.to_thread so the wedge happens on an executor
+            # worker and the asyncio event loop stays responsive for
+            # other coroutines (FastAPI request handlers, capture
+            # path, timer fires) for the duration of the IPC round-
+            # trip. The r3 tick instrumentation immediately above
+            # still measures the *work* portion (including the time
+            # this coroutine is suspended waiting for the worker to
+            # finish), which IS the operator-meaningful budget.
             tick_start_ns = time.perf_counter_ns()
             elapsed = loop.time() - t0
             t_ms = t0_ms + int(elapsed * 1000)
             try:
-                result = self._renderer.advance(t_ms)
+                result = await asyncio.to_thread(self._renderer.advance, t_ms)
             except RustRendererUnsupportedSlideError as e:
                 # Begin_slide accepted the slide but advance hit the
                 # unsupported-kind rail (happens for video on the very
@@ -1096,7 +1109,10 @@ class PlaybackLoop:
         ):
             transition_t0_ms = t0_ms + int((loop.time() - t0) * 1000)
             try:
-                self._renderer.begin_transition(
+                # Perf-night r4: off-loop per the rust_renderer.py:843-891
+                # TODO. Same rationale as begin_slide / advance above.
+                await asyncio.to_thread(
+                    self._renderer.begin_transition,
                     next_item.id,
                     int(next_item.duration_ms),
                     transition_kind,
@@ -1137,7 +1153,9 @@ class PlaybackLoop:
                     break
                 t_ms = t0_ms + int((loop.time() - t0) * 1000)
                 try:
-                    result = self._renderer.advance(t_ms)
+                    # Perf-night r4: off-loop per rust_renderer.py:843-891.
+                    # Same rationale as the slide-window advance above.
+                    result = await asyncio.to_thread(self._renderer.advance, t_ms)
                 except RustRendererUnsupportedTransitionError as e:
                     # Mid-transition error -- shouldn't happen (begin_
                     # transition already succeeded), but if it does
