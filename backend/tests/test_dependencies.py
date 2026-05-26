@@ -343,7 +343,9 @@ class _FakeRustRenderer:
     def profile_dump(self) -> str:
         self.calls.append(("profile_dump", (), {}))
         self._maybe_raise("profile_dump")
-        return "profile: frames_remaining=0\nfake_phase  n=1  p50=42us  p95=42us  p99=42us  max=42us\n"
+        return (
+            "profile: frames_remaining=0\nfake_phase  n=1  p50=42us  p95=42us  p99=42us  max=42us\n"
+        )
 
 
 class TestAutoFallbackRenderer:
