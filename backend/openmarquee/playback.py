@@ -239,7 +239,7 @@ class PlaybackLoop:
         # blocking the IPC channel long enough to starve Rust?". If
         # Python tick > 33ms, the renderer has run out of input by
         # the time advance() returns — visible glitch.
-        self._tick_ns_ring: "collections.deque[int]" = collections.deque(maxlen=600)
+        self._tick_ns_ring: collections.deque[int] = collections.deque(maxlen=600)
         # Monotonic wall-time of the most-recent over-budget warn log.
         # Rate-limit gate so a wedged readline doesn't spam logs.
         # Storing monotonic seconds (float) for compactness; compared
@@ -327,10 +327,7 @@ class PlaybackLoop:
         # (NOT `now - (self._last_tick_warn_at or 0.0)`) so a
         # future `time.monotonic() == 0.0` edge can't ambiguously
         # collapse the sentinel into a real timestamp.
-        if (
-            self._last_tick_warn_at is not None
-            and now_mono - self._last_tick_warn_at < 5.0
-        ):
+        if self._last_tick_warn_at is not None and now_mono - self._last_tick_warn_at < 5.0:
             return
         self._last_tick_warn_at = now_mono
         log.warning(
@@ -1022,9 +1019,7 @@ class PlaybackLoop:
             # asyncio.to_thread runs it on an executor worker so other
             # coroutines (FastAPI handlers, capture path, etc.) keep
             # progressing.
-            await asyncio.to_thread(
-                self._renderer.begin_slide, item.id, t0_ms, duration_ms
-            )
+            await asyncio.to_thread(self._renderer.begin_slide, item.id, t0_ms, duration_ms)
         except RustRendererUnsupportedSlideError as e:
             # Bug 8 gap (2026-05-20): throttle per slide id. First skip
             # logs INFO; subsequent skips for the SAME id log DEBUG —

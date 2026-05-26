@@ -238,9 +238,7 @@ class ScheduleStorage:
 # `default_playlist_name` is the one v1-only legacy key the migration
 # consumes (v2 renamed it to default_playlist_id); union it in so it
 # also gets filtered from extras.
-MIGRATION_HANDLED_TOP_LEVEL = (
-    frozenset(Schedule.model_fields.keys()) | {"default_playlist_name"}
-)
+MIGRATION_HANDLED_TOP_LEVEL = frozenset(Schedule.model_fields.keys()) | {"default_playlist_name"}
 
 
 def _resolve_legacy_name(

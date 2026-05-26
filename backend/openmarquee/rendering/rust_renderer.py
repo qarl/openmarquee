@@ -857,7 +857,8 @@ class RustRenderer:
     #   live.py::_pump                          render_frame      (r6 66d9964 — live-takeover pump)
     #   live.py::_pump                          end_external_frames (r6 — live-takeover takedown)
     #   api_settings.py::set_settings           reopen            (pre-r4)
-    #   playback.py::_capture_current_frame_sync capture (via outer await asyncio.to_thread) (pre-r4)
+    #   playback.py::_capture_current_frame_sync capture (pre-r4 —
+    #     wrapped via outer `await asyncio.to_thread(...)` at caller)
     #
     # `_send_op` itself stays sync (the API surface is unchanged); the
     # caller-side wraps push the blocking readline onto an executor

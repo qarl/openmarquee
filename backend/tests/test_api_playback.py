@@ -391,9 +391,7 @@ def test_perf_stats_returns_parsed_json_when_sidecar_valid(
     assert body == payload  # full round-trip; every field preserved.
 
 
-def test_perf_stats_returns_503_on_malformed_json(
-    client: TestClient, tmp_path: Path, monkeypatch
-):
+def test_perf_stats_returns_503_on_malformed_json(client: TestClient, tmp_path: Path, monkeypatch):
     """Defense in depth: the renderer uses .tmp+rename atomic writes
     so a torn write shouldn't reach the backend — but if it ever does
     (NFS, disk-full mid-rename, manual corruption), we want a 503 with
@@ -407,9 +405,7 @@ def test_perf_stats_returns_503_on_malformed_json(
     assert "parse failed" in response.json()["detail"]
 
 
-def test_perf_stats_returns_503_on_schema_mismatch(
-    client: TestClient, tmp_path: Path, monkeypatch
-):
+def test_perf_stats_returns_503_on_schema_mismatch(client: TestClient, tmp_path: Path, monkeypatch):
     """Schema-drift guard: if the renderer side renames a field
     without the backend catching up, Pydantic ValidationError surfaces
     as a 503 + 'schema mismatch' detail (NOT a 500). Operator can
@@ -433,9 +429,7 @@ def test_perf_stats_returns_503_on_schema_mismatch(
 # Pydantic PythonLoopStats response model.
 
 
-def test_loop_stats_returns_all_zero_for_fresh_loop(
-    client: TestClient, loop
-):
+def test_loop_stats_returns_all_zero_for_fresh_loop(client: TestClient, loop):
     """At test fixture setup, the PlaybackLoop has no ticks recorded
     (the loop hasn't been started + no slide has played yet). The
     endpoint must return all-zero rather than 4xx/5xx so the operator
@@ -453,9 +447,7 @@ def test_loop_stats_returns_all_zero_for_fresh_loop(
     }
 
 
-def test_loop_stats_reflects_recorded_ticks(
-    client: TestClient, loop
-):
+def test_loop_stats_reflects_recorded_ticks(client: TestClient, loop):
     """Drop synthetic ticks into the loop's ring buffer + verify the
     endpoint surfaces them with the documented percentile math (matches
     renderer/src/profile.rs:summarize_samples indexing). 99 fast ticks
@@ -485,9 +477,7 @@ def test_loop_stats_reflects_recorded_ticks(
 # the canonical-only-read property + future-timestamp passthrough.
 
 
-def test_perf_stats_returns_503_on_oversized_file(
-    client: TestClient, tmp_path: Path, monkeypatch
-):
+def test_perf_stats_returns_503_on_oversized_file(client: TestClient, tmp_path: Path, monkeypatch):
     """Corner 4: the read path caps at _PERF_STATS_MAX_BYTES (64 KB)
     to defend against a renderer-side bug or an attacker-replaced
     file. The realistic emit is <1 KB; anything past 64 KB is wrong

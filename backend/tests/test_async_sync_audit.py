@@ -47,8 +47,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
-from typing import Iterator
-
+from collections.abc import Iterator
 
 # ---------------------------------------------------------------
 # Blocking-call patterns
@@ -57,54 +56,60 @@ from typing import Iterator
 # Module-attribute pairs: e.g. (subprocess, run) → matches
 # `subprocess.run(...)`. Add new patterns here as future blocking
 # APIs land in the codebase.
-_BLOCKING_ATTR_CALLS: frozenset[tuple[str, str]] = frozenset({
-    # Subprocess: sync APIs that block the calling thread until child
-    # exits. ``asyncio.create_subprocess_exec`` is the async alternative
-    # (used correctly by stream_consumer.py / tailscale.py).
-    ("subprocess", "run"),
-    ("subprocess", "check_output"),
-    ("subprocess", "check_call"),
-    # Blocking sleep. ``asyncio.sleep`` is the async alternative.
-    ("time", "sleep"),
-    # Sync HTTP. ``httpx.AsyncClient`` (used by flock_sync.py) is the
-    # async alternative; ``requests.*`` has no async variant — wrap
-    # in asyncio.to_thread if needed.
-    ("requests", "get"),
-    ("requests", "post"),
-    ("requests", "put"),
-    ("requests", "delete"),
-    ("requests", "head"),
-    ("requests", "patch"),
-    ("requests", "request"),
-})
+_BLOCKING_ATTR_CALLS: frozenset[tuple[str, str]] = frozenset(
+    {
+        # Subprocess: sync APIs that block the calling thread until child
+        # exits. ``asyncio.create_subprocess_exec`` is the async alternative
+        # (used correctly by stream_consumer.py / tailscale.py).
+        ("subprocess", "run"),
+        ("subprocess", "check_output"),
+        ("subprocess", "check_call"),
+        # Blocking sleep. ``asyncio.sleep`` is the async alternative.
+        ("time", "sleep"),
+        # Sync HTTP. ``httpx.AsyncClient`` (used by flock_sync.py) is the
+        # async alternative; ``requests.*`` has no async variant — wrap
+        # in asyncio.to_thread if needed.
+        ("requests", "get"),
+        ("requests", "post"),
+        ("requests", "put"),
+        ("requests", "delete"),
+        ("requests", "head"),
+        ("requests", "patch"),
+        ("requests", "request"),
+    }
+)
 
 # RustRenderer / AutoFallbackRenderer sync IPC methods. The receiver
 # chain ending in one of these on a known renderer-shaped receiver
 # (see _RENDERER_RECEIVERS below) is the canonical r4/r5 wedge shape.
-_RENDERER_IPC_METHODS: frozenset[str] = frozenset({
-    "advance",
-    "begin_slide",
-    "begin_transition",
-    "capture",
-    "reconfigure",
-    "close",
-    "reopen",
-    "open",
-    "render_frame",
-    "end_external_frames",
-    "begin_external_frames",
-})
+_RENDERER_IPC_METHODS: frozenset[str] = frozenset(
+    {
+        "advance",
+        "begin_slide",
+        "begin_transition",
+        "capture",
+        "reconfigure",
+        "close",
+        "reopen",
+        "open",
+        "render_frame",
+        "end_external_frames",
+        "begin_external_frames",
+    }
+)
 
 # Receiver names that signal "this is a renderer". The detector also
 # strips a leading ``self.`` from the receiver chain so
 # ``self._renderer.advance`` matches via the ``_renderer`` entry.
-_RENDERER_RECEIVERS: frozenset[str] = frozenset({
-    "_renderer",
-    "renderer",
-    "loop.renderer",
-    "_primary",      # AutoFallbackRenderer's underlying RustRenderer ref
-    "self._primary",
-})
+_RENDERER_RECEIVERS: frozenset[str] = frozenset(
+    {
+        "_renderer",
+        "renderer",
+        "loop.renderer",
+        "_primary",  # AutoFallbackRenderer's underlying RustRenderer ref
+        "self._primary",
+    }
+)
 
 
 # ---------------------------------------------------------------
@@ -179,7 +184,7 @@ def _classify_call(node: ast.Call) -> str | None:
         # Strip leading `self.` so `self._renderer.advance` matches
         # via the `_renderer` receiver entry.
         if receiver.startswith("self."):
-            receiver = receiver[len("self."):]
+            receiver = receiver[len("self.") :]
         if receiver in _RENDERER_RECEIVERS:
             return chain
 
@@ -305,9 +310,7 @@ def test_allowlist_entries_have_rationale():
 
 def test_walker_flags_bare_subprocess_run():
     tree = ast.parse(
-        "async def bad():\n"
-        "    import subprocess\n"
-        "    subprocess.run(['echo', 'hi'])\n"
+        "async def bad():\n    import subprocess\n    subprocess.run(['echo', 'hi'])\n"
     )
     findings = _collect_findings(tree)
     assert findings == [("bad", "subprocess.run")]
@@ -324,10 +327,7 @@ def test_walker_does_not_flag_wrapped_subprocess_run():
 
 
 def test_walker_flags_bare_renderer_advance():
-    tree = ast.parse(
-        "async def bad(self):\n"
-        "    self._renderer.advance(123)\n"
-    )
+    tree = ast.parse("async def bad(self):\n    self._renderer.advance(123)\n")
     findings = _collect_findings(tree)
     assert findings == [("bad", "self._renderer.advance")]
 
@@ -343,21 +343,13 @@ def test_walker_does_not_flag_wrapped_renderer_advance():
 
 
 def test_walker_flags_bare_time_sleep():
-    tree = ast.parse(
-        "import time\n"
-        "async def bad():\n"
-        "    time.sleep(1)\n"
-    )
+    tree = ast.parse("import time\nasync def bad():\n    time.sleep(1)\n")
     findings = _collect_findings(tree)
     assert findings == [("bad", "time.sleep")]
 
 
 def test_walker_does_not_flag_asyncio_sleep():
-    tree = ast.parse(
-        "import asyncio\n"
-        "async def good():\n"
-        "    await asyncio.sleep(1)\n"
-    )
+    tree = ast.parse("import asyncio\nasync def good():\n    await asyncio.sleep(1)\n")
     findings = _collect_findings(tree)
     assert findings == []
 
@@ -366,11 +358,7 @@ def test_walker_does_not_flag_sync_def():
     """Bare blocking call inside a SYNC function is fine — the walker
     only inspects async defs (sync helpers may be invoked via to_thread
     by their callers, which is the correct pattern)."""
-    tree = ast.parse(
-        "import subprocess\n"
-        "def bad():\n"
-        "    subprocess.run(['echo'])\n"
-    )
+    tree = ast.parse("import subprocess\ndef bad():\n    subprocess.run(['echo'])\n")
     findings = _collect_findings(tree)
     assert findings == []
 
@@ -380,10 +368,7 @@ def test_walker_flags_renderer_method_with_loop_dot_renderer():
     pattern: `await asyncio.to_thread(loop.renderer.reopen)` IS
     wrapped, but a bare `loop.renderer.reopen()` would not be).
     """
-    tree = ast.parse(
-        "async def bad(loop):\n"
-        "    loop.renderer.reopen()\n"
-    )
+    tree = ast.parse("async def bad(loop):\n    loop.renderer.reopen()\n")
     findings = _collect_findings(tree)
     assert findings == [("bad", "loop.renderer.reopen")]
 
@@ -393,10 +378,7 @@ def test_walker_does_not_flag_unknown_receiver():
     in the renderer-receivers list should NOT be flagged. The
     detector intentionally only flags known shapes — false positives
     would dilute the signal."""
-    tree = ast.parse(
-        "async def maybe(self):\n"
-        "    self.unknown_obj.advance(123)\n"
-    )
+    tree = ast.parse("async def maybe(self):\n    self.unknown_obj.advance(123)\n")
     findings = _collect_findings(tree)
     assert findings == []
 

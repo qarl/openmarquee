@@ -286,7 +286,6 @@ def test_failed_slide_throttle_prunes_entries_older_than_ttl(monkeypatch):
     """Entries with a timestamp older than _FAILED_SLIDE_TTL_SECONDS
     drop from the throttle map on the next prune call. Pre-r12 the
     set was unbounded; failing slides accumulated entries forever."""
-    import time as _real_time
 
     # Seed the throttle map with 3 entries: 2 stale (older than the
     # TTL), 1 fresh. _prune_failed_slide_ids should drop the 2.
@@ -307,9 +306,7 @@ def test_failed_slide_throttle_prunes_entries_older_than_ttl(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_failed_slide_throttle_refreshes_timestamp_on_repeated_failure(
-    tmp_path, monkeypatch
-):
+async def test_failed_slide_throttle_refreshes_timestamp_on_repeated_failure(tmp_path, monkeypatch):
     """A repeat failure for the SAME id refreshes the timestamp,
     keeping the entry within the TTL window. This is the
     'persistently broken slide stays throttled' contract — without
@@ -323,9 +320,7 @@ async def test_failed_slide_throttle_refreshes_timestamp_on_repeated_failure(
     storage.save_web(slide)
 
     fake_clock = [1000.0]
-    monkeypatch.setattr(
-        web_screenshot.time, "monotonic", lambda: fake_clock[0]
-    )
+    monkeypatch.setattr(web_screenshot.time, "monotonic", lambda: fake_clock[0])
     _install_render(monkeypatch, raise_exc=WebRenderError("down"))
 
     # First failure at t=1000.
