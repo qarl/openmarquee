@@ -269,6 +269,11 @@ impl IpcPaintMetrics {
         // paints. _ns-suffixed PhaseStats field names anchor the
         // unit-of-measure at the type level.
         let stats = crate::profile::summarize_samples(&self.paint_us_samples);
+        // Cherry-pick fix (2026-05-26): code2's PerfStatsJson struct
+        // creation below references `paint_us_p99` as a bare binding
+        // but the prior code only inlined `stats.p99_ns` in the
+        // eprintln. Bind it explicitly so both consumers share.
+        let paint_us_p99 = stats.p99_ns;
         eprintln!(
             "ipc.soak window_s={} frames={} transitions={} fps_avg={:.1} paint_us=avg/{}/max/{} paint_us_p99={} session_frames={} session_transitions={} frames_observed_total={} frames_over_budget_total={}",
             elapsed.as_secs(),
@@ -277,7 +282,7 @@ impl IpcPaintMetrics {
             fps_avg,
             avg_us,
             self.max_paint_us,
-            stats.p99_ns,
+            paint_us_p99,
             self.session_frames,
             self.session_transitions,
             frames_observed_total,
