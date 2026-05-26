@@ -1331,7 +1331,19 @@ class PlaybackLoop:
                     src_w = consumer.source_width
                     src_h = consumer.source_height
                     try:
-                        renderer.render_frame(
+                        # Perf-night r5 (2026-05-26): mirrors r4
+                        # (d356587). render_frame triggers _send_op's
+                        # blocking subprocess.stdout.readline on the
+                        # lazy-begin (rust_renderer.py:843-891 TODO);
+                        # every subsequent frame in the pump loop hits
+                        # the same wedge. Wrap in asyncio.to_thread so
+                        # the asyncio event loop stays responsive while
+                        # the worker handles the IPC round-trip — at
+                        # ~30 frames/sec on the active stream path this
+                        # is the highest-frequency wedge point in
+                        # playback.py.
+                        await asyncio.to_thread(
+                            renderer.render_frame,
                             rgb,
                             pixel_format=consumer.pixel_format,
                             frame_w=src_w,
@@ -1373,7 +1385,16 @@ class PlaybackLoop:
             # every exit path (deadline, EOF, stop, pause, render
             # failure) so the sidecar can't hang in pump-mode.
             try:
-                renderer.end_external_frames()
+                # Perf-night r5: end_external_frames writes the
+                # 0-length end-sentinel to the binary frame pipe +
+                # flush (rust_renderer.py:709-733) — NOT a readline,
+                # so the wedge surface is narrower than render_frame's
+                # lazy-begin (kernel pipe write rarely blocks for a
+                # 4-byte payload). Still wrap for asyncio hygiene + to
+                # cover the slim "OS pipe-buffer full / sidecar slow
+                # to drain" worst case. Cold path: fires once per
+                # slide.
+                await asyncio.to_thread(renderer.end_external_frames)
             except Exception:
                 log.exception(
                     "playback: end_external_frames failed for stream slide id=%s",
@@ -1412,11 +1433,19 @@ class PlaybackLoop:
             # active NV12 pump session first so the black frame opens
             # a fresh rgb888 session (begin_external_frames' format is
             # latched per-session). A no-op when no pump is active.
+            #
+            # Perf-night r5: cold-path hygiene wraps. on_unreachable=
+            # "black" is rare (stream genuinely unreachable + slide-
+            # configured fallback policy), so the wedge here is
+            # uncommon — but the fix shape is the same and the cost
+            # is zero (the contextlib.suppress already catches any
+            # exception type, so worker-thread exception propagation
+            # through asyncio.to_thread is functionally identical).
             with contextlib.suppress(Exception):
-                self._renderer.end_external_frames()
+                await asyncio.to_thread(self._renderer.end_external_frames)
             black = bytes(self._renderer.width * self._renderer.height * 3)
             with contextlib.suppress(Exception):
-                self._renderer.render_frame(black)
+                await asyncio.to_thread(self._renderer.render_frame, black)
         # hold_last_frame, or black after its paint: wait the slot
         # out. _wait returns early on stop/pause so a takeover still
         # preempts a held stream slot.

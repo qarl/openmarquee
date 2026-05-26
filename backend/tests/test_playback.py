@@ -718,6 +718,79 @@ def _patch_stream_ffmpeg(
 
 
 @pytest.mark.asyncio
+async def test_stream_slide_render_frame_off_loop_allows_concurrent_progress(
+    renderer, tmp_path, monkeypatch
+):
+    """Perf-night r5 (2026-05-26) load-bearing invariant: the
+    asyncio.to_thread wrap around `renderer.render_frame` inside the
+    `_play_stream_slide` pump loop (playback.py:1248) must release the
+    asyncio event loop while the renderer is mid-IPC. Mirrors the
+    r4 pattern for the `_play_via_rust_ipc` advance wrap.
+
+    Setup:
+      - mock-ffmpeg delivers 5 NV12 frames
+      - renderer.render_frame is wrapped to inject a 30ms `time.sleep`
+        per call (simulating the slice-2.5 push-frames IPC blocking
+        readline)
+      - a counter coroutine increments every 5ms
+
+    Pre-fix (bare `renderer.render_frame(...)`), each 30ms sleep
+    blocks the asyncio loop entirely; across 5 frames the counter
+    would barely tick (~0-1 increments).
+
+    Post-fix (`await asyncio.to_thread(renderer.render_frame, ...)`),
+    each sleep happens on a worker thread; the counter at 5ms
+    cadence sees ~30 increments during 5×30ms of pump time. Floor
+    of 5 = conservative regression lock for slow CI runners."""
+    import time as _time
+
+    frame_size = 8 * 8 * 3 // 2  # NV12 at 8x8
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=5)
+    _patch_stream_ffmpeg(monkeypatch, mock, source_size=(8, 8))
+
+    real_render_frame = renderer.render_frame
+    def slow_render_frame(d, **kwargs):
+        _time.sleep(0.03)  # 30ms sync wedge per frame
+        return real_render_frame(d, **kwargs)
+    renderer.render_frame = slow_render_frame
+
+    counter = 0
+    async def tick_counter():
+        nonlocal counter
+        try:
+            while True:
+                await asyncio.sleep(0.005)
+                counter += 1
+        except asyncio.CancelledError:
+            return
+
+    slide = StreamSlide(name="live", stream_url="rtsp://h:8554/x", duration_ms=2000)
+    loop = _new_loop(renderer, fetch_items=lambda: [slide], read_asset=lambda _id: b"")
+    counter_task = asyncio.create_task(tick_counter())
+    try:
+        await loop.start()
+        # Long enough for the mock ffmpeg to spawn + deliver all 5
+        # frames (each gated by the 30ms sleep on render_frame).
+        await asyncio.sleep(1.0)
+        await loop.stop()
+        # Post-fix: each render_frame's 30ms sleep runs on a worker
+        # thread; tick_counter freely accumulates during those windows.
+        # Pre-fix: 5 frames × 30ms = 150ms of total event-loop wedge
+        # in tight succession; counter would near-zero through that
+        # window. > 5 is the regression-lock floor.
+        assert counter > 5, (
+            f"tick_counter only reached {counter} during the StreamSlide "
+            "pump — playback loop appears wedged during render_frame "
+            "calls. asyncio.to_thread wrap likely reverted or missing "
+            "from playback.py:1248."
+        )
+    finally:
+        counter_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await counter_task
+
+
+@pytest.mark.asyncio
 async def test_stream_slide_pumps_frames_to_renderer(renderer, tmp_path, monkeypatch):
     """A StreamSlide in the playlist is intercepted before the IPC
     path; its (mock) stream frames are pushed straight to the renderer.
