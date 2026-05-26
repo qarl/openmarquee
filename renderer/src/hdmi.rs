@@ -3092,6 +3092,14 @@ pub fn paint_and_present_one_frame_for_slide(
     // sidecar smoke driver's stderr thread for offline analysis.
     let trace = std::env::var_os("OPENMARQUEE_BOUNDARY_TRACE").is_some();
     let t_start = if trace { Some(std::time::Instant::now()) } else { None };
+    // perf-night r2 (2026-05-26): record bake/compose/present sub-
+    // phases for the runtime profile histogram (orthogonal to the
+    // boundary-trace env-var path above, which dumps per-frame JSON
+    // lines to stderr). The profile path aggregates p50/p95/p99/max
+    // across N frames and is dump-able via IPC for live measurement.
+    // Phase names sort adjacent: paint_bake_text / paint_compose /
+    // paint_present.
+    let t_phase = std::time::Instant::now();
     // Bug 3 Slice 2B: drain glyph-cache completions at frame start.
     // The worker pool rasterizes new MSDF cells asynchronously; this
     // call uploads any ready cells into the dynamic atlas page +
@@ -3183,6 +3191,11 @@ pub fn paint_and_present_one_frame_for_slide(
         .get_mut(&slide.id)
         .expect("slide_caches entry initialized above");
     let t_after_setup = if trace { Some(std::time::Instant::now()) } else { None };
+    crate::profile::record_phase(
+        "paint_bake_text",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+    let t_phase = std::time::Instant::now();
 
     paint_slide(
         session.gl,
@@ -3224,6 +3237,11 @@ pub fn paint_and_present_one_frame_for_slide(
         }
     }
     let t_after_postpass = if trace { Some(std::time::Instant::now()) } else { None };
+    crate::profile::record_phase(
+        "paint_compose",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+    let t_phase = std::time::Instant::now();
 
     // swap_buffers → lock → addFB → commit_fb. Same primitive
     // sequence as render_animated_slide_in_session's per-frame
@@ -3278,6 +3296,10 @@ pub fn paint_and_present_one_frame_for_slide(
     session.scanout_current_bo = Some(new_bo);
     session.scanout_current_fb = Some(new_fb);
     let t_end = if trace { Some(std::time::Instant::now()) } else { None };
+    crate::profile::record_phase(
+        "paint_present",
+        t_phase.elapsed().as_nanos() as u64,
+    );
 
     // Emit per-phase trace if OPENMARQUEE_BOUNDARY_TRACE was on.
     // One JSON line per painted frame; consumer is the sidecar
@@ -3326,6 +3348,11 @@ pub fn paint_and_present_one_image_slide_frame(
     content_root: &Path,
 ) -> Result<()> {
     use glow::HasContext;
+    // perf-night r2 (2026-05-26): bake/compose/present sub-phase
+    // wraps. Image bake = PNG decode + texture upload (cold) or
+    // texture-cache hit (warm); compose = blit to FBO + present pass;
+    // present = swap + lock + addFB + commit_fb.
+    let t_phase = std::time::Instant::now();
     let asset_path = crate::content::image_slide_asset_path(content_root, slide.id);
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
@@ -3356,6 +3383,11 @@ pub fn paint_and_present_one_image_slide_frame(
         session
             .image_slide_tex_cache
             .ensure(session.gl, slide.id, &asset_path)?;
+    crate::profile::record_phase(
+        "paint_bake_image",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+    let t_phase = std::time::Instant::now();
     if let Some((fbo, _tex)) = scene_fbo_handle {
         unsafe {
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
@@ -3385,6 +3417,11 @@ pub fn paint_and_present_one_image_slide_frame(
             run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
         }
     }
+    crate::profile::record_phase(
+        "paint_compose",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+    let t_phase = std::time::Instant::now();
     // Mirror paint_and_present_one_frame_for_slide's scanout
     // rotation: swap, lock front BO, addFB, commit_fb, then
     // shift scanout_current -> scanout_prev and stash the new pair.
@@ -3423,6 +3460,10 @@ pub fn paint_and_present_one_image_slide_frame(
     session.scanout_prev_bo = session.scanout_current_bo.take();
     session.scanout_current_bo = Some(new_bo);
     session.scanout_current_fb = Some(new_fb);
+    crate::profile::record_phase(
+        "paint_present",
+        t_phase.elapsed().as_nanos() as u64,
+    );
     Ok(())
 }
 
@@ -3680,6 +3721,12 @@ pub fn paint_and_present_one_video_slide_frame(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
     let t_enter = if profile_first { Some(std::time::Instant::now()) } else { None };
+    // perf-night r2 (2026-05-26): bake/compose/present sub-phases for
+    // the runtime profile. Video bake = V4L2 sample drain + NV12
+    // upload + cover-fit blit (inside bake_video_slide_to_current_fbo);
+    // compose = present_pass when rotated; present = swap + lock +
+    // addFB + commit_fb.
+    let t_phase = std::time::Instant::now();
     // FYS bug 5: for a non-zero display rotation, the video frame
     // must bake into the logical-sized scene FBO and then be
     // rotated onto the panel by the present pass. With rotation==0
@@ -3727,8 +3774,19 @@ pub fn paint_and_present_one_video_slide_frame(
             use glow::HasContext;
             unsafe { session.gl.bind_framebuffer(glow::FRAMEBUFFER, None); }
         }
+        // Sample the bake even on no-frame ticks -- it captures the
+        // V4L2 dqbuf wait + early-return path which can stall.
+        crate::profile::record_phase(
+            "paint_bake_video",
+            t_phase.elapsed().as_nanos() as u64,
+        );
         return Ok(());
     };
+    crate::profile::record_phase(
+        "paint_bake_video",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+    let t_phase = std::time::Instant::now();
     // FYS bug 5: rotated route -- present the logical scene FBO onto
     // the panel-native default fb with the rotating present pass.
     if let Some((_fbo, tex)) = scene_fbo_handle {
@@ -3742,8 +3800,17 @@ pub fn paint_and_present_one_video_slide_frame(
             run_present_pass(session.gl, tex, 1.0, 1.0, rotation)?;
         }
     }
+    crate::profile::record_phase(
+        "paint_compose",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+    let t_phase = std::time::Instant::now();
     let t_commit = if profile_first { Some(std::time::Instant::now()) } else { None };
     let r = finish_video_slide_swap_and_commit(session, card);
+    crate::profile::record_phase(
+        "paint_present",
+        t_phase.elapsed().as_nanos() as u64,
+    );
     if path_label == "DMABUF" {
         if let (Some(tc), Some(te)) = (t_commit, t_enter) {
             eprintln!(
