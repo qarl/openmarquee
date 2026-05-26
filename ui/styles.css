@@ -3755,3 +3755,42 @@ section.live {
     background: rgba(0, 0, 0, 0.3);
     border-radius: 2px;
 }
+
+/* --- Perf histogram capture control (Perf-night r8 / r2.5, 2026-05-26)
+   Operator-facing phase histogram capture button in the Settings →
+   Diagnostics card. Output is a monospace <pre> block + a Copy button.
+   Lives inside the Settings card (NOT the corner overlay) because a
+   ~30-line histogram body is too big for the corner widget. */
+.perf-histogram {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.perf-histogram__status {
+    margin: 0;
+    color: var(--om-text-dim);
+    font-size: 12px;
+    min-height: 1.2em;
+}
+.perf-histogram__output {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 4px;
+}
+.perf-histogram__text {
+    margin: 0;
+    padding: 8px 10px;
+    background: rgba(0, 0, 0, 0.5);
+    color: #d4d4d4;
+    font-family: var(--om-mono, ui-monospace, "SF Mono", monospace);
+    font-size: 11.5px;
+    line-height: 1.35;
+    border-radius: 4px;
+    max-height: 360px;
+    overflow: auto;
+    white-space: pre;
+}
+.perf-histogram__copy {
+    align-self: flex-start;
+}
