@@ -50,8 +50,10 @@ import asyncio
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 from openmarquee.content import WebSlide
 from openmarquee.web_render import WebRenderError, render_web_png
@@ -148,24 +150,51 @@ def _read_meminfo() -> tuple[int, int] | None:
 # timeout, so a waiter blocks at most ~that long.
 _render_lock = asyncio.Lock()
 
-# Slide ids whose most recent render FAILED. The first failure for an
-# id logs at WARNING (the operator must see a broken Web slide);
-# subsequent consecutive failures for the SAME id log at DEBUG, so a
-# persistently-failing URL on a short refresh interval doesn't emit a
-# WARNING every refresh forever. A success clears the id so a later
-# failure warns afresh. Module-level (process-lifetime) — resets on
-# restart, the right cadence for a "this slide is broken" signal.
-_failed_slide_ids: set = set()
+# Slide ids whose most recent render FAILED, mapped to the wall-clock
+# monotonic timestamp of the most-recent failure. The first failure
+# for an id logs at WARNING (the operator must see a broken Web
+# slide); subsequent consecutive failures for the SAME id log at
+# DEBUG, so a persistently-failing URL on a short refresh interval
+# doesn't emit a WARNING every refresh forever. A success clears the
+# id so a later failure warns afresh.
+#
+# r12 (2026-05-26) memory audit: replaced bare `set` with
+# `dict[UUID, float]` + TTL prune on access. Pre-fix, the set was
+# module-level + process-lifetime; an operator who created+deleted
+# many broken-URL slides over weeks would accumulate UUIDs forever.
+# Sub-1MB/year on realistic operator usage (slow leak, not 24h-OOM
+# threat), but architecturally unbounded. TTL-bound entries to a
+# 24h sliding window: a slide that hasn't failed in 24h drops from
+# the throttle map (so a fresh failure warns again — operator-
+# visible signal restored). The set's original semantic "this slide
+# is broken right now" is preserved.
+_FAILED_SLIDE_TTL_SECONDS: float = 24 * 60 * 60  # 24h
+_failed_slide_ids: dict[UUID, float] = {}
+
+
+def _prune_failed_slide_ids(now: float | None = None) -> None:
+    """Drop entries older than `_FAILED_SLIDE_TTL_SECONDS` from the
+    throttle map. Called from `_log_fetch_failure` so the prune cost
+    is amortized into the failure path (the throttle map only matters
+    in failure cycles; success calls `_failed_slide_ids.pop()` and
+    bypasses the prune)."""
+    cutoff = (now if now is not None else time.monotonic()) - _FAILED_SLIDE_TTL_SECONDS
+    expired = [k for k, t in _failed_slide_ids.items() if t < cutoff]
+    for k in expired:
+        _failed_slide_ids.pop(k, None)
 
 
 def _log_fetch_failure(slide: WebSlide, msg: str, *args) -> None:
     """Log a render failure with the first-fail-WARNING-then-DEBUG
     throttle. The first failure for `slide.id` logs WARNING; subsequent
     consecutive failures for the same id log DEBUG."""
+    now = time.monotonic()
+    _prune_failed_slide_ids(now=now)
     if slide.id in _failed_slide_ids:
+        _failed_slide_ids[slide.id] = now  # refresh timestamp
         log.debug(msg + " (throttled)", *args)
     else:
-        _failed_slide_ids.add(slide.id)
+        _failed_slide_ids[slide.id] = now
         log.warning(msg, *args)
 
 
@@ -263,7 +292,7 @@ async def fetch_web_screenshot(
         # Defensive catch-all — the playback loop fire-and-forgets this
         # coroutine, so nothing must escape. log.exception always emits
         # the traceback — an unexpected error is worth seeing each time.
-        _failed_slide_ids.add(slide.id)
+        _failed_slide_ids[slide.id] = time.monotonic()
         log.exception(
             "web-screenshot: unexpected error rendering slide id=%s "
             "url=%s; keeping last-good asset",
@@ -279,7 +308,7 @@ async def fetch_web_screenshot(
         # (save_web drops the cache entry before the write, so a failed
         # write doesn't leave stale state). Log + report failure rather
         # than crash the fire-and-forget task.
-        _failed_slide_ids.add(slide.id)
+        _failed_slide_ids[slide.id] = time.monotonic()
         log.exception(
             "web-screenshot: rendered slide id=%s but failed to save it; keeping last-good asset",
             slide.id,
@@ -288,7 +317,7 @@ async def fetch_web_screenshot(
 
     # A success clears the throttle entry so the NEXT failure for this
     # id warns again rather than being DEBUG-suppressed.
-    _failed_slide_ids.discard(slide.id)
+    _failed_slide_ids.pop(slide.id, None)
     log.info(
         "web-screenshot: refreshed slide id=%s url=%s (%d bytes)",
         slide.id,
