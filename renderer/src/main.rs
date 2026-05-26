@@ -34,6 +34,12 @@ mod mem;
 mod mp4_demux;
 mod playback;
 mod profile;
+/// `[perf]` r1 (2026-05-26) — host-testable predicate for the
+/// 30fps deadline-miss counter wired into `commit_fb`. Pure data;
+/// cross-platform so the boundary tests (0/35/36/37/100ms) run on
+/// Mac as well as the Pi. The production constants + warn-log live
+/// in `hdmi.rs`; this module is just the predicate + tests.
+mod frame_pacing;
 /// SDF arc slice B -- compile-time-baked MSDF atlas pipeline.
 /// Cross-platform parsing + per-glyph lookup.
 mod sdf_atlas;

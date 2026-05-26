@@ -187,7 +187,21 @@ impl IpcPaintMetrics {
         }
     }
 
-    fn maybe_emit_summary(&mut self) {
+    /// `[perf]` r1 (2026-05-26) addendum: `frames_observed_total`
+    /// and `frames_over_budget_total` snapshot the session-cumulative
+    /// counters maintained on `EglSession::record_present` (hdmi.rs).
+    /// Caller passes them in because the deadline-miss counter lives
+    /// on the session, not on IpcPaintMetrics (the chokepoint is
+    /// `commit_fb`, which is in hdmi.rs and doesn't see the IPC
+    /// metrics struct). Both numbers are monotonically non-decreasing
+    /// across the session; downstream can diff two consecutive
+    /// summaries to compute a window-rate. New fields go on the right
+    /// per the soak-parser regex-by-key convention.
+    fn maybe_emit_summary(
+        &mut self,
+        frames_observed_total: u64,
+        frames_over_budget_total: u64,
+    ) {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.last_summary);
         if elapsed.as_secs() < self.summary_window_s {
@@ -212,7 +226,7 @@ impl IpcPaintMetrics {
         let (_, _, _, _, paint_us_p99, _) =
             crate::profile::summarize_samples(&self.paint_us_samples);
         eprintln!(
-            "ipc.soak window_s={} frames={} transitions={} fps_avg={:.1} paint_us=avg/{}/max/{} paint_us_p99={} session_frames={} session_transitions={}",
+            "ipc.soak window_s={} frames={} transitions={} fps_avg={:.1} paint_us=avg/{}/max/{} paint_us_p99={} session_frames={} session_transitions={} frames_observed_total={} frames_over_budget_total={}",
             elapsed.as_secs(),
             self.frames,
             self.transitions,
@@ -222,6 +236,8 @@ impl IpcPaintMetrics {
             paint_us_p99,
             self.session_frames,
             self.session_transitions,
+            frames_observed_total,
+            frames_over_budget_total,
         );
         self.last_summary = now;
         self.frames = 0;
@@ -1114,6 +1130,20 @@ where
             };
             let paint_start = paint_kind.as_ref().map(|_| std::time::Instant::now());
 
+            // `[perf]` r1 (2026-05-26): forward the IPC-known
+            // paint-kind to the session so the deadline-miss
+            // warn-log inside commit_fb can differentiate
+            // "video glitching" (Slide, single-arm paint) from
+            // "transition heavy" (Transition, dual-input shader)
+            // without threading per-slide context through every
+            // commit_fb caller. Non-paint responses set the flag
+            // to false; the next over-budget warn (if any) sees
+            // a clean baseline.
+            session.set_in_transition(matches!(
+                paint_kind,
+                Some(IpcPaintKind::Transition)
+            ));
+
             // Linux paint hook: when the dispatcher returned a
             // PaintSlide / PaintTransition OpResult, fire the
             // actual GL paint. If paint errors, override the
@@ -1142,7 +1172,17 @@ where
             emit_response(stdout, &resp)?;
             // Phase 9 Step 9a: 30s soak summary emit. Cheap when the
             // window hasn't expired (single Instant::elapsed + branch).
-            paint_metrics.maybe_emit_summary();
+            // `[perf]` r1 addendum: snapshot the session-cumulative
+            // deadline-miss counters so the summary line carries the
+            // new frames_observed_total + frames_over_budget_total
+            // keys. The summary emitter prints them verbatim
+            // (monotonically non-decreasing across the session);
+            // downstream parsers diff consecutive windows to get a
+            // per-window rate.
+            paint_metrics.maybe_emit_summary(
+                session.frames_observed_total(),
+                session.frames_over_budget_total(),
+            );
             if is_begin_slide {
                 crate::mem::log_mem_snapshot(
                     &format!("begin_slide={begin_slide_count}"),
