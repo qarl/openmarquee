@@ -282,6 +282,20 @@ pub enum IpcRequest {
     /// Op 7: release everything. Caller is expected to close
     /// the IPC pipe after receiving the response.
     Close,
+    /// Op 9 (perf-night r1, 2026-05-26): enable the runtime profile
+    /// histogram for the next N frames. Replaces --profile-frames at
+    /// process start, which on Pi requires a sidecar restart (visible
+    /// blank flash + reel-from-start). Op is a no-cost setter; the
+    /// hot loop already checks `is_enabled()` / `frames_remaining()`.
+    /// Calling again before the budget exhausts replaces the budget.
+    ProfileStart(ProfileStartParams),
+    /// Op 10 (perf-night r1, 2026-05-26): return the accumulated
+    /// histogram as text (one line per phase: p50/p95/p99/max in µs).
+    /// Operator polls this after ProfileStart to know when the
+    /// `frames_remaining=0` window has finished. Pure read-only;
+    /// safe to call concurrent with playback (single Mutex guards
+    /// the sample store, microsecond-scale critical section).
+    ProfileDump,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -334,6 +348,15 @@ pub struct CaptureParams {
     /// Filesystem path to write the PNG. Caller is responsible
     /// for the directory existing + write permissions.
     pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileStartParams {
+    /// Number of frames to capture. The hot loop decrements this
+    /// each frame_complete; record_phase drops samples once it
+    /// reaches 0. Callers can poll ProfileDump to know when capture
+    /// is complete (dump's first line carries `frames_remaining=N`).
+    pub frames: u32,
 }
 
 /// STREAM/VLC HW-decode (2026-05-20): the external-frame pixel
@@ -543,8 +566,13 @@ pub enum OpResult {
     Idle,
     /// capture() result: bytes written to path.
     CaptureOk { path: String, bytes: u64 },
+    /// profile_dump() result: the text histogram. Body is
+    /// `profile::dump_text()`'s output — stable line-oriented
+    /// format the operator can grep / parse.
+    ProfileDumpOk { text: String },
     /// Empty result for ops without meaningful return data
-    /// (begin_slide / begin_transition / reconfigure / close).
+    /// (begin_slide / begin_transition / reconfigure / close /
+    /// profile_start).
     Empty,
 }
 

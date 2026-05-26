@@ -604,6 +604,41 @@ class RustRenderer:
             params["gamma"] = float(gamma)
         self._send_op("reconfigure", params)
 
+    def profile_start(self, frames: int) -> None:
+        """Op 9 (perf-night r1, 2026-05-26). Enable runtime phase
+        profiling for the next `frames` frames. Replaces the
+        --profile-frames CLI flag, which on Pi requires a sidecar
+        restart (visible blank flash + reel-from-start).
+
+        Idempotent-by-overwrite: a second call mid-capture replaces
+        the budget with the new N and starts a fresh sample window.
+        Safe to call concurrent with playback; the global sample-store
+        Mutex's critical section is microsecond-scale.
+        """
+        if int(frames) <= 0:
+            raise RustRendererOpError(
+                f"profile_start: frames must be > 0 (got {frames!r})"
+            )
+        self._send_op("profile_start", {"frames": int(frames)})
+
+    def profile_dump(self) -> str:
+        """Op 10 (perf-night r1, 2026-05-26). Return the accumulated
+        phase histogram as text. One line per phase:
+            `phase  n=N  p50=…us  p95=…us  p99=…us  max=…us`
+        First line carries `frames_remaining=N` so callers can poll
+        until N reaches 0. States the caller may see:
+          - `"profile: disabled"` -- no profile_start has been called
+          - `"profile: no samples (frames_remaining=N)"` -- started,
+            but no frame has completed yet
+          - histogram body -- one or more frames captured
+        """
+        body = self._send_op("profile_dump", None)
+        if body is None or "text" not in body:
+            raise RustRendererProtocolError(
+                f"ProfileDump OK response missing text: {body!r}"
+            )
+        return str(body["text"])
+
     def close(self) -> None:
         """Op 7. Send Close + tear down the subprocess. Safe to call repeatedly;
         the second + subsequent calls are no-ops."""

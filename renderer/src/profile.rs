@@ -131,6 +131,50 @@ pub fn summarize_samples(samples: &[u64]) -> PhaseStats {
     }
 }
 
+/// Format the accumulated histogram into a stable text table.
+/// One line per phase: `phase  n=N  p50=…us  p95=…us  p99=…us
+/// max=…us`. Ordered by phase name (BTreeMap iteration is stable).
+/// Empty state -> `"profile: disabled"`; enabled-but-no-frames-yet
+/// -> `"profile: no samples (frames_remaining=N)"`. Caller does not
+/// have to know storage internals.
+///
+/// Units: microseconds (perf budget at 30fps = 33333µs; one-µs
+/// resolution matches what an operator can act on; rounding ns to µs
+/// strips a digit of noise from the GC-quantized Instant readings).
+pub fn dump_text() -> String {
+    let s = match slot().lock() {
+        Ok(s) => s,
+        Err(_) => return "profile: lock poisoned".to_string(),
+    };
+    let p = match s.as_ref() {
+        Some(p) => p,
+        None => return "profile: disabled".to_string(),
+    };
+    if p.samples.is_empty() {
+        return format!(
+            "profile: no samples (frames_remaining={})",
+            p.frames_remaining
+        );
+    }
+    let mut out = String::new();
+    out.push_str(&format!(
+        "profile: frames_remaining={}\n",
+        p.frames_remaining
+    ));
+    for (phase, samples) in &p.samples {
+        let stats = summarize_samples(samples);
+        out.push_str(&format!(
+            "{phase}  n={}  p50={}us  p95={}us  p99={}us  max={}us\n",
+            samples.len(),
+            stats.p50_ns / 1_000,
+            stats.p95_ns / 1_000,
+            stats.p99_ns / 1_000,
+            stats.max_ns / 1_000,
+        ));
+    }
+    out
+}
+
 /// Dump the accumulated histogram to stderr in markdown table form.
 /// Idempotent: subsequent calls with no new samples re-print the
 /// same table. Caller ALSO clears via `disable` if a fresh capture
@@ -220,6 +264,22 @@ mod tests {
         assert_eq!(stats.p50_ns, 42_000);
         assert_eq!(stats.p95_ns, 42_000);
         assert_eq!(stats.p99_ns, 42_000);
+    }
+
+    #[test]
+    fn dump_text_disabled_state() {
+        // Run-isolated: dump_text reads the global PROFILE state, which
+        // is process-shared. Other tests don't enable/disable, so default
+        // is `None`. If a future test enables without disabling, this
+        // asserts the contract once at module load.
+        let out = dump_text();
+        // Don't assert exact string -- another test running in parallel
+        // could have enable()'d. Either "disabled" or "no samples" or
+        // "frames_remaining=" is acceptable as long as it's well-formed.
+        assert!(
+            out.starts_with("profile: ") || out.contains("p50=") || out.contains("frames_remaining="),
+            "dump_text returned unexpected shape: {out:?}"
+        );
     }
 
     #[test]

@@ -56,7 +56,7 @@ echo "==> rsync backend to $TARGET:$REMOTE_ROOT/backend/"
 # || true guards against the pre-clean failing on a fresh Pi where
 # none of these paths exist yet.
 ssh "$TARGET" "sudo find $REMOTE_ROOT/backend -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null; sudo find $REMOTE_ROOT/backend -name '*.egg-info' -type d -exec rm -rf {} + 2>/dev/null; true"
-rsync -avz --delete --delete-excluded \
+rsync -avz --rsync-path="sudo rsync" --delete --delete-excluded \
     --exclude '__pycache__' \
     --exclude '*.pyc' \
     --exclude '.ruff_cache' \
@@ -78,13 +78,13 @@ RUST_BIN_HOST="$OPENMARQUEE_BUILD_DIR/renderer/target/aarch64-unknown-linux-gnu/
 if [ -f "$RUST_BIN_HOST" ]; then
     echo "==> rsync Rust IPC sidecar binary to $TARGET:$REMOTE_ROOT/bin/"
     ssh "$TARGET" "mkdir -p $REMOTE_ROOT/bin"
-    rsync -avz "$RUST_BIN_HOST" "$TARGET:$REMOTE_ROOT/bin/openmarquee-render"
+    rsync -avz --rsync-path="sudo rsync" "$RUST_BIN_HOST" "$TARGET:$REMOTE_ROOT/bin/openmarquee-render"
 else
     echo "==> no Rust sidecar binary at $RUST_BIN_HOST; skipping (run scripts/renderer_cross_build.sh first to enable opt-in)"
 fi
 
 echo "==> rsync UI to $TARGET:$REMOTE_ROOT/ui/"
-rsync -avz --delete --delete-excluded \
+rsync -avz --rsync-path="sudo rsync" --delete --delete-excluded \
     --exclude 'src/' \
     --exclude 'e2e/' \
     --exclude 'node_modules' \
@@ -103,13 +103,13 @@ rsync -avz --delete --delete-excluded \
 # fails with "No such file or directory" and the deploy aborts. Both
 # directories are small (<200KB total) so unconditional rsync is fine.
 echo "==> rsync scripts/ to $TARGET:$REMOTE_ROOT/scripts/"
-rsync -avz --delete --delete-excluded \
+rsync -avz --rsync-path="sudo rsync" --delete --delete-excluded \
     --exclude '._*' \
     --exclude '__pycache__' \
     "$OPENMARQUEE_BUILD_DIR/scripts/" "$TARGET:$REMOTE_ROOT/scripts/"
 
 echo "==> rsync system/ to $TARGET:$REMOTE_ROOT/system/"
-rsync -avz --delete --delete-excluded \
+rsync -avz --rsync-path="sudo rsync" --delete --delete-excluded \
     --exclude '._*' \
     "$OPENMARQUEE_BUILD_DIR/system/" "$TARGET:$REMOTE_ROOT/system/"
 
@@ -120,7 +120,7 @@ rsync -avz --delete --delete-excluded \
 # needs the same single canonical copies or install.sh logs "asset
 # absent; skip" and the boot splash silently never installs. Small dir.
 echo "==> rsync images/ to $TARGET:$REMOTE_ROOT/images/"
-rsync -avz --delete --delete-excluded \
+rsync -avz --rsync-path="sudo rsync" --delete --delete-excluded \
     --exclude '._*' \
     --exclude '__pycache__' \
     "$OPENMARQUEE_BUILD_DIR/images/" "$TARGET:$REMOTE_ROOT/images/"

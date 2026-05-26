@@ -12,12 +12,13 @@ on the device once those land). Replaced the Phase 2 manual
 /dev/play/{id} poke (the dev endpoint has since been removed).
 """
 
+import asyncio
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from openmarquee.api import cors_headers_for_origin
 from openmarquee.content.storage import ContentStorage
@@ -193,3 +194,80 @@ async def start_playback(loop: LoopDep) -> None:
 @router.post("/stop", status_code=204)
 async def stop_playback(loop: LoopDep) -> None:
     await loop.stop()
+
+
+# ---------------------------------------------------------------------
+# Runtime perf-profile capture (perf-night r1, 2026-05-26).
+#
+# Foundation for perf measurement on a live Pi: enable phase-histogram
+# collection over an N-frame window without restarting the sidecar.
+# Restart would otherwise interrupt the operator's view (blank flash +
+# reel-from-start) since the renderer runs as --ipc-sidecar.
+#
+# Auth: standard bearer gate (AuthMiddleware whitelist does NOT carve
+# these out). Operator must POST with `Authorization: Bearer <token>`.
+# ---------------------------------------------------------------------
+
+
+class PerfStartRequest(BaseModel):
+    """Frames to capture. 1..100000 — upper bound prevents an operator
+    typo from pinning the sample store unbounded (each phase ~12 bytes
+    per sample; 100k frames * ~10 phases ~12MB, well under any
+    reasonable limit)."""
+
+    frames: int = Field(ge=1, le=100_000)
+
+
+class PerfDumpResponse(BaseModel):
+    """Dump body. `ready=True` when frames_remaining=0 (capture window
+    finished); `False` while still collecting OR profile disabled. The
+    operator polls until ready=True, then reads `text` for the
+    histogram. Distinguishing ready from "no samples" requires
+    inspecting `text` — both states are useful to surface to the
+    operator without invoking semantic interpretation here."""
+
+    ready: bool
+    text: str
+
+
+@router.post("/perf/start", status_code=204)
+async def perf_start(body: PerfStartRequest, loop: LoopDep) -> None:
+    """Enable runtime phase profiling for the next `frames` frames.
+    Replaces --profile-frames CLI flag with no sidecar restart.
+
+    Returns 503 when the active renderer doesn't support profile
+    capture (MockRenderer in dev/test). Production RustRenderer always
+    supports it.
+    """
+    renderer = loop.renderer
+    profile_start = getattr(renderer, "profile_start", None)
+    if profile_start is None:
+        raise HTTPException(
+            status_code=503,
+            detail="active renderer does not support profile capture (only RustRenderer does)",
+        )
+    # _send_op is blocking + acquires the IPC RLock; wrap in to_thread
+    # so we don't wedge the event loop while the playback advance() may
+    # be holding the lock. See rust_renderer.py:861 TODO -- this IS the
+    # FastAPI request-handler context that TODO calls out.
+    await asyncio.to_thread(profile_start, body.frames)
+
+
+@router.get("/perf/dump", response_model=PerfDumpResponse)
+async def perf_dump(loop: LoopDep) -> PerfDumpResponse:
+    """Poll the accumulated histogram. `ready=True` when
+    `frames_remaining=0` appears in the body's first line.
+
+    Returns 503 when the active renderer doesn't support profile
+    capture (MockRenderer in dev/test).
+    """
+    renderer = loop.renderer
+    profile_dump = getattr(renderer, "profile_dump", None)
+    if profile_dump is None:
+        raise HTTPException(
+            status_code=503,
+            detail="active renderer does not support profile capture (only RustRenderer does)",
+        )
+    text = await asyncio.to_thread(profile_dump)
+    ready = "frames_remaining=0" in text
+    return PerfDumpResponse(ready=ready, text=text)

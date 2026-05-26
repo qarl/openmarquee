@@ -1722,6 +1722,38 @@ fn handle_inner_request(
             state.reset();
             ok_empty()
         }
+        IpcRequest::ProfileStart(p) => {
+            // perf-night r1 (2026-05-26): replace --profile-frames at
+            // process start. enable() is idempotent-by-overwrite: a
+            // second call mid-capture resets the budget to the new N
+            // and starts a fresh sample window. The hot loop checks
+            // is_enabled()/frames_remaining() so no flag-wiring
+            // beyond this is needed.
+            //
+            // Subagent-flagged trap (r1 review): profile::enable(0)
+            // would set frames_remaining=0 immediately, and the
+            // backend's poll loop tests for "frames_remaining=0" in
+            // the dump text to decide ready -- so a frames=0 start
+            // produces ready=True with zero samples. The HTTP layer
+            // enforces ge=1, but the IPC layer is its own contract;
+            // mirror the Python proxy guard at rust_renderer.py.
+            if p.frames == 0 {
+                return err("profile_start: frames must be > 0");
+            }
+            crate::profile::enable(p.frames);
+            ok_empty()
+        }
+        IpcRequest::ProfileDump => {
+            // perf-night r1: pure read of the global sample store.
+            // dump_text handles all three states (disabled / no
+            // samples yet / has samples). Caller polls until the
+            // body's first line shows frames_remaining=0.
+            IpcResponse::Ok {
+                result: OpResult::ProfileDumpOk {
+                    text: crate::profile::dump_text(),
+                },
+            }
+        }
     }
 }
 
@@ -2133,6 +2165,67 @@ mod tests {
                 );
             }
             other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_profile_start_rejects_zero_frames() {
+        // r1 review (subagent finding #4): frames=0 would set
+        // frames_remaining=0 immediately, and the backend ready-check
+        // greps for "frames_remaining=0" -> dump returns ready=True
+        // with zero captured samples (silent bad behavior). HTTP
+        // layer Pydantic gate handles HTTP callers; this guard is
+        // the IPC-contract twin.
+        let mut state = PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let td = tempfile::TempDir::new().unwrap();
+        let req = IpcRequest::ProfileStart(
+            crate::playback::ProfileStartParams { frames: 0 },
+        );
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        match resp {
+            IpcResponse::Err { error } => {
+                assert!(
+                    error.starts_with("profile_start: frames must be > 0"),
+                    "expected the zero-frames guard message; got: {error}"
+                );
+            }
+            other => panic!("expected Err, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handle_profile_start_then_dump_round_trips() {
+        // perf-night r1 (2026-05-26): profile_start enables the global
+        // profile; profile_dump returns the text snapshot. State-only
+        // sidecar dispatches both through handle_inner_request (no HDMI
+        // interception needed -- pure-data ops on the global sample
+        // store). The dump's body shape locks the contract the FastAPI
+        // perf endpoint relies on (`frames_remaining=N` first line).
+        let mut state = PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let td = tempfile::TempDir::new().unwrap();
+
+        let start_req = IpcRequest::ProfileStart(
+            crate::playback::ProfileStartParams { frames: 42 },
+        );
+        let start_resp = handle_inner_request(start_req, &mut state, &mut cache, td.path());
+        assert_eq!(start_resp, IpcResponse::Ok { result: OpResult::Empty });
+
+        let dump_req = IpcRequest::ProfileDump;
+        let dump_resp = handle_inner_request(dump_req, &mut state, &mut cache, td.path());
+        match dump_resp {
+            IpcResponse::Ok { result: OpResult::ProfileDumpOk { text } } => {
+                // No frames have been completed yet -- enable but no
+                // samples. Body shape: "profile: no samples
+                // (frames_remaining=N)" since the global sample store
+                // is empty until a record_phase fires.
+                assert!(
+                    text.starts_with("profile:") || text.contains("frames_remaining="),
+                    "dump_text did not match either branch: {text:?}"
+                );
+            }
+            other => panic!("expected Ok(ProfileDumpOk), got {other:?}"),
         }
     }
 

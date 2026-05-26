@@ -303,6 +303,92 @@ def test_current_thumbnail_cors_for_localhost_origin(client: TestClient, storage
     client.post("/api/playback/stop")
 
 
+# ---------------------------------------------------------------------
+# Perf endpoints (perf-night r1, 2026-05-26).
+# MockRenderer doesn't expose profile_start/profile_dump -> 503.
+# A fake renderer that DOES expose them lets us pin the happy path
+# without instantiating a real RustRenderer sidecar.
+# ---------------------------------------------------------------------
+
+
+def test_perf_start_returns_503_when_renderer_lacks_profile(client: TestClient):
+    response = client.post("/api/playback/perf/start", json={"frames": 100})
+    assert response.status_code == 503
+    assert "does not support profile capture" in response.json()["detail"]
+
+
+def test_perf_dump_returns_503_when_renderer_lacks_profile(client: TestClient):
+    response = client.get("/api/playback/perf/dump")
+    assert response.status_code == 503
+
+
+def test_perf_start_rejects_zero_frames(client: TestClient):
+    response = client.post("/api/playback/perf/start", json={"frames": 0})
+    assert response.status_code == 422  # Pydantic ge=1 violation
+
+
+def test_perf_start_rejects_too_many_frames(client: TestClient):
+    response = client.post("/api/playback/perf/start", json={"frames": 100_001})
+    assert response.status_code == 422  # Pydantic le=100_000 violation
+
+
+def test_perf_round_trip_with_profile_capable_renderer(
+    storage: ContentStorage, tmp_path: Path
+):
+    """Wire-shape test: profile_start forwards frames to the renderer;
+    profile_dump returns text + a derived `ready` flag (True when
+    `frames_remaining=0` substring is present)."""
+
+    class _ProfileCapableRenderer(MockRenderer):
+        def __init__(self, w, h, p):
+            super().__init__(w, h, p)
+            self.last_frames_arg: int | None = None
+            self._dump_text = "profile: no samples (frames_remaining=42)"
+
+        def profile_start(self, frames: int) -> None:
+            self.last_frames_arg = int(frames)
+
+        def profile_dump(self) -> str:
+            return self._dump_text
+
+    fake = _ProfileCapableRenderer(8, 8, tmp_path / "preview.png")
+    fake_loop = PlaybackLoop(
+        renderer=fake,
+        fetch_items=storage.list_all,
+        read_asset=storage.read_asset,
+        empty_playlist_poll_seconds=0.01,
+    )
+    app.dependency_overrides[get_content_storage] = lambda: storage
+    app.dependency_overrides[get_mock_renderer] = lambda: fake
+    app.dependency_overrides[get_playback_loop] = lambda: fake_loop
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/playback/perf/start", json={"frames": 300})
+            assert response.status_code == 204
+            assert fake.last_frames_arg == 300
+
+            response = client.get("/api/playback/perf/dump")
+            assert response.status_code == 200
+            body = response.json()
+            assert body["ready"] is False  # frames_remaining=42, not 0
+            assert "frames_remaining=42" in body["text"]
+
+            fake._dump_text = (
+                "profile: frames_remaining=0\n"
+                "paint  n=300  p50=12000us  p95=18000us  p99=22000us  max=30000us\n"
+            )
+            response = client.get("/api/playback/perf/dump")
+            assert response.status_code == 200
+            body = response.json()
+            assert body["ready"] is True
+            assert "p99=22000us" in body["text"]
+    finally:
+        app.dependency_overrides.clear()
+        _content_storage_singleton.cache_clear()
+        _mock_renderer_singleton.cache_clear()
+        _playback_loop_singleton.cache_clear()
+
+
 def test_current_thumbnail_cors_for_flock_peer_origin(
     client: TestClient, storage: ContentStorage, tmp_path: Path
 ):
