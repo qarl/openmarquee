@@ -1017,10 +1017,11 @@ class PlaybackLoop:
         try:
             # Perf-night r4 (2026-05-26): `_renderer.begin_slide` does a
             # sync subprocess.stdout.readline (rust_renderer.py:843-891
-            # TODO). Bare-call would wedge the asyncio event loop for the
-            # full IPC round-trip. asyncio.to_thread runs it on an
-            # executor worker so other coroutines (FastAPI handlers,
-            # capture path, etc.) keep progressing.
+            # — now resolved per r4-r6 sweep). Bare-call would wedge the
+            # asyncio event loop for the full IPC round-trip.
+            # asyncio.to_thread runs it on an executor worker so other
+            # coroutines (FastAPI handlers, capture path, etc.) keep
+            # progressing.
             await asyncio.to_thread(
                 self._renderer.begin_slide, item.id, t0_ms, duration_ms
             )
@@ -1062,8 +1063,9 @@ class PlaybackLoop:
             #
             # Note: `_renderer.advance` does a blocking readline on
             # the renderer subprocess's stdout (rust_renderer.py:843-
-            # 891 TODO). Perf-night r4 (2026-05-26) wraps the call in
-            # asyncio.to_thread so the wedge happens on an executor
+            # 891 — now resolved per r4-r6 sweep). Perf-night r4
+            # (2026-05-26) wraps the call in asyncio.to_thread so
+            # the wedge happens on an executor
             # worker and the asyncio event loop stays responsive for
             # other coroutines (FastAPI request handlers, capture
             # path, timer fires) for the duration of the IPC round-
@@ -1128,7 +1130,8 @@ class PlaybackLoop:
             transition_t0_ms = t0_ms + int((loop.time() - t0) * 1000)
             try:
                 # Perf-night r4: off-loop per the rust_renderer.py:843-891
-                # TODO. Same rationale as begin_slide / advance above.
+                # sweep (now resolved). Same rationale as begin_slide /
+                # advance above.
                 await asyncio.to_thread(
                     self._renderer.begin_transition,
                     next_item.id,
@@ -1171,8 +1174,9 @@ class PlaybackLoop:
                     break
                 t_ms = t0_ms + int((loop.time() - t0) * 1000)
                 try:
-                    # Perf-night r4: off-loop per rust_renderer.py:843-891.
-                    # Same rationale as the slide-window advance above.
+                    # Perf-night r4: off-loop per rust_renderer.py:843-891
+                    # (now resolved per r4-r6 sweep). Same rationale as
+                    # the slide-window advance above.
                     result = await asyncio.to_thread(self._renderer.advance, t_ms)
                 except RustRendererUnsupportedTransitionError as e:
                     # Mid-transition error -- shouldn't happen (begin_
@@ -1266,8 +1270,9 @@ class PlaybackLoop:
                         # Perf-night r5 (2026-05-26): mirrors r4
                         # (d356587). render_frame triggers _send_op's
                         # blocking subprocess.stdout.readline on the
-                        # lazy-begin (rust_renderer.py:843-891 TODO);
-                        # every subsequent frame in the pump loop hits
+                        # lazy-begin (rust_renderer.py:843-891 — now
+                        # resolved per r4-r6 sweep); every subsequent
+                        # frame in the pump loop hits
                         # the same wedge. Wrap in asyncio.to_thread so
                         # the asyncio event loop stays responsive while
                         # the worker handles the IPC round-trip — at

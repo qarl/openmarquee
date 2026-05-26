@@ -365,8 +365,9 @@ class LiveSession:
                     # (44b013e _play_stream_slide). render_frame goes
                     # through _send_op's blocking subprocess.stdout.
                     # readline on the lazy-begin (rust_renderer.py:843-
-                    # 891 TODO); every subsequent frame writes the
-                    # binary frame channel without a readline, but the
+                    # 891 — now resolved per r4-r6 sweep); every
+                    # subsequent frame writes the binary frame
+                    # channel without a readline, but the
                     # lazy-begin first-frame call IS the wedge. Wrap
                     # in asyncio.to_thread so the live-takeover pump
                     # — running at the source frame rate (~30fps for
