@@ -68,6 +68,17 @@ Environment="OPENMARQUEE_DISABLE_DEV=1"
 Environment="OPENMARQUEE_RENDERER=auto"
 Environment="OPENMARQUEE_RENDERER_BINARY=/usr/local/bin/openmarquee-render"
 
+# Perf-night r4 (2026-05-26): enable V4L2 DMABUF CAPTURE path so the
+# renderer's bake_video_slide_to_current_fbo imports decoded frames
+# via EGLImage zero-copy instead of CPU tex_image_2d upload of Y + UV
+# planes. MMAP-mode upload was 24ms p50 on dev Pi (73% of 30fps
+# budget); DMABUF eliminates the upload. video_decode.rs:105 gates on
+# this var; missing → defaults to MMAP. EGL_EXT_image_dma_buf_import +
+# GL_OES_EGL_image_external must be present at runtime (verified on
+# dev Pi 2026-05-26; the renderer logs "DmaBuf EGLImage path disabled"
+# at session start when either is missing).
+Environment="OPENMARQUEE_RENDERER_DMABUF=1"
+
 # Shader transitions still off on Pi Zero 2 W. Three rounds of
 # fixes -- cycle-aware cache eviction (2026-05-06), pool 20->6,
 # and glTexSubImage2D for same-dim re-uploads (dca94d5) -- each
