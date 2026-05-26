@@ -560,3 +560,96 @@ def test_loop_stats_reflects_recorded_ticks(
     assert body["p99_us"] == 50_000
     assert body["max_us"] == 50_000
     assert body["ticks_over_budget"] == 1
+
+
+# r15 (2026-05-26) robustness: 6-corner audit of the perf-stats.json
+# read path. 4 corners were already-handled (missing file, malformed
+# JSON, schema mismatch, concurrent reads); these tests pin them
+# against future drift + add coverage for the new 64KB size cap +
+# the canonical-only-read property + future-timestamp passthrough.
+
+
+def test_perf_stats_returns_503_on_oversized_file(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """Corner 4: the read path caps at _PERF_STATS_MAX_BYTES (64 KB)
+    to defend against a renderer-side bug or an attacker-replaced
+    file. The realistic emit is <1 KB; anything past 64 KB is wrong
+    upstream. Without the cap, `path.read_text()` would allocate the
+    whole file into the request handler before Pydantic could reject
+    the schema.
+
+    Test plants a 1 MB file at the sidecar path + asserts the handler
+    returns 503 with the size-cap detail string BEFORE attempting to
+    parse the bytes."""
+    perf_path = tmp_path / "perf-stats.json"
+    # 1 MB of zeros — well past the 64 KB cap. The JSON is invalid;
+    # the size check fires first so JSON parse never runs.
+    perf_path.write_bytes(b"0" * (1024 * 1024))
+    monkeypatch.setenv("OPENMARQUEE_PERF_STATS_PATH", str(perf_path))
+
+    response = client.get("/api/playback/perf/stats")
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "exceeds" in detail and "byte cap" in detail
+
+
+def test_perf_stats_reads_canonical_path_only_ignores_orphan_tmp(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """Corner 2: the renderer's `.tmp + rename` atomic-write helper
+    may leave an orphan `.tmp` sibling if it dies between write and
+    rename. The backend reads the CANONICAL path only. An orphan
+    `.tmp` with different content (e.g. an aborted in-progress write)
+    must NOT be confused for the canonical file.
+
+    Pin the canonical-only-read property: plant a valid canonical
+    file with payload A + an orphan `.tmp` with payload B (different
+    `frames` field). Backend should return A, never B."""
+    import json as _json
+
+    perf_path = tmp_path / "perf-stats.json"
+    tmp_orphan_path = tmp_path / "perf-stats.json.tmp"
+
+    payload_canonical = _valid_perf_stats_payload()  # frames=900
+    payload_orphan = {**_valid_perf_stats_payload(), "frames": 99999}
+
+    perf_path.write_text(_json.dumps(payload_canonical))
+    tmp_orphan_path.write_text(_json.dumps(payload_orphan))
+    monkeypatch.setenv("OPENMARQUEE_PERF_STATS_PATH", str(perf_path))
+
+    response = client.get("/api/playback/perf/stats")
+    assert response.status_code == 200
+    # The canonical's frames=900 must come through, NOT the orphan's
+    # frames=99999. Confirms the read targets only the env-var-pointed
+    # path, not the sibling .tmp.
+    assert response.json()["frames"] == 900
+
+
+def test_perf_stats_accepts_future_timestamp_unix_s(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """Corner 6: clock-skew defensive — backend passes
+    `timestamp_unix_s` through as a plain int without bounds-checking.
+    UI overlay's `ageString` (perf-overlay.js) does Math.max(0, ...)
+    so a future timestamp (renderer's clock ahead of backend, or an
+    operator's NTP correction) renders as '0s ago' rather than a
+    negative number.
+
+    Regression-guard against a future PR adding `if ts > now() →
+    reject` to the backend handler — that would break the UI overlay
+    on legitimate NTP drift. Pin the passthrough behavior: a
+    far-future timestamp (year 2099) is accepted as a valid int."""
+    import json as _json
+
+    perf_path = tmp_path / "perf-stats.json"
+    payload = _valid_perf_stats_payload()
+    # 2099-01-01 UTC = 4070908800. Far future relative to any
+    # realistic backend clock.
+    payload["timestamp_unix_s"] = 4_070_908_800
+    perf_path.write_text(_json.dumps(payload))
+    monkeypatch.setenv("OPENMARQUEE_PERF_STATS_PATH", str(perf_path))
+
+    response = client.get("/api/playback/perf/stats")
+    assert response.status_code == 200
+    assert response.json()["timestamp_unix_s"] == 4_070_908_800
