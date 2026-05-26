@@ -268,6 +268,25 @@ const SECTION_TEMPLATE = `
                 </label>
             </div>
 
+            <!-- Perf-night r2 (2026-05-26): toggleable operator-
+                 facing perf overlay (corner-floating fixed-position
+                 panel). The toggle persists in localStorage as
+                 'om.perf.show' (perf-overlay.js). Settings doesn't
+                 own the overlay lifecycle - flipping the toggle just
+                 dispatches 'openmarquee:perf-overlay-toggle'; main.js
+                 listens + mounts/unmounts. Off by default. -->
+            <div class="om-card settings-perf-overlay">
+                <div ${CARD_EYEBROW}>Diagnostics</div>
+                <label class="field-inline" style="display: flex; align-items: center; gap: 8px;">
+                    <input type="checkbox" class="field-perf-overlay-toggle">
+                    <span>Show perf overlay (live fps + over-budget rate)</span>
+                </label>
+                <p class="settings-hint" style="margin: 8px 0 0; color: var(--om-text-dim); font-size: 12px;">
+                    Floats a small panel in the corner with the renderer's last 30s window stats.
+                    Threshold-coded color: green &lt;5%, yellow &lt;15%, red &gt;=15% frames over the 30fps budget.
+                </p>
+            </div>
+
             <div class="om-card settings-operator-password">
                 <div ${CARD_EYEBROW}>Operator login</div>
                 <p class="settings-hint" style="margin: 0 0 12px;">
@@ -633,6 +652,40 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         });
     }
     wireChangePasswordCard();
+
+    // Perf-night r2 (2026-05-26): toggle for the corner perf overlay.
+    // Settings owns the checkbox state + localStorage write; main.js
+    // owns the overlay lifecycle. Decoupled via the
+    // `openmarquee:perf-overlay-toggle` custom event so the overlay
+    // survives Settings panel un-mount / re-mount cycles.
+    function wirePerfOverlayToggle() {
+        const card = container.querySelector(".settings-perf-overlay");
+        if (!card) return;
+        const checkbox = card.querySelector(".field-perf-overlay-toggle");
+        if (!checkbox) return;
+        // Initialize from localStorage so a page reload preserves the
+        // operator's last choice.
+        try {
+            checkbox.checked = localStorage.getItem("om.perf.show") === "1";
+        } catch {
+            checkbox.checked = false;
+        }
+        checkbox.addEventListener("change", () => {
+            try {
+                if (checkbox.checked) {
+                    localStorage.setItem("om.perf.show", "1");
+                } else {
+                    localStorage.removeItem("om.perf.show");
+                }
+            } catch { /* private-browsing — checkbox state still drives the event */ }
+            document.dispatchEvent(
+                new CustomEvent("openmarquee:perf-overlay-toggle", {
+                    detail: { enabled: checkbox.checked },
+                }),
+            );
+        });
+    }
+    wirePerfOverlayToggle();
 
     async function refresh() {
         statusEl.textContent = "";

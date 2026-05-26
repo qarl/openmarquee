@@ -75,6 +75,10 @@ import {
     runDeleteCascade,
 } from "./slide-event-handlers.js";
 import { mountLivePanel } from "./live-panel.js";
+import {
+    isPerfOverlayEnabled,
+    mountPerfOverlay,
+} from "./perf-overlay.js";
 import { mountVideoUploader } from "./video-upload.js";
 import { mountStreamUploader } from "./stream-upload.js";
 import { mountWebSlideEditor } from "./web-slide.js";
@@ -859,6 +863,27 @@ async function boot() {
             );
         },
         onDelete: deleteFlockPeer,
+    });
+
+    // Perf-night r2 (2026-05-26): floating perf overlay. Settings owns
+    // the toggle checkbox + localStorage write; main.js owns the
+    // mount/unmount lifecycle so the overlay survives Settings panel
+    // navigation hide/show cycles. The handle is module-scope so the
+    // toggle handler can destroy + re-mount cleanly.
+    let perfOverlayHandle = null;
+    function applyPerfOverlayState(enabled) {
+        if (enabled && !perfOverlayHandle) {
+            perfOverlayHandle = mountPerfOverlay();
+        } else if (!enabled && perfOverlayHandle) {
+            perfOverlayHandle.destroy();
+            perfOverlayHandle = null;
+        }
+    }
+    // Initial state: respect localStorage so a page reload restores
+    // the operator's last choice.
+    applyPerfOverlayState(isPerfOverlayEnabled());
+    document.addEventListener("openmarquee:perf-overlay-toggle", (event) => {
+        applyPerfOverlayState(Boolean(event?.detail?.enabled));
     });
 
     // Re-mount on settings change so the canvas always matches current

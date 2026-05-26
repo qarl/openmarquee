@@ -331,3 +331,98 @@ def test_current_thumbnail_cors_for_flock_peer_origin(
     finally:
         client.post("/api/playback/stop")
         _flock_storage_singleton.cache_clear()
+
+
+# Perf-night r2 (2026-05-26): /api/playback/perf/stats sidecar read.
+# These tests pin the contract between the renderer's PerfStatsJson
+# (renderer/src/ipc_main.rs) and the backend's RendererPerfStats wire
+# model. A breaking rename on either side trips these.
+
+
+def _valid_perf_stats_payload() -> dict:
+    """Canonical fixture mirroring renderer/src/ipc_main.rs
+    PerfStatsJson. Update both sides in lockstep when the wire model
+    grows new fields."""
+    return {
+        "window_s": 30,
+        "frames": 900,
+        "transitions": 50,
+        "fps_avg": 29.8,
+        "paint_us_avg": 5000,
+        "paint_us_max": 33000,
+        "paint_us_p99": 28000,
+        "session_frames": 12000,
+        "session_transitions": 600,
+        "frames_observed_total": 18000,
+        "frames_over_budget_total": 234,
+        "timestamp_unix_s": 1748275200,
+    }
+
+
+def test_perf_stats_returns_503_when_sidecar_missing(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """First 30s of any session: renderer hasn't emitted an ipc.soak
+    window yet, so the sidecar file doesn't exist. Operator-facing
+    overlay must see 503 + a stable detail string so the UI can show
+    a 'no data yet' state cleanly."""
+    monkeypatch.setenv("OPENMARQUEE_PERF_STATS_PATH", str(tmp_path / "missing.json"))
+    response = client.get("/api/playback/perf/stats")
+    assert response.status_code == 503
+    assert "not yet written" in response.json()["detail"]
+
+
+def test_perf_stats_returns_parsed_json_when_sidecar_valid(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """End-to-end wire-contract: renderer writes the canonical
+    PerfStatsJson, backend parses it, response carries every field
+    through unchanged."""
+    import json as _json
+
+    perf_path = tmp_path / "perf-stats.json"
+    payload = _valid_perf_stats_payload()
+    perf_path.write_text(_json.dumps(payload))
+    monkeypatch.setenv("OPENMARQUEE_PERF_STATS_PATH", str(perf_path))
+
+    response = client.get("/api/playback/perf/stats")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == payload  # full round-trip; every field preserved.
+
+
+def test_perf_stats_returns_503_on_malformed_json(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """Defense in depth: the renderer uses .tmp+rename atomic writes
+    so a torn write shouldn't reach the backend — but if it ever does
+    (NFS, disk-full mid-rename, manual corruption), we want a 503 with
+    a 'parse failed' detail rather than a 500 stack trace."""
+    perf_path = tmp_path / "perf-stats.json"
+    perf_path.write_text("{not valid json")
+    monkeypatch.setenv("OPENMARQUEE_PERF_STATS_PATH", str(perf_path))
+
+    response = client.get("/api/playback/perf/stats")
+    assert response.status_code == 503
+    assert "parse failed" in response.json()["detail"]
+
+
+def test_perf_stats_returns_503_on_schema_mismatch(
+    client: TestClient, tmp_path: Path, monkeypatch
+):
+    """Schema-drift guard: if the renderer side renames a field
+    without the backend catching up, Pydantic ValidationError surfaces
+    as a 503 + 'schema mismatch' detail (NOT a 500). Operator can
+    spot the drift in the UI overlay's error state and the field name
+    is in the journal."""
+    import json as _json
+
+    perf_path = tmp_path / "perf-stats.json"
+    payload = _valid_perf_stats_payload()
+    del payload["frames_over_budget_total"]  # simulate renderer rename
+    perf_path.write_text(_json.dumps(payload))
+    monkeypatch.setenv("OPENMARQUEE_PERF_STATS_PATH", str(perf_path))
+
+    response = client.get("/api/playback/perf/stats")
+    assert response.status_code == 503
+    assert "schema mismatch" in response.json()["detail"]
