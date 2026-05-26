@@ -447,7 +447,22 @@ class LiveSession:
                         return
                     frame_w, frame_h = dims
                 try:
-                    renderer.render_frame(
+                    # Perf-night r6 (2026-05-26): mirrors r5
+                    # (44b013e _play_stream_slide). render_frame goes
+                    # through _send_op's blocking subprocess.stdout.
+                    # readline on the lazy-begin (rust_renderer.py:843-
+                    # 891 TODO); every subsequent frame writes the
+                    # binary frame channel without a readline, but the
+                    # lazy-begin first-frame call IS the wedge. Wrap
+                    # in asyncio.to_thread so the live-takeover pump
+                    # — running at the source frame rate (~30fps for
+                    # WebRTC, source fps for ffmpeg) — doesn't block
+                    # the asyncio event loop for the IPC round-trip.
+                    # Surfaced by the r6 regression-guard test
+                    # (tests/test_async_sync_audit.py), missed by the
+                    # initial human audit pass.
+                    await asyncio.to_thread(
+                        renderer.render_frame,
                         frame_bytes,
                         pixel_format=pixel_format,
                         frame_w=frame_w,
@@ -468,7 +483,14 @@ class LiveSession:
             # cancellation) so the sidecar can't hang blocked in
             # pump-mode waiting for a frame that will never come.
             try:
-                renderer.end_external_frames()
+                # Perf-night r6: end_external_frames writes the
+                # 0-length sentinel to the binary frame pipe + flush
+                # (rust_renderer.py:709-733). Pipe-write wedge surface
+                # is narrow but the asyncio.to_thread wrap is
+                # consistent with r5's takedown wrap at playback.py:
+                # 1307 and keeps the loop responsive during the
+                # takedown round-trip on every pump exit path.
+                await asyncio.to_thread(renderer.end_external_frames)
             except Exception:
                 log.exception("live: end_external_frames failed")
             # Stream hardening C2 (findings M1+M2): a stream pump that
