@@ -19,7 +19,28 @@ from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync, PullWorker
 from openmarquee.tombstone import TombstoneStorage
 
-_NOW = datetime(2026, 4, 24, 12, 0, 0, tzinfo=UTC)
+# r10 (2026-05-26): anchored to "now" so the test set doesn't go
+# stale. `TombstoneStorage` filters `list_active()` by a 30-day TTL
+# (tombstone.py:42, 97-102); a hardcoded `datetime(2026, 4, 24, ...)`
+# aged past the cutoff on 2026-05-24 (32 days later than the
+# constant's date) and the `_ingest_delete` tests started failing
+# because their tombstone's `deleted_at` was outside the active
+# window. Anchoring to wall-clock-now keeps the constant always
+# within the TTL, regardless of how long this test file lives.
+#
+# Module-scope means Python evaluates this ONCE at import time —
+# the same `_NOW` value is shared across every test in this file
+# within a single pytest session, so relative-time math
+# (`_NOW + timedelta(hours=1)` etc.) stays consistent. The 1-hour
+# back-shift gives headroom for tests that need to compare a
+# `_NOW + timedelta(...)` value against current-wall-time logic.
+#
+# Same pattern as `test_pull_from_peer_applies_tombstones` at
+# line 489+ (look for "Dates are anchored to 'now' so the test
+# never goes stale" — that test was rewritten earlier with the
+# same anti-time-bomb fix; this constant-level fix closes the
+# loop for every other test in the file).
+_NOW = datetime.now(UTC) - timedelta(hours=1)
 
 
 def _make_png_bytes(color=(10, 20, 30)) -> bytes:
