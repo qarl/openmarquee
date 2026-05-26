@@ -74,8 +74,32 @@ rsync -avz --rsync-path="sudo rsync" --delete --delete-excluded \
 # deploy when they want the sidecar opt-in active. A missing binary
 # just means install.sh will skip the binary install step (sidecar is
 # opt-in via OPENMARQUEE_RENDERER=rust-sidecar).
+#
+# PERF-NIGHT R1 LESSON (2026-05-26): the .githooks/pre-push hook's
+# aarch64 cross-COMPILE gate is a regression check, NOT a build step.
+# It does cargo zigbuild but the link stage fails on Mac (no
+# libgbm.so) so it never produces a deployable binary. After ANY
+# renderer/ source change, run scripts/renderer_cross_build.sh
+# BEFORE bash scripts/deploy.sh -- the cross-build uses the pi-sysroot
+# to actually link, then cp's the binary back to the path deploy.sh
+# rsyncs from. Skipping this step ships a stale binary silently
+# (no error -- deploy.sh just rsyncs what's on disk).
+#
+# Staleness guard (2026-05-26): warn if the local binary is older
+# than the most recent commit touching renderer/. Helps catch the
+# "forgot to cross-build" footgun before it ships stale bits.
 RUST_BIN_HOST="$OPENMARQUEE_BUILD_DIR/renderer/target/aarch64-unknown-linux-gnu/release/openmarquee-render"
 if [ -f "$RUST_BIN_HOST" ]; then
+    LATEST_RENDERER_COMMIT_TS="$(git -C "$OPENMARQUEE_SRC" log -1 --format=%ct -- renderer/ 2>/dev/null || echo 0)"
+    BIN_MTIME="$(stat -f %m "$RUST_BIN_HOST" 2>/dev/null || stat -c %Y "$RUST_BIN_HOST" 2>/dev/null || echo 0)"
+    if [ "$LATEST_RENDERER_COMMIT_TS" -gt "$BIN_MTIME" ]; then
+        echo "==> WARNING: aarch64 binary mtime is OLDER than the latest renderer/ commit." >&2
+        echo "             binary: $(date -r "$BIN_MTIME")" >&2
+        echo "             commit: $(date -r "$LATEST_RENDERER_COMMIT_TS")" >&2
+        echo "             Run scripts/renderer_cross_build.sh to refresh before deploy." >&2
+        echo "             Continuing in 5s with the stale binary; Ctrl-C to abort." >&2
+        sleep 5
+    fi
     echo "==> rsync Rust IPC sidecar binary to $TARGET:$REMOTE_ROOT/bin/"
     ssh "$TARGET" "mkdir -p $REMOTE_ROOT/bin"
     rsync -avz --rsync-path="sudo rsync" "$RUST_BIN_HOST" "$TARGET:$REMOTE_ROOT/bin/openmarquee-render"
