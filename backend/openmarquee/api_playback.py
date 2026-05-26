@@ -250,7 +250,13 @@ async def perf_start(body: PerfStartRequest, loop: LoopDep) -> None:
     # so we don't wedge the event loop while the playback advance() may
     # be holding the lock. See rust_renderer.py:861 TODO -- this IS the
     # FastAPI request-handler context that TODO calls out.
-    await asyncio.to_thread(profile_start, body.frames)
+    try:
+        await asyncio.to_thread(profile_start, body.frames)
+    except RuntimeError as exc:
+        # r1 hotfix: AutoFallbackRenderer raises RuntimeError if it's
+        # swapped to Mock (no IPC sidecar to profile). 503 keeps the
+        # surface uniform with the no-method path above.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.get("/perf/dump", response_model=PerfDumpResponse)
@@ -268,6 +274,9 @@ async def perf_dump(loop: LoopDep) -> PerfDumpResponse:
             status_code=503,
             detail="active renderer does not support profile capture (only RustRenderer does)",
         )
-    text = await asyncio.to_thread(profile_dump)
+    try:
+        text = await asyncio.to_thread(profile_dump)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     ready = "frames_remaining=0" in text
     return PerfDumpResponse(ready=ready, text=text)

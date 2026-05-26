@@ -204,6 +204,34 @@ class AutoFallbackRenderer:
             mock = self._swap_to_mock(f"end_external_frames: {e}")
             mock.end_external_frames()
 
+    def profile_start(self, frames: int) -> None:
+        """Forward to the active RustRenderer proxy. After fallback
+        swap there is no IPC sidecar to profile -- raise so the
+        FastAPI handler (api_playback.perf_start) surfaces a clean
+        503 instead of a misleading 204-success-with-no-data.
+
+        perf-night r1 hotfix (2026-05-26): without this forwarder the
+        endpoint's `getattr(renderer, "profile_start", None)` returned
+        None -> 503 even when the primary RustRenderer was healthy
+        (production AutoFallback wrap path).
+        """
+        if self._mock is not None:
+            raise RuntimeError(
+                "profile_start requires the RustRenderer IPC sidecar; "
+                "AutoFallback has swapped to MockRenderer"
+            )
+        self._primary.profile_start(frames)
+
+    def profile_dump(self) -> str:
+        """Forward to the active RustRenderer proxy. Same fallback
+        contract as profile_start."""
+        if self._mock is not None:
+            raise RuntimeError(
+                "profile_dump requires the RustRenderer IPC sidecar; "
+                "AutoFallback has swapped to MockRenderer"
+            )
+        return self._primary.profile_dump()
+
     def reopen(self) -> None:
         """Restart the active renderer so it picks up Open-time config
         (display rotation, FYS bug 5). Mock is a no-op; the

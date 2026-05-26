@@ -334,6 +334,17 @@ class _FakeRustRenderer:
         self.calls.append(("reconfigure", args, kwargs))
         self._maybe_raise("reconfigure")
 
+    def profile_start(self, frames: int) -> None:
+        # r1 hotfix (2026-05-26): AutoFallback must forward perf-night
+        # IPC ops to the live RustRenderer proxy.
+        self.calls.append(("profile_start", (frames,), {}))
+        self._maybe_raise("profile_start")
+
+    def profile_dump(self) -> str:
+        self.calls.append(("profile_dump", (), {}))
+        self._maybe_raise("profile_dump")
+        return "profile: frames_remaining=0\nfake_phase  n=1  p50=42us  p95=42us  p99=42us  max=42us\n"
+
 
 class TestAutoFallbackRenderer:
     """Unit tests for the dependencies.AutoFallbackRenderer wrapper.
@@ -703,6 +714,42 @@ class TestAutoFallbackRenderer:
             r for r in caplog.records if "skipped" in r.getMessage() and "advance" in r.getMessage()
         ]
         assert matching, f"expected skip log; got {[r.getMessage() for r in caplog.records]}"
+
+    def test_profile_start_forwards_to_primary(self, tmp_path):
+        """perf-night r1 hotfix (2026-05-26): the FastAPI perf endpoint
+        forwards via `getattr(loop.renderer, "profile_start", None)`.
+        Before this forwarder, AutoFallback (the production renderer
+        wrap) did NOT expose profile_start -> the endpoint returned 503
+        even when the primary RustRenderer was healthy."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+
+        fake = _FakeRustRenderer()
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        wrapper.profile_start(300)
+        assert ("profile_start", (300,), {}) in fake.calls
+
+    def test_profile_dump_forwards_to_primary(self, tmp_path):
+        from openmarquee.dependencies import AutoFallbackRenderer
+
+        fake = _FakeRustRenderer()
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        text = wrapper.profile_dump()
+        assert "frames_remaining=0" in text
+        assert ("profile_dump", (), {}) in fake.calls
+
+    def test_profile_start_raises_after_mock_fallback(self, tmp_path):
+        """Once swapped to MockRenderer there is no IPC sidecar to
+        profile -- the wrapper raises so the FastAPI handler can map
+        to 503 instead of silently 204-acking a no-op."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+
+        fake = _FakeRustRenderer()
+        wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+        wrapper._swap_to_mock("test-induced")  # force fallback
+        with pytest.raises(RuntimeError, match="profile_start requires"):
+            wrapper.profile_start(300)
+        with pytest.raises(RuntimeError, match="profile_dump requires"):
+            wrapper.profile_dump()
 
     def test_unsupported_slide_error_is_caught_before_subprocess_error(self, tmp_path):
         """Subagent-flagged invariant from the slice-4 dispatch: the
