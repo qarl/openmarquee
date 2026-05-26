@@ -91,6 +91,21 @@ _ALLOWLIST: dict[tuple[str, str], str] = {
         "139-146. r12 (2026-05-26) audit-confirmed: walker was right "
         "to flag the shape, but the LRU at write-site makes this bounded."
     ),
+    (
+        "backend/openmarquee/auth.py",
+        "_VERIFIED_TOKEN_CACHE",
+    ): (
+        "OrderedDict LRU bounded at _VERIFIED_TOKEN_CACHE_CAP (1024 "
+        "entries) with _VERIFIED_TOKEN_TTL_SECONDS (10 min) per entry. "
+        "Round-10 DiD: capacity-bounded against cache-key-mangling "
+        "attacks. Cache HIT moves entry to tail (most-recent); INSERT "
+        "at cap evicts head (least-recent). See auth.py:265-280 + "
+        "clear_verified_token_cache() helper for the reset hook. "
+        "Caught by the walker on the r14 cherry-pick to main; the "
+        "container existed pre-r12 on main but wasn't in code2's "
+        "tree when r12 was authored (cherry-pick fix following the "
+        "d859494 paint_us_p99 precedent)."
+    ),
 }
 
 
