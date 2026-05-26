@@ -22,9 +22,11 @@ permanently broken slide).
 """
 
 import asyncio
+import collections
 import contextlib
 import logging
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
@@ -224,6 +226,32 @@ class PlaybackLoop:
         # stack tasks. The fetch coroutine's done-callback clears the
         # id (see _kick_web_refresh).
         self._web_inflight: set[UUID] = set()
+        # Perf-night r3 (2026-05-26): per-tick work-time ring buffer
+        # for the inner _play_via_rust_ipc 30Hz loop. Stores
+        # `perf_counter_ns()` deltas for the WORK portion of each
+        # tick (excludes the `await self._wait(...)` slack). 600
+        # entries = 20s @ 30fps; deque(maxlen) evicts oldest
+        # automatically with no per-tick allocation.
+        #
+        # Complementary signal to r1's renderer-side missed-deadline
+        # counter (Rust EglSession::record_present): that one answers
+        # "is Rust meeting 30fps?", this one answers "is Python
+        # blocking the IPC channel long enough to starve Rust?". If
+        # Python tick > 33ms, the renderer has run out of input by
+        # the time advance() returns — visible glitch.
+        self._tick_ns_ring: "collections.deque[int]" = collections.deque(maxlen=600)
+        # Monotonic wall-time of the most-recent over-budget warn log.
+        # Rate-limit gate so a wedged readline doesn't spam logs.
+        # Storing monotonic seconds (float) for compactness; compared
+        # against `time.monotonic()` in _record_tick.
+        #
+        # `None` is the "never warned" sentinel (NOT 0.0): a 0.0
+        # sentinel would silently swallow the FIRST over-budget warn
+        # whenever `time.monotonic()` reads < 5.0 (the rate-limit
+        # gate). Process-startup stutters (cold cache, post-respawn
+        # first IPC round-trip) live in that window — losing their
+        # warn was a real diagnostic gap.
+        self._last_tick_warn_at: float | None = None
 
     @property
     def is_running(self) -> bool:
@@ -270,6 +298,86 @@ class PlaybackLoop:
     @property
     def current_item_auto_format(self) -> str | None:
         return self._current_auto_format
+
+    # Perf-night r3 (2026-05-26): tick-budget bookkeeping. The 33ms
+    # threshold matches the 30fps target. `_record_tick` is called
+    # exactly once per inner-loop iteration in `_play_via_rust_ipc`
+    # with the work-portion delta (NOT the wait/slack). `get_loop_stats`
+    # is the FastAPI endpoint accessor — same coroutine context as
+    # `_play_via_rust_ipc`, so no locking needed (asyncio is single-
+    # threaded; the GIL also serializes CPython deque mutation).
+    TICK_BUDGET_NS: int = 33_000_000  # 33ms = 1/30s
+
+    def _record_tick(self, delta_ns: int, slide_id: UUID, phase: str) -> None:
+        """Push one tick's work-time into the ring + maybe warn-log.
+
+        Steady-state cost: deque.append (in-place; no allocation),
+        one u64 compare. ~50-80ns measured via cProfile on the dev box.
+
+        Warn-log is rate-limited via `time.monotonic()` against
+        `self._last_tick_warn_at` with a 5s gate, so a wedged
+        readline (or a slow IPC round-trip) can't spam the journal.
+        """
+        self._tick_ns_ring.append(delta_ns)
+        if delta_ns <= self.TICK_BUDGET_NS:
+            return
+        now_mono = time.monotonic()
+        # None sentinel = no prior warn → fire unconditionally.
+        # Otherwise gate on the 5s window. Explicit None-check
+        # (NOT `now - (self._last_tick_warn_at or 0.0)`) so a
+        # future `time.monotonic() == 0.0` edge can't ambiguously
+        # collapse the sentinel into a real timestamp.
+        if (
+            self._last_tick_warn_at is not None
+            and now_mono - self._last_tick_warn_at < 5.0
+        ):
+            return
+        self._last_tick_warn_at = now_mono
+        log.warning(
+            "playback: tick over budget: %.1fms (slide_id=%s phase=%s); "
+            "see ipc.soak for paired Rust-side numbers",
+            delta_ns / 1_000_000,
+            slide_id,
+            phase,
+        )
+
+    def get_loop_stats(self) -> dict[str, int]:
+        """Snapshot the tick ring into percentile + counter form.
+
+        Returns a plain dict (NOT a Pydantic model — that lives in
+        api_playback.py so the loop has no FastAPI dep). All times
+        are microseconds for operator readability; the ring stores
+        ns. Empty ring returns all-zero counts (no data yet — common
+        in tests that don't exercise the play loop).
+        """
+        snapshot = list(self._tick_ns_ring)
+        n = len(snapshot)
+        if n == 0:
+            return {
+                "ticks_observed": 0,
+                "p50_us": 0,
+                "p95_us": 0,
+                "p99_us": 0,
+                "max_us": 0,
+                "ticks_over_budget": 0,
+            }
+        sorted_snapshot = sorted(snapshot)
+        # Same percentile-index math as renderer/src/profile.rs:
+        # idx = min(int(n * pct / 100), n - 1). Floor-on-low,
+        # cap-at-top so empty-window math doesn't underflow.
+        p50_ns = sorted_snapshot[min(n // 2, n - 1)]
+        p95_ns = sorted_snapshot[min((n * 95) // 100, n - 1)]
+        p99_ns = sorted_snapshot[min((n * 99) // 100, n - 1)]
+        max_ns = sorted_snapshot[-1]
+        over_budget = sum(1 for v in snapshot if v > self.TICK_BUDGET_NS)
+        return {
+            "ticks_observed": n,
+            "p50_us": p50_ns // 1000,
+            "p95_us": p95_ns // 1000,
+            "p99_us": p99_ns // 1000,
+            "max_us": max_ns // 1000,
+            "ticks_over_budget": over_budget,
+        }
 
     async def start(self) -> None:
         """Start the loop. No-op if already running."""
@@ -919,6 +1027,20 @@ class PlaybackLoop:
         while True:
             if self._stop_event.is_set() or self._pause_event.is_set():
                 break
+            # Perf-night r3 (2026-05-26): measure the WORK portion of
+            # each inner-loop iteration — `elapsed` math + the sync
+            # `advance()` IPC round-trip — and exclude the trailing
+            # `await self._wait(...)` slack. The "tick budget" the
+            # operator cares about is whether work fits under 33ms;
+            # the wait fills out the remainder of the 1/30s slot.
+            #
+            # Note: `_renderer.advance` does a blocking readline on
+            # the renderer subprocess's stdout (rust_renderer.py:843-
+            # 891) which wedges the asyncio event loop for the
+            # duration of the IPC round-trip. This counter will reveal
+            # how often that wedge exceeds budget. The asyncio.to_thread
+            # fix to release the event loop is a separate dispatch.
+            tick_start_ns = time.perf_counter_ns()
             elapsed = loop.time() - t0
             t_ms = t0_ms + int(elapsed * 1000)
             try:
@@ -942,6 +1064,16 @@ class PlaybackLoop:
                         e.message,
                     )
                 return False
+            # Perf-night r3: record the work-time of this iteration
+            # BEFORE the SlideComplete short-circuit, so the last
+            # tick of a slide still gets observed. Errors above
+            # `return False` deliberately skip recording — the IPC
+            # raised, no meaningful "tick" delta to measure.
+            self._record_tick(
+                time.perf_counter_ns() - tick_start_ns,
+                item.id,
+                "advance",
+            )
             if isinstance(result, SlideComplete):
                 # Sidecar's state machine signaled duration-end. Slide
                 # finished cleanly; advance to next item.

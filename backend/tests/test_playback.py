@@ -1260,3 +1260,185 @@ async def test_kick_web_refresh_now_failed_producer_does_not_raise(renderer):
     # The crashed task's done-callback cleared the in-flight id, so a
     # subsequent kick can still proceed — no wedged id, no raise.
     assert web.id not in loop._web_inflight
+
+
+# Perf-night r3 (2026-05-26): playback-loop tick-budget bookkeeping.
+# The ring buffer + percentile math + rate-limited warn behavior are
+# the operator-facing signal the QA r3 dispatch asks for.
+
+
+def test_loop_stats_empty_ring_returns_all_zeros(renderer):
+    """Fresh PlaybackLoop instance — no tick has been recorded yet.
+    get_loop_stats must return a clean all-zero shape (NOT raise) so
+    the /api/playback/loop_stats endpoint can serve 200 OK at boot."""
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (0, 0, 0)),
+    )
+    stats = loop.get_loop_stats()
+    assert stats == {
+        "ticks_observed": 0,
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "max_us": 0,
+        "ticks_over_budget": 0,
+    }
+
+
+def test_loop_stats_percentile_math_matches_renderer_profile_rs(renderer):
+    """Match the percentile-index convention from renderer/src/
+    profile.rs:summarize_samples (min(int(n*pct/100), n-1)).
+
+    With 100 samples of 1000us each, p50=p95=p99=max=1000us. With a
+    single spike at the top, p99 catches the spike — we want the
+    operator to see "the 99th-percentile tick was slow."
+    """
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (0, 0, 0)),
+    )
+    slide_id = uuid4()
+    # 99 fast ticks @ 1ms + 1 spike @ 50ms.
+    for _ in range(99):
+        loop._record_tick(1_000_000, slide_id, "advance")
+    loop._record_tick(50_000_000, slide_id, "advance")
+    stats = loop.get_loop_stats()
+    assert stats["ticks_observed"] == 100
+    assert stats["p50_us"] == 1000        # median is in the fast tier
+    assert stats["p95_us"] == 1000        # 95th still in fast tier (95 < 99)
+    assert stats["p99_us"] == 50_000      # 99th hits the spike
+    assert stats["max_us"] == 50_000
+    assert stats["ticks_over_budget"] == 1  # 50ms > 33ms threshold
+
+
+def test_loop_stats_ring_evicts_oldest_at_600(renderer):
+    """deque(maxlen=600) is the no-allocation eviction policy. Verify
+    the ring stays bounded under heavy ingestion — a multi-day
+    soak can't grow it without bound."""
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (0, 0, 0)),
+    )
+    slide_id = uuid4()
+    # 1000 distinct ticks; only the last 600 should remain.
+    for i in range(1000):
+        loop._record_tick((i + 1) * 1_000, slide_id, "advance")
+    stats = loop.get_loop_stats()
+    assert stats["ticks_observed"] == 600
+    # First-401 evicted; max = the last tick (1000us * 1000 = 1_000_000ns = 1000us)
+    assert stats["max_us"] == 1000
+
+
+def test_record_tick_under_budget_does_not_warn(renderer, caplog):
+    """Sub-budget ticks (< 33ms) must NOT emit the warn log. Otherwise
+    the journal floods at 30 ticks/sec under normal operation."""
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (0, 0, 0)),
+    )
+    slide_id = uuid4()
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING, logger="openmarquee.playback"):
+        for _ in range(100):
+            loop._record_tick(5_000_000, slide_id, "advance")  # 5ms — well under
+    # Filter to just the playback logger so other loggers don't trip the assert.
+    warns = [r for r in caplog.records if r.name == "openmarquee.playback" and r.levelname == "WARNING"]
+    assert warns == []
+
+
+def test_record_tick_over_budget_warns_once_then_rate_limits(renderer, caplog, monkeypatch):
+    """Multiple over-budget ticks in rapid succession emit ONE warn
+    (then suppressed for 5s). The dispatch's hard rule on rate-limiting
+    so a wedged readline doesn't spam logs."""
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (0, 0, 0)),
+    )
+    slide_id = uuid4()
+    # Pin time.monotonic so the rate-limit math is deterministic.
+    # Both calls fall in the same monotonic second → second warn
+    # MUST be rate-limited.
+    fixed_monotonic = [100.0]
+    import time as _time
+    monkeypatch.setattr(_time, "monotonic", lambda: fixed_monotonic[0])
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING, logger="openmarquee.playback"):
+        loop._record_tick(50_000_000, slide_id, "advance")  # 50ms — over
+        loop._record_tick(60_000_000, slide_id, "advance")  # 60ms — over
+        loop._record_tick(70_000_000, slide_id, "advance")  # 70ms — over
+    warns = [
+        r for r in caplog.records
+        if r.name == "openmarquee.playback" and r.levelname == "WARNING"
+    ]
+    assert len(warns) == 1
+    assert "tick over budget" in warns[0].message
+    assert "50.0ms" in warns[0].message  # first over-budget value
+    # All 3 still recorded in the ring + counted as over_budget.
+    stats = loop.get_loop_stats()
+    assert stats["ticks_observed"] == 3
+    assert stats["ticks_over_budget"] == 3
+
+
+def test_record_tick_warn_fires_again_after_5s_window(renderer, caplog, monkeypatch):
+    """After the 5s rate-limit window elapses, the NEXT over-budget
+    tick warns again — operator gets fresh signal if the stutter
+    recurs, not just the first incident."""
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (0, 0, 0)),
+    )
+    slide_id = uuid4()
+    fixed_monotonic = [100.0]
+    import time as _time
+    monkeypatch.setattr(_time, "monotonic", lambda: fixed_monotonic[0])
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING, logger="openmarquee.playback"):
+        loop._record_tick(50_000_000, slide_id, "advance")  # first warn
+        fixed_monotonic[0] = 100.0 + 5.5  # advance past rate-limit gate
+        loop._record_tick(50_000_000, slide_id, "advance")  # second warn
+    warns = [
+        r for r in caplog.records
+        if r.name == "openmarquee.playback" and r.levelname == "WARNING"
+    ]
+    assert len(warns) == 2
+
+
+def test_record_tick_first_warn_fires_during_startup_window(renderer, caplog, monkeypatch):
+    """Pre-edit, `self._last_tick_warn_at: float = 0.0` made the first
+    over-budget tick suppress its warn whenever `time.monotonic() < 5.0`
+    (5s rate-limit gate read against the zero sentinel). Process-
+    startup stutters (cold cache, first IPC round-trip after a
+    renderer respawn) live in that window — losing their warn was a
+    real diagnostic gap.
+
+    Post-edit: `_last_tick_warn_at: float | None = None`. The None
+    sentinel is explicitly bypassed by the gate, so the first over-
+    budget tick at startup ALWAYS warns. Locks against the
+    pre-edit regression."""
+    loop = _new_loop(
+        renderer,
+        fetch_items=lambda: [],
+        read_asset=lambda _id: _png_bytes(8, 8, (0, 0, 0)),
+    )
+    slide_id = uuid4()
+    # Pin monotonic to 1.5 — well inside the 5s startup window. Pre-
+    # edit, gate evaluated to `1.5 - 0.0 < 5.0` → True → return →
+    # warn suppressed. Post-edit, gate sees None sentinel → fires.
+    import time as _time
+    monkeypatch.setattr(_time, "monotonic", lambda: 1.5)
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING, logger="openmarquee.playback"):
+        loop._record_tick(50_000_000, slide_id, "advance")
+    warns = [
+        r for r in caplog.records
+        if r.name == "openmarquee.playback" and r.levelname == "WARNING"
+    ]
+    assert len(warns) == 1
+    assert "tick over budget" in warns[0].message

@@ -426,3 +426,53 @@ def test_perf_stats_returns_503_on_schema_mismatch(
     response = client.get("/api/playback/perf/stats")
     assert response.status_code == 503
     assert "schema mismatch" in response.json()["detail"]
+
+
+# Perf-night r3 (2026-05-26): /api/playback/loop_stats endpoint.
+# Pins the wire contract between PlaybackLoop.get_loop_stats() and the
+# Pydantic PythonLoopStats response model.
+
+
+def test_loop_stats_returns_all_zero_for_fresh_loop(
+    client: TestClient, loop
+):
+    """At test fixture setup, the PlaybackLoop has no ticks recorded
+    (the loop hasn't been started + no slide has played yet). The
+    endpoint must return all-zero rather than 4xx/5xx so the operator
+    UI can render a clean 'no data yet' state."""
+    response = client.get("/api/playback/loop_stats")
+    assert response.status_code == 200
+    body = response.json()
+    assert body == {
+        "ticks_observed": 0,
+        "p50_us": 0,
+        "p95_us": 0,
+        "p99_us": 0,
+        "max_us": 0,
+        "ticks_over_budget": 0,
+    }
+
+
+def test_loop_stats_reflects_recorded_ticks(
+    client: TestClient, loop
+):
+    """Drop synthetic ticks into the loop's ring buffer + verify the
+    endpoint surfaces them with the documented percentile math (matches
+    renderer/src/profile.rs:summarize_samples indexing). 99 fast ticks
+    + 1 spike: p50/p95 = fast, p99/max = spike, over_budget = 1."""
+    from uuid import uuid4
+
+    slide_id = uuid4()
+    for _ in range(99):
+        loop._record_tick(1_000_000, slide_id, "advance")  # 1ms
+    loop._record_tick(50_000_000, slide_id, "advance")  # 50ms — over budget
+
+    response = client.get("/api/playback/loop_stats")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ticks_observed"] == 100
+    assert body["p50_us"] == 1000
+    assert body["p95_us"] == 1000
+    assert body["p99_us"] == 50_000
+    assert body["max_us"] == 50_000
+    assert body["ticks_over_budget"] == 1
