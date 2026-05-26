@@ -6540,6 +6540,13 @@ unsafe fn bake_video_slide_to_current_fbo(
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
     let t_feed_start = if profile_first { Some(std::time::Instant::now()) } else { None };
+    // perf-night r3 (2026-05-26): sub-sub-phase wraps inside the
+    // bake_video bottleneck. r2 showed paint_bake_video p99=29.8ms
+    // (89% of 30fps budget). Three sub-sub-phases:
+    //   - paint_bake_video_dqbuf  (V4L2 feed + next_frame retry loop)
+    //   - paint_bake_video_upload (MMAP tex_image_2d Y + UV; ~0 for DMABUF)
+    //   - paint_bake_video_shader (run_nv12_blit_pass or DMABUF variant)
+    let t_phase = std::time::Instant::now();
     // Feed the next sample. Codec is pipelined: a single feed may
     // not produce a frame this tick; the EAGAIN retry below covers
     // the latency.
@@ -6592,8 +6599,19 @@ unsafe fn bake_video_slide_to_current_fbo(
     }
     let Some(frame) = frame_opt else {
         // No frame ready this tick. Caller should skip swap+commit.
+        // Sample the dqbuf even on no-frame ticks so the EAGAIN wait
+        // shows up in the histogram.
+        crate::profile::record_phase(
+            "paint_bake_video_dqbuf",
+            t_phase.elapsed().as_nanos() as u64,
+        );
         return Ok(None);
     };
+    crate::profile::record_phase(
+        "paint_bake_video_dqbuf",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+    let t_phase = std::time::Instant::now();
     let f_w = frame.width();
     let f_h = frame.height();
     // FYS bug B (2026-05-21): a regular uploaded MP4 video must be
@@ -6617,6 +6635,16 @@ unsafe fn bake_video_slide_to_current_fbo(
     if let Some(fd) = frame.dma_buf_fd() {
         let stride = frame.stride();
         let t_blit = if profile_first { Some(std::time::Instant::now()) } else { None };
+        // DMABUF path: zero CPU upload — EGLImage is imported inside
+        // run_nv12_dmabuf_blit_pass + sampled via OES_external. Record
+        // a 0-cost upload sample to keep the phase count consistent
+        // with MMAP (both paths emit exactly one upload + one shader
+        // sample) so the histogram comparison is honest.
+        crate::profile::record_phase(
+            "paint_bake_video_upload",
+            t_phase.elapsed().as_nanos() as u64,
+        );
+        let t_phase_shader = std::time::Instant::now();
         let took_dmabuf = {
             let gl = session.gl;
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);
@@ -6640,6 +6668,10 @@ unsafe fn bake_video_slide_to_current_fbo(
             );
         }
         if took_dmabuf {
+            crate::profile::record_phase(
+                "paint_bake_video_shader",
+                t_phase_shader.elapsed().as_nanos() as u64,
+            );
             // Drop the Frame so its Drop re-QBUFs CAPTURE BEFORE the
             // caller's buffer swap; holding the Frame across the next
             // advance would starve the codec of CAPTURE buffers.
@@ -6647,6 +6679,8 @@ unsafe fn bake_video_slide_to_current_fbo(
             *frames_decoded += 1;
             return Ok(Some("DMABUF"));
         }
+        // DMABUF fall-through: don't record shader since we didn't
+        // complete; MMAP path's shader sample below covers it instead.
         // Extensions missing at runtime: fall through to the MMAP
         // upload path below. Piece 4a-fix kept REQBUFS=V4L2_MEMORY_
         // MMAP for both capture modes so y_plane()/uv_plane() are
@@ -6656,6 +6690,12 @@ unsafe fn bake_video_slide_to_current_fbo(
     // empirical fact; a future codec or alignment regime could
     // surface stride > width, which would require GL_UNPACK_ROW_
     // LENGTH (GLES3) here.
+    // perf-night r3: t_phase here covers the Y + UV tex_image_2d
+    // uploads -- the CPU->GPU copy of two byte planes per frame.
+    // Reset t_phase here (DMABUF fallthrough may have arrived
+    // without resetting); record paint_bake_video_upload after both
+    // uploads land.
+    let t_phase = std::time::Instant::now();
     let y_plane = frame.y_plane();
     let uv_plane = frame.uv_plane();
     let gl = session.gl;
@@ -6712,6 +6752,13 @@ unsafe fn bake_video_slide_to_current_fbo(
     // Reset active unit so run_nv12_blit_pass's own binding
     // sequence starts from a clean slate.
     gl.active_texture(glow::TEXTURE0);
+    // perf-night r3: both tex_image_2d uploads + texture create/bind
+    // landed. Record the upload phase before the shader pass.
+    crate::profile::record_phase(
+        "paint_bake_video_upload",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+    let t_phase_shader = std::time::Instant::now();
     // FYS bug B: cover_vbo cover-fits the frame to the panel.
     let blit_result = run_nv12_blit_pass(gl, cover_vbo, y_tex, uv_tex);
     gl.delete_texture(y_tex);
@@ -6721,6 +6768,10 @@ unsafe fn bake_video_slide_to_current_fbo(
     // unusual for non-NV12 callers downstream.
     gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
     blit_result?;
+    crate::profile::record_phase(
+        "paint_bake_video_shader",
+        t_phase_shader.elapsed().as_nanos() as u64,
+    );
     // Drop the Frame so its Drop re-QBUFs CAPTURE before the
     // caller's swap. Critical: holding the Frame across the next
     // advance starves the codec of CAPTURE buffers.

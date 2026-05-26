@@ -1277,7 +1277,15 @@ fn run_paint_hook(
     // decremented (auto-end never fired). Wrap each arm here with a
     // phase tag + frame_complete so an IPC-driven session emits
     // useful per-frame stats.
+    //
+    // perf-night r3 (2026-05-26): also wrap the dispatch gap with
+    // `paint_dispatch` -- captures cache lookup + kind discriminator
+    // + validate_paint_slide_inputs cost BEFORE the heavy paint helper
+    // call. r2's ipc_paint_total max=631ms was outside any sub-phase
+    // sum, suggesting the outlier hides in this gap (slide-cache
+    // get_mut + ContentItem clone borrow gymnastics).
     let t_hook = std::time::Instant::now();
+    let t_dispatch = t_hook;
 
     // Move-by-value: destructure resp into an owned OpResult so the
     // success path can re-pack via field-init shorthand without
@@ -1322,6 +1330,10 @@ fn run_paint_hook(
                         ContentItem::Text(s) => s,
                         _ => unreachable!("item_kind matched text"),
                     };
+                    crate::profile::record_phase(
+                        "paint_dispatch",
+                        t_dispatch.elapsed().as_nanos() as u64,
+                    );
                     if let Err(e) = hdmi::paint_and_present_one_frame_for_slide(
                         session,
                         card,
@@ -1347,6 +1359,10 @@ fn run_paint_hook(
                         ContentItem::Image(s) => s,
                         _ => unreachable!("item_kind matched image"),
                     };
+                    crate::profile::record_phase(
+                        "paint_dispatch",
+                        t_dispatch.elapsed().as_nanos() as u64,
+                    );
                     if let Err(e) = hdmi::paint_and_present_one_image_slide_frame(
                         session, card, slide, cr,
                     ) {
@@ -1382,6 +1398,10 @@ fn run_paint_hook(
                     // frames_decoded. Take the indices by &mut and
                     // the decoder by & via splitting the borrow.
                     let frames_decoded_before = dec_state.frames_decoded_for_log();
+                    crate::profile::record_phase(
+                        "paint_dispatch",
+                        t_dispatch.elapsed().as_nanos() as u64,
+                    );
                     if let Err(e) = hdmi::paint_and_present_one_video_slide_frame(
                         session,
                         card,
