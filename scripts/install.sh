@@ -368,7 +368,33 @@ RUST_BIN_INSTALLED="${ROOT_PREFIX}/usr/local/bin/openmarquee-render"
 say "Install Rust IPC sidecar binary (opt-in via OPENMARQUEE_RENDERER=rust-sidecar)"
 if [ "$DRY_RUN" -eq 1 ] || [ -f "$RUST_BIN_STAGED" ]; then
     run mkdir -p "$(dirname "$RUST_BIN_INSTALLED")"
-    run cp "$RUST_BIN_STAGED" "$RUST_BIN_INSTALLED"
+    # Stop backend BEFORE the cp: the running sidecar holds
+    # $RUST_BIN_INSTALLED open for execution, which makes cp fail
+    # with `Text file busy`. The cp's exit-1 was previously swallowed
+    # (no explicit check), leaving the installed binary stale across
+    # the redeploy. Perf-night r5+r6 (2026-05-26+28) burned the
+    # manual stop/cp/start workaround twice in a row — fix it here
+    # so deploy.sh actually rolls the binary over.
+    # `is-active` guard avoids "Unit not loaded" stderr noise on
+    # first install (no service yet); `--root` is gated by --dry-run
+    # at line 79 so this systemctl call never fires under chroot test.
+    backend_was_running=0
+    if systemctl is-active --quiet openmarquee-backend.service 2>/dev/null; then
+        run systemctl stop openmarquee-backend.service
+        backend_was_running=1
+    fi
+    if ! run cp "$RUST_BIN_STAGED" "$RUST_BIN_INSTALLED"; then
+        say "ERROR: cp $RUST_BIN_STAGED -> $RUST_BIN_INSTALLED failed."
+        say "  (sidecar may still be holding the binary; check with:"
+        say "   sudo systemctl status openmarquee-backend; lsof $RUST_BIN_INSTALLED)"
+        # Don't leave the box with a stopped backend. End-of-script
+        # restart (line ~892) doesn't run after this exit; explicitly
+        # start here so operator gets a recoverable state.
+        if [ "$backend_was_running" -eq 1 ]; then
+            run systemctl start openmarquee-backend.service || true
+        fi
+        exit 1
+    fi
     run chmod +x "$RUST_BIN_INSTALLED"
 else
     say "  no staged binary at ${RUST_BIN_STAGED}; skip (sidecar opt-in unused)"
