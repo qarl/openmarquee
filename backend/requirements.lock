@@ -50,11 +50,11 @@ h11==0.16.0
     #   uvicorn
 httpcore==1.0.9
     # via httpx
-httptools==0.7.1
+httptools==0.8.0
     # via uvicorn
 httpx==0.28.1
     # via openmarquee (pyproject.toml)
-idna==3.16
+idna==3.17
     # via
     #   anyio
     #   httpx
@@ -80,7 +80,7 @@ python-dotenv==1.2.2
     # via uvicorn
 pyyaml==6.0.3
     # via uvicorn
-starlette==1.1.0
+starlette==1.2.0
     # via fastapi
 typing-extensions==4.15.0
     # via
