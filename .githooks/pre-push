@@ -152,8 +152,24 @@ if [ "$run_ui" = "1" ]; then
     elif [ ! -d ui/node_modules ]; then
         warn "UI tests: ui/node_modules missing; skipping (run \`bash scripts/setup.sh\` first)"
     else
-        ( cd ui && npm test --silent ) || fail "ui vitest"
-        ok "ui vitest"
+        # Pick vitest from local node_modules/.bin (canonical), PATH, or
+        # ~/.local/bin. node_modules/ can exist without a runnable vitest
+        # (npm install wedge on macOS-virtiofs leaves the dir but no .bin
+        # entries) -- guard before invoke, parity with the ruff binary
+        # walk above.
+        VITEST=""
+        for candidate in ui/node_modules/.bin/vitest vitest "$HOME/.local/bin/vitest"; do
+            if [ -x "$candidate" ] || command -v "$candidate" >/dev/null 2>&1; then
+                VITEST="$candidate"
+                break
+            fi
+        done
+        if [ -z "$VITEST" ]; then
+            warn "UI tests: vitest binary not found in ui/node_modules/.bin or PATH; skipping (run \`cd ui && npm install\` first)"
+        else
+            ( cd ui && npm test --silent ) || fail "ui vitest"
+            ok "ui vitest"
+        fi
     fi
 fi
 
