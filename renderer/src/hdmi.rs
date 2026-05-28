@@ -781,6 +781,12 @@ where
     // rasterizes each codepoint on first encounter and emits a
     // GlyphKind::DynamicEmoji quad on subsequent frames.
 
+    // perf-night r6 (2026-05-28): pre-compile GLES2 program cache
+    // upfront so the first video slide doesn't pay the 592ms
+    // NV12_DMABUF link cost in the paint hot path, and the first
+    // transition doesn't pay the 132ms composite-shader compile.
+    prewarm_shader_programs(&session);
+
     let work_result = work(&mut session);
 
     // v1-spec-delta #8 (F-image-bg-cache): free per-session
@@ -10328,6 +10334,119 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
 
     blit_result?;
     Ok(true)
+}
+
+/// Pre-warm GLES2 program cache at sidecar startup so the first
+/// video slide (and the first transition) don't pay the
+/// link_program cost in the paint hot path.
+///
+/// perf-night r6 (2026-05-28): r5 captured paint_bake_video_shader
+/// max=592ms + paint_compose max=132ms — both first-call shader
+/// compiles ([[project-perf-night-code1-r1-r5-2026-05-26]] for the
+/// r5 baseline). The warmup pre-feed in r5 closed V4L2 cold-start
+/// at the decoder side; this closes the GL-side compile cold-start.
+///
+/// Failure semantics: each compile is independent; a single failure
+/// logs `warn:` and the shader stays uncached (next runtime use
+/// will compile on demand, surfacing the same error then). Does
+/// NOT abort startup — the sidecar should still come up even if
+/// (say) FS_HALFTONE has a driver bug.
+#[cfg(target_os = "linux")]
+fn prewarm_shader_programs(session: &EglSession) {
+    let t0 = std::time::Instant::now();
+    let mut compiled: u32 = 0;
+    let mut failed: u32 = 0;
+    let gl = session.gl;
+
+    macro_rules! try_warm {
+        ($label:expr, $expr:expr) => {
+            match $expr {
+                Ok(_) => compiled += 1,
+                Err(e) => {
+                    eprintln!("warn: prewarm {} failed: {e}", $label);
+                    failed += 1;
+                }
+            }
+        };
+    }
+
+    // EGL extension entry-point resolution gates the NV12 DMABUF
+    // path: a sidecar without EGL_EXT_image_dma_buf_import + GL_OES_
+    // EGL_image_external silently falls back to MMAP at runtime
+    // (run_nv12_dmabuf_blit_pass returns Ok(false)). Mirror that
+    // gate here so we don't try to compile FS_NV12_DMABUF_TO_RGB
+    // (which declares `#extension GL_OES_EGL_image_external : require`)
+    // on a system where the extension is absent — that compile would
+    // bump the failed counter for a reason that isn't actionable.
+    let has_dmabuf = dma_buf_egl_entry_points(session.egl_lib, session.display, gl).is_some();
+
+    if has_dmabuf {
+        // The proven r5 culprit: 592ms first-call compile on the
+        // initial video slide.
+        try_warm!("nv12_dmabuf_program", cached_nv12_dmabuf_program(gl));
+    }
+    // MMAP fallback path (taken when the DMABUF gate fails or the
+    // Frame doesn't expose a dma_buf_fd). Always pre-warm so the
+    // fallback doesn't pay a fresh cold-start either.
+    try_warm!("nv12_program", cached_nv12_program(gl));
+    try_warm!("nv12_cover_program", cached_nv12_cover_program(gl));
+
+    // Compose pipeline shaders (blit + brightness/gamma + overlay
+    // blend). paint_compose max=132ms in r5 capture; expected first-
+    // transition compile.
+    try_warm!("blit_program", cached_blit_program(gl));
+    // bright_gamma + overlay_blend are unsafe-marked; same lazy-
+    // compile pattern under the hood.
+    try_warm!("bright_gamma_program", unsafe { cached_bright_gamma_program(gl) });
+    try_warm!("overlay_blend_program", unsafe { cached_overlay_blend_program(gl) });
+
+    // Cut composite — both sides pre-cached. The cut runtime path
+    // (hdmi.rs:8723) explicitly does NOT compile cached_composite_
+    // program("cut") — it uses cached_cut_composite_program(side_b)
+    // exclusively — so we skip "cut" in the composite loop below to
+    // match that contract (otherwise we burn an unused program slot).
+    try_warm!("cut_composite_program(A)", cached_cut_composite_program(gl, false));
+    try_warm!("cut_composite_program(B)", cached_cut_composite_program(gl, true));
+
+    // All 16 transition kinds — pre-warm two caches each:
+    //   - cached_transition_program(fs): legacy 3-pass path (still
+    //     the fallback for kinds where the scissored-bake tier
+    //     doesn't fit; covers ALL 16 since the FS exists for each).
+    //   - cached_composite_program(kind): scissored-bake composite
+    //     path. Gated by sp_kind_static — "glitch" has no SP
+    //     generator (sp_kind_static returns None at hdmi_logic.rs:
+    //     7054) so cached_composite_program("glitch") fails fast.
+    //     Skip "cut" too per the comment above.
+    //
+    // SP single-pass tier (cached_transition_sp_program) needs
+    // per-slide layer counts (n_a, n_b) which aren't known here.
+    // prewarm_sp_session at line 11998 handles that in the reel
+    // path; sidecar IPC paint goes through this path instead and
+    // relies on the SP cache being populated lazily on first use.
+    const TRANSITION_KINDS: &[&str] = &[
+        "cut", "fade", "wipe", "iris", "dissolve", "pixelate", "scanline",
+        "halftone", "glitch", "slide", "push", "scroll", "blinds", "flip",
+        "marquee", "shutter",
+    ];
+    for kind in TRANSITION_KINDS {
+        // Composite path: skip kinds the runtime intentionally avoids
+        // OR can't compile.
+        if *kind != "cut" && crate::hdmi_logic::sp_kind_static(kind).is_some() {
+            try_warm!(format!("composite_program({kind})"),
+                cached_composite_program(gl, kind));
+        }
+        // Legacy 3-pass path: pre-warm for all 16 (the FS exists per
+        // fs_for_transition_kind).
+        if let Some(fs) = crate::hdmi_logic::fs_for_transition_kind(kind) {
+            try_warm!(format!("transition_program({kind})"),
+                cached_transition_program(gl, fs));
+        }
+    }
+
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "prewarm: compiled {compiled} shader programs in {ms:.1}ms ({failed} failed)"
+    );
 }
 
 /// Populate `slide_caches[slide_id].bg_tex` for non-solid bgs
