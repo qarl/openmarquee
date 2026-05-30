@@ -39,6 +39,13 @@
 
 set -uo pipefail
 
+# Mac/virtiofs guard: cargo's incremental dep-graph writes partial files
+# under target/debug/incremental/.../dep-graph.part.bin that virtiofs
+# races on, producing "os error 2" mid-test. Disable incremental
+# compilation for the hook subshell so cargo writes whole object files
+# instead. ~3-5s slower on a clean tree, no impact on a warm one.
+export CARGO_INCREMENTAL=0
+
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
