@@ -121,7 +121,11 @@ async def main() -> int:
     from openmarquee.seed import _DEMO_REEL  # type: ignore
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    server, port = _start_static_server(HARNESS_HTML.parent)
+    # Serve the repo ROOT (not ui/) so the harness's wasm-renderer.js
+    # import of ../../renderer-wasm/pkg/* resolves. Serving ui/ alone
+    # 404s the WASM module and the harness never reaches its 'ready'
+    # state (10s wait_for_function timeout). Same fix as bake.py:75-80.
+    server, port = _start_static_server(REPO)
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch()
@@ -139,7 +143,7 @@ async def main() -> int:
                 "pageerror",
                 lambda err: print(f"  [browser:error] {err}", file=sys.stderr),
             )
-            url = f"http://127.0.0.1:{port}/parity-harness.html"
+            url = f"http://127.0.0.1:{port}/ui/parity-harness.html"
             await page.goto(url)
             await page.wait_for_function(
                 "document.getElementById('parity-status')"

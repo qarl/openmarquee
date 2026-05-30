@@ -575,6 +575,11 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_ms=600,
     ),
     # 6 · UNCAGE — Alfa Slab on amber→scarlet gradient, shaking.
+    # qarl 2026-05-30: each of the three visible lines (UNCAGE / YOUR
+    # / SIGN!!) is its own layer with a distinct motion_phase so
+    # they shake independently. Previously one layer carried
+    # "UNCAGE\nYOUR SIGN!!" which auto-wrapped to 3 visual lines
+    # but all 3 moved as a rigid block under one shake phase.
     _DemoFrame(
         name="06 · Uncage!!",
         duration_ms=1700,
@@ -586,20 +591,42 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         ),
         layers=(
             _DemoLayer(
-                # Cream-yellow on amber→scarlet so the type pops against
-                # both gradient stops -- prior #1A0F00 disappeared on the
-                # dark-red bottom (B20, 2026-05-05).
-                text="UNCAGE\nYOUR SIGN!!",
+                # Line 1 — UNCAGE. Phase 0.0.
+                # qarl 2026-05-30 pass 2: intensity 70 → 35 (half the
+                # shake amplitude — calmer per-line, still independent).
+                text="UNCAGE",
                 font_family="Alfa Slab One",
                 text_color="#FFF1B0",
-                box=_b(0.05, 0.15, 0.9, 0.65),
-                # Bug 4 (2026-05-19): bumped from 33 → 100 so every wrapped
-                # line naturally overflows boxW and triggers the per-line
-                # X-squish-to-boxW. Achieves "each line fills boxW edge-to-
-                # edge" intent via content, not renderer stretch-up.
+                box=_b(0.05, 0.15, 0.9, 0.2167),
+                # Per-line X-squish-to-boxW still applies (Bug 4
+                # 2026-05-19). 100% of boxW guarantees overflow → squish.
                 font_size_pct=100.0,
                 motion="shake",
-                motion_intensity=70,
+                motion_intensity=35,
+                motion_phase=0.0,
+            ),
+            _DemoLayer(
+                # Line 2 — YOUR. Phase 0.33 → out of sync with the
+                # other two lines.
+                text="YOUR",
+                font_family="Alfa Slab One",
+                text_color="#FFF1B0",
+                box=_b(0.05, 0.3667, 0.9, 0.2167),
+                font_size_pct=100.0,
+                motion="shake",
+                motion_intensity=35,
+                motion_phase=0.33,
+            ),
+            _DemoLayer(
+                # Line 3 — SIGN!!. Phase 0.67.
+                text="SIGN!!",
+                font_family="Alfa Slab One",
+                text_color="#FFF1B0",
+                box=_b(0.05, 0.5833, 0.9, 0.2167),
+                font_size_pct=100.0,
+                motion="shake",
+                motion_intensity=35,
+                motion_phase=0.67,
             ),
             _DemoLayer(
                 # Same B20 fix -- soft amber-cream caption on the dark
@@ -838,6 +865,8 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
     # box stretched to fill more of the slide vertically.
     # qarl 2026-05-19: emoji translation 🔓 🫵 🪧 ! + ticker font
     # size 11.5→22.5 + duration 1000→1500ms.
+    # qarl 2026-05-30: ticker slower — motion_speed 1.0 → 0.70
+    # (started at 0.35, doubled to 0.70 on a second qarl pass).
     _DemoFrame(
         name="10 · Scream",
         duration_ms=1500,
@@ -856,6 +885,7 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 font_size_pct=22.5,
                 motion="ticker",
                 motion_intensity=85,
+                motion_speed=0.70,
             ),
         ),
         transition_out="cut",
@@ -1022,9 +1052,16 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
         transition_out="scroll",  # to BOOT
         transition_ms=600,
     ),
-    # 15 · BOOT — VT323 boot log + breathing status badge. Loop
-    # transition Boot→FREE uses iris (qarl 2026-05-04: "iris was
-    # the original Boot→FREE choice and still works").
+    # 15 · BOOT — VT323 boot log + blinking status badge + integrated
+    # clock. Loop transition Boot→FREE uses iris (qarl 2026-05-04:
+    # "iris was the original Boot→FREE choice and still works").
+    # qarl 2026-05-30:
+    #   * PANEL-0 OK now blinks (not scales) — motion breathe → blink.
+    #   * Clock recolored to match boot-log amber #FFB43C.
+    #   * Clock integrated with the boot log: same box / same font_size_pct
+    #     / right-aligned so it lands on the top line as a session
+    #     header. Scales with the boot log on any screen size since
+    #     both are in the same normalized box at the same font %.
     _DemoFrame(
         name="15 · Boot",
         duration_ms=2000,
@@ -1047,20 +1084,32 @@ _DEMO_REEL: tuple[_DemoFrame, ...] = (
                 text_color="#FFB43C",
                 box=_b(0.55, 0.05, 0.4, 0.1),
                 font_size_pct=12.0,
-                motion="breathe",
+                motion="blink",
                 motion_intensity=45,
                 motion_speed=0.7,  # slow heartbeat (B2)
             ),
-            # qarl 2026-05-19: live time-clock layer. Empty text —
-            # auto_mode="time" populates it at render time; the
-            # renderer formats per auto_format="time_hms".
+            # Live time-clock — auto_mode="time" populates at render
+            # time, auto_format="time_hms" formats it as HH:MM:SS.
+            # Thin strip box pinned to the TOP of the boot-log area:
+            #   * same x/width as boot log (0.05, 0.9) → right edge
+            #     of the clock aligns with the right edge of the
+            #     "panel-0 ... ok" value column.
+            #   * y=0.18 (= boot log top) + h=0.11 → single-line strip,
+            #     so the renderer can't vertical-center the clock down
+            #     into the middle of the log.
+            #   * font_size_pct=8.0 (same as boot log) computed over
+            #     the same box width → identical glyph size.
+            # Net: clock renders at the top-right of the boot log,
+            # sharing a baseline with the "> openMarquee v0.4.2 boot"
+            # header line. qarl 2026-05-30: original tall-box version
+            # placed the clock mid-area; this fixes that.
             _DemoLayer(
                 text="",
                 font_family="VT323",
-                text_color="#F4B755",
-                box=_b(0.7007, 0.6295, 0.1941, 0.1),
-                font_size_pct=33.5,
-                text_align="left",
+                text_color="#FFB43C",
+                box=_b(0.05, 0.18, 0.9, 0.11),
+                font_size_pct=8.0,
+                text_align="right",
                 motion="static",
                 auto_mode="time",
                 auto_format="time_hms",
