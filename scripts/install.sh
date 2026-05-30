@@ -426,6 +426,25 @@ run mkdir -p "$(dirname "$DNSMASQ_DST")"
 # on every install.sh run is fine and even desirable (picks up changes).
 run cp "${OPT_DIR}/system/dnsmasq.conf" "$DNSMASQ_DST"
 
+# 2026-05-30 QA: re-run ap0 setup before dnsmasq starts so ap0's IP
+# self-heals if it was flushed after the original boot-time setup
+# (NetworkManager hiccup, brcmfmac wedge recovery, manual restart
+# churn during perf rounds). Without this, dnsmasq fails with
+# "unknown interface ap0" and stays in failed-state until the
+# operator either reboots or manually re-runs openmarquee-ap0-setup.sh.
+# `openmarquee-ap0.service` is `Type=oneshot RemainAfterExit=yes` so
+# it doesn't re-execute on dnsmasq restart -- this drop-in's
+# ExecStartPre is what closes that gap. Section 8's daemon-reload
+# below picks up this drop-in; no separate reload needed here.
+say "Stage dnsmasq ap0-heal drop-in"
+DNSMASQ_DROPIN_SRC="${OPT_DIR}/system/dnsmasq.service.d/openmarquee-ap0-heal.conf"
+DNSMASQ_DROPIN_DST_DIR="${SYSTEMD_DIR}/dnsmasq.service.d"
+DNSMASQ_DROPIN_DST="${DNSMASQ_DROPIN_DST_DIR}/openmarquee-ap0-heal.conf"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "$DNSMASQ_DROPIN_SRC" ]; then
+    run install -d -m 0755 "$DNSMASQ_DROPIN_DST_DIR"
+    run install -m 0644 "$DNSMASQ_DROPIN_SRC" "$DNSMASQ_DROPIN_DST"
+fi
+
 # --- 5a. NetworkManager unmanaged-devices for ap0 ---------------------------
 #
 # Phase 4u: keep ap0 out of NetworkManager's hands. The boot-9 forensic
