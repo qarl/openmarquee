@@ -15,7 +15,21 @@ time with a deprecation-warning print (e.g. `0.5.0-beta` → `0.5.0b0`,
 literal version string is preserved across all four component
 locations for cross-ecosystem readability.
 
-## [Unreleased]
+## [0.9.0] - 2026-05-30
+
+Cut at the close of the renderer perf-night arc + the FYS demo reel
+polish round. Skips the 0.7.x and 0.8.x version slots that internal
+development cycled through — the project went from `v0.6.0-beta` to
+`0.7.0-rc.1` (development version, never tagged) and now to `0.9.0` as
+a release-candidate-for-1.0 stamp.
+
+HDMI output ships in 0.9.0. HUB75 / WS2812B / composite panel modes
+are explicitly deferred to v1.x — their Python drivers were removed in
+the v0.6 DELETE-PIL purge and the Rust ports are post-1.0 work. Stream
+Mode B network-source playback controls (pause / seek / VLC source)
+and the originals/deployed storage split are also deferred.
+
+
 
 ### Backend
 
