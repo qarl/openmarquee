@@ -4986,6 +4986,42 @@ pub fn fourcc_for_argb_family(name: &str) -> Option<[u8; 4]> {
     }
 }
 
+/// r25 (2026-05-31): pure-logic predicate for the glyph-prewarm
+/// drain gate. Lives here (cross-platform) so the regression-
+/// prevention invariant has a unit test runnable on the Mac dev
+/// box (hdmi.rs is `#[cfg(target_os = "linux")]`-gated at
+/// main.rs:19-20, so a `mod tests` over there would silently skip
+/// on host cargo test).
+///
+/// Returns `true` when the prewarm drain loop should exit. Both
+/// conditions must hold:
+///   (a) `completions_since_baseline >= requested` — every glyph
+///       we enqueued has produced exactly one completion (Ready
+///       OR FontMissing both bump completion_count per
+///       glyph_cache.rs:686-692).
+///   (b) `last_drained_count == 0` — the most recent
+///       poll_completions found nothing left in the channel
+///       buffer; no in-flight uploads remain queued.
+///
+/// (a) alone is not enough: completion_count could hit the
+/// target while a final batch is still sitting in the channel
+/// waiting for the next poll. (b) alone is not enough: an empty
+/// channel could just mean workers are momentarily idle between
+/// rasterizations, not done with the queue.
+///
+/// Both together guarantee the playback loop's downstream
+/// poll_completions at hdmi.rs:3187 will return uploaded=0 and
+/// thus skip the slide_caches drain that was the r20-first-ship
+/// regression mechanism (see 530cd25 commit body).
+#[inline]
+pub fn glyph_prewarm_drain_complete(
+    requested: u64,
+    completions_since_baseline: u64,
+    last_drained_count: usize,
+) -> bool {
+    completions_since_baseline >= requested && last_drained_count == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10436,5 +10472,68 @@ mod tests {
             .expect("parse Playfair Display TTF")
     }
 
+    // ---- r25 glyph-prewarm drain-gate predicate ----
+    //
+    // Pins the regression-prevention invariant from 530cd25: the
+    // playback loop's poll_completions at hdmi.rs:3187 fires
+    // slide_caches.drain() on any frame where uploaded > 0. The
+    // r25 gate must therefore ensure the prewarm function returns
+    // ONLY when BOTH conditions hold (see glyph_prewarm_drain_complete
+    // docstring above for the full rationale).
 
+    #[test]
+    fn glyph_prewarm_drain_complete_both_conditions() {
+        // 5 enqueued, 5 completed, last poll drained nothing left
+        // → gate satisfied.
+        assert!(glyph_prewarm_drain_complete(5, 5, 0));
+    }
+
+    #[test]
+    fn glyph_prewarm_drain_complete_completions_exceed_requested() {
+        // Defensive: if some external code path bumped
+        // completion_count between our baseline snapshot and the
+        // poll, the diff might over-count. Use `>=` not `==` so a
+        // benign over-count doesn't trip an infinite loop.
+        assert!(glyph_prewarm_drain_complete(5, 6, 0));
+    }
+
+    #[test]
+    fn glyph_prewarm_drain_incomplete_when_completions_short() {
+        // Workers still rasterizing; the channel will deliver more
+        // completions later.
+        assert!(!glyph_prewarm_drain_complete(5, 3, 0));
+    }
+
+    #[test]
+    fn glyph_prewarm_drain_incomplete_when_channel_pending_even_if_count_met() {
+        // The regression mechanism this gate prevents: completion
+        // count reached the target but the most recent
+        // poll_completions still drained N > 0 entries from the
+        // channel buffer. Returning now would mean the playback
+        // loop's NEXT poll_completions finds completions waiting
+        // and fires slide_caches.drain() inside the
+        // paint_bake_text measurement window. Must keep looping
+        // until the channel drains too.
+        assert!(!glyph_prewarm_drain_complete(5, 5, 2));
+    }
+
+    #[test]
+    fn glyph_prewarm_drain_incomplete_when_zero_requested_but_channel_busy() {
+        // Edge case: zero enqueues (e.g. all fonts missing on
+        // disk), but stale completions from prior sessions sit in
+        // the channel. With requested=0 and
+        // completions_since_baseline=0, condition (a) holds
+        // trivially. If `drained_this_call > 0` we still must
+        // loop to drain that residue. Catches a future regression
+        // where "no enqueues" silently skipped the channel-empty
+        // check.
+        assert!(!glyph_prewarm_drain_complete(0, 0, 3));
+    }
+
+    #[test]
+    fn glyph_prewarm_drain_complete_zero_requested_zero_pending() {
+        // Truly idle: nothing enqueued, nothing in flight. Return
+        // immediately.
+        assert!(glyph_prewarm_drain_complete(0, 0, 0));
+    }
 }

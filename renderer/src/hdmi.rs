@@ -788,6 +788,12 @@ where
     // r20 (2026-05-30): extended to cover the 6 text shader programs
     // (msdf x outline, glyph x outline, tofu, emoji) -- mirror of r6
     // for the text path.
+    //
+    // Runs for ALL with_egl_session callers (cost ~180ms, amortized
+    // across the session even on snapshot/CLI paths). r25's heavier
+    // glyph rasterization prewarm (~16s) lives in
+    // run_in_egl_session below so only the long-lived IPC sidecar
+    // pays it.
     prewarm_shader_programs(&session);
 
     let work_result = work(&mut session);
@@ -4447,7 +4453,20 @@ pub fn run_in_egl_session<F, R>(card: &Card, rotation: i32, work: F) -> Result<R
 where
     F: FnOnce(&mut EglSession) -> Result<R>,
 {
-    with_egl_session(card, rotation, work)
+    // r25 (2026-05-31): glyph rasterization prewarm lives at the
+    // long-lived-sidecar entrypoint, NOT inside with_egl_session
+    // itself. The 16s drain-to-zero cost is only worth paying when
+    // the session outlives the prewarm by many minutes-to-hours
+    // (the IPC sidecar). All other with_egl_session callers
+    // (--play-slide, --capture-*, --solid-color, --fade-*, the
+    // standalone reel driver, the QA visual-verdict snapshot
+    // paths) construct + tear down a session for one or a few
+    // paints; the 16s prewarm tax would dominate their wall-clock
+    // and force-cache glyphs they never render.
+    with_egl_session(card, rotation, |session| {
+        prewarm_glyph_rasterization(session);
+        work(session)
+    })
 }
 
 /// v1-spec-delta #11 (slice a, 2026-05-08) -- read back the
@@ -10470,6 +10489,146 @@ fn prewarm_shader_programs(session: &EglSession) {
     );
 }
 
+/// r25 (2026-05-31): enqueue the demo-reel font set's printable-
+/// ASCII glyph range into `session.dynamic_glyph_cache`, then
+/// **drain to zero** before returning so the playback loop opens
+/// its first paint_bake_text window against a fully-warm cache.
+///
+/// Why "drain to zero" not "wait N seconds": the playback loop's
+/// poll_completions at hdmi.rs:3187 triggers a full slide_caches
+/// drain on any frame where `uploaded > 0`. r20-first-ship used a
+/// 3s deadline; on Pi Zero 2 W at the observed ~53 g/s msdfgen
+/// rate, only ~159 of the 855 enqueued glyphs drained in budget.
+/// The remaining ~696 bled into the playback loop at ~3/frame
+/// over ~15s, firing slide_caches.drain() on every frame in that
+/// window -> paint_bake_text p99 regressed from 126us to 2284us.
+/// See 530cd25 commit body for the full forensics.
+///
+/// Trade: sidecar boot wall-time grows by the full drain duration
+/// (~16s on Pi Zero 2 W for 855 glyphs). Plymouth handoff has
+/// already covered the kernel-to-sidecar transition so the
+/// operator sees a splash, not black, during this window. r25
+/// chose the (c-cheap) variant from the QA dispatch: log start +
+/// end, no synthetic Loading frame.
+///
+/// Watchdog: 120s hard cap. In practice 7-8x the realistic drain
+/// time; exists so a catastrophically wedged worker pool (all 4
+/// workers panicked, msdfgen FFI deadlock, etc.) can't gate the
+/// sidecar forever. On watchdog trip: log + continue to playback;
+/// uncached glyphs then populate lazily on first encounter, with
+/// the same slide_caches-drain cost as the r20-first-ship
+/// regression but bounded to the residual queue.
+///
+/// Known interaction with glyph_cache::poll_completions error
+/// branches (atlas-full-with-no-evict at glyph_cache.rs:654,
+/// upload_slot failure at glyph_cache.rs:662): both `continue`
+/// PAST the `completion_count += 1` increment. If even one
+/// prewarm glyph trips either branch, `completions_since_baseline`
+/// never reaches `requested` and the gate spins until the
+/// watchdog. Realistic likelihood: low (fresh GL context + 1820-
+/// slot 2048×2048 page vs 855-glyph budget). The watchdog floor
+/// is the failsafe; bumping completion_count in those branches
+/// is a glyph_cache.rs follow-up, out of r25 scope.
+#[cfg(target_os = "linux")]
+fn prewarm_glyph_rasterization(session: &mut EglSession) {
+    use crate::glyph_cache::{font_family_id_from_stem, GlyphKey, RenderMode};
+
+    // Demo-reel font set per backend/openmarquee/seed.py _DEMO_REEL
+    // + FALLBACK_FONT_STEMS. Stems match
+    // hdmi_logic::font_family_to_filename's basename-minus-extension.
+    // Keep in sync with seed.py _DEMO_REEL's font_family= set +
+    // FALLBACK_FONT_STEMS if either changes.
+    const DEMO_REEL_STEMS: &[&str] = &[
+        "anton",
+        "alfa-slab-one",
+        "bowlby-one-sc",
+        "playfair-display",
+        "vt323",
+        "permanent-marker",
+        "caveat-brush",
+        "jetbrains-mono",
+        "dejavu-sans",
+    ];
+    const PRINTABLE_ASCII_START: u32 = 0x20;
+    const PRINTABLE_ASCII_END: u32 = 0x7E;
+    const PREWARM_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
+
+    let t0 = std::time::Instant::now();
+    // Capture pre-prewarm completion count so we can measure
+    // "completions due to MY enqueues only" -- defensive in case
+    // some other code path bumps completion_count before this
+    // function runs (it doesn't today, but the diff-against-
+    // baseline shape is sound either way).
+    let baseline_completions = session.dynamic_glyph_cache.completion_count();
+    let mut requested: u64 = 0;
+    let mut skipped_fonts: u32 = 0;
+
+    for stem in DEMO_REEL_STEMS {
+        let fid = font_family_id_from_stem(stem);
+        let font_path = session.dynamic_fonts_dir.join(format!("{stem}.ttf"));
+        if !font_path.exists() {
+            eprintln!(
+                "glyph-prewarm: skip {stem} -- font file not found at {font_path:?}"
+            );
+            skipped_fonts += 1;
+            continue;
+        }
+        for cp in PRINTABLE_ASCII_START..=PRINTABLE_ASCII_END {
+            let key = GlyphKey {
+                font_family_id: fid,
+                codepoint: cp,
+                render_mode: RenderMode::Msdf,
+            };
+            let _ = session
+                .dynamic_glyph_cache
+                .get_or_request(key, || font_path.clone());
+            requested += 1;
+        }
+    }
+
+    eprintln!(
+        "glyph-prewarm: enqueued {requested} glyphs across {} fonts ({skipped_fonts} skipped); draining to zero...",
+        DEMO_REEL_STEMS.len() - skipped_fonts as usize,
+    );
+
+    let watchdog_deadline = t0 + PREWARM_WATCHDOG;
+    loop {
+        let drained_this_call = session.dynamic_glyph_cache.poll_completions(
+            session.gl,
+            &mut session.dynamic_atlas_page_msdf,
+            &mut session.dynamic_atlas_page_colr,
+            128,
+        );
+        let completions_since_baseline =
+            session.dynamic_glyph_cache.completion_count() - baseline_completions;
+        if crate::hdmi_logic::glyph_prewarm_drain_complete(
+            requested,
+            completions_since_baseline,
+            drained_this_call,
+        ) {
+            break;
+        }
+        if std::time::Instant::now() > watchdog_deadline {
+            eprintln!(
+                "glyph-prewarm: WATCHDOG tripped after {:.1}s -- enqueued {requested}, drained {completions_since_baseline}. \
+                 Continuing to boot; uncached glyphs populate lazily (slide_caches-drain cost bounded to residual queue).",
+                t0.elapsed().as_secs_f64()
+            );
+            break;
+        }
+        if drained_this_call == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let completions_since_baseline =
+        session.dynamic_glyph_cache.completion_count() - baseline_completions;
+    eprintln!(
+        "glyph-prewarm: drained {completions_since_baseline}/{requested} glyphs in {ms:.1}ms (sidecar boot gate cleared)"
+    );
+}
+
 /// Populate `slide_caches[slide_id].bg_tex` for non-solid bgs
 /// at atlas region size (2048x1024). Idempotent: returns early
 /// if already cached. Returns `Ok(())` for solid bgs (no cache
@@ -13432,3 +13591,4 @@ impl ObjectProps {
             .ok_or_else(|| anyhow!("property {name:?} not found on object"))
     }
 }
+
