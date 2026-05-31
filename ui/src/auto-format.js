@@ -2,14 +2,13 @@
 // the renderer's hdmi_logic::format_auto_text — formats a JS Date
 // for the preview's ticking overlay on auto-mode text slides.
 //
-// TIMEZONE (parity follow-up, 2026-05-20): the auto_mode preview
-// resolves in the SIGN's configured timezone — `settings.timezone`
-// — so the editor preview clock/date matches what the device
-// renders on glass. The device renderer resolves local time via
-// libc localtime_r with TZ=settings.timezone (commit 4a59d4f);
-// this module mirrors that with `Intl.DateTimeFormat`'s
-// `timeZone` option. The app calls `setSignTimezone` at boot +
-// on a Settings save.
+// TIMEZONE: the auto_mode preview resolves in the SIGN's configured
+// timezone — `settings.timezone` — so the editor preview clock/date
+// matches what the device renders on glass. The device renderer
+// resolves local time via libc localtime_r with TZ=settings.timezone
+// (renderer commit 4a59d4f); this module mirrors that with
+// `Intl.DateTimeFormat`'s `timeZone` option. The app calls
+// `setSignTimezone` at boot + on a Settings save.
 //
 // When the sign's timezone is null ("Device local"), the browser
 // genuinely cannot know the device's zone (it can't read the Pi's

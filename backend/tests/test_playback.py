@@ -1001,7 +1001,15 @@ async def test_stream_slide_preempted_by_pause(renderer, tmp_path, monkeypatch):
     await loop.start()
     await asyncio.sleep(0.15)  # let the pump start streaming frames
     await loop.pause()
-    await asyncio.sleep(0.1)
+    # pause() only sets _pause_event — the playback loop must yield
+    # from its current op, see the event, and commit _resume_at_index.
+    # Under batch-test load (1300+ tests ahead of this one) a fixed
+    # sleep races that takeover, so poll the actual condition with a
+    # 2s ceiling.
+    loop_t = asyncio.get_event_loop()
+    deadline = loop_t.time() + 2.0
+    while loop_t.time() < deadline and loop._resume_at_index is None:
+        await asyncio.sleep(0.01)
     assert loop.is_paused
     assert loop._resume_at_index == 0
     await loop.resume()

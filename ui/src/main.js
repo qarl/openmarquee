@@ -105,12 +105,13 @@ const DEFAULT_SECTION = "slides";
 export async function resolvePanelDims() {
     try {
         const settings = await getSettings();
-        // Parity follow-up (2026-05-20): publish the sign's
-        // configured timezone app-wide so every auto_mode preview
-        // (editor canvas, slide tiles, inline preview) resolves
-        // its clock/date in the SAME zone the device renders in.
-        // Runs before the editor mounts, so the first preview
-        // frame already has the right zone.
+        // Publish the sign's configured timezone app-wide so every
+        // auto_mode preview (editor canvas, slide tiles, inline
+        // preview) resolves its clock/date in the SAME zone the
+        // device renders in. Runs before the editor mounts, so the
+        // first preview frame already has the right zone. See
+        // auto-format.js for the resolution semantics + null=
+        // "device local" fallback.
         setSignTimezone(settings.timezone);
         const dims = effectiveDisplayDims(settings);
         const outputMode = settings.output_mode || "hdmi";
