@@ -52,6 +52,29 @@ fi
 TARGET="$1"
 REMOTE_ROOT="${OPENMARQUEE_REMOTE_ROOT:-/opt/openmarquee}"
 
+# r32 (2026-05-31): ensure the COLRv1 emoji font is present before
+# sync_to_build_dir. The font is gitignored (~5 MB binary) and
+# downloaded once at clone time by scripts/setup.sh, but the /tmp
+# clone workflow that deploy.sh frequently runs from never invokes
+# setup.sh. Result: the font is absent from $OPENMARQUEE_SRC's
+# ui/fonts/, sync_to_build_dir omits it from $BUILD_DIR, the ui/
+# rsync's --delete WIPES the existing noto-color-emoji-colrv1.ttf
+# from /opt/openmarquee/ui/fonts/ on the target. The runtime COLR
+# dispatch at hdmi_logic.rs:752 then can't load the font ->
+# rasterize_colr_cell returns Err -> the worker direct-inserts
+# FontMissing -> emoji renders as Tofu in the MSDF fallback.
+#
+# Caught 2026-05-31 by r32: my own r31 deploy did exactly this on
+# FYS prod; QA mis-attributed the regression to r25's prewarm but
+# the actual cause was the deploy pipeline silently shipping a
+# pruned ui/fonts/ that --delete propagated to the target.
+#
+# Fix is idempotent: the download script SHA-pins the source and
+# skips if the destination file already exists with the right hash.
+# Re-running is a no-op if the font is already present.
+echo "==> ensure COLRv1 emoji font present in source tree"
+bash "$OPENMARQUEE_SRC/scripts/download-emoji-font-colrv1.sh"
+
 sync_to_build_dir
 
 echo "==> rebuilding UI bundle in $OPENMARQUEE_BUILD_DIR/ui"
@@ -129,7 +152,18 @@ rsync -avz --rsync-path="sudo rsync" --delete --delete-excluded \
     --exclude 'test-results/' \
     --exclude 'package-lock.json' \
     --exclude '._*' \
+    --exclude 'fonts/noto-color-emoji.ttf' \
     "$OPENMARQUEE_BUILD_DIR/ui/" "$TARGET:$REMOTE_ROOT/ui/"
+# r32 (2026-05-31): the `noto-color-emoji.ttf` exclude is load-bearing.
+# That file is the LEGACY CBDT emoji bitmap font (10.6 MB, distinct
+# from the runtime `noto-color-emoji-colrv1.ttf` which deploy.sh's
+# new prep step downloads at line ~75). seed.py:1539 still reads it
+# for emoji rendering in baked seed-slide backgrounds; operators
+# drop it into ui/fonts/ once per seed.py:1303 instructions and
+# there's no automatic download script for it. Without this
+# exclude, deploy.sh's --delete rsync would WIPE it from the target
+# whenever the local /tmp clone doesn't have it (exact failure mode
+# r31 hit with the colrv1 variant 2026-05-31, root cause of r32).
 
 # scripts/ and system/ both need to be on the Pi for install.sh to find
 # itself + the systemd units, hostapd.conf, dnsmasq.conf it stages. Without
