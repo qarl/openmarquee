@@ -203,6 +203,16 @@ the text-layer chrome triad: same shape (renderer-side struct gap),
 all small in isolation, bundle-friendly into one
 `renderer/src/content.rs` patch + one auto_render guard.
 
+**ERRATA (2026-05-31, r22) — §5 row 4:** The "video slides TBD"
+marker is no longer emitted anywhere in `renderer/src/ipc_main.rs`
+(sweep + audit via QA). The Capture-side validator at line 1424
+already rejects Video with the distinct
+`"Capture: VideoSlide capture not implemented"` string + uses the
+`RustRendererUnsupportedSlideError` rail. The "validator split"
+is structurally already done (separate functions at line 1392
+`validate_paint_slide_inputs` + line 1424 `validate_capture_inputs`).
+Remaining surface was comment hygiene only, closed by r22.
+
 ## §6 Not gaps — deliberate, ignore on review
 
 - **HTTPS / TLS termination on-device.** SYSTEM_SPEC §4.3 (lines

@@ -360,8 +360,10 @@ impl IpcPaintMetrics {
 /// demuxer's SPS/PPS/samples through the codec. Demuxer
 /// instantiation is best-effort -- if `asset.mp4` is missing or
 /// malformed, we log + continue with the cache populated only
-/// for `items`; the paint_slide "video slides TBD" path still
-/// triggers the Python proxy's PIL fallback.
+/// for `items`; the paint_slide path falls through to the
+/// UnsupportedSlide wire, raising the Python proxy's
+/// `RustRendererUnsupportedSlideError` (the playback loop then
+/// logs + skips, per `playback.py` post-DELETE-PIL contract).
 /// LRU cap on `SlideCache.items` + `SlideCache.item_mtimes`. Pre-cap
 /// these maps were insert-only -- every slide ever shown stayed
 /// resident, so a long playlist or operator-edit churn over hours/days
@@ -517,7 +519,8 @@ impl SlideCache {
     /// the asset.mp4 + parse it into an Mp4Demuxer. Failure to
     /// open the MP4 logs a warning + leaves video_demuxers
     /// without an entry; downstream paint paths fall back via
-    /// the existing "video slides TBD" wire.
+    /// the existing UnsupportedSlide wire (Python:
+    /// `RustRendererUnsupportedSlideError`).
     fn load(&mut self, content_root: &std::path::Path, item_id: uuid::Uuid) -> Result<()> {
         // Bug 1 (qarl 2026-05-16): on-disk mtime check defeats the
         // contains_key short-circuit when the operator edits a slide.
@@ -605,8 +608,9 @@ impl SlideCache {
                     );
                     // V4L2 piece 3c: on Linux, also prime the
                     // hardware decoder. Failure is best-effort
-                    // (warn + fall through to PIL fallback via
-                    // the "video slides TBD" wire). Mac: skip.
+                    // (warn + fall through to the UnsupportedSlide
+                    // wire — playback loop logs + skips per the
+                    // post-DELETE-PIL contract). Mac: skip.
                     #[cfg(target_os = "linux")]
                     match prime_video_decoder(&dem) {
                         Ok(dec_state) => {
@@ -2506,12 +2510,16 @@ mod tests {
     }
 
     /// V4L2 piece 3e: validate_paint_slide_inputs now accepts
-    /// Video (was: rejected with "video slides TBD"). The actual
-    /// per-advance decode/paint is run by run_paint_hook against
-    /// SlideCache.video_{decoders,demuxers}; the validator no
-    /// longer gates Video. This test pins the new contract --
-    /// any regression here would silently flip Video back into
-    /// the Python proxy's PIL-fallback path.
+    /// Video; PaintSlide-side rejection (was "video slides TBD")
+    /// is removed. Capture-side rejection remains at
+    /// validate_capture_inputs (line 1424) with the distinct
+    /// "Capture: VideoSlide capture not implemented" marker. The
+    /// actual per-advance decode/paint is run by run_paint_hook
+    /// against SlideCache.video_{decoders,demuxers}; the validator
+    /// no longer gates Video. This test pins the new contract --
+    /// any regression here would silently flip Video back to the
+    /// UnsupportedSlide wire rail (playback loop log + skip per
+    /// post-DELETE-PIL contract).
     #[test]
     fn validate_paint_slide_video_now_accepted() {
         let item = video_item();
@@ -2926,7 +2934,9 @@ mod tests {
     /// V4L2 piece 3b: when asset.mp4 is missing or malformed,
     /// cache.load still succeeds (Video item is in items),
     /// video_demuxers is left empty for that id, and the
-    /// "video slides TBD" PIL-fallback path stays usable.
+    /// UnsupportedSlide wire rail (Python raises
+    /// `RustRendererUnsupportedSlideError`; playback loop log +
+    /// skip post-DELETE-PIL) stays usable.
     #[test]
     fn cache_load_video_tolerates_missing_asset() {
         let td = tempfile::TempDir::new().unwrap();
