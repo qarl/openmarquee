@@ -224,8 +224,22 @@ Remaining surface was comment hygiene only, closed by r22.
   189-199) is correct: Tailscale provides transport security
   end-to-end; the device does not terminate TLS. Tailscale's
   WireGuard tunnel is transparent to FastAPI which serves plain
-  HTTP on port 80. No FqdnRedirectMiddleware code SHOULD exist
-  per design.
+  HTTP on port 80. **However**, `FqdnRedirectMiddleware` at
+  `backend/openmarquee/fqdn_redirect_middleware.py:69` (wired in
+  `app.py:251`) exists by design for the orthogonal Chrome
+  secure-context gating problem (`navigator.mediaDevices` requires
+  HTTPS or localhost / IP-literal). The middleware 301-redirects
+  bare-hostname HTTP requests to the canonical Tailscale FQDN
+  HTTPS URL where Tailscale Serve terminates the LE-cert TLS
+  off-device. Live-panel camera preview depends on this. The
+  middleware is NOT a TLS-termination-on-device gap.
+
+  **ERRATA (2026-05-31, r28):** Audit bullet above originally
+  claimed "no FqdnRedirectMiddleware should exist per design" —
+  incorrect. The middleware serves Chrome secure-context, not
+  TLS termination. Confirmed live on FYS prod 2026-05-31:
+  `http://fireplacesign/healthz` → 301 → `https://fireplacesign.tail71c768.ts.net/healthz`
+  → `{"status":"alive","version":"0.9.0"}`. Wording fixed.
 - **Async PNG texture upload (task #168) not in spec.** Renderer-
   internal optimization (per memory [[project-task-168-async-texture-upload]]).
   Not a contract surface.
