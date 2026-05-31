@@ -12,9 +12,9 @@ before stamping the v0.9.0 → v1.0 arc.
 |----------|------:|---------------|
 | **P0**   | 0     | Ship-blocking for v1.0. None found. |
 | **P1**   | 3     | Real gaps operators will notice; should-fix-soon but don't block v1.0 tag if scoped as "ship-known-limitations." |
-| **P2**   | 3     | Polish + non-load-bearing doc gaps; deferrable to v1.x. (Was 4; row 4 closed by r22 + r24 errata — see §5.) |
+| **P2**   | 2     | Polish + non-load-bearing doc gaps; deferrable to v1.x. (Was 4; row 4 closed by r22 + r24 errata, row 5 closed by r27 — see §5.) |
 | **P3**   | 0     | Trivia bucket empty this round. |
-| **doc-drift** | 2 | Stale doc sections that don't block ship; refresh-doc tasks. |
+| **doc-drift** | 1 | Stale doc sections that don't block ship; refresh-doc tasks. (Was 2; row 9 closed by r27 — same edit as P2 row 5.) |
 
 ## Headline — "what's between v0.9.0 and v1.0" (plain English)
 
@@ -64,13 +64,13 @@ Audited surfaces:
 | 5 | P1 — SSID rotation three-way doc drift | **CLOSED** | `system/openmarquee-firstboot.sh` rotates to `MySign<N>`; `system/hostapd.conf:32` keeps `openMarquee-SETUP` as cold-boot default; docs now consistently describe both states. |
 | 6 | P1 — `system/openmarquee-sudoers` "two" vs "four" contradiction | **STALE / OVERTAKEN** | Re-read at HEAD: line 7 says "exactly two," line 17 says "Anything beyond these two." Internally consistent now. The "four" was already cleaned up. |
 | 7 | P2 — VideoSlide Capture emits `"video slides TBD"` marker | **CLOSED (errata)** | Original claim — "Markers still present at `renderer/src/ipc_main.rs:395,536,621` (the lines moved from `:648,718` as the file restructured)" — is wrong. **ERRATA (2026-05-31, r24):** Audit caught two errors via r22 sweep (0c4039c): (a) the literal `"video slides TBD"` marker is no longer emitted anywhere in runtime code; only doc-comments referenced it, and those have been swept; (b) the cited line numbers 395/536/621 did not contain marker text — the prior doc-comment sites were at lines 363/520/609/2509/2929, all closed by r22. The structural "validator split" is already done (separate `validate_paint_slide_inputs` at line 1392 and `validate_capture_inputs` at line 1424); Capture rejection uses the `"Capture: VideoSlide capture not implemented"` string + the `RustRendererUnsupportedSlideError` rail (playback-loop log + skip per post-DELETE-PIL contract). |
-| 8 | P2 — `OPENMARQUEE_FIRSTFRAME_PROFILE` undocumented | **STILL OPEN** | Profile gate still lives at `renderer/src/hdmi.rs:3560` and `:6399`. Not in any user-facing doc. Diagnostic-only; not a load-bearing gap. |
+| 8 | P2 — `OPENMARQUEE_FIRSTFRAME_PROFILE` undocumented | **CLOSED** | r27 (5940046) added `OPENMARQUEE_FIRSTFRAME_PROFILE=1` to `docs/v4l2-decode.md` (cited in the piece-4f line at 145-146 and the §Diagnostics gate at line 275). Profile gate now discoverable by operators. |
 | 9 | P2 — `system/README.md` "wpa_supplicant template-out" stale Phase-7 item | **CLOSED** | README rewritten; line 66 now describes the nmcli architecture: "legacy fallback config… trixie uses NetworkManager + nmcli instead." |
 | 10 | P2 — README missing AP/NM coexistence + `Before=NetworkManager.service` note | **CLOSED** | README architecture section now carries the AP/NM coexistence pattern with the `Before=` ordering call-out and the task-#99 reference (lines 74-116). |
 
-**Score:** 9 of 10 closed (5 P1 + 3 P2 + 1 stale), 1 still open
-(P2 #8 profile-gate doc). #7 Capture-side marker closed by r22
-sweep (0c4039c) + r24 errata.
+**Score:** 10 of 10 closed (5 P1 + 4 P2 + 1 stale). #7 Capture-side
+marker closed by r22 sweep (0c4039c) + r24 errata; #8 profile-gate
+doc closed by r27 (5940046).
 
 ## §3 New gaps surfaced between 2026-05-14 and v0.9.0
 
@@ -144,12 +144,11 @@ struct. Net behavior:
 
 ### 3.2 Profile-gate documentation
 
-P2 holdover from May-14 #8: `OPENMARQUEE_FIRSTFRAME_PROFILE=1` is a
-diagnostic instrumentation gate at `renderer/src/hdmi.rs:3560` and
-`:6399`. Not described in `docs/v4l2-decode.md` or
-`docs/phase-7-as-built-2026-05-14.md`. Same call-out as the
-DMABUF env-var got at line 144 of v4l2-decode.md would close it.
-~3 LOC of doc.
+P2 holdover from May-14 #8. **CLOSED by r27 (5940046).** The
+`OPENMARQUEE_FIRSTFRAME_PROFILE=1` gate is now cited in
+`docs/v4l2-decode.md` at line 145-146 (piece-4f) and line 275
+(§Diagnostics). Operators can discover the gate from the same doc
+that covers the rest of the v4l2 decode path.
 
 ### 3.3 VideoSlide Capture-side validator split
 
@@ -194,14 +193,15 @@ gap.
 | 2 | P1 | Text-layers | `weight` (variable-font 300-900) accepted by backend, ignored by renderer | S (~20 LOC: same shape as anchor) |
 | 3 | P1 | Text-layers | `visible: false` ignored at save-time rasterization (correct at playback) | XS (~3 LOC: guard in auto_render.py) |
 | 4 | ~~P2~~ | Phase 7 | VideoSlide Capture emits `"video slides TBD"` (carryover #7 from May 14) | **CLOSED by r22 (0c4039c) — see errata below.** Original estimate ~30 LOC turned out to be doc-comment hygiene only; structural split was already in place. |
-| 5 | P2 | V4L2 | `OPENMARQUEE_FIRSTFRAME_PROFILE` gate undocumented (carryover #8) | XS (~3 LOC of doc) |
+| 5 | ~~P2~~ | V4L2 | `OPENMARQUEE_FIRSTFRAME_PROFILE` gate undocumented (carryover #8) | **CLOSED by r27 (5940046)** — docs/v4l2-decode.md now cites the gate at line 145-146 + line 275. |
 | 6 | P2 | Text-layers | `locked` is UI-only chrome; no server-side enforcement | S (~10 LOC if qarl wants enforcement; "by-design" otherwise) |
 | 7 | P2 | Spec docs | SYSTEM_SPEC line 77 vs 492-502 wording inconsistency on HUB75/WS2812B/composite "future vs pending" | XS (doc edit, ~5 words) |
 | 8 | doc-drift | Spec docs | IMPLEMENTATION_PLAN.md milestone pointer stale (predates v0.9.0 tag) | S (~5 LOC of doc) |
-| 9 | doc-drift | v4l2-decode | Profile gate documentation cross-link absent (same source as #5; doc-side surface) | XS (~3 LOC of doc) |
+| 9 | ~~doc-drift~~ | v4l2-decode | Profile gate documentation cross-link absent (same source as #5; doc-side surface) | **CLOSED by r27 (5940046)** — same edit closed both #5 and #9. |
 
-**Totals: 0 P0, 3 P1, 3 P2 (was 4; row 4 closed by r22 — see
-errata below), 2 doc-drift.**
+**Totals: 0 P0, 3 P1, 2 P2 (was 4; row 4 closed by r22, row 5
+closed by r27 — see errata + row-status above), 1 doc-drift
+(was 2; row 9 closed by r27).**
 
 P0 = 0 means v0.9.0 is operationally complete. The 3 P1 are all in
 the text-layer chrome triad: same shape (renderer-side struct gap),
