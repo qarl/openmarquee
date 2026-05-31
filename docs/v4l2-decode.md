@@ -279,7 +279,10 @@ aids:
   (MMAP path), and first paint. Gate condition is
   `next_sample_idx == 1 && frames_decoded == 0` so the
   instrumentation fires once per session. Zero overhead when off.
-  Anchored at `renderer/src/hdmi.rs:2733-2750`.
+  Anchored at `renderer/src/hdmi.rs:3560` (DMABUF path) +
+  `renderer/src/hdmi.rs:6418` (MMAP path) — line numbers refreshed
+  2026-05-31 (file restructured during the perf-night arc; the
+  gate logic is unchanged).
 
 ## Quantization range — known latent gap
 
