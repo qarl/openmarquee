@@ -466,7 +466,10 @@ def test_mgmt_nm_keyfile_moved_from_bootfs_to_system_connections(
     _stage_mgmt_bootfs_keyfile(fakefs, ssid="InstallerWifi", psk="mgmt-test")
     _run_oneshot(fakefs)
     dst = (
-        fakefs / "etc" / "NetworkManager" / "system-connections"
+        fakefs
+        / "etc"
+        / "NetworkManager"
+        / "system-connections"
         / "openmarquee-mgmt-wifi.nmconnection"
     )
     assert dst.exists(), "mgmt keyfile not copied to system-connections/"
@@ -494,7 +497,10 @@ def test_mgmt_nm_keyfile_chmod_600_after_move(fakefs: Path) -> None:
     _stage_mgmt_bootfs_keyfile(fakefs, ssid="x", psk="y")
     _run_oneshot(fakefs)
     dst = (
-        fakefs / "etc" / "NetworkManager" / "system-connections"
+        fakefs
+        / "etc"
+        / "NetworkManager"
+        / "system-connections"
         / "openmarquee-mgmt-wifi.nmconnection"
     )
     mode = stat.S_IMODE(dst.stat().st_mode)
