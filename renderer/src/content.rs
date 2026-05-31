@@ -196,6 +196,22 @@ pub struct TextLayer {
     /// that fixed-function blend can't express).
     #[serde(default = "default_blend")]
     pub blend: String,
+    /// v1.0 close (2026-05-30) — vertical anchor INSIDE the layer
+    /// box. One of `top` / `center` / `bottom`; spec §5.10a line 318.
+    /// Honored at paint via `parse_v_align` in `draw_text_layer_msdf`.
+    #[serde(default = "default_anchor")]
+    pub anchor: String,
+    /// v1.0 close (2026-05-30) — variable-font CSS weight (100-900,
+    /// multiples of 100) from the Pydantic model. Wire-accepted but
+    /// render-deferred: the bundled font system is single-TTF-per-
+    /// family (see `font_family_to_filename` in hdmi_logic.rs) and
+    /// fontdue does not support variable-axis selection, so the field
+    /// survives a save/load round-trip but the renderer paints with
+    /// the bundled TTF's native weight. Honoring weight ships behind
+    /// a font-bundling decision (variant TTFs OR a different
+    /// rasterizer) — queued for v1.1.
+    #[serde(default)]
+    pub weight: Option<u32>,
     pub r#box: TextBox,
 }
 
@@ -235,6 +251,9 @@ fn default_opacity() -> f32 {
 }
 fn default_visible() -> bool {
     true
+}
+fn default_anchor() -> String {
+    "center".to_string()
 }
 fn default_motion() -> String {
     "static".to_string()
@@ -1178,6 +1197,50 @@ mod tests {
         assert_eq!(layer.motion_intensity, 50);
         assert!((layer.motion_phase - 0.0).abs() < 1e-6);
         assert!((layer.motion_speed - 1.0).abs() < 1e-6);
+        // v1.0 close: anchor defaults to "center" (matches §5.10a's
+        // default + the pre-v1.0 always-center renderer behavior).
+        assert_eq!(layer.anchor, "center");
+        // weight is an optional field; absent in this fixture.
+        assert!(layer.weight.is_none());
+    }
+
+    #[test]
+    fn anchor_round_trips_three_spec_values() {
+        // v1.0 close (SYSTEM_SPEC §5.10a line 318): top/center/bottom.
+        // Pin each so a schema rename or accidental drop fires here.
+        for kind in ["top", "center", "bottom"] {
+            let json = format!(
+                r##"{{
+                    "text": "X",
+                    "anchor": "{kind}",
+                    "box": {{"x": 0, "y": 0, "w": 1, "h": 1}}
+                }}"##
+            );
+            let layer: TextLayer = serde_json::from_str(&json).unwrap();
+            assert_eq!(layer.anchor, kind, "kind={kind}");
+        }
+    }
+
+    #[test]
+    fn weight_round_trips_as_optional() {
+        // v1.0 close: weight is wire-accepted (preserves through
+        // save/load) but render-deferred — fontdue doesn't support
+        // variable-axis selection and the bundled font system is
+        // single-TTF-per-family. Future v1.1 work bundles weight-
+        // variant TTFs OR swaps rasterizers. Until then this pins
+        // that the field at least survives a deserialize so a
+        // future render-side wire-up has a value to read.
+        let with_weight: TextLayer = serde_json::from_str(
+            r#"{"text": "Y", "weight": 700, "box": {"x":0,"y":0,"w":1,"h":1}}"#,
+        )
+        .unwrap();
+        assert_eq!(with_weight.weight, Some(700));
+
+        let without_weight: TextLayer = serde_json::from_str(
+            r#"{"text": "Y", "box": {"x":0,"y":0,"w":1,"h":1}}"#,
+        )
+        .unwrap();
+        assert!(without_weight.weight.is_none());
     }
 
     #[test]

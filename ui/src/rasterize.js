@@ -112,6 +112,14 @@ export function drawTextOnly(canvas, item, opts) {
         const slideKey = (item && (item.id || "?")) + "";
         for (let i = 0; i < layers.length; i++) {
             const layer = layers[i];
+            // v1.0 close (2026-05-30) — match drawCanvas (line 517+) on
+            // hidden-layer skipping. Pre-fix, a Text-over-Video slide
+            // with a hidden layer would still paint that layer on top
+            // of the video frame in the inline-preview path, diverging
+            // from drawCanvas's behavior on the same slide. SYSTEM_SPEC
+            // §5.10a lines 320-323 require save-time + preview honoring
+            // of visible: false.
+            if (layer?.visible === false) continue;
             // Auto-mode resolution: mirror drawCanvas (line 510). Without
             // this, a Text-over-Video slide with an auto_mode="time" /
             // "date" / "day" layer rendered the placeholder token

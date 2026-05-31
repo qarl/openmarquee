@@ -99,9 +99,24 @@ struct. Net behavior:
   weight (Inter, Oswald, Roboto Slab are the variable-weight
   candidates). Operator selection is functionally disabled.
   **Spec:** `SYSTEM_SPEC.md` line 317. **Impl gap:** same shape as
-  `anchor` — field + plumb-through. ~20 LOC. Note: variable-font
+  `anchor` — field + plumb-through. ~20 LOC. ~~Note: variable-font
   rasterization via fontdue is supported; the wire is the gap, not
-  the rasterizer.
+  the rasterizer.~~
+
+  **ERRATA (2026-05-30, r26 close):** The struck-through note above
+  is WRONG. `fontdue` does NOT support variable-axis selection — it
+  parses static TTFs only. The bundled font system at
+  `renderer/src/hdmi_logic.rs:4165` is single-TTF-per-family with
+  no weight variants on disk. Honoring `weight` at render time
+  requires either (a) bundling weight-variant TTFs (Inter-300.ttf,
+  Inter-700.ttf, …) + extending `font_family_to_filename` to
+  `(family, weight) → filename`, or (b) swapping rasterizers to one
+  that supports the fvar table. v1.0 ships `weight` as
+  **wire-accepted-render-deferred**: the renderer struct preserves
+  the field through a save/load round-trip (`Option<u32>` in
+  `renderer/src/content.rs`) so a future v1.1 wire-up has a value
+  to read. UI/render parity gap is now a documented v1.1 decision
+  (bundle variants OR hide the editor affordance).
 
 - **P1 — Text-layer `visible` ignored at SAVE time.** Renderer
   correctly skips `visible: false` layers during playback (the

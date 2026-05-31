@@ -4859,6 +4859,18 @@ pub fn parse_h_align(s: &str) -> HAlign {
     }
 }
 
+/// Parse the `anchor` string (vertical alignment) from the layer
+/// model. Spec §5.10a literal: `top` / `center` / `bottom`.
+/// Unrecognized values default to `Middle` (matches Python's tolerant
+/// defaults + the pre-v1.0 renderer behavior of always-center).
+pub fn parse_v_align(s: &str) -> VAlign {
+    match s {
+        "top" => VAlign::Top,
+        "bottom" => VAlign::Bottom,
+        _ => VAlign::Middle,
+    }
+}
+
 /// NDC quad for placing a `bm_w × bm_h` bitmap inside a slide-
 /// relative `box(x, y, w, h)` (fractions of mode_w / mode_h) on a
 /// `mode_w × mode_h` viewport, aligned per `(halign, valign)`.
@@ -9262,6 +9274,25 @@ mod tests {
         assert_eq!(parse_h_align(""), HAlign::Left);
         assert_eq!(parse_h_align("justify"), HAlign::Left);
         assert_eq!(parse_h_align("CENTER"), HAlign::Left); // case-sensitive
+    }
+
+    // v1.0 close: parse_v_align mirrors the parse_h_align contract for
+    // SYSTEM_SPEC §5.10a `anchor` (top / center / bottom). Unknown
+    // values fall back to Middle so a forward-compat field doesn't
+    // panic at paint time.
+
+    #[test]
+    fn parse_v_align_recognized() {
+        assert_eq!(parse_v_align("top"), VAlign::Top);
+        assert_eq!(parse_v_align("center"), VAlign::Middle);
+        assert_eq!(parse_v_align("bottom"), VAlign::Bottom);
+    }
+
+    #[test]
+    fn parse_v_align_unknown_falls_back_middle() {
+        assert_eq!(parse_v_align(""), VAlign::Middle);
+        assert_eq!(parse_v_align("baseline"), VAlign::Middle);
+        assert_eq!(parse_v_align("TOP"), VAlign::Middle); // case-sensitive
     }
 
     // -- box_to_ndc_quad -----------------------------------------

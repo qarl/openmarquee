@@ -308,6 +308,29 @@ describe("drawTextOnly (Phase 5b — Text-over-Video overlay)", () => {
         expect(canvas._ctx.fillText.mock.calls[0][0]).toBe("BOTTOM");
         expect(canvas._ctx.fillText.mock.calls[1][0]).toBe("TOP");
     });
+
+    it("skips layers with visible: false (v1.0 close — §5.10a save-time parity)", () => {
+        // Pre-v1.0 gap: drawTextOnly iterated every layer regardless
+        // of visible, so a Text-over-Video slide with a hidden layer
+        // would still paint the hidden layer on top of the video
+        // frame in the inline-preview path. drawCanvas (the editor +
+        // save-time rasterizer) honored visible at line 517+; this
+        // closes the same wire in drawTextOnly.
+        const canvas = mockCanvas(200, 200);
+        drawTextOnly(canvas, {
+            text_layers: [
+                { text: "VISIBLE", visible: true },
+                { text: "HIDDEN", visible: false },
+                { text: "ALSO VISIBLE" }, // visible defaults to true
+            ],
+        });
+        // Two fillText calls — the hidden layer is skipped entirely.
+        expect(canvas._ctx.fillText).toHaveBeenCalledTimes(2);
+        const drawn = canvas._ctx.fillText.mock.calls.map((c) => c[0]);
+        expect(drawn).toContain("VISIBLE");
+        expect(drawn).toContain("ALSO VISIBLE");
+        expect(drawn).not.toContain("HIDDEN");
+    });
 });
 
 // --- mountEditor ---

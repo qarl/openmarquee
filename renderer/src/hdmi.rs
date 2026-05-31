@@ -46,7 +46,7 @@ use crate::hdmi_logic::{
     effective_font_size_px, effective_hold_ms, format_auto_text, fourcc_for_argb_family,
     fs_for_transition_kind, gradient_uniforms, grid_uniforms, halftone_uniforms,
     hex_to_rgba, hsv_to_rgb, motion_offset_to_px,
-    parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind,
+    parse_blend_mode, parse_crtc_list_filter_bits, parse_h_align, parse_motion_kind, parse_v_align,
     parse_pattern_kind, pattern_kind_label, pick_largest_mode_index, prev_idx_for_reel,
     rays_uniforms, rings_uniforms, scanlines_uniforms, should_rerasterize, wrap_text_to_width,
     classify_prewarm_pair,
@@ -2199,7 +2199,10 @@ fn draw_text_layer_msdf(
         mode_w,
     );
     let halign = parse_h_align(&layer.text_align);
-    let valign = VAlign::Middle;
+    // v1.0 close (2026-05-30) — honor §5.10a `anchor` field instead of
+    // always-center. Operator picks top/bottom in the editor; the
+    // renderer now matches the editor preview's vertical placement.
+    let valign = parse_v_align(&layer.anchor);
 
     // Stage 1: outer NDC rect for the WHOLE laid-out text (matches
     // `box_to_ndc_quad` contract; pad-inclusive). bm_pad = 1 to
