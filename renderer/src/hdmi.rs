@@ -785,7 +785,17 @@ where
     // upfront so the first video slide doesn't pay the 592ms
     // NV12_DMABUF link cost in the paint hot path, and the first
     // transition doesn't pay the 132ms composite-shader compile.
+    // r20 (2026-05-30): extended to cover the 6 text shader programs
+    // (msdf x outline, glyph x outline, tofu, emoji) -- mirror of r6
+    // for the text path.
     prewarm_shader_programs(&session);
+
+    // perf-night r20 (2026-05-30): rasterize the demo-reel font set's
+    // ASCII glyph range upfront so the first text slide doesn't pay
+    // the FT_Load + msdfgen cold cost on the paint hot path. Trades
+    // ~3s startup latency (hard-deadlined) for a smoother cold-start
+    // first-text-frame.
+    prewarm_glyph_rasterization(&mut session);
 
     let work_result = work(&mut session);
 
@@ -10443,9 +10453,146 @@ fn prewarm_shader_programs(session: &EglSession) {
         }
     }
 
+    // r20 (2026-05-30): text-side shader programs. The first text
+    // slide on a fresh sidecar previously paid the link cost for
+    // cached_msdf_program (FS_MSDF_FIXED + FS_MSDF_OUTLINE_FIXED) on
+    // the paint hot path -- baseline paint_bake_text MAX ~90 ms,
+    // paint_compose MAX 340 ms in r6 capture. The 4 MSDF/glyph
+    // variants cover the static-atlas + runtime-cache draw paths;
+    // tofu + emoji cover the FontMissing fallback and the COLRv1
+    // emoji quad path.
+    try_warm!("glyph_program", cached_glyph_program(gl, false));
+    try_warm!("glyph_outline_program", cached_glyph_program(gl, true));
+    try_warm!("msdf_program", cached_msdf_program(gl, false));
+    try_warm!("msdf_outline_program", cached_msdf_program(gl, true));
+    try_warm!("tofu_program", cached_tofu_program(gl));
+    try_warm!("emoji_program", cached_emoji_program(gl));
+
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     eprintln!(
         "prewarm: compiled {compiled} shader programs in {ms:.1}ms ({failed} failed)"
+    );
+}
+
+/// r20 (2026-05-30): rasterize the demo-reel font set's printable-
+/// ASCII glyph range into `session.dynamic_glyph_cache` /
+/// `dynamic_atlas_page_msdf` upfront. Mirrors r6's shader prewarm
+/// for the glyph-cache miss path.
+///
+/// Why this is here: a fresh sidecar's `dynamic_glyph_cache` starts
+/// empty, so the first text slide blocks on (a) the worker queue
+/// rasterizing each codepoint via FT_Load + msdfgen, then (b) the
+/// next paint's `poll_completions` uploading to the atlas, then (c)
+/// the slide's `slide_caches` re-resolving against the now-Ready
+/// states. Until then the slide draws Tofu placeholders OR delays
+/// the frame. Pre-populating the cache shifts that cost from
+/// "first visible text frame" to sidecar startup, where the user
+/// is already seeing the boot splash.
+///
+/// Scope:
+///   * Demo-reel font stems (the boot reel's actual set) -- 8 fonts
+///     including `dejavu-sans` (the FontMissing fallback per
+///     `glyph_cache::FALLBACK_FONT_STEMS`).
+///   * Printable ASCII U+0020..=U+007E (95 codepoints). Covers all
+///     boot-reel slide text; non-ASCII codepoints + emoji ranges
+///     populate lazily on first encounter (still a cold-start cost,
+///     but vanishingly rare on the demo reel and tractable when it
+///     happens).
+///
+/// Deadline: 3s hard cap. ASCII MSDF cells rasterize at ~10-50ms
+/// median per glyph; 8 fonts × 95 codepoints = 760 glyphs / 4
+/// worker threads ≈ 190 per worker, so ~2-3s wall-clock for the
+/// happy path. The cap exists for msdfgen tail latency (482ms p99
+/// single-thread per the glyph_cache.rs comment) -- a slow font
+/// can't blow the startup budget; uncached glyphs just populate
+/// lazily on first paint.
+///
+/// Failure semantics: missing font files log + skip (not fatal --
+/// the renderer's runtime FontMissing fallback path handles it
+/// identically to a worker-side failure).
+#[cfg(target_os = "linux")]
+fn prewarm_glyph_rasterization(session: &mut EglSession) {
+    use crate::glyph_cache::{font_family_id_from_stem, GlyphKey, RenderMode};
+
+    // Demo-reel font set per backend/openmarquee/seed.py _DEMO_REEL +
+    // FALLBACK_FONT_STEMS. Stems match
+    // hdmi_logic::font_family_to_filename's basename-minus-extension.
+    // Subagent review caught JetBrains Mono being in the reel but
+    // missing from the first draft -- keep this in sync with seed.py
+    // _DEMO_REEL's font_family= set + FALLBACK_FONT_STEMS.
+    const DEMO_REEL_STEMS: &[&str] = &[
+        "anton",
+        "alfa-slab-one",
+        "bowlby-one-sc",
+        "playfair-display",
+        "vt323",
+        "permanent-marker",
+        "caveat-brush",
+        "jetbrains-mono",
+        "dejavu-sans",
+    ];
+    const PRINTABLE_ASCII_START: u32 = 0x20;
+    const PRINTABLE_ASCII_END: u32 = 0x7E;
+    const PREWARM_DEADLINE: std::time::Duration = std::time::Duration::from_millis(3000);
+
+    let t0 = std::time::Instant::now();
+    let mut requested: u32 = 0;
+    let mut skipped_fonts: u32 = 0;
+
+    for stem in DEMO_REEL_STEMS {
+        let fid = font_family_id_from_stem(stem);
+        let font_path = session.dynamic_fonts_dir.join(format!("{stem}.ttf"));
+        if !font_path.exists() {
+            eprintln!(
+                "glyph-prewarm: skip {stem} -- font file not found at {font_path:?}"
+            );
+            skipped_fonts += 1;
+            continue;
+        }
+        for cp in PRINTABLE_ASCII_START..=PRINTABLE_ASCII_END {
+            let key = GlyphKey {
+                font_family_id: fid,
+                codepoint: cp,
+                render_mode: RenderMode::Msdf,
+            };
+            let _ = session
+                .dynamic_glyph_cache
+                .get_or_request(key, || font_path.clone());
+            requested += 1;
+        }
+    }
+
+    // Drain completions until either all requested glyphs are
+    // resolved OR the deadline trips. poll_completions returns the
+    // count drained this call -- counting BOTH Ready (atlas-uploaded)
+    // and FontMissing (worker direct-inserted) variants per
+    // glyph_cache.rs:686-692. Every requested glyph yields exactly
+    // one completion of one variant, so `uploaded as u32 >= requested`
+    // is a sound early-exit. On a quiet channel sleep 10ms to avoid
+    // CPU-spinning at the workers' transcoding rate; deadline is a
+    // hard cap for msdfgen tail latency.
+    let deadline = t0 + PREWARM_DEADLINE;
+    let mut uploaded: usize = 0;
+    while std::time::Instant::now() < deadline {
+        let n = session.dynamic_glyph_cache.poll_completions(
+            session.gl,
+            &mut session.dynamic_atlas_page_msdf,
+            &mut session.dynamic_atlas_page_colr,
+            128,
+        );
+        uploaded += n;
+        if uploaded as u32 >= requested {
+            break;
+        }
+        if n == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    eprintln!(
+        "glyph-prewarm: requested {requested} glyphs across {} fonts ({skipped_fonts} skipped); uploaded {uploaded} in {ms:.1}ms",
+        DEMO_REEL_STEMS.len() - skipped_fonts as usize,
     );
 }
 
