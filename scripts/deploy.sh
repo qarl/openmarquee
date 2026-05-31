@@ -31,6 +31,16 @@
 # it into an SD card image.
 set -euo pipefail
 
+# r31 (2026-05-31): suppress macOS AppleDouble sidecars in the
+# wheels cache that the new pip-download step writes to
+# $OPENMARQUEE_BUILD_DIR/wheels/. Mirrors build_sd_bundle.sh:47
+# which sets the same flag before its wheel download for the same
+# reason (boot-5 forensics 2026-05-21 found 41 ._* sidecars
+# accreting in the SD bundle's wheels dir). The rsync to remote
+# already --excludes ._* so they never reach the Pi; this just
+# keeps the local cache clean.
+export COPYFILE_DISABLE=1
+
 source "$(dirname "$0")/_lib.sh"
 
 if [ $# -ne 1 ]; then
@@ -148,6 +158,88 @@ rsync -avz --rsync-path="sudo rsync" --delete --delete-excluded \
     --exclude '._*' \
     --exclude '__pycache__' \
     "$OPENMARQUEE_BUILD_DIR/images/" "$TARGET:$REMOTE_ROOT/images/"
+
+# r31 (2026-05-31) -- wheels refresh.
+#
+# FYS-prod v1.0.0 deploy (r28) hit a pip rc=1 because
+# /opt/openmarquee/wheels/ was 15 days stale (pinned to v0.9.0's
+# wheel set, which had certifi==2026.4.22 vs v1.0.0's pinned
+# certifi==2026.5.20). pip with --no-index --find-links can't
+# find the newer version → "No matching distribution found for
+# certifi==2026.5.20" → install.sh EXIT trap → partial deploy.
+#
+# Fix: download a fresh aarch64 wheel set matching the CURRENT
+# requirements.lock into a local cache, then rsync that to
+# /opt/openmarquee/wheels/ on the Pi. pip download is idempotent
+# (skips wheels already in the cache that match the requested
+# spec), so cross-deploy reuse is fast — only the wheels for new
+# / bumped pins get re-fetched.
+#
+# The cache lives at $OPENMARQUEE_BUILD_DIR/wheels/ so it
+# survives across deploys but is local-disk-only (not in the
+# source tree, not gitignored separately because BUILD_DIR is
+# already outside the repo).
+#
+# Platform tags mirror build_sd_bundle.sh §3 (which builds the
+# canonical SD-bundle wheels). Keep both in sync if either
+# changes -- a divergence would mean factory-flashed Pis get
+# different wheels than dev-redeployed Pis.
+echo "==> refreshing aarch64 wheel cache for current requirements.lock"
+WHEELS_CACHE="$OPENMARQUEE_BUILD_DIR/wheels"
+mkdir -p "$WHEELS_CACHE"
+# --only-binary=:all: refuses source-dist: if a pinned dep doesn't
+# ship an aarch64 wheel at any of the listed manylinux tags, this
+# fails LOUDLY on the dev host rather than silently shipping an
+# incomplete cache that the Pi can't resolve.
+PYTHON_VERSION="${PYTHON_VERSION:-3.13}"
+pip download \
+    --dest "$WHEELS_CACHE" \
+    --platform manylinux2014_aarch64 \
+    --platform manylinux_2_17_aarch64 \
+    --platform manylinux_2_28_aarch64 \
+    --platform manylinux_2_26_aarch64 \
+    --platform manylinux_2_31_aarch64 \
+    --platform linux_aarch64 \
+    --python-version "$PYTHON_VERSION" \
+    --implementation cp \
+    --abi "cp${PYTHON_VERSION//./}" \
+    --only-binary=:all: \
+    --requirement "$OPENMARQUEE_BUILD_DIR/backend/requirements.lock" \
+    > /dev/null
+# Bootstrap setuptools/wheel/pip per build_sd_bundle.sh §3 — pure-
+# Python (py3-none-any) wheels needed for the editable install with
+# --no-build-isolation. Versions pinned to match the SD bundle.
+pip download \
+    --dest "$WHEELS_CACHE" \
+    --only-binary=:all: \
+    "setuptools==82.0.1" "wheel==0.47.0" "pip==26.1.1" \
+    > /dev/null
+WHEEL_COUNT=$(find "$WHEELS_CACHE" -name '*.whl' | wc -l | tr -d ' ')
+echo "==>   wheel cache: $WHEEL_COUNT wheels at $WHEELS_CACHE"
+
+# Mirror build_sd_bundle.sh:305-311's BAD_WHEELS sanity check.
+# Catches a permissive --platform tag (or a regression in pip's
+# tag matching) that would otherwise quietly land x86_64 / amd64
+# wheels in the cache + ship them to the Pi, where they crash on
+# first import. Fast-fail at the dev host before the rsync.
+BAD_WHEELS=$(find "$WHEELS_CACHE" -name '*x86_64*.whl' -o -name '*amd64*.whl' 2>/dev/null || true)
+if [ -n "$BAD_WHEELS" ]; then
+    echo "ERROR: non-aarch64 wheels in cache (would crash on the Pi):" >&2
+    echo "$BAD_WHEELS" | sed 's/^/    /' >&2
+    echo "    pip download flags may be too permissive; investigate $WHEELS_CACHE" >&2
+    exit 1
+fi
+
+echo "==> rsync wheels/ to $TARGET:$REMOTE_ROOT/wheels/"
+# --delete trims stale wheels (e.g. yanked package versions) so the
+# Pi's /opt/openmarquee/wheels/ exactly matches the current cache.
+# Important: a stale wheel left in place would happily satisfy a
+# pin if the version happened to match, even if it's no longer in
+# the requirements.lock -- which would mask a future regression
+# where install.sh ought to fail-loud.
+rsync -avz --rsync-path="sudo rsync" --delete \
+    --exclude '._*' \
+    "$WHEELS_CACHE/" "$TARGET:$REMOTE_ROOT/wheels/"
 
 echo "==> running install.sh on remote (idempotent provisioning)"
 # install.sh handles venv (Batch 11.1 / sweep #5 #7 requirements.lock

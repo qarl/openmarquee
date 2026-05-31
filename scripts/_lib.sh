@@ -43,5 +43,13 @@ sync_to_build_dir() {
         --exclude='openmarquee-*.json' \
         --exclude='*.log' \
         --exclude='demo/' \
+        --exclude='wheels' \
         "$OPENMARQUEE_SRC/" "$OPENMARQUEE_BUILD_DIR/"
 }
+# r31 (2026-05-31) -- the 'wheels' exclude is load-bearing for
+# scripts/deploy.sh's wheels-refresh step: deploy.sh maintains an
+# aarch64 wheel cache at $OPENMARQUEE_BUILD_DIR/wheels/ that
+# survives across deploys for idempotent pip download. Without
+# the exclude, sync_to_build_dir's --delete would wipe the cache
+# every deploy (source tree has no top-level wheels/ dir, so
+# rsync --delete sees it as "extraneous").

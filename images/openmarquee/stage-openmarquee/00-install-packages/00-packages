@@ -5,6 +5,13 @@ python3
 python3-pip
 python3-venv
 ffmpeg
+libavcodec-dev
+libavformat-dev
+libavutil-dev
+libavfilter-dev
+libavdevice-dev
+libswscale-dev
+libswresample-dev
 fonts-dejavu
 qrencode
 git
