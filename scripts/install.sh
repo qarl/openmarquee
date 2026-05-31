@@ -270,7 +270,134 @@ if [ -z "$ROOT_PREFIX" ]; then
     run chown openmarquee:openmarquee "$VAR_DIR" "$LIB_DIR"
 fi
 
+# r29 (2026-05-31) -- SECTION REORDER:
+#
+# Sections 3 (systemd units), 3a (chmod helpers), and 3b (Rust IPC
+# sidecar binary) deliberately run BEFORE section 2 (Python venv +
+# pip install) so a transient pip failure doesn't take down the
+# deploy pipeline. Before r29, install.sh ran §2 → §3 → §3a → §3b
+# → ... → §8 (end-of-script daemon-reload + restart). r28's FYS
+# v1.0.0 deploy (2026-05-31) hit a pip resolver failure at §2; the
+# EXIT trap fired; §3b's renderer binary cp + §8's backend restart
+# never ran. Manual `scp + stop/cp/start` was the recovery — r29
+# eliminates the need for that bypass.
+#
+# Section numbers (3, 3a, 3b) are preserved as historical IDs so
+# downstream "the systemd units staged in §3" references stay
+# accurate; only their position in the file moves.
+#
+# Key invariant per the r29 dispatch contract: NO systemctl start/
+# restart fires between sections 3 and 7. The end-of-script
+# daemon-reload + restart at section 8 (line ~939) is the single
+# atomic transition. Section 3b uses atomic rename(2) for the
+# renderer binary so it never needs to bounce the backend
+# mid-install -- see the §3b body below for the mechanism.
+
+# --- 3. Systemd unit files --------------------------------------------------
+
+say "Install systemd units"
+run mkdir -p "$SYSTEMD_DIR"
+for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tailscale.service; do
+    SRC="${OPT_DIR}/system/${unit}"
+    DST="${SYSTEMD_DIR}/${unit}"
+    if already_done -f "$DST" && already_done "$SRC" -nt "$DST"; then
+        # Source is newer than installed unit; update.
+        run cp "$SRC" "$DST"
+    elif already_done -f "$DST"; then
+        say "  ${unit} up to date; skip"
+    else
+        run cp "$SRC" "$DST"
+    fi
+done
+
+# --- 3a. Ensure +x on system/*.sh helpers -----------------------------------
+#
+# Task #99 investigation (2026-05-14): the deployed Pi had system/*.sh
+# files at -rw-r--r-- despite Mac source being -rwxr-xr-x. `rsync -avz`
+# SHOULD preserve perms (--perms is part of -a) and the tar-cf/-xf bundle
+# path should too, but the dev Pi shows otherwise. Belt-and-suspenders:
+# explicitly chmod +x the .sh ExecStart= targets so systemd can invoke
+# them. Idempotent: chmod +x on an already-executable file is a no-op.
+say "Ensure +x on system/*.sh helpers"
+for sh_helper in openmarquee-ap0-setup.sh openmarquee-firstboot.sh openmarquee-tailscale.sh; do
+    SH_PATH="${OPT_DIR}/system/${sh_helper}"
+    if [ "$DRY_RUN" -eq 1 ] || [ -f "$SH_PATH" ]; then
+        run chmod +x "$SH_PATH"
+    fi
+done
+
+# --- 3b. Rust IPC sidecar binary (Phase 7 slice 3) --------------------------
+
+# Install the openmarquee-render binary to /usr/local/bin/ if deploy.sh
+# staged it under /opt/openmarquee/bin/. This binary is opt-in via
+# OPENMARQUEE_RENDERER=rust-sidecar (see backend/openmarquee/
+# dependencies.py); a missing staged binary just means the operator
+# hasn't enabled the sidecar yet -- not an error.
+#
+# r29 (2026-05-31) -- atomic-rename install pattern.
+#
+# The running sidecar holds $RUST_BIN_INSTALLED open via exec mmap, so
+# `cp $SRC $DST` (in-place write) fails with ETXTBSY ("Text file busy").
+# Three historical workarounds, in order of increasing quality:
+#
+#   1. (pre-r21) Plain cp + swallow the failure → silent stale binary
+#      across redeploys. Cost: manual stop/cp/start workaround burned
+#      twice during perf-night r5+r6 (2026-05-26+28).
+#   2. (r21 2026-05-30) Stop backend, cp, then rely on §8's restart.
+#      Works for the happy path, but couples binary install to a
+#      backend bounce AND if a LATER section (e.g. pip) trips the EXIT
+#      trap before §8 fires, the box is left with the backend stopped.
+#      Cost: bit FYS-prod r28 v1.0.0 deploy 2026-05-31.
+#   3. (r29 -- this commit) cp to sibling `.new` path, then `mv -f`
+#      atomic rename. rename(2) on the same filesystem operates on
+#      the directory entry, NOT the file content -- the running
+#      backend's open fd stays bound to the OLD inode (kernel
+#      preserves the inode until the last fd closes, even though
+#      the dirent now points to the NEW inode). No ETXTBSY, no
+#      backend bounce, no partial-rollback risk if a later section
+#      trips. §8's end-of-script restart picks up the new binary
+#      on the happy path; if pip fails, the backend keeps running
+#      with the old binary (graceful) and the operator can re-run
+#      install.sh after fixing pip to get the new binary live.
+RUST_BIN_STAGED="${OPT_DIR}/bin/openmarquee-render"
+RUST_BIN_INSTALLED="${ROOT_PREFIX}/usr/local/bin/openmarquee-render"
+RUST_BIN_TMP="${RUST_BIN_INSTALLED}.new"
+say "Install Rust IPC sidecar binary (opt-in via OPENMARQUEE_RENDERER=rust-sidecar)"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "$RUST_BIN_STAGED" ]; then
+    run mkdir -p "$(dirname "$RUST_BIN_INSTALLED")"
+    # cp to sibling temp path first (no ETXTBSY -- nothing holds the
+    # .new path open). Defensive cleanup of any leftover .new from a
+    # prior failed install run -- `cp` would overwrite it anyway, but
+    # explicit rm makes the intent obvious.
+    run rm -f "$RUST_BIN_TMP" || true
+    if ! run cp "$RUST_BIN_STAGED" "$RUST_BIN_TMP"; then
+        say "ERROR: cp $RUST_BIN_STAGED -> $RUST_BIN_TMP failed."
+        say "  (likely disk-full or permission issue; investigate with:"
+        say "   df -h $(dirname "$RUST_BIN_INSTALLED"); ls -ld $(dirname "$RUST_BIN_INSTALLED"))"
+        run rm -f "$RUST_BIN_TMP" || true
+        exit 1
+    fi
+    run chmod +x "$RUST_BIN_TMP"
+    # Atomic swap. rename(2) on a same-filesystem dest doesn't touch
+    # the destination's content -- it just re-points the directory
+    # entry. The running backend's exec-mmap stays bound to the old
+    # inode; the old inode is reaped when the backend exits OR is
+    # restarted at §8. No ETXTBSY possible here.
+    if ! run mv -f "$RUST_BIN_TMP" "$RUST_BIN_INSTALLED"; then
+        say "ERROR: mv $RUST_BIN_TMP -> $RUST_BIN_INSTALLED failed."
+        say "  (cross-filesystem rename? both paths must be on the same fs;"
+        say "   check with: df -h $RUST_BIN_TMP $(dirname "$RUST_BIN_INSTALLED"))"
+        run rm -f "$RUST_BIN_TMP" || true
+        exit 1
+    fi
+else
+    say "  no staged binary at ${RUST_BIN_STAGED}; skip (sidecar opt-in unused)"
+fi
+
 # --- 2. Python venv ---------------------------------------------------------
+#
+# r29 (2026-05-31): runs AFTER sections 3, 3a, 3b — see the meta-comment
+# above section 3 for the rationale.
 
 VENV_DIR="${OPT_DIR}/venv"
 say "Ensure Python venv at ${VENV_DIR}"
@@ -322,83 +449,6 @@ if [ -f "${OPT_DIR}/backend/requirements.lock" ]; then
     run "${VENV_DIR}/bin/pip" install --upgrade ${PIP_OFFLINE_FLAGS[@]+"${PIP_OFFLINE_FLAGS[@]}"} -r "${OPT_DIR}/backend/requirements.lock"
 fi
 run "${VENV_DIR}/bin/pip" install --upgrade ${PIP_OFFLINE_FLAGS[@]+"${PIP_OFFLINE_FLAGS[@]}"} -e "${OPT_DIR}/backend"
-
-# --- 3. Systemd unit files --------------------------------------------------
-
-say "Install systemd units"
-run mkdir -p "$SYSTEMD_DIR"
-for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tailscale.service; do
-    SRC="${OPT_DIR}/system/${unit}"
-    DST="${SYSTEMD_DIR}/${unit}"
-    if already_done -f "$DST" && already_done "$SRC" -nt "$DST"; then
-        # Source is newer than installed unit; update.
-        run cp "$SRC" "$DST"
-    elif already_done -f "$DST"; then
-        say "  ${unit} up to date; skip"
-    else
-        run cp "$SRC" "$DST"
-    fi
-done
-
-# --- 3a. Ensure +x on system/*.sh helpers -----------------------------------
-#
-# Task #99 investigation (2026-05-14): the deployed Pi had system/*.sh
-# files at -rw-r--r-- despite Mac source being -rwxr-xr-x. `rsync -avz`
-# SHOULD preserve perms (--perms is part of -a) and the tar-cf/-xf bundle
-# path should too, but the dev Pi shows otherwise. Belt-and-suspenders:
-# explicitly chmod +x the .sh ExecStart= targets so systemd can invoke
-# them. Idempotent: chmod +x on an already-executable file is a no-op.
-say "Ensure +x on system/*.sh helpers"
-for sh_helper in openmarquee-ap0-setup.sh openmarquee-firstboot.sh openmarquee-tailscale.sh; do
-    SH_PATH="${OPT_DIR}/system/${sh_helper}"
-    if [ "$DRY_RUN" -eq 1 ] || [ -f "$SH_PATH" ]; then
-        run chmod +x "$SH_PATH"
-    fi
-done
-
-# --- 3b. Rust IPC sidecar binary (Phase 7 slice 3) --------------------------
-
-# Install the openmarquee-render binary to /usr/local/bin/ if deploy.sh
-# staged it under /opt/openmarquee/bin/. This binary is opt-in via
-# OPENMARQUEE_RENDERER=rust-sidecar (see backend/openmarquee/
-# dependencies.py); a missing staged binary just means the operator
-# hasn't enabled the sidecar yet -- not an error.
-RUST_BIN_STAGED="${OPT_DIR}/bin/openmarquee-render"
-RUST_BIN_INSTALLED="${ROOT_PREFIX}/usr/local/bin/openmarquee-render"
-say "Install Rust IPC sidecar binary (opt-in via OPENMARQUEE_RENDERER=rust-sidecar)"
-if [ "$DRY_RUN" -eq 1 ] || [ -f "$RUST_BIN_STAGED" ]; then
-    run mkdir -p "$(dirname "$RUST_BIN_INSTALLED")"
-    # Stop backend BEFORE the cp: the running sidecar holds
-    # $RUST_BIN_INSTALLED open for execution, which makes cp fail
-    # with `Text file busy`. The cp's exit-1 was previously swallowed
-    # (no explicit check), leaving the installed binary stale across
-    # the redeploy. Perf-night r5+r6 (2026-05-26+28) burned the
-    # manual stop/cp/start workaround twice in a row — fix it here
-    # so deploy.sh actually rolls the binary over.
-    # `is-active` guard avoids "Unit not loaded" stderr noise on
-    # first install (no service yet); `--root` is gated by --dry-run
-    # at line 79 so this systemctl call never fires under chroot test.
-    backend_was_running=0
-    if systemctl is-active --quiet openmarquee-backend.service 2>/dev/null; then
-        run systemctl stop openmarquee-backend.service
-        backend_was_running=1
-    fi
-    if ! run cp "$RUST_BIN_STAGED" "$RUST_BIN_INSTALLED"; then
-        say "ERROR: cp $RUST_BIN_STAGED -> $RUST_BIN_INSTALLED failed."
-        say "  (sidecar may still be holding the binary; check with:"
-        say "   sudo systemctl status openmarquee-backend; lsof $RUST_BIN_INSTALLED)"
-        # Don't leave the box with a stopped backend. End-of-script
-        # restart (line ~892) doesn't run after this exit; explicitly
-        # start here so operator gets a recoverable state.
-        if [ "$backend_was_running" -eq 1 ]; then
-            run systemctl start openmarquee-backend.service || true
-        fi
-        exit 1
-    fi
-    run chmod +x "$RUST_BIN_INSTALLED"
-else
-    say "  no staged binary at ${RUST_BIN_STAGED}; skip (sidecar opt-in unused)"
-fi
 
 # --- 4. hostapd.conf --------------------------------------------------------
 

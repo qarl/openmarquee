@@ -247,26 +247,40 @@ def test_dry_run_root_prefix_propagates_into_paths(tmp_path: Path) -> None:
 
 
 def test_dry_run_step_ordering(dry_output: str) -> None:
-    """The actions must run in dependency order: state dirs before
-    venv (pip writes to /var?), venv before systemd units (the
-    service runs from the venv), systemd install before
-    daemon-reload, daemon-reload before restart."""
+    """The actions must run in dependency order:
+      state dirs → systemd units → venv (pip) → daemon-reload → restart.
+
+    r29 (2026-05-31): systemd unit install moved BEFORE the Python
+    venv + pip install. The previous order (venv before systemd) was
+    rationalized as "the service runs from the venv" — but that's
+    only true at runtime, after §8's daemon-reload + restart. The
+    systemd unit FILES install in §3 is just a `cp`; nothing
+    references the venv at install-step time. The reorder makes
+    install.sh deploy-resilient: a transient pip failure at §2 no
+    longer aborts before §3b's renderer binary install or §8's
+    restart. See install.sh:273 meta-comment for the full r29
+    rationale (motivated by r28's FYS-prod v1.0.0 deploy hitting a
+    pip resolver failure that left the box in a partial-rollback
+    state).
+    """
     # Find substrings; assert ordering by index.
     state_idx = dry_output.find("Ensure state directories")
-    venv_idx = dry_output.find("Ensure Python venv")
     systemd_idx = dry_output.find("Install systemd units")
+    venv_idx = dry_output.find("Ensure Python venv")
     reload_idx = dry_output.find("systemctl daemon-reload")
     restart_idx = dry_output.find("restart openmarquee-backend")
     for marker, idx in [
         ("state dirs", state_idx),
-        ("venv", venv_idx),
         ("systemd install", systemd_idx),
+        ("venv", venv_idx),
         ("daemon-reload", reload_idx),
         ("restart", restart_idx),
     ]:
         assert idx != -1, f"missing dry-run marker: {marker}"
-    assert state_idx < venv_idx < systemd_idx < reload_idx < restart_idx, (
-        f"step ordering broken: {state_idx=} {venv_idx=} {systemd_idx=} "
+    # r29 invariant: systemd_idx < venv_idx (systemd unit files install
+    # BEFORE pip so a pip failure doesn't kill the binary rollover).
+    assert state_idx < systemd_idx < venv_idx < reload_idx < restart_idx, (
+        f"step ordering broken: {state_idx=} {systemd_idx=} {venv_idx=} "
         f"{reload_idx=} {restart_idx=}"
     )
 
