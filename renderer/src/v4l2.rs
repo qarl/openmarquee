@@ -860,7 +860,7 @@ impl Decoder {
     }
 
     /// Verify the CAPTURE quantization the driver picked is
-    /// compatible with the MMAP-path BT.601 limited-range shader.
+    /// compatible with the MMAP-path BT.709 limited-range shader.
     /// Call AFTER `set_capture_format`.
     ///
     /// Background (P1 from `qa/v1-spec-delta-2026-05-14.md`):

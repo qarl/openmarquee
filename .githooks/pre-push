@@ -25,6 +25,15 @@
 # Any root-level file or cross-area change runs everything (defensive
 # default).
 #
+# Exception: `scripts/tests/*` files (bash-only test harnesses run
+# manually via `bash scripts/tests/<name>.sh`) take a NO-OP path —
+# they cannot mechanically affect the Python pytest, cargo test, or
+# vitest suites since they're shell tests of shell scripts. A push
+# that touches only `scripts/tests/*` (and nothing else under
+# `scripts/`) bypasses all three area suites. Any other change
+# under `scripts/` still falls through to the cross-cutting default
+# below.
+#
 # Emergency bypass: `git push --no-verify` skips this hook. Use
 # sparingly + document the reason in the commit msg.
 #
@@ -104,11 +113,20 @@ if [ -n "$CHANGED_PATHS" ]; then
             backend/*)  run_backend=1 ;;
             ui/*)       run_ui=1 ;;
             renderer/*) run_renderer=1 ;;
+            # `scripts/tests/*` files are shell-only test harnesses
+            # run manually; they cannot mechanically affect pytest,
+            # cargo test, or vitest. A no-op classification (don't
+            # opt in to any area) means a push touching ONLY these
+            # paths runs no heavy suites. This branch MUST stay
+            # BEFORE the broader `scripts/*` fall-through (the *)
+            # catchall) or it gets shadowed.
+            scripts/tests/*) ;;
             "")         ;;  # skip blank lines from the diff
-            # Any other path (root config, .github/, scripts/, qa/,
-            # CHANGELOG.md, etc.) is treated as cross-cutting -- run
-            # every area's tests defensively. This is the "shared dep
-            # change shouldn't skip" rule from the dispatch.
+            # Any other path (root config, .github/, scripts/<other>,
+            # qa/, CHANGELOG.md, etc.) is treated as cross-cutting --
+            # run every area's tests defensively. This is the
+            # "shared dep change shouldn't skip" rule from the
+            # dispatch.
             *)          run_backend=1; run_ui=1; run_renderer=1 ;;
         esac
     done <<< "$CHANGED_PATHS"
