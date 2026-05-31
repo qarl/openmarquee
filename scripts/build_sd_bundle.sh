@@ -121,6 +121,89 @@ if [ -n "$SECRET_HITS" ]; then
     exit 3
 fi
 
+# --- 0a. r37a (2026-05-31): ensure gitignored runtime assets present ------
+#
+# build_sd_bundle.sh has historically assumed scripts/setup.sh ran first
+# (which downloads the COLRv1 emoji font). A fresh /tmp clone build skips
+# setup.sh and ships the bundle without ui/fonts/noto-color-emoji-colrv1.ttf.
+# Customers fresh-burning that bundle see emoji tofu. Same regression class
+# that bit FYS prod 2026-05-31 r31 -> r32, surfaced for the bundle path by
+# code2's r36 audit §B.5 + §C.1.
+#
+# Mirrors r32's deploy.sh fix shape. The download script is SHA-pinned +
+# idempotent (skips if file present at the expected stripped size).
+say "Ensuring gitignored runtime assets are present"
+bash "$REPO_ROOT/scripts/download-emoji-font-colrv1.sh"
+
+# --- 0b. r37a (2026-05-31): fail-loud asset preconditions -----------------
+#
+# Sanity-check required artifacts BEFORE the expensive staging + tar
+# steps. Better to fail in ~50ms than after 30s of wheel downloads when
+# a truncated font or missing binary would have silently shipped.
+#
+# Per code2's r36 audit §F.7. Covers the asset classes that cause
+# customer-visible regressions if shipped silently:
+#   - emoji font absent OR truncated (tofu on every emoji slide)
+#   - aarch64 renderer binary absent (Pi falls back to Python+DRM,
+#     much slower) OR wrong architecture (won't even exec)
+
+# Emoji font: must exist + be larger than 3 MB (the stripped colrv1
+# binary is ~4.8 MB; values < 3 MB indicate truncation, partial
+# download, or accidental zero-byte file).
+EMOJI_FONT="$REPO_ROOT/ui/fonts/noto-color-emoji-colrv1.ttf"
+if [ ! -f "$EMOJI_FONT" ]; then
+    echo "error: COLRv1 emoji font missing at $EMOJI_FONT" >&2
+    echo "       (the download in section 0a should have placed it; re-run" >&2
+    echo "        \`bash scripts/download-emoji-font-colrv1.sh\` manually if" >&2
+    echo "        that section was edited out)" >&2
+    exit 8
+fi
+# stat -f%z is BSD (macOS); stat -c%s is GNU (Linux). Try both per
+# the same fallback pattern at the SHA256 sidecar + manifest size
+# sites later in this script.
+FONT_SIZE=$(stat -f%z "$EMOJI_FONT" 2>/dev/null || stat -c%s "$EMOJI_FONT" 2>/dev/null || echo 0)
+if [ "$FONT_SIZE" -lt 3000000 ]; then
+    echo "error: COLRv1 emoji font at $EMOJI_FONT is too small ($FONT_SIZE bytes; expected > 3 MB)" >&2
+    echo "       truncated download? delete + re-run \`bash scripts/download-emoji-font-colrv1.sh\`" >&2
+    exit 8
+fi
+say "  emoji font OK ($FONT_SIZE bytes at $EMOJI_FONT)"
+
+# aarch64 renderer binary: pre-flight ARCH sanity ONLY (binary
+# present-or-absent is handled by section 2 below, which prints
+# WARNING + continues; we don't pre-flight that case because
+# duplicating the warn adds no information). The arch check IS
+# pre-flight-worthy: if the binary exists but is wrong-arch (e.g.
+# host-build leaked to the cross-build path), better to fail in
+# 50ms than after 30s of wheel downloads + tar/zstd.
+RUST_BIN_PRE_LOCAL="$REPO_ROOT/renderer/target/aarch64-unknown-linux-gnu/release/openmarquee-render"
+RUST_BIN_PRE_BUILD="$HOME/tmp/openmarquee-build/renderer/target/aarch64-unknown-linux-gnu/release/openmarquee-render"
+if [ -f "$RUST_BIN_PRE_LOCAL" ]; then
+    RUST_BIN_PRE="$RUST_BIN_PRE_LOCAL"
+elif [ -f "$RUST_BIN_PRE_BUILD" ]; then
+    RUST_BIN_PRE="$RUST_BIN_PRE_BUILD"
+else
+    RUST_BIN_PRE=""
+fi
+if [ -n "$RUST_BIN_PRE" ] && command -v file >/dev/null; then
+    PRE_FILE_OUT="$(file "$RUST_BIN_PRE")"
+    # `aarch64` / `ARM aarch64` are the discriminating substrings.
+    # Do NOT add `ELF 64-bit` to the alternation — it matches x86_64
+    # ELF too ("ELF 64-bit LSB executable, x86-64, ...") and would
+    # silently pass a wrong-arch binary through. (Pre-r37a section 2
+    # had this same loose alternation; r37a tightens both sites.)
+    if ! echo "$PRE_FILE_OUT" | grep -q 'aarch64\|ARM aarch64'; then
+        echo "error: Rust binary at $RUST_BIN_PRE does not look like aarch64 ELF:" >&2
+        echo "    $PRE_FILE_OUT" >&2
+        echo "    re-run \`bash scripts/renderer_cross_build.sh\` from a fresh state" >&2
+        exit 8
+    fi
+    say "  aarch64 renderer binary OK ($RUST_BIN_PRE)"
+fi
+# (Binary-missing case intentionally not pre-flighted here — section
+# 2 below handles it with a WARNING + ships without sidecar. Pi can
+# still serve the UI on the Python+DRM path.)
+
 # --- 1. Code tree (backend, ui-built, scripts, system) ---------------------
 
 say "Copying backend/ to staging (excluding tests + caches + runtime state)"
@@ -235,7 +318,7 @@ if [ -n "$RUST_BIN" ]; then
     # Sanity-check arch: aarch64 ELF magic + e_machine=0xb7 (AArch64).
     if command -v file >/dev/null; then
         FILE_OUT="$(file "$ROOT/bin/openmarquee-render")"
-        if ! echo "$FILE_OUT" | grep -q 'aarch64\|ARM aarch64\|ELF 64-bit'; then
+        if ! echo "$FILE_OUT" | grep -q 'aarch64\|ARM aarch64'; then
             echo "error: Rust binary doesn't look like aarch64 ELF:" >&2
             echo "    $FILE_OUT" >&2
             exit 5
@@ -447,11 +530,36 @@ SIZE_HUMAN=$(echo "$SIZE" | awk '{
     else printf "%d B", $1
 }')
 
+# r37a (2026-05-31): SHA256 sidecar so operators can verify the artifact
+# they pulled matches the artifact this build produced. Per code2 r36
+# audit §F.6. Mirrors the v0.9.0 release pattern — that bundle shipped
+# with SHA documented (sha256
+# 9aec7cdaef771735d8085769d37b4d85b9f7e37c63c9db2281860742cdeaf987)
+# but the stamp was published manually; this lands the sidecar at
+# build time so it's never out-of-band.
+#
+# shasum is BSD-style (macOS preinstalled); falls back to sha256sum
+# on Linux. Output format matches what `sha256sum -c` accepts so an
+# operator can verify with: `sha256sum -c <bundle>.sha256`.
+if command -v shasum >/dev/null 2>&1; then
+    (cd "$(dirname "$OUTPUT")" && shasum -a 256 "$(basename "$OUTPUT")") > "$OUTPUT.sha256"
+elif command -v sha256sum >/dev/null 2>&1; then
+    (cd "$(dirname "$OUTPUT")" && sha256sum "$(basename "$OUTPUT")") > "$OUTPUT.sha256"
+else
+    # Remove any stale sidecar from a prior build so the "bundle ready"
+    # report doesn't mis-stamp this artifact with the prior hash.
+    rm -f "$OUTPUT.sha256"
+    echo "warning: no shasum/sha256sum on PATH; skipping sidecar" >&2
+fi
+BUNDLE_SHA256=$(awk '{print $1}' "$OUTPUT.sha256" 2>/dev/null || echo "(unavailable)")
+
 cat <<EOF
 
 bundle ready:
     $OUTPUT
-    size: $SIZE_HUMAN ($SIZE bytes)
+    size:   $SIZE_HUMAN ($SIZE bytes)
+    sha256: $BUNDLE_SHA256
+    stamp:  $OUTPUT.sha256
 
 next:
     bash scripts/stage_sd_card.sh /Volumes/bootfs
