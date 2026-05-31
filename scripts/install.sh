@@ -941,16 +941,20 @@ run systemctl --no-block restart openmarquee-backend.service || true
 # etc.) — without this, install.sh would exit 0 even when the AP comes
 # up but http://10.0.0.1/ hangs. /healthz is documented as the deploy
 # health gate (auth_middleware.py:52) and is no-auth + side-effect-free.
-# Loop is 30 × (curl --max-time 1 + sleep 1): ~30s when port 80 is
-# unbound (curl returns immediately), up to ~60s if uvicorn is bound
-# but hung. Failure does NOT fail-stop install.sh — the backend may
+# Loop is 75 × (curl --max-time 1 + sleep 1): ~75s when port 80 is
+# unbound (curl returns immediately), up to ~150s if uvicorn is bound
+# but hung. Budget bumped from 30s to 75s on 2026-05-31 (r28) to
+# accommodate the r25 glyph-prewarm gate -- sidecar boot now spends
+# ~33s draining the prewarm queue before the FastAPI lifespan
+# completes, so the prior 30s probe false-WARNed on every clean
+# install. Failure does NOT fail-stop install.sh — the backend may
 # legitimately come up later when cloud-init finishes pulling in
 # deferred services. Failure leaves a sentinel file so next-boot
 # diagnosis has an obvious anchor.
 if [ "$DRY_RUN" -eq 0 ]; then
-    say "Probing backend health (~30s budget; up to ~60s if uvicorn hangs)"
+    say "Probing backend health (~75s budget; up to ~150s if uvicorn hangs)"
     backend_up=0
-    for _ in $(seq 1 30); do
+    for _ in $(seq 1 75); do
         if curl -fsS --max-time 1 http://127.0.0.1/healthz >/dev/null 2>&1; then
             backend_up=1
             break
@@ -961,7 +965,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
         say "  backend /healthz responded OK"
         rm -f "${ROOT_PREFIX}/var/openmarquee-backend-startup-failed"
     else
-        say "WARNING: backend did not respond to /healthz within 30s"
+        say "WARNING: backend did not respond to /healthz within 75s"
         touch "${ROOT_PREFIX}/var/openmarquee-backend-startup-failed"
     fi
 fi
