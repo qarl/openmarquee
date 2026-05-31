@@ -12,7 +12,7 @@ before stamping the v0.9.0 → v1.0 arc.
 |----------|------:|---------------|
 | **P0**   | 0     | Ship-blocking for v1.0. None found. |
 | **P1**   | 3     | Real gaps operators will notice; should-fix-soon but don't block v1.0 tag if scoped as "ship-known-limitations." |
-| **P2**   | 2     | Polish + non-load-bearing doc gaps; deferrable to v1.x. (Was 4; row 4 closed by r22 + r24 errata, row 5 closed by r27 — see §5.) |
+| **P2**   | 1     | Polish + non-load-bearing doc gaps; deferrable to v1.x. (Was 4; row 4 closed by r22 + r24 errata, row 5 closed by r27, row 6 closed by-design — see §5.) |
 | **P3**   | 0     | Trivia bucket empty this round. |
 | **doc-drift** | 1 | Stale doc sections that don't block ship; refresh-doc tasks. (Was 2; row 9 closed by r27 — same edit as P2 row 5.) |
 
@@ -131,16 +131,16 @@ struct. Net behavior:
   honoring. **Impl gap:** one-line guard in `auto_render.py`'s
   `_render_text_layers` loop. ~3 LOC.
 
-- **P2 — Text-layer `locked` is UI-only chrome.** Backend model
-  carries `locked: bool` but no server validation rejects edits to
-  locked layers; the constraint lives only in the editor's JS
-  form-disable logic. No data-loss risk (operator can still un-
-  lock + edit), but the lock isn't enforced system-wide. **Spec:**
-  `SYSTEM_SPEC.md` line 314 (line 320 describes it as editor-UX,
-  not server validation, so this is also borderline by-design —
-  noted P2 for that reason). **Impl gap:** depends on what qarl
-  wants the contract to be. If server-side enforcement is desired,
-  ~10 LOC validator in `api_content.py`'s text-layer PATCH paths.
+- **P2 — Text-layer `locked` is UI-only chrome. CLOSED by-design.**
+  Backend model carries `locked: bool` but no server validation
+  rejects edits to locked layers; the constraint lives only in the
+  editor's JS form-disable logic. **Spec resolution:**
+  `SYSTEM_SPEC.md` line 320 explicitly defines `locked` as editor
+  UX gating, not server-side enforcement. The current behavior
+  (editor-only chrome) is the spec's intended contract — no
+  data-loss risk, no enforcement gap. **Resolution:** qarl-closed
+  2026-05-31 as by-design; no impl change needed. v1.0 tag is
+  unblocked.
 
 ### 3.2 Profile-gate documentation
 
@@ -194,13 +194,15 @@ gap.
 | 3 | P1 | Text-layers | `visible: false` ignored at save-time rasterization (correct at playback) | XS (~3 LOC: guard in auto_render.py) |
 | 4 | ~~P2~~ | Phase 7 | VideoSlide Capture emits `"video slides TBD"` (carryover #7 from May 14) | **CLOSED by r22 (0c4039c) — see errata below.** Original estimate ~30 LOC turned out to be doc-comment hygiene only; structural split was already in place. |
 | 5 | ~~P2~~ | V4L2 | `OPENMARQUEE_FIRSTFRAME_PROFILE` gate undocumented (carryover #8) | **CLOSED by r27 (5940046)** — docs/v4l2-decode.md now cites the gate at line 145-146 + line 275. |
-| 6 | P2 | Text-layers | `locked` is UI-only chrome; no server-side enforcement | S (~10 LOC if qarl wants enforcement; "by-design" otherwise) |
+| 6 | ~~P2~~ | Text-layers | `locked` is UI-only chrome; no server-side enforcement | **CLOSED by-design (qarl 2026-05-31)** — SYSTEM_SPEC line 320 defines `locked` as editor-UX gating; current behavior matches the spec contract. |
 | 7 | P2 | Spec docs | SYSTEM_SPEC line 77 vs 492-502 wording inconsistency on HUB75/WS2812B/composite "future vs pending" | XS (doc edit, ~5 words) |
 | 8 | doc-drift | Spec docs | IMPLEMENTATION_PLAN.md milestone pointer stale (predates v0.9.0 tag) | S (~5 LOC of doc) |
 | 9 | ~~doc-drift~~ | v4l2-decode | Profile gate documentation cross-link absent (same source as #5; doc-side surface) | **CLOSED by r27 (5940046)** — same edit closed both #5 and #9. |
 
-**Totals: 0 P0, 3 P1, 2 P2 (was 4; row 4 closed by r22, row 5
-closed by r27 — see errata + row-status above), 1 doc-drift
+**Totals: 0 P0, 3 P1 (all closed by c38e64d), 1 P2 (was 4; rows
+4 + 5 + 6 closed via r22 + r27 + qarl-by-design; only row 7 the
+SYSTEM_SPEC line 77 outer-repo wording remains — covered by the
+recommended-outer-repo-edits doc shipped in r27), 1 doc-drift
 (was 2; row 9 closed by r27).**
 
 P0 = 0 means v0.9.0 is operationally complete. The 3 P1 are all in
@@ -286,14 +288,16 @@ Three paths:
 2. **Tag v1.0 = v0.9.0 with the 3 P1 gaps documented as known-
    limitations.** Zero code work; one doc dispatch updating
    SYSTEM_SPEC to call out the deferral. The "ship-ready" v1.0 tag.
-3. **Defer the v1.0 tag until P2 #6 also closes.** (#4 already
-   closed by r22 — was doc-comment hygiene, not the ~30 LOC
-   validator split originally estimated.) Adds a `locked` server-
-   side enforcement layer if qarl wants that. ~10 LOC more.
+3. ~~Defer the v1.0 tag until P2 #6 also closes.~~ — N/A. **P2 #6
+   `locked` closed by-design (qarl 2026-05-31)**: SYSTEM_SPEC line
+   320 defines `locked` as editor-UX gating, not server-side
+   enforcement, so the current behavior matches the spec contract.
+   Path 3 is moot.
 
-My read: path 1. The triad gaps are visible (anchor/weight) or
-confusing-UX (visible at save time); closing them is small + non-
-risky; the v1.0 → v1.1 cadence stays clean.
+My read (2026-05-31 resolution): path 1 taken. 3 P1 closures
+landed in `c38e64d` (anchor + visible-at-save full close; weight
+wire-accepted-render-deferred). v1.0 tagged at `8209f41`-or-newer
+on the same QA close-out.
 
 ---
 

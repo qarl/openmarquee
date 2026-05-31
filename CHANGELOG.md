@@ -15,6 +15,72 @@ time with a deprecation-warning print (e.g. `0.5.0-beta` → `0.5.0b0`,
 literal version string is preserved across all four component
 locations for cross-ecosystem readability.
 
+## [1.0.0] - 2026-05-31
+
+Spec-complete v1.0 ship. Closes the v0.9.0 → v1.0 arc: text-layer
+chrome triad (`c38e64d`), 4 audit retractions (`0c4039c` + `930954a`
++ `c1a5e0a` + r26 doc closure `51e719f`), pre-push hook chmod
+hygiene (`8d07409` + `2605a53`), and the r25 glyph rasterization
+prewarm with drain-to-zero gate (`ab047a5` + capture `8209f41`).
+
+### Renderer perf — r25 (paint_bake_text MAX −56%)
+
+`ab047a5` — Glyph rasterization prewarm at sidecar startup with
+drain-to-zero gate: 855 ASCII glyphs (printable U+0020..U+007E)
+across 9 fonts (anton, alfa-slab-one, bowlby-one-sc,
+playfair-display, vt323, permanent-marker, caveat-brush,
+jetbrains-mono, dejavu-sans-fallback). Playback loop blocks
+until the worker queue fully drains — prevents the
+`slide_caches` invalidation cascade that regressed r20's first
+ship. Sidecar boot wall-time grows ~33s on Pi Zero 2 W
+(~26 g/s msdfgen rate); watchdog 120s still has 3-4x margin.
+Captures at `qa/captures/r25-glyph-prewarm-{baseline,after}-2026-05-31.json`.
+
+### Text-layer chrome (3 P1 closures via r26 `c38e64d`)
+
+- `anchor` (vertical alignment top/center/bottom) honored at
+  paint via new `parse_v_align` in `hdmi_logic.rs`. Operator
+  choice no longer silently dropped to center.
+- `visible` honored at SAVE time (was already honored at playback)
+  — drawTextOnly inline-preview path guards on `layer.visible`.
+- `weight` wire-accepted, render-deferred to v1.x: fontdue
+  doesn't support variable-axis selection + bundled font system
+  is single-TTF-per-family. Field survives save/load round-trip.
+
+### Spec-delta audit retractions
+
+The v1 spec-delta audit doc (`qa/v1-spec-delta-2026-05-30.md`)
+carries 4 errata blocks documenting audit errors caught + fixed:
+
+- fontdue weight (r26): "variable-axis supported" claim was wrong
+- P2 #4 / §5 row 4 / §2 row 7 (r22 + r24): "validator split
+  needed" + stale line citations — the split was already done,
+  only comment hygiene remained
+- §6 FqdnRedirectMiddleware (r28): "should not exist" claim was
+  wrong — the middleware exists by design for Chrome
+  secure-context (`navigator.mediaDevices` HTTPS gating)
+
+P2 #6 `locked` server-enforcement closed by-design per
+SYSTEM_SPEC line 320 (editor-UX gating is the spec contract).
+
+### Hygiene
+
+- `8d07409` + `2605a53` — `.githooks/pre-push` + 9 other
+  `scripts/*.sh` files tracked as 100755 (was 100644; fresh
+  clones silently bypassed the pre-push validation gate).
+- `5940046` — outer-repo recommended-edits doc shipped for admin
+  Jimmy `openmarquee` to apply mechanically.
+- deploy.sh `/healthz` probe budget bumped 30s → 75s to
+  accommodate the ~46s post-r25 sidecar boot.
+
+### Notes
+
+HUB75 / WS2812B / composite panel modes remain deferred to v1.x
+(Python drivers removed in v0.6 DELETE-PIL; Rust ports pending).
+Stream Mode B network-source controls + originals/deployed
+storage split also deferred. FYS production is the first device
+to receive v1.0.
+
 ## [0.9.0] - 2026-05-30
 
 Cut at the close of the renderer perf-night arc + the FYS demo reel
