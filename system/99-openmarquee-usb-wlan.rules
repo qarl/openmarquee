@@ -1,0 +1,26 @@
+# Predictable USB-WiFi naming for the openMarquee mgmt-dongle path.
+#
+# Rationale: with two WiFi radios attached (built-in BCM43438 +
+# a USB-WiFi dongle), the USB dongle's kernel name is
+# enumeration-ordering-dependent (wlan1 / wlan2 / wlan3 depending
+# on USB init timing). Pin matching dongles to NAME=wlan-dongle
+# so the NM keyfile dropped at burn time can match on
+# interface-name=wlan-dongle reliably.
+#
+# Rule scope: rt2800usb-driver dongles only (RT5370 / RT2870 /
+# RT3070 / RT5572 family). The hand-tested FYS topology uses a
+# Ralink RT5370 at USB ID 148f:5370.
+#
+# Out-of-scope: second-dongle handling. If two rt2800usb dongles
+# are present, both race for NAME=wlan-dongle and udev rejects
+# the second. v1.x assumes one dongle per Pi.
+#
+# To extend to other chipset families: add a SUBSYSTEM=="net"
+# DRIVERS=="<driver>" line per family. Common candidates:
+#   - mt76_usb     (MT7601U / MT7610U / MT7612U)
+#   - rtl88x2bu    (RTL8812BU / RTL8822BU, out-of-tree)
+#   - rtl8xxxu     (RTL8188CU / RTL8192CU, etc.)
+#
+# Background: qa/r31-dongle-topology-recommendation-2026-05-31.md §B.1.
+
+SUBSYSTEM=="net", ACTION=="add", DRIVERS=="rt2800usb", NAME="wlan-dongle"

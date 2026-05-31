@@ -99,6 +99,12 @@ PHY_IFACE="${PHY_IFACE:-wlan0}"
 # move it into NetworkManager's system-connections/ with the right perms
 # (NM rejects keyfiles with looser perms than 600).
 BOOTFS_NM_KEYFILE="${BOOTFS_NM_KEYFILE:-/boot/firmware/openmarquee-wifi.nmconnection}"
+# r34 (2026-05-31): mgmt-WiFi keyfile drop, mirrors the sign-WiFi
+# path above. burn_sd_card.sh --mgmt-wifi-ssid drops this onto
+# bootfs alongside the sign keyfile; firstboot §5d moves it to
+# system-connections/. Independent of the sign keyfile — either,
+# both, or neither may be present.
+BOOTFS_MGMT_NM_KEYFILE="${BOOTFS_MGMT_NM_KEYFILE:-/boot/firmware/openmarquee-mgmt-wifi.nmconnection}"
 NM_SYSTEM_CONNECTIONS="${NM_SYSTEM_CONNECTIONS:-/etc/NetworkManager/system-connections}"
 
 # Allow tests to redirect everything under a tmpdir.
@@ -111,6 +117,7 @@ BOOTSTRAP_MARKER="${ROOT_PREFIX}${BOOTSTRAP_MARKER}"
 ETC_HOSTNAME="${ROOT_PREFIX}${ETC_HOSTNAME}"
 ETC_HOSTS="${ROOT_PREFIX}${ETC_HOSTS}"
 BOOTFS_NM_KEYFILE="${ROOT_PREFIX}${BOOTFS_NM_KEYFILE}"
+BOOTFS_MGMT_NM_KEYFILE="${ROOT_PREFIX}${BOOTFS_MGMT_NM_KEYFILE}"
 NM_SYSTEM_CONNECTIONS="${ROOT_PREFIX}${NM_SYSTEM_CONNECTIONS}"
 
 say() { printf '==> %s\n' "$*"; }
@@ -136,7 +143,7 @@ fatal() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
     printf 'forensic: disk free:\n'
     df -h / /boot/firmware 2>/dev/null || df -h 2>/dev/null || echo "  (no df available)"
     printf 'forensic: file sizes pre-templating:\n'
-    for f in "$ETC_HOSTS" "$HOSTAPD_CONF" "$WELCOME_HTML" "$BOOTFS_NM_KEYFILE"; do
+    for f in "$ETC_HOSTS" "$HOSTAPD_CONF" "$WELCOME_HTML" "$BOOTFS_NM_KEYFILE" "$BOOTFS_MGMT_NM_KEYFILE"; do
         if [ -e "$f" ]; then
             printf '  %s: %s bytes, perms %s\n' "$f" \
                 "$(stat -c '%s' "$f" 2>/dev/null || wc -c < "$f" 2>/dev/null || echo unknown)" \
@@ -394,6 +401,42 @@ if [ -f "$BOOTFS_NM_KEYFILE" ]; then
     # exists at /etc/NetworkManager/system-connections/ with mode 0600).
     # DO NOT fail firstboot for this cleanup step.
     if rm -f "$BOOTFS_NM_KEYFILE" 2>/dev/null; then
+        say "  applied; bootfs copy removed"
+    else
+        say "  applied; could not remove bootfs copy (likely ro bootfs); leaving in place"
+    fi
+fi
+
+# --- 5d. r34: operator mgmt-WiFi pre-config via NM keyfile ------------------
+#
+# burn_sd_card.sh --mgmt-wifi-ssid drops /boot/firmware/openmarquee-
+# mgmt-wifi.nmconnection onto bootfs. Same move + chmod + chown +
+# remove-bootfs-copy dance as §5c above, but for the mgmt-WiFi
+# keyfile pinned to interface-name=wlan-dongle (the udev-renamed
+# USB dongle). No-op when the keyfile is absent — the §5d block
+# short-circuits at the `-f` guard, preserving the no-dongle
+# fallback path (Option A of qa/r31-dongle-topology-recommendation
+# -2026-05-31.md §B.4): without a dongle keyfile, the brcmfmac
+# AP+STA captive-portal path on wlan0 is unchanged.
+#
+# Independent of §5c: the sign-WiFi and mgmt-WiFi keyfiles ship
+# as separate burn-time options. An operator can pre-burn both,
+# either, or neither.
+if [ -f "$BOOTFS_MGMT_NM_KEYFILE" ]; then
+    MGMT_DST="${NM_SYSTEM_CONNECTIONS}/openmarquee-mgmt-wifi.nmconnection"
+    say "Operator pre-configured mgmt-WiFi keyfile found; moving to $MGMT_DST"
+    MGMT_KEY_SSID="$(grep '^ssid=' "$BOOTFS_MGMT_NM_KEYFILE" | head -1 | cut -d= -f2- || true)"
+    say "  SSID: ${MGMT_KEY_SSID:-<unparseable>}"
+    mkdir -p "$NM_SYSTEM_CONNECTIONS"
+    cp "$BOOTFS_MGMT_NM_KEYFILE" "$MGMT_DST"
+    chmod 600 "$MGMT_DST" || say "  WARN: chmod 600 failed (test mode?)"
+    if [ -z "$ROOT_PREFIX" ] && [ "$(id -u)" -eq 0 ]; then
+        chown root:root "$MGMT_DST"
+        if command -v nmcli >/dev/null 2>&1; then
+            nmcli connection reload 2>/dev/null || true
+        fi
+    fi
+    if rm -f "$BOOTFS_MGMT_NM_KEYFILE" 2>/dev/null; then
         say "  applied; bootfs copy removed"
     else
         say "  applied; could not remove bootfs copy (likely ro bootfs); leaving in place"

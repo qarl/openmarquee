@@ -28,6 +28,23 @@
 #                             --wifi-password 'inline-secret' /dev/diskN
 #         # Inline -- WARNING: visible in `ps`. Use env / file in CI.
 #
+# Optional mgmt-WiFi pre-config (r34, 2026-05-31):
+#     scripts/burn_sd_card.sh --mgmt-wifi-ssid InstallerWifi /dev/diskN
+#         # Independent of --wifi-ssid: drops a SECOND NM keyfile
+#         # pinned to interface-name=wlan-dongle (the udev-renamed
+#         # USB-WiFi dongle). When a rt2800usb-family dongle is
+#         # plugged in, the Pi auto-joins the installer's WiFi via
+#         # the dongle while the built-in radio (wlan0) stays free
+#         # for sign-WiFi or the captive-portal AP. See
+#         # docs/dual-radio-shipping-test.md for the verification
+#         # sweep + qa/r31-dongle-topology-recommendation-2026-05-31.md
+#         # for the design.
+#         #
+#         # Password sources mirror --wifi-password: --mgmt-wifi-password
+#         # PASS (inline, ps-visible), --mgmt-wifi-password-file PATH
+#         # (preferred), $OPENMARQUEE_MGMT_WIFI_PASSWORD env (CI-safe),
+#         # or interactive prompt when stdin is a tty.
+#
 # Safety:
 #   - The target must be a removable / external disk per diskutil
 #     info. Internal disks (/dev/disk0 / /dev/disk1 typically) are
@@ -87,6 +104,13 @@ WIFI_SSID=""
 WIFI_PASSWORD=""
 WIFI_PASSWORD_FILE=""
 WIFI_PASSWORD_INLINE=0
+# r34 (2026-05-31): mgmt-WiFi (the USB-WiFi-dongle path). Independent
+# of the sign-WiFi pre-config above. See qa/r31-dongle-topology-
+# recommendation-2026-05-31.md §B.2 for the role split.
+MGMT_WIFI_SSID=""
+MGMT_WIFI_PASSWORD=""
+MGMT_WIFI_PASSWORD_FILE=""
+MGMT_WIFI_PASSWORD_INLINE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -95,7 +119,11 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --help|-h)
-            sed -n '2,55p' "$0"
+            # r34: range bumped from 2,55 to 2,66 to keep the new
+            # mgmt-WiFi block + the Safety / macOS / Cache sections
+            # in --help output. Re-bump if the header grows again;
+            # the boundary is one line above `set -euo pipefail`.
+            sed -n '2,66p' "$0"
             exit 0
             ;;
         --wifi-ssid)
@@ -125,6 +153,35 @@ while [ $# -gt 0 ]; do
             ;;
         --wifi-password-file=*)
             WIFI_PASSWORD_FILE="${1#*=}"
+            shift
+            ;;
+        --mgmt-wifi-ssid)
+            MGMT_WIFI_SSID="${2:-}"
+            [ -z "$MGMT_WIFI_SSID" ] && die "--mgmt-wifi-ssid requires a value"
+            shift 2
+            ;;
+        --mgmt-wifi-ssid=*)
+            MGMT_WIFI_SSID="${1#*=}"
+            shift
+            ;;
+        --mgmt-wifi-password)
+            MGMT_WIFI_PASSWORD="${2:-}"
+            MGMT_WIFI_PASSWORD_INLINE=1
+            [ -z "$MGMT_WIFI_PASSWORD" ] && die "--mgmt-wifi-password requires a value"
+            shift 2
+            ;;
+        --mgmt-wifi-password=*)
+            MGMT_WIFI_PASSWORD="${1#*=}"
+            MGMT_WIFI_PASSWORD_INLINE=1
+            shift
+            ;;
+        --mgmt-wifi-password-file)
+            MGMT_WIFI_PASSWORD_FILE="${2:-}"
+            [ -z "$MGMT_WIFI_PASSWORD_FILE" ] && die "--mgmt-wifi-password-file requires a path"
+            shift 2
+            ;;
+        --mgmt-wifi-password-file=*)
+            MGMT_WIFI_PASSWORD_FILE="${1#*=}"
             shift
             ;;
         --)
@@ -174,6 +231,33 @@ if [ -n "$WIFI_SSID" ]; then
             [ -z "$WIFI_PASSWORD" ] && die "empty password"
         else
             die "--wifi-ssid requires --wifi-password, --wifi-password-file, or \$OPENMARQUEE_WIFI_PASSWORD (no tty for interactive prompt)"
+        fi
+    fi
+fi
+
+# r34 (2026-05-31): mirror the resolution chain above for the
+# mgmt-WiFi credentials. Same priority order; same partial-spec
+# refusal. The two paths are independent: an operator can pre-burn
+# both, neither, or just one.
+if [ -n "$MGMT_WIFI_SSID" ]; then
+    if [ -n "$MGMT_WIFI_PASSWORD_FILE" ]; then
+        [ -r "$MGMT_WIFI_PASSWORD_FILE" ] || die "--mgmt-wifi-password-file: cannot read $MGMT_WIFI_PASSWORD_FILE"
+        MGMT_WIFI_PASSWORD="$(head -n1 "$MGMT_WIFI_PASSWORD_FILE" | tr -d '\r\n')"
+        [ -z "$MGMT_WIFI_PASSWORD" ] && die "--mgmt-wifi-password-file: file is empty"
+    elif [ -n "${OPENMARQUEE_MGMT_WIFI_PASSWORD:-}" ]; then
+        MGMT_WIFI_PASSWORD="$OPENMARQUEE_MGMT_WIFI_PASSWORD"
+    elif [ "$MGMT_WIFI_PASSWORD_INLINE" -eq 1 ]; then
+        warn "--mgmt-wifi-password as inline arg is visible in 'ps auxww'."
+        warn "    For production / CI use \$OPENMARQUEE_MGMT_WIFI_PASSWORD or"
+        warn "    --mgmt-wifi-password-file instead."
+    else
+        if [ -t 0 ]; then
+            printf 'mgmt-WiFi password for SSID %s (input hidden): ' "$MGMT_WIFI_SSID" >&2
+            IFS= read -rs MGMT_WIFI_PASSWORD || die "read failed"
+            printf '\n' >&2
+            [ -z "$MGMT_WIFI_PASSWORD" ] && die "empty password"
+        else
+            die "--mgmt-wifi-ssid requires --mgmt-wifi-password, --mgmt-wifi-password-file, or \$OPENMARQUEE_MGMT_WIFI_PASSWORD (no tty for interactive prompt)"
         fi
     fi
 fi
@@ -516,6 +600,57 @@ addr-gen-mode=default
 KEYFILE_EOF
         umask 022
         log "    wrote keyfile ($(wc -c < "$KEYFILE") bytes); password not logged"
+    fi
+fi
+
+# r34 (2026-05-31): optional mgmt-WiFi pre-config via NM keyfile drop.
+# When --mgmt-wifi-ssid is given, write a second NM keyfile to bootfs.
+# openmarquee-firstboot.sh §5d detects this on first boot and moves
+# it into /etc/NetworkManager/system-connections/ with mode 0600
+# root:root, mirroring §5c for the sign-WiFi keyfile.
+#
+# Differences vs sign-WiFi: interface-name=wlan-dongle (the udev-
+# renamed USB dongle), route-metric=50 (lower = preferred for
+# default route -- mgmt path wins over sign-WiFi's 600), and the
+# id= field is openmarquee-mgmt-wifi for unambiguous nmcli listing.
+#
+# Independent of the sign-WiFi block above: an operator can pre-burn
+# both, just one, or neither. The runtime cost of writing the
+# keyfile is trivial; the firstboot drop is a no-op if the keyfile
+# is absent.
+if [ -n "$MGMT_WIFI_SSID" ]; then
+    MGMT_KEYFILE="$BOOTFS/openmarquee-mgmt-wifi.nmconnection"
+    info "writing mgmt-WiFi pre-config keyfile to $MGMT_KEYFILE (SSID=$MGMT_WIFI_SSID)..."
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "    [DRY-RUN] would write mgmt keyfile (password redacted)"
+    else
+        umask 077
+        cat > "$MGMT_KEYFILE" <<MGMT_KEYFILE_EOF
+[connection]
+id=openmarquee-mgmt-wifi
+type=wifi
+interface-name=wlan-dongle
+autoconnect=true
+autoconnect-priority=10
+
+[wifi]
+mode=infrastructure
+ssid=$MGMT_WIFI_SSID
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=$MGMT_WIFI_PASSWORD
+
+[ipv4]
+method=auto
+route-metric=50
+
+[ipv6]
+method=auto
+addr-gen-mode=default
+MGMT_KEYFILE_EOF
+        umask 022
+        log "    wrote mgmt keyfile ($(wc -c < "$MGMT_KEYFILE") bytes); password not logged"
     fi
 fi
 

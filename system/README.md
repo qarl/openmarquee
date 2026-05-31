@@ -121,6 +121,131 @@ shared between the two roles. Low-bandwidth UI traffic handles this
 comfortably; a Pi 4 (dual-radio, 2.4 + 5 GHz) would remove the
 compromise if we ever need it.
 
+## Dual-radio shipping topology (USB-WiFi dongle, r34)
+
+For operators who want an **always-on management path** independent
+of whichever WiFi the sign is supposed to display content from,
+openMarquee supports attaching a USB-WiFi dongle alongside the built-in
+brcmfmac radio. The role split:
+
+- **`wlan-dongle`** (rt2x00usb-family USB dongle, udev-renamed) =
+  management STA. Joins the operator/installer's home WiFi. NM
+  profile `openmarquee-mgmt-wifi`, pinned to
+  `interface-name=wlan-dongle`, `route-metric=50` (low =
+  preferred for default route). Tailscale outbound prefers this
+  path.
+- **`wlan0`** (built-in brcmfmac) = sign work. Either AP (captive
+  portal for setup) OR STA (joined to the customer's WiFi for
+  serving content). NM profile `openmarquee-wifi`, pinned to
+  `interface-name=wlan0`. No explicit `route-metric=` in the
+  keyfile; NM's default wifi metric (~600 on trixie) keeps wlan0
+  as the backup egress while the mgmt dongle's `metric=50` wins
+  the default route.
+- **`ap0`** (virtual on wlan0) = captive portal. Unchanged from
+  the single-radio path above. Stays bound to the brcmfmac via
+  `iw dev wlan0 interface add ap0 type __ap`.
+
+The mgmt-WiFi path is **additive**: a Pi without a dongle behaves
+identically to the single-radio topology described above, with no
+regression. A Pi WITH a dongle adds the second radio's mgmt-STA
+without disturbing the wlan0 AP+STA dual-mode that hosts the
+captive portal.
+
+### Burn-time configuration
+
+Two independent SSID/PSK pairs at `burn_sd_card.sh` invocation:
+
+    bash scripts/burn_sd_card.sh /dev/diskN \
+        --wifi-ssid       "<sign-SSID>"      --wifi-password       "<sign-PSK>" \
+        --mgmt-wifi-ssid  "<mgmt-SSID>"      --mgmt-wifi-password  "<mgmt-PSK>"
+
+Either flag can be given alone (one for sign-only, the other for
+mgmt-only). Both write NM keyfiles to bootfs;
+`openmarquee-firstboot.sh` §5c + §5d move them into
+`/etc/NetworkManager/system-connections/` with mode 0600 on first
+boot. Password resolution mirrors the existing
+`--wifi-password{,-file}` pattern; see `burn_sd_card.sh --help`.
+
+### Udev rule for predictable dongle naming
+
+`system/99-openmarquee-usb-wlan.rules` (installed by
+`scripts/install.sh` §5b) renames any rt2x00usb-driver USB-WiFi
+device to `wlan-dongle`. Without this, the kernel name is
+enumeration-ordering-dependent (`wlan1` / `wlan2` / `wlan3`) and
+the mgmt-WiFi NM keyfile's `interface-name=wlan-dongle` pin
+wouldn't match.
+
+**Supported chipsets (v1.x):** rt2x00usb family only — covers
+RT5370 (cheap, widely available), RT2870, RT3070, RT5572, and
+similar SKUs sharing the `rt2800usb` kernel driver. Realtek
+RTL88x2BU + Mediatek MT76 are NOT yet supported; adding them
+means appending one `SUBSYSTEM=="net" DRIVERS=="<driver>" NAME=
+"wlan-dongle"` line per family to the rules file.
+
+**Single-dongle constraint:** if two rt2x00usb dongles are plugged
+in simultaneously, udev rejects the second's `NAME=wlan-dongle`
+(name conflict) and the dongle stays at its kernel default name.
+v1.x assumes one dongle per Pi.
+
+### No-dongle fallback (silent)
+
+When no rt2x00usb dongle is attached:
+
+- The udev rule has nothing to match → no `wlan-dongle`
+  interface appears.
+- `firstboot.sh` §5d's `if [ -f $BOOTFS_MGMT_NM_KEYFILE ]` guard
+  is a no-op if the operator burned without `--mgmt-wifi-ssid`;
+  if they burned WITH it, the keyfile lands in
+  `system-connections/` but sits unused until they later plug
+  in a dongle (NM auto-matches via `interface-name=` on
+  insertion).
+- The captive-portal AP + wlan0 STA path runs unchanged.
+
+This is the no-regression-against-pre-r34 invariant.
+
+### Hot-plug / unplug behavior
+
+- **Hot-plug** (dongle inserted AFTER install.sh has run at
+  least once): udev rule is on-disk → `add` event fires before
+  NM brings the new iface up → rename to `wlan-dongle` succeeds
+  → NM autoconnects the mgmt keyfile via the burned PSK. No
+  manual steps needed.
+- **Unplug:** `wlan-dongle` disappears; NM marks the mgmt
+  connection inactive; default route falls back to `wlan0` via
+  the sign profile (NM's default wifi metric) or the captive
+  portal (no default route then). ssh / Tailscale routing
+  through wlan0 still works if the Pi is on a routable
+  sign-WiFi.
+- **First-flash WITH dongle pre-attached** (the canonical
+  shipping case): the kernel enumerates the dongle as `wlan1`
+  before `install.sh` has dropped the udev rule. Once
+  `install.sh` runs (via cloud-init runcmd), the rule lands +
+  `udevadm trigger` fires — but the kernel rejects `NAME=`
+  rename on an `IFF_UP` interface (EBUSY), and NM has already
+  brought `wlan1` up for scanning. **A single reboot converges:**
+  on the second boot, the rule is in `/etc/udev/rules.d/` before
+  kernel enumeration, the dongle gets named `wlan-dongle`
+  natively, and NM autoconnects the mgmt keyfile. See
+  `docs/dual-radio-shipping-test.md` step 3 for the verification
+  flow. A single-boot bring-up path (down/rename/up in
+  install.sh) is plausible future work.
+
+### Verification
+
+`docs/dual-radio-shipping-test.md` has the 7-step manual sanity
+sweep an installer should run on a fresh-burn Pi to confirm the
+dual-radio topology works end-to-end (udev rename + mgmt
+autoconnect + captive portal preservation + Tailscale routing
+preference + graceful hot-unplug).
+
+### Background
+
+See `qa/r31-dongle-topology-recommendation-2026-05-31.md` for the
+full design + audit (current install.sh/system/ state + target
+state + open-question resolutions). The hand-tested topology that
+informed r34 ran live on FYS prod 2026-05-31 using a Ralink
+RT5370 dongle.
+
 ## First-time install (until Phase 9's image builder lands)
 
 Until pi-gen bakes all of this into a flashable SD card image, these are

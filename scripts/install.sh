@@ -88,6 +88,12 @@ SYSTEMD_DIR="${ROOT_PREFIX}/etc/systemd/system"
 HOSTAPD_DST="${ROOT_PREFIX}/etc/hostapd/hostapd.conf"
 DNSMASQ_DST="${ROOT_PREFIX}/etc/dnsmasq.d/openmarquee.conf"
 NM_UNMANAGED_DST="${ROOT_PREFIX}/etc/NetworkManager/conf.d/openmarquee-unmanaged.conf"
+# r34 (2026-05-31): predictable name for the USB-WiFi mgmt dongle.
+# Rule pins rt2800usb-family dongles to NAME=wlan-dongle so the
+# burn-time mgmt-WiFi NM keyfile can match on interface-name=
+# reliably. See system/99-openmarquee-usb-wlan.rules for scope +
+# qa/r31-dongle-topology-recommendation-2026-05-31.md §B.1 for rationale.
+UDEV_USB_WLAN_DST="${ROOT_PREFIX}/etc/udev/rules.d/99-openmarquee-usb-wlan.rules"
 BOOTSTRAP_MARKER="${VAR_DIR}/.bootstrapped"
 
 # --- Helpers ----------------------------------------------------------------
@@ -513,6 +519,68 @@ fi
 say "Stage NetworkManager unmanaged-devices drop-in"
 run mkdir -p "$(dirname "$NM_UNMANAGED_DST")"
 run cp "${OPT_DIR}/system/NetworkManager-openmarquee-unmanaged.conf" "$NM_UNMANAGED_DST"
+
+# --- 5b. udev rule for predictable USB-WiFi dongle naming -------------------
+#
+# r34 (2026-05-31): pin rt2800usb-driver USB-WiFi dongles to
+# NAME=wlan-dongle so the dual-radio mgmt-WiFi NM keyfile (dropped
+# at burn time via burn_sd_card.sh --mgmt-wifi-ssid) can match
+# on interface-name=wlan-dongle reliably. Without the rule, USB
+# enumeration order decides the kernel name (wlan1 / wlan2 / wlan3)
+# and the keyfile's interface-name= pin won't match. Section B.1
+# of qa/r31-dongle-topology-recommendation-2026-05-31.md has the
+# full design + chipset-matrix discussion.
+#
+# Timing: cloud-init runcmd (images/openmarquee/cloud-init/user-data:80)
+# runs THIS install.sh AFTER NetworkManager is already up on first
+# boot. So on a first flash with a dongle pre-attached, NM sees the
+# dongle as wlan1 BEFORE the rule lands. The udevadm trigger below
+# renames the existing interface at runtime; netlink notifies NM of
+# the rename + NM picks up the mgmt-WiFi keyfile (which matches
+# interface-name=wlan-dongle on the renamed iface).
+#
+# On SUBSEQUENT boots (and on redeploys), the rule is already in
+# /etc/udev/rules.d/ at kernel init -- udev applies the name before
+# NM even starts, and the renaming-after-NM race doesn't apply.
+
+say "Stage USB-WiFi-dongle udev rule"
+run mkdir -p "$(dirname "$UDEV_USB_WLAN_DST")"
+run cp "${OPT_DIR}/system/99-openmarquee-usb-wlan.rules" "$UDEV_USB_WLAN_DST"
+
+# Reload udev's compiled ruleset + trigger a re-eval on already-
+# attached net devices. Idempotent: udev's per-device applied-rules
+# cache makes a re-run a no-op when the rule body hasn't changed.
+# Skip in dry-run mode AND when staging into a ROOT_PREFIX (tests).
+#
+# CAVEAT (subagent review 2026-05-31): the kernel rejects NAME=
+# udev rename directives on an interface that is IFF_UP (EBUSY).
+# By the time cloud-init runcmd reaches install.sh, NM is already
+# up and has brought any wifi netdev to UP for scanning. So the
+# trigger below WILL NOT rename a dongle that was attached at
+# kernel-init time — on the first-flash-WITH-dongle-pre-attached
+# path, the rename converges only after a reboot (when the rule
+# is in /etc/udev/rules.d/ before kernel enumeration). The
+# hot-plug path (dongle inserted after install.sh ran) works
+# correctly via the udev `add` event, which fires BEFORE NM
+# brings the new iface up.
+#
+# Mitigations considered + deferred:
+#   - `ip link set wlanX down; ip link set wlanX name wlan-dongle;
+#     ip link set wlan-dongle up` is the single-boot bring-up
+#     surface; needs reliable dongle detection (parse `udevadm
+#     info /sys/class/net/wlan*` for DRIVERS=rt2800usb). Adds
+#     ~30 LOC + a small race window if NM tries to reassociate
+#     during the down→rename→up. Punt to a future dispatch.
+#   - Forcing a reboot at install.sh end fixes it but is
+#     heavy-handed and breaks redeploy idempotency.
+#
+# docs/dual-radio-shipping-test.md step 3 explicitly verifies the
+# reboot-with-dongle path; system/README.md hot-plug section
+# notes the first-flash-with-dongle reboot requirement.
+if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ]; then
+    udevadm control --reload-rules 2>/dev/null || true
+    udevadm trigger --subsystem-match=net --action=add 2>/dev/null || true
+fi
 
 # --- 5.5. Install vendored trixie packages ----------------------------------
 #

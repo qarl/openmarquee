@@ -424,6 +424,114 @@ def test_no_keyfile_no_op(fakefs: Path) -> None:
         )
 
 
+# --- r34: mgmt-WiFi keyfile drop (§5d) -----------------------------------
+
+
+def _stage_mgmt_bootfs_keyfile(fakefs: Path, ssid: str, psk: str) -> Path:
+    """Drop a faux /boot/firmware/openmarquee-mgmt-wifi.nmconnection
+    in the fakefs so the firstboot §5d detection path fires.
+
+    Mirrors _stage_bootfs_keyfile but writes the mgmt-side keyfile
+    with interface-name=wlan-dongle (the udev-renamed USB dongle)
+    and route-metric=50 (preferred for default route over the
+    sign-WiFi's 600)."""
+    keyfile = fakefs / "boot" / "firmware" / "openmarquee-mgmt-wifi.nmconnection"
+    keyfile.parent.mkdir(parents=True, exist_ok=True)
+    keyfile.write_text(
+        "[connection]\n"
+        "id=openmarquee-mgmt-wifi\n"
+        "type=wifi\n"
+        "interface-name=wlan-dongle\n"
+        "autoconnect=true\n"
+        "autoconnect-priority=10\n"
+        "\n"
+        "[wifi]\n"
+        "mode=infrastructure\n"
+        f"ssid={ssid}\n"
+        "\n"
+        "[wifi-security]\n"
+        "key-mgmt=wpa-psk\n"
+        f"psk={psk}\n"
+        "\n"
+        "[ipv4]\n"
+        "method=auto\n"
+        "route-metric=50\n"
+    )
+    return keyfile
+
+
+def test_mgmt_nm_keyfile_moved_from_bootfs_to_system_connections(
+    fakefs: Path,
+) -> None:
+    _stage_mgmt_bootfs_keyfile(fakefs, ssid="InstallerWifi", psk="mgmt-test")
+    _run_oneshot(fakefs)
+    dst = (
+        fakefs / "etc" / "NetworkManager" / "system-connections"
+        / "openmarquee-mgmt-wifi.nmconnection"
+    )
+    assert dst.exists(), "mgmt keyfile not copied to system-connections/"
+    body = dst.read_text()
+    assert "ssid=InstallerWifi" in body
+    assert "psk=mgmt-test" in body
+    assert "interface-name=wlan-dongle" in body, (
+        "mgmt keyfile must pin to wlan-dongle (the udev-renamed dongle)"
+    )
+
+
+def test_mgmt_nm_keyfile_bootfs_copy_removed_after_move(fakefs: Path) -> None:
+    """Mirrors the sign-WiFi safety: plaintext psk on bootfs is
+    readable by anyone who mounts the SD card -- remove the bootfs
+    copy once promoted to system-connections/."""
+    keyfile = _stage_mgmt_bootfs_keyfile(fakefs, ssid="x", psk="y")
+    assert keyfile.exists()
+    _run_oneshot(fakefs)
+    assert not keyfile.exists(), "bootfs mgmt keyfile not removed after move"
+
+
+def test_mgmt_nm_keyfile_chmod_600_after_move(fakefs: Path) -> None:
+    """NM silently rejects keyfiles wider than 0600 -- chmod is
+    load-bearing for the mgmt path too."""
+    _stage_mgmt_bootfs_keyfile(fakefs, ssid="x", psk="y")
+    _run_oneshot(fakefs)
+    dst = (
+        fakefs / "etc" / "NetworkManager" / "system-connections"
+        / "openmarquee-mgmt-wifi.nmconnection"
+    )
+    mode = stat.S_IMODE(dst.stat().st_mode)
+    assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+
+
+def test_both_keyfiles_land_independently(fakefs: Path) -> None:
+    """When BOTH sign-WiFi AND mgmt-WiFi keyfiles are staged at
+    burn time, firstboot must promote both -- the §5d block can't
+    short-circuit on §5c's success or vice versa. Regression guard
+    against a future refactor that conflates the two paths."""
+    _stage_bootfs_keyfile(fakefs, ssid="SignWifi", psk="sign-pass")
+    _stage_mgmt_bootfs_keyfile(fakefs, ssid="MgmtWifi", psk="mgmt-pass")
+    _run_oneshot(fakefs)
+    sysconn = fakefs / "etc" / "NetworkManager" / "system-connections"
+    sign_dst = sysconn / "openmarquee-wifi.nmconnection"
+    mgmt_dst = sysconn / "openmarquee-mgmt-wifi.nmconnection"
+    assert sign_dst.exists(), "sign-WiFi keyfile dropped when both staged"
+    assert mgmt_dst.exists(), "mgmt-WiFi keyfile dropped when both staged"
+    assert "ssid=SignWifi" in sign_dst.read_text()
+    assert "ssid=MgmtWifi" in mgmt_dst.read_text()
+
+
+def test_no_mgmt_keyfile_no_mgmt_op(fakefs: Path) -> None:
+    """When mgmt keyfile is absent (operator didn't pass
+    --mgmt-wifi-ssid at burn), the §5d block is a no-op even if
+    the sign-WiFi keyfile IS present. No spurious mgmt file
+    appears in system-connections/."""
+    _stage_bootfs_keyfile(fakefs, ssid="SignOnly", psk="sign-only-pass")
+    _run_oneshot(fakefs)
+    sysconn = fakefs / "etc" / "NetworkManager" / "system-connections"
+    mgmt_dst = sysconn / "openmarquee-mgmt-wifi.nmconnection"
+    assert not mgmt_dst.exists(), (
+        "mgmt keyfile created spuriously when no mgmt-bootfs-keyfile staged"
+    )
+
+
 def test_nm_keyfile_psk_not_logged_to_stdout(fakefs: Path) -> None:
     """Defense-in-depth: the psk shouldn't appear in the firstboot
     log even though it lives in the keyfile contents. The SSID is OK
