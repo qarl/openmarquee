@@ -3749,7 +3749,7 @@ pub fn paint_and_present_external_nv12_frame(
 /// Feeds the next H.264 sample (if any) into a primed v4l2::Decoder,
 /// drains the next decoded NV12 Frame (with a short EAGAIN retry
 /// budget), uploads Y + UV planes to GLES textures, blits through
-/// the BT.601 NV12 -> RGB shader (FS_NV12_TO_RGB from piece 3d),
+/// the BT.709 NV12 -> RGB shader (FS_NV12_TO_RGB from piece 3d),
 /// and swaps + commits the scanout buffer pair (same FB-rotation
 /// shape as paint_and_present_one_image_slide_frame).
 ///
