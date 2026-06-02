@@ -101,6 +101,36 @@ pub struct TextSlide {
     /// and background_pattern is ignored with a warn.
     #[serde(default)]
     pub background_image_slide_id: Option<Uuid>,
+    /// r46 (2026-06-02): per SYSTEM_SPEC §5.10, a TextSlide can
+    /// reference a VideoSlide as its background. The renderer
+    /// resolves the referenced VideoSlide at slide-entry time
+    /// (priming the V4L2 demuxer + decoder if needed, same as the
+    /// standalone-video paint path), then per-frame: decodes one
+    /// video sample, blits it as the FBO background via
+    /// `bake_video_slide_to_current_fbo`, composites text layers
+    /// on top via the existing text-layer pass, and finally
+    /// performs the standard scanout swap+commit. Loop semantics
+    /// match standalone VideoSlide (FYS bug 3 fix in
+    /// `bake_video_slide_to_current_fbo`'s `next_sample_idx` wrap):
+    /// a clip shorter than the slot replays from sample 0; a clip
+    /// longer than the slot truncates when `playback.py`'s
+    /// `end_at` fires.
+    ///
+    /// Mutex with `background_image_slide_id` + `background_pattern`
+    /// per the Python validator (enforced at save time). The
+    /// renderer doesn't enforce mutex; if BOTH image and video
+    /// references are set in a hand-edited payload that bypassed
+    /// the validator, the **video reference wins** at the IPC
+    /// dispatcher (text-over-video routing is checked first; see
+    /// `ipc_main.rs` text-arm). The dispatcher emits a `warn:`
+    /// line naming both ids for diagnosis. Image-vs-video
+    /// precedence is the OPPOSITE of image-vs-pattern (image
+    /// wins over pattern in `resolve_slide_bg`); this asymmetry
+    /// reflects that the text-over-video path is a fundamentally
+    /// different paint pipeline (V4L2 decode + composite) rather
+    /// than another BgKind variant.
+    #[serde(default)]
+    pub background_video_slide_id: Option<Uuid>,
     /// Ordered text layers; index 0 draws first, later entries
     /// composite over earlier ones. Phase 4.2a renders only the
     /// FIRST layer; multi-layer compositing lands in Phase 4.2c.
@@ -908,6 +938,37 @@ mod tests {
     }
 
     #[test]
+    fn text_slide_parses_background_video_slide_id() {
+        // r46 (2026-06-02): SYSTEM_SPEC §5.10 text-over-video.
+        // Pin field-name + UUID-roundtrip so a backend rename surfaces
+        // here, not in a silent black-bg paint regression.
+        let json = r#"{
+            "id": "00000000-0000-4000-8000-000000000099",
+            "name": "text-over-video",
+            "background_video_slide_id": "4b8b5394-0000-4000-8000-000000000001"
+        }"#;
+        let slide: TextSlide = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            slide.background_video_slide_id,
+            Some(Uuid::parse_str("4b8b5394-0000-4000-8000-000000000001").unwrap())
+        );
+        assert!(slide.background_image_slide_id.is_none());
+    }
+
+    #[test]
+    fn text_slide_background_video_defaults_to_none() {
+        // Operator hasn't selected a video bg -- the field defaults to
+        // None so paint_slide takes the existing image/pattern/solid
+        // path without surprise.
+        let json = r#"{
+            "id": "00000000-0000-4000-8000-000000000099",
+            "name": "no-video"
+        }"#;
+        let slide: TextSlide = serde_json::from_str(json).unwrap();
+        assert!(slide.background_video_slide_id.is_none());
+    }
+
+    #[test]
     fn text_slide_tolerates_unknown_fields() {
         // The backend evolves ahead of us — adding a field to a
         // TextSlide must not break the renderer until we choose to
@@ -1163,6 +1224,7 @@ mod tests {
             duration_ms: 5000,
             background_color: "#222222".to_string(),
             background_image_slide_id: None,
+            background_video_slide_id: None,
             background_pattern: Some(BackgroundPattern {
                 pattern: pattern.to_string(),
                 color_a: color_a.to_string(),
@@ -1425,6 +1487,7 @@ mod tests {
             background_color: "#050608".to_string(),
             background_pattern: None,
             background_image_slide_id: None,
+            background_video_slide_id: None,
             text_layers: vec![],
         };
         assert_eq!(solid_bg_hex(&slide), "#050608");

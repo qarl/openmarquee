@@ -2690,6 +2690,23 @@ fn resolve_slide_bg(
     slide: &TextSlide,
     content_root: Option<&Path>,
 ) -> Result<(BgKind, &'static str)> {
+    // r46 (2026-06-02): SYSTEM_SPEC §5.10 text-over-video. The
+    // IPC sidecar's text-arm dispatcher routes around this
+    // function entirely when slide.background_video_slide_id is
+    // set, calling paint_and_present_one_text_over_video_slide_
+    // frame instead. resolve_slide_bg is reached only by NON-IPC
+    // paths (standalone reel, parity harness, --debug-render CLI,
+    // and the slide-A/B sides of a transition). Those paths do
+    // NOT yet support text-over-video; the bg falls back to
+    // solid/pattern/image per the chain below + a warn surfaces
+    // the gap. Defer text-over-video in transition + standalone
+    // paths to a r47+ follow-up.
+    if slide.background_video_slide_id.is_some() {
+        eprintln!(
+            "warn: slide {} has background_video_slide_id but resolve_slide_bg was called -- non-IPC paint paths (standalone, transition, parity harness, --debug-render) do not yet support text-over-video per SYSTEM_SPEC §5.10. Falling back to image/pattern/solid bg. See qa/r46-text-over-video-impl-2026-06-02.md §5.",
+            slide.id
+        );
+    }
     // v1-spec-delta #8 (slice b): image bg takes precedence over
     // background_pattern + background_color when the schema
     // references an ImageSlide AND the renderer was given a
@@ -3398,6 +3415,261 @@ pub fn paint_and_present_one_frame_for_slide(
             (t6 - t0).as_micros(),
         );
     }
+    Ok(())
+}
+
+/// r46 (2026-06-02): per SYSTEM_SPEC §5.10, paint one frame of a
+/// TextSlide whose `background_video_slide_id` references a
+/// VideoSlide. Mirrors `paint_and_present_one_frame_for_slide`'s
+/// shape but swaps the bg-paint step (was: solid/pattern/image)
+/// for a V4L2 video-frame bake via
+/// `bake_video_slide_to_current_fbo`; the text layers then
+/// composite on top through `paint_slide_with_viewport` with
+/// `bg_kind=None` (the "caller has already filled the bg" signal
+/// the function already accepts from the atlas SB bg-cache
+/// path).
+///
+/// The bg-video's V4L2 demuxer + decoder MUST be primed before
+/// calling this -- the IPC `cache.load()` for a TextSlide with
+/// `background_video_slide_id` set side-loads the referenced
+/// VideoSlide for exactly this purpose.
+///
+/// Loop semantics: `bake_video_slide_to_current_fbo` wraps
+/// `next_sample_idx` back to 0 when samples exhaust (FYS bug 3
+/// fix), so a clip shorter than the slot replays from the
+/// beginning. A clip longer than the slot truncates when the
+/// backend's `playback.py` `end_at` fires (the renderer doesn't
+/// drive slide duration).
+///
+/// Motion text: works naturally. Text layers paint per-tick on
+/// top of the freshly-decoded video frame, exactly like the
+/// image-bg-on-text path does today.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub fn paint_and_present_one_text_over_video_slide_frame(
+    session: &mut EglSession,
+    card: &Card,
+    slide: &TextSlide,
+    fonts: Option<&FontCatalog>,
+    content_root: Option<&Path>,
+    _t_in_slide_ms: u64,
+    samples: &[crate::mp4_demux::Sample],
+    next_sample_idx: &mut usize,
+    frames_decoded: &mut usize,
+    decoder: &crate::v4l2::Decoder,
+) -> Result<()> {
+    use glow::HasContext;
+    let t_phase = std::time::Instant::now();
+    // Same glyph-cache poll + slide-cache invalidation cascade as
+    // paint_and_present_one_frame_for_slide. Keeps text-layer
+    // rasterization in step with worker-pool completions.
+    let uploaded = session.dynamic_glyph_cache.poll_completions(
+        session.gl,
+        &mut session.dynamic_atlas_page_msdf,
+        &mut session.dynamic_atlas_page_colr,
+        4,
+    );
+    if uploaded > 0 {
+        let drained: Vec<_> = session.slide_caches.drain().collect();
+        for (_id, entry) in drained {
+            free_slide_render_cache(session.gl, entry);
+        }
+    }
+    // Resolve layers + bg_kind from the slide schema. For the text-
+    // over-video path we IGNORE bg_kind (the video frame replaces
+    // it). resolve_slide_layers still validates the layer set +
+    // returns fonts-resolved tuples we need for paint_slide_with_
+    // viewport.
+    let (_unused_bg_kind, _pattern_label, text_layers) =
+        resolve_slide_layers(slide, fonts, content_root)?;
+    let tick_seconds = session.motion_tick_seconds();
+    let motion_states = motion_states_for_layers(slide.id, &text_layers, tick_seconds);
+    let wall_clock_unix = current_unix_seconds();
+    let identity = session.current_settings.is_color_identity();
+    let rotation = session.rotation;
+    let mode_w = session.mode_w as u32;
+    let mode_h = session.mode_h as u32;
+    // Scene FBO for rotation or non-identity color, same as the
+    // text-only path. Critical for text-over-video specifically
+    // because the video bake also needs the scene FBO bound BEFORE
+    // bake_video_slide_to_current_fbo runs (mirrors the standalone
+    // paint_and_present_one_video_slide_frame routing).
+    let scene_fbo_handle = if !identity || rotation != 0 {
+        Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
+    } else {
+        None
+    };
+    if let Some((fbo, _tex)) = scene_fbo_handle {
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        }
+    }
+    // r46 CMA mitigation: first paint of a text-over-video slide
+    // forces eviction of the image_bg + image_slide_tex caches to
+    // free up to ~96 MB of CMA for the V4L2 decoder pool the
+    // bg-video bake needs. Detection via slide_caches absence --
+    // subsequent paints of the same slide skip the eviction
+    // (cheap no-op on empty caches anyway). See
+    // qa/r46-text-over-video-impl-2026-06-02.md §4 CMA Budget.
+    let first_paint = !session.slide_caches.contains_key(&slide.id);
+    if first_paint {
+        session.force_evict_image_caches_for_cma_pressure();
+    }
+    {
+        let needs_new = match session.slide_caches.get(&slide.id) {
+            Some(c) => c.glyph.len() != text_layers.len(),
+            None => true,
+        };
+        if needs_new {
+            if let Some(old) = session.slide_caches.remove(&slide.id) {
+                free_slide_render_cache(session.gl, old);
+            }
+            session
+                .slide_caches
+                .insert(slide.id, SlideRenderCache::new(text_layers.len()));
+        }
+    }
+    crate::profile::record_phase(
+        "paint_bake_text",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+
+    // Step 1: decode + bake the next V4L2 video frame into the
+    // currently-bound framebuffer (scene FBO when rotated/non-
+    // identity, else default fb). On a no-frame tick
+    // (Ok(None) -- V4L2 EAGAIN, no decoded frame ready) the FBO
+    // contents are undefined after the eglSwapBuffers we'd run
+    // below; painting text on undefined pixels would produce a
+    // warmup-tick flicker on glass. Mirror the standalone
+    // paint_and_present_one_video_slide_frame's behavior at lines
+    // ~3840-3857: skip the swap+commit; the kernel keeps the
+    // prior scanout BO/FB pair live so the prior decoded frame
+    // stays on glass. The next advance retries the V4L2 dqbuf;
+    // motion text effectively pauses for one tick (≤30 ms),
+    // visually identical to the standalone-video case.
+    let t_phase = std::time::Instant::now();
+    let painted = unsafe {
+        bake_video_slide_to_current_fbo(
+            session,
+            samples,
+            next_sample_idx,
+            frames_decoded,
+            decoder,
+            mode_w,
+            mode_h,
+        )?
+    };
+    crate::profile::record_phase(
+        "paint_bake_video",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+    if painted.is_none() {
+        // No-frame tick: re-bind the default fb if we routed
+        // through the scene FBO for rotation (matches standalone
+        // video path's rebind at line ~3846), then return without
+        // present. Subagent finding: prevents text-on-garbage
+        // flicker (qa/r46-text-over-video-impl-2026-06-02.md §H).
+        if scene_fbo_handle.is_some() {
+            unsafe {
+                session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            }
+        }
+        return Ok(());
+    }
+
+    // Step 2: composite text layers on top via paint_slide_with_
+    // viewport with bg_kind=None -- the "caller has already
+    // filled the bg" path the function documents at lines ~11295.
+    let t_phase = std::time::Instant::now();
+    let cache = session
+        .slide_caches
+        .get_mut(&slide.id)
+        .expect("slide_caches entry initialized above");
+    paint_slide_with_viewport(
+        session.gl,
+        mode_w,
+        mode_h,
+        0,
+        0,
+        mode_w,
+        mode_h,
+        None, // bg already filled by bake_video_slide_to_current_fbo
+        &text_layers,
+        Some(&motion_states),
+        wall_clock_unix,
+        Some(&mut cache.glyph),
+        Some(&mut session.image_bg_cache),
+        Some(&mut cache.tex),
+        Some(crate::glyph_cache::RuntimeGlyphCtx {
+            cache: &session.dynamic_glyph_cache,
+            fonts_dir: &session.dynamic_fonts_dir,
+        }),
+    )?;
+    unsafe { session.gl.flush(); }
+
+    // Step 3: present pass through scene FBO if rotated/non-
+    // identity. Mirrors paint_and_present_one_frame_for_slide.
+    if let Some((_fbo, tex)) = scene_fbo_handle {
+        let brightness = (session.current_settings.brightness as f32) / 100.0;
+        let gamma = session.current_settings.gamma;
+        let (phys_w, phys_h) = session.phys_mode_size();
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
+            run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
+        }
+    }
+    crate::profile::record_phase(
+        "paint_compose",
+        t_phase.elapsed().as_nanos() as u64,
+    );
+
+    // Step 4: standard scanout swap+commit -- verbatim mirror of
+    // paint_and_present_one_frame_for_slide's tail (canonical 11-
+    // step release contract per qa/r38b-hdmi-cma-deep-read-2026-
+    // 06-02.md §2).
+    let t_phase = std::time::Instant::now();
+    session
+        .egl_lib
+        .swap_buffers(session.display, session.egl_surface)
+        .map_err(|e| anyhow!("eglSwapBuffers (text-over-video) failed: {e:?}"))?;
+    let new_bo = unsafe {
+        session
+            .gbm_surface
+            .lock_front_buffer()
+            .context("gbm_surface_lock_front_buffer (text-over-video) failed")?
+    };
+    let fb_buf =
+        GbmBufferAdapter::new(&new_bo).context("read GBM bo metadata (text-over-video)")?;
+    let new_fb = card
+        .add_framebuffer(&fb_buf, 32, 32)
+        .map_err(|e| anyhow!("drmModeAddFB (text-over-video) failed: {e}"))?;
+    if let Err(e) = commit_fb(session, card, new_fb) {
+        if let Err(de) = card.destroy_framebuffer(new_fb) {
+            eprintln!(
+                "warn: cleanup destroy_framebuffer({new_fb:?}) on commit-fail (text-over-video): {de}"
+            );
+        }
+        drop(new_bo);
+        return Err(e);
+    }
+    if let Some(fb) = session.scanout_prev_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_prev, text-over-video): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_prev_bo.take() {
+        drop(bo);
+    }
+    session.scanout_prev_fb = session.scanout_current_fb.take();
+    session.scanout_prev_bo = session.scanout_current_bo.take();
+    session.scanout_current_bo = Some(new_bo);
+    session.scanout_current_fb = Some(new_fb);
+    crate::profile::record_phase(
+        "paint_present",
+        t_phase.elapsed().as_nanos() as u64,
+    );
     Ok(())
 }
 
@@ -5620,6 +5892,44 @@ impl<'a> EglSession<'a> {
     /// Prefix `cma_dump_` makes the SIGUSR1 surface grep-discoverable.
     pub fn cma_dump_cache_lens(&self) -> (usize, usize) {
         (self.image_bg_cache.len(), self.image_slide_tex_cache.len())
+    }
+
+    /// r46 (2026-06-02): CMA-pressure mitigation for the text-over-
+    /// video paint path (SYSTEM_SPEC §5.10). Pi Zero 2 W steady-
+    /// state CMA is ~250 MB (per qa/r38d-sigusr1-cache-dump-
+    /// 2026-06-02.md observation); the V4L2 decoder pool that the
+    /// bg-video bake needs adds ~24 MB; combined ceiling exceeds
+    /// the 256 MB pool. Frees up to ~96 MB by draining both
+    /// image-bg caches (6 entries × ~8 MB each × 2 caches at
+    /// worst case).
+    ///
+    /// Called once on first paint of a text-over-video slide
+    /// (detected via `slide_caches.contains_key`). Subsequent
+    /// frames of the same slide skip the eviction (cheap;
+    /// idempotent when caches are already empty). The image
+    /// caches re-warm naturally when the next image-bg slide
+    /// plays — no other side effect.
+    ///
+    /// Trade-off: alternating playlists (text-over-video ↔
+    /// image-bg) will thrash these caches. Accepted as
+    /// implementation cost; the alternative is per-deployment
+    /// V4L2 pool tuning which is a Phase 9 refactor.
+    pub fn force_evict_image_caches_for_cma_pressure(&mut self) {
+        use glow::HasContext;
+        let freed_bg = self.image_bg_cache.len();
+        let freed_slide = self.image_slide_tex_cache.len();
+        for (_path, (tex, _, _)) in self.image_bg_cache.drain() {
+            unsafe { self.gl.delete_texture(tex); }
+        }
+        for tex in self.image_slide_tex_cache.take_all_textures() {
+            unsafe { self.gl.delete_texture(tex); }
+        }
+        if freed_bg > 0 || freed_slide > 0 {
+            eprintln!(
+                "ipc: r46 text-over-video CMA mitigation -- evicted {} image_bg + {} image_slide_tex entries",
+                freed_bg, freed_slide
+            );
+        }
     }
 
     /// Bug 1 fix (qarl-flag 2026-05-09): the canonical motion

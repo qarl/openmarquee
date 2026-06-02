@@ -510,6 +510,56 @@ impl SlideCache {
         self.video_decoders.retain(|k, _| *k == keep);
     }
 
+    /// r46 (2026-06-02): when `item_id` is a TextSlide with
+    /// `background_video_slide_id` set (per SYSTEM_SPEC §5.10),
+    /// recursively load the referenced VideoSlide so its
+    /// `Mp4Demuxer` + V4L2 decoder are primed before the paint
+    /// path needs them. Best-effort: if the bg video is missing/
+    /// malformed, the paint path falls back to a no-op (last
+    /// painted frame stays on screen, text composites on top).
+    ///
+    /// Idempotent: the recursive `self.load(bg_id)` short-circuits
+    /// if the bg video is already in `items` AND its demuxer +
+    /// decoder are still primed. After a prior
+    /// `evict_other_video_state` (which clears the bg video on
+    /// every BeginSlide that isn't the bg video itself), the
+    /// recursive call falls through to re-prime via
+    /// `video_reprime_needed`.
+    fn ensure_bg_video_for_text_slide(
+        &mut self,
+        content_root: &std::path::Path,
+        item_id: uuid::Uuid,
+    ) -> Result<()> {
+        let bg_id = match self.items.get(&item_id) {
+            Some(ContentItem::Text(s)) => s.background_video_slide_id,
+            _ => return Ok(()), // not a text slide -> nothing to do
+        };
+        let Some(bg_id) = bg_id else {
+            return Ok(()); // text slide without bg video -> nothing to do
+        };
+        if bg_id == item_id {
+            // Defensive: a TextSlide referencing itself as bg video
+            // would infinite-loop the recursion. Python validator
+            // catches this at save time; renderer treats it as a
+            // no-op + warn.
+            eprintln!(
+                "ipc: warning -- text slide {} references itself as bg video; ignoring",
+                item_id
+            );
+            return Ok(());
+        }
+        if let Err(e) = self.load(content_root, bg_id) {
+            // Best-effort: log + carry on. The paint path will
+            // detect the missing demuxer/decoder + skip the video
+            // bake step (last frame stays on screen).
+            eprintln!(
+                "ipc: warning -- text slide {} references bg video {} but load failed: {:#}",
+                item_id, bg_id, e
+            );
+        }
+        Ok(())
+    }
+
     /// Try to load + cache a slide by UUID. content_root is
     /// required for the find_*_slide chain. Tries text -> image
     /// -> video. Returns Err with a message if all three return
@@ -575,7 +625,13 @@ impl SlideCache {
                     self.has_video_decoder(item_id),
                 );
                 if !video_needs_reprime {
-                    return Ok(());
+                    // r46 (2026-06-02): text slides may have a bg
+                    // video reference that was evicted by the prior
+                    // BeginSlide's `evict_other_video_state` call.
+                    // Re-prime the bg video before short-circuiting.
+                    // No-op for text slides without bg video, image
+                    // slides, and video slides.
+                    return self.ensure_bg_video_for_text_slide(content_root, item_id);
                 }
             } else {
                 eprintln!(
@@ -595,7 +651,12 @@ impl SlideCache {
             if let Some(m) = on_disk_mtime {
                 self.item_mtimes.insert(item_id, m);
             }
-            return Ok(());
+            // r46 (2026-06-02): if this is a TextSlide with a
+            // background_video_slide_id (per SYSTEM_SPEC §5.10), the
+            // referenced VideoSlide needs its demuxer + V4L2 decoder
+            // primed before the paint path needs them. Recursive
+            // self.load handles items[bg_id]/demuxer/decoder priming.
+            return self.ensure_bg_video_for_text_slide(content_root, item_id);
         }
         if let Some(s) = find_video_slide(content_root, item_id)? {
             self.items.insert(item_id, ContentItem::Video(s));
@@ -1529,6 +1590,87 @@ fn run_paint_hook(
             }
             match item_kind {
                 "text" => {
+                    // r46 (2026-06-02): SYSTEM_SPEC §5.10 -- TextSlide
+                    // with background_video_slide_id routes to the
+                    // text-over-video paint path that bakes a V4L2
+                    // video frame into the FBO before compositing
+                    // text layers on top. cache.load /
+                    // ensure_bg_video_for_text_slide has already
+                    // primed the bg video's demuxer + decoder.
+                    //
+                    // Mutex warn: if a hand-edited payload bypassed
+                    // Python validator and set BOTH background_image
+                    // _slide_id AND background_video_slide_id, video
+                    // wins here (this dispatch fires first); the
+                    // warn names both ids for diagnosis. The standard
+                    // image-vs-pattern precedence in resolve_slide_bg
+                    // (image wins) is preserved -- text-over-video
+                    // is a different paint pipeline.
+                    #[cfg(target_os = "linux")]
+                    let bg_video_id = match cache.items.get(&slide_id) {
+                        Some(ContentItem::Text(s)) => {
+                            if s.background_video_slide_id.is_some()
+                                && s.background_image_slide_id.is_some()
+                            {
+                                eprintln!(
+                                    "ipc: r46 mutex warn -- slide {} has BOTH background_video_slide_id={:?} AND background_image_slide_id={:?}; Python validator should have rejected; video wins at this dispatcher",
+                                    slide_id,
+                                    s.background_video_slide_id,
+                                    s.background_image_slide_id,
+                                );
+                            }
+                            s.background_video_slide_id
+                        }
+                        _ => unreachable!("item_kind matched text"),
+                    };
+                    #[cfg(target_os = "linux")]
+                    if let Some(bg_id) = bg_video_id {
+                        // Pull bg-video state. If either is missing
+                        // (best-effort load failure), warn + fall
+                        // through to the standard text paint path so
+                        // the slide still renders (text on solid bg).
+                        let dem_present = cache.video_demuxers.contains_key(&bg_id);
+                        let dec_present = cache.video_decoders.contains_key(&bg_id);
+                        if dem_present && dec_present {
+                            let dem = cache.video_demuxers
+                                .get(&bg_id)
+                                .expect("dem_present checked above");
+                            let dec_state = cache.video_decoders
+                                .get_mut(&bg_id)
+                                .expect("dec_present checked above");
+                            let item = cache.items.get(&slide_id)
+                                .expect("checked above");
+                            let slide = match item {
+                                ContentItem::Text(s) => s,
+                                _ => unreachable!("item_kind matched text"),
+                            };
+                            crate::profile::record_phase(
+                                "paint_dispatch",
+                                t_dispatch.elapsed().as_nanos() as u64,
+                            );
+                            if let Err(e) = hdmi::paint_and_present_one_text_over_video_slide_frame(
+                                session,
+                                card,
+                                slide,
+                                fonts,
+                                content_root,
+                                t_in_slide_ms,
+                                &dem.samples,
+                                &mut dec_state.next_sample_idx,
+                                &mut dec_state.frames_decoded,
+                                &dec_state.decoder,
+                            ) {
+                                return err(format!("paint_slide (text-over-video) failed: {e:#}"));
+                            }
+                            return IpcResponse::Ok {
+                                result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
+                            };
+                        }
+                        eprintln!(
+                            "ipc: text slide {} references bg video {} but demuxer={} decoder={}; falling back to text-only paint",
+                            slide_id, bg_id, dem_present, dec_present
+                        );
+                    }
                     let item = cache.items.get(&slide_id).expect("checked above");
                     let slide = match item {
                         ContentItem::Text(s) => s,

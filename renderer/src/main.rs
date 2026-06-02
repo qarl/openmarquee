@@ -651,6 +651,7 @@ fn build_motion_test_slide(kind: &str) -> content::TextSlide {
         background_color: "#1A1A1A".to_string(),
         background_pattern: None,
         background_image_slide_id: None,
+        background_video_slide_id: None,
         text_layers: vec![layer],
     }
 }
@@ -704,6 +705,7 @@ fn build_auto_mode_test_slide(kind: &str) -> content::TextSlide {
         background_color: "#1A1A1A".to_string(),
         background_pattern: None,
         background_image_slide_id: None,
+        background_video_slide_id: None,
         text_layers: vec![layer],
     }
 }
@@ -761,6 +763,7 @@ fn build_pattern_test_slide(pattern_name: &str) -> content::TextSlide {
             density: 0.5,
         }),
         background_image_slide_id: None,
+        background_video_slide_id: None,
         text_layers: vec![layer],
     }
 }
@@ -806,6 +809,7 @@ fn build_bg_image_test_slide(image_id: uuid::Uuid) -> content::TextSlide {
         background_color: "#222222".to_string(),
         background_pattern: None,
         background_image_slide_id: Some(image_id),
+        background_video_slide_id: None,
         text_layers: vec![layer],
     }
 }
@@ -855,6 +859,7 @@ fn build_blend_test_slide(blend_name: &str) -> content::TextSlide {
         background_color: "#FF6B00".to_string(),  // orange
         background_pattern: None,
         background_image_slide_id: None,
+        background_video_slide_id: None,
         text_layers: vec![layer],
     }
 }
@@ -899,6 +904,7 @@ fn build_outline_test_slide() -> content::TextSlide {
         background_color: "#666666".to_string(),
         background_pattern: None,
         background_image_slide_id: None,
+        background_video_slide_id: None,
         text_layers: vec![layer],
     }
 }
