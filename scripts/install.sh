@@ -428,6 +428,50 @@ else
     say "  no cron source at ${CRON_SRC}; skip (r38c not yet shipped on this branch)"
 fi
 
+# --- 3d. Ensure cron daemon is enabled (defense for §3c) -------------------
+#
+# The §3c cron drop-in only fires if cron.service is enabled + running.
+# Belt-and-braces guard for the r38c daily-restart safety net. See
+# qa/cron-enable-guard-followup-2026-06-02.md.
+#
+# Three states handled:
+#   enabled / static / etc -> no-op
+#   disabled               -> systemctl enable cron.service
+#   masked / not-found     -> loud warn, no action (operator-deliberate)
+#
+# Cron package not installed at all (`cron` on Debian / `crond` on
+# RHEL-family) -> loud warn + continue. Watchdog still functional;
+# only the daily safety net is lost.
+say "Ensure cron daemon enabled (for §3c daily-restart drop-in)"
+if command -v cron >/dev/null 2>&1 || command -v crond >/dev/null 2>&1; then
+    cron_state="$(systemctl is-enabled cron.service 2>&1 || echo unknown)"
+    case "$cron_state" in
+        enabled|enabled-runtime|static|indirect|alias|linked|linked-runtime|generated)
+            say "  cron.service is ${cron_state}; no action needed"
+            ;;
+        disabled)
+            say "  cron.service is disabled; enabling for /etc/cron.d/openmarquee-daily-restart"
+            run systemctl enable cron.service
+            ;;
+        masked|masked-runtime)
+            say "  WARN: cron.service is ${cron_state} (operator-deliberate?)."
+            say "       /etc/cron.d/openmarquee-daily-restart will not fire."
+            say "       Watchdog (openmarquee-cma-watchdog.timer) still functional."
+            ;;
+        *)
+            # Catches: transient, bad, unknown (our fallback), or any
+            # future systemd state we don't know about.
+            say "  WARN: cron.service in unexpected state '${cron_state}'."
+            say "       /etc/cron.d/openmarquee-daily-restart fire status unverified."
+            ;;
+    esac
+else
+    say "  WARN: cron daemon not installed (neither 'cron' nor 'crond' on PATH)."
+    say "       /etc/cron.d/openmarquee-daily-restart will not fire."
+    say "       Watchdog (openmarquee-cma-watchdog.timer) still functional."
+    say "       To wire up: apt install cron && re-run install.sh"
+fi
+
 # --- 2. Python venv ---------------------------------------------------------
 #
 # r29 (2026-05-31): runs AFTER sections 3, 3a, 3b — see the meta-comment
