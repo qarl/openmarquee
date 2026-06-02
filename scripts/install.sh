@@ -402,11 +402,11 @@ else
     say "  no cron source at ${CRON_SRC}; skip (r38c not yet shipped on this branch)"
 fi
 
-# --- 3d. Ensure cron daemon is enabled (r38d defense for §3c) ---------------
+# --- 3d. Ensure cron daemon is enabled (defense for §3c) -------------------
 #
 # The §3c cron drop-in only fires if cron.service is enabled + running.
 # Belt-and-braces guard for the r38c daily-restart safety net. See
-# qa/r38d-cron-enable-guard-2026-06-02.md.
+# qa/cron-enable-guard-followup-2026-06-02.md.
 #
 # Three states handled:
 #   enabled / static / etc -> no-op

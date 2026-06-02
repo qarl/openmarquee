@@ -1,9 +1,10 @@
-# r38d — install.sh cron enable-guard (defense for r38c daily-restart drop-in)
+# Cron enable-guard follow-up (defense for r38c daily-restart drop-in)
 
 **Author:** jimmy:openmarquee-code2
 **Date:** 2026-06-02
 **Status:** SHIPPED on code2; cherry-picked to main
 **Predecessor:** [r38c CMA-pressure watchdog + daily restart](r38c-cma-pressure-watchdog-2026-06-02.md) (audit §F.5)
+**Naming note:** Originally tagged r38d before QA reassigned r38d to the SIGUSR1 cache-dump dispatch. This is an unnumbered ride-along.
 
 ## A. Problem
 
@@ -16,8 +17,7 @@ restart silently never runs. Watchdog still catches fast drift;
 slow drift becomes a multi-day wedge.
 
 r38c audit §F.5 noted this failure-mode as defense-in-depth follow-
-up. QA's ACK in their r38d-or-stand-by routing surfaced it as a
-ride-along candidate.
+up. QA's ACK after r38c surfaced it as a ride-along candidate.
 
 ## B. Fix shape
 
@@ -115,7 +115,7 @@ the right surface — paired with the cron drop-in install.
 
 The watchdog shell test
 ([scripts/tests/test_cma_watchdog.sh](../scripts/tests/test_cma_watchdog.sh))
-does not need updates — r38d is install.sh-only and doesn't change
+does not need updates — this is install.sh-only and doesn't change
 watchdog behavior.
 
 A shell test for install.sh §3d is impractical at this layer (it
@@ -204,12 +204,12 @@ us.
   changes, no Python changes, no renderer changes.
 - Pre-push hook gate applies (install.sh changed) — backend ruff,
   backend pytest, renderer cargo + cross-compile. r38c's push went
-  clean through all gates; r38d should too.
+  clean through all gates; this guard's diff is smaller.
 - Cherry-pick to main via /tmp clone per standard pattern (r38c
-  needed manual replay due to §3 region offset; r38d's edit lands
+  needed manual replay due to §3 region offset; this guard lands
   AFTER §3c which is identical between code2 and main now, so the
   cherry-pick should auto-merge cleanly).
 
 ---
 
-End of r38d audit.
+End of cron-enable-guard audit.
