@@ -1,0 +1,21 @@
+[Unit]
+Description=openMarquee CMA-pressure watchdog (60s timer)
+Documentation=https://github.com/qarl/openmarquee
+
+[Timer]
+# Fire 60s after boot, then every 60s. Polling interval; see
+# qa/r38c-cma-pressure-watchdog-2026-06-02.md C.4 for rationale.
+OnBootSec=60s
+OnUnitActiveSec=60s
+
+# Allow the oneshot to start even if the system clock jumped
+# (NTP large correction at boot can otherwise skip a firing).
+AccuracySec=1s
+
+# Persistent=false: don't catch up on missed firings while the
+# system was off -- a 60s polling interval doesn't benefit from
+# accumulated firings on resume.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

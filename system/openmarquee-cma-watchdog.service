@@ -1,0 +1,49 @@
+[Unit]
+Description=openMarquee CMA-pressure watchdog (oneshot)
+Documentation=https://github.com/qarl/openmarquee
+# Don't fire if the backend isn't running -- nothing to release.
+ConditionPathExists=/run/systemd/system
+
+[Service]
+Type=oneshot
+
+# Watchdog script reads /proc/meminfo CmaTotal/CmaFree, restarts
+# openmarquee-backend if CmaUsed crosses THRESHOLD_MB outside of
+# COOLDOWN_SEC. See qa/r38c-cma-pressure-watchdog-2026-06-02.md.
+ExecStart=/opt/openmarquee/system/openmarquee-cma-watchdog.sh
+
+# Single iteration must complete fast -- /proc/meminfo read + maybe one
+# `systemctl restart --no-block` call. 30s is comfortable upper bound;
+# longer means the watchdog itself is wedged. systemd SIGKILLs after.
+RuntimeMaxSec=30s
+
+# Don't restart this unit on failure -- the .timer will fire the next
+# iteration. Restart=no is the default for oneshot but be explicit.
+Restart=no
+
+# Run as root: needs `systemctl restart` privileges + read of
+# /proc/meminfo (world-readable, but defense in depth).
+User=root
+Group=root
+
+# Sandbox: matches openmarquee-backend hardening profile where
+# applicable. The watchdog doesn't need network, ptrace, or write
+# access outside /var/openmarquee + /run.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+ReadWritePaths=/var/openmarquee /run
+
+# Don't set CapabilityBoundingSet -- systemctl restart requires
+# CAP_KILL via D-Bus auth to systemd; running as root with default
+# bounding-set is the path of least resistance.
+
+[Install]
+# Not WantedBy= a target -- the .timer is what wires this in.
