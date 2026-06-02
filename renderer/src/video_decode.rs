@@ -228,6 +228,36 @@ pub fn reprime_video_decoder_for_loop(
     state: &mut VideoDecoderState,
     dem: &Mp4Demuxer,
 ) -> Result<()> {
+    // r46.3 (2026-06-02): reset the V4L2 streaming state BEFORE
+    // re-feeding the primer. Pre-r46.2 the IPC sidecar dropped the
+    // decoder on every BeginSlide so the decoder was always fresh
+    // here; the standalone reel path (render_video_slide_in_session)
+    // similarly only loops within a single hold so the decoder
+    // never reaches V4L2_BUF_FLAG_LAST. r46.2's keep_ids
+    // memoization preserves the decoder across BeginSlide for
+    // text-over-video same-slide loops -- and a long-enough slide
+    // will reach EOS, setting capture_drained=true in DecoderInner,
+    // which makes all subsequent next_frame() return Ok(None)
+    // forever (v4l2.rs:1304). The bare-IDR feed below would NOT
+    // recover from that state because feeding output buffers
+    // doesn't clear the drained-capture flag + Frame::Drop skips
+    // re-QBUF when drained.
+    //
+    // reset_for_replay does STREAMOFF + clear capture_drained +
+    // reset capture_in_flight + STREAMON (re-QBUFs all capture
+    // buffers). After that the decoder is in the V4L2 equivalent
+    // of "freshly primed" except SPS/PPS are not yet fed -- which
+    // the primer feed below provides.
+    //
+    // For the in-loop wrap case (decoder still streaming, no
+    // EOS yet), reset_for_replay's STREAMOFF then STREAMON is
+    // a cheap state-cycle (~few ms of V4L2 ioctls). Acceptable
+    // overhead per loop boundary; the alternative would be to
+    // gate on capture_drained which needs a getter on Decoder.
+    state
+        .decoder
+        .reset_for_replay()
+        .context("reset_for_replay before re-priming SPS+PPS+IDR")?;
     let first_sample = dem
         .samples
         .first()

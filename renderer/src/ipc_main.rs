@@ -1667,6 +1667,34 @@ fn run_paint_hook(
                             let dec_state = cache.video_decoders
                                 .get_mut(&bg_id)
                                 .expect("dec_present checked above");
+                            // r46.3 (2026-06-02): if the bg video decoder
+                            // has reached end-of-stream (next_sample_idx
+                            // wrapped past samples.len() during prior
+                            // playback OR a FLAG_LAST mid-stream signal
+                            // set capture_drained=true in V4L2 inner),
+                            // re-prime via the existing canonical
+                            // reprime_video_decoder_for_loop path
+                            // (STREAMOFF + clear drained + STREAMON +
+                            // re-feed SPS+PPS+IDR per its r46.3 update).
+                            // Mirrors render_video_slide_in_session at
+                            // hdmi.rs:3025-3034 (the standalone reel
+                            // wrap-and-reprime pattern). Without this
+                            // the r46.2 keep_ids memoization preserves
+                            // a drained decoder; bake_video_slide_to_
+                            // current_fbo's next_frame() returns Ok(None)
+                            // forever; paint early-returns before
+                            // swap+commit; FYS panel goes BLACK.
+                            if dec_state.next_sample_idx >= dem.samples.len() {
+                                if let Err(e) =
+                                    crate::video_decode::reprime_video_decoder_for_loop(
+                                        dec_state, dem,
+                                    )
+                                {
+                                    return err(format!(
+                                        "paint_slide (text-over-video): reprime_video_decoder_for_loop failed: {e:#}"
+                                    ));
+                                }
+                            }
                             let item = cache.items.get(&slide_id)
                                 .expect("checked above");
                             let slide = match item {

@@ -1186,6 +1186,57 @@ impl Decoder {
         Ok(())
     }
 
+    /// r46.3 (2026-06-02): reset the V4L2 decoder for re-play
+    /// without dropping the Decoder struct (which would also
+    /// drop the buffer pool + V4L2 fd). Necessary because
+    /// r46.2's `keep_ids` memoization preserves the decoder
+    /// across BeginSlide for text-over-video slides -- but the
+    /// prior playback may have hit `V4L2_BUF_FLAG_LAST` on its
+    /// last decoded frame, setting `capture_drained = true`
+    /// (see `next_frame` at the EPIPE / FLAG_LAST sites). Once
+    /// set, `next_frame` returns `Ok(None)` forever +
+    /// `Frame::Drop` skips re-QBUF (v4l2.rs:735) -- the
+    /// decoder is wedged. Pre-r46.2 hid this because the
+    /// decoder was dropped + re-primed on every BeginSlide,
+    /// re-creating fresh inner state.
+    ///
+    /// Reset semantics:
+    ///   1. STREAMOFF both queues (returns all buffers to user-
+    ///      space ownership; flushes pending in-kernel work).
+    ///   2. Clear `capture_drained` flag.
+    ///   3. Reset `capture_in_flight` tracking (no buffer is
+    ///      held by user-space; the next start_streaming will
+    ///      re-QBUF them all to the kernel).
+    ///   4. STREAMON both queues via the existing
+    ///      `start_streaming` impl (which pre-QBUFs all capture
+    ///      buffers so the kernel has somewhere to write).
+    ///   5. Caller is responsible for re-feeding SPS+PPS+IDR
+    ///      (the bake helper does this naturally on the next
+    ///      call after the FYS-bug-3 wrap, since samples[0] is
+    ///      the IDR).
+    ///
+    /// Cost: ~few ms (a handful of V4L2 ioctls + kernel state
+    /// machine traversal). Called at most once per slide-play
+    /// cycle (when bake's `next_sample_idx >= samples.len()`
+    /// wrap fires). Net vs the pre-r46.2 drop+re-prime pattern:
+    /// SAME functional reset but the V4L2 buffer pool persists,
+    /// so NO ~24 MB CMA allocation per cycle -- preserves the
+    /// r46.2 freeze-fix CMA budget.
+    pub fn reset_for_replay(&self) -> Result<()> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.stop_streaming_quiet();
+            inner.capture_drained = false;
+            for slot in inner.capture_in_flight.iter_mut() {
+                *slot = false;
+            }
+            inner.output_eof_sent = false;
+        }
+        self.start_streaming()
+            .context("reset_for_replay: re-STREAMON after stop")?;
+        Ok(())
+    }
+
     /// Queue one H.264 NAL chunk (Annex-B byte stream) into
     /// the OUTPUT queue. Empty slice signals end-of-input
     /// (V4L2_BUF_FLAG_LAST). Reclaims completed OUTPUT buffers

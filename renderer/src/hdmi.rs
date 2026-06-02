@@ -7091,6 +7091,17 @@ unsafe fn bake_video_slide_to_current_fbo(
     }
     if *next_sample_idx >= samples.len() {
         *next_sample_idx = 0;
+        // r46.3 (2026-06-02): the wrap-at-bake handler stays as the
+        // minimal "wrap back to sample 0" pattern. The actual
+        // V4L2-state reset (STREAMOFF + clear drained + STREAMON +
+        // re-QBUF + re-feed SPS+PPS+IDR primer) lives in
+        // reprime_video_decoder_for_loop and is invoked from the IPC
+        // dispatcher BEFORE this bake call (when it detects the
+        // wrap condition). That separation keeps bake from needing
+        // a &Mp4Demuxer parameter; the primer requires SPS/PPS
+        // bytes which only the demuxer carries. The standalone
+        // reel path (render_video_slide_in_session at hdmi.rs:3025-
+        // 3034) already follows this pattern.
     }
     let s = &samples[*next_sample_idx];
     decoder
