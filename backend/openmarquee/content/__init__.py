@@ -571,9 +571,16 @@ class VideoSlide(BaseModel):
     current panel dims via ffmpeg's `-vf scale` filter inside the decode
     pipeline (sws_scale, no Python in the per-frame loop).
 
-    `duration_ms` is informational: the playback engine reads the actual
-    runtime from the file. Keeping it present so the schema parallels
-    TextSlide / ImageSlide and a single ContentItem union works.
+    `duration_ms` is the operator-set slot length — same contract as
+    TextSlide / ImageSlide / StreamSlide / WebSlide and the rest of
+    the ContentItem union (`SYSTEM_SPEC.md` §5.10). The playback
+    engine reads `item.duration_ms` directly (`playback.py` —
+    `_play_one_slide` computes `end_at = t0 + duration_ms / 1000`)
+    and the renderer LOOPS the clip back to sample 0 when the file
+    is shorter than the slot (`renderer/src/hdmi.rs` — FYS bug 3
+    fix in `bake_video_slide_to_current_fbo`'s sample-feed wrap).
+    If the file is longer than the slot, playback advances when
+    the slot ends — the remaining samples never decode.
     """
 
     # Round-11 forward-compat: preserve unknown fields. See TextSlide

@@ -424,11 +424,16 @@ pub fn image_slide_asset_path(content_root: &Path, slide_id: Uuid) -> PathBuf {
 /// at 1080p per the backend docstring) lives at
 /// `<content_root>/<id>/asset.mp4`; thumbnail at `asset.png`.
 /// The schema fields the renderer needs are id + duration_ms +
-/// transition; name is kept for log lines. duration_ms is
-/// informational per the Python schema -- the playback engine
-/// reads actual runtime from the file -- but the renderer
-/// honors it for hold-time hints and the reel driver's pass_ms
-/// gate.
+/// transition; name is kept for log lines. duration_ms is the
+/// operator-set slot length -- same contract as TextSlide /
+/// ImageSlide / StreamSlide / WebSlide (see SYSTEM_SPEC.md
+/// §5.10). The reel driver honors it as the hold/pass_ms gate;
+/// the IPC sidecar's per-Advance loop ticks until the backend's
+/// `playback.py` end_at fires. When the clip is shorter than
+/// the slot, hdmi.rs:bake_video_slide_to_current_fbo wraps
+/// next_sample_idx back to 0 (FYS bug 3 fix); when longer,
+/// playback advances at slot end and the remaining samples
+/// never decode.
 ///
 /// SLICE-C SCOPE NOTE: this slice ships the schema mirror +
 /// ContentItem::Video dispatch + warn-and-fall in the reel
