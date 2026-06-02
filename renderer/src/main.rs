@@ -34,6 +34,12 @@ mod mem;
 mod mp4_demux;
 mod playback;
 mod profile;
+/// r38d (2026-06-02) — SIGUSR1 cache-dump handler. Async-signal-safe
+/// AtomicBool flag + dump-emitter. Used by ipc_main.rs's inner loop
+/// to drop a [cache-dump] line on stderr (journald-visible) when an
+/// operator sends `pkill -USR1 -f openmarquee-render`. See
+/// qa/r38d-sigusr1-cache-dump-2026-06-02.md.
+mod sigusr1;
 /// `[perf]` r1 (2026-05-26) — host-testable predicate for the
 /// 30fps deadline-miss counter wired into `commit_fb`. Pure data;
 /// cross-platform so the boundary tests (0/35/36/37/100ms) run on
