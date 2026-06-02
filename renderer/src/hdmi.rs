@@ -4279,10 +4279,29 @@ pub fn paint_and_present_one_transition_frame(
             std::mem::size_of_val(&verts),
         );
         session.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-        let a_pos = session.gl.get_attrib_location(program, "a_pos")
-            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos"))?;
-        let a_uv = session.gl.get_attrib_location(program, "a_uv")
-            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv"))?;
+        // r38b (2026-06-02): the prior `?`-bubble shape at a_pos /
+        // a_uv / ensure_scene_fbo leaked the cleanup_static resource
+        // set (fbo_a + tex_a + fbo_b + tex_b + vbo + program ≈ 16 MB
+        // of bake-target GLES storage) on the failure path. Mirror
+        // the link_program / create_buffer match-arm pattern above:
+        // explicit cleanup + delete_program before propagating the
+        // error. See qa/r38b-hdmi-cma-deep-read-2026-06-02.md §3.4.
+        let a_pos = match session.gl.get_attrib_location(program, "a_pos") {
+            Some(loc) => loc,
+            None => {
+                cleanup_static(session.gl, Some(vbo));
+                session.gl.delete_program(program);
+                return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos"));
+            }
+        };
+        let a_uv = match session.gl.get_attrib_location(program, "a_uv") {
+            Some(loc) => loc,
+            None => {
+                cleanup_static(session.gl, Some(vbo));
+                session.gl.delete_program(program);
+                return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv"));
+            }
+        };
         let u_src_a = session.gl.get_uniform_location(program, "u_src_a");
         let u_src_b = session.gl.get_uniform_location(program, "u_src_b");
         let u_t = session.gl.get_uniform_location(program, "u_t");
@@ -4300,7 +4319,14 @@ pub fn paint_and_present_one_transition_frame(
         let identity = session.current_settings.is_color_identity();
         let rotation = session.rotation;
         let scene_for_post_pass = if !identity || rotation != 0 {
-            Some(ensure_scene_fbo(session, mode_w_u32, mode_h_u32)?)
+            match ensure_scene_fbo(session, mode_w_u32, mode_h_u32) {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    cleanup_static(session.gl, Some(vbo));
+                    session.gl.delete_program(program);
+                    return Err(e);
+                }
+            }
         } else {
             None
         };
