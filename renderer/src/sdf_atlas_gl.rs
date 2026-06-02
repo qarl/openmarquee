@@ -45,13 +45,41 @@ pub fn upload_all(
 ) -> Result<Vec<MsdfAtlasGl>> {
     use glow::HasContext;
 
+    // r41 (2026-06-02): early-return on a per-iteration failure
+    // previously dropped `out: Vec<MsdfAtlasGl>` without releasing
+    // the GL texture handles it carried -- glow's NativeTexture is
+    // a u32 alias, no Drop semantics. delete_all() only runs at
+    // session teardown via the success path; an Err from
+    // upload_all means the caller never receives `out`, so its
+    // textures live until the GL context dies. Wrap both bubble
+    // sites + the success path's pixel_store restore so a partial
+    // upload doesn't leak prior textures or leave GL state on
+    // UNPACK_ALIGNMENT=1. Session-startup is fatal-on-fail today,
+    // but the canonical pattern survives future refactors that
+    // might want to retry / continue. See qa/r41-capture-startup-
+    // cleanup-2026-06-02.md.
+    let cleanup_partial = |gl: &glow::Context, out: &mut Vec<MsdfAtlasGl>| unsafe {
+        for entry in out.drain(..) {
+            gl.delete_texture(entry.tex);
+        }
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+    };
+
     let mut out = Vec::with_capacity(atlases.len());
     unsafe {
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
         for atlas in atlases {
-            let tex = gl
-                .create_texture()
-                .map_err(|e| anyhow!("glGenTextures(msdf {}): {e}", atlas.manifest.font))?;
+            let tex = match gl.create_texture() {
+                Ok(t) => t,
+                Err(e) => {
+                    cleanup_partial(gl, &mut out);
+                    return Err(anyhow!(
+                        "glGenTextures(msdf {}): {e}",
+                        atlas.manifest.font
+                    ));
+                }
+            };
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
@@ -87,6 +115,7 @@ pub fn upload_all(
             let err = gl.get_error();
             if err != 0 {
                 gl.delete_texture(tex);
+                cleanup_partial(gl, &mut out);
                 return Err(anyhow!(
                     "msdf atlas {} upload failed: GL error 0x{err:x}",
                     atlas.manifest.font

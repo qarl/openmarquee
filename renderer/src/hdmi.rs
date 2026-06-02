@@ -5174,10 +5174,23 @@ pub fn capture_fullres_transition_mid_to_png(
             }
         };
 
+        // r41 (2026-06-02): bring this cap_tex create-fail handler
+        // in line with the sibling at capture_legacy_3pass_transition_
+        // mid_to_png:4906-4912. Pre-r41 the bare `?` leaked
+        // fbo_a/tex_a/fbo_b/tex_b (~16 MB FBO storage at 1080p)
+        // because the success path's deferred cleanup at function
+        // exit is past the bubble. See qa/r41-capture-startup-
+        // cleanup-2026-06-02.md.
         let cap_tex = unsafe {
             let t_ = gl
                 .create_texture()
-                .map_err(|e| anyhow!("capture tex: {e}"))?;
+                .map_err(|e| {
+                    gl.delete_framebuffer(fbo_a);
+                    gl.delete_texture(tex_a);
+                    gl.delete_framebuffer(fbo_b);
+                    gl.delete_texture(tex_b);
+                    anyhow!("capture tex: {e}")
+                })?;
             gl.bind_texture(glow::TEXTURE_2D, Some(t_));
             gl.tex_image_2d(
                 glow::TEXTURE_2D, 0, glow::RGBA as i32, mode_w as i32, mode_h as i32, 0,
