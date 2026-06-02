@@ -6604,9 +6604,20 @@ unsafe fn bake_external_nv12_to_current_fbo(
             frame_w as i32, frame_h as i32, 0,
             glow::LUMINANCE, glow::UNSIGNED_BYTE, Some(y_plane),
         );
-        let uv_tex = gl
-            .create_texture()
-            .map_err(|e| anyhow!("glGenTextures(external NV12 UV): {e}"))?;
+        // r40 (2026-06-02): if uv_tex glGenTextures fails the
+        // prior y_tex would orphan (~2 MB GLES storage at 1080p)
+        // -- *nv12_tex never gets assigned, so the next call
+        // re-enters dims_changed=true and creates ANOTHER y_tex.
+        // Explicit cleanup mirrors the canonical scanout commit-fail
+        // shape at :3724-3731 + the r38b transition-closure pattern.
+        // See qa/r40-non-fys-allocator-fixes-2026-06-02.md.
+        let uv_tex = match gl.create_texture() {
+            Ok(t) => t,
+            Err(e) => {
+                gl.delete_texture(y_tex);
+                return Err(anyhow!("glGenTextures(external NV12 UV): {e}"));
+            }
+        };
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
@@ -6909,9 +6920,20 @@ unsafe fn bake_video_slide_to_current_fbo(
         glow::UNSIGNED_BYTE,
         Some(y_plane),
     );
-    let uv_tex = gl
-        .create_texture()
-        .map_err(|e| anyhow!("glGenTextures(video UV): {e}"))?;
+    // r40 (2026-06-02): twin of Fix 1 above for the V4L2 video
+    // paint hot path. y_tex is per-call (NOT session-cached) and
+    // deleted at the matching delete_texture calls after the blit
+    // pass. The `?`-bubble below would leak y_tex on a transient
+    // GL_OUT_OF_MEMORY -- per-frame leak in the hottest video
+    // path. Same canonical pattern as Fix 1 + the scanout commit-
+    // fail at :3724-3731.
+    let uv_tex = match gl.create_texture() {
+        Ok(t) => t,
+        Err(e) => {
+            gl.delete_texture(y_tex);
+            return Err(anyhow!("glGenTextures(video UV): {e}"));
+        }
+    };
     gl.active_texture(glow::TEXTURE1);
     gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
@@ -10335,8 +10357,27 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     // to LINEAR; CLAMP_TO_EDGE both axes (the spec lists wrap as
     // one of the supported parameters on TEXTURE_EXTERNAL_OES;
     // CLAMP_TO_EDGE is universally accepted).
-    let tex = gl.create_texture()
-        .map_err(|e| anyhow!("glGenTextures(external-OES): {e}"))?;
+    // r40 (2026-06-02): if glGenTextures fails the EGLImage above
+    // would leak the kernel-side dma_buf ref (~3 MB CMA per NV12
+    // frame at 1080p). The EGLImage holds an independent ref on
+    // the dma_buf via the EGL_LINUX_DMA_BUF_EXT import; without an
+    // explicit destroy_image the kernel keeps the buffer pinned
+    // until renderer exit. Frame::Drop's re-QBUF only re-queues the
+    // V4L2 buffer slot; it doesn't release the EGLImage's dma_buf
+    // ref. See qa/r40-non-fys-allocator-fixes-2026-06-02.md.
+    let tex = match gl.create_texture() {
+        Ok(t) => t,
+        Err(e) => {
+            let destroyed = (eps.destroy_image)(display.as_ptr(), egl_image);
+            if destroyed == 0 {
+                eprintln!(
+                    "warn: eglDestroyImageKHR returned EGL_FALSE for fd={} during create_texture-fail cleanup",
+                    fd
+                );
+            }
+            return Err(anyhow!("glGenTextures(external-OES): {e}"));
+        }
+    };
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, Some(tex));
     gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
