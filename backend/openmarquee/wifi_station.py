@@ -75,9 +75,28 @@ log = logging.getLogger(__name__)
 # `which nmcli` on the dev Pi.
 _NMCLI_BIN = "/usr/bin/nmcli"
 
-# wlan0 is the BCM43438 radio's primary interface on Pi Zero 2 W;
-# the AP runs on ap0 (separate virtual interface). Hardcoded for
-# now; future multi-radio devices would parameterize.
+# r44 (2026-06-02): post-r34 dongle topology, wlan0 is NOT "the
+# primary interface" -- it's the SIGN-side radio (built-in BCM43438
+# on Pi Zero 2 W). Role split per system/README.md "Dual-radio
+# shipping topology":
+#   - wlan0       = sign-STA + captive-portal-AP (this module's
+#                   scope: the operator's content-fetching WiFi
+#                   join). Note: on a Pi with no dongle attached,
+#                   wlan0 IS the only WiFi radio, and this module
+#                   is what manages it. Post-r34, wlan0 is still
+#                   THE sign radio either way.
+#   - wlan-dongle = management WiFi (when a USB dongle is plugged
+#                   in; r34 topology, handled by NM keyfile +
+#                   Tailscale, NOT this module).
+#   - ap0         = captive portal virtual interface, sibling of
+#                   wlan0 on the brcmfmac radio (single-radio
+#                   AP+STA per Option A topology; r43 SHIP-approved
+#                   Option B retires ap0, pending implementation
+#                   dispatch -- _STATION_IFNAME stays "wlan0" in
+#                   either topology).
+# Hardcoded here; if a hypothetical future device has multiple
+# BCM43438-equivalent sign radios, parameterization would land
+# alongside the multi-radio implementation work.
 _STATION_IFNAME = "wlan0"
 
 

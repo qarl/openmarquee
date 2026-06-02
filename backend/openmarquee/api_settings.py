@@ -330,10 +330,13 @@ async def set_settings(
     # to (its mode comes from the DRM panel, not Settings width/height).
     rotation_changed = int(previous.display_rotation) != int(validated.display_rotation)
     # Wifi-station fields: BEFORE save so we can diff. The actual
-    # apply (template wpa_supplicant-wlan0.conf + systemctl restart
-    # + iw poll) runs in a background thread so the HTTP response
-    # returns immediately. UI polls GET /api/settings/wifi-station-
-    # state for live status.
+    # apply (nmcli connection delete + nmcli device wifi connect on
+    # wlan0 + status polling) runs in a background thread so the
+    # HTTP response returns immediately. UI polls GET
+    # /api/settings/wifi-station-state for live status. (Pre-2026-05
+    # this was a wpa_supplicant-wlan0.conf template + systemctl
+    # restart; the wifi_station.py history block documents the
+    # Pi OS Lite trixie NetworkManager rewrite.)
     wifi_station_changed = wifi_station.has_settings_changed(
         prev_enabled=previous.wifi_station_enabled,
         prev_ssid=previous.wifi_station_ssid,
@@ -498,9 +501,13 @@ async def patch_wifi_station_password(
     previous = storage.load()
     response = _patch_secret_field(storage, "wifi_station_password", new_value)
     # If station mode is enabled and the password actually changed,
-    # re-template the conf + restart wpa_supplicant. Background thread
-    # so the PATCH returns immediately; UI polls
-    # /api/settings/wifi-station-state for live status.
+    # re-issue the nmcli connect with the new credentials on wlan0
+    # (delete + recreate the wifi-station connection profile under
+    # NetworkManager). Background thread so the PATCH returns
+    # immediately; UI polls /api/settings/wifi-station-state for
+    # live status. (Pre-2026-05 this re-templated a wpa_supplicant
+    # conf + restarted wpa_supplicant; the wifi_station.py history
+    # block documents the rewrite.)
     if previous.wifi_station_enabled and previous.wifi_station_password != new_value:
         latest = storage.load()
         wifi_station.apply_in_background(
