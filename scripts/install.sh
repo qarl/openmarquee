@@ -327,7 +327,8 @@ run "${VENV_DIR}/bin/pip" install --upgrade ${PIP_OFFLINE_FLAGS[@]+"${PIP_OFFLIN
 
 say "Install systemd units"
 run mkdir -p "$SYSTEMD_DIR"
-for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tailscale.service; do
+for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tailscale.service \
+            openmarquee-cma-watchdog.service openmarquee-cma-watchdog.timer; do
     SRC="${OPT_DIR}/system/${unit}"
     DST="${SYSTEMD_DIR}/${unit}"
     if already_done -f "$DST" && already_done "$SRC" -nt "$DST"; then
@@ -349,7 +350,8 @@ done
 # explicitly chmod +x the .sh ExecStart= targets so systemd can invoke
 # them. Idempotent: chmod +x on an already-executable file is a no-op.
 say "Ensure +x on system/*.sh helpers"
-for sh_helper in openmarquee-ap0-setup.sh openmarquee-firstboot.sh openmarquee-tailscale.sh; do
+for sh_helper in openmarquee-ap0-setup.sh openmarquee-firstboot.sh openmarquee-tailscale.sh \
+                 openmarquee-cma-watchdog.sh; do
     SH_PATH="${OPT_DIR}/system/${sh_helper}"
     if [ "$DRY_RUN" -eq 1 ] || [ -f "$SH_PATH" ]; then
         run chmod +x "$SH_PATH"
@@ -372,6 +374,32 @@ if [ "$DRY_RUN" -eq 1 ] || [ -f "$RUST_BIN_STAGED" ]; then
     run chmod +x "$RUST_BIN_INSTALLED"
 else
     say "  no staged binary at ${RUST_BIN_STAGED}; skip (sidecar opt-in unused)"
+fi
+
+# --- 3c. CMA-pressure daily-restart cron (r38c stopgap) ---------------------
+#
+# Belt-and-braces companion to openmarquee-cma-watchdog.timer (the 60s
+# threshold-driven watchdog). The cron fires unconditionally at 03:00
+# local time -- catches slow CMA drift that stays below the watchdog
+# threshold but would still wedge the renderer over multi-day uptime.
+#
+# Lives at /etc/cron.d/openmarquee-daily-restart. crond on Debian
+# trixie scans /etc/cron.d for owner-root, mode <= 0644 drop-ins;
+# we set 0644 explicitly. crond picks up the new drop-in on the
+# next cron-daemon-scan tick (no daemon-reload needed).
+#
+# Bridges until r38b's actual leak fix lands. See
+# qa/r38c-cma-pressure-watchdog-2026-06-02.md.
+CRON_SRC="${OPT_DIR}/system/openmarquee-daily-restart.cron"
+CRON_DST="${ROOT_PREFIX}/etc/cron.d/openmarquee-daily-restart"
+say "Stage openmarquee-daily-restart cron drop-in"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "$CRON_SRC" ]; then
+    run mkdir -p "$(dirname "$CRON_DST")"
+    run cp "$CRON_SRC" "$CRON_DST"
+    run chmod 0644 "$CRON_DST"
+    run chown root:root "$CRON_DST"
+else
+    say "  no cron source at ${CRON_SRC}; skip (r38c not yet shipped on this branch)"
 fi
 
 # --- 4. hostapd.conf --------------------------------------------------------
@@ -855,6 +883,15 @@ run systemctl enable openmarquee-backend.service \
                     openmarquee-ap0.service \
                     hostapd.service \
                     dnsmasq.service
+
+# r38c CMA-pressure watchdog -- timer fires the oneshot every 60s,
+# oneshot reads /proc/meminfo and restarts openmarquee-backend.service
+# if CmaUsed crosses THRESHOLD_MB (default 220MB) outside the cooldown
+# window (default 30 min). enable + start the timer; the .service is
+# triggered by the timer and shouldn't be enabled directly.
+# See qa/r38c-cma-pressure-watchdog-2026-06-02.md.
+run systemctl enable openmarquee-cma-watchdog.timer
+run systemctl start openmarquee-cma-watchdog.timer || true
 
 # Phase 4u: explicit start sequence. `systemctl enable` alone does NOT
 # activate units when multi-user.target is already reached during

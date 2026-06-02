@@ -1,0 +1,16 @@
+# /etc/cron.d/openmarquee-daily-restart
+#
+# Belt-and-braces companion to openmarquee-cma-watchdog.timer.
+# The watchdog catches CMA pressure that crosses 220MB; this cron
+# catches slow drift that stays below the watchdog threshold but
+# would still wedge over multi-day uptime.
+#
+# Fires at 03:00 local time -- Pi system TZ is intentionally local
+# per the schedule.py contract. Restart costs ~3-8s of black screen
+# during the slowest viewer hour.
+#
+# Bridges until r38b's actual leak fix lands. See
+# qa/r38c-cma-pressure-watchdog-2026-06-02.md.
+#
+# Format: m h dom mon dow user command
+0 3 * * * root /bin/systemctl restart --no-block openmarquee-backend.service
