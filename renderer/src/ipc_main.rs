@@ -504,10 +504,39 @@ impl SlideCache {
     /// video->video transition needs both the from- and to-slide
     /// decoders live; the next BeginSlide (on the to-slide, after
     /// the transition completes) is what evicts the from-slide.
-    fn evict_other_video_state(&mut self, keep: uuid::Uuid) {
-        self.video_demuxers.retain(|k, _| *k == keep);
+    fn evict_other_video_state(&mut self, keep_ids: &[uuid::Uuid]) {
+        // r46.2 (2026-06-02): widened from a single `keep: Uuid` to
+        // a slice. The single-keep shape was wrong for text-over-
+        // video (SYSTEM_SPEC §5.10): a text slide with
+        // `background_video_slide_id` references a bg video that's
+        // NOT the slide_id itself, so passing `slide_id` evicted
+        // the bg video's V4L2 demuxer + decoder on every
+        // BeginSlide. The IPC text-arm + `ensure_bg_video_for_text_
+        // slide` then re-primed the bg video each cycle, allocating
+        // a fresh ~24 MB V4L2 buffer pool. Under CMA pressure (Pi
+        // Zero 2 W 256 MB pool), the kernel-side dma_buf refcount
+        // on the prior pool didn't release fast enough → cumulative
+        // CMA leak → eventually the alloc failed → `Mp4Demuxer`
+        // open succeeded but `prime_video_decoder` returned Err →
+        // `UnsupportedSlide` wire marker → playback.py held the
+        // last frame for 3s before retrying. Visible on FYS as the
+        // text-over-video slide freezing ~80% of the time.
+        //
+        // The fix: callers pass `[slide_id, bg_video_id]` for text-
+        // over-video slides so the bg video's state survives the
+        // eviction. The next `cache.load(bg_id)` short-circuits
+        // (items+mtime hit, demuxer + decoder present); no re-prime;
+        // no fresh V4L2 alloc; CMA pressure stays bounded.
+        //
+        // For standalone-video slides (single keep id), behavior is
+        // unchanged: `evict_other_video_state(&[slide_id])` retains
+        // only the current slide's state. For multi-slide playlists
+        // alternating different video bgs, the bg of the prior
+        // slide gets evicted naturally (it's not in the new
+        // keep_ids slice).
+        self.video_demuxers.retain(|k, _| keep_ids.contains(k));
         #[cfg(target_os = "linux")]
-        self.video_decoders.retain(|k, _| *k == keep);
+        self.video_decoders.retain(|k, _| keep_ids.contains(k));
     }
 
     /// r46 (2026-06-02): when `item_id` is a TextSlide with
@@ -1988,7 +2017,45 @@ fn handle_inner_request(
             // slide's V4L2 decoder before loading this slide —
             // decoders were otherwise never freed on a normal
             // slide change and accumulated toward OOM.
-            cache.evict_other_video_state(p.slide_id);
+            //
+            // r46.2 (2026-06-02): when the new slide is a TextSlide
+            // with `background_video_slide_id` (per SYSTEM_SPEC
+            // §5.10), the bg video's V4L2 state must ALSO survive
+            // the eviction or the IPC text-arm will re-prime it on
+            // every BeginSlide (a fresh ~24 MB V4L2 pool alloc per
+            // cycle). Under CMA pressure, the prior pool's kernel-
+            // side dma_buf refs don't release fast enough → CMA
+            // accumulates → eventually `prime_video_decoder` Err →
+            // UnsupportedSlide → 3s held-last-frame retry. Looked
+            // like the text-over-video slide was freezing ~80% of
+            // the time. Looking up the bg_video_id here (BEFORE
+            // eviction) and passing both ids to keep_ids preserves
+            // the bg video state; the subsequent `cache.load(text_
+            // id)` then short-circuits + `ensure_bg_video_for_text_
+            // slide`'s recursive `cache.load(bg_id)` also short-
+            // circuits (items+mtime hit, demuxer + decoder present
+            // post-evict). No re-prime; no fresh V4L2 alloc; CMA
+            // pressure stays bounded.
+            //
+            // The lookup tolerates a cache miss (first BeginSlide
+            // for a never-seen slide: items[slide_id]=None →
+            // bg_video_id=None → keep_ids=[slide_id] → standard
+            // single-keep behavior; the bg video gets primed on
+            // cache.load's recursive path as before). The lookup
+            // also tolerates a non-Text item kind (an Image or
+            // Video slide → bg_video_id=None → keep_ids=[slide_id]
+            // → standard behavior).
+            let bg_video_id = match cache.items.peek(&p.slide_id) {
+                Some(ContentItem::Text(s)) => s.background_video_slide_id,
+                _ => None,
+            };
+            let mut keep_ids = vec![p.slide_id];
+            if let Some(bg_id) = bg_video_id {
+                if bg_id != p.slide_id {
+                    keep_ids.push(bg_id);
+                }
+            }
+            cache.evict_other_video_state(&keep_ids);
             if let Err(e) = cache.load(content_root, p.slide_id) {
                 return err(format!("begin_slide load failed: {e:#}"));
             }
@@ -2452,7 +2519,7 @@ mod tests {
         );
         // Simulate the Bug 9 slide-change eviction of the
         // from-slide's video state.
-        cache.evict_other_video_state(uuid(9));
+        cache.evict_other_video_state(&[uuid(9)]);
         assert!(
             !cache.video_demuxers.contains_key(&id_from),
             "from-slide demuxer evicted",
@@ -2959,7 +3026,7 @@ mod tests {
         );
         // Simulate Bug 9's slide-change eviction: a BeginSlide on
         // some OTHER slide evicts this video's demuxer + decoder.
-        cache.evict_other_video_state(uuid(6));
+        cache.evict_other_video_state(&[uuid(6)]);
         assert!(
             !cache.video_demuxers.contains_key(&id),
             "demuxer evicted by evict_other_video_state",
@@ -2978,6 +3045,52 @@ mod tests {
         assert_eq!(dem.width, 320);
         assert_eq!(dem.height, 240);
         assert!(!dem.samples.is_empty());
+    }
+
+    /// r46.2 (2026-06-02): text-over-video freeze fix.
+    /// `evict_other_video_state` now accepts a slice of keep ids
+    /// (was a single Uuid). For text-over-video slides, the caller
+    /// passes `[text_slide_id, bg_video_id]` so the bg video's
+    /// V4L2 state survives the eviction → no re-prime → no CMA
+    /// pressure spike. This test pins the multi-keep semantics.
+    #[test]
+    fn evict_other_video_state_preserves_multiple_keep_ids() {
+        let mut cache = SlideCache::new();
+        let text_id = uuid(11);
+        let bg_id = uuid(12);
+        let stale_id = uuid(13);
+        // Seed three demuxers (mock dummy entries). We don't need
+        // real Mp4Demuxer state for the eviction-set test — just
+        // observe which keys retain() drops.
+        // Dummy demuxers — all fields are pub so we can construct
+        // a minimal struct without parsing an MP4 file.
+        let mk_dummy = || crate::mp4_demux::Mp4Demuxer {
+            sps: vec![],
+            pps: vec![],
+            samples: vec![],
+            width: 0,
+            height: 0,
+        };
+        cache.video_demuxers.insert(text_id, mk_dummy());
+        cache.video_demuxers.insert(bg_id, mk_dummy());
+        cache.video_demuxers.insert(stale_id, mk_dummy());
+        // Multi-keep: text + bg both survive, stale is dropped.
+        cache.evict_other_video_state(&[text_id, bg_id]);
+        assert!(
+            cache.video_demuxers.contains_key(&text_id),
+            "text slide demuxer preserved by multi-keep"
+        );
+        assert!(
+            cache.video_demuxers.contains_key(&bg_id),
+            "bg video demuxer preserved by multi-keep (r46.2 freeze fix)"
+        );
+        assert!(
+            !cache.video_demuxers.contains_key(&stale_id),
+            "stale demuxer dropped"
+        );
+        // Empty-keep slice drops everything (defensive sanity).
+        cache.evict_other_video_state(&[]);
+        assert!(cache.video_demuxers.is_empty(), "empty keep slice drops all");
     }
 
     /// Finding H1 (2026-05-21): the FYS bug A re-prime predicate
