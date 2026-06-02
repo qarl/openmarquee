@@ -2693,20 +2693,23 @@ fn resolve_slide_bg(
     // r46 (2026-06-02): SYSTEM_SPEC §5.10 text-over-video. The
     // IPC sidecar's text-arm dispatcher routes around this
     // function entirely when slide.background_video_slide_id is
-    // set, calling paint_and_present_one_text_over_video_slide_
-    // frame instead. resolve_slide_bg is reached only by NON-IPC
-    // paths (standalone reel, parity harness, --debug-render CLI,
-    // and the slide-A/B sides of a transition). Those paths do
-    // NOT yet support text-over-video; the bg falls back to
-    // solid/pattern/image per the chain below + a warn surfaces
-    // the gap. Defer text-over-video in transition + standalone
-    // paths to a r47+ follow-up.
-    if slide.background_video_slide_id.is_some() {
-        eprintln!(
-            "warn: slide {} has background_video_slide_id but resolve_slide_bg was called -- non-IPC paint paths (standalone, transition, parity harness, --debug-render) do not yet support text-over-video per SYSTEM_SPEC §5.10. Falling back to image/pattern/solid bg. See qa/r46-text-over-video-impl-2026-06-02.md §5.",
-            slide.id
-        );
-    }
+    // set + the bg-video's demuxer + decoder are primed; it
+    // calls paint_and_present_one_text_over_video_slide_frame
+    // (hdmi.rs ~3420) instead. That function in turn calls
+    // resolve_slide_layers (which calls THIS function) just to
+    // get the text_layers Vec; the returned bg_kind is then
+    // DISCARDED + paint_slide_with_viewport(bg_kind=None) runs
+    // with the video frame already baked into the FBO.
+    //
+    // r46.1 (2026-06-02): the r46 sweep gap "warn when
+    // background_video_slide_id is set on non-IPC paint paths"
+    // was over-engineered -- the warn fires for EVERY paint of
+    // text-over-video slides (the IPC path goes through
+    // resolve_slide_layers → here), spamming journalctl at
+    // ~22Hz with misleading "falling back" text. Removed; the
+    // non-IPC-paths-don't-support-text-over-video limitation is
+    // documented in qa/r46-text-over-video-impl-2026-06-02.md
+    // §5 + §H.2 #6.
     // v1-spec-delta #8 (slice b): image bg takes precedence over
     // background_pattern + background_color when the schema
     // references an ImageSlide AND the renderer was given a
