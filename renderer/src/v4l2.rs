@@ -1068,6 +1068,26 @@ impl Decoder {
                     num_planes
                 ));
             }
+            // r42 (2026-06-02): mid-loop failure leaks any fds
+            // already pushed -- the assignment to
+            // inner.capture_dmabuf_fds (line below) only runs
+            // after the loop completes successfully. RawFd has no
+            // Drop; DecoderInner::drop only closes
+            // inner.capture_dmabuf_fds which stays empty on this
+            // error path. cleanup_partial_fds mirrors the r41
+            // sdf_atlas_gl.rs cleanup_partial closure pattern
+            // (and the r38b cleanup_static shape) -- per-iteration
+            // failure releases any fds accumulated so far before
+            // propagating. See qa/r42-v4l2-expbuf-fd-leak-2026-06-02.md.
+            let cleanup_partial_fds = |fds: &mut Vec<std::os::fd::RawFd>| {
+                for fd in fds.drain(..) {
+                    // SAFETY: each fd was obtained from a successful
+                    // VIDIOC_EXPBUF above and is not yet handed off
+                    // to inner.capture_dmabuf_fds. We own these
+                    // exclusively; libc::close is safe.
+                    unsafe { libc::close(fd); }
+                }
+            };
             let mut fds: Vec<std::os::fd::RawFd> = Vec::with_capacity(allocated_count);
             for buf_idx in 0..allocated_count {
                 let mut expbuf = V4l2Exportbuffer {
@@ -1086,12 +1106,15 @@ impl Decoder {
                 // V4L2_MEMORY_DMABUF for REQBUFS was wrong; the
                 // kernel returned EINVAL on EXPBUF because no
                 // buffer existed at that index).
-                unsafe { vidioc_expbuf(inner.fd(), &mut expbuf) }
-                    .with_context(|| format!(
+                if let Err(e) = unsafe { vidioc_expbuf(inner.fd(), &mut expbuf) } {
+                    cleanup_partial_fds(&mut fds);
+                    return Err(anyhow::Error::from(e).context(format!(
                         "VIDIOC_EXPBUF({:?} idx={}) on MMAP-allocated buffer",
                         dir, buf_idx
-                    ))?;
+                    )));
+                }
                 if expbuf.fd < 0 {
+                    cleanup_partial_fds(&mut fds);
                     return Err(anyhow!(
                         "VIDIOC_EXPBUF({:?} idx={}) returned fd={}",
                         dir, buf_idx, expbuf.fd
