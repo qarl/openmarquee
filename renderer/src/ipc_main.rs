@@ -780,6 +780,17 @@ fn err(msg: impl Into<String>) -> IpcResponse {
 /// before Open return Err. After Open succeeds, dispatch
 /// transfers to run_inner_loop which holds the EGL session.
 pub fn run_ipc_sidecar() -> Result<()> {
+    // r38d SIGUSR1 cache-dump handler. Best-effort install -- failure
+    // here means the [cache-dump] surface is unavailable but rendering
+    // proceeds normally. The handler itself is async-signal-safe (sets
+    // an AtomicBool only); the actual dump happens in the inner loop
+    // below at the start of each Advance iteration. See
+    // qa/r38d-sigusr1-cache-dump-2026-06-02.md.
+    if let Err(e) = crate::sigusr1::install_handler() {
+        eprintln!("warn: SIGUSR1 cache-dump handler install failed: {e}; \
+                   /cache-dump observability unavailable");
+    }
+
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     let stdin_lock = stdin.lock();
@@ -1179,6 +1190,19 @@ where
             session.apply_settings(initial);
         }
         while let Some(line) = lines.next() {
+            // r38d: drain a pending SIGUSR1 by emitting one
+            // [cache-dump] line to stderr. take_pending() is a
+            // single atomic swap (cheap, ~5 ns) -- safe to call
+            // every iteration. Caps come from the canonical pub
+            // consts so a future cap bump auto-flows here.
+            if crate::sigusr1::take_pending() {
+                let (bg_len, tex_len) = session.cma_dump_cache_lens();
+                crate::sigusr1::emit_dump_line(
+                    bg_len, crate::hdmi::IMAGE_BG_CACHE_CAPACITY,
+                    tex_len,
+                    crate::image_slide_tex::IMAGE_SLIDE_TEX_CACHE_CAPACITY,
+                );
+            }
             // Opportunistic settings poll. Cheap stat() call
             // per iteration; the watcher returns None when
             // mtime is unchanged.

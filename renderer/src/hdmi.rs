@@ -5301,6 +5301,17 @@ impl<'a> EglSession<'a> {
         crate::mem::GpuCounters { bo, fb, fbo, textures }
     }
 
+    /// r38d SIGUSR1 cache-dump surface. Returns (image_bg_cache.len,
+    /// image_slide_tex_cache.len). Cheap — both caches expose a pub
+    /// len() (lru.rs:69, image_slide_tex.rs:105); this accessor
+    /// exists solely to surface those numbers across the
+    /// hdmi::Session encapsulation boundary so ipc_main.rs's
+    /// SIGUSR1 handler can format them into the [cache-dump] line.
+    /// Prefix `cma_dump_` makes the SIGUSR1 surface grep-discoverable.
+    pub fn cma_dump_cache_lens(&self) -> (usize, usize) {
+        (self.image_bg_cache.len(), self.image_slide_tex_cache.len())
+    }
+
     /// Bug 1 fix (qarl-flag 2026-05-09): the canonical motion
     /// `tick_seconds` basis. session_start is set once at EglSession
     /// construction and never reset, so every render path (standalone
