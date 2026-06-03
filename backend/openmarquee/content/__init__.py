@@ -194,8 +194,14 @@ class TextLayer(BaseModel):
     # support (2026-05-05) -- multi-line wrapped text reads better
     # left-aligned for prose, center stays the default for short labels.
     text_align: Literal["left", "center", "right"] = "center"
-    # Stroke outline around the glyphs. Editor-set; render support TBD.
+    # Stroke outline around the glyphs. r51 (2026-06-03) wired the UI
+    # toggle + canvas + Rust paths (previously model-only / dead in
+    # production — r49 audit F013 CRITICAL).
     outline: bool = False
+    # r51: drop shadow under the glyphs. Bool toggle for v1.0.1; offset/
+    # blur/color knobs are v1.1 polish. Defaults: small bottom-right
+    # offset (0.04 em), slight blur, ~70% black per dispatch.
+    drop_shadow: bool = False
     # Layer opacity, 0–1. Composited by the renderer when < 1.
     opacity: float = Field(default=1.0, ge=0.0, le=1.0)
     # Vertical anchor INSIDE the box. The current renderer always

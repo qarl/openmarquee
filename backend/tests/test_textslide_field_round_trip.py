@@ -76,3 +76,28 @@ def test_upload_only_fields_are_explicitly_documented():
         f"it should be on TextSlide too, add it to TextSlide and remove "
         f"from this set."
     )
+
+
+def test_text_layer_outline_and_drop_shadow_default_false():
+    """r51: both text-effect bools default to False so legacy slides
+    (and unspecified-field uploads) get the conservative "effects off"
+    behavior. Operators opt in via the editor toggles."""
+    from openmarquee.content import TextLayer
+
+    layer = TextLayer(text="hello")
+    assert layer.outline is False
+    assert layer.drop_shadow is False
+
+
+def test_text_layer_drop_shadow_round_trips_through_dump_and_validate():
+    """r51: drop_shadow survives a model_dump → model_validate cycle
+    in both states. This is the wire-level round trip the renderer +
+    on-disk envelope rely on."""
+    from openmarquee.content import TextLayer
+
+    for value in (True, False):
+        layer = TextLayer(text="hi", drop_shadow=value)
+        dumped = layer.model_dump(mode="json")
+        assert dumped["drop_shadow"] is value
+        rebuilt = TextLayer.model_validate(dumped)
+        assert rebuilt.drop_shadow is value

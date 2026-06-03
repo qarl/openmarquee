@@ -238,6 +238,17 @@ const LAYER_GROUP_TEMPLATE = `
                 <input type="range" class="om-range field-opacity" min="0" max="100" step="1" value="100">
             </label>
         </div>
+        <div class="om-row field-text-effects" style="gap: 14px; align-items: center;">
+            <span class="om-field-label-text-effects">Text effects</span>
+            <label class="om-field om-field-checkbox">
+                <input type="checkbox" class="field-outline">
+                <span>Outline</span>
+            </label>
+            <label class="om-field om-field-checkbox">
+                <input type="checkbox" class="field-drop-shadow">
+                <span>Drop shadow</span>
+            </label>
+        </div>
         <label class="om-field">
             <span>Layer name</span>
             <input type="text" class="om-input field-layer-name" placeholder="Headline" maxlength="200">
@@ -682,6 +693,11 @@ export function mountEditor(
         if (Number.isFinite(parsedSpeed)) {
             fields.motionSpeed = Math.max(0, Math.min(2, parsedSpeed / 100));
         }
+        // r51: text effects (outline + drop_shadow) bool toggles.
+        const outlineEl = groupEl.querySelector(".field-outline");
+        if (outlineEl) fields.outline = outlineEl.checked === true;
+        const dropShadowEl = groupEl.querySelector(".field-drop-shadow");
+        if (dropShadowEl) fields.dropShadow = dropShadowEl.checked === true;
         return fields;
     }
 
@@ -792,11 +808,15 @@ export function mountEditor(
         const motionSpeedEl = groupEl.querySelector(".field-motion-speed");
         const blendEl = groupEl.querySelector(".field-blend");
         const opacityEl = groupEl.querySelector(".field-opacity");
+        // r51 text effects (outline + drop_shadow) checkboxes.
+        const outlineEl = groupEl.querySelector(".field-outline");
+        const dropShadowEl = groupEl.querySelector(".field-drop-shadow");
 
         for (const el of [
             textEl, layerNameEl, textColorEl, fontSizeEl, fontFamilyEl,
             motionEl, motionIntensityEl, motionPhaseEl, motionSpeedEl,
             blendEl, opacityEl,
+            outlineEl, dropShadowEl,
         ]) {
             if (!el) continue;
             // <select> fires "change" on commit; <input> fires "input"
@@ -1112,6 +1132,11 @@ export function mountEditor(
         intensityEl.value = String(layer.motionIntensity ?? 50);
         phaseEl.value = String(layer.motionPhase ?? 0);
         if (speedEl) speedEl.value = String(Math.round((layer.motionSpeed ?? 1) * 100));
+        // r51: hydrate text-effect checkboxes from layer state.
+        const outlineEl = groupEl.querySelector(".field-outline");
+        if (outlineEl) outlineEl.checked = layer.outline === true;
+        const dropShadowEl = groupEl.querySelector(".field-drop-shadow");
+        if (dropShadowEl) dropShadowEl.checked = layer.dropShadow === true;
         paintLayerReadouts(groupEl, layer);
         groupEl.querySelector(".field-motion-controls").hidden =
             (layer.motion || "static") === "static";
@@ -1499,6 +1524,12 @@ export function mountEditor(
             motion_phase: layer.motionPhase ?? 0,
             motion_speed: layer.motionSpeed ?? 1.0,
             blend: layer.blend || "normal",
+            // r51: text effects (outline + drop_shadow). Editor-state
+            // uses camelCase (outline / dropShadow); wire uses
+            // snake_case (outline / drop_shadow). outline matches both
+            // ways since it's already one word.
+            outline: layer.outline === true,
+            drop_shadow: layer.dropShadow === true,
             opacity: layer.opacity ?? 1.0,
             visible: layer.visible !== false,
             box: { ...layer.box },
@@ -1637,6 +1668,11 @@ export function mountEditor(
             motionPhase: wire?.motion_phase ?? 0,
             motionSpeed: typeof wire?.motion_speed === "number" ? wire.motion_speed : 1.0,
             blend: wire?.blend || "normal",
+            // r51: hydrate text effects from wire (snake_case) into
+            // editor-state (outline + dropShadow). Defaults match
+            // layer-defaults.js.
+            outline: wire?.outline === true,
+            dropShadow: wire?.drop_shadow === true,
             opacity: typeof wire?.opacity === "number" ? wire.opacity : 1.0,
             visible: wire?.visible !== false,
             box:
