@@ -122,6 +122,17 @@ class PlaylistItem(BaseModel):
     ] = "cut"
     transition_ms: int = Field(default=500, ge=0, le=5000)
 
+    @model_validator(mode="after")
+    def _clamp_cut_to_zero(self) -> "PlaylistItem":
+        # r52: "cut" has no animation, so its duration is structurally 0.
+        # We CLAMP rather than reject so legacy JSON with `cut` + non-zero
+        # ms loads cleanly (the field was previously hard-coded to 500 by
+        # the UI for every transition kind including cut). Operators
+        # editing in the new popover get the same coercion server-side.
+        if self.transition == "cut" and self.transition_ms != 0:
+            self.transition_ms = 0
+        return self
+
 
 class Playlist(BaseModel):
     """A playlist with a stable UUID `id` and an editable display `name`.
