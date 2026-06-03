@@ -261,3 +261,127 @@ describe("paintLayer line-height (Rust-canonical layout)", () => {
         expect(y).toBeLessThan(600);
     });
 });
+
+
+// r51: outline + drop_shadow are applied via drawTextLineWithEffects
+// which mutates ctx.strokeStyle / lineWidth / shadow* state around the
+// fillText call. The stubbed canvas needs to track those.
+describe("paintLayer text effects (r51 outline + drop_shadow)", () => {
+    function makeStubbedCanvasWithEffects() {
+        const fillCalls = [];
+        const strokeCalls = [];
+        const events = [];
+        let strokeStyle = null;
+        let lineWidth = null;
+        let shadowOffsetX = 0;
+        let shadowOffsetY = 0;
+        let shadowBlur = 0;
+        let shadowColor = null;
+        const ctx = {
+            save: vi.fn(), restore: vi.fn(), translate: vi.fn(),
+            scale: vi.fn(), fillRect: vi.fn(),
+            fillText: vi.fn((line, x, y) => {
+                fillCalls.push({
+                    line, x, y,
+                    shadowOffsetX, shadowOffsetY, shadowBlur, shadowColor,
+                });
+                events.push({ kind: "fill", shadowOffsetX, shadowOffsetY });
+            }),
+            strokeText: vi.fn((line, x, y) => {
+                strokeCalls.push({
+                    line, x, y, strokeStyle, lineWidth,
+                    shadowOffsetX, shadowOffsetY,
+                });
+                events.push({
+                    kind: "stroke", strokeStyle, lineWidth,
+                    shadowOffsetX, shadowOffsetY,
+                });
+            }),
+            measureText: vi.fn((str) => ({
+                width: str.length * 30,
+                actualBoundingBoxAscent: 75,
+                actualBoundingBoxDescent: 25,
+            })),
+            set fillStyle(_v) {}, set font(_v) {},
+            set textAlign(_v) {}, set textBaseline(_v) {},
+            set globalAlpha(_v) {}, set globalCompositeOperation(_v) {},
+            set strokeStyle(v) { strokeStyle = v; },
+            set lineWidth(v) { lineWidth = v; },
+            set shadowOffsetX(v) { shadowOffsetX = v; },
+            set shadowOffsetY(v) { shadowOffsetY = v; },
+            set shadowBlur(v) { shadowBlur = v; },
+            set shadowColor(v) { shadowColor = v; },
+        };
+        return {
+            width: 1000, height: 1000, getContext: () => ctx,
+            _fillCalls: fillCalls, _strokeCalls: strokeCalls,
+            _events: events,
+        };
+    }
+
+    it("default layer (no effects) only calls fillText with no shadow + no stroke", () => {
+        const canvas = makeStubbedCanvasWithEffects();
+        drawCanvas(canvas, { text: "X", font_size_px: 50 });
+        expect(canvas._strokeCalls).toHaveLength(0);
+        expect(canvas._fillCalls).toHaveLength(1);
+        expect(canvas._fillCalls[0].shadowOffsetX).toBe(0);
+        expect(canvas._fillCalls[0].shadowBlur).toBe(0);
+    });
+
+    it("outline=true calls strokeText before fillText with black + scaled lineWidth", () => {
+        const canvas = makeStubbedCanvasWithEffects();
+        drawCanvas(canvas, {
+            text: "X",
+            font_size_px: 100,
+            outline: true,
+        });
+        expect(canvas._events.map((e) => e.kind)).toEqual(["stroke", "fill"]);
+        expect(canvas._strokeCalls[0].strokeStyle).toBe("#000000");
+        // lineWidth scales with font: 100 * 0.05 = 5
+        expect(canvas._strokeCalls[0].lineWidth).toBe(5);
+        // Stroke has no shadow regardless of drop_shadow state.
+        expect(canvas._strokeCalls[0].shadowOffsetX).toBe(0);
+    });
+
+    it("drop_shadow=true sets shadow* before fillText then resets after", () => {
+        const canvas = makeStubbedCanvasWithEffects();
+        drawCanvas(canvas, {
+            text: "X",
+            font_size_px: 100,
+            drop_shadow: true,
+        });
+        // 100 * 0.04 = 4 offset; 100 * 0.06 = 6 blur
+        expect(canvas._fillCalls[0].shadowOffsetX).toBe(4);
+        expect(canvas._fillCalls[0].shadowOffsetY).toBe(4);
+        expect(canvas._fillCalls[0].shadowBlur).toBe(6);
+        expect(canvas._fillCalls[0].shadowColor).toMatch(/rgba\(0,\s*0,\s*0,\s*0\.7\)/);
+    });
+
+    it("outline + drop_shadow: stroke first (no shadow), then fill (with shadow)", () => {
+        const canvas = makeStubbedCanvasWithEffects();
+        drawCanvas(canvas, {
+            text: "X",
+            font_size_px: 100,
+            outline: true,
+            drop_shadow: true,
+        });
+        const kinds = canvas._events.map((e) => e.kind);
+        expect(kinds).toEqual(["stroke", "fill"]);
+        // Stroke has no shadow regardless of drop_shadow state
+        expect(canvas._strokeCalls[0].shadowOffsetX).toBe(0);
+        // Fill carries the shadow at offset (0.04 em)
+        expect(canvas._fillCalls[0].shadowOffsetX).toBe(4);
+    });
+
+    it("accepts camelCase aliases dropShadow + outlineEnabled", () => {
+        const canvas = makeStubbedCanvasWithEffects();
+        drawCanvas(canvas, {
+            text: "X",
+            font_size_px: 100,
+            outlineEnabled: true,
+            dropShadow: true,
+        });
+        expect(canvas._strokeCalls).toHaveLength(1);
+        expect(canvas._fillCalls[0].shadowOffsetX).toBe(4);
+    });
+});

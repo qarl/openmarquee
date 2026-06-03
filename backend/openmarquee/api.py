@@ -259,6 +259,10 @@ class TextLayerUpload(BaseModel):
     text_color: str = "#FFFFFF"
     text_align: str | None = None
     outline: bool | None = None
+    # r51 (2026-06-03): drop_shadow toggle wire field. Optional so
+    # legacy clients posting without the key still succeed; server
+    # defaults to False on the canonical model.
+    drop_shadow: bool | None = None
     opacity: float | None = None
     anchor: str | None = None
     visible: bool | None = None

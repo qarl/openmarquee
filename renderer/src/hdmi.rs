@@ -2416,6 +2416,65 @@ fn draw_text_layer_msdf(
             gl.enable(glow::SCISSOR_TEST);
         }
 
+        // r51: drop_shadow pre-pass. When layer.drop_shadow is true, we
+        // draw the static MSDF batch a second time UNDERNEATH with
+        // shifted vertex positions (small bottom-right offset, ~0.04 of
+        // font height in pixels) and semi-transparent black. Outline is
+        // INTENTIONALLY suppressed on the shadow pass — we want the
+        // solid glyph silhouette to cast the shadow, not the outline
+        // ring. The main pass below then draws with text color +
+        // optional outline on top. Same VBO layout (4 floats per vertex
+        // [x, y, u, v]); a temporary shifted copy gets uploaded once
+        // for the shadow draw and discarded.
+        if layer.drop_shadow && !ink_verts.is_empty() {
+            let offset_px = (size_px * 0.04).max(1.0);
+            let dx_ndc = (offset_px / mode_w as f32) * 2.0;
+            let dy_ndc = -(offset_px / mode_h as f32) * 2.0;
+            let mut shadow_verts: Vec<f32> = ink_verts.clone();
+            for chunk in shadow_verts.chunks_exact_mut(4) {
+                chunk[0] += dx_ndc;
+                chunk[1] += dy_ndc;
+            }
+            let cgp_sh = cached_msdf_program(gl, false)?;
+            let vbo_sh = gl
+                .create_buffer()
+                .map_err(|e| anyhow!("glGenBuffers (msdf shadow): {e}"))?;
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo_sh));
+            let bytes_sh = std::slice::from_raw_parts(
+                shadow_verts.as_ptr() as *const u8,
+                shadow_verts.len() * std::mem::size_of::<f32>(),
+            );
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes_sh, glow::STATIC_DRAW);
+            gl.use_program(Some(cgp_sh.program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(atlas_tex));
+            gl.uniform_1_i32(cgp_sh.u_atlas.as_ref(), 0);
+            gl.uniform_3_f32(cgp_sh.u_text_color.as_ref(), 0.0, 0.0, 0.0);
+            gl.uniform_1_f32(cgp_sh.u_opacity.as_ref(), opacity * 0.7);
+            if cgp_sh.u_aa_width.is_some() {
+                gl.uniform_1_f32(cgp_sh.u_aa_width.as_ref(), 0.05);
+            }
+            let a_pos_sh = cgp_sh.a_pos;
+            let a_uv_sh = cgp_sh.a_uv;
+            let stride = (4 * std::mem::size_of::<f32>()) as i32;
+            gl.enable_vertex_attrib_array(a_pos_sh);
+            gl.vertex_attrib_pointer_f32(a_pos_sh, 2, glow::FLOAT, false, stride, 0);
+            gl.enable_vertex_attrib_array(a_uv_sh);
+            gl.vertex_attrib_pointer_f32(
+                a_uv_sh,
+                2,
+                glow::FLOAT,
+                false,
+                stride,
+                (2 * std::mem::size_of::<f32>()) as i32,
+            );
+            let vert_count_sh = (shadow_verts.len() / 4) as i32;
+            gl.draw_arrays(glow::TRIANGLES, 0, vert_count_sh);
+            gl.disable_vertex_attrib_array(a_pos_sh);
+            gl.disable_vertex_attrib_array(a_uv_sh);
+            gl.delete_buffer(vbo_sh);
+        }
+
         // Batch 1: MSDF-ink glyphs.
         if !ink_verts.is_empty() {
             let cgp = cached_msdf_program(gl, layer.outline)?;
@@ -2526,6 +2585,64 @@ fn draw_text_layer_msdf(
         // committed to dynamic geometry for these quads.
         if !dynamic_ink_verts.is_empty() {
             if let Some(dyn_tex) = dynamic_atlas_tex() {
+                // r51: drop_shadow pre-pass for dynamic glyphs (mirrors
+                // Batch 1's pre-pass; same offset math + black + 0.7
+                // opacity + outline=false so the solid silhouette
+                // casts the shadow).
+                if layer.drop_shadow {
+                    let offset_px = (size_px * 0.04).max(1.0);
+                    let dx_ndc = (offset_px / mode_w as f32) * 2.0;
+                    let dy_ndc = -(offset_px / mode_h as f32) * 2.0;
+                    let mut shadow_verts: Vec<f32> = dynamic_ink_verts.clone();
+                    for chunk in shadow_verts.chunks_exact_mut(4) {
+                        chunk[0] += dx_ndc;
+                        chunk[1] += dy_ndc;
+                    }
+                    let cgp_sh = cached_msdf_program(gl, false)?;
+                    let vbo_sh = gl
+                        .create_buffer()
+                        .map_err(|e| anyhow!("glGenBuffers (dyn msdf shadow): {e}"))?;
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo_sh));
+                    let bytes_sh = std::slice::from_raw_parts(
+                        shadow_verts.as_ptr() as *const u8,
+                        shadow_verts.len() * std::mem::size_of::<f32>(),
+                    );
+                    gl.buffer_data_u8_slice(
+                        glow::ARRAY_BUFFER,
+                        bytes_sh,
+                        glow::STATIC_DRAW,
+                    );
+                    gl.use_program(Some(cgp_sh.program));
+                    gl.active_texture(glow::TEXTURE0);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(dyn_tex));
+                    gl.uniform_1_i32(cgp_sh.u_atlas.as_ref(), 0);
+                    gl.uniform_3_f32(cgp_sh.u_text_color.as_ref(), 0.0, 0.0, 0.0);
+                    gl.uniform_1_f32(cgp_sh.u_opacity.as_ref(), opacity * 0.7);
+                    if cgp_sh.u_aa_width.is_some() {
+                        gl.uniform_1_f32(cgp_sh.u_aa_width.as_ref(), 0.05);
+                    }
+                    let a_pos_sh = cgp_sh.a_pos;
+                    let a_uv_sh = cgp_sh.a_uv;
+                    let stride = (4 * std::mem::size_of::<f32>()) as i32;
+                    gl.enable_vertex_attrib_array(a_pos_sh);
+                    gl.vertex_attrib_pointer_f32(
+                        a_pos_sh, 2, glow::FLOAT, false, stride, 0,
+                    );
+                    gl.enable_vertex_attrib_array(a_uv_sh);
+                    gl.vertex_attrib_pointer_f32(
+                        a_uv_sh,
+                        2,
+                        glow::FLOAT,
+                        false,
+                        stride,
+                        (2 * std::mem::size_of::<f32>()) as i32,
+                    );
+                    let vert_count_sh = (shadow_verts.len() / 4) as i32;
+                    gl.draw_arrays(glow::TRIANGLES, 0, vert_count_sh);
+                    gl.disable_vertex_attrib_array(a_pos_sh);
+                    gl.disable_vertex_attrib_array(a_uv_sh);
+                    gl.delete_buffer(vbo_sh);
+                }
                 let cgp = cached_msdf_program(gl, layer.outline)?;
                 let vbo = gl
                     .create_buffer()

@@ -30,6 +30,12 @@ export function defaultLayer() {
         motionPhase: 0,
         motionSpeed: 1.0,
         blend: "normal",
+        // r51: text effects (defaults off — operator opts in via the
+        // editor "Text Effects" panel section). Editor-state field
+        // names; loadForEdit + performSave bridge to wire snake_case
+        // (outline / drop_shadow).
+        outline: false,
+        dropShadow: false,
         opacity: 1.0,
         visible: true,
         box: { x: 0.1, y: 0.1, w: 0.8, h: 0.8 },

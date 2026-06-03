@@ -185,6 +185,15 @@ pub struct TextLayer {
     /// ring in u_outline_color (black).
     #[serde(default)]
     pub outline: bool,
+    /// r51 -- drop shadow under the glyphs. Bool toggle for v1.0.1;
+    /// offset/blur/color knobs are v1.1 polish. When true, the
+    /// glyph batch render does a pre-pass: the same MSDF batch is
+    /// drawn at a small bottom-right offset (~0.04 of font height
+    /// in pixels) with semi-transparent black (~0.7 alpha), then
+    /// the regular text pass draws on top. Canvas mirrors via
+    /// ctx.shadowOffsetX/Y/Blur/Color.
+    #[serde(default)]
+    pub drop_shadow: bool,
     /// v1-spec-delta #7 -- per-layer compositing mode against
     /// what's already been drawn. Schema literal:
     /// `normal` / `screen` / `multiply` / `overlay`. Default

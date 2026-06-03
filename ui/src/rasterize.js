@@ -170,6 +170,14 @@ function paintLayer(ctx, canvas, layer) {
         fontSizePx = pickFontSize(boxW);
     }
     ctx.fillStyle = textColor;
+    // r51: text effects flags. Outline strokes a black ring before fill;
+    // drop_shadow casts a small bottom-right shadow via the native canvas
+    // shadow API. Read both editor-state + wire field names since this
+    // path is used by inline-preview (wire shape) AND drawCanvas
+    // (editor-state shape).
+    const outline = layer.outline === true || layer.outlineEnabled === true;
+    const dropShadow =
+        layer.drop_shadow === true || layer.dropShadow === true;
     const weight = FONT_WEIGHT_BY_VALUE.get(fontFamily) ?? 700;
     ctx.font = `${weight} ${fontSizePx}px ${cssFontFamily(fontFamily)}`;
     const textAlign = layer.text_align || layer.textAlign || "center";
@@ -367,7 +375,14 @@ function paintLayer(ctx, canvas, layer) {
         }
     } else if (yScale === 1) {
         for (let i = 0; i < lines.length; i++) {
-            ctx.fillText(lines[i], anchorX, firstBaselineY + i * lineHeight, maxWidth);
+            drawTextLineWithEffects(
+                ctx,
+                lines[i],
+                anchorX,
+                firstBaselineY + i * lineHeight,
+                maxWidth,
+                { outline, dropShadow, fontSizePx },
+            );
         }
     } else {
         ctx.save();
@@ -381,9 +396,62 @@ function paintLayer(ctx, canvas, layer) {
         // now only reached when WASM isn't available OR the font
         // isn't registered (Phase 3a removed the yScale==1 WASM gate).
         for (let i = 0; i < lines.length; i++) {
-            ctx.fillText(lines[i], 0, firstBaselineLocal + i * lineHeight, maxWidth);
+            drawTextLineWithEffects(
+                ctx,
+                lines[i],
+                0,
+                firstBaselineLocal + i * lineHeight,
+                maxWidth,
+                { outline, dropShadow, fontSizePx },
+            );
         }
         ctx.restore();
+    }
+}
+
+/**
+ * r51: draw one text line with outline + drop_shadow effects.
+ *
+ * Order:
+ *   1. (outline) strokeText with no shadow — paints the black ring
+ *   2. (drop_shadow) set shadow* state so the fillText that follows
+ *      casts a shadow under the entire glyph silhouette
+ *   3. fillText — paints the text color on top of the outline
+ *   4. reset shadow* state so subsequent draws aren't shadowed
+ *
+ * Shadow defaults per dispatch:
+ *   offset: (0.04 em, 0.04 em) -- small bottom-right
+ *   blur:   0.06 em
+ *   color:  rgba(0, 0, 0, 0.7)
+ *
+ * Outline color hard-coded black per Rust's u_outline_color convention.
+ * Outline width scales with font size (~5%) so it stays proportional.
+ */
+function drawTextLineWithEffects(ctx, line, x, y, maxWidth, opts) {
+    const { outline, dropShadow, fontSizePx } = opts;
+    if (outline) {
+        const prevStroke = ctx.strokeStyle;
+        const prevWidth = ctx.lineWidth;
+        // Shadow OFF for the stroke so the outline doesn't cast its
+        // own (hollow-ring) shadow.
+        ctx.strokeStyle = "#000000";
+        ctx.lineWidth = Math.max(1, fontSizePx * 0.05);
+        ctx.strokeText(line, x, y, maxWidth);
+        ctx.strokeStyle = prevStroke;
+        ctx.lineWidth = prevWidth;
+    }
+    if (dropShadow) {
+        ctx.shadowOffsetX = fontSizePx * 0.04;
+        ctx.shadowOffsetY = fontSizePx * 0.04;
+        ctx.shadowBlur = fontSizePx * 0.06;
+        ctx.shadowColor = "rgba(0, 0, 0, 0.7)";
+    }
+    ctx.fillText(line, x, y, maxWidth);
+    if (dropShadow) {
+        ctx.shadowOffsetX = 0;
+        ctx.shadowOffsetY = 0;
+        ctx.shadowBlur = 0;
+        ctx.shadowColor = "rgba(0, 0, 0, 0)";
     }
 }
 
