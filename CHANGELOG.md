@@ -19,61 +19,215 @@ locations for cross-ecosystem readability.
 
 **DRAFT release notes.** The 1.0.1 tag + RELEASE commit are
 qarl's call. These notes cover everything between `v1.0.0`
-(`57d95db`, 2026-05-31) and origin/main HEAD `4a0ba6d` as of
-2026-06-02 — 27 commits across renderer perf, CMA observability
-+ stopgaps, dual-radio topology, build/deploy hygiene, and doc
-hygiene. Spec / DESIGN_BRIEF / IMPLEMENTATION_PLAN unchanged
-since v1.0.0; no operator-visible feature changes; pure
-maintenance ship.
+(`57d95db`, 2026-05-31) and origin/main HEAD `f4d59948` as of
+2026-06-03 — 38 commits across a SUBSTANTIVE feature ship
+(text-over-video composite), the operator-visible UI exposure
+batch (outline + drop shadow + transition timing + HTTPS toggle),
+two workflow-driven adversarial-refute audits (r47 spec-vs-code
++ r49 UI-vs-model), the cumulative renderer allocator defense-
+in-depth arc, CMA observability stopgaps, dual-radio topology,
+and build/deploy hygiene. **Not a pure maintenance ship — text-
+over-video and 4 UI feature exposures are real operator-visible
+changes.** Spec coordination is documented per-section below;
+SYSTEM_SPEC rewrites pending admin-Jimmy per r47 §F.
+
+### Renderer feat — text-over-video composite (the headline)
+
+End-to-end implementation of SYSTEM_SPEC §5.10's text-over-video
+slide type. r47's spec-vs-code audit had flagged the §5.10 claim
+as PARTIAL (NV12 dmabuf sampling worked; text-layer compositing
+in the video-frame path didn't exist); r46 closed it.
+
+The implementation iterated through several rounds. Documented
+honestly because the iteration pattern matters for v1.0.1's
+story:
+
+- `f5254af` r46 — initial implementation. Adds
+  `TextLayer.background_video_slide_id: Option<Uuid>` in
+  `renderer/src/content.rs` (was previously serde-dropped
+  silently); adds `paint_and_present_one_text_over_video_slide_frame`
+  in `hdmi.rs` (mirrors the image-bg-on-text path with a V4L2
+  decode + dmabuf-blit bg step); adds `ensure_bg_video_for_text_slide`
+  cache method in `ipc_main.rs`. Per-frame text paint (not the
+  dispatch's literal cached-PNG design); rationale in audit
+  `qa/r46-text-over-video-impl-2026-06-02.md` §C.
+- `b2b225f` r46.1 — `resolve_slide_bg` warn cleanup. Hot-path
+  log spam removed.
+- `12cafba` r46.2 — text-over-video freeze fix attempt (CMA
+  re-prime memoization). Memoized the per-slide V4L2 decoder
+  init to avoid re-creation cost on slide repeat. *Side effect:
+  broke the scanout chain on the second play of a memoized
+  slide.*
+- `dd8fa74` r46.3 — text-over-video scanout regression fix
+  (`capture_drained` reset). Restored scanout correctness from
+  r46.2. *Side effect: broke video sample wrap (clip shorter
+  than slot stopped looping).*
+- `b3f932d` r46.4 — V4L2 wrap fix via
+  `VIDIOC_DECODER_CMD V4L2_DEC_CMD_START`. Targeted the wrap
+  symptom by adding a kernel-level decoder restart between
+  loops. *Side effect: didn't help — wrong surface.*
+- `c2edea1` r48 — V4L2 OUTPUT buffer rotation (the perf-night-
+  r5 free-list refactor). **The actual fix.** Pre-r48
+  `Decoder::feed()` always used `buf_idx=0` (single OUTPUT
+  buffer); on bcm2835-codec, back-to-back feeds raced
+  `drain_output_quiet` against the kernel's decode pipeline —
+  the kernel still owned slot 0 when the next feed tried to
+  QBUF it again, returning `VIDIOC_QBUF OUTPUT: EINVAL`. The
+  perf-night r5 comment at `video_decode.rs:170-178`
+  (2026-05-26) explicitly anticipated this refactor; r48 ships
+  it. After r48, the text-over-video freeze + wrap symptoms
+  both resolve at the root cause.
+- r50 (in flight / pending qarl confirmation as of v1.0.1
+  draft) — wires text-over-video INTO the playlist-level
+  transition rendering path so a fade/wipe/etc. into a text-
+  over-video slide presents both layers correctly. If r50 has
+  landed by tag-cut, this entry replaces with its SHA + the
+  transition coverage closes §5.10 fully. **Tag-cut blocker:
+  r50 live-fire verification on FYS.**
+
+The symptom-chase pattern (r46.2 → r46.3 → r46.4 each fixed a
+symptom + introduced the next, until r48 found the right
+surface) is the v1.0.1 lesson on staying disciplined under
+symptom pressure. r48's commit message explicitly cites the
+2026-05-26 perf-night r5 comment that anticipated the free-list
+refactor — the right fix was already named in a code comment;
+the chase happened because the symptoms looked V4L2-spec-flow
+shaped, not free-list shaped.
+
+### UI exposure — text effects, transition timing, HTTPS toggle
+
+r49's UI-vs-model audit (see below) surfaced 14 fields where the
+Pydantic model + Rust renderer honored an effect but the UI
+editor had no surface. v1.0.1 closes 4 of them; the rest deferred
+to v1.1 or by-design per r49.
+
+- `ef3bc95` r51 — `TextLayer.outline` (CRITICAL F013 from r49)
+  + `TextLayer.drop_shadow` (NEW field) across all 4 surfaces:
+  Pydantic model + Rust renderer (MSDF shadow pre-pass at the
+  static + dynamic glyph batches) + Canvas2D (native
+  shadowOffsetX/Y/Blur/Color API + strokeText) + UI editor (new
+  Text effects row in the per-layer accordion). Outline shader
+  was previously dead in production because nothing in the UI
+  ever set the flag; r51 unblocks it. drop_shadow is a fresh
+  bool toggle with baked-in v1.0.1 defaults (small bottom-right
+  offset, slight blur on Canvas, ~70% black). Parity gap
+  documented in `qa/r51-outline-dropshadow-2026-06-03.md` §F
+  (Canvas gaussian blur vs Rust sharp SDF); parity fixture
+  staged at `renderer/tests/fixtures/f0000000-0000-4000-8000-00000000005a/`
+  pending the FYS-side `scripts/render_tests.sh --bless` golden
+  generation as an r51b follow-up.
+- `a222973` r52 — `PlaylistItem.transition_ms` operator-editable
+  via the Option B click-to-open popover. Pre-r52 the playlist
+  track UI hard-coded 500 ms at 3 sites (HIGH F081 from r49).
+  Now: clicking the transition chip opens a popover with BOTH
+  kind and duration controls. Cut transitions structurally have
+  length=0 — both UI (disables ms input on kind=cut, auto-
+  restores `lastNonZeroMs` on kind=other, auto-switches to
+  `lastNonCutKind` when operator types ms while kind=cut) AND
+  backend (`PlaylistItem._clamp_cut_to_zero` model_validator
+  clamps rather than rejects so legacy on-disk JSON with
+  `{transition:"cut", transition_ms:500}` loads cleanly).
+  Migration: v2 storage migration assertion updated 500 → 0 in
+  the existing `test_v2_on_disk_migrates_with_default_transitions`
+  test.
+- `f4d5994` r53 — `SystemSettings.tailscale_https_enabled` UI
+  checkbox in the Tailscale fieldset. Closes 9-day-old backlog
+  from `project_https_phase_1_shipped_2026_05_24` (HIGH F078
+  from r49). The field was wired backend-side
+  (`fqdn_redirect_middleware.py:120` + `install.sh`) since
+  2026-05-24 but had zero UI surface. r53's hydration uses
+  `settings.tailscale_https_enabled !== false` (not `=== true`)
+  so a legacy `settings.json` missing the key renders as
+  checked, matching the model default (`True`) and the device's
+  at-rest HTTPS-on behavior.
+
+### Workflow-driven audit work — r47 + r49
+
+Two adversarial-refute audits drove the dispatch routing for
+v1.0.1's later half. Both used the same workflow harness pattern:
+enumerate candidates → parallel verifiers → adversarial
+refuters with distinct skeptic lenses → majority-refutes (2+ of
+3) kills the finding. Workflow scripts live under
+`.claude/workflows/` (not committed per the standing rule;
+methodology described in each audit doc).
+
+- `c57e109` r47 — SYSTEM_SPEC.md vs code audit. 38 agents /
+  1.5M subagent tokens / 16 min. 74 capability claims; 53
+  VERIFIED, 12 PARTIAL, 9 NOT_IMPLEMENTED (7 CRITICAL). Zero
+  adversarial flips — all 9 NOT_IMPLEMENTED findings survived
+  3-lens (alternate field names / indirect implementation /
+  wire-format translation) skeptic refutation. Top findings:
+  C074 sign-side WiFi welcome screen (never shipped; pending
+  qarl decision doc-rewrite vs build-the-impl), C036
+  text-over-video (closed by r46+r48 above), C034 TextSlide
+  rerender on display-dim change (removed in DELETE-PIL; spec
+  pending rewrite), C007 output_mode collapsed to HDMI-only,
+  C014 USB-WiFi-dongle udev rule (proposed in r31/r34 audits
+  but never landed), C030/C031/C032 Welcome+Freedom seed
+  collapsed into FREE YOUR SIGN demo reel. Full table in
+  `qa/r47-spec-vs-code-audit-2026-06-02.md`. **§F outer-repo
+  recommendations queued for admin-Jimmy** — 7 SYSTEM_SPEC.md
+  rewrite candidates documented; F.5 + F.7 require qarl product
+  judgment (doc-rewrite vs ship-the-impl).
+- `12a986e` r49 — UI vs Pydantic-model audit. 55 agents / 1.88M
+  subagent tokens / 12.3 min. 92 operator-facing fields; 74
+  VERIFIED (80%), 18 non-VERIFIED. 5 high-impact (1 CRITICAL +
+  3 HIGH + 1 MEDIUM); 13 by-design LOW (mostly v3+ playlist-
+  owns-transitions legacy fields). Zero adversarial flips
+  matching r47's gold-standard rigor. Top-5: F013 outline
+  (closed by r51), F008 font_size_px READ_ONLY (likely-
+  intentional responsive design), F078 tailscale_https_enabled
+  (closed by r53), F081 PlaylistItem.transition_ms (closed by
+  r52), F010 TextLayer.weight (deferred v1.1, ~80-100 LOC
+  across model+UI+renderer). Full table in
+  `qa/r49-ui-vs-model-audit-2026-06-03.md`.
+
+The workflow pattern is now part of the toolkit and will be
+reused for any future "enumerate + verify + adversarially refute"
+audit.
 
 ### Renderer perf — allocator defense-in-depth arc
 
 The CMA-pool "leak" hypothesis from the post-v1.0.0 D.2 / r35
 FPS investigation drove a four-round audit + fix arc on the
-renderer's GLES / EGL / V4L2 allocator paths. **The HIGH-priority
-"scanout BO/FB leak in a SUSPECT path" hypothesis from r37's
-audit was REFUTED** by deep-read (`qa/r38b-hdmi-cma-deep-read-2026-06-02.md`)
-— all 13 `lock_front_buffer` callsites in `hdmi.rs` already
-match the canonical 11-step release contract. But the deep-read
-+ adversarial subagent reviews surfaced 7 latent defense-in-depth
-bugs in adjacent allocator paths, all shipped. None affect FYS
-production steady-state (FYS has no streams, no VideoSlides, no
-DMABUF) but each improves robustness for any flock member running
-those modes.
+renderer's GLES / EGL / V4L2 allocator paths. **The HIGH-
+priority "scanout BO/FB leak in a SUSPECT path" hypothesis from
+r37's audit was REFUTED** by deep-read
+(`qa/r38b-hdmi-cma-deep-read-2026-06-02.md`) — all 13
+`lock_front_buffer` callsites in `hdmi.rs` already match the
+canonical 11-step release contract.
+
+The cumulative arc's allocator-leak hypothesis space is **fully
+audited** — zero new SUSPECT or CONFIRMED-LEAK sites remain
+across `renderer/src/` per r42's §F. But the FYS leak hypothesis
+that DROVE the arc turned out to be wrong: post-r38c QA time-
+series traces showed `cma_used` swinging 229-254 MB on per-
+minute intervals — a noisy band, not a stable steady state.
+The "187 → 255.8 MB over 6h drift" in D.2 was largely variance +
+cache fill, not a 70 MB leak. **Honest read: the renderer perf
+arc shipped real defense-in-depth for non-FYS deployments
+(VideoSlide + DMABUF + VLC stream paths), but the FYS leak
+hypothesis was wrong; the symptom was cache + noise.** Future
+perf-ceiling audits should follow the standing rule (see
+`feedback_perf_audit_enumerate_allocators` memory): inventory
+allocator surfaces alongside compute/sync candidates from
+round zero, not after a multi-round chase.
 
 - `5ac3ca2` r38b — transition-closure scanout cleanup. 3
   `?`-bubble sites in `paint_and_present_one_transition_frame`
   would leak ~16 MB of bake-target GLES storage on
-  `ensure_scene_fbo` / `get_attrib_location` failure. Match-arm
-  cleanup mirroring the canonical `:3724-3731` scanout
-  commit-fail pattern.
+  `ensure_scene_fbo` / `get_attrib_location` failure.
 - `f14c3b1` r40 — 3 non-FYS allocator fixes:
-  `bake_external_nv12_to_current_fbo` y_tex orphan on uv_tex
-  create-fail (VLC NV12 stream path); `run_nv12_dmabuf_blit_pass`
-  EGLImage + dma_buf ref leak on tex create-fail (DMABUF
-  VideoSlide path, gated by `OPENMARQUEE_RENDERER_DMABUF=1` +
-  VideoSlide); `bake_video_slide_to_current_fbo` MMAP y_tex
-  orphan on uv_tex create-fail (V4L2 video paint HOT path; per-
-  video-frame leak under CMA pressure).
-- `30039bd` r41 — capture-path + atlas-startup cleanup.
-  `capture_fullres_transition_mid_to_png` cap_tex create-fail
-  leaked fbo_a/tex_a/fbo_b/tex_b (~16 MB); brought in line with
-  the verbatim sibling at `capture_legacy_3pass_transition_mid_to_png:4951-4960`.
-  `sdf_atlas_gl.rs:upload_all` `cleanup_partial` closure
-  releases partial-Vec textures + restores `UNPACK_ALIGNMENT=4`
-  on the failure path.
+  `bake_external_nv12_to_current_fbo` y_tex orphan,
+  `run_nv12_dmabuf_blit_pass` EGLImage + dma_buf ref leak,
+  `bake_video_slide_to_current_fbo` MMAP y_tex orphan.
+- `30039bd` r41 — `capture_fullres_transition_mid_to_png`
+  cap_tex create-fail leaked fbo_a/tex_a/fbo_b/tex_b (~16 MB)
+  + `sdf_atlas_gl.rs:upload_all` `cleanup_partial` closure.
 - `14adb16` r42 — V4L2 EXPBUF fd-leak. `allocate_buffers`
   EXPBUF loop leaked any fds already pushed to local
-  `fds: Vec<RawFd>` on mid-loop failure (`RawFd` has no Drop;
-  `DecoderInner::drop` only closes
-  `inner.capture_dmabuf_fds` which stayed empty on the error
-  path). `cleanup_partial_fds` closure with `libc::close`,
-  mirroring the r41 `cleanup_partial` pattern.
-
-**Cumulative sweep complete.** Per `qa/r42-v4l2-expbuf-fd-leak-2026-06-02.md`
-§F, zero new SUSPECT or CONFIRMED-LEAK sites remain across
-`renderer/src/`. The renderer's `?`-bubble allocator-leak
-hypothesis space is fully audited.
+  `fds: Vec<RawFd>` on mid-loop failure;
+  `cleanup_partial_fds` closure with `libc::close`.
 
 ### CMA observability + stopgaps
 
@@ -81,198 +235,267 @@ hypothesis space is fully audited.
   oneshot service polls `/proc/meminfo` every 60s; if
   `CmaUsed >= 220 MB` AND outside the 30-min cooldown, runs
   `systemctl restart --no-block openmarquee-backend.service`.
-  Backend restart tears down the renderer subprocess via uvicorn
-  lifespan, releasing all CMA-backed allocations. Paired with a
-  daily 03:00 cron restart as the hard floor. **Threshold may
-  be too low** — see Known Issues below.
-- `84629f0` cron enable-guard follow-up — defense for the r38c
-  `§3c` daily-restart drop-in.
-- `95b150a` r38d — SIGUSR1 cache-dump handler in `main.rs`.
-  Operators can `sudo pkill -USR1 -f openmarquee-render` to dump
-  `image_bg_cache.len()`, `image_slide_tex_cache.len()`,
-  `slide_caches.len()`, and `cma_used` to journald. Surfaces
-  whether observed CMA-used growth is the LRU caches warming
-  toward cap (expected) or a true leak (now refuted by the
-  allocator-defense arc).
+  Paired with a daily 03:00 cron restart as the hard floor.
+  **Threshold mistuned** — see Known Issues below.
+- `84629f0` cron enable-guard follow-up — defense for the
+  daily-restart drop-in. `install.sh §3d` checks
+  `systemctl is-enabled cron.service` and enables if disabled.
+- `95b150a` r38d — SIGUSR1 cache-dump handler. Operators can
+  `sudo pkill -USR1 -f openmarquee-render` to dump
+  `image_bg_cache.len()`, `image_slide_tex_cache.len()`, and
+  CMA/vm_rss snapshot to journald in a single TAB-separated
+  `[cache-dump]` line. Confirms whether observed CMA growth is
+  cache fill (expected; capped) or pipeline churn.
 
 ### Topology — dual-radio dongle + Option B SHIP verdict
 
 - `b5b9919` r34 — dual-radio USB-WiFi-dongle shipping topology
   (feat). Adds the `wlan-dongle` management-WiFi role: any
   rt2x00usb-family USB dongle, udev-renamed via
-  `99-openmarquee-usb-wlan.rules`, with a NetworkManager
+  `system/99-openmarquee-usb-wlan.rules`, with a NetworkManager
   keyfile pinned `interface-name=wlan-dongle` and
-  `route-metric=50`. Tailscale outbound prefers the dongle path;
-  on a Pi WITHOUT a dongle behavior is identical to v1.0.0
-  (single-radio AP+STA via `ap0`+`wlan0`).
-  `system/README.md` "Dual-radio shipping topology" (lines
-  124-153) is the canonical operator-facing doc.
-- `13d5067` — ruff format fixup for r34 firstboot tests.
+  `route-metric=50`. (r47's C014 NOT_IMPLEMENTED finding was a
+  code2-vs-main worktree divergence — the rule landed on main
+  with r34's `b5b9919` but had not yet propagated to the code2
+  worktree at the time r47's audit ran; on main HEAD the file
+  is present and the C014 gap is closed.)
 - `2486073` r43 — brcmfmac AP-only audit. Static + community-
-  evidence research audit closing code2 r33's "critical premise
-  A.6" (does hostapd directly on `wlan0` AP-only work reliably
-  on BCM43438?). Verdict: **SHIP Option B** with conditions
-  (kernel rpi-6.12.y or newer containing `3f8ad41f42b6`;
-  `hostapd.conf` driver=nl80211 + hard-coded channel 1/6/11 +
-  `ieee80211w=0` + `disassoc_low_ack=1`; no concurrent STA; ≤10
-  phone clients; systemd `Restart=on-failure`). Rollback
-  criteria in audit `§C.3`. **Implementation pending qarl's
-  ship-now/hold call** — not in v1.0.1.
+  evidence research audit closing code2 r33's "critical
+  premise A.6" (does hostapd directly on `wlan0` AP-only work
+  reliably on BCM43438?). Verdict: **SHIP Option B** with
+  conditions. **Implementation pending qarl's ship-now/hold
+  call** — not in v1.0.1.
 - `4a0ba6d` r44 — `wifi_station.py` post-dongle/nmcli comment
-  sweep. Replaces the pre-r34 "wlan0 is the BCM43438 radio's
-  primary interface" comment with the post-r34 role-split
-  docstring (wlan0 = sign-STA + captive-portal-AP scope;
-  wlan-dongle = mgmt-WiFi). Also fixes 2 pre-existing stale
-  `api_settings.py` comments describing the OLD
-  `wpa_supplicant@wlan0` template implementation that got
-  replaced by the nmcli rewrite (commit `6ecd1a2`, pre-v1.0).
+  sweep.
 
 ### Build / deploy hygiene
 
-- `3de2a3f` — `/healthz` probe budget bumped 30s → 75s to
-  accommodate the post-r25 ~46s sidecar boot.
-- `5d2a9e9` r29 — `install.sh` reorder. Sections §3 (renderer
-  binary download) + §3a (defensive chmod) + §3b (binary
-  install) now run BEFORE §2 (venv + pip). Closes a class
-  where a pip-install failure left an EXIT-trap that prevented
-  the renderer binary from being installed — md5 verify against
-  `/usr/local/bin/openmarquee-render` after every deploy is now
-  the operator pattern. Also makes the binary install atomic
+- `3de2a3f` — `/healthz` probe budget bumped 30s → 75s.
+- `5d2a9e9` r29 — `install.sh` reorder. Sections §3 + §3a +
+  §3b run BEFORE §2. Renderer binary install also atomic now
   (cp to `.new` then rename).
-- `687485d` r31 — `deploy.sh` refreshes aarch64 wheels on each
-  deploy + adds FFmpeg dev headers to the apt install set
-  (Candidate A+B per the r30 install.sh pip-failure audit).
-- `621b4f3` r32 — `deploy.sh` ensures emoji fonts survive the
-  `rsync --delete` propagation. The pre-r32 `/tmp` clone
-  workflow could wipe `noto-color-emoji-colrv1.ttf` from FYS;
-  emergency fix shipped 2026-05-31.
+- `687485d` r31 — `deploy.sh` refreshes aarch64 wheels per
+  deploy + adds FFmpeg dev headers (Candidate A+B per the r30
+  install.sh pip-failure audit).
+- `621b4f3` r32 — `deploy.sh` ensures emoji fonts survive
+  `rsync --delete`.
 - `3cee501` r33 — manifest-based regression test for `deploy.sh`
-  runtime assets. Static-parse test pins the protection
-  semantics for both `noto-color-emoji-colrv1.ttf` (download-
-  before-sync) and `noto-color-emoji.ttf` (rsync `--exclude`
-  inside the ui rsync block). Future regressions of the
-  emoji-font-wipe class are caught at pre-push.
+  runtime assets.
 - `ce47ffe` r37a — `scripts/build_sd_bundle.sh` hygiene:
-  emoji-font pre-fetch (§0a), manifest-based runtime-asset test
-  (§0b preflight), SHA256 sidecar stamp after bundle write, and
-  fail-loud preflight asserts (emoji-font size > 3MB; aarch64
-  arch grep tightened).
-- `d06c506` r32 — pre-push hook tighten (code2; the BT.709
-  v4l2.rs comment ride-along piece is doc-only — see Doc
-  hygiene below).
+  emoji-font pre-fetch, manifest preflight, SHA256 sidecar,
+  fail-loud preflight asserts.
+- **Operator deploy pattern (Path D)** — emerged from tonight's
+  reboot cycle pain. Standard sequence:
+  1. `systemctl stop openmarquee-wifi-watchdog` (so it doesn't
+     reboot the box mid-deploy)
+  2. `systemctl stop openmarquee-backend` (releases mmap'd
+     `/usr/local/bin/openmarquee-render`)
+  3. `rsync` the new binary unthrottled (no ETXTBSY)
+  4. `mv -f` atomic rename (same-filesystem dirent swap)
+  5. `systemctl start openmarquee-backend` (picks up new
+     binary)
+  6. `systemctl start openmarquee-wifi-watchdog`
+  Path D is the new standard for any renderer-binary deploy
+  outside of the standard `scripts/deploy.sh` flow.
 
 ### Doc hygiene
 
 - `d06c506` r32 + `0584f14` r33 — BT.709 colorspace doc-comment
   ride-alongs (code2). Pure renderer-comment updates in
-  `v4l2.rs:colorspace_block` and `hdmi.rs:3520` to clarify the
-  BT.709 vs BT.601 matrix-coefficient choice. Zero behavior
-  change.
-- `af6001e` r39 — `VideoSlide.duration_ms` docstring rewrite in
-  `backend/openmarquee/content/__init__.py` + the Rust schema
-  mirror in `renderer/src/content.rs`. The pre-r39 "duration_ms
-  is informational; the playback engine reads the actual runtime
-  from the file" claim was WRONG — `playback.py` reads
-  `item.duration_ms` directly + computes `end_at = t0 +
-  duration_ms / 1000`, and the renderer LOOPS the clip back to
-  sample 0 when the file is shorter than the slot (FYS bug 3
-  fix in `bake_video_slide_to_current_fbo`). `SYSTEM_SPEC.md`
-  §5.10 already documented the looping behavior correctly; the
-  Pydantic + Rust docstrings were the outliers.
+  `v4l2.rs:colorspace_block` and `hdmi.rs:3520`.
+- `af6001e` r39 — `VideoSlide.duration_ms` docstring rewrite.
+  The pre-r39 "duration_ms is informational; the playback
+  engine reads the actual runtime from the file" claim was
+  WRONG.
 - `4a0ba6d` r44 — see Topology above.
-- 7 QA recommendation docs shipped under
-  `qa/r3{0,1,3,4,5,6,7}-*.md` describing audit findings + fix
-  candidate rankings that drove the per-round code work.
-  Operator-facing impact: zero direct; these are internal
-  process artifacts that informed the code commits already
-  catalogued above.
+- 11+ QA recommendation + audit docs shipped under `qa/` over
+  the v1.0.1 window: r30 install pip, r31 dongle topology, r33
+  Option B captive portal, r34 outer-repo edits, r35 FPS
+  ceiling, r36 SD bundle, r37 CMA allocator, r38b CMA deep-
+  read, r38c CMA watchdog, r38d SIGUSR1, r39 video duration,
+  r40-r42 allocator fixes, r43 brcmfmac AP-only, r44 wifi
+  comments, r46+r48 text-over-video, r47 spec-vs-code, r49
+  UI-vs-model, r51 outline+drop_shadow, r52 transition_ms
+  popover, r53 HTTPS toggle, plus this r54 release-notes
+  refresh.
 
 ### Notable operator-visible behavior changes
 
-1. **CMA-pressure watchdog**. New systemd timer service
-   (`openmarquee-cma-watchdog.timer`). Default threshold:
-   220 MB. Restarts `openmarquee-backend.service` (which
-   restarts the renderer subprocess) on threshold trip with a
-   30-min cooldown. Daily 03:00 cron restart as the hard floor.
-   See Known Issues below for the threshold-tuning question.
-2. **SIGUSR1 cache-dump for the renderer**. Operators can
-   ```
-   sudo pkill -USR1 -f openmarquee-render
-   journalctl -u openmarquee-backend.service | grep cache-dump
-   ```
-   to inspect renderer cache states + CMA usage for diagnosis.
-3. **Dual-radio USB-WiFi dongle SUPPORT**. Per r34: any
-   rt2x00usb-family USB dongle, attached to a Pi running
-   openMarquee, can now carry management WiFi independently of
-   the sign-side WiFi on the built-in BCM43438. Documented in
-   `system/README.md` + `docs/dual-radio-shipping-test.md`.
-   **Additive**: no behavior change for installs without a
-   dongle.
-4. **install.sh + deploy.sh resilience**. Pip-failure no
-   longer blocks renderer binary install; aarch64 wheels refresh
-   per deploy; emoji fonts protected against `rsync --delete`
-   propagation; SD bundle build has fail-loud preflight asserts.
+1. **Text over video** (r46+r48). Operators can now select a
+   VideoSlide as the background for a TextSlide via the existing
+   editor bg-source picker; the renderer composites text on the
+   live-decoded video frames at 30 fps. Per the §5.10 contract.
+2. **TextLayer outline + drop shadow** (r51). New "Text effects"
+   row in the per-layer accordion editor. Both defaults off;
+   operators opt in. Outline color hardcoded black,
+   width ~5% of font height; drop shadow offset 0.04 em, blur
+   0.06 em on Canvas / sharp on Rust, ~70% black.
+3. **Playlist transition duration knob** (r52). Clicking a
+   playlist track block's transition chip opens a popover with
+   BOTH kind and duration. Cut transitions structurally have
+   length=0 (UI + backend both enforce). Pre-r52 every entry
+   was hard-coded to 500 ms.
+4. **Tailscale HTTPS toggle** (r53). New checkbox in Settings
+   → Tailscale section. Default checked (matches model + at-
+   rest device behavior); operator can disable to serve plain
+   HTTP on port 80.
+5. **CMA-pressure watchdog** (r38c). New systemd timer
+   service. Default threshold: 220 MB. Restarts
+   `openmarquee-backend.service` on threshold trip. Daily
+   03:00 cron restart as the hard floor. **Threshold mistuned
+   — see Known Issues.**
+6. **SIGUSR1 cache-dump** (r38d). Renderer-side forensic
+   surface (`sudo pkill -USR1 -f openmarquee-render`).
+7. **Dual-radio USB-WiFi dongle SUPPORT** (r34). Additive —
+   no behavior change for installs without a dongle.
+8. **install.sh + deploy.sh resilience** — Pip-failure no
+   longer blocks renderer binary install; aarch64 wheels
+   refresh per deploy; emoji fonts protected against
+   `rsync --delete` propagation; SD bundle build has fail-loud
+   preflight asserts; Path D pattern for renderer-binary-only
+   redeploy.
 
 ### Known issues
 
-- **CMA watchdog threshold of 220 MB is too aggressive — bump to
-  260+ MB before v1.0.1 tag.** The r38b deep-read REFUTED the
-  original CMA-leak hypothesis. Per `qa/r38d-sigusr1-cache-dump-2026-06-02.md`,
-  QA's post-r38c FYS time-series trace shows `cma_used` swinging
-  **229-254 MB on per-minute intervals over 15 min** — a ~25 MB
-  wide noisy band, NOT a stable steady state. The current 220 MB
-  default trips well inside that band, GUARANTEEING spurious
-  restart loops even with no true leak. Operators experiencing
-  unwanted restarts should:
+- **CMA watchdog threshold of 220 MB is too aggressive — bump
+  to 254-260 MB before v1.0.1 tag.** Per QA's post-r38c FYS
+  time-series trace, `cma_used` swings **229-254 MB on per-
+  minute intervals** — a ~25 MB wide noisy band. The current
+  220 MB default trips well inside that band, GUARANTEEING
+  spurious restart loops even with no true leak. Operators
+  experiencing unwanted restarts should:
   ```
   sudo mkdir -p /etc/default
-  echo 'THRESHOLD_MB=260' | sudo tee /etc/default/openmarquee-cma-watchdog
+  echo 'THRESHOLD_MB=254' | sudo tee /etc/default/openmarquee-cma-watchdog
   sudo systemctl restart openmarquee-cma-watchdog.timer
   ```
-  Note: `/etc/default/openmarquee-cma-watchdog` is not shipped
-  as a template; `system/openmarquee-cma-watchdog.sh` sources
-  it unconditionally if present. 260 MB sits ~6 MB above the
-  observed 254 MB high-water with a small margin; 265 MB is
-  the conservative alternative if further swing widening is
-  expected. **v1.0.1 ship-decision should bump the default to
-  260+ MB** before cutting the tag. Daily 03:00 cron restart
-  remains the safety net regardless.
+  **Ship decision pending qarl**: bump the default in
+  `system/openmarquee-cma-watchdog.sh` to ~254 MB OR implement
+  the smarter "sustained N polls above threshold" detector
+  before tag-cut. r38d's cache-dump data would distinguish
+  cache-driven swings from pipeline churn; full data collection
+  in flight from QA SSH lane.
+- **r47 NOT_IMPLEMENTED Cluster A — 5 SYSTEM_SPEC.md rewrites
+  pending admin-Jimmy.** C007 output_mode (HDMI-only, not 4-
+  way), C010 SSID derivation (random alphanumeric, not MAC),
+  C030/C031/C032 Welcome+Freedom seed (collapsed into FREE
+  YOUR SIGN demo reel), C034 TextSlide rerender (removed in
+  DELETE-PIL phase 3), C046 CBDT emoji bake (replaced by COLRv1
+  vector raster). Doc-rewrite class; no code change required.
+- **r47 NOT_IMPLEMENTED Cluster B — pending implementation.**
+  C074 sign-side WiFi welcome screen with SSID/password/QR
+  (~180 LOC if shipped, OR a doc-rewrite if the captive-portal-
+  only welcome flow is the intended design — **qarl decision
+  pending**). (Note: C014 USB-WiFi-dongle udev rule, also
+  originally in Cluster B, was already shipped on main as
+  `system/99-openmarquee-usb-wlan.rules` per r34's commit
+  `b5b9919`; r47's NOT_IMPLEMENTED verdict was against the
+  code2 worktree which had not propagated the rule yet.)
+- **r49 deferred UI exposure findings** — F010 `TextLayer.weight`
+  (variable-font Light/Bold per-layer override, ~80-100 LOC
+  across model + UI + renderer; v1.1) and F008
+  `TextLayer.font_size_px` (READ_ONLY pixel-precise sizing;
+  likely-intentional responsive design but confirm with qarl).
+  Other 13 LOW findings are by-design v3+ playlist-owns-
+  transitions legacy fields + future-reserved (Schedule.tz,
+  TextLayer.anchor/locked) — candidates for MODEL CLEANUP
+  in a v1.1 dispatch.
+- **r51 parity gap** — Canvas `shadowBlur` is gaussian; Rust
+  drop-shadow pass is sharp SDF (no blur). Visible difference:
+  Canvas side has soft fading shadow edges; Rust side has hard
+  glyph-silhouette shadow. Threshold relaxed to ssim≥0.85 +
+  mean_delta≤24 in the staged parity fixture. Mitigation
+  (multi-sample SDF blur OR offscreen FBO + gaussian) deferred
+  to r51b.
+- **r51 WASM-squish path** — WASM-rasterized text in the
+  yScale!=1 squish path doesn't apply outline + drop_shadow
+  (the helper isn't called from the WASM `drawImage` branch).
+  Uncommon path (only triggers when text overflows the box
+  vertically AND fontdue WASM is available). r51b doc note.
 - **Option B captive-portal topology approved but NOT yet
-  shipped.** The r43 audit's SHIP verdict (retire ap0;
-  hostapd-on-wlan0-AP-only) is approved with conditions but
-  the implementation dispatch is pending qarl's ship-now/hold
-  call. v1.0.1 continues on Option A (current ap0+wlan0 single-
-  radio AP+STA topology). Option B will land in a future minor
-  or patch release.
+  shipped.** r43's SHIP verdict (retire ap0; hostapd-on-wlan0-
+  AP-only) is approved with conditions but the implementation
+  dispatch is pending qarl's ship-now/hold call. v1.0.1
+  continues on Option A.
 - **CVE-2025-40321 / iOS 18.6+ ANQP NULL-deref crash class.**
   Real risk for any AP-mode deployment on brcmfmac; the
   upstream fix (`3776c685ebe5`) is already in rpi-6.12.y as
-  `3f8ad41f42b6` per r43 §A.1. Bookworm-base SD images shipping
-  the current rpi kernel pick this up automatically.
+  `3f8ad41f42b6` per r43 §A.1. Bookworm-base SD images
+  shipping the current rpi kernel pick this up automatically.
+- **Home-router AP rejecting wlan-dongle auth → wifi-watchdog
+  reboots Pi every ~10 min.** Deployment-environment issue
+  surfaced during tonight's Path D deploy cycle. Operators on
+  a dongle topology should verify their home AP isn't filtering
+  MAC + that the WPA2-PSK is correct in `/etc/NetworkManager/
+  system-connections/wlan-dongle.nmconnection`. wifi-watchdog
+  treats sustained outbound connectivity loss as
+  "rebooting-might-help"; on a misconfigured AP this becomes a
+  reboot loop. Workaround: `systemctl disable
+  openmarquee-wifi-watchdog` if your network's AP needs
+  troubleshooting and you don't want the box rebooting under
+  you.
 
 ### Spec / outer-repo coordination
 
-- `SYSTEM_SPEC.md`, `IMPLEMENTATION_PLAN.md`, `DESIGN_BRIEF.md`
-  unchanged since v1.0.0. v1.0.1 is a maintenance ship; no spec
-  delta.
-- If Option B implementation lands BEFORE v1.0.1 tags, this
-  Topology section should be updated to call it out. For now:
-  "Option B retire-ap0 SHIP verdict approved (r43);
-  implementation pending operator direction."
+The v1.0.1 ship moves SYSTEM_SPEC.md from "matches code" (the
+v1.0.0 baseline) to "needs catch-up rewrites in §F-listed
+sections" per r47's audit. The §5.10 text-over-video claim is
+NOW actually shipped (r46+r48); §5.10a text effects partial
+(outline + drop_shadow shipped, motion+blend still future);
+other §F items remain pending admin-Jimmy.
+
+Admin-Jimmy spec-rewrite work queue:
+
+- **r47 §F.1** §3.4 line 156 `output_mode` reality (collapsed
+  to HDMI-only)
+- **r47 §F.2** §3.4 line 164 SSID derivation (random
+  alphanumeric, not MAC-derived)
+- **r47 §F.3** §4.1.1 line 191 USB-WiFi-dongle udev rule —
+  CLOSED on main per r34 `b5b9919`; spec text may still need a
+  pass to verify the wording matches the shipped rule
+  (`system/99-openmarquee-usb-wlan.rules`)
+- **r47 §F.4** §5.7 lines 294-296 FREE YOUR SIGN demo reel
+  (replaces Welcome+Freedom)
+- **r47 §F.5** §5.8 line 312 TextSlide rerender on display-
+  dim change — qarl decision: doc-rewrite vs ship-the-fix
+- **r47 §F.6** §5.10a line 352 COLRv1 vector (replaces CBDT
+  bake)
+- **r47 §F.7** §8 line 565 sign-side welcome screen — qarl
+  decision: doc-rewrite vs ship-the-impl
+- **r49 §F.1** §5.10a text effects updated to reflect outline
+  + drop_shadow shipped per r51 (the §F.1 from r49 was a
+  "spec may over-promise" flag; r51 closed the gap so the
+  spec text is now consistent with reality)
+- **r49 §F.3** §5.4 / §7.1 transition_ms doc text (verify
+  consistency with r52's operator-editable shape)
 
 ### Tag posture
 
 When qarl directs the v1.0.1 tag cut:
-1. Update `[1.0.1] - 2026-06-DD — DRAFT (not yet tagged)`
+
+1. **r50 verification on FYS** — live-fire confirm text-over-
+   video transitions composite correctly. r50 is the last
+   structural piece for §5.10's transition-into-text-over-video
+   case; without r50 the §5.10 claim is "partial — transitions
+   pending r50".
+2. **CMA watchdog default decision** — either:
+   (a) bump `THRESHOLD_MB` in
+       `system/openmarquee-cma-watchdog.sh` to ~254 MB, or
+   (b) ship the sustained-N-polls detector instead (~15 LOC +
+       state file extension), or
+   (c) accept the 220 MB default + document the override
+       workaround as the operator's responsibility.
+3. Update `[1.0.1] - 2026-06-DD — DRAFT (not yet tagged)`
    above to the actual cut date + drop the DRAFT marker.
-2. Bump version strings in `backend/openmarquee/__init__.py`,
-   `backend/pyproject.toml`, `renderer/Cargo.toml`. (UI
-   `package.json` is at `0.9.0` per pre-v1.0.0 convention; bump
-   to match if qarl wants alignment, or leave per current
-   practice.)
-3. RELEASE commit + `git tag v1.0.1` + push tag.
-4. FYS deploy via standard `bash scripts/deploy.sh
-   openmarquee@fireplacesign` flow.
+4. Bump version strings in `backend/openmarquee/__init__.py`,
+   `backend/pyproject.toml`, `renderer/Cargo.toml`, and
+   `ui/package.json` (all currently at 1.0.0). All four
+   components share the single version string per the file
+   header at top of this changelog.
+5. RELEASE commit + `git tag v1.0.1` + push tag.
+6. FYS deploy via the standard
+   `bash scripts/deploy.sh openmarquee@fireplacesign` flow,
+   OR the Path D sequence for renderer-binary-only redeploy.
 
 ## [1.0.0] - 2026-05-31
 
