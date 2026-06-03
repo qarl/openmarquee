@@ -3213,6 +3213,19 @@ pub fn render_transition_any_endpoint_in_session(
              (no SlideCache for V4L2 decoder state); caller should hard-cut",
         );
     }
+    // r50 subagent (2026-06-03 NIT): text-over-video slides
+    // (TextSlide with background_video_slide_id) silently drop the
+    // bg to solid in the standalone reel — same root cause: no
+    // SlideCache for V4L2 state. The IPC sidecar path
+    // (paint_and_present_one_transition_frame via the dispatcher
+    // at ipc_main.rs:OpResult::PaintTransition) routes these to
+    // TransitionEndpoint::TextOverVideo and bakes the video bg +
+    // text composite. The standalone reel is the QA/preview path
+    // (offline rendering, no IPC), so for now it lags the IPC
+    // path's fidelity by 1 layer. Operator/QA running a text-over-
+    // video playlist through the reel will see the bg drop to
+    // solid for the transition window. Not a regression vs r48
+    // -- documenting the inconsistency.
     let frame_budget = std::time::Duration::from_secs_f64(1.0 / fps as f64);
     let total_frames =
         ((transition_ms as f64) / 1000.0 * fps as f64).round().max(1.0) as u32;
@@ -4498,6 +4511,20 @@ pub fn paint_and_present_one_transition_frame(
     // ImageSlideTextureCache lookup keyed by slide_id.
     let mut image_a: Option<(uuid::Uuid, PathBuf)> = None;
     let mut image_b: Option<(uuid::Uuid, PathBuf)> = None;
+    // r50 (2026-06-03): TextOverVideo pre-resolves like Text but
+    // tagged separately so the bake dispatcher routes to the
+    // SlideBakeInputs::TextOverVideo branch (with the bg-video V4L2
+    // state carried in the endpoint enum itself).
+    let mut text_over_video_a: Option<(
+        uuid::Uuid,
+        Vec<(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)>,
+        Vec<MotionState>,
+    )> = None;
+    let mut text_over_video_b: Option<(
+        uuid::Uuid,
+        Vec<(&crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)>,
+        Vec<MotionState>,
+    )> = None;
     match &endpoint_a {
         TransitionEndpoint::Text(slide) => {
             let (bg, _, layers) = resolve_slide_layers(slide, fonts, content_root)?;
@@ -4514,6 +4541,25 @@ pub fn paint_and_present_one_transition_frame(
             image_a = Some((slide.id, crate::content::image_slide_asset_path(root, slide.id)));
         }
         TransitionEndpoint::Video { .. } => {}
+        TransitionEndpoint::TextOverVideo { text_slide, .. } => {
+            let (bg, _, layers) = resolve_slide_layers(text_slide, fonts, content_root)?;
+            // r50 subagent (2026-06-03 NIT): warn if a text-over-
+            // video slide arrives with both bg_video_id AND a non-
+            // solid bg_kind. The Pydantic mutex at backend/
+            // openmarquee/content/__init__.py:310 enforces this, so
+            // it should be impossible -- but a future validator
+            // regression or hand-edited content JSON could bypass.
+            // Mirrors the r46 dual-bg mutex warn at ipc_main.rs
+            // (background_video + background_image) one layer up.
+            if !matches!(bg, BgKind::Solid(_)) {
+                eprintln!(
+                    "warn: text-over-video slide {} has bg_video_id AND non-solid bg_kind; bg_kind ignored (transition endpoint_a)",
+                    text_slide.id
+                );
+            }
+            let motion_states = motion_states_for_layers(text_slide.id, &layers, tick_seconds);
+            text_over_video_a = Some((text_slide.id, layers, motion_states));
+        }
     }
     match &endpoint_b {
         TransitionEndpoint::Text(slide) => {
@@ -4531,6 +4577,17 @@ pub fn paint_and_present_one_transition_frame(
             image_b = Some((slide.id, crate::content::image_slide_asset_path(root, slide.id)));
         }
         TransitionEndpoint::Video { .. } => {}
+        TransitionEndpoint::TextOverVideo { text_slide, .. } => {
+            let (bg, _, layers) = resolve_slide_layers(text_slide, fonts, content_root)?;
+            if !matches!(bg, BgKind::Solid(_)) {
+                eprintln!(
+                    "warn: text-over-video slide {} has bg_video_id AND non-solid bg_kind; bg_kind ignored (transition endpoint_b)",
+                    text_slide.id
+                );
+            }
+            let motion_states = motion_states_for_layers(text_slide.id, &layers, tick_seconds);
+            text_over_video_b = Some((text_slide.id, layers, motion_states));
+        }
     }
 
     // Ok(true) = transition frame painted + ready to present;
@@ -4576,6 +4633,26 @@ pub fn paint_and_present_one_transition_frame(
                 frames_decoded: &mut **frames_decoded,
                 decoder: *decoder,
             },
+            TransitionEndpoint::TextOverVideo {
+                bg_samples,
+                bg_next_sample_idx,
+                bg_frames_decoded,
+                bg_decoder,
+                ..
+            } => {
+                let (id, layers, states) = text_over_video_a
+                    .as_ref()
+                    .expect("text_over_video_a pre-resolved above");
+                SlideBakeInputs::TextOverVideo {
+                    slide_id: *id,
+                    text_layers: layers,
+                    motion_states: Some(states),
+                    bg_samples: *bg_samples,
+                    bg_next_sample_idx: &mut **bg_next_sample_idx,
+                    bg_frames_decoded: &mut **bg_frames_decoded,
+                    bg_decoder: *bg_decoder,
+                }
+            }
         };
         // FYS bug C: a Video endpoint with no frame ready this tick
         // bakes to Ok(None) — skip the whole transition paint for
@@ -4617,6 +4694,26 @@ pub fn paint_and_present_one_transition_frame(
                 frames_decoded: &mut **frames_decoded,
                 decoder: *decoder,
             },
+            TransitionEndpoint::TextOverVideo {
+                bg_samples,
+                bg_next_sample_idx,
+                bg_frames_decoded,
+                bg_decoder,
+                ..
+            } => {
+                let (id, layers, states) = text_over_video_b
+                    .as_ref()
+                    .expect("text_over_video_b pre-resolved above");
+                SlideBakeInputs::TextOverVideo {
+                    slide_id: *id,
+                    text_layers: layers,
+                    motion_states: Some(states),
+                    bg_samples: *bg_samples,
+                    bg_next_sample_idx: &mut **bg_next_sample_idx,
+                    bg_frames_decoded: &mut **bg_frames_decoded,
+                    bg_decoder: *bg_decoder,
+                }
+            }
         };
         let (fbo_b, tex_b) = match bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_b) {
             Ok(Some(p)) => p,
@@ -4856,6 +4953,25 @@ pub enum TransitionEndpoint<'a> {
         next_sample_idx: &'a mut usize,
         frames_decoded: &'a mut usize,
         decoder: &'a crate::v4l2::Decoder,
+    },
+    /// r50 (2026-06-03): TextSlide with `background_video_slide_id`
+    /// per SYSTEM_SPEC §5.10. Closes the §F.new gap from r46: the
+    /// transition path previously treated this as plain Text (its
+    /// bg dropped to solid for the transition's duration). Now the
+    /// bake step composites the video bg + text layers on each
+    /// side, then the existing transition blend mixes the two
+    /// composites.
+    ///
+    /// Payload carries BOTH the text slide ref (for text-layer
+    /// resolution) AND the bg-video V4L2 state (looked up from
+    /// cache.video_decoders / cache.video_demuxers via the slide's
+    /// `background_video_slide_id`, NOT the text slide id itself).
+    TextOverVideo {
+        text_slide: &'a crate::content::TextSlide,
+        bg_samples: &'a [crate::mp4_demux::Sample],
+        bg_next_sample_idx: &'a mut usize,
+        bg_frames_decoded: &'a mut usize,
+        bg_decoder: &'a crate::v4l2::Decoder,
     },
 }
 
@@ -7642,6 +7758,23 @@ enum SlideBakeInputs<'a> {
         frames_decoded: &'a mut usize,
         decoder: &'a crate::v4l2::Decoder,
     },
+    /// r50 (2026-06-03): bake a text-over-video composite into an
+    /// FBO for use as a transition endpoint. Order matches the
+    /// steady-state paint at hdmi.rs:paint_and_present_one_text_
+    /// over_video_slide_frame: bake video frame to FBO via
+    /// `bake_video_slide_to_current_fbo`, then composite text
+    /// layers on top via `paint_slide_with_viewport` with
+    /// bg_kind=None (caller-already-filled-bg path).
+    #[cfg(target_os = "linux")]
+    TextOverVideo {
+        slide_id: uuid::Uuid,
+        text_layers: &'a [(&'a crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
+        motion_states: Option<&'a [MotionState]>,
+        bg_samples: &'a [crate::mp4_demux::Sample],
+        bg_next_sample_idx: &'a mut usize,
+        bg_frames_decoded: &'a mut usize,
+        bg_decoder: &'a crate::v4l2::Decoder,
+    },
 }
 
 /// Phase 8 slice 3 — create an empty (NativeFramebuffer,
@@ -7904,6 +8037,139 @@ unsafe fn bake_slide_to_fbo(
                     Err(e)
                 }
             }
+        }
+        #[cfg(target_os = "linux")]
+        SlideBakeInputs::TextOverVideo {
+            slide_id,
+            text_layers,
+            motion_states,
+            bg_samples,
+            bg_next_sample_idx,
+            bg_frames_decoded,
+            bg_decoder,
+        } => {
+            // r50 (2026-06-03): composite path mirrors the steady-
+            // state paint_and_present_one_text_over_video_slide_
+            // frame at hdmi.rs:~3569. Two phases inside the FBO:
+            //   1. bake video frame to FBO (FBO is bound by
+            //      create_slide_fbo_pair).
+            //   2. composite text layers on top via
+            //      paint_slide_with_viewport bg_kind=None.
+            //
+            // The slide_caches prewarm mirrors the text-only branch
+            // above so cache.glyph + cache.tex are sized to the
+            // text layer count.
+            //
+            // r50 subagent (2026-06-03 BLOCKER): mirror the r46
+            // first-paint CMA pressure mitigation from the steady-
+            // state path. A transition INTO a text-over-video slide
+            // from an image-heavy prior slide can leave
+            // image_bg_cache + image_slide_tex_cache hot (~96 MB),
+            // and a 2-side text-over-video transition adds a second
+            // V4L2 decoder pool (~24 MB) on top of the bake FBO
+            // pair (~16 MB) + transient transition shader work.
+            // Peak without eviction could exceed the 254 MB CMA
+            // watchdog threshold during the 1.2-1.5s transition
+            // window. The eviction is idempotent on already-empty
+            // caches, so subsequent ticks within the window are
+            // a no-op. Detection via slide_caches absence matches
+            // the steady-state check at hdmi.rs:3635.
+            let first_paint = !session.slide_caches.contains_key(&slide_id);
+            if first_paint {
+                session.force_evict_image_caches_for_cma_pressure();
+            }
+            let layers_len = text_layers.len();
+            let needs_new = match session.slide_caches.get(&slide_id) {
+                Some(c) => c.glyph.len() != layers_len,
+                None => true,
+            };
+            if needs_new {
+                if let Some(old) = session.slide_caches.remove(&slide_id) {
+                    free_slide_render_cache(session.gl, old);
+                }
+                session
+                    .slide_caches
+                    .insert(slide_id, SlideRenderCache::new(layers_len));
+            }
+            let (fbo, tex) = create_slide_fbo_pair(session.gl, mode_w, mode_h)?;
+            // Phase 1: bake video frame INTO the just-created FBO
+            // (still bound by create_slide_fbo_pair).
+            let video_result = bake_video_slide_to_current_fbo(
+                session,
+                bg_samples,
+                bg_next_sample_idx,
+                bg_frames_decoded,
+                bg_decoder,
+                mode_w,
+                mode_h,
+            );
+            let painted = match video_result {
+                Ok(Some(_path)) => true,
+                Ok(None) => {
+                    // FYS bug C analog: no video frame ready this
+                    // tick. Free the FBO and return Ok(None) so
+                    // the transition caller skips the swap+commit
+                    // and the next advance retries. Identical
+                    // semantics to the Video-only branch above.
+                    session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    session.gl.delete_framebuffer(fbo);
+                    session.gl.delete_texture(tex);
+                    return Ok(None);
+                }
+                Err(e) => {
+                    session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    session.gl.delete_framebuffer(fbo);
+                    session.gl.delete_texture(tex);
+                    return Err(e);
+                }
+            };
+            debug_assert!(painted, "video bake reported painted=true");
+            // Phase 2: composite text layers on top of the video
+            // frame via paint_slide_with_viewport with bg_kind=None
+            // (caller-already-filled-bg path).
+            //
+            // bake_video_slide_to_current_fbo leaves the FBO bound
+            // (writes happen via standard GL draws, no rebind on
+            // its happy path). We rely on that contract here.
+            //
+            // Construct the runtime glyph context first (shared-
+            // borrow on disjoint session fields; same pattern as
+            // the Text branch above).
+            let runtime_glyph_ctx = Some(crate::glyph_cache::RuntimeGlyphCtx {
+                cache: &session.dynamic_glyph_cache,
+                fonts_dir: &session.dynamic_fonts_dir,
+            });
+            // Then take the mut borrow on slide_caches for the
+            // glyph + tex caches.
+            let cache = session
+                .slide_caches
+                .get_mut(&slide_id)
+                .expect("slide_caches entry initialized above");
+            let wall_clock_unix = current_unix_seconds();
+            let paint_result = paint_slide_with_viewport(
+                session.gl,
+                mode_w,
+                mode_h,
+                0,
+                0,
+                mode_w,
+                mode_h,
+                None, // bg already filled by bake_video_slide_to_current_fbo
+                text_layers,
+                motion_states,
+                wall_clock_unix,
+                Some(&mut cache.glyph),
+                Some(&mut session.image_bg_cache),
+                Some(&mut cache.tex),
+                runtime_glyph_ctx,
+            );
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            if let Err(e) = paint_result {
+                session.gl.delete_framebuffer(fbo);
+                session.gl.delete_texture(tex);
+                return Err(e);
+            }
+            Ok(Some((fbo, tex)))
         }
     }
 }

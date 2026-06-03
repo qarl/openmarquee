@@ -1848,48 +1848,84 @@ fn run_paint_hook(
             // Determine endpoint kinds without holding borrows on
             // cache.items past the kind discriminator (so the
             // subsequent video-state lookups don't conflict).
-            let from_kind = match cache.items.get(&from_id) {
-                Some(ContentItem::Text(_)) => 't',
+            //
+            // r50 (2026-06-03): 'b' kind = text-over-video
+            // (TextSlide with background_video_slide_id per
+            // SYSTEM_SPEC §5.10). Closes the §F.new gap from r46:
+            // pre-r50 a TextSlide with bg_video_id matched 't' so
+            // the transition painted the text on solid (bg dropped)
+            // for the transition's duration. r50 routes 'b' to a
+            // new endpoint that decodes the bg video frame +
+            // composites text on top, identical to the steady-
+            // state paint_and_present_one_text_over_video_slide_
+            // frame path.
+            let from_kind = match cache.items.peek(&from_id) {
+                Some(ContentItem::Text(s)) => {
+                    if s.background_video_slide_id.is_some() { 'b' } else { 't' }
+                }
                 Some(ContentItem::Image(_)) => 'i',
                 Some(ContentItem::Video(_)) => 'v',
                 None => return err(format!("paint_transition: from slide {from_id} not in cache")),
             };
-            let to_kind = match cache.items.get(&to_id) {
-                Some(ContentItem::Text(_)) => 't',
+            let to_kind = match cache.items.peek(&to_id) {
+                Some(ContentItem::Text(s)) => {
+                    if s.background_video_slide_id.is_some() { 'b' } else { 't' }
+                }
                 Some(ContentItem::Image(_)) => 'i',
                 Some(ContentItem::Video(_)) => 'v',
                 None => return err(format!("paint_transition: to slide {to_id} not in cache")),
             };
 
-            // Same-id Video/Video transitions would need two &mut to
-            // the same `VideoDecoderState` entry — impossible in safe
+            // r50: resolve the V4L2 decoder lookup id per side.
+            // For 'v' kind, the decoder is keyed by slide_id. For
+            // 'b' kind, it's keyed by the TextSlide's
+            // background_video_slide_id. Other kinds: None (no
+            // decoder needed).
+            let from_dec_id: Option<uuid::Uuid> = match cache.items.peek(&from_id) {
+                Some(ContentItem::Text(s)) => s.background_video_slide_id,
+                Some(ContentItem::Video(_)) => Some(from_id),
+                _ => None,
+            };
+            let to_dec_id: Option<uuid::Uuid> = match cache.items.peek(&to_id) {
+                Some(ContentItem::Text(s)) => s.background_video_slide_id,
+                Some(ContentItem::Video(_)) => Some(to_id),
+                _ => None,
+            };
+
+            // Same-decoder transitions would need two &mut to the
+            // same `VideoDecoderState` entry — impossible in safe
             // Rust AND semantically wrong (two drains per Advance
-            // call on the same decoder). Bail explicitly. Same-id
-            // text/text and image/image are fine (idempotent bakes).
-            if from_kind == 'v' && to_kind == 'v' && from_id == to_id {
-                return err(format!(
-                    "paint_transition: same-id video→video transition not supported (slide_id={from_id})",
-                ));
+            // call on the same decoder). r50: this check now
+            // applies to BOTH 'v' and 'b' (or mixed); the conflict
+            // is on the decoder lookup id, not the slide id.
+            // Same-id text/text and image/image are still fine
+            // (idempotent bakes).
+            if let (Some(fid), Some(tid)) = (from_dec_id, to_dec_id) {
+                if fid == tid {
+                    return err(format!(
+                        "paint_transition: same decoder id on both sides ({fid}) not supported \
+                         (e.g. two text-over-video slides sharing one bg video)",
+                    ));
+                }
             }
 
-            // Resolve V4L2 decoder state &muts up-front for video
-            // endpoints. Single get_mut for single-video; `iter_mut`
-            // for dual-video (Rust 1.85 lacks
-            // `HashMap::get_disjoint_mut` — stable in 1.86).
-            // `iter_mut` yields disjoint &mut per entry, which is
-            // what we need; safe-Rust alternative to the unsafe
-            // raw-pointer dance.
+            // Resolve V4L2 decoder state &muts up-front. Single
+            // get_mut for single-decoder; `iter_mut` for dual-
+            // decoder (Rust 1.85 lacks `HashMap::get_disjoint_mut`
+            // — stable in 1.86). `iter_mut` yields disjoint &mut
+            // per entry, which is what we need; safe-Rust
+            // alternative to the unsafe raw-pointer dance.
             let (mut from_dec_state, mut to_dec_state): (
                 Option<&mut VideoDecoderState>,
                 Option<&mut VideoDecoderState>,
-            ) = match (from_kind, to_kind) {
-                ('v', 'v') => {
+            ) = match (from_dec_id, to_dec_id) {
+                (Some(fid), Some(tid)) => {
                     let mut a = None;
                     let mut b = None;
                     for (k, v) in cache.video_decoders.iter_mut() {
-                        if *k == from_id {
+                        if *k == fid {
                             a = Some(v);
-                        } else if *k == to_id {
+                        } else if *k == tid {
                             b = Some(v);
                         }
                         if a.is_some() && b.is_some() {
@@ -1898,36 +1934,97 @@ fn run_paint_hook(
                     }
                     if a.is_none() {
                         return err(format!(
-                            "paint_transition: from video {from_id} decoder state missing",
+                            "paint_transition: from decoder {fid} state missing \
+                             (from_kind={from_kind})",
                         ));
                     }
                     if b.is_none() {
                         return err(format!(
-                            "paint_transition: to video {to_id} decoder state missing",
+                            "paint_transition: to decoder {tid} state missing \
+                             (to_kind={to_kind})",
                         ));
                     }
                     (a, b)
                 }
-                ('v', _) => {
-                    let a = cache.video_decoders.get_mut(&from_id);
+                (Some(fid), None) => {
+                    let a = cache.video_decoders.get_mut(&fid);
                     if a.is_none() {
                         return err(format!(
-                            "paint_transition: from video {from_id} decoder state missing",
+                            "paint_transition: from decoder {fid} state missing \
+                             (from_kind={from_kind})",
                         ));
                     }
                     (a, None)
                 }
-                (_, 'v') => {
-                    let b = cache.video_decoders.get_mut(&to_id);
+                (None, Some(tid)) => {
+                    let b = cache.video_decoders.get_mut(&tid);
                     if b.is_none() {
                         return err(format!(
-                            "paint_transition: to video {to_id} decoder state missing",
+                            "paint_transition: to decoder {tid} state missing \
+                             (to_kind={to_kind})",
                         ));
                     }
                     (None, b)
                 }
-                _ => (None, None),
+                (None, None) => (None, None),
             };
+
+            // r50 (2026-06-03): wrap-and-reprime check for each side
+            // whose decoder needs it. Mirrors the steady-state paint
+            // path at ipc_main.rs:~1687: when the userspace sample
+            // counter has reached the end of the demuxer's sample
+            // list, re-feed SPS+PPS+IDR (the canonical loop pattern)
+            // BEFORE bake's call to feed() the next NAL. Without
+            // this, a slide that played long enough to wrap once
+            // would silently skip the SPS/PPS re-feed at the
+            // transition boundary and the decoder would fail with
+            // bcm2835's "feed sample 0 after EOS" error.
+            //
+            // The check runs against the resolved decoder lookup id
+            // (from_dec_id / to_dec_id from above), which maps:
+            //   - 'v' kind: slide_id
+            //   - 'b' kind: TextSlide.background_video_slide_id
+            //   - other:    None (no check needed)
+            if let Some(fid) = from_dec_id {
+                let dem = match cache.video_demuxers.get(&fid) {
+                    Some(d) => d,
+                    None => return err(format!(
+                        "paint_transition: from demuxer {fid} missing for wrap-check",
+                    )),
+                };
+                let dec = from_dec_state
+                    .as_deref_mut()
+                    .expect("from_dec_state set above for from_dec_id Some(_)");
+                if dec.next_sample_idx >= dem.samples.len() {
+                    if let Err(e) =
+                        crate::video_decode::reprime_video_decoder_for_loop(dec, dem)
+                    {
+                        return err(format!(
+                            "paint_transition: from decoder reprime_video_decoder_for_loop failed: {e:#}",
+                        ));
+                    }
+                }
+            }
+            if let Some(tid) = to_dec_id {
+                let dem = match cache.video_demuxers.get(&tid) {
+                    Some(d) => d,
+                    None => return err(format!(
+                        "paint_transition: to demuxer {tid} missing for wrap-check",
+                    )),
+                };
+                let dec = to_dec_state
+                    .as_deref_mut()
+                    .expect("to_dec_state set above for to_dec_id Some(_)");
+                if dec.next_sample_idx >= dem.samples.len() {
+                    if let Err(e) =
+                        crate::video_decode::reprime_video_decoder_for_loop(dec, dem)
+                    {
+                        return err(format!(
+                            "paint_transition: to decoder reprime_video_decoder_for_loop failed: {e:#}",
+                        ));
+                    }
+                }
+            }
 
             // Build TransitionEndpoints. ContentItem refs come from a
             // shared borrow on cache.items (field-disjoint from the
@@ -1948,7 +2045,33 @@ fn run_paint_hook(
             cache.items.get(&from_id);
             cache.items.get(&to_id);
             let endpoint_a = match cache.items.peek(&from_id) {
-                Some(ContentItem::Text(s)) => hdmi::TransitionEndpoint::Text(s),
+                Some(ContentItem::Text(s)) => {
+                    if let Some(bg_id) = s.background_video_slide_id {
+                        // r50: text-over-video. Decoder lookup id
+                        // = bg_id (the referenced VideoSlide), NOT
+                        // the text slide id. Demuxer also keyed by
+                        // bg_id.
+                        let demuxer = match cache.video_demuxers.get(&bg_id) {
+                            Some(d) => d,
+                            None => return err(format!(
+                                "paint_transition: from text-over-video bg demuxer {bg_id} missing \
+                                 (text slide {from_id} background_video_slide_id)",
+                            )),
+                        };
+                        let dec_state = from_dec_state
+                            .take()
+                            .expect("from_dec_state set above for 'b' kind");
+                        hdmi::TransitionEndpoint::TextOverVideo {
+                            text_slide: s,
+                            bg_samples: demuxer.samples.as_slice(),
+                            bg_next_sample_idx: &mut dec_state.next_sample_idx,
+                            bg_frames_decoded: &mut dec_state.frames_decoded,
+                            bg_decoder: &dec_state.decoder,
+                        }
+                    } else {
+                        hdmi::TransitionEndpoint::Text(s)
+                    }
+                }
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
                 Some(ContentItem::Video(_)) => {
                     let demuxer = match cache.video_demuxers.get(&from_id) {
@@ -1969,7 +2092,29 @@ fn run_paint_hook(
                 None => unreachable!("from_id presence verified above"),
             };
             let endpoint_b = match cache.items.peek(&to_id) {
-                Some(ContentItem::Text(s)) => hdmi::TransitionEndpoint::Text(s),
+                Some(ContentItem::Text(s)) => {
+                    if let Some(bg_id) = s.background_video_slide_id {
+                        let demuxer = match cache.video_demuxers.get(&bg_id) {
+                            Some(d) => d,
+                            None => return err(format!(
+                                "paint_transition: to text-over-video bg demuxer {bg_id} missing \
+                                 (text slide {to_id} background_video_slide_id)",
+                            )),
+                        };
+                        let dec_state = to_dec_state
+                            .take()
+                            .expect("to_dec_state set above for 'b' kind");
+                        hdmi::TransitionEndpoint::TextOverVideo {
+                            text_slide: s,
+                            bg_samples: demuxer.samples.as_slice(),
+                            bg_next_sample_idx: &mut dec_state.next_sample_idx,
+                            bg_frames_decoded: &mut dec_state.frames_decoded,
+                            bg_decoder: &dec_state.decoder,
+                        }
+                    } else {
+                        hdmi::TransitionEndpoint::Text(s)
+                    }
+                }
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
                 Some(ContentItem::Video(_)) => {
                     let demuxer = match cache.video_demuxers.get(&to_id) {
