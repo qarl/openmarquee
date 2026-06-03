@@ -254,6 +254,21 @@ const SECTION_TEMPLATE = `
                                  echoes the redacted sentinel intact and the
                                  backend's secret-substitution doesn't clobber. -->
                             <input type="hidden" class="field-tailscale-auth-key">
+                            <!-- r53 (2026-06-03): HTTPS provisioning toggle.
+                                 Closes the 9-day backlog from r49 F078 +
+                                 project_https_phase_1_shipped memory.
+                                 When checked, the device runs tailscale serve
+                                 with bg + https=443 so the magic-DNS FQDN
+                                 serves HTTPS (FqdnRedirectMiddleware also 301s
+                                 non-FQDN traffic to the canonical FQDN). When
+                                 unchecked, the device serves HTTP only on
+                                 port 80. Settings.tailscale_https_enabled
+                                 default in the model is True; checked-by-
+                                 default here matches that. -->
+                            <label class="field-inline" style="margin-top: 10px; display: flex; gap: 8px; align-items: center;">
+                                <input type="checkbox" class="field-tailscale-https-enabled">
+                                <span>Enable HTTPS on Tailscale FQDN</span>
+                            </label>
                         </fieldset>
                     </fieldset>
                 </div>
@@ -391,6 +406,9 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     const tsEnabledEl = container.querySelector(".field-tailscale-enabled");
     const tsHostnameEl = container.querySelector(".field-tailscale-hostname");
     const tsAuthKeyEl = container.querySelector(".field-tailscale-auth-key");
+    const tsHttpsEnabledEl = container.querySelector(
+        ".field-tailscale-https-enabled",
+    );
     const tsStateEl = container.querySelector(".field-tailscale-state");
     const tsEnableBtn = container.querySelector(".field-tailscale-enable-btn");
     const tsAuthBox = container.querySelector(".field-tailscale-auth");
@@ -767,6 +785,11 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             tsEnabledEl.checked = Boolean(settings.tailscale_enabled);
             tsHostnameEl.value = settings.tailscale_hostname ?? "";
             tsAuthKeyEl.value = settings.tailscale_auth_key ?? "";
+            // r53: hydrate HTTPS toggle. Model default is True so a
+            // legacy settings.json missing the key reads as true here
+            // (matches the device's at-rest behavior; the boot path
+            // already provisions HTTPS).
+            tsHttpsEnabledEl.checked = settings.tailscale_https_enabled !== false;
             syncWifiGrayOut();
             syncTailscaleStationGating();
             syncWs281xOrderVisibility();
@@ -902,6 +925,9 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             tailscale_enabled: tsEnabledEl.checked,
             tailscale_hostname: tsHostnameEl.value.trim() || null,
             tailscale_auth_key: tsAuthKeyEl.value || null,
+            // r53: HTTPS toggle. The field is bool (not nullable);
+            // checkbox.checked is the canonical source of truth.
+            tailscale_https_enabled: tsHttpsEnabledEl.checked,
         };
     }
 

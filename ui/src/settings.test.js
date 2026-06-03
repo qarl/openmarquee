@@ -41,6 +41,9 @@ const SAMPLE = {
     tailscale_enabled: false,
     tailscale_hostname: null,
     tailscale_auth_key: null,
+    // r53: HTTPS toggle defaults to true on the model; tests that
+    // override SETTINGS pass their own value when needed.
+    tailscale_https_enabled: true,
 };
 
 describe("mountSettings", () => {
@@ -863,5 +866,52 @@ describe("mountSettings", () => {
         expect(container.querySelector("[data-perf-histogram]")).not.toBeNull();
         handle.destroy();
         expect(container.querySelector("[data-perf-histogram]")).toBeNull();
+    });
+
+    // r53: Tailscale HTTPS toggle exposure (closes r49 F078 +
+    // project_https_phase_1_shipped 9-day backlog).
+    it("hydrates tailscale_https_enabled checkbox from settings and serializes it on save", async () => {
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        mount(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                tailscale_enabled: true,
+                tailscale_https_enabled: false,
+            }),
+            onSave,
+        });
+        await tick();
+        const httpsBox = container.querySelector(
+            ".field-tailscale-https-enabled",
+        );
+        expect(httpsBox).not.toBeNull();
+        expect(httpsBox.checked).toBe(false);
+
+        // Toggle on -> dirty -> save payload reflects the new value.
+        httpsBox.checked = true;
+        httpsBox.dispatchEvent(new Event("change", { bubbles: true }));
+        await tick();
+        const payload = onSave.mock.calls[0][0];
+        expect(payload.tailscale_https_enabled).toBe(true);
+    });
+
+    it("hydrates tailscale_https_enabled as true when settings omits the key (model default)", async () => {
+        // r53: SystemSettings.tailscale_https_enabled defaults True
+        // on the model, so a legacy settings.json missing the key
+        // should hydrate as checked. Implementation reads
+        // `settings.tailscale_https_enabled !== false` so undefined +
+        // null + true all hydrate true; only literal false hydrates false.
+        const container = document.createElement("div");
+        const { tailscale_https_enabled: _omit, ...legacy } = SAMPLE;
+        mount(container, {
+            fetchSettings: async () => legacy,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const httpsBox = container.querySelector(
+            ".field-tailscale-https-enabled",
+        );
+        expect(httpsBox.checked).toBe(true);
     });
 });
