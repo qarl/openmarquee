@@ -641,6 +641,61 @@ header h1 {
    The .track-block-transition class survives in the markup purely
    as a JS hook (change listener + sortable drag-filter selector). */
 
+/* r52: transition chip became a click-to-open popover (button + hidden
+   panel) so the operator can edit both kind AND ms duration without
+   leaving the row. .track-block-transition-wrap is the positioned
+   anchor; the popover floats just below the chip with absolute
+   positioning so it doesn't push other rows down. */
+.track-block-transition-wrap {
+    position: relative;
+    display: inline-block;
+}
+.track-block-transition-popover {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 5;
+    background: var(--om-surface, #fff);
+    border: 1px solid var(--om-border, rgba(0,0,0,0.18));
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 180px;
+}
+.track-block-transition-popover[hidden] { display: none; }
+.track-block-transition-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+}
+.track-block-transition-row > span:first-child {
+    flex: 0 0 60px;
+    color: var(--om-muted, #555);
+}
+.track-block-transition-row .track-block-transition-kind {
+    flex: 1;
+}
+.track-block-transition-row .track-block-transition-ms {
+    flex: 1;
+    min-width: 70px;
+    padding: 4px 6px;
+    border: 1px solid var(--om-border, rgba(0,0,0,0.18));
+    border-radius: 4px;
+}
+.track-block-transition-row .track-block-transition-ms:disabled {
+    background: var(--om-disabled-bg, #f0f0f0);
+    color: var(--om-muted, #888);
+    cursor: not-allowed;
+}
+.track-block-transition-ms-unit {
+    color: var(--om-muted, #555);
+    font-size: 11px;
+}
+
 /* Remove × — top-right corner, always visible (unlike the old
    thumb-overlay design, this one's outside the thumb). */
 .track-remove {

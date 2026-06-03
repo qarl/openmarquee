@@ -414,7 +414,12 @@ def test_v2_on_disk_migrates_with_default_transitions(tmp_path: Path):
     assert [str(i) for i in loaded.item_ids] == [a, b]
     # Migrated items get the default transitions.
     assert all(i.transition == "cut" for i in loaded.items)
-    assert all(i.transition_ms == 500 for i in loaded.items)
+    # r52: cut-clamps-to-0 invariant — pre-r52 this asserted 500 (the
+    # field default), but the model_validator now coerces cut entries
+    # to ms=0. The pre-r52 default of 500 was always wrong for cut
+    # (cuts are instantaneous); the migration writes the new canonical
+    # 0 transparently.
+    assert all(i.transition_ms == 0 for i in loaded.items)
 
 
 def test_v1_unnamed_on_disk_migrates_to_default_playlist(tmp_path: Path):
@@ -810,3 +815,56 @@ def test_concurrent_appends_dont_lose_items(tmp_path: Path):
         f"load-mutate-save race. Sample missing: "
         f"{list(missing)[:5]}"
     )
+# --- r52: cut-clamps-to-0 model validator -----------------------------------
+
+
+def test_playlistitem_cut_clamps_transition_ms_to_zero_on_construction():
+    """r52: a PlaylistItem with transition='cut' coerces transition_ms to 0.
+
+    Pre-r52 the UI hard-coded 500 ms for every entry including cut, so
+    legacy storage JSON has plenty of `cut` + non-zero entries on disk.
+    The model_validator clamps rather than rejects so a load round-trip
+    cleans them up silently.
+    """
+    from uuid import uuid4
+
+    from openmarquee.playlist import PlaylistItem
+
+    item = PlaylistItem(item_id=uuid4(), transition="cut", transition_ms=500)
+    assert item.transition == "cut"
+    assert item.transition_ms == 0
+
+
+def test_playlistitem_non_cut_preserves_transition_ms():
+    """Non-cut kinds keep operator-set transition_ms unchanged."""
+    from uuid import uuid4
+
+    from openmarquee.playlist import PlaylistItem
+
+    item = PlaylistItem(item_id=uuid4(), transition="fade", transition_ms=750)
+    assert item.transition == "fade"
+    assert item.transition_ms == 750
+
+
+def test_playlistitem_cut_already_zero_no_op():
+    """Cut + 0 ms is the canonical shape; clamp is a no-op."""
+    from uuid import uuid4
+
+    from openmarquee.playlist import PlaylistItem
+
+    item = PlaylistItem(item_id=uuid4(), transition="cut", transition_ms=0)
+    assert item.transition == "cut"
+    assert item.transition_ms == 0
+
+
+def test_playlistitem_cut_default_ms_clamps_to_zero():
+    """Default `transition_ms=500` on a cut entry is also clamped."""
+    from uuid import uuid4
+
+    from openmarquee.playlist import PlaylistItem
+
+    # transition defaults to "cut"; transition_ms defaults to 500 per the
+    # field. The validator should still clamp.
+    item = PlaylistItem(item_id=uuid4())
+    assert item.transition == "cut"
+    assert item.transition_ms == 0

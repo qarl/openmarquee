@@ -1,6 +1,6 @@
-// Playlist page: horizontal timeline of the default playlist + a pallet
-// of every saved slide at the bottom. Drag within the timeline to reorder;
-// drag from the pallet onto the timeline to add; click × on a timeline
+// Playlist page: vertical stack of track blocks for the active playlist +
+// a pallet of every saved slide on the right. Drag within the track to
+// reorder; drag from the pallet onto the track to add; click × on a track
 // block to remove.
 //
 // qarl's spec: single default playlist (named playlists are hidden for
@@ -56,6 +56,36 @@ function transitionOptionsHTML(selected) {
         (opt) =>
             `<option value="${escapeHtml(opt.value)}"${opt.value === selected ? " selected" : ""}>${escapeHtml(opt.label)}</option>`,
     ).join("");
+}
+
+// r52: format the chip label so the dense scannable row shows BOTH the
+// transition kind and (for animated kinds) its duration. "cut" has no
+// duration semantically — show just the kind. Others render "kind · 500ms"
+// or "kind · 1.0s" (the latter once we cross 1000ms, to keep the chip
+// compact). Returns a plain string; caller is responsible for escaping
+// before innerHTML use.
+function transitionChipLabel(kind, ms) {
+    const k = String(kind || "cut");
+    if (k === "cut") return "cut";
+    const n = Math.max(0, Math.round(Number(ms) || 0));
+    if (n === 0) return k;
+    if (n >= 1000) {
+        // Drop the trailing ".0" — "1s" reads better than "1.0s" but we keep
+        // one decimal for fractional values like "1.5s".
+        const sec = n / 1000;
+        const formatted = Number.isInteger(sec) ? String(sec) : sec.toFixed(1);
+        return `${k} · ${formatted}s`;
+    }
+    return `${k} · ${n}ms`;
+}
+
+// r52: clamp arbitrary user input (string from <input type="number">) to
+// the Pydantic field constraint (0-5000 ms, integer). Returns 0 on
+// non-finite/negative.
+function clampTransitionMs(value) {
+    const n = Math.round(Number(value));
+    if (!Number.isFinite(n)) return 0;
+    return Math.max(0, Math.min(5000, n));
 }
 
 // Mode-locking went away when videos became resolution-independent H.264
@@ -582,21 +612,129 @@ function bindTrackRemoveButtons(trackEl, markDirty) {
             markDirty();
         });
     }
-    // Transition selector: <select> pulldown listing the available
-    // transitions. Replaced the prior cycle-button (cut → fade →
-    // wipe → slide → iris on each click) per the 2026-04-28 design
-    // batch — the new transition palette is growing past the 5
-    // currently shipped, and a click-to-cycle UX won't scale to 16.
-    // Source of truth is the block's dataset so collectTrackEntries
-    // picks up the value at Save time.
-    for (const chip of trackEl.querySelectorAll(".track-block-transition")) {
-        if (chip.dataset.bound === "1") continue;
-        chip.dataset.bound = "1";
-        chip.addEventListener("change", () => {
-            const block = chip.closest(".track-block");
-            if (!block) return;
-            block.dataset.transition = chip.value;
+    // r52: transition chip is a click-to-open popover (kind + duration).
+    // Cut-coupling logic:
+    //   - kind=cut FORCES ms=0 + disables the ms input
+    //   - if operator changes kind from cut → other, restore the
+    //     remembered "lastNonZeroMs" (or 500 default) so the duration
+    //     control isn't suddenly a no-op
+    //   - if operator types non-zero ms while kind=cut, auto-switch
+    //     kind to the remembered "lastNonCutKind" (default "fade")
+    // Source of truth stays the block's dataset (transition + transitionMs);
+    // collectTrackEntries picks up both at Save time.
+    for (const wrap of trackEl.querySelectorAll(".track-block-transition-wrap")) {
+        if (wrap.dataset.bound === "1") continue;
+        wrap.dataset.bound = "1";
+        const chip = wrap.querySelector(".track-block-transition");
+        const pop = wrap.querySelector(".track-block-transition-popover");
+        const kindSel = wrap.querySelector(".track-block-transition-kind");
+        const msInput = wrap.querySelector(".track-block-transition-ms");
+        const block = chip?.closest(".track-block");
+        if (!chip || !pop || !kindSel || !msInput || !block) continue;
+        // Initial sync: enforce cut-locks-ms-to-0 on first render.
+        if (kindSel.value === "cut") {
+            msInput.value = "0";
+            msInput.disabled = true;
+            block.dataset.transitionMs = "0";
+        }
+        chip.addEventListener("click", (e) => {
+            e.stopPropagation();
+            const willOpen = pop.hidden;
+            // Close any other open popover so we don't stack.
+            for (const other of trackEl.querySelectorAll(
+                ".track-block-transition-popover",
+            )) {
+                if (other !== pop) other.hidden = true;
+            }
+            pop.hidden = !willOpen;
+            chip.setAttribute("aria-expanded", String(willOpen));
+            if (willOpen) {
+                // Focus the kind select for keyboard operators.
+                kindSel.focus();
+            }
+        });
+        // Clicks inside the popover should not bubble up and close it via
+        // the outside-click handler below.
+        pop.addEventListener("click", (e) => e.stopPropagation());
+        kindSel.addEventListener("change", () => {
+            const newKind = kindSel.value;
+            if (newKind === "cut") {
+                // Remember the current ms so a future kind-flip restores it.
+                const m = clampTransitionMs(msInput.value);
+                if (m > 0) block.dataset.lastNonZeroMs = String(m);
+                msInput.value = "0";
+                msInput.disabled = true;
+                block.dataset.transitionMs = "0";
+            } else {
+                msInput.disabled = false;
+                block.dataset.lastNonCutKind = newKind;
+                if (clampTransitionMs(msInput.value) === 0) {
+                    const restored = clampTransitionMs(
+                        block.dataset.lastNonZeroMs,
+                    ) || 500;
+                    msInput.value = String(restored);
+                }
+                block.dataset.transitionMs = String(
+                    clampTransitionMs(msInput.value),
+                );
+            }
+            block.dataset.transition = newKind;
+            chip.textContent = transitionChipLabel(
+                newKind,
+                clampTransitionMs(msInput.value),
+            );
             markDirty();
+        });
+        msInput.addEventListener("input", () => {
+            const m = clampTransitionMs(msInput.value);
+            // Surface the clamp in the input itself so user feedback is
+            // immediate. Only rewrite if the canonicalised value differs
+            // to avoid caret-jump on every keystroke.
+            if (String(m) !== msInput.value) msInput.value = String(m);
+            if (m > 0 && kindSel.value === "cut") {
+                // Operator typed a duration while kind=cut → auto-switch
+                // to the last non-cut kind (default "fade") so they don't
+                // have to make two trips through the popover.
+                const restoredKind = block.dataset.lastNonCutKind || "fade";
+                kindSel.value = restoredKind;
+                block.dataset.transition = restoredKind;
+                msInput.disabled = false;
+            }
+            if (kindSel.value !== "cut") {
+                block.dataset.lastNonCutKind = kindSel.value;
+                if (m > 0) block.dataset.lastNonZeroMs = String(m);
+            }
+            block.dataset.transitionMs = String(m);
+            chip.textContent = transitionChipLabel(kindSel.value, m);
+            markDirty();
+        });
+    }
+
+    // One per-track outside-click + Escape handler closes any open
+    // transition popover so the chip click target is "open" only.
+    if (trackEl.dataset.transitionPopoverBound !== "1") {
+        trackEl.dataset.transitionPopoverBound = "1";
+        const closeAll = () => {
+            for (const pop of trackEl.querySelectorAll(
+                ".track-block-transition-popover",
+            )) {
+                if (!pop.hidden) pop.hidden = true;
+            }
+            for (const chip of trackEl.querySelectorAll(
+                ".track-block-transition[aria-expanded='true']",
+            )) {
+                chip.setAttribute("aria-expanded", "false");
+            }
+        };
+        // Use the trackEl-scoped document for jsdom + a real browser.
+        const doc = trackEl.ownerDocument || document;
+        doc.addEventListener("click", (e) => {
+            if (!e.target.closest?.(".track-block-transition-wrap")) {
+                closeAll();
+            }
+        });
+        doc.addEventListener("keydown", (e) => {
+            if (e.key === "Escape") closeAll();
         });
     }
 }
@@ -708,6 +846,18 @@ function renderTrackBlock(
     const durationLabel = Number.isInteger(seconds)
         ? String(seconds)
         : seconds.toFixed(1);
+    // r52: the .track-block-transition chip is now a button that opens an
+    // inline popover with BOTH kind and duration controls (Option B from
+    // the UX sketches). Cut transitions structurally have ms=0; the popover
+    // disables the ms input when kind=cut and auto-switches kind to "fade"
+    // (or the last-non-cut kind) if the operator types a non-zero duration
+    // while kind=cut. The chip itself stays compact in the row — its label
+    // is built by transitionChipLabel(kind, ms) so a scannable read of the
+    // playlist shows the duration without opening every popover.
+    const chipLabel = transitionChipLabel(
+        entry.transition,
+        entry.transition_ms,
+    );
     li.innerHTML = `
         <div class="track-grip" aria-hidden="true">
             <span class="track-grip-dots">⋮⋮</span>
@@ -716,8 +866,24 @@ function renderTrackBlock(
         <div class="track-block-meta">
             <b class="track-block-name">${safeName}</b>
             <span class="track-block-sub">${safeType} · #${String(item.id).slice(0, 6)}</span>
-            <select class="om-pulldown track-block-transition"
-                    title="Transition out of this slide">${transitionOptionsHTML(entry.transition)}</select>
+            <div class="track-block-transition-wrap">
+                <button type="button" class="om-pulldown track-block-transition"
+                        aria-haspopup="true" aria-expanded="false"
+                        title="Click to change transition kind and duration">${escapeHtml(chipLabel)}</button>
+                <div class="track-block-transition-popover" hidden>
+                    <label class="track-block-transition-row">
+                        <span>Kind</span>
+                        <select class="om-pulldown track-block-transition-kind">${transitionOptionsHTML(entry.transition)}</select>
+                    </label>
+                    <label class="track-block-transition-row">
+                        <span>Duration</span>
+                        <input type="number" class="track-block-transition-ms"
+                               min="0" max="5000" step="50"
+                               value="${Number(entry.transition_ms) || 0}">
+                        <span class="track-block-transition-ms-unit">ms</span>
+                    </label>
+                </div>
+            </div>
         </div>
         <button type="button" class="track-block-duration track-block-dur"
                 title="Click to change this slide's duration"

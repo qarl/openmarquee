@@ -119,16 +119,18 @@ describe("mountPlaylistTrack", () => {
         });
         await tick();
 
-        const chip = container.querySelector(
-            '.track-block[data-id="a"] .track-block-transition',
-        );
-        // 2026-04-28: chip became a <select> pulldown. Selected option
-        // is the source of visible truth; setting .value + dispatching
-        // change matches operator behavior. Lock in the option set so
-        // accidental palette regressions surface here when the new
-        // 11 transitions start landing in subsequent commits.
-        expect(chip.tagName).toBe("SELECT");
-        expect(Array.from(chip.options).map((o) => o.value)).toEqual([
+        const block = container.querySelector('.track-block[data-id="a"]');
+        const chip = block.querySelector(".track-block-transition");
+        // r52: chip became a click-to-open popover button. The popover
+        // hosts the <select> kind picker + numeric ms input. Lock in the
+        // option set so accidental palette regressions surface here.
+        expect(chip.tagName).toBe("BUTTON");
+        chip.click();
+        await tick();
+        const kindSel = block.querySelector(".track-block-transition-kind");
+        const msInput = block.querySelector(".track-block-transition-ms");
+        expect(kindSel.tagName).toBe("SELECT");
+        expect(Array.from(kindSel.options).map((o) => o.value)).toEqual([
             "cut",
             "fade",
             "wipe",
@@ -146,11 +148,17 @@ describe("mountPlaylistTrack", () => {
             "blinds",
             "shutter",
         ]);
-        expect(chip.value).toBe("cut");
-        chip.value = "fade";
-        chip.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(kindSel.value).toBe("cut");
+        // r52: a fresh "cut" entry has ms locked to 0; flipping to fade
+        // restores the default 500ms via the lastNonZeroMs memory path.
+        expect(msInput.disabled).toBe(true);
+        expect(msInput.value).toBe("0");
+        kindSel.value = "fade";
+        kindSel.dispatchEvent(new Event("change", { bubbles: true }));
         await tick();
-        expect(chip.value).toBe("fade");
+        expect(kindSel.value).toBe("fade");
+        expect(msInput.disabled).toBe(false);
+        expect(msInput.value).toBe("500");
 
         await handle.flushAutoSave();
         expect(onSavePlaylist).toHaveBeenCalledTimes(1);
@@ -185,10 +193,18 @@ describe("mountPlaylistTrack", () => {
         const blockA = container.querySelector('.track-block[data-id="a"]');
         expect(blockA.dataset.transition).toBe("fade");
         expect(blockA.dataset.transitionMs).toBe("250");
-        // Pulldown's selected option mirrors the dataset hydration.
-        expect(blockA.querySelector(".track-block-transition").value).toBe(
-            "fade",
-        );
+        // r52: chip label compactly carries the duration; popover's kind
+        // select mirrors the dataset hydration once opened.
+        const chip = blockA.querySelector(".track-block-transition");
+        expect(chip.textContent.trim()).toBe("fade · 250ms");
+        chip.click();
+        await tick();
+        expect(
+            blockA.querySelector(".track-block-transition-kind").value,
+        ).toBe("fade");
+        expect(
+            blockA.querySelector(".track-block-transition-ms").value,
+        ).toBe("250");
     });
 
     it("empty-state hint is surfaced on an empty playlist via data-empty-hint", async () => {
@@ -370,11 +386,17 @@ describe("mountPlaylistTrack — onDraftChange (bug #5)", () => {
         });
         await tick();
 
-        // Pulldown swap on the first block (cut → fade).
+        // r52: chip click opens popover; kind change inside popover is
+        // what fires onDraftChange now.
         const chip = container.querySelector(".track-block-transition");
         expect(chip).not.toBeNull();
-        chip.value = "fade";
-        chip.dispatchEvent(new Event("change", { bubbles: true }));
+        chip.click();
+        await tick();
+        const kindSel = container.querySelector(
+            ".track-block-transition-kind",
+        );
+        kindSel.value = "fade";
+        kindSel.dispatchEvent(new Event("change", { bubbles: true }));
 
         expect(onDraftChange).toHaveBeenCalledTimes(1);
         const [draft] = onDraftChange.mock.calls[0];
@@ -438,9 +460,14 @@ describe("mountPlaylistTrack — onDraftChange (bug #5)", () => {
         });
         await tick();
         const chip = container.querySelector(".track-block-transition");
+        // r52: same back-compat invariant with the new popover surface.
         expect(() => {
-            chip.value = "fade";
-            chip.dispatchEvent(new Event("change", { bubbles: true }));
+            chip.click();
+            const kindSel = container.querySelector(
+                ".track-block-transition-kind",
+            );
+            kindSel.value = "fade";
+            kindSel.dispatchEvent(new Event("change", { bubbles: true }));
         }).not.toThrow();
     });
 });
@@ -782,6 +809,188 @@ describe("mountPlaylistTrack — Sortable bind-generation guard", () => {
             // Happy path regression-lock: name DOES sync to server when
             // the operator isn't editing.
             expect(nameEl.value).toBe("server-renamed-it");
+        } finally {
+            document.body.removeChild(container);
+        }
+    });
+});
+
+
+describe("mountPlaylistTrack — r52 transition_ms popover (cut-coupling)", () => {
+    it("cut → fade restores lastNonZeroMs default 500", async () => {
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: fetchPlaylistsWith(["a"]),
+            onReorder: vi.fn(),
+        });
+        await tick();
+        const block = container.querySelector('.track-block[data-id="a"]');
+        const chip = block.querySelector(".track-block-transition");
+        chip.click();
+        await tick();
+        const kindSel = block.querySelector(".track-block-transition-kind");
+        const msInput = block.querySelector(".track-block-transition-ms");
+        expect(kindSel.value).toBe("cut");
+        expect(msInput.disabled).toBe(true);
+        expect(msInput.value).toBe("0");
+        kindSel.value = "fade";
+        kindSel.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(msInput.disabled).toBe(false);
+        expect(msInput.value).toBe("500");
+        expect(block.dataset.transition).toBe("fade");
+        expect(block.dataset.transitionMs).toBe("500");
+    });
+
+    it("fade → cut clamps ms to 0 and disables input + remembers the value", async () => {
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({
+                schema_version: 4,
+                playlists: [
+                    {
+                        id: DEFAULT_PLAYLIST_ID,
+                        name: "default",
+                        items: [
+                            { item_id: "a", transition: "fade", transition_ms: 750 },
+                        ],
+                    },
+                ],
+            }),
+            onReorder: vi.fn(),
+        });
+        await tick();
+        const block = container.querySelector('.track-block[data-id="a"]');
+        const chip = block.querySelector(".track-block-transition");
+        chip.click();
+        await tick();
+        const kindSel = block.querySelector(".track-block-transition-kind");
+        const msInput = block.querySelector(".track-block-transition-ms");
+        expect(msInput.value).toBe("750");
+        kindSel.value = "cut";
+        kindSel.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(msInput.disabled).toBe(true);
+        expect(msInput.value).toBe("0");
+        expect(block.dataset.transition).toBe("cut");
+        expect(block.dataset.transitionMs).toBe("0");
+        // Flip back to fade → restore 750 from the remembered last-non-zero.
+        kindSel.value = "fade";
+        kindSel.dispatchEvent(new Event("change", { bubbles: true }));
+        expect(msInput.disabled).toBe(false);
+        expect(msInput.value).toBe("750");
+    });
+
+    it("typing a non-zero ms while kind=cut auto-switches kind to fade", async () => {
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: fetchPlaylistsWith(["a"]),
+            onReorder: vi.fn(),
+        });
+        await tick();
+        const block = container.querySelector('.track-block[data-id="a"]');
+        const chip = block.querySelector(".track-block-transition");
+        chip.click();
+        await tick();
+        const kindSel = block.querySelector(".track-block-transition-kind");
+        const msInput = block.querySelector(".track-block-transition-ms");
+        // Force-enable the input the way the operator's keystroke would
+        // before the cut-lock kicks in (the input is disabled in DOM but
+        // a synthetic dispatch can still fire change/input on it).
+        msInput.disabled = false;
+        msInput.value = "300";
+        msInput.dispatchEvent(new Event("input", { bubbles: true }));
+        expect(kindSel.value).toBe("fade");
+        expect(block.dataset.transition).toBe("fade");
+        expect(block.dataset.transitionMs).toBe("300");
+        expect(msInput.disabled).toBe(false);
+    });
+
+    it("clamps ms input to 0-5000 range on input", async () => {
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({
+                schema_version: 4,
+                playlists: [
+                    {
+                        id: DEFAULT_PLAYLIST_ID,
+                        name: "default",
+                        items: [
+                            { item_id: "a", transition: "fade", transition_ms: 500 },
+                        ],
+                    },
+                ],
+            }),
+            onReorder: vi.fn(),
+        });
+        await tick();
+        const block = container.querySelector('.track-block[data-id="a"]');
+        block.querySelector(".track-block-transition").click();
+        await tick();
+        const msInput = block.querySelector(".track-block-transition-ms");
+        msInput.value = "99999";
+        msInput.dispatchEvent(new Event("input", { bubbles: true }));
+        expect(msInput.value).toBe("5000");
+        expect(block.dataset.transitionMs).toBe("5000");
+        msInput.value = "-50";
+        msInput.dispatchEvent(new Event("input", { bubbles: true }));
+        expect(msInput.value).toBe("0");
+        expect(block.dataset.transitionMs).toBe("0");
+    });
+
+    it("chip label shows kind + ms compactly (cut bare, fade · 500ms, fade · 1.5s)", async () => {
+        const container = document.createElement("div");
+        mountPlaylistTrack(container, {
+            fetchItems: async () => ITEMS,
+            fetchPlaylists: async () => ({
+                schema_version: 4,
+                playlists: [
+                    {
+                        id: DEFAULT_PLAYLIST_ID,
+                        name: "default",
+                        items: [
+                            { item_id: "a", transition: "cut", transition_ms: 0 },
+                            { item_id: "b", transition: "fade", transition_ms: 500 },
+                            { item_id: "c", transition: "fade", transition_ms: 1500 },
+                        ],
+                    },
+                ],
+            }),
+            onReorder: vi.fn(),
+        });
+        await tick();
+        const chipA = container.querySelector('.track-block[data-id="a"] .track-block-transition');
+        const chipB = container.querySelector('.track-block[data-id="b"] .track-block-transition');
+        const chipC = container.querySelector('.track-block[data-id="c"] .track-block-transition');
+        expect(chipA.textContent.trim()).toBe("cut");
+        expect(chipB.textContent.trim()).toBe("fade · 500ms");
+        expect(chipC.textContent.trim()).toBe("fade · 1.5s");
+    });
+
+    it("popover stays closed by default and opens on chip click; clicking outside closes it", async () => {
+        const container = document.createElement("div");
+        document.body.appendChild(container);
+        try {
+            mountPlaylistTrack(container, {
+                fetchItems: async () => ITEMS,
+                fetchPlaylists: fetchPlaylistsWith(["a"]),
+                onReorder: vi.fn(),
+            });
+            await tick();
+            const block = container.querySelector('.track-block[data-id="a"]');
+            const chip = block.querySelector(".track-block-transition");
+            const pop = block.querySelector(".track-block-transition-popover");
+            expect(pop.hidden).toBe(true);
+            expect(chip.getAttribute("aria-expanded")).toBe("false");
+            chip.click();
+            await tick();
+            expect(pop.hidden).toBe(false);
+            expect(chip.getAttribute("aria-expanded")).toBe("true");
+            // Click outside the wrap closes.
+            document.body.click();
+            expect(pop.hidden).toBe(true);
         } finally {
             document.body.removeChild(container);
         }
