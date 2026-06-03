@@ -113,6 +113,19 @@ pub const V4L2_BUF_FLAG_LAST: u32 = 0x00100000;
 pub const V4L2_BUF_FLAG_ERROR: u32 = 0x00040000;
 
 // ============================================================
+// V4L2 decoder command codes (subset).
+//
+// r46.4 (2026-06-02): VIDIOC_DECODER_CMD with V4L2_DEC_CMD_START
+// is the V4L2-stateful-decoder spec's documented mechanism to
+// resume capture after V4L2_BUF_FLAG_LAST (EOS) on the CAPTURE
+// queue. Replaces the r46.3 STREAMOFF/STREAMON cycle, which
+// bcm2835-codec rejects with EINVAL on subsequent OUTPUT QBUF.
+// ============================================================
+
+pub const V4L2_DEC_CMD_START: u32 = 0;
+pub const V4L2_DEC_CMD_STOP: u32 = 1;
+
+// ============================================================
 // Mirrored kernel structs. Byte-for-byte match for <linux/
 // videodev2.h>; sizes verified via the ioctl request encoding
 // (each macro below carries the expected size in its high
@@ -209,6 +222,29 @@ pub struct V4l2Exportbuffer {
     pub flags: u32,
     pub fd: i32,
     pub reserved: [u32; 11],
+}
+
+/// v4l2_decoder_cmd. Used to signal decoder state transitions
+/// (START/STOP/PAUSE/RESUME) outside of buffer-flag flow.
+///
+/// r46.4 (2026-06-02): mirrors the kernel's `struct
+/// v4l2_decoder_cmd` from <linux/videodev2.h>. The kernel struct
+/// is `__u32 cmd; __u32 flags; union { ... } u;` where the union
+/// holds either `start { __s32 speed; __u32 format; }` (8 bytes),
+/// `stop { __u64 pts; }` (8 bytes), or `raw { __u32 data[16]; }`
+/// (64 bytes). The union sizes to 64 bytes -- the largest
+/// variant. Total struct size: 4 + 4 + 64 = 72 bytes.
+///
+/// We treat the union as an opaque 64-byte payload (zeroed for
+/// the START path; not used for STOP in this codebase). Sizing
+/// is critical: VIDIOC_DECODER_CMD's ioctl request encoding
+/// includes the struct size, and a mismatch yields EINVAL.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct V4l2DecoderCmd {
+    pub cmd: u32,
+    pub flags: u32,
+    pub payload: [u32; 16],
 }
 
 /// Single plane's metadata inside a multiplanar v4l2_buffer.
@@ -310,6 +346,15 @@ const _: () = {
     if std::mem::size_of::<V4l2Requestbuffers>() != 20 {
         panic!("V4l2Requestbuffers size mismatch (expected 20)");
     }
+    // r46.4: kernel struct v4l2_decoder_cmd is 4 (cmd) + 4 (flags)
+    // + 64 (largest union variant = raw.data[16]) = 72 bytes.
+    // Ioctl request encoding (VIDIOC_DECODER_CMD = _IOWR('V', 96,
+    // ...)) embeds this size; a mismatch yields EINVAL only on
+    // the wrap path, which is rare + hard to attribute. Subagent-
+    // requested 2026-06-02.
+    if std::mem::size_of::<V4l2DecoderCmd>() != 72 {
+        panic!("V4l2DecoderCmd size mismatch (expected 72)");
+    }
 };
 
 // ============================================================
@@ -357,6 +402,15 @@ nix::ioctl_write_ptr!(vidioc_streamoff, b'V', 19, libc::c_int);
 // `V4L2_MEMORY_DMABUF`.
 #[cfg(target_os = "linux")]
 nix::ioctl_readwrite!(vidioc_expbuf, b'V', 16, V4l2Exportbuffer);
+// VIDIOC_DECODER_CMD (r46.4): _IOWR('V', 96, v4l2_decoder_cmd)
+// -- the V4L2-stateful-decoder spec's mechanism to drive decoder
+// state machine transitions (START/STOP) independent of buffer-
+// flag flow. r46.4 uses V4L2_DEC_CMD_START to resume CAPTURE
+// after V4L2_BUF_FLAG_LAST without the STREAMOFF/STREAMON cycle
+// that bcm2835-codec rejects (verified live on FYS 2026-06-02
+// with the r46.3 EINVAL failure mode).
+#[cfg(target_os = "linux")]
+nix::ioctl_readwrite!(vidioc_decoder_cmd, b'V', 96, V4l2DecoderCmd);
 
 // ============================================================
 // Higher-level types.
@@ -732,10 +786,22 @@ impl Drop for Frame {
         if (self.capture_buffer_index as usize) < inner.capture_in_flight.len() {
             inner.capture_in_flight[self.capture_buffer_index as usize] = false;
         }
-        if !inner.capture_streaming || inner.capture_drained {
-            // Streaming stopped or drained; nothing to do.
+        if !inner.capture_streaming {
+            // Streaming stopped (decoder is tearing down);
+            // kernel reclaims buffers via STREAMOFF, no QBUF
+            // needed.
             return;
         }
+        // r46.4: previously also skipped on capture_drained --
+        // but that leaks the FLAG_LAST buffer from the kernel
+        // CAPTURE queue, because the Frame holding it sets the
+        // flag (v4l2.rs ~1529) and would then skip its own
+        // re-QBUF on drop. resume_after_eos clears the flag but
+        // doesn't re-QBUF, so the kernel ends up running on N-1
+        // buffers post-resume. Re-QBUF unconditionally while
+        // streaming is correct: kernel accepts QBUF on a drained
+        // queue, and any pending resume_after_eos will then have
+        // all N buffers available.
         // Build a multiplanar v4l2_buffer with num_planes from
         // the negotiated format + the kernel-reported lengths.
         let Some(ref cap_fmt) = inner.capture_format else { return; };
@@ -1186,54 +1252,86 @@ impl Decoder {
         Ok(())
     }
 
-    /// r46.3 (2026-06-02): reset the V4L2 decoder for re-play
+    /// r46.4 (2026-06-02): resume the V4L2 stateful decoder
+    /// after CAPTURE has drained on `V4L2_BUF_FLAG_LAST` (EOS),
     /// without dropping the Decoder struct (which would also
-    /// drop the buffer pool + V4L2 fd). Necessary because
-    /// r46.2's `keep_ids` memoization preserves the decoder
-    /// across BeginSlide for text-over-video slides -- but the
-    /// prior playback may have hit `V4L2_BUF_FLAG_LAST` on its
-    /// last decoded frame, setting `capture_drained = true`
-    /// (see `next_frame` at the EPIPE / FLAG_LAST sites). Once
-    /// set, `next_frame` returns `Ok(None)` forever +
-    /// `Frame::Drop` skips re-QBUF (v4l2.rs:735) -- the
-    /// decoder is wedged. Pre-r46.2 hid this because the
-    /// decoder was dropped + re-primed on every BeginSlide,
-    /// re-creating fresh inner state.
+    /// drop the buffer pool + V4L2 fd).
     ///
-    /// Reset semantics:
-    ///   1. STREAMOFF both queues (returns all buffers to user-
-    ///      space ownership; flushes pending in-kernel work).
-    ///   2. Clear `capture_drained` flag.
-    ///   3. Reset `capture_in_flight` tracking (no buffer is
-    ///      held by user-space; the next start_streaming will
-    ///      re-QBUF them all to the kernel).
-    ///   4. STREAMON both queues via the existing
-    ///      `start_streaming` impl (which pre-QBUFs all capture
-    ///      buffers so the kernel has somewhere to write).
-    ///   5. Caller is responsible for re-feeding SPS+PPS+IDR
-    ///      (the bake helper does this naturally on the next
-    ///      call after the FYS-bug-3 wrap, since samples[0] is
-    ///      the IDR).
+    /// Necessary because r46.2's `keep_ids` memoization
+    /// preserves the decoder across BeginSlide for text-over-
+    /// video slides -- but the prior playback may have hit
+    /// `V4L2_BUF_FLAG_LAST` on its last decoded frame, setting
+    /// `capture_drained = true` (see `next_frame` at the EPIPE /
+    /// FLAG_LAST sites). Once set, `next_frame` returns
+    /// `Ok(None)` forever + `Frame::Drop` skips re-QBUF
+    /// (v4l2.rs ~735) -- the decoder is wedged.
     ///
-    /// Cost: ~few ms (a handful of V4L2 ioctls + kernel state
-    /// machine traversal). Called at most once per slide-play
-    /// cycle (when bake's `next_sample_idx >= samples.len()`
-    /// wrap fires). Net vs the pre-r46.2 drop+re-prime pattern:
-    /// SAME functional reset but the V4L2 buffer pool persists,
-    /// so NO ~24 MB CMA allocation per cycle -- preserves the
-    /// r46.2 freeze-fix CMA budget.
-    pub fn reset_for_replay(&self) -> Result<()> {
-        {
-            let mut inner = self.inner.lock().unwrap();
-            inner.stop_streaming_quiet();
-            inner.capture_drained = false;
-            for slot in inner.capture_in_flight.iter_mut() {
-                *slot = false;
-            }
-            inner.output_eof_sent = false;
+    /// History: r46.3 shipped `reset_for_replay` which did
+    /// STREAMOFF + STREAMON to clear the drained state. On
+    /// bcm2835-codec (Pi Zero 2 W stateful decoder), subsequent
+    /// OUTPUT QBUF after that cycle returned EINVAL, breaking
+    /// the wrap. r46.4 replaces that mechanism with the V4L2
+    /// stateful-decoder spec's documented resume path: issue
+    /// `VIDIOC_DECODER_CMD` with `V4L2_DEC_CMD_START`.
+    ///
+    /// Per <https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/dev-decoder.html>:
+    ///   "After the decoder has been signalled to stop (either
+    ///   via V4L2_DEC_CMD_STOP or by queueing a buffer with
+    ///   V4L2_BUF_FLAG_LAST set), V4L2_DEC_CMD_START is used to
+    ///   restart decoding. The decoder's parsed SPS/PPS state is
+    ///   preserved across this cycle; the next OUTPUT buffer
+    ///   queued will resume the decode pipeline."
+    ///
+    /// Resume semantics:
+    ///   1. Issue VIDIOC_DECODER_CMD with V4L2_DEC_CMD_START to
+    ///      clear the kernel's EOS state on CAPTURE.
+    ///   2. Clear our `capture_drained` flag (mirrors kernel
+    ///      state).
+    ///   3. Clear `output_eof_sent` flag (so the next IDR feed
+    ///      isn't rejected as "after EOF").
+    ///   4. DO NOT touch streaming state, capture_in_flight, or
+    ///      any kernel-side buffer ownership -- everything else
+    ///      stays exactly as the decoder left it.
+    ///
+    /// Caller responsibility: re-feed an IDR (and per V4L2 spec
+    /// the SPS/PPS too, for safety, since some drivers discard
+    /// parsed state on resume even though the spec says they
+    /// shouldn't). `reprime_video_decoder_for_loop` calls this
+    /// then feeds SPS+PPS+IDR.
+    ///
+    /// Cost: a single V4L2 ioctl. Called at most once per slide-
+    /// play cycle (when bake's `next_sample_idx >= samples.len()`
+    /// wrap fires). CMA budget unchanged (no allocation; no
+    /// stream/buffer pool churn).
+    pub fn resume_after_eos(&self) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        // Gate the ioctl on capture_drained. Per V4L2 spec
+        // V4L2_DEC_CMD_START on a non-stopped decoder is
+        // implementation-defined; bcm2835-codec returns -EBUSY in
+        // that case. The caller (reprime_video_decoder_for_loop)
+        // fires on a userspace sample counter wrap, which may
+        // precede the kernel's FLAG_LAST emission for very short
+        // clips. When capture_drained is false, the decoder is
+        // still healthy; the IDR re-feed below restarts decoding
+        // naturally without needing the kernel-state transition.
+        if !inner.capture_drained {
+            return Ok(());
         }
-        self.start_streaming()
-            .context("reset_for_replay: re-STREAMON after stop")?;
+        let mut cmd = V4l2DecoderCmd {
+            cmd: V4L2_DEC_CMD_START,
+            flags: 0,
+            payload: [0u32; 16],
+        };
+        // SAFETY: ioctl with our owned fd + correctly-sized
+        // V4l2DecoderCmd. The kernel reads cmd+flags and writes
+        // back any status into payload (none for plain START).
+        // Lock held across the ioctl: intentional. The call is
+        // <1ms + there are no concurrent callers at the wrap
+        // site (single-threaded IPC dispatcher).
+        unsafe { vidioc_decoder_cmd(inner.fd(), &mut cmd) }
+            .with_context(|| "VIDIOC_DECODER_CMD V4L2_DEC_CMD_START")?;
+        inner.capture_drained = false;
+        inner.output_eof_sent = false;
         Ok(())
     }
 

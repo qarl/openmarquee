@@ -228,36 +228,32 @@ pub fn reprime_video_decoder_for_loop(
     state: &mut VideoDecoderState,
     dem: &Mp4Demuxer,
 ) -> Result<()> {
-    // r46.3 (2026-06-02): reset the V4L2 streaming state BEFORE
-    // re-feeding the primer. Pre-r46.2 the IPC sidecar dropped the
-    // decoder on every BeginSlide so the decoder was always fresh
-    // here; the standalone reel path (render_video_slide_in_session)
-    // similarly only loops within a single hold so the decoder
-    // never reaches V4L2_BUF_FLAG_LAST. r46.2's keep_ids
-    // memoization preserves the decoder across BeginSlide for
-    // text-over-video same-slide loops -- and a long-enough slide
-    // will reach EOS, setting capture_drained=true in DecoderInner,
-    // which makes all subsequent next_frame() return Ok(None)
-    // forever (v4l2.rs:1304). The bare-IDR feed below would NOT
-    // recover from that state because feeding output buffers
-    // doesn't clear the drained-capture flag + Frame::Drop skips
-    // re-QBUF when drained.
+    // r46.4 (2026-06-02): resume the V4L2 stateful decoder
+    // BEFORE re-feeding the primer. Pre-r46.2 the IPC sidecar
+    // dropped the decoder on every BeginSlide so it was always
+    // fresh; the standalone reel path only loops within a single
+    // hold so the decoder never reaches V4L2_BUF_FLAG_LAST.
+    // r46.2's keep_ids memoization preserves the decoder across
+    // BeginSlide for text-over-video same-slide loops -- and a
+    // long-enough slide will reach EOS, setting
+    // capture_drained=true in DecoderInner, which makes all
+    // subsequent next_frame() return Ok(None) forever. The bare-
+    // IDR feed below would NOT recover from that state because
+    // feeding output buffers doesn't clear the drained flag.
     //
-    // reset_for_replay does STREAMOFF + clear capture_drained +
-    // reset capture_in_flight + STREAMON (re-QBUFs all capture
-    // buffers). After that the decoder is in the V4L2 equivalent
-    // of "freshly primed" except SPS/PPS are not yet fed -- which
-    // the primer feed below provides.
-    //
-    // For the in-loop wrap case (decoder still streaming, no
-    // EOS yet), reset_for_replay's STREAMOFF then STREAMON is
-    // a cheap state-cycle (~few ms of V4L2 ioctls). Acceptable
-    // overhead per loop boundary; the alternative would be to
-    // gate on capture_drained which needs a getter on Decoder.
+    // r46.3 shipped reset_for_replay (STREAMOFF + STREAMON +
+    // re-QBUF). That cycle is rejected by bcm2835-codec on
+    // subsequent OUTPUT QBUF with EINVAL (verified live on FYS
+    // 2026-06-02 r46.3 deploy). r46.4 replaces it with
+    // resume_after_eos which issues VIDIOC_DECODER_CMD with
+    // V4L2_DEC_CMD_START -- the V4L2 stateful-decoder spec's
+    // documented mechanism for post-EOS resume. Does not touch
+    // streaming/buffer state; just clears the kernel's EOS
+    // marker on CAPTURE.
     state
         .decoder
-        .reset_for_replay()
-        .context("reset_for_replay before re-priming SPS+PPS+IDR")?;
+        .resume_after_eos()
+        .context("resume_after_eos before re-priming SPS+PPS+IDR")?;
     let first_sample = dem
         .samples
         .first()
