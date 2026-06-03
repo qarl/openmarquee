@@ -59,6 +59,8 @@
 //! individually `#[cfg(target_os = "linux")]` gated.
 
 #[cfg(target_os = "linux")]
+use std::collections::VecDeque;
+#[cfg(target_os = "linux")]
 use std::fs::{File, OpenOptions};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -613,6 +615,23 @@ struct DecoderInner {
     /// Whether the kernel has returned V4L2_BUF_FLAG_LAST on a
     /// CAPTURE dequeue; subsequent next_frame() returns None.
     capture_drained: bool,
+    /// r48 (2026-06-03): OUTPUT-side free-buffer-index pool.
+    /// Populated by `allocate_buffers(Output)` with all N indices.
+    /// `feed()` pops the next free index; `drain_output_quiet`'s
+    /// DQBUF success path pushes the reclaimed index back.
+    ///
+    /// Pre-r48 history: `feed` hardcoded `buf_idx = 0`, single-shot
+    /// safe per its docstring. perf-night r5 (2026-05-26) wrote a
+    /// 9-line comment (video_decode.rs:170-178) anticipating "the
+    /// free-list refactor that v4l2.rs:1184-1191 mentions (piece
+    /// 3's real driver loop)" as the long-term fix; r46.4 on FYS
+    /// 2026-06-02 made the EINVAL surface live: bcm2835-codec
+    /// rejects VIDIOC_QBUF OUTPUT on a buffer it already owns,
+    /// and the prior `drain_output_quiet` had a timing window
+    /// where sample N+1's feed could fire before sample N's
+    /// buffer was dequeued. r48 closes the race by tracking
+    /// kernel-vs-userspace ownership explicitly.
+    free_output_slots: VecDeque<u32>,
     /// File. Declared LAST so Drop closes it AFTER the
     /// MmapRegion Drops munmap. (Rust drops struct fields in
     /// declaration order; mapping the kernel order requires the
@@ -637,6 +656,17 @@ impl DecoderInner {
             // swallow errors so Drop doesn't panic.
             unsafe { let _ = vidioc_streamoff(self.fd(), &bt); }
             self.output_streaming = false;
+            // r48: STREAMOFF returns all queued OUTPUT buffers to
+            // userspace ownership. Repopulate the free pool with
+            // every index so any subsequent start_streaming +
+            // feed cycle starts with a full pool. Pre-r48 the
+            // pool wasn't tracked so there was nothing to reset;
+            // post-r48 a STREAMOFF-then-resume without this
+            // would leave the kernel-tracked indices missing
+            // from the free deque and feed() would either skip
+            // them or hit the "all in flight" error path.
+            let n = self.mapped_output.len();
+            self.free_output_slots = (0..n as u32).collect();
         }
         if self.capture_streaming {
             let bt: libc::c_int = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE as libc::c_int;
@@ -864,6 +894,7 @@ impl Decoder {
             capture_streaming: false,
             output_eof_sent: false,
             capture_drained: false,
+            free_output_slots: VecDeque::new(),
             file,
             path: path.to_path_buf(),
         };
@@ -1108,7 +1139,18 @@ impl Decoder {
             buffer_regions.push(plane_regions);
         }
         match dir {
-            QueueDirection::Output => inner.mapped_output = buffer_regions,
+            QueueDirection::Output => {
+                inner.mapped_output = buffer_regions;
+                // r48: seed the free-list with all OUTPUT indices.
+                // All slots start userspace-owned; `feed()` pops
+                // one when it QBUFs to the kernel, and
+                // `drain_output_quiet`'s DQBUF success path pushes
+                // it back. A repeat allocate_buffers (currently
+                // not supported but defensible) overwrites both
+                // the mmap regions and the free pool together.
+                inner.free_output_slots =
+                    (0..allocated_count as u32).collect();
+            }
             QueueDirection::Capture => {
                 inner.capture_in_flight = vec![false; allocated_count];
                 inner.mapped_capture = buffer_regions;
@@ -1339,51 +1381,89 @@ impl Decoder {
     /// the OUTPUT queue. Empty slice signals end-of-input
     /// (V4L2_BUF_FLAG_LAST). Reclaims completed OUTPUT buffers
     /// in the same call to keep the pipeline full.
+    ///
+    /// r48 (2026-06-03): rotates through ALL allocated OUTPUT
+    /// buffers via the `free_output_slots` deque (vs the pre-r48
+    /// single-buffer hardcode `buf_idx = 0`, which raced
+    /// `drain_output_quiet` and produced VIDIOC_QBUF OUTPUT EINVAL
+    /// on bcm2835-codec for any back-to-back feed faster than the
+    /// kernel could decode + dequeue).
     pub fn feed(&self, h264_nal: &[u8]) -> Result<()> {
         // Drain any completed OUTPUT buffers first (they're
         // ready for reuse). EAGAIN means none ready -- fine.
+        // r48: drain feeds slots back to the pool; if still
+        // empty after, we'll retry with bounded sleep below.
         self.drain_output_quiet();
+
+        // r48 (subagent 2026-06-03): if the first drain didn't
+        // refill the pool, do up to 5 more drains spaced 2ms
+        // apart before declaring the decoder wedged. Mirrors the
+        // perf-night-r5 next_frame EAGAIN sleep pattern -- under
+        // transient back-pressure (one tick where kernel hasn't
+        // released any OUTPUT buffer yet), feed() should soft-
+        // wait instead of hard-erroring (which propagates as a
+        // slide/transition abort via the IPC dispatcher).
+        for _ in 0..5 {
+            {
+                let inner = self.inner.lock().unwrap();
+                if !inner.free_output_slots.is_empty() {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            self.drain_output_quiet();
+        }
+
         let mut inner = self.inner.lock().unwrap();
         if inner.output_eof_sent && !h264_nal.is_empty() {
             return Err(anyhow!("feed() called after EOF"));
         }
-        let Some(ref out_fmt) = inner.output_format else {
-            return Err(anyhow!("feed: output not formatted"));
-        };
         if inner.mapped_output.is_empty() {
             return Err(anyhow!("feed: no OUTPUT buffers allocated"));
         }
-        // SINGLE-SHOT-SAFE only: piece 2b always picks buffer
-        // index 0. The test fixture feeds the entire 17 KB
-        // Annex-B stream + EOF in two calls -- by the second
-        // call (EOF), drain_output_quiet has reclaimed idx 0.
-        // Piece 3's real driver loop will need a free-list
-        // (track which OUTPUT indices the kernel has handed
-        // back via DQBUF) and reject feed() with EBUSY if
-        // every OUTPUT buffer is in flight.
-        let buf_idx = 0u32;
-        let num_planes = out_fmt.num_planes as usize;
-        let plane_max = out_fmt.plane_fmt[0].sizeimage as usize;
-        // Snapshot the per-plane sizeimages BEFORE taking the
-        // &mut on `inner.mapped_output`, since `out_fmt` is itself
-        // borrowed from `inner.output_format`. Without this copy
-        // the borrow checker rejects the simultaneous immutable
-        // borrow of `inner.output_format` and mutable borrow of
-        // `inner.mapped_output` (caught by piece 3c cross-compile).
-        let plane_sizeimages: [u32; 8] = {
-            let mut a = [0u32; 8];
+        // r48: snapshot the format fields we need + free-pool
+        // depth in a tight scoped borrow, then drop the borrow
+        // before mutating inner.free_output_slots /
+        // inner.mapped_output. Both the format read AND the
+        // pool pop need to coexist with the later mut access to
+        // mapped_output; snapshotting up front sidesteps the
+        // multi-field borrow conflict (caught by piece 3c
+        // cross-compile, same shape).
+        let (num_planes, plane_max, plane_sizeimages) = {
+            let Some(ref out_fmt) = inner.output_format else {
+                return Err(anyhow!("feed: output not formatted"));
+            };
+            let num_planes = out_fmt.num_planes as usize;
+            let plane_max = out_fmt.plane_fmt[0].sizeimage as usize;
+            let mut sizeimages = [0u32; 8];
             for p in 0..num_planes {
-                a[p] = out_fmt.plane_fmt[p].sizeimage;
+                sizeimages[p] = out_fmt.plane_fmt[p].sizeimage;
             }
-            a
+            (num_planes, plane_max, sizeimages)
+        };
+        // r48: pull the next free OUTPUT buffer index from the
+        // deque. If still empty after the bounded retry above,
+        // surface an error so the caller (typically the IPC
+        // playback loop) can decide to drop the slide.
+        let pool_capacity = inner.mapped_output.len();
+        let Some(buf_idx) = inner.free_output_slots.pop_front() else {
+            return Err(anyhow!(
+                "feed: all {} OUTPUT buffers in flight (kernel-owned); \
+                 drain wedged after 10ms retry budget -- decoder may \
+                 need reset",
+                pool_capacity
+            ));
         };
         if h264_nal.len() > plane_max {
+            // r48: return slot to free pool on validation error;
+            // we never QBUF'd it.
+            inner.free_output_slots.push_front(buf_idx);
             return Err(anyhow!(
                 "feed: NAL chunk ({} bytes) larger than OUTPUT buffer ({})",
                 h264_nal.len(), plane_max
             ));
         }
-        // Copy bytes into plane 0 of buffer 0.
+        // Copy bytes into plane 0 of the chosen buffer.
         let region = &mut inner.mapped_output[buf_idx as usize][0];
         let dst = region.as_mut_slice();
         dst[..h264_nal.len()].copy_from_slice(h264_nal);
@@ -1404,19 +1484,47 @@ impl Decoder {
         };
         // SAFETY: ioctl with valid fd + buffer + planes array
         // alive through the call.
-        unsafe { vidioc_qbuf(inner.fd(), &mut buf) }
-            .with_context(|| "VIDIOC_QBUF OUTPUT")?;
+        let qbuf_result = unsafe { vidioc_qbuf(inner.fd(), &mut buf) };
+        if let Err(e) = qbuf_result {
+            // r48 (subagent 2026-06-03): QBUF failed; return
+            // slot to the BACK of the pool so a transiently bad
+            // slot rotates past for the next feed (vs push_front
+            // which would re-pop the same bad slot and wedge the
+            // decoder on a 1-of-N persistent error). Validation-
+            // error path above still uses push_front because the
+            // slot is provably clean (never reached the kernel).
+            inner.free_output_slots.push_back(buf_idx);
+            return Err(anyhow::Error::new(e)).with_context(|| "VIDIOC_QBUF OUTPUT");
+        }
         if h264_nal.is_empty() {
             inner.output_eof_sent = true;
         }
         Ok(())
     }
 
+    /// r48 test accessor: snapshot the current OUTPUT free-list.
+    /// Returns the indices in the deque (front-first). Used by
+    /// the rotation-correctness tests below to verify the pool's
+    /// invariants without exposing DecoderInner's full surface.
+    #[cfg(test)]
+    pub fn free_output_slots_snapshot(&self) -> Vec<u32> {
+        let inner = self.inner.lock().unwrap();
+        inner.free_output_slots.iter().copied().collect()
+    }
+
     /// Best-effort: drain completed OUTPUT buffers so they're
     /// available for the next feed. EAGAIN -> nothing ready ->
     /// silently return.
+    ///
+    /// r48 (2026-06-03): each successful DQBUF returns the
+    /// dequeued buffer's index to `free_output_slots` so the
+    /// next `feed()` can rotate to a different slot. Pre-r48
+    /// the DQBUF result was discarded entirely; combined with
+    /// feed's hardcoded `buf_idx = 0` this gave the appearance
+    /// of working under single-shot test patterns but raced the
+    /// kernel under any back-to-back feed.
     fn drain_output_quiet(&self) {
-        let inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         if !inner.output_streaming {
             return;
         }
@@ -1435,7 +1543,14 @@ impl Decoder {
             // buf + planes array. EAGAIN if nothing ready.
             let r = unsafe { vidioc_dqbuf(inner.fd(), &mut buf) };
             match r {
-                Ok(_) => continue, // reclaimed; check for more.
+                Ok(_) => {
+                    // r48: return reclaimed slot to the free pool.
+                    // push_back is FIFO -- slots cycle in QBUF
+                    // order, which gives kernel maximum time to
+                    // process buf_idx N before we re-use N.
+                    inner.free_output_slots.push_back(buf.index);
+                    continue;
+                }
                 Err(nix::errno::Errno::EAGAIN) => return, // nothing left.
                 Err(_) => return, // other errors: bail (caller
                 // will surface them on the next real feed/next_frame).
@@ -1910,5 +2025,228 @@ mod tests {
         // Re-open immediately. If anything leaked, this'd fail.
         let dec2 = Decoder::open(path).expect("re-open");
         let _ = dec2.query_capabilities().expect("re-QUERYCAP");
+    }
+
+    // ========================================================
+    // r48: OUTPUT buffer rotation correctness tests.
+    // ========================================================
+
+    /// allocate_buffers(Output, N) seeds the free pool with all
+    /// N indices in order [0..N). Pool depth before allocation
+    /// is zero.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn r48_allocate_output_seeds_free_pool() {
+        let path = Path::new("/dev/video10");
+        if !path.exists() {
+            eprintln!("skipping: /dev/video10 absent");
+            return;
+        }
+        let dec = Decoder::open(path).expect("open");
+        // Before allocation: pool empty.
+        assert_eq!(
+            dec.free_output_slots_snapshot(), Vec::<u32>::new(),
+            "free pool should be empty before allocate_buffers"
+        );
+        let _ = dec.set_output_format(V4L2_PIX_FMT_H264, 320, 240)
+            .expect("S_FMT OUTPUT");
+        let _ = dec.set_capture_format(V4L2_PIX_FMT_NV12, 320, 240)
+            .expect("S_FMT CAPTURE");
+        dec.allocate_buffers(QueueDirection::Output, 4)
+            .expect("REQBUFS OUTPUT");
+        // After allocation: pool should contain [0, 1, 2, 3].
+        // The kernel may negotiate a different count (it's free
+        // to allocate more or fewer than requested); accept any
+        // N as long as the pool is in 0..N order.
+        let pool = dec.free_output_slots_snapshot();
+        assert!(!pool.is_empty(), "pool should be non-empty");
+        for (i, &idx) in pool.iter().enumerate() {
+            assert_eq!(
+                idx, i as u32,
+                "pool should be [0..N) in order; got {:?}", pool
+            );
+        }
+    }
+
+    /// feed() pops the next free slot; drain_output_quiet
+    /// (called from next feed) returns it. Smoke test that the
+    /// FIFO rotation pattern doesn't immediately surface
+    /// VIDIOC_QBUF EINVAL across multiple back-to-back feeds.
+    ///
+    /// This is a smoke test, NOT a deterministic regression-
+    /// catcher (subagent 2026-06-03): pre-r48 the same test
+    /// MIGHT have passed on a fast kernel that reclaimed buf 0
+    /// between feeds via drain_output_quiet. The live FYS bug
+    /// (r46.4 deploy 2026-06-02) showed the race surface with
+    /// real H.264 content + bcm2835's actual decode latency.
+    /// To turn this into a true regression test you'd need to
+    /// gate drain_output_quiet (or add a #[cfg(test)] no-drain
+    /// variant) -- out of scope for r48.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn r48_feed_rotates_through_pool_back_to_back() {
+        let path = Path::new("/dev/video10");
+        if !path.exists() {
+            eprintln!("skipping: /dev/video10 absent");
+            return;
+        }
+        let fixture = include_bytes!(
+            "../tests/fixtures/test_320x240.h264"
+        );
+        let dec = Decoder::open(path).expect("open");
+        let _ = dec.set_output_format(V4L2_PIX_FMT_H264, 320, 240)
+            .expect("S_FMT OUTPUT");
+        let _ = dec.set_capture_format(V4L2_PIX_FMT_NV12, 320, 240)
+            .expect("S_FMT CAPTURE");
+        dec.allocate_buffers(QueueDirection::Output, 4)
+            .expect("REQBUFS OUTPUT");
+        dec.allocate_buffers(QueueDirection::Capture, 4)
+            .expect("REQBUFS CAPTURE");
+        dec.start_streaming().expect("STREAMON");
+
+        let initial_pool = dec.free_output_slots_snapshot();
+        let pool_capacity = initial_pool.len();
+        assert!(
+            pool_capacity >= 2,
+            "test needs >=2 OUTPUT buffers; got {}",
+            pool_capacity
+        );
+
+        // Feed the same fixture N times back-to-back. Pre-r48
+        // this would EINVAL on the 2nd feed (buf_idx=0 still
+        // kernel-owned). Post-r48 the pool rotates through and
+        // back-to-back feeds succeed.
+        //
+        // Note: we DON'T feed EOF here -- want to keep buffers
+        // cycling, not signal end-of-stream.
+        for n in 0..pool_capacity {
+            dec.feed(fixture).unwrap_or_else(|e| {
+                panic!(
+                    "feed #{} failed (pool rotation broken?): {}", n, e
+                );
+            });
+        }
+        // After feeding pool_capacity times in rapid succession
+        // (no drain time), the pool should be empty -- every
+        // slot has been QBUF'd to the kernel + the kernel hasn't
+        // had time to DQBUF any back.
+        //
+        // Sleep briefly so the kernel can process some, then
+        // poke drain via next_frame's internal call OR another
+        // feed attempt (which will trigger drain_output_quiet).
+        // The exact pool state depends on bcm2835's processing
+        // speed; we just want to see SOMETHING come back.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Trigger drain by calling next_frame (which calls
+        // drain_output_quiet internally).
+        let _ = dec.next_frame();
+        let final_pool = dec.free_output_slots_snapshot();
+        eprintln!(
+            "after {} feeds + 50ms + drain: pool = {:?}",
+            pool_capacity, final_pool
+        );
+        // The most important thing: NO EINVALs above. That
+        // alone validates the rotation contract.
+    }
+
+    /// feed() with an oversized NAL returns the popped slot to
+    /// the free pool (validation error path).
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn r48_feed_oversized_nal_restores_pool_depth() {
+        let path = Path::new("/dev/video10");
+        if !path.exists() {
+            eprintln!("skipping: /dev/video10 absent");
+            return;
+        }
+        let dec = Decoder::open(path).expect("open");
+        let _ = dec.set_output_format(V4L2_PIX_FMT_H264, 320, 240)
+            .expect("S_FMT OUTPUT");
+        let _ = dec.set_capture_format(V4L2_PIX_FMT_NV12, 320, 240)
+            .expect("S_FMT CAPTURE");
+        dec.allocate_buffers(QueueDirection::Output, 4)
+            .expect("REQBUFS OUTPUT");
+        dec.allocate_buffers(QueueDirection::Capture, 4)
+            .expect("REQBUFS CAPTURE");
+        dec.start_streaming().expect("STREAMON");
+
+        let pre = dec.free_output_slots_snapshot();
+        // Build an oversized fake NAL: bigger than any plausible
+        // OUTPUT plane (16 MB exceeds bcm2835's typical sizeimage
+        // of 1-4 MB for 320x240).
+        let huge = vec![0u8; 16 * 1024 * 1024];
+        let err = dec.feed(&huge).expect_err("oversized NAL must error");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("larger than OUTPUT buffer"),
+            "expected size-mismatch error; got: {msg}"
+        );
+        let post = dec.free_output_slots_snapshot();
+        assert_eq!(
+            pre.len(), post.len(),
+            "pool depth must be preserved on validation error"
+        );
+        // r48: push_front on error keeps the next feed
+        // deterministic -- the failed slot retries first. Verify
+        // the same head index.
+        if !pre.is_empty() {
+            assert_eq!(
+                pre[0], post[0],
+                "error path should push_front (same head)"
+            );
+        }
+    }
+
+    /// Sanity: N back-to-back feeds drain the pool below its
+    /// initial depth (slots end up kernel-owned). This is a
+    /// smoke test that confirms `feed()` actually CONSUMES slots
+    /// from the pool (vs. somehow pre-restoring them).
+    ///
+    /// NOTE: this is NOT a STREAMOFF-repopulation test. STREAMOFF
+    /// + post-STREAMOFF pool state is exercised through Drop in
+    /// `drop_then_reopen_clean` (any pool leak would EBUSY the
+    /// next REQBUFS on re-open). Verifying mid-life STREAMOFF
+    /// pool-reset would need a #[cfg(test)] pub stop_streaming
+    /// accessor on Decoder; not in r48 scope.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn r48_feed_consumes_pool_slots() {
+        let path = Path::new("/dev/video10");
+        if !path.exists() {
+            eprintln!("skipping: /dev/video10 absent");
+            return;
+        }
+        let fixture = include_bytes!(
+            "../tests/fixtures/test_320x240.h264"
+        );
+        let dec = Decoder::open(path).expect("open");
+        let _ = dec.set_output_format(V4L2_PIX_FMT_H264, 320, 240)
+            .expect("S_FMT OUTPUT");
+        let _ = dec.set_capture_format(V4L2_PIX_FMT_NV12, 320, 240)
+            .expect("S_FMT CAPTURE");
+        dec.allocate_buffers(QueueDirection::Output, 4)
+            .expect("REQBUFS OUTPUT");
+        dec.allocate_buffers(QueueDirection::Capture, 4)
+            .expect("REQBUFS CAPTURE");
+        dec.start_streaming().expect("STREAMON");
+
+        let initial = dec.free_output_slots_snapshot();
+        let n = initial.len();
+        // Feed N times back-to-back; on a fast kernel some slots
+        // may have been reclaimed by drain_output_quiet inside
+        // feed(), but we should still see SOMETHING in flight.
+        for _ in 0..n {
+            let _ = dec.feed(fixture);
+        }
+        // Snapshot WITHOUT triggering drain (free_output_slots_
+        // snapshot doesn't call drain). Pool should be smaller
+        // than initial; on bcm2835 at 320x240 it's typically 0-1
+        // since decode time exceeds feed-loop time.
+        let after_feeds = dec.free_output_slots_snapshot();
+        assert!(
+            after_feeds.len() < n,
+            "pool should have been drained by N feeds; before={} after={}",
+            n, after_feeds.len()
+        );
     }
 }
