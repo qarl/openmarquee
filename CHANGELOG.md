@@ -19,8 +19,10 @@ locations for cross-ecosystem readability.
 
 **DRAFT release notes.** The 1.0.1 tag + RELEASE commit are
 qarl's call. These notes cover everything between `v1.0.0`
-(`57d95db`, 2026-05-31) and origin/main HEAD `f4d59948` as of
-2026-06-03 — 38 commits across a SUBSTANTIVE feature ship
+(`57d95db`, 2026-05-31) and origin/main HEAD `5c5ff39` as of
+2026-06-03 (r50 landed during r54 draft; r54 follow-up
+commit updates this section to cite it) — 39 commits across
+a SUBSTANTIVE feature ship
 (text-over-video composite), the operator-visible UI exposure
 batch (outline + drop shadow + transition timing + HTTPS toggle),
 two workflow-driven adversarial-refute audits (r47 spec-vs-code
@@ -77,13 +79,16 @@ story:
   (2026-05-26) explicitly anticipated this refactor; r48 ships
   it. After r48, the text-over-video freeze + wrap symptoms
   both resolve at the root cause.
-- r50 (in flight / pending qarl confirmation as of v1.0.1
-  draft) — wires text-over-video INTO the playlist-level
+- `5c5ff39` r50 — text-over-video in transitions (closes r46
+  §F.new). Wires text-over-video INTO the playlist-level
   transition rendering path so a fade/wipe/etc. into a text-
-  over-video slide presents both layers correctly. If r50 has
-  landed by tag-cut, this entry replaces with its SHA + the
-  transition coverage closes §5.10 fully. **Tag-cut blocker:
-  r50 live-fire verification on FYS.**
+  over-video slide presents both layers correctly. Landed
+  after r54's initial draft; §5.10's transition-into-text-
+  over-video case is now structurally complete. **Tag-cut
+  blocker reduces to: r50 live-fire verification on FYS** —
+  visual confirmation that the transition path composites
+  correctly under real load (no shader regressions or scanout
+  glitches under transition stress).
 
 The symptom-chase pattern (r46.2 → r46.3 → r46.4 each fixed a
 symptom + introduced the next, until r48 found the right
@@ -473,11 +478,12 @@ Admin-Jimmy spec-rewrite work queue:
 
 When qarl directs the v1.0.1 tag cut:
 
-1. **r50 verification on FYS** — live-fire confirm text-over-
-   video transitions composite correctly. r50 is the last
-   structural piece for §5.10's transition-into-text-over-video
-   case; without r50 the §5.10 claim is "partial — transitions
-   pending r50".
+1. **r50 verification on FYS** — `5c5ff39` landed; live-fire
+   confirm transitions into text-over-video slides composite
+   correctly under load. With r50 landed, §5.10's transition-
+   into-text-over-video case is structurally complete; the
+   remaining gate is visual / behavioral verification on the
+   real hardware, not additional code.
 2. **CMA watchdog default decision** — either:
    (a) bump `THRESHOLD_MB` in
        `system/openmarquee-cma-watchdog.sh` to ~254 MB, or
