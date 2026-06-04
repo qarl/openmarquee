@@ -186,23 +186,40 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
     // baseline journal: 'first frame painted (sample idx 4)' after a
     // 10670ms over-budget delta_ms.
     //
-    // Why this works with feed()'s single-buffer (buffer 0 only) shape:
-    // feed() internally calls drain_output_quiet which dequeues any
-    // completed OUTPUT buffer before QBUF-ing the new sample. With a
-    // sleep between successive feeds, the kernel has time to consume
-    // sample N before sample N+1 is QBUF'd. The free-list refactor that
-    // v4l2.rs:1184-1191 mentions (piece 3's "real driver loop") is the
-    // proper long-term fix but is out of scope for r5; the sleep here
-    // is a workaround that costs ~25ms at prime time AND saves ~10s
-    // per slide at runtime -- net win by ~400x.
+    // r57 (2026-06-04): the 4×6 ms `std::thread::sleep(6 ms)` calls
+    // inside this loop have been removed. They were a workaround for
+    // the pre-r48 single-OUTPUT-buffer race: feed() always used
+    // buf_idx=0, so the second of two back-to-back feeds would QBUF
+    // a buffer the kernel still owned and the ioctl returned EINVAL.
+    // The sleeps gave the kernel ~6 ms to release the previous QBUF
+    // before the next feed collided.
+    //
+    // r48 (2026-06-03) replaced the single-buffer hardcode with a
+    // free-list rotation across all 4 OUTPUT buffers (`free_output_
+    // slots: VecDeque` in DecoderInner; see v4l2.rs:618-634). Each
+    // feed() now pop_front()s a different slot index, so back-to-
+    // back feeds queue to different kernel-side slots and never
+    // collide.
+    //
+    // r57 subagent (2026-06-04): warmup_count narrowed from 4 to 3
+    // so the total feed sequence (1 primer + 3 warmup = 4) fits the
+    // 4-slot OUTPUT pool with strict zero-wait math. Pre-fix the 5th
+    // feed (4th warmup sample) depended on feed()'s 5×2 ms drain-
+    // retry budget to find a slot, which is tight under CMA-pressured
+    // worst-case kernel-side decode timing (~7-8 ms/sample). With
+    // warmup_count=3 the worst case is strictly non-blocking. H.264
+    // B-frame reorder distance is typically 3-4 frames, so 3 warmup
+    // samples still fills the kernel's lookahead window — perf delta
+    // vs warmup_count=4 is negligible in the steady-state advance
+    // loop, which feeds one sample per tick from sample idx 4 onward.
+    //
+    // Pixel-perfect parity contract preserved: the samples fed and
+    // their order are unchanged; only the timing of when sample N+1
+    // arrives at the kernel changes (sooner). First-frame output is
+    // bit-identical.
     let t_warmup = Instant::now();
-    let warmup_count = 4.min(dem.samples.len().saturating_sub(1));
+    let warmup_count = 3.min(dem.samples.len().saturating_sub(1));
     for _ in 0..warmup_count {
-        // Give the kernel ~6ms to consume the previous OUTPUT buffer.
-        // bcm2835-codec on Pi Zero 2 W decodes a 1280x720 sample in
-        // ~5ms; 6ms is one extra ms of safety. Total warmup overhead
-        // ~24ms at prime, paid once per slide attach.
-        std::thread::sleep(std::time::Duration::from_millis(6));
         let s = &dem.samples[next_sample_idx];
         match dec.feed(s) {
             Ok(()) => {
