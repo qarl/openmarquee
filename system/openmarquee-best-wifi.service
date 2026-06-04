@@ -1,0 +1,57 @@
+[Unit]
+# r60 (2026-06-04): scan visible WiFi + pick the strongest known
+# SSID. Runs once at boot AFTER NetworkManager-online so the wifi
+# stack is up + at least the cached scan is loaded. The recurring
+# scan/re-check is driven by openmarquee-best-wifi.timer (every
+# 5 min); this unit handles the one-shot boot fire.
+#
+# Spec: qarl 2026-06-04 "create a system where it scans all the
+# network/passwords it knows and connects to the best."
+#
+# Safety: the helper script never leaves the Pi disconnected.
+# If a switch fails reachability it reverts to the prior SSID;
+# if no known SSID is visible it no-ops and leaves NM's default
+# behavior intact (whatever NM picked stays).
+Description=openMarquee: pick the best known WiFi SSID
+
+# Order after NM is up so wlan0 has a chance to bind + scan. r60
+# subagent (WARN): After=NetworkManager-online only gates on NM
+# settling, NOT on a connection being up. Adding
+# network-online.target (pulled by NetworkManager-wait-online.service
+# on Pi OS Trixie) tightens the wait to actual connectivity. The
+# 3 s sleep after rescan in the helper script catches any residual
+# scan-result-not-yet-loaded race.
+After=NetworkManager.service NetworkManager-online.service network-online.target
+Wants=NetworkManager-online.service network-online.target
+
+# Skip cleanly if NM isn't installed (e.g. dnsmasq-only or hostapd-
+# only test rigs). The script no-ops when nmcli is missing too.
+ConditionPathExists=/usr/bin/nmcli
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart=/opt/openmarquee/system/openmarquee-best-wifi.sh
+# A failed scan or reachability check must not block the rest of
+# boot. The helper script's safety contract guarantees we don't
+# leave the Pi disconnected; reflect that here.
+SuccessExitStatus=0 1
+# Resource limits: this is a 100-line shell + nmcli ioctls; max
+# expected RSS ~10 MB. The MemoryMax cap is defense-in-depth
+# against a runaway log buffer.
+MemoryMax=64M
+# Log to journal so the boot fire's diagnostic is captured
+# alongside the timer recurrences.
+StandardOutput=journal
+StandardError=journal
+
+# r60 subagent (NIT fix): no [Install] section. The boot fire is
+# driven by install.sh's explicit `systemctl start` (gated on
+# SSH_CONNECTION) AND by the .timer's OnBootSec=1min. Adding
+# WantedBy=multi-user.target would cause the unit to fire a THIRD
+# time at multi-user.target-reach (install.sh start + multi-user
+# WantedBy + timer at +60s). Without [Install] the unit is on-demand
+# only: install.sh fires it once at provisioning, the timer fires
+# it at boot + every 5 min thereafter. The timer's own [Install]
+# section is what links the pair to boot, not this unit's.
+

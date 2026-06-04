@@ -1,0 +1,27 @@
+[Unit]
+# r60 (2026-06-04): periodic re-check of best-known-WiFi. Roams
+# to a stronger known SSID when one becomes available (e.g. the
+# operator powers up a different home AP, or the sign moves to
+# a different room).
+#
+# Hysteresis lives in the helper script (HYSTERESIS_DBM=8 by
+# default); this timer just drives the cadence.
+Description=openMarquee: re-pick best known WiFi SSID every 5 minutes
+
+[Timer]
+# Fire first 60s after boot so the boot-time oneshot has had time
+# to settle (the oneshot's check happens at startup; this is the
+# first RECURRING tick on top).
+OnBootSec=1min
+# Then every 5 minutes. Per dispatch "every N minutes (think 5-10
+# min), re-scan." 5 min is at the aggressive end of the range so
+# the operator sees roams within one tick after moving the Pi.
+OnUnitActiveSec=5min
+# Add a small random delay so the timer doesn't fire at exactly
+# the same wall-clock second every interval (cosmetic, but keeps
+# the log noise out of correlated fingerprints).
+RandomizedDelaySec=10
+Unit=openmarquee-best-wifi.service
+
+[Install]
+WantedBy=timers.target

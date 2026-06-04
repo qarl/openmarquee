@@ -304,7 +304,8 @@ fi
 say "Install systemd units"
 run mkdir -p "$SYSTEMD_DIR"
 for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tailscale.service \
-            openmarquee-cma-watchdog.service openmarquee-cma-watchdog.timer; do
+            openmarquee-cma-watchdog.service openmarquee-cma-watchdog.timer \
+            openmarquee-best-wifi.service openmarquee-best-wifi.timer; do
     SRC="${OPT_DIR}/system/${unit}"
     DST="${SYSTEMD_DIR}/${unit}"
     if already_done -f "$DST" && already_done "$SRC" -nt "$DST"; then
@@ -327,7 +328,7 @@ done
 # them. Idempotent: chmod +x on an already-executable file is a no-op.
 say "Ensure +x on system/*.sh helpers"
 for sh_helper in openmarquee-ap0-setup.sh openmarquee-firstboot.sh openmarquee-tailscale.sh \
-                 openmarquee-cma-watchdog.sh; do
+                 openmarquee-cma-watchdog.sh openmarquee-best-wifi.sh; do
     SH_PATH="${OPT_DIR}/system/${sh_helper}"
     if [ "$DRY_RUN" -eq 1 ] || [ -f "$SH_PATH" ]; then
         run chmod +x "$SH_PATH"
@@ -1091,11 +1092,39 @@ run systemctl daemon-reload
 # unmasked units). `|| true` is defense-in-depth: if a future Debian
 # image leaves these unmasked, the no-op unmask shouldn't fail-stop
 # the install under set -e.
-run systemctl unmask hostapd.service dnsmasq.service || true
-run systemctl enable openmarquee-backend.service \
-                    openmarquee-ap0.service \
-                    hostapd.service \
-                    dnsmasq.service
+# r60 (2026-06-04): AP off by default. Per qarl spec, the brcmfmac
+# dual-mode (AP on ap0 + STA on wlan0) crashes under load (r43
+# investigation). Mask the AP-side units so they cannot fire on
+# boot or via late-postinst nudges. The unit files stay installed
+# under /etc/systemd/system/ so an operator can re-enable for
+# field-provisioning via `systemctl unmask openmarquee-ap0.service
+# hostapd.service dnsmasq.service && systemctl start ...`.
+#
+# Field-provisioning fallback design lives in
+# qa/r60-ap-off-by-default-design.md §A: today the operator runs
+# the manual unmask + start sequence at the console (Option 2 from
+# the dispatch); a one-shot first-boot-AP wizard with auto-disable
+# is a future r62+ candidate.
+#
+# The mask is idempotent (no-op on already-masked units) and uses
+# `|| true` because an unmask-after-prior-mask race (e.g. operator
+# unmasked manually + restarted install.sh) shouldn't fail-stop
+# under set -e.
+say "Mask AP-side units (r60: AP off by default; field-provisioning is unmask-then-start)"
+run systemctl mask openmarquee-ap0.service hostapd.service dnsmasq.service || true
+
+run systemctl enable openmarquee-backend.service
+
+# r60: best-known-WiFi scanner + roam timer. Boot oneshot picks the
+# strongest visible known SSID; 5-min recurring timer roams to a
+# better SSID when one appears (with 8 pts NM-signal hysteresis to
+# prevent oscillation). qa/r60-ap-off-by-default-design.md §B
+# details the roam semantics + lockout-safety contract.
+#
+# Only the .timer carries [Install]/WantedBy (r60 subagent NIT fix
+# to avoid boot-time double-fire on the .service); enabling the
+# timer wires the unit pair into the boot dependency graph.
+run systemctl enable openmarquee-best-wifi.timer
 
 # r38c CMA-pressure watchdog -- timer fires the oneshot every 60s,
 # oneshot reads /proc/meminfo and restarts openmarquee-backend.service
@@ -1106,23 +1135,23 @@ run systemctl enable openmarquee-backend.service \
 run systemctl enable openmarquee-cma-watchdog.timer
 run systemctl start openmarquee-cma-watchdog.timer || true
 
-# Phase 4u: explicit start sequence. `systemctl enable` alone does NOT
-# activate units when multi-user.target is already reached during
-# cloud-init -- the units are wired into next-boot's dependency graph,
-# but they don't get started this boot. Section 5.5's mask above stops
-# FUTURE invocations of hostapd / dnsmasq from the .deb postinst, but
-# any failed-state already queued before mask landed survives the
-# mask; reset-failed clears it. Then bring up ap0 explicitly (needed
-# for hostapd to find an interface to bind), then restart hostapd +
-# dnsmasq so they pick up the now-templated configs and the now-extant
-# ap0. `ip link set wlan0 up` is belt-and-braces (ap0-setup.sh handles
-# its own interface up, but a wlan0-down state would mean ap0 can't
-# create either).
-run systemctl reset-failed hostapd.service dnsmasq.service || true
-run ip link set wlan0 up || true
-run systemctl start openmarquee-ap0.service
-run systemctl restart hostapd.service
-run systemctl restart dnsmasq.service
+# r60 subagent (BLOCKER fix): only fire the best-wifi oneshot mid-
+# install when we're NOT running under an interactive ssh session.
+# If install.sh was invoked over wifi-ssh (developer redeploy via
+# `bash scripts/deploy.sh`), the helper script's `nmcli connection
+# up id <other-ssid>` would drop wlan0 mid-session and the install
+# would die before the §8.5+ backend restart + /healthz probe ran.
+# In cloud-init / first-boot contexts SSH_CONNECTION is unset
+# (init's environment), so the oneshot fires normally. In all
+# other contexts the OnBootSec=1min timer picks it up at next
+# boot -- one boot's grace period is fine; the system was already
+# working with whatever NM picked anyway.
+if [ -z "${SSH_CONNECTION:-}" ]; then
+    say "Starting best-wifi oneshot (boot context detected; SSH_CONNECTION unset)"
+    run systemctl start openmarquee-best-wifi.service || true
+else
+    say "Deferring best-wifi oneshot (SSH session detected; OnBootSec=1min timer will pick it up at next boot)"
+fi
 
 # Restart the backend so the new code takes effect on developer redeploy.
 # On first boot the unit isn't running; --no-block queues the restart and
