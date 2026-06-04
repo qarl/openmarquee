@@ -2272,9 +2272,21 @@ fn handle_inner_request(
                 }
             }
             cache.evict_other_video_state(&keep_ids);
+            // r58 (2026-06-04): time the cache.load so QA can see
+            // when a PreloadSlide pre-warm shaved the BeginSlide
+            // critical path. A small us (≲ 1 ms) means short-
+            // circuit on items+mtime+demuxer+decoder hit (pre-warm
+            // landed); a large us (~70-270 ms range) means cold
+            // load (pre-warm missed or wasn't sent).
+            let t_load = std::time::Instant::now();
             if let Err(e) = cache.load(content_root, p.slide_id) {
                 return err(format!("begin_slide load failed: {e:#}"));
             }
+            let load_us = t_load.elapsed().as_micros();
+            eprintln!(
+                "[perf] begin_slide_load slide_id={} load_us={}",
+                p.slide_id, load_us,
+            );
             // Bug 8 / Fix A (2026-05-17): cache.load succeeded
             // populating ContentItem::Video, but the underlying
             // MP4 demuxer failed (asset.mp4 missing, malformed, or
@@ -2298,9 +2310,18 @@ fn handle_inner_request(
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
+            // r58 (2026-06-04): time the to-slide cache.load so QA
+            // can see PreloadSlide wins on the transition path too.
+            // Same heuristic as begin_slide_load above.
+            let t_load = std::time::Instant::now();
             if let Err(e) = cache.load(content_root, p.to_slide_id) {
                 return err(format!("begin_transition load failed: {e:#}"));
             }
+            let load_us = t_load.elapsed().as_micros();
+            eprintln!(
+                "[perf] begin_transition_load slide_id={} load_us={}",
+                p.to_slide_id, load_us,
+            );
             // Hardening C3 / M1 (2026-05-21): also re-prime the
             // FROM-slide. The transition paint path fetches the
             // from-endpoint demuxer / decoder with a HARD ERROR if
@@ -2423,6 +2444,63 @@ fn handle_inner_request(
                 result: OpResult::ProfileDumpOk {
                     text: crate::profile::dump_text(),
                 },
+            }
+        }
+        IpcRequest::PreloadSlide(p) => {
+            // r58 (2026-06-04): pre-warm a slide's cache state ahead
+            // of BeginSlide so the V4L2 decoder bring-up cost
+            // (~70-270 ms per r56 measurement) happens off the
+            // transition critical path.
+            //
+            // Implementation: just `cache.load(slide_id)`. For text-
+            // over-video slides, cache.load recurses through
+            // `ensure_bg_video_for_text_slide` which loads the bg
+            // VideoSlide as well -- so PreloadSlide for a TextSlide
+            // pre-warms BOTH the text slide and its bg video. For
+            // bare Video slides, cache.load primes the decoder
+            // directly. For Image / Text-only slides, cache.load
+            // populates items + reads the JSON; cheap.
+            //
+            // Idempotent: a duplicate PreloadSlide on the same id
+            // short-circuits at cache.load's items+mtime+demuxer+
+            // decoder check (assuming evict_other_video_state didn't
+            // fire between the two calls).
+            //
+            // Errors are non-fatal from the backend's POV. The
+            // backend logs + continues; the slide hits the same
+            // failure on its actual BeginSlide and the existing
+            // UnsupportedSlide rail picks it up.
+            //
+            // We DO NOT evict here. evict_other_video_state runs
+            // ONLY on BeginSlide, which is the "this slide is now
+            // the current slide" anchor. PreloadSlide is a hint that
+            // a slide MIGHT be the next current — the actual
+            // eviction stays with BeginSlide where the lifecycle
+            // already lives. During the overlap window between
+            // PreloadSlide and BeginSlide, both the current slide's
+            // and the preloaded slide's V4L2 decoders are live —
+            // identical CMA shape to the existing BeginTransition
+            // window (which also has both pools live). Peak does
+            // not grow; the 2-pool window widens by ~500 ms.
+            let preload_id = p.slide_id;
+            let t_preload = std::time::Instant::now();
+            let load_result = cache.load(content_root, preload_id);
+            let us = t_preload.elapsed().as_micros();
+            match load_result {
+                Ok(()) => {
+                    eprintln!(
+                        "[perf] preload slide_id={} us={}",
+                        preload_id, us,
+                    );
+                    ok_empty()
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[perf] preload slide_id={} failed_us={} err={:#}",
+                        preload_id, us, e,
+                    );
+                    err(format!("preload_slide load failed: {e:#}"))
+                }
             }
         }
     }

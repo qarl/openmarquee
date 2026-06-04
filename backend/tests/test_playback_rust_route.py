@@ -88,6 +88,10 @@ class _FakeRustRenderer:
         # (to_slide_id, to_duration_ms, kind, transition_ms, t0_ms)
         self.begin_transition_calls: list[tuple[UUID, int, str, int, int]] = []
         self.advance_calls: list[int] = []
+        # r58 (2026-06-04): preload_slide recorder for the pre-warm
+        # trigger test. List of slide ids the playback loop asked
+        # the sidecar to pre-warm.
+        self.preload_slide_calls: list[UUID] = []
         self.render_frame_calls: int = 0
         self._current_slide: UUID | None = None
         self._begin_t_ms: int = 0
@@ -108,6 +112,13 @@ class _FakeRustRenderer:
         self.render_frame_calls += 1
 
     # IPC ops --------------------------------------------------------
+
+    def preload_slide(self, slide_id: UUID) -> None:
+        """r58 (2026-06-04): test stub for the pre-warm hint. Records
+        the call so tests can assert the trigger fired with the
+        expected next-slide id. No state mutation — preload is a
+        cache hint, not a playback-state op."""
+        self.preload_slide_calls.append(slide_id)
 
     def begin_slide(self, slide_id: UUID, t0_ms: int, duration_ms: int) -> None:
         # Record the attempt BEFORE the unsupported-slide rail so tests
@@ -891,3 +902,191 @@ async def test_subprocess_error_during_begin_transition_swaps_to_mock():
             0,
         )
     assert wrapper.is_in_fallback is True
+
+
+# ----------------------------------------------------------------------
+# r58 (2026-06-04): PreloadSlide pre-warm trigger tests
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_r58_preload_fires_for_next_slide_during_current_tail():
+    """Pre-warm contract: ~500ms before slide end, the playback loop
+    sends preload_slide for the next slide so its V4L2 decoder bring-
+    up happens off the transition critical path.
+
+    Uses a 700ms duration (well over the 500ms threshold) so the
+    trigger fires reliably. Asserts preload_slide_calls contains the
+    other slide's id by the time the playlist iterates."""
+    text_a = _text_slide(
+        name="A",
+        text="A",
+        duration_ms=700,
+        transition="fade",
+        transition_ms=30,
+    )
+    text_b = _text_slide(
+        name="B",
+        text="B",
+        duration_ms=700,
+        transition="fade",
+        transition_ms=30,
+    )
+
+    fake = _FakeRustRenderer(width=8, height=8)
+    loop = PlaybackLoop(
+        fake,
+        fetch_items=lambda: [text_a, text_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+        auto_tick_seconds=0.02,
+    )
+    await loop.start()
+    # Allow one full cycle: A (700ms) + transition (~30ms) + B starts.
+    await asyncio.sleep(1.0)
+    await loop.stop()
+
+    # Pre-warm of next slide should have fired during A's tail.
+    # next_item for A's slot is B; next_item for B's slot is A
+    # (playlist wraps). With ~1.0s of run-time we expect at least
+    # the first preload (B during A's tail) to have landed.
+    assert text_b.id in fake.preload_slide_calls, (
+        f"expected preload of B during A's tail; got {fake.preload_slide_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_r58_preload_skipped_when_duration_below_threshold():
+    """Edge case: slides with duration_ms < 500ms skip the pre-warm
+    entirely (the trigger condition `elapsed >= duration/1000 - 0.5`
+    requires elapsed < 0 which never happens). Verify no preload
+    fires when the slot is too short for a meaningful pre-warm."""
+    short_a = _text_slide(
+        name="A",
+        text="A",
+        duration_ms=_FAST_DURATION_MS,  # 100ms, well under 500ms
+        transition="fade",
+        transition_ms=30,
+    )
+    short_b = _text_slide(
+        name="B",
+        text="B",
+        duration_ms=_FAST_DURATION_MS,
+        transition="fade",
+        transition_ms=30,
+    )
+
+    fake = _FakeRustRenderer(width=8, height=8)
+    loop = PlaybackLoop(
+        fake,
+        fetch_items=lambda: [short_a, short_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+        auto_tick_seconds=0.02,
+    )
+    await loop.start()
+    # Several short cycles to make sure if it WAS going to fire,
+    # it would have. ~5 slide slots over 500ms.
+    await asyncio.sleep(0.5)
+    await loop.stop()
+
+    assert fake.preload_slide_calls == [], (
+        f"sub-500ms slides should not trigger preload; got "
+        f"{fake.preload_slide_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_r58_preload_forwards_through_autofallback_wrapper():
+    """Production path: PlaybackLoop wraps the bare RustRenderer in an
+    AutoFallbackRenderer. The wrapper must forward preload_slide; the
+    pre-r58-fix wrapper was missing this method, so production preloads
+    AttributeError'd silently in playback.py's broad except and the
+    pre-warm IPC never reached the sidecar.
+
+    This test instantiates the wrapper around _FakeRustRenderer and
+    asserts that preload_slide_calls land on the underlying fake."""
+    from openmarquee.dependencies import (
+        AutoFallbackRenderer,
+        _mock_renderer_singleton,
+    )
+
+    text_a = _text_slide(
+        name="A",
+        text="A",
+        duration_ms=700,
+        transition="fade",
+        transition_ms=30,
+    )
+    text_b = _text_slide(
+        name="B",
+        text="B",
+        duration_ms=700,
+        transition="fade",
+        transition_ms=30,
+    )
+
+    fake = _FakeRustRenderer(width=8, height=8)
+    wrapper = AutoFallbackRenderer(fake, _mock_renderer_singleton)
+    loop = PlaybackLoop(
+        wrapper,
+        fetch_items=lambda: [text_a, text_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+        auto_tick_seconds=0.02,
+    )
+    await loop.start()
+    await asyncio.sleep(1.0)
+    await loop.stop()
+
+    # Through the wrapper, preload_slide(B) should have been forwarded
+    # to the underlying _FakeRustRenderer during slide A's tail.
+    assert text_b.id in fake.preload_slide_calls, (
+        f"AutoFallbackRenderer wrapper must forward preload_slide; "
+        f"underlying fake saw {fake.preload_slide_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_r58_preload_exception_does_not_kill_playback(caplog):
+    """If preload_slide raises, the playback loop logs a warning and
+    continues — the slide still plays out, and the failure is
+    non-fatal. Mirrors the dispatch's edge case 5 (CMA pressure mid-
+    preload should not crash the renderer / loop)."""
+
+    class _PreloadRaisingFake(_FakeRustRenderer):
+        def preload_slide(self, slide_id: UUID) -> None:
+            self.preload_slide_calls.append(slide_id)
+            raise RuntimeError("simulated preload failure (CMA pressure)")
+
+    text_a = _text_slide(
+        name="A", text="A", duration_ms=700, transition="fade", transition_ms=30
+    )
+    text_b = _text_slide(
+        name="B", text="B", duration_ms=700, transition="fade", transition_ms=30
+    )
+
+    fake = _PreloadRaisingFake(width=8, height=8)
+    loop = PlaybackLoop(
+        fake,
+        fetch_items=lambda: [text_a, text_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+        auto_tick_seconds=0.02,
+    )
+    with caplog.at_level("WARNING", logger="openmarquee.playback"):
+        await loop.start()
+        await asyncio.sleep(1.0)
+        await loop.stop()
+
+    # The preload should have fired (and raised), but begin_slide
+    # for both A and B should still have happened.
+    assert len(fake.preload_slide_calls) >= 1
+    begin_ids = {c[0] for c in fake.begin_slide_calls}
+    assert text_a.id in begin_ids
+    # A warning line about the non-fatal preload failure should be
+    # in the log.
+    assert any(
+        "preload_slide" in r.message and "non-fatal" in r.message
+        for r in caplog.records
+    ), f"expected non-fatal preload warning; got {[r.message for r in caplog.records]}"

@@ -1069,6 +1069,21 @@ class PlaybackLoop:
         # to its own paint cadence so over-ticking is harmless.
         tick_period = 1.0 / 30
         end_at = t0 + duration_ms / 1000
+        # r58 (2026-06-04): pre-warm trigger state. Fires PreloadSlide
+        # for `next_item` once `elapsed >= duration_ms/1000 - 0.5` so
+        # the next slide's V4L2 decoder bring-up (~70-270 ms per r56
+        # measurement) happens off the transition critical path. Set
+        # to next_item.id after the preload IPC returns so we don't
+        # re-fire on every subsequent tick. None means "not yet
+        # preloaded in this slot" (or "no preload needed / pending").
+        preloaded_next_id: UUID | None = None
+        # Threshold seconds-before-slide-end for the preload trigger.
+        # ~500 ms covers the worst-case ~270 ms prime cost with
+        # generous headroom for the IPC round-trip + scheduler jitter.
+        # If duration_ms is less than this threshold the preload is
+        # skipped entirely (we never cross the trigger window for a
+        # slide that holds for <500 ms; rare in practice).
+        preload_lead_seconds = 0.5
         while True:
             if self._stop_event.is_set() or self._pause_event.is_set():
                 break
@@ -1128,7 +1143,74 @@ class PlaybackLoop:
             if isinstance(result, SlideComplete):
                 # Sidecar's state machine signaled duration-end. Slide
                 # finished cleanly; advance to next item.
+                #
+                # r58 (2026-06-04, subagent WARN fix): the preload
+                # trigger lives BELOW this break so we don't fire
+                # PreloadSlide on the very last tick of a slot. If
+                # the preload fired here it would run immediately
+                # before begin_transition — sequenced under the
+                # renderer's RLock the prime cost lands INSIDE the
+                # transition critical path anyway, defeating the
+                # whole point of pre-warm.
                 break
+            # r58 (2026-06-04): pre-warm trigger. Once per slide
+            # slot, ~500 ms before SlideComplete fires, send
+            # PreloadSlide for next_item so its V4L2 decoder bring-
+            # up happens during this slide's tail rather than at
+            # transition start. Skipped when:
+            #   * no next_item (single-item playlist, manual stop,
+            #     etc.) — nothing to pre-warm
+            #   * duration_ms < 500 ms — preload threshold never
+            #     crosses; the trigger condition `elapsed >=
+            #     duration_ms/1000 - 0.5` would require elapsed < 0
+            #   * preloaded_next_id matches next_item.id — already
+            #     fired for this slot
+            # CMA budget: pre-warm holds the next slide's V4L2
+            # decoder concurrent with the current slide's for
+            # ~500 ms of overlap (vs the ~1.5 s of transition
+            # overlap that's already happening today per r50). Peak
+            # CMA is unchanged because the 2-pool concurrent shape
+            # already exists during transitions — pre-warm only
+            # widens its time window by ~500 ms.
+            if (
+                next_item is not None
+                and preloaded_next_id != next_item.id
+                and duration_ms >= 500
+                and elapsed >= (duration_ms / 1000) - preload_lead_seconds
+            ):
+                try:
+                    # Same off-loop pattern as begin_slide / advance:
+                    # blocking IPC round-trip on an executor worker.
+                    # The renderer's RLock serializes against the
+                    # next advance() call so we don't pipeline two
+                    # ops to the same sidecar.
+                    await asyncio.to_thread(
+                        self._renderer.preload_slide,
+                        next_item.id,
+                    )
+                    log.debug(
+                        "playback: preloaded next slide id=%s during slide id=%s tail",
+                        next_item.id,
+                        item.id,
+                    )
+                except Exception as e:
+                    # Non-fatal: the slide will hit the same failure
+                    # on its actual BeginSlide and the existing
+                    # UnsupportedSlide rail picks it up. Throttle
+                    # the warning so a hot-loop of failing preloads
+                    # doesn't spam the journal.
+                    log.warning(
+                        "playback: preload_slide for next id=%s failed "
+                        "(non-fatal; will retry at BeginSlide): %s",
+                        next_item.id,
+                        e,
+                    )
+                # Mark this id as preloaded for this slot whether
+                # the IPC succeeded or failed — failure shouldn't
+                # cause a retry storm. If the same next_item.id
+                # appears in a later slot the per-slot
+                # preloaded_next_id reset handles it.
+                preloaded_next_id = next_item.id
             remaining = end_at - loop.time()
             if remaining <= 0:
                 break

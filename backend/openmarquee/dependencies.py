@@ -326,6 +326,18 @@ class AutoFallbackRenderer:
     def reconfigure(self, *args, **kwargs):
         return self._forward_ipc_op("reconfigure", args, kwargs)
 
+    def preload_slide(self, *args, **kwargs):
+        # r58 (2026-06-04, subagent BLOCKER fix): without this
+        # forwarder, production calls to AutoFallbackRenderer.
+        # preload_slide raise AttributeError -- caught by playback.py's
+        # broad `except Exception` and logged as a non-fatal preload
+        # failure once per slide-tail. Net effect: pre-warm never
+        # reaches the sidecar in production AND the warning spams the
+        # journal. Matches the begin_slide / advance / begin_transition
+        # shape above so the AutoFallbackInMockError + subprocess-error
+        # swap semantics apply uniformly.
+        return self._forward_ipc_op("preload_slide", args, kwargs)
+
     def _forward_ipc_op(self, op_name: str, args: tuple, kwargs: dict):
         if self._mock is not None:
             raise AutoFallbackInMockError(

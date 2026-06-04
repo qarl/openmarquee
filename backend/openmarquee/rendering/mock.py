@@ -147,6 +147,10 @@ class MockRenderer:
         self.begin_slide_calls: list[tuple[uuid.UUID | str, int, int]] = []
         self.begin_transition_calls: list[tuple[uuid.UUID | str, int, str, int, int]] = []
         self.advance_calls: list[int] = []
+        # r58 (2026-06-04): preload_slide call recorder for
+        # backend playback tests that assert the pre-warm trigger
+        # fires at the right moment.
+        self.preload_slide_calls: list[uuid.UUID | str] = []
         self.render_frame_calls: int = 0
         self.end_external_frames_calls: int = 0
         self.reopen_calls: int = 0
@@ -211,6 +215,16 @@ class MockRenderer:
         self._begin_t_ms = int(t0_ms)
         self._duration_ms = int(duration_ms)
         self._paint_placeholder(str(slide_id))
+
+    def preload_slide(self, slide_id: uuid.UUID | str) -> None:
+        """Op 11 (r58, 2026-06-04). Test stub for the pre-warm hint.
+        Records the call so the playback test can assert the trigger
+        fired with the expected next-slide id. No state mutation —
+        preload doesn't change `_current_slide`, so subsequent
+        advance() calls behave as if preload never happened (matches
+        the Rust sidecar contract: preload is a cache hint, not a
+        playback-state op)."""
+        self.preload_slide_calls.append(slide_id)
 
     def advance(self, t_ms: int):
         """Op 3. Return one of PaintSlide / PaintTransition /

@@ -530,6 +530,25 @@ class RustRenderer:
             },
         )
 
+    def preload_slide(self, slide_id: uuid.UUID | str) -> None:
+        """Op 11 (r58, 2026-06-04). Hint to the sidecar that this slide is
+        likely to be the next one — pre-warms the cache + V4L2 decoder so the
+        eventual ``begin_slide`` / ``begin_transition`` short-circuits at the
+        items+mtime+demuxer+decoder check instead of paying the ~70-270 ms
+        cold-load cost on the transition critical path.
+
+        Idempotent: a duplicate preload on the same id is a cheap no-op (cache
+        hit). Errors are non-fatal from the caller's POV — the sidecar logs +
+        returns Err; the caller may proceed to ``begin_slide`` for the same id
+        and hit the same failure on the actual critical path (UnsupportedSlide
+        rail handles missing / malformed assets the same way as before).
+
+        For TextSlide with ``background_video_slide_id``, the sidecar
+        recursively pre-warms the referenced VideoSlide as well — text-over-
+        video pre-warm is a single op from the backend's POV.
+        """
+        self._send_op("preload_slide", {"slide_id": str(slide_id)})
+
     def advance(self, t_ms: int) -> AdvanceResult:
         """Op 3. Tells the sidecar to paint a frame at wall-clock `t_ms`.
         Returns one of PaintSlide / PaintTransition / SlideComplete / Idle."""

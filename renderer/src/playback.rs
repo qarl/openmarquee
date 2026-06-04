@@ -296,6 +296,28 @@ pub enum IpcRequest {
     /// safe to call concurrent with playback (single Mutex guards
     /// the sample store, microsecond-scale critical section).
     ProfileDump,
+    /// Op 11 (r58, 2026-06-04): pre-warm a slide's cache state
+    /// without making it the current slide.
+    ///
+    /// The backend playback loop fires this ~500 ms before a slide
+    /// transition fires so the V4L2 decoder bring-up (~70-270 ms
+    /// per r56 measurement) happens off the transition critical
+    /// path. The handler runs the same `cache.load(slide_id)` that
+    /// `BeginSlide` runs, including `ensure_bg_video_for_text_
+    /// slide` recursion for `TextSlide.background_video_slide_id`,
+    /// so text-over-video keeps working.
+    ///
+    /// Idempotent: if the slide is already loaded (cache hit), the
+    /// handler returns Ok immediately. The next BeginSlide /
+    /// BeginTransition for that id will then short-circuit on
+    /// cache.load's items+mtime check.
+    ///
+    /// Errors are non-fatal: a backend that asked us to preload a
+    /// missing or malformed asset gets back Err with a diagnostic;
+    /// the backend logs + continues. The slide will hit the same
+    /// failure on its actual BeginSlide and the existing
+    /// UnsupportedSlide rail picks it up.
+    PreloadSlide(PreloadSlideParams),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -341,6 +363,14 @@ pub struct BeginTransitionParams {
     pub kind: String,
     pub transition_ms: u32,
     pub t0_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreloadSlideParams {
+    /// The id of the slide to pre-warm. Same semantics as
+    /// `BeginSlideParams::slide_id` — the handler resolves the
+    /// asset via content_root from the Open call.
+    pub slide_id: Uuid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
