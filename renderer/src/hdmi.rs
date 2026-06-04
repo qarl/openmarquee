@@ -3592,6 +3592,25 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     decoder: &crate::v4l2::Decoder,
 ) -> Result<()> {
     use glow::HasContext;
+    // r61 Phase B (2026-06-04): first-frame paint breakdown for the
+    // text-over-video hot path. r58 + r57 shaved most of the
+    // pre-transition stall; the residual gap qarl can still see is
+    // the cost of producing the first VISIBLE frame on the
+    // panel after BeginSlide returns. Sub-phases:
+    //   * bake_us       = V4L2 next_frame() + NV12 upload + blit
+    //   * composite_us  = text-layer paint via paint_slide_with_viewport
+    //   * present_us    = scene-FBO present pass (rotated/non-identity only)
+    //   * scanout_us    = swap + lock_front_buffer + addFB + commit_fb
+    //   * total_us      = whole function wall time
+    //
+    // First-frame detection: frames_decoded is incremented INSIDE
+    // bake_video_slide_to_current_fbo on success, so we snapshot the
+    // pre-bake value here. transition_kind is intentionally omitted
+    // (transition state is cleared by the time this paint runs); QA
+    // correlates with the prior [perf] begin_transition_load line in
+    // the same journal.
+    let was_first = *frames_decoded == 0;
+    let t_total = if was_first { Some(std::time::Instant::now()) } else { None };
     let t_phase = std::time::Instant::now();
     // Same glyph-cache poll + slide-cache invalidation cascade as
     // paint_and_present_one_frame_for_slide. Keeps text-layer
@@ -3693,6 +3712,14 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             mode_h,
         )?
     };
+    // r61 Phase B: snapshot bake duration before its record_phase
+    // call (record_phase's emit shouldn't pollute the sub-phase
+    // timer). bake_us is the dispatch's "dequeue_us" equivalent --
+    // it bundles V4L2 next_frame() (DQBUF wait) + NV12 upload +
+    // cover-fit blit; further decomposition would need timers
+    // inside bake_video_slide_to_current_fbo, deferred until the
+    // top-level data flags bake as the dominant phase.
+    let bake_us = t_phase.elapsed().as_micros();
     crate::profile::record_phase(
         "paint_bake_video",
         t_phase.elapsed().as_nanos() as u64,
@@ -3741,8 +3768,14 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     )?;
     unsafe { session.gl.flush(); }
 
+    // r61 Phase B: snapshot composite duration before the present-
+    // pass timer overlay. composite_us covers paint_slide_with_
+    // viewport (text glyph raster + draw) only; the rotation
+    // present pass is timed separately below.
+    let composite_us = t_phase.elapsed().as_micros();
     // Step 3: present pass through scene FBO if rotated/non-
     // identity. Mirrors paint_and_present_one_frame_for_slide.
+    let t_present = std::time::Instant::now();
     if let Some((_fbo, tex)) = scene_fbo_handle {
         let brightness = (session.current_settings.brightness as f32) / 100.0;
         let gamma = session.current_settings.gamma;
@@ -3753,6 +3786,7 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
         }
     }
+    let present_us = t_present.elapsed().as_micros();
     crate::profile::record_phase(
         "paint_compose",
         t_phase.elapsed().as_nanos() as u64,
@@ -3799,10 +3833,33 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     session.scanout_prev_bo = session.scanout_current_bo.take();
     session.scanout_current_bo = Some(new_bo);
     session.scanout_current_fb = Some(new_fb);
+    // r61 Phase B: scanout_us = wall time of the swap+lock+addFB+
+    // commit sequence (the canonical 11-step release contract per
+    // qa/r38b §2). On a busy CMA pool the lock_front_buffer +
+    // add_framebuffer ioctls can stall waiting for the previous
+    // BO to be released by the next page-flip event.
+    let scanout_us = t_phase.elapsed().as_micros();
     crate::profile::record_phase(
         "paint_present",
         t_phase.elapsed().as_nanos() as u64,
     );
+    // r61 Phase B: emit the first-frame breakdown exactly once per
+    // slide cycle (first paint after BeginSlide). Subsequent
+    // steady-state paints are NOT logged here -- the existing
+    // perf-night-r3 tick budget already covers them. transition_
+    // kind is omitted because transition state is already cleared
+    // by the time this paint runs; QA correlates the
+    // first_frame_paint timestamp against the prior
+    // [perf] begin_transition_load line for the same slide_id.
+    if was_first {
+        let total_us = t_total
+            .map(|t| t.elapsed().as_micros())
+            .unwrap_or(0);
+        eprintln!(
+            "[perf] first_frame_paint slide_id={} bake_us={} composite_us={} present_us={} scanout_us={} total_us={}",
+            slide.id, bake_us, composite_us, present_us, scanout_us, total_us,
+        );
+    }
     Ok(())
 }
 

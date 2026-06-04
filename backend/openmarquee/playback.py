@@ -1070,20 +1070,35 @@ class PlaybackLoop:
         tick_period = 1.0 / 30
         end_at = t0 + duration_ms / 1000
         # r58 (2026-06-04): pre-warm trigger state. Fires PreloadSlide
-        # for `next_item` once `elapsed >= duration_ms/1000 - 0.5` so
-        # the next slide's V4L2 decoder bring-up (~70-270 ms per r56
-        # measurement) happens off the transition critical path. Set
-        # to next_item.id after the preload IPC returns so we don't
-        # re-fire on every subsequent tick. None means "not yet
-        # preloaded in this slot" (or "no preload needed / pending").
+        # for `next_item` once `elapsed >= duration_ms/1000 -
+        # preload_lead_seconds` so the next slide's V4L2 decoder
+        # bring-up (empirically 263-732 ms on FYS per r56 + live
+        # journal data) happens off the transition critical path.
+        # Set to next_item.id after the preload IPC returns so we
+        # don't re-fire on every subsequent tick. None means "not
+        # yet preloaded in this slot" (or "no preload needed /
+        # pending").
         preloaded_next_id: UUID | None = None
         # Threshold seconds-before-slide-end for the preload trigger.
-        # ~500 ms covers the worst-case ~270 ms prime cost with
-        # generous headroom for the IPC round-trip + scheduler jitter.
-        # If duration_ms is less than this threshold the preload is
-        # skipped entirely (we never cross the trigger window for a
-        # slide that holds for <500 ms; rare in practice).
-        preload_lead_seconds = 0.5
+        # r58 shipped at 0.5 s based on a code-reading estimate of
+        # ~100-300 ms prime cost. r61 (2026-06-04): FYS journal
+        # showed `[perf] preload us=N` ranges 263-732 ms across 5
+        # cold-loads, dominated by `mp4_open_us` (~350 ms typical,
+        # up to 522 ms). Three of five transitions had the
+        # PreloadSlide IPC still in flight when BeginTransition
+        # fired -- the renderer's RLock then serialized the two
+        # ops so the prime cost landed in the transition critical
+        # path anyway. Bumped to 1.0 s = ~732 ms worst-case +
+        # ~268 ms headroom for IPC round-trip + executor scheduling
+        # + the next advance tick.
+        #
+        # Trade-off: a slide whose duration_ms is below the gate
+        # (`duration_ms < 1000`) skips pre-warm entirely. The gate
+        # check at the trigger site catches this. Operator-set
+        # short slides (< 1 s) are unusual but possible; for those
+        # the transition into the next slide pays the cold prime
+        # cost as before, no worse than r57.
+        preload_lead_seconds = 1.0
         while True:
             if self._stop_event.is_set() or self._pause_event.is_set():
                 break
@@ -1154,28 +1169,36 @@ class PlaybackLoop:
                 # whole point of pre-warm.
                 break
             # r58 (2026-06-04): pre-warm trigger. Once per slide
-            # slot, ~500 ms before SlideComplete fires, send
-            # PreloadSlide for next_item so its V4L2 decoder bring-
-            # up happens during this slide's tail rather than at
-            # transition start. Skipped when:
+            # slot, `preload_lead_seconds` before SlideComplete
+            # fires, send PreloadSlide for next_item so its V4L2
+            # decoder bring-up happens during this slide's tail
+            # rather than at transition start. r61 widened the
+            # lead from 0.5 s to 1.0 s after FYS measurements
+            # showed worst-case preload up to 732 ms.
+            #
+            # Skipped when:
             #   * no next_item (single-item playlist, manual stop,
             #     etc.) — nothing to pre-warm
-            #   * duration_ms < 500 ms — preload threshold never
-            #     crosses; the trigger condition `elapsed >=
-            #     duration_ms/1000 - 0.5` would require elapsed < 0
+            #   * duration_ms < lead_seconds × 1000 ms — preload
+            #     threshold never crosses; the trigger condition
+            #     `elapsed >= duration/1000 - lead` requires
+            #     elapsed < 0 which never happens
             #   * preloaded_next_id matches next_item.id — already
             #     fired for this slot
             # CMA budget: pre-warm holds the next slide's V4L2
             # decoder concurrent with the current slide's for
-            # ~500 ms of overlap (vs the ~1.5 s of transition
-            # overlap that's already happening today per r50). Peak
-            # CMA is unchanged because the 2-pool concurrent shape
-            # already exists during transitions — pre-warm only
-            # widens its time window by ~500 ms.
+            # `preload_lead_seconds` of overlap (vs the ~1.5 s of
+            # transition overlap that's already happening today
+            # per r50). Peak CMA is unchanged because the 2-pool
+            # concurrent shape already exists during transitions
+            # — pre-warm only widens its time window. r58 measured
+            # 251.8 MB peak under the 254 MB watchdog; r61's
+            # wider window stays within the same budget.
+            preload_min_duration_ms = int(preload_lead_seconds * 1000)
             if (
                 next_item is not None
                 and preloaded_next_id != next_item.id
-                and duration_ms >= 500
+                and duration_ms >= preload_min_duration_ms
                 and elapsed >= (duration_ms / 1000) - preload_lead_seconds
             ):
                 try:

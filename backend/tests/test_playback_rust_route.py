@@ -911,24 +911,27 @@ async def test_subprocess_error_during_begin_transition_swaps_to_mock():
 
 @pytest.mark.asyncio
 async def test_r58_preload_fires_for_next_slide_during_current_tail():
-    """Pre-warm contract: ~500ms before slide end, the playback loop
-    sends preload_slide for the next slide so its V4L2 decoder bring-
-    up happens off the transition critical path.
+    """Pre-warm contract: ~1000 ms before slide end (r61-widened
+    from r58's 500 ms after FYS measurements showed worst-case
+    preload up to 732 ms), the playback loop sends preload_slide for
+    the next slide so its V4L2 decoder bring-up happens off the
+    transition critical path.
 
-    Uses a 700ms duration (well over the 500ms threshold) so the
-    trigger fires reliably. Asserts preload_slide_calls contains the
-    other slide's id by the time the playlist iterates."""
+    Uses a 1500 ms duration (well over the 1000 ms threshold) so the
+    trigger fires reliably. The 1.0 s sleep covers the trigger
+    boundary (1500/1000 − 1.0 = 0.5 s) — slide A does NOT finish in
+    the window; we assert only that B was preloaded (not begun)."""
     text_a = _text_slide(
         name="A",
         text="A",
-        duration_ms=700,
+        duration_ms=1500,
         transition="fade",
         transition_ms=30,
     )
     text_b = _text_slide(
         name="B",
         text="B",
-        duration_ms=700,
+        duration_ms=1500,
         transition="fade",
         transition_ms=30,
     )
@@ -957,14 +960,15 @@ async def test_r58_preload_fires_for_next_slide_during_current_tail():
 
 @pytest.mark.asyncio
 async def test_r58_preload_skipped_when_duration_below_threshold():
-    """Edge case: slides with duration_ms < 500ms skip the pre-warm
-    entirely (the trigger condition `elapsed >= duration/1000 - 0.5`
-    requires elapsed < 0 which never happens). Verify no preload
-    fires when the slot is too short for a meaningful pre-warm."""
+    """Edge case: slides with duration_ms < 1000 ms (r61 gate,
+    widened from r58's 500 ms) skip the pre-warm entirely. The
+    trigger condition `elapsed >= duration/1000 - 1.0` requires
+    elapsed < 0 which never happens. Verify no preload fires when
+    the slot is too short for a meaningful pre-warm."""
     short_a = _text_slide(
         name="A",
         text="A",
-        duration_ms=_FAST_DURATION_MS,  # 100ms, well under 500ms
+        duration_ms=_FAST_DURATION_MS,  # 100 ms, well under r61's 1000 ms gate
         transition="fade",
         transition_ms=30,
     )
@@ -1014,14 +1018,14 @@ async def test_r58_preload_forwards_through_autofallback_wrapper():
     text_a = _text_slide(
         name="A",
         text="A",
-        duration_ms=700,
+        duration_ms=1500,
         transition="fade",
         transition_ms=30,
     )
     text_b = _text_slide(
         name="B",
         text="B",
-        duration_ms=700,
+        duration_ms=1500,
         transition="fade",
         transition_ms=30,
     )
@@ -1060,10 +1064,10 @@ async def test_r58_preload_exception_does_not_kill_playback(caplog):
             raise RuntimeError("simulated preload failure (CMA pressure)")
 
     text_a = _text_slide(
-        name="A", text="A", duration_ms=700, transition="fade", transition_ms=30
+        name="A", text="A", duration_ms=1500, transition="fade", transition_ms=30
     )
     text_b = _text_slide(
-        name="B", text="B", duration_ms=700, transition="fade", transition_ms=30
+        name="B", text="B", duration_ms=1500, transition="fade", transition_ms=30
     )
 
     fake = _PreloadRaisingFake(width=8, height=8)
