@@ -93,6 +93,15 @@ impl VideoDecoderState {
 /// so REQBUFS uses the right memory type.
 pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
     use std::path::Path;
+    use std::time::Instant;
+    // r56 Phase A (2026-06-03): sub-phase timing for the prime
+    // path. qarl observed per-transition stalls in a 4-video-slide
+    // playlist; the "ipc: opened MP4" event lands AT the slide
+    // boundary, suggesting decoder bring-up is synchronous on the
+    // transition path. This single [perf] line breaks the cost
+    // down so the eventual mitigation (pre-warm, kept-open,
+    // first-frame cache, etc.) targets the right phase.
+    let t_total = Instant::now();
     let path = Path::new(V4L2_DECODER_PATH);
     if !path.exists() {
         anyhow::bail!(
@@ -100,8 +109,10 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
             V4L2_DECODER_PATH
         );
     }
+    let t_device_open = Instant::now();
     let dec = v4l2::Decoder::open(path)
         .with_context(|| format!("open V4L2 decoder at {}", V4L2_DECODER_PATH))?;
+    let device_open_us = t_device_open.elapsed().as_micros();
     let use_dmabuf = std::env::var("OPENMARQUEE_RENDERER_DMABUF")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -111,12 +122,14 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
     }
     let w = dem.width as u32;
     let h = dem.height as u32;
+    let t_s_fmt = Instant::now();
     let _out_fmt = dec
         .set_output_format(v4l2::V4L2_PIX_FMT_H264, w, h)
         .context("S_FMT OUTPUT (H264)")?;
     let cap_fmt = dec
         .set_capture_format(v4l2::V4L2_PIX_FMT_NV12, w, h)
         .context("S_FMT CAPTURE (NV12)")?;
+    let s_fmt_us = t_s_fmt.elapsed().as_micros();
     // Fail loud if the codec emits FULL_RANGE quantization — the
     // MMAP-path FS_NV12_TO_RGB shader does explicit LIM_RANGE
     // scaling and would crush blacks / clip whites. See
@@ -133,11 +146,15 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
             _ => "?",
         }
     );
+    let t_reqbufs = Instant::now();
     dec.allocate_buffers(v4l2::QueueDirection::Output, 4)
         .context("REQBUFS OUTPUT")?;
     dec.allocate_buffers(v4l2::QueueDirection::Capture, 4)
         .context("REQBUFS CAPTURE")?;
+    let reqbufs_us = t_reqbufs.elapsed().as_micros();
+    let t_streamon = Instant::now();
     dec.start_streaming().context("STREAMON")?;
+    let streamon_us = t_streamon.elapsed().as_micros();
     // Feed the codec headers + first sample as a SINGLE concatenated
     // buffer. `v4l2::Decoder::feed` is single-shot-safe per its
     // docstring — back-to-back calls collide on OUTPUT buffer index 0
@@ -153,7 +170,9 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
     let mut primer: Vec<u8> = Vec::with_capacity(header.len() + first_sample.len());
     primer.extend_from_slice(&header);
     primer.extend_from_slice(first_sample);
+    let t_primer = Instant::now();
     dec.feed(&primer).context("feed SPS+PPS+IDR primer")?;
+    let primer_feed_us = t_primer.elapsed().as_micros();
     let mut next_sample_idx: usize = 1;
 
     // perf-night r5 (2026-05-26): warmup pre-feed -- push samples 1..N
@@ -176,6 +195,7 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
     // proper long-term fix but is out of scope for r5; the sleep here
     // is a workaround that costs ~25ms at prime time AND saves ~10s
     // per slide at runtime -- net win by ~400x.
+    let t_warmup = Instant::now();
     let warmup_count = 4.min(dem.samples.len().saturating_sub(1));
     for _ in 0..warmup_count {
         // Give the kernel ~6ms to consume the previous OUTPUT buffer.
@@ -200,6 +220,29 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
             }
         }
     }
+    let warmup_us = t_warmup.elapsed().as_micros();
+
+    let total_us = t_total.elapsed().as_micros();
+    // r56 Phase A: one structured line per prime call. Keys ordered
+    // by phase sequence; total_us includes the path-existence check
+    // + dmabuf env-var read but those are sub-microsecond so total
+    // ~= device_open + s_fmt + reqbufs + streamon + primer_feed
+    // + warmup + assert_capture_quantization (the latter is
+    // currently uninstrumented; ~few µs ioctl, lumped into
+    // total - sum-of-named).
+    eprintln!(
+        "[perf] v4l2_prime device_open_us={} s_fmt_us={} reqbufs_us={} streamon_us={} primer_feed_us={} warmup_us={} total_us={} samples={} dims={}x{}",
+        device_open_us,
+        s_fmt_us,
+        reqbufs_us,
+        streamon_us,
+        primer_feed_us,
+        warmup_us,
+        total_us,
+        dem.samples.len(),
+        dem.width,
+        dem.height,
+    );
 
     Ok(VideoDecoderState {
         decoder: dec,

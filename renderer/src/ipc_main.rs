@@ -690,8 +690,22 @@ impl SlideCache {
         if let Some(s) = find_video_slide(content_root, item_id)? {
             self.items.insert(item_id, ContentItem::Video(s));
             let asset_path = video_slide_asset_path(content_root, item_id);
+            // r56 Phase A (2026-06-03): measure the per-video-slide
+            // synchronous load cost (Mp4Demuxer::open +
+            // prime_video_decoder). qarl reports stalls at each new
+            // transition in a 4-video playlist; the journal showed
+            // "ipc: opened MP4" landing AT the slide boundary, which
+            // is exactly this code path. The [perf] line below pairs
+            // with the [perf] v4l2_prime line emitted from
+            // video_decode.rs to give a full breakdown of where the
+            // ms go (file open + ftyp+moov parse + sample table walk
+            // vs V4L2 device open + S_FMT + REQBUFS + STREAMON +
+            // primer feed + warmup).
+            let t_load_total = std::time::Instant::now();
+            let t_mp4_open = std::time::Instant::now();
             match Mp4Demuxer::open(&asset_path) {
                 Ok(dem) => {
+                    let mp4_open_us = t_mp4_open.elapsed().as_micros();
                     eprintln!(
                         "ipc: opened MP4 for video slide {} ({}x{}, {} samples)",
                         item_id, dem.width, dem.height, dem.samples.len()
@@ -701,19 +715,48 @@ impl SlideCache {
                     // (warn + fall through to the UnsupportedSlide
                     // wire — playback loop logs + skips per the
                     // post-DELETE-PIL contract). Mac: skip.
+                    //
+                    // r56 Phase A subagent (2026-06-03 WARN): time
+                    // the prime call ONLY on Linux. On macOS the
+                    // entire prime_video_decoder call is elided by
+                    // cfg, so measuring around it would produce a
+                    // structurally-zero prime_us field -- confusing
+                    // for future log readers. Phase A's purpose is
+                    // Pi-side data, so a separate (smaller) [perf]
+                    // line on macOS isn't worth it -- we just skip
+                    // emission there.
                     #[cfg(target_os = "linux")]
-                    match prime_video_decoder(&dem) {
-                        Ok(dec_state) => {
-                            self.video_decoders.insert(item_id, dec_state);
+                    let prime_us = {
+                        let t_prime = std::time::Instant::now();
+                        match prime_video_decoder(&dem) {
+                            Ok(dec_state) => {
+                                self.video_decoders.insert(item_id, dec_state);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "ipc: warning -- failed to prime V4L2 decoder for video slide {}: {:#}",
+                                    item_id, e
+                                );
+                            }
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "ipc: warning -- failed to prime V4L2 decoder for video slide {}: {:#}",
-                                item_id, e
-                            );
-                        }
-                    }
+                        t_prime.elapsed().as_micros()
+                    };
                     self.video_demuxers.insert(item_id, dem);
+                    let total_us = t_load_total.elapsed().as_micros();
+                    #[cfg(target_os = "linux")]
+                    eprintln!(
+                        "[perf] video_load slide_id={} mp4_open_us={} prime_us={} total_us={}",
+                        item_id, mp4_open_us, prime_us, total_us
+                    );
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        // Mac dev path: emit a minimal [perf] line
+                        // without prime_us (V4L2 priming is Linux-
+                        // only). Keeps the log line shape parseable
+                        // by any aggregator that sees both.
+                        let _ = mp4_open_us;
+                        let _ = total_us;
+                    }
                 }
                 Err(e) => {
                     eprintln!(
