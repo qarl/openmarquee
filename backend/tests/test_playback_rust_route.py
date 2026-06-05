@@ -911,27 +911,28 @@ async def test_subprocess_error_during_begin_transition_swaps_to_mock():
 
 @pytest.mark.asyncio
 async def test_r58_preload_fires_for_next_slide_during_current_tail():
-    """Pre-warm contract: ~1000 ms before slide end (r61-widened
-    from r58's 500 ms after FYS measurements showed worst-case
-    preload up to 732 ms), the playback loop sends preload_slide for
-    the next slide so its V4L2 decoder bring-up happens off the
+    """Pre-warm contract: ~2000 ms before slide end (r62-widened
+    from r61's 1000 ms / r58's 500 ms after FYS data with the real
+    r61 binary showed preload max 1322 ms — ~30% still exceeded the
+    1.0 s window), the playback loop sends preload_slide for the
+    next slide so its V4L2 decoder bring-up happens off the
     transition critical path.
 
-    Uses a 1500 ms duration (well over the 1000 ms threshold) so the
-    trigger fires reliably. The 1.0 s sleep covers the trigger
-    boundary (1500/1000 − 1.0 = 0.5 s) — slide A does NOT finish in
+    Uses a 3000 ms duration (well over the 2000 ms threshold) so
+    the trigger fires reliably. The 1.5 s sleep covers the trigger
+    boundary (3000/1000 − 2.0 = 1.0 s) — slide A does NOT finish in
     the window; we assert only that B was preloaded (not begun)."""
     text_a = _text_slide(
         name="A",
         text="A",
-        duration_ms=1500,
+        duration_ms=3000,
         transition="fade",
         transition_ms=30,
     )
     text_b = _text_slide(
         name="B",
         text="B",
-        duration_ms=1500,
+        duration_ms=3000,
         transition="fade",
         transition_ms=30,
     )
@@ -945,8 +946,12 @@ async def test_r58_preload_fires_for_next_slide_during_current_tail():
         auto_tick_seconds=0.02,
     )
     await loop.start()
-    # Allow one full cycle: A (700ms) + transition (~30ms) + B starts.
-    await asyncio.sleep(1.0)
+    # r62 (2026-06-05): with 3000ms duration + 2.0s lead, trigger
+    # fires at elapsed=1.0s. Sleep 1.5s gives the preload IPC +
+    # 30 Hz tick fence headroom to land before assertion. Slide A
+    # does NOT finish in the window; we assert B was preloaded,
+    # not begun.
+    await asyncio.sleep(1.5)
     await loop.stop()
 
     # Pre-warm of next slide should have fired during A's tail.
@@ -960,15 +965,16 @@ async def test_r58_preload_fires_for_next_slide_during_current_tail():
 
 @pytest.mark.asyncio
 async def test_r58_preload_skipped_when_duration_below_threshold():
-    """Edge case: slides with duration_ms < 1000 ms (r61 gate,
-    widened from r58's 500 ms) skip the pre-warm entirely. The
-    trigger condition `elapsed >= duration/1000 - 1.0` requires
-    elapsed < 0 which never happens. Verify no preload fires when
-    the slot is too short for a meaningful pre-warm."""
+    """Edge case: slides with duration_ms < 2000 ms (r62 gate,
+    widened from r61's 1000 ms / r58's 500 ms) skip the pre-warm
+    entirely. The trigger condition `elapsed >= duration/1000 -
+    2.0` requires elapsed < 0 which never happens. Verify no
+    preload fires when the slot is too short for a meaningful
+    pre-warm."""
     short_a = _text_slide(
         name="A",
         text="A",
-        duration_ms=_FAST_DURATION_MS,  # 100 ms, well under r61's 1000 ms gate
+        duration_ms=_FAST_DURATION_MS,  # 100 ms, well under r62's 2000 ms gate
         transition="fade",
         transition_ms=30,
     )
@@ -1018,14 +1024,14 @@ async def test_r58_preload_forwards_through_autofallback_wrapper():
     text_a = _text_slide(
         name="A",
         text="A",
-        duration_ms=1500,
+        duration_ms=3000,
         transition="fade",
         transition_ms=30,
     )
     text_b = _text_slide(
         name="B",
         text="B",
-        duration_ms=1500,
+        duration_ms=3000,
         transition="fade",
         transition_ms=30,
     )
@@ -1040,7 +1046,8 @@ async def test_r58_preload_forwards_through_autofallback_wrapper():
         auto_tick_seconds=0.02,
     )
     await loop.start()
-    await asyncio.sleep(1.0)
+    # r62: trigger at elapsed=1.0s with 3000ms duration + 2.0s lead.
+    await asyncio.sleep(1.5)
     await loop.stop()
 
     # Through the wrapper, preload_slide(B) should have been forwarded
@@ -1064,10 +1071,10 @@ async def test_r58_preload_exception_does_not_kill_playback(caplog):
             raise RuntimeError("simulated preload failure (CMA pressure)")
 
     text_a = _text_slide(
-        name="A", text="A", duration_ms=1500, transition="fade", transition_ms=30
+        name="A", text="A", duration_ms=3000, transition="fade", transition_ms=30
     )
     text_b = _text_slide(
-        name="B", text="B", duration_ms=1500, transition="fade", transition_ms=30
+        name="B", text="B", duration_ms=3000, transition="fade", transition_ms=30
     )
 
     fake = _PreloadRaisingFake(width=8, height=8)
@@ -1080,7 +1087,8 @@ async def test_r58_preload_exception_does_not_kill_playback(caplog):
     )
     with caplog.at_level("WARNING", logger="openmarquee.playback"):
         await loop.start()
-        await asyncio.sleep(1.0)
+        # r62: trigger at elapsed=1.0s with 3000ms duration + 2.0s lead.
+        await asyncio.sleep(1.5)
         await loop.stop()
 
     # The preload should have fired (and raised), but begin_slide

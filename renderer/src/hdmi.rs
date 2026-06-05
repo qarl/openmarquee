@@ -824,18 +824,16 @@ where
         // level slide_caches. Glyph alpha bitmaps are CPU heap
         // (drop on drain). Texture handles are kernel-side; need
         // explicit gl.delete_texture while context is bound.
-        for (_slide_id, mut entry) in session.slide_caches.drain() {
-            for slot in entry.tex.iter_mut() {
-                if let Some(t) = slot.take() {
-                    unsafe { gl.delete_texture(t); }
-                }
-            }
-            // Atlas SB bg-cache (2026-05-09): free the cached bg
-            // texture for this slide. Lives at slide-cache lifetime;
-            // GL_DELETE_TEXTURE while context still bound.
-            if let Some(t) = entry.bg_tex.take() {
-                unsafe { gl.delete_texture(t); }
-            }
+        // r62 subagent (BLOCKER fix): route the session-teardown
+        // drain through free_slide_render_cache so future fields
+        // added to SlideRenderCache (like r62's first_frame_tex)
+        // are freed by the canonical single-source-of-truth helper
+        // and not the inline tex+bg_tex deletion that diverged
+        // from it. The 9+ slide_caches.remove call sites already
+        // route through free_slide_render_cache; matching here
+        // closes the last divergent path.
+        for (_slide_id, entry) in session.slide_caches.drain() {
+            free_slide_render_cache(&gl, entry);
         }
     }
     // qarl-direct perf-profile (2026-05-08): free thread-local
@@ -3687,6 +3685,152 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         t_phase.elapsed().as_nanos() as u64,
     );
 
+    // r62 Phase B (2026-06-05): fast-path cache lookup. If we
+    // captured this slide's composited first-frame on a prior
+    // BeginSlide (in a cycling playlist this means "after the
+    // first cycle"), short-circuit the V4L2 bake + text composite
+    // + present + scanout sequence by drawing the cached texture
+    // fullscreen, then doing the same swap+commit the normal path
+    // does. ZERO V4L2 dependency on this paint -- first-frame
+    // visible-on-glass latency drops from "wait for cold decoder
+    // primer + first frame decode + composite + scanout" to
+    // "blit a ~3.5MB texture + scanout" -- the goal qarl set.
+    //
+    // The live V4L2 decoder continues cold-priming in parallel
+    // (preload IPC sent ~2s before this BeginSlide); on
+    // subsequent ticks, *frames_decoded > 0 skips this fast
+    // path and the live decoder takes over.
+    //
+    // Motion-text caveat: cached frame captures motion at the
+    // phase active when it was first captured. On re-entry the
+    // cached blit shows that snapshot, then live frames resume
+    // at the CURRENT phase -- a small "jump" possible. Trade-off
+    // is accepted: jump is far less visible than the stall it
+    // replaces.
+    //
+    // r62 subagent (BLOCKER fix): the fast-path + capture are
+    // gated on `rotation == 0`. On a rotated display the fast-
+    // path would need to call run_present_pass TWICE per cached
+    // paint (once with rotation=0 to blit cached into scene FBO,
+    // once with session_rotation to present scene FBO into
+    // default fb). PRESENT_QUAD_VBO is a 1-slot Cell explicitly
+    // documented "rotation is fixed for the session lifetime, so
+    // a single VBO suffices"; calling it with rotation=0 then
+    // session_rotation back-to-back rebuilds the VBO TWICE per
+    // fast-path paint and again at the next live paint -- 3x
+    // VBO rebuilds vs zero, defeating the very latency win.
+    // Widening PRESENT_QUAD_VBO to 2-slot (a la COVER_QUAD_VBO)
+    // would be the proper fix but is larger scope; r62 ships the
+    // simpler gate. FYS panel is rotation=0 (operator config) so
+    // qarl gets the full r62 win; operators on rotated panels
+    // fall through to the slow path -- same behavior as r61, no
+    // regression.
+    let cache_eligible = was_first && rotation == 0;
+    let cache_hit_first_frame_tex = if cache_eligible {
+        session
+            .slide_caches
+            .get(&slide.id)
+            .and_then(|c| c.first_frame_tex)
+    } else {
+        None
+    };
+    if let Some(cached_tex) = cache_hit_first_frame_tex {
+        // Fast path: cached blit + swap + commit + early return.
+        // Self-contained so the cache-miss code below stays
+        // untouched (cleaner diff + lower regression surface).
+        let t_bake = std::time::Instant::now();
+        unsafe {
+            // Bound FBO is scene FBO (rotation) or default fb
+            // (identity) -- set up by scene_fbo_handle binding
+            // above. Since cache_eligible gates on rotation == 0,
+            // scene_fbo_handle is None here when identity (the
+            // common case); the bound FBO is default fb. Draw
+            // cached texture verbatim into it.
+            //
+            // r62 subagent (WARN fix): no gl.flush() here. The
+            // canonical implicit-flush boundary is eglSwapBuffers
+            // below at the scanout step (the non-fast-path tail
+            // relies on this too); an explicit flush would induce
+            // a CPU-side roundtrip that defeats the pipelining
+            // around the single-blit fast path.
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            run_present_pass(session.gl, cached_tex, 1.0, 1.0, 0)?;
+        }
+        let bake_us = t_bake.elapsed().as_micros();
+
+        // Step 3 (rotation case): present scene FBO -> default fb
+        // with CURRENT brightness/gamma/rotation. Honors settings
+        // changes even on cached paint.
+        let t_present = std::time::Instant::now();
+        if let Some((_fbo, scene_tex)) = scene_fbo_handle {
+            let brightness = (session.current_settings.brightness as f32) / 100.0;
+            let gamma = session.current_settings.gamma;
+            let (phys_w, phys_h) = session.phys_mode_size();
+            unsafe {
+                session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
+                run_present_pass(session.gl, scene_tex, brightness, gamma, rotation)?;
+            }
+        }
+        let present_us = t_present.elapsed().as_micros();
+
+        // Step 4: standard scanout swap+commit -- verbatim mirror
+        // of the non-cached path's tail.
+        let t_scanout = std::time::Instant::now();
+        session
+            .egl_lib
+            .swap_buffers(session.display, session.egl_surface)
+            .map_err(|e| anyhow!("eglSwapBuffers (text-over-video cached) failed: {e:?}"))?;
+        let new_bo = unsafe {
+            session
+                .gbm_surface
+                .lock_front_buffer()
+                .context("gbm_surface_lock_front_buffer (text-over-video cached) failed")?
+        };
+        let fb_buf = GbmBufferAdapter::new(&new_bo)
+            .context("read GBM bo metadata (text-over-video cached)")?;
+        let new_fb = card
+            .add_framebuffer(&fb_buf, 32, 32)
+            .map_err(|e| anyhow!("drmModeAddFB (text-over-video cached) failed: {e}"))?;
+        if let Err(e) = commit_fb(session, card, new_fb) {
+            if let Err(de) = card.destroy_framebuffer(new_fb) {
+                eprintln!(
+                    "warn: cleanup destroy_framebuffer({new_fb:?}) on commit-fail (text-over-video cached): {de}"
+                );
+            }
+            drop(new_bo);
+            return Err(e);
+        }
+        if let Some(fb) = session.scanout_prev_fb.take() {
+            if let Err(e) = card.destroy_framebuffer(fb) {
+                eprintln!("warn: destroy_framebuffer(scanout_prev, text-over-video cached): {e}");
+            }
+        }
+        if let Some(bo) = session.scanout_prev_bo.take() {
+            drop(bo);
+        }
+        session.scanout_prev_fb = session.scanout_current_fb.take();
+        session.scanout_prev_bo = session.scanout_current_bo.take();
+        session.scanout_current_bo = Some(new_bo);
+        session.scanout_current_fb = Some(new_fb);
+        let scanout_us = t_scanout.elapsed().as_micros();
+
+        // Mark frame so subsequent ticks use live path.
+        *frames_decoded = 1;
+
+        // [perf] line with cache_hit=true so QA can see the wins
+        // in journal. composite_us is 0 (skipped: text is already
+        // in cached frame).
+        let total_us = t_total
+            .map(|t| t.elapsed().as_micros())
+            .unwrap_or(0);
+        eprintln!(
+            "[perf] first_frame_paint slide_id={} cache_hit=true bake_us={} composite_us=0 present_us={} scanout_us={} total_us={}",
+            slide.id, bake_us, present_us, scanout_us, total_us,
+        );
+        return Ok(());
+    }
+
     // Step 1: decode + bake the next V4L2 video frame into the
     // currently-bound framebuffer (scene FBO when rotated/non-
     // identity, else default fb). On a no-frame tick
@@ -3773,6 +3917,94 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // viewport (text glyph raster + draw) only; the rotation
     // present pass is timed separately below.
     let composite_us = t_phase.elapsed().as_micros();
+
+    // r62 Phase B (2026-06-05): capture the composited frame for
+    // the cache. After the bake + composite steps, the currently
+    // bound FBO (scene FBO when rotated/non-identity, default fb
+    // otherwise) contains the video + text composite. Copy it
+    // into a new RGBA8 texture via glCopyTexImage2D and store in
+    // SlideRenderCache. On a subsequent BeginSlide for this
+    // slide_id (cycling playlist re-entry), the fast-path
+    // lookup at the top of this function will hit and produce
+    // an instant first frame.
+    //
+    // Capture runs ONLY on `was_first` (i.e. this is the live
+    // first paint after BeginSlide) AND when the cache entry is
+    // currently None AND rotation == 0 (see the fast-path
+    // BLOCKER-fix gate above). glCopyTexImage2D is GPU-to-GPU
+    // (no CPU readback) -- cost ~few ms on bcm2835. One-time per
+    // slide.
+    if cache_eligible {
+        let needs_capture = session
+            .slide_caches
+            .get(&slide.id)
+            .map(|c| c.first_frame_tex.is_none())
+            .unwrap_or(false);
+        if needs_capture {
+            let capture_result: Result<glow::NativeTexture> = unsafe {
+                // Create destination texture sized to mode dims.
+                // RGBA8 is implicit in glCopyTexImage2D's GL_RGBA
+                // internalformat argument.
+                let dest_tex = session.gl.create_texture()
+                    .map_err(|e| anyhow!("r62 first_frame_tex create_texture: {e}"))?;
+                session.gl.bind_texture(glow::TEXTURE_2D, Some(dest_tex));
+                // Filter to LINEAR + CLAMP_TO_EDGE so the fast-path
+                // present pass sampling produces clean pixels with
+                // no border bleed (matches create_slide_fbo_pair's
+                // texture setup).
+                session.gl.tex_parameter_i32(
+                    glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
+                );
+                session.gl.tex_parameter_i32(
+                    glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32,
+                );
+                session.gl.tex_parameter_i32(
+                    glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32,
+                );
+                session.gl.tex_parameter_i32(
+                    glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32,
+                );
+                // glCopyTexImage2D reads from the currently bound
+                // GL_FRAMEBUFFER. That's the scene FBO (rotation)
+                // or default fb (identity) -- exactly what we want
+                // to cache.
+                session.gl.copy_tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0, // mip level
+                    glow::RGBA,
+                    0, // x
+                    0, // y
+                    mode_w as i32,
+                    mode_h as i32,
+                    0, // border (must be 0 in GLES)
+                );
+                session.gl.bind_texture(glow::TEXTURE_2D, None);
+                Ok(dest_tex)
+            };
+            match capture_result {
+                Ok(dest_tex) => {
+                    // Store in cache. If the cache entry isn't
+                    // there (race with slide_caches.drain on
+                    // glyph atlas upload), drop the texture
+                    // cleanly.
+                    if let Some(cache) = session.slide_caches.get_mut(&slide.id) {
+                        cache.first_frame_tex = Some(dest_tex);
+                    } else {
+                        unsafe { session.gl.delete_texture(dest_tex); }
+                    }
+                }
+                Err(e) => {
+                    // Non-fatal: log + skip capture. Subsequent
+                    // first-paint of this slide will retry.
+                    eprintln!(
+                        "warn: r62 first_frame_tex capture failed for slide {}: {e}",
+                        slide.id
+                    );
+                }
+            }
+        }
+    }
+
     // Step 3: present pass through scene FBO if rotated/non-
     // identity. Mirrors paint_and_present_one_frame_for_slide.
     let t_present = std::time::Instant::now();
@@ -11970,6 +12202,42 @@ pub struct SlideRenderCache {
     /// `None` for solid-bg slides (glClear is already free; no
     /// cache benefit).
     pub bg_tex: Option<glow::NativeTexture>,
+    /// r62 (2026-06-05): cached COMPOSITED first-frame texture for
+    /// text-over-video slides. Captured at the end of the FIRST
+    /// successful live paint of a slide via glCopyTexImage2D from
+    /// the composite framebuffer (scene FBO when rotated/non-
+    /// identity, default fb otherwise). On a subsequent
+    /// BeginSlide for the same id (e.g. cycling playlist), the
+    /// next first-frame paint short-circuits to a fast blit of
+    /// this texture, then the live decoder hands off via the
+    /// existing frames_decoded > 0 path.
+    ///
+    /// Dimensions: mode_w * mode_h * 4 bytes (RGBA8). FYS panel
+    /// (1360x768) = ~4.17 MB. The 19-slide FYS reel with each
+    /// slide cached worst-case = ~79 MB.
+    ///
+    /// IMPORTANT subagent caveat (r62 review): Pi Zero 2 W is a
+    /// UMA SoC — there is no separate "GPU VRAM." The cma=256M
+    /// cmdline carves CMA out of the 512 MB system RAM for V4L2 /
+    /// DRM scanout / GBM; GLES texture allocations come from the
+    /// REMAINING ~256 MB shared with kernel + userspace + Python
+    /// backend + renderer. The cached textures DO NOT compete
+    /// with CMA (they're regular kernel-managed buffers), but
+    /// they DO compete with non-CMA system memory.
+    ///
+    /// session.slide_caches is currently an unbounded HashMap
+    /// with no LRU. If empirical measurement on real hardware
+    /// shows total first_frame_tex VRAM crossing ~50 MB, an N-
+    /// most-recent-slides ring buffer becomes the right follow-
+    /// up. For r62 + the 4-video qarl playlist (~17 MB), no
+    /// bound is needed.
+    ///
+    /// Cache lifetime is tied to SlideRenderCache itself:
+    /// invalidation paths that drop the SlideRenderCache (mtime
+    /// change, glyph atlas reload, evict_other_video_state-driven
+    /// BeginSlide for a different slide) also drop this texture
+    /// via free_slide_render_cache below.
+    pub first_frame_tex: Option<glow::NativeTexture>,
 }
 
 impl SlideRenderCache {
@@ -11978,16 +12246,17 @@ impl SlideRenderCache {
         glyph.resize_with(layer_count, || None);
         let mut tex: TextureCache = Vec::with_capacity(layer_count);
         tex.resize_with(layer_count, || None);
-        Self { glyph, tex, bg_tex: None }
+        Self { glyph, tex, bg_tex: None, first_frame_tex: None }
     }
 }
 
 /// Free GL textures owned by a SlideRenderCache being removed
-/// from session.slide_caches (2026-05-09 atlas SB bg-cache).
+/// from session.slide_caches (2026-05-09 atlas SB bg-cache;
+/// r62 first-frame composite cache).
 /// Must be called while the GL context is still bound. Used by
 /// the multiple slide_caches.remove call sites that previously
 /// inlined `for slot in old.tex { delete_texture(t) }` and now
-/// also need to free `bg_tex`.
+/// also need to free `bg_tex` and the r62 `first_frame_tex`.
 fn free_slide_render_cache(gl: &glow::Context, mut cache: SlideRenderCache) {
     use glow::HasContext;
     unsafe {
@@ -11997,6 +12266,9 @@ fn free_slide_render_cache(gl: &glow::Context, mut cache: SlideRenderCache) {
             }
         }
         if let Some(t) = cache.bg_tex.take() {
+            gl.delete_texture(t);
+        }
+        if let Some(t) = cache.first_frame_tex.take() {
             gl.delete_texture(t);
         }
     }

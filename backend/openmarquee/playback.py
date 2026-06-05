@@ -1080,25 +1080,27 @@ class PlaybackLoop:
         # pending").
         preloaded_next_id: UUID | None = None
         # Threshold seconds-before-slide-end for the preload trigger.
-        # r58 shipped at 0.5 s based on a code-reading estimate of
-        # ~100-300 ms prime cost. r61 (2026-06-04): FYS journal
-        # showed `[perf] preload us=N` ranges 263-732 ms across 5
-        # cold-loads, dominated by `mp4_open_us` (~350 ms typical,
-        # up to 522 ms). Three of five transitions had the
-        # PreloadSlide IPC still in flight when BeginTransition
-        # fired -- the renderer's RLock then serialized the two
-        # ops so the prime cost landed in the transition critical
-        # path anyway. Bumped to 1.0 s = ~732 ms worst-case +
-        # ~268 ms headroom for IPC round-trip + executor scheduling
-        # + the next advance tick.
+        # r58 shipped at 0.5 s, r61 widened to 1.0 s. r62 (2026-06-05)
+        # widens again to 2.0 s after FYS data with the REAL r61
+        # binary showed preload_us p50 ~550 ms, p90 ~1100 ms, max
+        # 1322 ms (21-sample window). ~30% of preloads still exceeded
+        # the 1.0 s window so the slow tail landed in the transition
+        # critical path. 2.0 s comfortably covers the 1322 ms
+        # worst case + ~678 ms headroom.
         #
-        # Trade-off: a slide whose duration_ms is below the gate
-        # (`duration_ms < 1000`) skips pre-warm entirely. The gate
-        # check at the trigger site catches this. Operator-set
-        # short slides (< 1 s) are unusual but possible; for those
-        # the transition into the next slide pays the cold prime
-        # cost as before, no worse than r57.
-        preload_lead_seconds = 1.0
+        # CMA: r58 measured 251.8 MB peak under the 254 MB watchdog
+        # in a ~1.5 s 2-pool window; r61 widened to ~2.5 s, r62 to
+        # ~3.5 s. The 2-pool concurrent shape already exists during
+        # transitions today -- pre-warm only widens its TIME window,
+        # not the peak. r59 raised the watchdog ceiling 220 -> 254
+        # MB which gives the wider window more headroom.
+        #
+        # Trade-off: slides with duration_ms < 2000 ms skip pre-warm
+        # entirely. Default duration in api.py is 5000-10000 ms;
+        # operators CAN set 100-2000 ms via the API. For sub-2-s
+        # slides the transition pays the cold prime cost as before
+        # -- no worse than r57.
+        preload_lead_seconds = 2.0
         while True:
             if self._stop_event.is_set() or self._pause_event.is_set():
                 break
