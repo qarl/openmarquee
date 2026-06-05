@@ -413,7 +413,65 @@ struct SlideCache {
     /// before production at scale.
     #[cfg(target_os = "linux")]
     video_decoders: std::collections::HashMap<uuid::Uuid, VideoDecoderState>,
+    /// r65 (2026-06-05): in-flight async preload thread handles
+    /// keyed by the slide_id the worker is priming. Populated by
+    /// the PreloadSlide IPC handler, drained by
+    /// `ensure_preload_complete` at the head of BeginSlide and
+    /// BeginTransition (where the caller WILL touch the cache
+    /// entries the worker produced).
+    ///
+    /// The worker thread runs `preload_in_worker` -- a Send-safe
+    /// function that does the expensive bits (`Mp4Demuxer::open`
+    /// + `prime_video_decoder` for Video / TextSlide-with-bg-video
+    /// kinds) WITHOUT touching this SlideCache. On finish, the
+    /// worker returns `PreloadArtifacts` (a Send bag of
+    /// `ContentItem` + `Mp4Demuxer` + `VideoDecoderState`) which
+    /// the main thread installs into items/demuxers/decoders.
+    ///
+    /// Pre-r65, PreloadSlide called cache.load synchronously on
+    /// the main thread, blocking the IPC + paint loops for the
+    /// 200-600 ms V4L2 bring-up time. qarl observed this as a
+    /// "stall exactly 2 s before each transition" -- exactly
+    /// when preload_lead_seconds=2.0 fired the backend's
+    /// PreloadSlide. r65 offloads the work; main thread returns
+    /// from PreloadSlide in microseconds.
+    pending_preloads: std::collections::HashMap<
+        uuid::Uuid,
+        PreloadHandle,
+    >,
 }
+
+/// r65 (2026-06-05): handle stored in `SlideCache.pending_preloads`
+/// for an in-flight worker. The thread's JoinHandle yields a
+/// `PreloadResult` on .join().
+struct PreloadHandle {
+    thread: std::thread::JoinHandle<PreloadResult>,
+    enqueued_at: std::time::Instant,
+}
+
+/// r65: per-slide artifacts produced by `preload_in_worker`.
+/// Send-safe so the worker can build them up + ship them across
+/// the join boundary. Recursive TextSlide-with-bg-video preloads
+/// pack the bg-video's artifacts into the same struct via the
+/// flat Vec layout below.
+struct PreloadArtifacts {
+    /// (slide_id, ContentItem, optional mtime). Multiple entries
+    /// when a TextSlide-with-bg-video preload also yielded the
+    /// underlying VideoSlide.
+    items: Vec<(uuid::Uuid, ContentItem, Option<std::time::SystemTime>)>,
+    /// (slide_id, Mp4Demuxer). One per Video kind encountered.
+    demuxers: Vec<(uuid::Uuid, Mp4Demuxer)>,
+    /// Linux-only: (slide_id, VideoDecoderState). One per
+    /// Video kind that primed successfully.
+    #[cfg(target_os = "linux")]
+    decoders: Vec<(uuid::Uuid, VideoDecoderState)>,
+    /// Slide-ids whose load found a JSON but the demuxer / V4L2
+    /// prime failed. Main thread inserts these into video_skip
+    /// so the existing UnsupportedSlide rail picks them up.
+    skip_marks: Vec<uuid::Uuid>,
+}
+
+type PreloadResult = anyhow::Result<PreloadArtifacts>;
 
 impl SlideCache {
     fn new() -> Self {
@@ -424,6 +482,7 @@ impl SlideCache {
             video_skip: std::collections::HashSet::new(),
             #[cfg(target_os = "linux")]
             video_decoders: std::collections::HashMap::new(),
+            pending_preloads: std::collections::HashMap::new(),
         }
     }
 
@@ -783,6 +842,230 @@ impl SlideCache {
             "no item found for {item_id} under {} (type not text_slide / image / video)",
             content_root.display()
         ))
+    }
+}
+
+/// r65 (2026-06-05): worker-thread entry point. Builds a
+/// `PreloadArtifacts` for a slide WITHOUT touching the shared
+/// SlideCache (the worker doesn't own one). Recursive for
+/// TextSlide-with-bg-video: the bg VideoSlide's artifacts are
+/// appended to the same struct.
+///
+/// The expensive bits live here: `Mp4Demuxer::open` (file open +
+/// ftyp/moov/sample-table parse) + `prime_video_decoder`
+/// (V4L2 device open + S_FMT + REQBUFS + STREAMON + primer feed
+/// + warmup). On Pi Zero 2 W the prime is the 200-600 ms cost
+/// that the dispatch identified as blocking the main thread.
+///
+/// Errors at the JSON-parse or asset-resolution layer abort the
+/// worker (and the caller's BeginSlide will fall through to the
+/// normal cache.load path). A failed V4L2 prime is non-fatal:
+/// the demuxer is shipped + a video_skip marker recorded so the
+/// existing UnsupportedSlide rail picks it up.
+fn preload_in_worker(
+    content_root: &std::path::Path,
+    item_id: uuid::Uuid,
+) -> PreloadResult {
+    let mut artifacts = PreloadArtifacts {
+        items: Vec::new(),
+        demuxers: Vec::new(),
+        #[cfg(target_os = "linux")]
+        decoders: Vec::new(),
+        skip_marks: Vec::new(),
+    };
+    let mtime = std::fs::metadata(
+        content_root.join(item_id.to_string()).join("item.json"),
+    )
+    .ok()
+    .and_then(|m| m.modified().ok());
+    if let Some(s) = find_text_slide(content_root, item_id)? {
+        let bg_id = s.background_video_slide_id;
+        artifacts.items.push((item_id, ContentItem::Text(s), mtime));
+        if let Some(bg_id) = bg_id {
+            if bg_id != item_id {
+                // r65 subagent (NIT fix): mirror
+                // ensure_bg_video_for_text_slide's best-effort
+                // semantics (cache.load's path logs + continues
+                // on a missing/malformed bg video so the text
+                // slide still loads). Pre-fix the `?` would
+                // propagate the bg failure up, ensure_preload_
+                // complete would log + drop, and BeginSlide
+                // would fall through to a synchronous cache.load
+                // -- re-introducing the very 200-600 ms stall
+                // r65 is trying to remove for the text slide
+                // itself.
+                match preload_in_worker(content_root, bg_id) {
+                    Ok(bg) => {
+                        artifacts.items.extend(bg.items);
+                        artifacts.demuxers.extend(bg.demuxers);
+                        #[cfg(target_os = "linux")]
+                        artifacts.decoders.extend(bg.decoders);
+                        artifacts.skip_marks.extend(bg.skip_marks);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "ipc: preload_worker -- text slide {} references bg video {} but preload failed: {:#}",
+                            item_id, bg_id, e,
+                        );
+                        // Text slide artifacts still ship; the
+                        // bg failure surfaces via the existing
+                        // UnsupportedSlide rail at paint time.
+                    }
+                }
+            }
+        }
+        return Ok(artifacts);
+    }
+    if let Some(s) = find_image_slide(content_root, item_id)? {
+        artifacts.items.push((item_id, ContentItem::Image(s), mtime));
+        return Ok(artifacts);
+    }
+    if let Some(s) = find_video_slide(content_root, item_id)? {
+        artifacts.items.push((item_id, ContentItem::Video(s), mtime));
+        let asset_path = video_slide_asset_path(content_root, item_id);
+        match Mp4Demuxer::open(&asset_path) {
+            Ok(dem) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let t_prime = std::time::Instant::now();
+                    match crate::video_decode::prime_video_decoder(&dem) {
+                        Ok(dec_state) => {
+                            let prime_us = t_prime.elapsed().as_micros();
+                            eprintln!(
+                                "[perf] preload_worker_prime slide_id={} prime_us={}",
+                                item_id, prime_us
+                            );
+                            artifacts.decoders.push((item_id, dec_state));
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "ipc: preload_worker -- failed to prime V4L2 decoder for video slide {}: {:#}",
+                                item_id, e
+                            );
+                        }
+                    }
+                }
+                artifacts.demuxers.push((item_id, dem));
+            }
+            Err(e) => {
+                eprintln!(
+                    "ipc: preload_worker -- failed to open MP4 {} for video slide {}: {:#}",
+                    asset_path.display(), item_id, e
+                );
+                artifacts.skip_marks.push(item_id);
+            }
+        }
+        return Ok(artifacts);
+    }
+    Err(anyhow!(
+        "preload_in_worker: no item found for {} under {}",
+        item_id, content_root.display(),
+    ))
+}
+
+/// r65 subagent (WARN fix): drain pending_preloads handles older
+/// than `max_age`. If a BeginSlide never arrives (operator
+/// changed playlist between PreloadSlide(A) and BeginSlide(A)),
+/// the artifacts -- including a primed ~5 MB V4L2 decoder --
+/// leak in pending_preloads forever. Called opportunistically
+/// from the BeginSlide and BeginTransition handlers (which run
+/// at most once every few seconds), so the walk cost is amortized.
+fn drain_stale_preloads(
+    cache: &mut SlideCache,
+    max_age: std::time::Duration,
+) {
+    let stale_ids: Vec<uuid::Uuid> = cache
+        .pending_preloads
+        .iter()
+        .filter(|(_, h)| h.enqueued_at.elapsed() > max_age)
+        .map(|(id, _)| *id)
+        .collect();
+    if stale_ids.is_empty() {
+        return;
+    }
+    for id in stale_ids {
+        if let Some(handle) = cache.pending_preloads.remove(&id) {
+            // Join the worker so its artifacts drop cleanly (V4L2
+            // decoder STREAMOFFs + munmaps from DecoderInner::Drop).
+            // If the worker panicked, log + continue; we still want
+            // to release our slot in pending_preloads.
+            let age = handle.enqueued_at.elapsed();
+            match handle.thread.join() {
+                Ok(Ok(_)) => eprintln!(
+                    "[perf] preload_stale_drained slide_id={} age_ms={}",
+                    id,
+                    age.as_millis(),
+                ),
+                Ok(Err(e)) => eprintln!(
+                    "[perf] preload_stale_drained slide_id={} age_ms={} err={:#}",
+                    id,
+                    age.as_millis(),
+                    e,
+                ),
+                Err(_) => eprintln!(
+                    "[perf] preload_stale_drained slide_id={} age_ms={} thread_panicked",
+                    id,
+                    age.as_millis(),
+                ),
+            }
+        }
+    }
+}
+
+/// r65: if `slide_id` has a pending preload thread, join it and
+/// install the artifacts into the main thread's `cache`. Called
+/// from the BeginSlide and BeginTransition IPC handlers at the
+/// TOP (before evict_other_video_state / cache.load) so the
+/// existing logic short-circuits cleanly on the artifacts the
+/// worker already produced.
+///
+/// Emits `[perf] begin_slide_wait slide_id=X wait_us=N` so QA
+/// can see when BeginSlide had to block on an unfinished
+/// preload. Steady state: wait_us ~= 0 µs (worker done long
+/// before BeginSlide fires for the same id).
+fn ensure_preload_complete(cache: &mut SlideCache, slide_id: uuid::Uuid) {
+    let Some(handle) = cache.pending_preloads.remove(&slide_id) else {
+        return;
+    };
+    let t_wait = std::time::Instant::now();
+    let elapsed_since_enqueue = handle.enqueued_at.elapsed().as_micros();
+    let join_result = handle.thread.join();
+    let wait_us = t_wait.elapsed().as_micros();
+    eprintln!(
+        "[perf] begin_slide_wait slide_id={} wait_us={} time_since_enqueue_us={}",
+        slide_id, wait_us, elapsed_since_enqueue,
+    );
+    match join_result {
+        Ok(Ok(artifacts)) => {
+            for (id, item, mtime) in artifacts.items {
+                cache.items.insert(id, item);
+                if let Some(m) = mtime {
+                    cache.item_mtimes.insert(id, m);
+                }
+            }
+            for (id, dem) in artifacts.demuxers {
+                cache.video_demuxers.insert(id, dem);
+            }
+            #[cfg(target_os = "linux")]
+            for (id, dec) in artifacts.decoders {
+                cache.video_decoders.insert(id, dec);
+            }
+            for id in artifacts.skip_marks {
+                cache.video_skip.insert(id);
+            }
+        }
+        Ok(Err(e)) => {
+            eprintln!(
+                "ipc: preload worker for slide {} returned Err: {:#} (BeginSlide will fall through to synchronous cache.load)",
+                slide_id, e
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "ipc: preload worker thread for slide {} panicked: {:?} (BeginSlide will fall through to synchronous cache.load)",
+                slide_id, e
+            );
+        }
     }
 }
 
@@ -2229,6 +2512,25 @@ fn handle_inner_request(
             err("Open already called; nested Open is not supported")
         }
         IpcRequest::BeginSlide(p) => {
+            // r65 subagent (WARN fix): opportunistically drain
+            // stale pending_preloads (e.g. PreloadSlide(A) fired
+            // but operator changed playlist before A's slot).
+            // 10 s is a comfortable envelope vs the 2 s preload
+            // lead -- any handle older than 10 s reflects a
+            // never-arriving BeginSlide. Walk is O(pending_preloads)
+            // ≤ MAX_CONCURRENT_PRELOADS = 2.
+            drain_stale_preloads(cache, std::time::Duration::from_secs(10));
+            // r65 (2026-06-05): if an async preload for this
+            // slide_id is still in flight, join it now + install
+            // the artifacts BEFORE the existing eviction +
+            // cache.load run. Steady state: wait_us ~= 0 µs
+            // (worker finished long before BeginSlide fires for
+            // the same id). Worst case: wait_us = the residual
+            // V4L2 prime time we couldn't hide behind the slide
+            // hold -- which is exactly the stall pre-r65 had,
+            // now sequestered to a single observable [perf]
+            // begin_slide_wait line.
+            ensure_preload_complete(cache, p.slide_id);
             // FYS bug 9 (2026-05-20): release the previous video
             // slide's V4L2 decoder before loading this slide —
             // decoders were otherwise never freed on a normal
@@ -2310,6 +2612,13 @@ fn handle_inner_request(
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
+            // r65 (2026-06-05): join any in-flight async preload
+            // for the to-slide BEFORE cache.load so the load
+            // short-circuits on the artifacts the worker
+            // produced. Identical semantics to the BeginSlide
+            // path above; emits the same [perf]
+            // begin_slide_wait line.
+            ensure_preload_complete(cache, p.to_slide_id);
             // r58 (2026-06-04): time the to-slide cache.load so QA
             // can see PreloadSlide wins on the transition path too.
             // Same heuristic as begin_slide_load above.
@@ -2483,23 +2792,133 @@ fn handle_inner_request(
             // window (which also has both pools live). Peak does
             // not grow; the 2-pool window widens by ~500 ms.
             let preload_id = p.slide_id;
-            let t_preload = std::time::Instant::now();
-            let load_result = cache.load(content_root, preload_id);
-            let us = t_preload.elapsed().as_micros();
-            match load_result {
-                Ok(()) => {
+            let t_enqueue = std::time::Instant::now();
+            // Already loaded? Short-circuit at near-zero cost.
+            // The same items+demuxer+decoder check cache.load
+            // uses; we replicate inline so we don't even build
+            // mtime info on the common idempotent path.
+            let already_loaded = cache.items.peek(&preload_id).is_some()
+                && cache.video_demuxers.contains_key(&preload_id)
+                && {
+                    #[cfg(target_os = "linux")]
+                    {
+                        cache.has_video_decoder(preload_id)
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        true
+                    }
+                };
+            if already_loaded {
+                let us = t_enqueue.elapsed().as_micros();
+                // r65 subagent (BLOCKER fix): emit `us=N` alongside
+                // the variant-specific key so r64's perf_stats
+                // parser (which keys on `us`) records a meaningful
+                // sample for each preload event. The variant key
+                // disambiguates the SHAPE of the cost; `us` is
+                // the value any aggregator that scans the
+                // canonical key still sees.
+                eprintln!(
+                    "[perf] preload slide_id={} us={} cached_us={}",
+                    preload_id, us, us,
+                );
+                return ok_empty();
+            }
+            // r65 subagent (WARN fix): unbounded spawn cap.
+            // bcm2835-codec supports at most 4 concurrent
+            // decoder instances; the natural transition envelope
+            // is current-slide + next-preload = 2. Cap at 2 to
+            // leave headroom for a transition that begins while
+            // a preload is still in flight. When at capacity,
+            // drop the new preload + let BeginSlide hit the
+            // synchronous cache.load path (same cost shape as
+            // pre-r65).
+            const MAX_CONCURRENT_PRELOADS: usize = 2;
+            if cache.pending_preloads.len() >= MAX_CONCURRENT_PRELOADS
+                && !cache.pending_preloads.contains_key(&preload_id)
+            {
+                let us = t_enqueue.elapsed().as_micros();
+                eprintln!(
+                    "[perf] preload slide_id={} us={} dropped_us={} reason=capacity",
+                    preload_id, us, us,
+                );
+                return ok_empty();
+            }
+            // Already in flight? No-op return (the existing
+            // worker will finish; subsequent BeginSlide will
+            // join it). Per-dispatch edge case #1 "Two
+            // PreloadSlides in flight back-to-back".
+            if cache.pending_preloads.contains_key(&preload_id) {
+                let us = t_enqueue.elapsed().as_micros();
+                eprintln!(
+                    "[perf] preload slide_id={} us={} in_flight_us={}",
+                    preload_id, us, us,
+                );
+                return ok_empty();
+            }
+            // r65 core: spawn worker. The main thread returns
+            // immediately (just the cheap spawn cost). The worker
+            // does the V4L2 prime + Mp4Demuxer::open in
+            // parallel; ensure_preload_complete at the next
+            // BeginSlide / BeginTransition for the same id joins
+            // it and installs the artifacts.
+            let content_root_clone = content_root.to_path_buf();
+            let preload_id_clone = preload_id;
+            let spawn_result = std::thread::Builder::new()
+                .name(format!("preload-{preload_id}"))
+                .spawn(move || -> PreloadResult {
+                    let t_work = std::time::Instant::now();
+                    let r = preload_in_worker(&content_root_clone, preload_id_clone);
+                    let work_us = t_work.elapsed().as_micros();
+                    match &r {
+                        Ok(_) => eprintln!(
+                            "[perf] preload_worker slide_id={} work_us={}",
+                            preload_id_clone, work_us,
+                        ),
+                        Err(e) => eprintln!(
+                            "[perf] preload_worker slide_id={} failed_us={} err={:#}",
+                            preload_id_clone, work_us, e,
+                        ),
+                    }
+                    r
+                });
+            match spawn_result {
+                Ok(thread) => {
+                    cache.pending_preloads.insert(
+                        preload_id,
+                        PreloadHandle { thread, enqueued_at: t_enqueue },
+                    );
+                    let queued_us = t_enqueue.elapsed().as_micros();
+                    // BLOCKER fix: emit `us=N` alongside
+                    // `queued_us=N` for r64 parser compatibility.
                     eprintln!(
-                        "[perf] preload slide_id={} us={}",
-                        preload_id, us,
+                        "[perf] preload slide_id={} us={} queued_us={}",
+                        preload_id, queued_us, queued_us,
                     );
                     ok_empty()
                 }
                 Err(e) => {
+                    // Spawn failure (OS thread limit etc.) is
+                    // rare; fall back to synchronous load so
+                    // BeginSlide doesn't hit a cold path later.
                     eprintln!(
-                        "[perf] preload slide_id={} failed_us={} err={:#}",
-                        preload_id, us, e,
+                        "ipc: preload spawn failed for {}: {:#}; falling back to synchronous cache.load",
+                        preload_id, e,
                     );
-                    err(format!("preload_slide load failed: {e:#}"))
+                    let t_sync = std::time::Instant::now();
+                    match cache.load(content_root, preload_id) {
+                        Ok(()) => {
+                            let sync_us = t_sync.elapsed().as_micros();
+                            eprintln!(
+                                "[perf] preload slide_id={} us={} sync_us={} (spawn failed)",
+                                preload_id, sync_us, sync_us,
+                            );
+                            ok_empty()
+                        }
+                        Err(e2) => {
+                            err(format!("preload_slide load failed: {e2:#}"))
+                        }
+                    }
                 }
             }
         }
