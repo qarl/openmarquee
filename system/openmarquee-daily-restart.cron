@@ -1,7 +1,8 @@
 # /etc/cron.d/openmarquee-daily-restart
 #
 # Belt-and-braces companion to openmarquee-cma-watchdog.timer.
-# The watchdog catches CMA pressure that crosses 220MB; this cron
+# The watchdog catches CMA pressure that crosses 254MB (r59 default;
+# was 220 in r38c, raised for v1.0.1); this cron
 # catches slow drift that stays below the watchdog threshold but
 # would still wedge over multi-day uptime.
 #
