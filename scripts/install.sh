@@ -930,10 +930,11 @@ run systemctl enable openmarquee-backend.service \
 
 # r38c CMA-pressure watchdog -- timer fires the oneshot every 60s,
 # oneshot reads /proc/meminfo and restarts openmarquee-backend.service
-# if CmaUsed crosses THRESHOLD_MB (default 220MB) outside the cooldown
-# window (default 30 min). enable + start the timer; the .service is
-# triggered by the timer and shouldn't be enabled directly.
-# See qa/r38c-cma-pressure-watchdog-2026-06-02.md.
+# if CmaUsed crosses THRESHOLD_MB (default 254MB per r59; was 220 in
+# r38c, raised for v1.0.1) outside the cooldown window (default 30
+# min). enable + start the timer; the .service is triggered by the
+# timer and shouldn't be enabled directly.
+# See qa/r59-cma-watchdog-default-decision-2026-06-04.md.
 run systemctl enable openmarquee-cma-watchdog.timer
 run systemctl start openmarquee-cma-watchdog.timer || true
 

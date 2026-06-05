@@ -11,8 +11,17 @@
 # qa/r38c-cma-pressure-watchdog-2026-06-02.md.
 #
 # Configurable via /etc/default/openmarquee-cma-watchdog:
-#   THRESHOLD_MB=220
+#   THRESHOLD_MB=254
 #   COOLDOWN_SEC=1800
+#
+# r59 (2026-06-04): default raised 220 -> 254 MB for v1.0.1 tag-cut.
+# Empirical CMA peak under text-over-video (post-r48 + r50) is
+# ~251.8 MB on FYS; the 220 default was tripping on benign peaks
+# and triggering spurious backend restarts. 254 sits 2.2 MB above
+# the measured peak and 2 MB below the 256 MB CMA pool reservation,
+# so the watchdog fires BEFORE the kernel allocator hits exhaustion
+# while still allowing normal text-over-video operation. See
+# qa/r59-cma-watchdog-default-decision-2026-06-04.md.
 #
 # Override CmaUsed for testing via /run/openmarquee-cma-watchdog-test:
 #   CMA_USED_OVERRIDE_MB=250
@@ -23,7 +32,7 @@
 
 set -euo pipefail
 
-THRESHOLD_MB="${THRESHOLD_MB:-220}"
+THRESHOLD_MB="${THRESHOLD_MB:-254}"
 COOLDOWN_SEC="${COOLDOWN_SEC:-1800}"
 STATE_FILE="${STATE_FILE:-/var/openmarquee/cma-watchdog-state}"
 MEMINFO_PATH="${MEMINFO_PATH:-/proc/meminfo}"
