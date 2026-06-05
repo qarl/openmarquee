@@ -101,6 +101,12 @@ _WHITELIST_EXACT: frozenset[str] = frozenset(
         # body at WARNING + nothing else (no persistence, no DB write,
         # so unauth-write surface is bounded to journald-spam).
         "/api/system/csp-report",
+        # r64 (2026-06-05): cheap perf telemetry snapshot. Read-only,
+        # no PII (slide UUIDs only, no content). Per dispatch:
+        # "NOT require auth (read-only, localhost-OK, behind the Pi's
+        # local IP so external access is gated by Tailscale anyway)."
+        # QA polls this once a minute from a small client script.
+        "/api/perf-stats",
     }
 )
 

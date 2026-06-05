@@ -897,10 +897,38 @@ class RustRenderer:
         proc = self._proc
         if proc is None or proc.stderr is None:
             return
+        # r64 (2026-06-05): also parse [perf] lines into the
+        # rolling perf_stats buffer so the cheap
+        # `GET /api/perf-stats` endpoint can serve them without
+        # journalctl. Import inside the function so the module
+        # import graph stays clean (renderer is imported during
+        # FastAPI startup; perf_stats has zero external deps
+        # but the lazy import keeps the layer boundary obvious).
+        try:
+            from openmarquee.perf_stats import parse_and_record_perf_line
+        except Exception:
+            # Module missing or broken? Fall back to log-only --
+            # never break the stderr drainer on a perf_stats import
+            # issue.
+            parse_and_record_perf_line = None  # type: ignore[assignment]
         try:
             for line in iter(proc.stderr.readline, ""):
-                if line:
-                    log.info("rust-sidecar stderr: %s", line.rstrip())
+                if not line:
+                    continue
+                clean = line.rstrip()
+                # Parse FIRST (fast: just regex + dict updates).
+                # The parser returns True if it handled the line;
+                # we still log it so the journal carries the
+                # narrative for operators reading via journalctl.
+                if parse_and_record_perf_line is not None:
+                    try:
+                        parse_and_record_perf_line(clean)
+                    except Exception:
+                        # Never let a parser bug kill stderr
+                        # draining (which would dead-lock the
+                        # sidecar at the pipe-buffer limit).
+                        log.debug("perf_stats parser raised", exc_info=True)
+                log.info("rust-sidecar stderr: %s", clean)
         except Exception:
             # Pipe closed on teardown; readline returns "" and the
             # for-loop exits cleanly. Other exceptions (e.g., decode

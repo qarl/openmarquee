@@ -1100,7 +1100,7 @@ class PlaybackLoop:
         # operators CAN set 100-2000 ms via the API. For sub-2-s
         # slides the transition pays the cold prime cost as before
         # -- no worse than r57.
-        preload_lead_seconds = 2.0
+        preload_lead_seconds = 1.0  # QA revert from r62 2.0 (visible 2s-before-stall per qarl); r65 will fix the underlying renderer-blocking PreloadSlide
         while True:
             if self._stop_event.is_set() or self._pause_event.is_set():
                 break

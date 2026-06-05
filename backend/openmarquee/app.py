@@ -1,5 +1,6 @@
 """FastAPI application that runs on the device."""
 
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -23,6 +24,7 @@ from openmarquee.api_playback import router as playback_router
 from openmarquee.api_playlist import router as playlist_router
 from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
+from openmarquee.api_perf import router as perf_router
 from openmarquee.api_system import router as system_router
 from openmarquee.auth_middleware import AuthMiddleware
 from openmarquee.content.migrations import migrate_050608_bg_to_000000
@@ -186,6 +188,22 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await get_pull_worker().start()
         except Exception:
             log.exception("startup pull worker autostart failed")
+
+    # r64 (2026-06-05): perf telemetry CMA sampler. Reads /proc/meminfo
+    # every 5 s into a 1-minute rolling window so `GET /api/perf-stats`
+    # can serve `cma_used_max_mb_1m` + `cma_used_avg_mb_1m` without
+    # a per-request syscall. Cheap: ~sub-ms /proc read + dict update.
+    # Disabled in test fixtures alongside DISABLE_AUTOSTART since they
+    # don't run the full lifespan worker set.
+    cma_sampler_handle: "asyncio.Task[None] | None" = None
+    if os.environ.get("OPENMARQUEE_DISABLE_AUTOSTART") != "1":
+        try:
+            from openmarquee.perf_stats import cma_sampler_task
+            cma_sampler_handle = asyncio.create_task(
+                cma_sampler_task(), name="cma-sampler"
+            )
+        except Exception:
+            log.exception("startup CMA sampler autostart failed")
     yield
     # Tear down any active live session BEFORE the playback loop stops
     # so the session's close() can resume() the loop cleanly even though
@@ -197,6 +215,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await get_playback_loop().stop()
     with suppress(Exception):
         await get_pull_worker().stop()
+    # r64: stop the CMA sampler. Cancellation is idempotent; if it
+    # already exited (CancelledError raise during sleep), .cancel()
+    # is a no-op.
+    if cma_sampler_handle is not None:
+        cma_sampler_handle.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await cma_sampler_handle
     # Close the renderer last -- after the playback loop has stopped
     # writing frames -- so we don't free its buffers mid-render.
     renderer = get_renderer()
@@ -331,6 +356,9 @@ app.include_router(backgrounds_router)
 app.include_router(playback_router)
 app.include_router(live_router)
 app.include_router(system_router)
+# r64 (2026-06-05): GET /api/perf-stats -- cheap in-memory perf
+# telemetry snapshot. No auth (read-only, no PII, Tailscale-gated).
+app.include_router(perf_router)
 app.include_router(flock_router)
 
 # Dev tooling (preview page, manual play endpoint) is mounted by default
