@@ -62,28 +62,55 @@ log() {
 # networks like 'Marriott:Guest') would never be matched.
 NMCLI_TERSE="nmcli -t -e no"
 
-# Return space-separated list of SSIDs we have credentials for in
+# Return one-per-line list of SSIDs we have credentials for in
 # NetworkManager. Filters to wifi-typed connections only; lowercase
 # the type so a mixed-case stock NM doesn't drop a profile.
 #
 # r60 subagent (WARN): drop `exit` from terminating awk blocks to
-# avoid SIGPIPE-141 under `set -o pipefail`. nmcli output can be
-# longer than the pipe buffer when many wifi profiles exist; an
-# awk that exits early closes the pipe and nmcli exits 141, which
-# pipefail then propagates. Using `END { print best }` instead of
-# `{ print; exit }` keeps the pipe drained.
+# avoid SIGPIPE-141 under `set -o pipefail`.
+#
+# r63 (2026-06-05): the pre-r63 single-pass `-f NAME,TYPE,802-11-
+# wireless.ssid connection show` was REJECTED by nmcli because it
+# mixed connection-level fields (NAME, TYPE) with setting-level
+# fields (802-11-wireless.ssid) in the same `-f` list. nmcli exits
+# 2 ("invalid field '802-11-wireless.ssid'") which propagates
+# under `set -euo pipefail` and the whole service fails. The
+# pre-r63 fire-every-5-min timer landed `Failed with result
+# 'exit-code', status=2/INVALIDARGUMENT` in journal on every tick.
+#
+# Two-pass replacement:
+#   Pass 1: list wifi-typed connection NAMEs via connection-level
+#           fields only (NAME, TYPE) -- nmcli accepts this.
+#   Pass 2: per NAME, query the setting-level `802-11-wireless.ssid`
+#           via `nmcli -g SETTING.PROP connection show <NAME>`.
+#           `-g` (--get-values) returns the raw value with no
+#           field-name prefix or escape encoding -- cleaner than
+#           `-t` + awk-split for single-field queries.
+#
+# Empty-SSID fallback (preserved from pre-r63 behavior): some NM
+# profiles store an empty 802-11-wireless.ssid and rely on the
+# connection name being the SSID. Fall back to NAME when the
+# setting returns empty.
 known_ssids() {
-    # nmcli -t with field selection puts each connection on its own
-    # `name:type:ssid` line. We want the ssid; some profiles store
-    # an empty SSID and reuse the connection name -- fall back to
-    # NAME when 802-11-wireless.ssid is empty.
-    $NMCLI_TERSE -f NAME,TYPE,802-11-wireless.ssid connection show 2>/dev/null \
-        | awk -F: '
-            tolower($2) == "802-11-wireless" {
-                ssid = ($3 != "") ? $3 : $1
-                print ssid
-            }' \
-        | sort -u
+    local names
+    names=$($NMCLI_TERSE -f NAME,TYPE connection show 2>/dev/null \
+        | awk -F: 'tolower($2) == "802-11-wireless" {print $1}')
+    [ -z "$names" ] && return 0
+    # Per-NAME setting lookup. The while-read pattern handles
+    # connection names with spaces / unicode safely (terse mode
+    # doesn't quote, but each name is on its own line so we read
+    # the full line into one variable).
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        local ssid
+        # nmcli -g raw-value-only; falls back to empty on missing
+        # setting (e.g. legacy ethernet profile that somehow matched
+        # 802-11-wireless type -- defensive only). 2>/dev/null
+        # swallows any per-name lookup error without aborting the
+        # outer loop.
+        ssid=$($NMCLI_TERSE -g 802-11-wireless.ssid connection show "$name" 2>/dev/null || true)
+        echo "${ssid:-$name}"
+    done <<< "$names" | sort -u
 }
 
 # Currently-active SSID on any interface. Returns empty string if
@@ -204,14 +231,30 @@ main() {
     # profile, not the SSID -- they're usually identical but may
     # differ. Look up the connection NAME for this SSID; fall back
     # to the SSID string itself (NM matches case-sensitively).
-    local conn_name
-    conn_name=$($NMCLI_TERSE -f NAME,802-11-wireless.ssid,TYPE connection show 2>/dev/null \
-        | awk -F: -v want="$best_ssid" '
-            tolower($3) == "802-11-wireless" {
-                ssid = ($2 != "") ? $2 : $1
-                if (ssid == want && first == "") { first = $1 }
-            }
-            END { if (first != "") print first }')
+    #
+    # r63 (2026-06-05): same two-pass shape as known_ssids above.
+    # The pre-r63 single-pass `-f NAME,802-11-wireless.ssid,TYPE
+    # connection show` hit the same "invalid field" rejection from
+    # nmcli + propagated exit 2. Two-pass: list wifi names, query
+    # the SSID setting per-name, match against best_ssid.
+    local conn_name=""
+    local _conn_names
+    _conn_names=$($NMCLI_TERSE -f NAME,TYPE connection show 2>/dev/null \
+        | awk -F: 'tolower($2) == "802-11-wireless" {print $1}')
+    if [ -n "$_conn_names" ]; then
+        while IFS= read -r _name; do
+            [ -z "$_name" ] && continue
+            local _ssid
+            _ssid=$($NMCLI_TERSE -g 802-11-wireless.ssid connection show "$_name" 2>/dev/null || true)
+            # Empty-SSID profile: assume name == SSID (matches the
+            # known_ssids fallback).
+            local _resolved="${_ssid:-$_name}"
+            if [ "$_resolved" = "$best_ssid" ] && [ -z "$conn_name" ]; then
+                conn_name=$_name
+                break
+            fi
+        done <<< "$_conn_names"
+    fi
     if [ -z "$conn_name" ]; then
         # Fallback: assume connection NAME == SSID.
         conn_name=$best_ssid
@@ -244,4 +287,11 @@ main() {
     return 1
 }
 
-main "$@"
+# r63 (2026-06-05): sourceable-when-tested guard. The
+# scripts/tests/test_best_wifi.sh harness sources this script to
+# call known_ssids / current_ssid / ssid_signal in isolation with
+# a mocked nmcli on PATH. The systemd unit + manual invocations
+# (where $0 == BASH_SOURCE[0]) still run main as before.
+if [ "${BASH_SOURCE[0]:-$0}" = "$0" ]; then
+    main "$@"
+fi
