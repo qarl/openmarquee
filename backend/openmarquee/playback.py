@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 from uuid import UUID
 
 from openmarquee.content import ContentItem, StreamSlide, WebSlide
+from openmarquee.perf_stats import STATS as _PERF_STATS
 from openmarquee.rendering import Renderer
 from openmarquee.stream_consumer import StreamConsumer
 
@@ -328,6 +329,26 @@ class PlaybackLoop:
         readline (or a slow IPC round-trip) can't spam the journal.
         """
         self._tick_ns_ring.append(delta_ns)
+        # r64+r66: feed the cheap /api/perf-stats endpoint so QA can
+        # poll counter deltas without journalctl. `delta_ms` is the
+        # OVER-budget portion (clamped to 0); record_frame_observation
+        # bumps frames_observed_total unconditionally and
+        # frame_over_budget_total when delta_ms > 0. Renderer's
+        # `frame over budget` stderr is parser-recognized but no-op,
+        # so this is the single ingest path (no double-count).
+        try:
+            # r66 subagent WARN-3: ceiling-divide so sub-ms over-budget
+            # ticks (e.g. delta_ns = 33_500_000 → 0.5 ms over) still bump
+            # frame_over_budget_total. Floor-div would silently undercount
+            # while the warn-log below still fires -- counter/log mismatch.
+            delta_over_ns = delta_ns - self.TICK_BUDGET_NS
+            over_ms = (delta_over_ns + 999_999) // 1_000_000 if delta_over_ns > 0 else 0
+            _PERF_STATS.record_frame_observation(
+                delta_ms=int(over_ms),
+                in_transition=(phase == "transition"),
+            )
+        except Exception:
+            log.debug("perf_stats record_frame_observation raised", exc_info=True)
         if delta_ns <= self.TICK_BUDGET_NS:
             return
         now_mono = time.monotonic()
@@ -1265,6 +1286,14 @@ class PlaybackLoop:
                     int(transition_ms),
                     transition_t0_ms,
                 )
+                # r64+r66: bump transitions_total only on a successful
+                # handoff (the except branches below are unsupported-
+                # transition / unsupported-slide fallbacks that do NOT
+                # paint a transition).
+                try:
+                    _PERF_STATS.record_transition_observation()
+                except Exception:
+                    log.debug("perf_stats record_transition_observation raised", exc_info=True)
             except RustRendererUnsupportedTransitionError as e:
                 # Forward-compat catch -- today's Rust silently FS_CUT-
                 # fallbacks for unknown kinds so this path doesn't fire.

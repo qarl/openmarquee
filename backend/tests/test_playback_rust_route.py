@@ -1102,3 +1102,103 @@ async def test_r58_preload_exception_does_not_kill_playback(caplog):
         "preload_slide" in r.message and "non-fatal" in r.message
         for r in caplog.records
     ), f"expected non-fatal preload warning; got {[r.message for r in caplog.records]}"
+
+
+# ============================================================
+# r66 (2026-06-05): /api/perf-stats counter-wiring guard.
+#
+# r64 shipped the endpoint + PerfStats unit semantics but the
+# commit's claimed playback.py plumbing was never actually in
+# the diff -- frames_observed_total / frame_over_budget_total /
+# transitions_total stayed at 0 across 10+ min of playback even
+# though preload_recent / v4l2_prime_recent updated fine. These
+# tests pin the increment paths so a future revert can't silently
+# regress them again.
+# ============================================================
+
+
+def test_r66_record_tick_bumps_frames_observed_total(tmp_path):
+    """Every `_record_tick` call MUST bump frames_observed_total by 1,
+    regardless of whether the tick is in-budget or over-budget."""
+    from uuid import uuid4
+
+    from openmarquee.perf_stats import STATS
+
+    loop = PlaybackLoop(
+        MockRenderer(8, 8, tmp_path / "out.png"),
+        fetch_items=lambda: [],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+    )
+    before = STATS.snapshot()["frames_observed_total"]
+    # In-budget tick (30 ms < 33 ms TICK_BUDGET_NS).
+    loop._record_tick(30_000_000, uuid4(), "advance")
+    after_in = STATS.snapshot()["frames_observed_total"]
+    assert after_in - before == 1, "in-budget tick must bump frames_observed_total"
+    # Over-budget tick (50 ms).
+    loop._record_tick(50_000_000, uuid4(), "advance")
+    after_over = STATS.snapshot()["frames_observed_total"]
+    assert after_over - before == 2, "over-budget tick must ALSO bump frames_observed_total"
+
+
+def test_r66_record_tick_over_budget_bumps_frame_over_budget_total(tmp_path):
+    """Only OVER-budget ticks bump frame_over_budget_total; in-budget
+    ticks must NOT (it is the over-budget-count, not total-ticks)."""
+    from uuid import uuid4
+
+    from openmarquee.perf_stats import STATS
+
+    loop = PlaybackLoop(
+        MockRenderer(8, 8, tmp_path / "out.png"),
+        fetch_items=lambda: [],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+    )
+    before = STATS.snapshot()["frame_over_budget_total"]
+    # In-budget tick: must NOT bump.
+    loop._record_tick(30_000_000, uuid4(), "advance")
+    assert STATS.snapshot()["frame_over_budget_total"] == before
+    # Over-budget tick (50 ms > 33 ms budget): MUST bump.
+    loop._record_tick(50_000_000, uuid4(), "advance")
+    assert STATS.snapshot()["frame_over_budget_total"] - before == 1
+    # r66 subagent WARN-3 pin: sub-ms over-budget (33.5 ms = 0.5 ms over)
+    # MUST also bump -- floor-div would silently swallow this while the
+    # `tick over budget` warn-log still fires.
+    loop._record_tick(33_500_000, uuid4(), "advance")
+    assert STATS.snapshot()["frame_over_budget_total"] - before == 2
+
+
+@pytest.mark.asyncio
+async def test_r66_transition_handoff_bumps_transitions_total(tmp_path):
+    """A successful begin_transition handoff MUST bump transitions_total
+    by 1. Drives the same fade-transition path as
+    test_mock_renderer_drives_transition_via_playback_loop and asserts
+    the counter delta matches the begin_transition_calls count."""
+    from openmarquee.perf_stats import STATS
+
+    mock = MockRenderer(8, 8, tmp_path / "out.png")
+    slide_a = TextSlide(
+        name="A", text_layers=[TextLayer(text="A")],
+        duration_ms=100, transition="fade", transition_ms=200,
+    )
+    slide_b = TextSlide(
+        name="B", text_layers=[TextLayer(text="B")],
+        duration_ms=100, transition="fade", transition_ms=200,
+    )
+    loop = PlaybackLoop(
+        mock,
+        fetch_items=lambda: [slide_a, slide_b],
+        read_asset=lambda _id: b"",
+        empty_playlist_poll_seconds=0.01,
+    )
+    before = STATS.snapshot()["transitions_total"]
+    await loop.start()
+    await asyncio.sleep(0.7)
+    await loop.stop()
+
+    transition_calls = len(mock.begin_transition_calls)
+    assert transition_calls >= 1, "test setup: expected the loop to drive >=1 transition"
+    delta = STATS.snapshot()["transitions_total"] - before
+    assert delta == transition_calls, (
+        f"transitions_total bumped {delta} but begin_transition was called {transition_calls} times"
+    )
