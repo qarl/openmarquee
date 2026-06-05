@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the bundled seed backgrounds via Pollinations.ai.
 
-Writes JPEGs to backend/openmarquee/seed_assets/backgrounds/. First-boot
+Writes JPEGs to backend/openmarquee/seed_assets/images/. First-boot
 seed picks those up and registers each as an ImageSlide.
 
 This is a *one-shot maintainer script*, not part of the device's runtime.
@@ -109,7 +109,7 @@ def _fetch_with_retry(url: str, attempts: int = 4) -> bytes | None:
 
 def main() -> int:
     project_root = Path(__file__).resolve().parent.parent
-    dest = project_root / "backend/openmarquee/seed_assets/backgrounds"
+    dest = project_root / "backend/openmarquee/seed_assets/images"
     dest.mkdir(parents=True, exist_ok=True)
 
     print(f"writing to {dest}")

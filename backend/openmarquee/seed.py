@@ -8,7 +8,7 @@ Contract:
     (a) no seed-marker file exists at `marker_path`, AND
     (b) the content storage has no items.
 - If it runs, seed registers:
-    1. Any bundled curated backgrounds from `seed_assets/backgrounds/`
+    1. Any bundled curated backgrounds from `seed_assets/images/`
        (committed to git; generated once via
        `scripts/generate-seed-backgrounds.py` calling Pollinations.ai).
        These are the nicer "shipped with the product" backgrounds.
@@ -110,7 +110,7 @@ def render_gradient_png(preset: SeedPreset, width: int, height: int) -> bytes:
 def _default_bundled_backgrounds_dir() -> Path:
     """Default location of curated backgrounds shipped in the Python
     package (committed to git by scripts/generate-seed-backgrounds.py)."""
-    return Path(__file__).resolve().parent / "seed_assets" / "backgrounds"
+    return Path(__file__).resolve().parent / "seed_assets" / "images"
 
 
 def _default_bundled_videos_dir() -> Path:

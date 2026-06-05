@@ -48,8 +48,8 @@ openmarquee-flock.json
 backend/openmarquee/seed_assets/*
 !backend/openmarquee/seed_assets/.gitkeep
 !backend/openmarquee/seed_assets/README.md
-!backend/openmarquee/seed_assets/backgrounds/
-!backend/openmarquee/seed_assets/backgrounds/**
+!backend/openmarquee/seed_assets/images/
+!backend/openmarquee/seed_assets/images/**
 !backend/openmarquee/seed_assets/videos/
 !backend/openmarquee/seed_assets/videos/**
 !backend/openmarquee/seed_assets/demo_reel/

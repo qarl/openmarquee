@@ -3,7 +3,7 @@
 
 Higher-quality alternative to generate-seed-backgrounds.py (which uses
 the free Pollinations.ai endpoint). Both scripts write to the same
-destination — backend/openmarquee/seed_assets/backgrounds/ — so you
+destination — backend/openmarquee/seed_assets/images/ — so you
 pick whichever provider matches the prompts + budget you want for a
 given generation round.
 
@@ -129,7 +129,7 @@ def _generate_one(stem: str, prompt: str, dest: Path) -> None:
 
 def main() -> int:
     project_root = Path(__file__).resolve().parent.parent
-    dest_dir = project_root / "backend/openmarquee/seed_assets/backgrounds"
+    dest_dir = project_root / "backend/openmarquee/seed_assets/images"
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"writing to {dest_dir}")
