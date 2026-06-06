@@ -84,6 +84,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
 import subprocess
 import threading
 import time
@@ -108,6 +109,24 @@ class RustRendererSubprocessError(RustRendererError):
     """The renderer subprocess failed to launch, died, or otherwise
     misbehaved at the process layer (broken pipes, EOF, non-zero exit
     before response).
+    """
+
+
+class RustRendererTimeoutError(RustRendererSubprocessError):
+    """r74 (2026-06-06): the renderer subprocess didn't write a complete
+    response line within the per-op timeout window. This is the
+    backend-visible signature of a kernel-level wedge in the renderer
+    (the V4L2 bcm2835-codec D-state path observed 2026-06-06 after ~52
+    min of healthy 1080p playback). Pre-r74 the proxy's blocking
+    `readline()` held `_lock` indefinitely while the renderer was
+    wedged in an uninterruptible kernel ioctl; every other asyncio
+    executor thread piled up on `_lock` (the futex_wait cascade
+    captured in the r74 dispatch forensics). r74 raises this as a
+    subclass of `RustRendererSubprocessError` so the existing
+    `_send_op` reconnect path kicks in, releases the lock, kills the
+    wedged subprocess, and respawns. Session state (begin_slide /
+    begin_transition) is lost on the respawn -- callers should treat
+    this like `RustRendererRespawnedError`.
     """
 
 
@@ -379,12 +398,36 @@ class RustRenderer:
     # Graceful-exit wait before terminate(); terminate() wait before kill().
     GRACEFUL_EXIT_TIMEOUT_S = 5.0
     TERMINATE_TIMEOUT_S = 2.0
+    # r74 subagent BLOCKER fix: bounded post-SIGKILL wait. Pre-r74-v2 the
+    # post-kill `proc.wait()` had no timeout. If the rust subprocess is
+    # in a V4L2 D-state (uninterruptible kernel sleep, the exact wedge
+    # r74 was built to recover from), SIGKILL doesn't reap the threads
+    # because the kernel never returns from the ioctl. The unbounded
+    # wait then re-introduced the EXACT futex_wait cascade r74's
+    # _readline_with_timeout broke -- just relocated from readline to
+    # proc.wait, still under _lock. ABANDON_TIMEOUT_S caps the wait;
+    # on timeout the proxy logs CRITICAL + abandons the un-reapable
+    # PID + releases _lock so the rest of the backend stays responsive.
+    # The orphaned PID stays alive until the kernel ioctl returns
+    # (which may be never -- it's already in D-state); systemd
+    # reaps it at backend restart.
+    ABANDON_TIMEOUT_S = 3.0
     # Reconnect defaults. The 3-retries-in-60s window matches typical
     # process-supervisor crash-loop thresholds (e.g. systemd Restart=
     # on-failure with StartLimitBurst=3 / StartLimitIntervalSec=60s).
     DEFAULT_RECONNECT_MAX_RETRIES = 3
     DEFAULT_RECONNECT_WINDOW_S = 60.0
     DEFAULT_WATCHDOG_INTERVAL_S = 1.0
+    # r74 (2026-06-06): per-op response timeout. Pre-r74 the proxy did
+    # a blocking `readline()` while holding `_lock`; if the renderer
+    # wedged in a kernel V4L2 ioctl (D-state observed), readline never
+    # returned and every other asyncio executor thread piled up on the
+    # lock. 10s comfortably covers the slowest expected response
+    # (begin_slide cold-start V4L2 prime ~600ms; preload completion
+    # ~100ms; everything else sub-100ms) without falsing on the
+    # genuine slow path. Configurable via OPENMARQUEE_RENDERER_RESPONSE_
+    # TIMEOUT_S env var so QA can hot-tune.
+    DEFAULT_RESPONSE_TIMEOUT_S = 10.0
 
     def __init__(
         self,
@@ -402,6 +445,7 @@ class RustRenderer:
         reconnect_window_s: float = DEFAULT_RECONNECT_WINDOW_S,
         watchdog_enabled: bool = True,
         watchdog_interval_s: float = DEFAULT_WATCHDOG_INTERVAL_S,
+        response_timeout_s: float | None = None,
     ):
         # Renderer Protocol attrs. Refreshed from the sidecar's
         # OpenOk response after open() so the negotiated mode wins
@@ -463,6 +507,27 @@ class RustRenderer:
         self._watchdog_interval_s = float(watchdog_interval_s)
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
+
+        # r74 (2026-06-06): per-op response timeout. Resolution:
+        # explicit ctor arg > env var > class default. Env name kept
+        # short + scoped so QA can `systemctl edit openmarquee-backend`
+        # in an emergency.
+        if response_timeout_s is not None:
+            self._response_timeout_s = float(response_timeout_s)
+        else:
+            env_val = os.environ.get("OPENMARQUEE_RENDERER_RESPONSE_TIMEOUT_S")
+            if env_val:
+                try:
+                    self._response_timeout_s = float(env_val)
+                except ValueError:
+                    log.warning(
+                        "ignoring invalid OPENMARQUEE_RENDERER_RESPONSE_TIMEOUT_S=%r; "
+                        "using default %.1fs",
+                        env_val, self.DEFAULT_RESPONSE_TIMEOUT_S,
+                    )
+                    self._response_timeout_s = self.DEFAULT_RESPONSE_TIMEOUT_S
+            else:
+                self._response_timeout_s = self.DEFAULT_RESPONSE_TIMEOUT_S
 
     # ------------------------------------------------------------------
     # Lifecycle.
@@ -1034,7 +1099,9 @@ class RustRenderer:
 
         try:
             assert self._proc.stdout is not None
-            response_line = self._proc.stdout.readline()
+            response_line = self._readline_with_timeout(
+                op, self._response_timeout_s,
+            )
         except (BrokenPipeError, OSError) as e:
             raise RustRendererSubprocessError(f"Failed to read response to op {op!r}: {e}") from e
         if not response_line:
@@ -1052,6 +1119,66 @@ class RustRenderer:
             ) from e
 
         return self._decode_response(op, resp)
+
+    def _readline_with_timeout(self, op: str, timeout_s: float) -> str:
+        """r74 (2026-06-06): bounded-time stdout readline. Returns the
+        next complete line (incl. trailing newline) or `""` on EOF.
+        Raises `RustRendererTimeoutError` if no line arrives within
+        `timeout_s` seconds.
+
+        Why this exists: the pre-r74 `self._proc.stdout.readline()` was
+        an unbounded blocking call that held `_lock` for as long as
+        the renderer took to respond. When the renderer wedged in a
+        V4L2 kernel ioctl (the 2026-06-06 D-state observation after
+        ~52 min of healthy playback), readline never returned, the
+        lock was never released, and every other asyncio executor
+        thread that wanted to call begin_slide / advance / preload
+        piled up on `_lock` in futex_wait. Backend HTTP stayed alive
+        (the asyncio loop's epoll_wait was fine), but no playback
+        events fired -- the screen froze.
+
+        Implementation: `select()` on the stdout fd with the budget,
+        then call `readline()` once data is ready. The rust side
+        writes each response as a single line with explicit flush,
+        so the buffered readline reads exactly one complete line in
+        one syscall round-trip after select wakes.
+
+        Edge case (documented assumption): if a prior response left
+        partial bytes in Python's TextIOWrapper buffer, select() may
+        not show the fd as ready even though readline would return.
+        For our 1-line-per-op protocol with rust's explicit flush
+        after each line, this can't happen -- each readline consumes
+        exactly one line and the buffer ends empty. The assumption
+        is asserted by the rust-side contract; if violated, the
+        timeout fires falsely on the next op, which is itself a
+        diagnostic signal.
+        """
+        assert self._proc is not None
+        assert self._proc.stdout is not None
+        fd = self._proc.stdout.fileno()
+
+        def _raise_timeout() -> "RustRendererTimeoutError":
+            # r74 subagent NIT-7: single source of truth for the
+            # timeout-error message. A future op-specific hint
+            # (e.g. "for op begin_slide try increasing budget to N
+            # to accommodate cold prime") goes here in one place.
+            return RustRendererTimeoutError(
+                f"renderer didn't respond to op {op!r} within "
+                f"{timeout_s:.1f}s -- likely V4L2 / IPC wedge; "
+                f"reconnect path will respawn the subprocess"
+            )
+
+        # r74 subagent NIT-6: single-shot select, no implicit loop.
+        # `readline()` returns one complete line per call (rust's
+        # explicit flush after each response makes this safe) so we
+        # never need to come back to select for more data.
+        ready, _, _ = select.select([fd], [], [], timeout_s)
+        if not ready:
+            raise _raise_timeout()
+        # Data is ready at the OS pipe level. readline() pulls one
+        # complete line; on EOF returns "" which the caller promotes
+        # to RustRendererSubprocessError.
+        return self._proc.stdout.readline()
 
     def _decode_response(self, op: str, resp: Any) -> dict[str, Any] | None:
         """Decode the externally-tagged IpcResponse. On Ok, returns the
@@ -1151,7 +1278,26 @@ class RustRenderer:
                     self.TERMINATE_TIMEOUT_S,
                 )
                 proc.kill()
-                proc.wait()
+                try:
+                    proc.wait(timeout=self.ABANDON_TIMEOUT_S)
+                except subprocess.TimeoutExpired:
+                    # r74 subagent BLOCKER fix: process didn't reap
+                    # within the abandon budget after SIGKILL. Most
+                    # likely a V4L2 D-state thread holding the
+                    # kernel's grip on the ioctl. We cannot wait
+                    # this out -- the ioctl may never return. Log
+                    # CRITICAL + leave the orphan PID for systemd
+                    # to reap at backend restart. The proxy returns
+                    # WITHOUT holding _lock open against an
+                    # unreapable process; the rest of the asyncio
+                    # executor pool stays responsive.
+                    log.critical(
+                        "RustRenderer subprocess pid=%d did not reap after SIGKILL "
+                        "within %.1fs (likely V4L2 D-state); abandoning the handle. "
+                        "The orphan PID will linger until kernel ioctl returns "
+                        "(may be never -- needs Pi reboot or systemd restart).",
+                        proc.pid, self.ABANDON_TIMEOUT_S,
+                    )
         if self._stderr_thread is not None and self._stderr_thread.is_alive():
             self._stderr_thread.join(timeout=1.0)
         self._proc = None

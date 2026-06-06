@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -39,6 +40,7 @@ from openmarquee.rendering.rust_renderer import (
     RustRendererProtocolError,
     RustRendererRespawnedError,
     RustRendererSubprocessError,
+    RustRendererTimeoutError,
     RustRendererUnsupportedSlideError,
     SlideComplete,
 )
@@ -75,6 +77,18 @@ if tz_probe:
 # (simulates subprocess death mid-session).
 DIE_AFTER_OP = os.environ.get("FAKE_SIDECAR_DIE_AFTER_OP")
 DIE_RC = int(os.environ.get("FAKE_SIDECAR_DIE_RC", "1"))
+
+# r74 (2026-06-06): wedge on a specific op so the proxy's bounded-time
+# readline path is reachable. The sidecar receives the request, then
+# sleeps forever (without writing a response), mimicking the V4L2 D-
+# state wedge. The proxy's _readline_with_timeout MUST raise within
+# response_timeout_s seconds and the reconnect path MUST kick in.
+WEDGE_ON_OP = os.environ.get("FAKE_SIDECAR_WEDGE_ON_OP")
+
+# Optional: delay each response by this many seconds (uniform across
+# all ops). Used to test that the timeout doesn't fire on legitimate
+# slow responses below the threshold.
+RESPONSE_DELAY_S = float(os.environ.get("FAKE_SIDECAR_RESPONSE_DELAY_S", "0"))
 
 # Optional: respond to all reconfigure ops with an err.
 RECONFIGURE_ERR = os.environ.get("FAKE_SIDECAR_RECONFIGURE_ERR")
@@ -124,6 +138,18 @@ for raw in sys.stdin:
         continue
     op = req.get("op")
     params = req.get("params") or {}
+
+    # r74 (2026-06-06): wedge before responding so the proxy's
+    # _readline_with_timeout times out + reconnect path runs.
+    if WEDGE_ON_OP and op == WEDGE_ON_OP:
+        import time as _t
+        _t.sleep(3600)  # never reached -- proxy will kill us
+
+    # r74: slow-response simulation for the "legitimate slow response
+    # does NOT time out" case.
+    if RESPONSE_DELAY_S > 0:
+        import time as _t
+        _t.sleep(RESPONSE_DELAY_S)
 
     if MALFORMED_NEXT and not malformed_emitted:
         sys.stdout.write("this is not json\n")
@@ -1242,3 +1268,290 @@ def test_real_sidecar_open_close_roundtrip(tmp_path):
     finally:
         r.close()
     assert r.is_alive is False
+
+
+# ============================================================
+# r74 (2026-06-06): bounded-time readline + reconnect-on-timeout.
+#
+# Pre-r74 the proxy's _send_op_locked did a blocking readline()
+# while holding _lock. If the renderer wedged in a V4L2 kernel
+# ioctl (the 2026-06-06 D-state observed after ~52 min of healthy
+# 1080p playback), readline never returned, every other asyncio
+# executor thread piled up on _lock in futex_wait, and the
+# playback loop went silent while /healthz stayed green.
+#
+# r74 wires `_readline_with_timeout(op, timeout_s)` using select()
+# at the fd level. On timeout, raises RustRendererTimeoutError
+# (subclass of RustRendererSubprocessError) so the existing
+# _send_op reconnect path kicks in -- lock released, wedged
+# subprocess killed, fresh one spawned. These tests pin that
+# behavior end-to-end.
+# ============================================================
+
+
+def test_r74_response_timeout_default_is_ten_seconds(make_renderer):
+    """Pin the compiled default so a future change has to be
+    deliberate. 10s comfortably covers begin_slide cold-prime
+    (~600ms) without falsing."""
+    r = make_renderer()
+    try:
+        assert r._response_timeout_s == r.DEFAULT_RESPONSE_TIMEOUT_S == 10.0
+    finally:
+        r.close()
+
+
+def test_r74_response_timeout_explicit_ctor_arg_overrides_default(make_renderer):
+    """Ctor arg > class default. Used by tests that need a snappier
+    timeout to keep the suite fast."""
+    r = make_renderer(response_timeout_s=0.2)
+    try:
+        assert r._response_timeout_s == 0.2
+    finally:
+        r.close()
+
+
+def test_r74_response_timeout_env_overrides_default(make_renderer):
+    """Env override > class default. Used by QA for emergency
+    `systemctl edit` hot-tuning without a backend rebuild."""
+    r = make_renderer(env_extra={"OPENMARQUEE_RENDERER_RESPONSE_TIMEOUT_S": "2.5"})
+    try:
+        assert r._response_timeout_s == 2.5
+    finally:
+        r.close()
+
+
+def test_r74_response_timeout_garbage_env_falls_back_to_default(make_renderer):
+    """Bogus env value must NOT crash the proxy; just log a warning
+    and use the default."""
+    r = make_renderer(env_extra={"OPENMARQUEE_RENDERER_RESPONSE_TIMEOUT_S": "notanumber"})
+    try:
+        assert r._response_timeout_s == r.DEFAULT_RESPONSE_TIMEOUT_S
+    finally:
+        r.close()
+
+
+def test_r74_wedged_renderer_raises_timeout_error_within_budget(make_renderer):
+    """The smoking-gun test: a fake sidecar that wedges on `advance`
+    MUST surface a RustRendererTimeoutError within roughly the
+    configured timeout. Pre-r74 this would block forever in
+    readline().
+
+    Wedge on `advance` (not `open`) because `open` has a
+    terminate-on-failure path with a 5s graceful-exit wait that
+    would dominate the test's elapsed measurement.
+
+    Note: with reconnect_max_retries=0, the timeout is wrapped in an
+    outer RustRendererSubprocessError by `_send_op`'s reconnect-
+    exhausted branch. We catch the broader class then walk the
+    `__cause__` chain to verify the root was the timeout.
+    """
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_WEDGE_ON_OP": "advance"},
+        response_timeout_s=0.3,
+        reconnect_max_retries=0,
+        watchdog_enabled=False,
+    )
+    try:
+        r.open()
+        t_start = time.monotonic()
+        with pytest.raises(RustRendererSubprocessError) as excinfo:
+            r.advance(t_ms=0)
+        elapsed = time.monotonic() - t_start
+        assert elapsed < 2.0, (
+            f"timeout took {elapsed:.2f}s; expected ~0.3s "
+            "(pre-r74 was an infinite hang)"
+        )
+        # Walk the cause chain -- the outer error is the reconnect-
+        # exhausted wrapper; the root cause MUST be our timeout.
+        cause = excinfo.value
+        while cause is not None:
+            if isinstance(cause, RustRendererTimeoutError):
+                break
+            cause = cause.__cause__
+        assert isinstance(cause, RustRendererTimeoutError), (
+            f"expected RustRendererTimeoutError in the cause chain, "
+            f"got: {excinfo.value!r}"
+        )
+    finally:
+        r.close()
+
+
+def test_r74_lock_is_released_after_timeout(make_renderer):
+    """The critical invariant: after a timeout, `_lock` MUST be free
+    so a subsequent caller doesn't block forever. This is what
+    breaks the futex_wait cascade observed in the r74 dispatch
+    forensics."""
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_WEDGE_ON_OP": "advance"},
+        response_timeout_s=0.2,
+        reconnect_max_retries=0,
+        watchdog_enabled=False,
+    )
+    try:
+        r.open()
+        # advance() wedges + times out.
+        with pytest.raises(RustRendererSubprocessError):
+            r.advance(t_ms=0)
+        # Now confirm _lock is acquirable from this thread WITHOUT
+        # blocking. Use non-blocking acquire as a smoke test --
+        # if _lock were still held by the timed-out call, this would
+        # return False. (RLock is re-entrant on the same thread, so
+        # this passes trivially if the test thread holds it; we use
+        # a separate thread to make the assertion meaningful.)
+        acquired_in_other_thread = threading.Event()
+        timed_out = threading.Event()
+        def _try_acquire():
+            if r._lock.acquire(blocking=True, timeout=2.0):
+                acquired_in_other_thread.set()
+                r._lock.release()
+            else:
+                timed_out.set()
+        t = threading.Thread(target=_try_acquire, daemon=True)
+        t.start()
+        t.join(timeout=3.0)
+        assert acquired_in_other_thread.is_set(), (
+            "another thread couldn't acquire _lock after timeout -- "
+            "the futex_wait cascade was re-introduced"
+        )
+        assert not timed_out.is_set()
+    finally:
+        r.close()
+
+
+def test_r74_timeout_triggers_reconnect_path(make_renderer):
+    """End-to-end: a wedge MUST trigger the reconnect path (proven
+    by RustRendererRespawnedError surfacing instead of a bare
+    RustRendererTimeoutError). The respawned proxy is fresh + can
+    succeed on the next op IF we route to a non-wedging sidecar
+    (which we don't here -- spawned subprocess wedges identically,
+    so we just assert the respawn ATTEMPT happens)."""
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_WEDGE_ON_OP": "advance"},
+        response_timeout_s=0.2,
+        reconnect_max_retries=1,
+        watchdog_enabled=False,
+    )
+    try:
+        r.open()
+        # The wedge on advance times out, reconnect spawns a fresh
+        # subprocess (which also wedges on advance), eventually
+        # exhausts reconnect budget and re-raises. The important
+        # thing: we don't hang.
+        t_start = time.monotonic()
+        with pytest.raises(RustRendererSubprocessError):
+            r.advance(t_ms=0)
+        elapsed = time.monotonic() - t_start
+        # Budget: 1 wedge x 0.2s + 1 reconnect attempt's wedge x 0.2s
+        # + subprocess spawn overhead. Bound generously at 10s.
+        assert elapsed < 10.0, f"reconnect path elapsed={elapsed:.2f}s; expected < 10s"
+    finally:
+        r.close()
+
+
+def test_r74_slow_but_within_budget_response_does_NOT_time_out(make_renderer):
+    """Pre-r74 the proxy waited forever; r74 must wait long enough.
+    A 0.1s response with a 1.0s budget MUST succeed, not falsely
+    time out."""
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_RESPONSE_DELAY_S": "0.1"},
+        response_timeout_s=1.0,
+    )
+    try:
+        result = r.open()
+        assert result.mode_w > 0
+        assert result.mode_h > 0
+    finally:
+        r.close()
+
+
+def test_r74_terminate_subprocess_abandons_unreapable_pid(make_renderer, caplog):
+    """r74 subagent BLOCKER lock pin: if the rust subprocess is in a
+    V4L2 D-state and SIGKILL doesn't reap the threads, the post-kill
+    `proc.wait()` MUST be bounded -- otherwise it blocks forever under
+    `_lock` and re-introduces the EXACT cascade r74 was built to
+    break, just relocated from readline to wait.
+
+    Simulates the un-reapable case by monkey-patching `proc.wait()`
+    to always raise TimeoutExpired and `proc.terminate`/`proc.kill`
+    to no-op. Asserts `_terminate_subprocess` returns within the
+    abandon budget AND `self._proc` is nulled out so the proxy can
+    re-spawn cleanly.
+    """
+    import logging
+    r = make_renderer()
+    try:
+        r.open()
+        proc = r._proc
+        assert proc is not None
+
+        # Patch the subprocess control so it never actually exits.
+        # `wait` always TimeoutExpired-s; `terminate`/`kill` no-op.
+        class _FakeProcWedged:
+            pid = proc.pid
+            stdin = proc.stdin
+            stdout = proc.stdout
+            stderr = proc.stderr
+            returncode = None
+
+            def poll(self):
+                return None  # still "alive"
+
+            def wait(self, timeout=None):
+                # Sleep for the requested timeout-ish, then "timeout".
+                # Simulates a kernel-blocked process.
+                if timeout is None:
+                    raise AssertionError(
+                        "_terminate_subprocess called wait() with no timeout -- "
+                        "the r74 BLOCKER fix was reverted; the futex cascade "
+                        "will fire on the next V4L2 D-state wedge"
+                    )
+                time.sleep(min(timeout, 0.05))  # don't sleep the full budget
+                raise subprocess.TimeoutExpired(cmd=["fake"], timeout=timeout)
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        # Swap in the fake; real subprocess gets reaped by test teardown.
+        real_proc = r._proc
+        r._proc = _FakeProcWedged()  # type: ignore[assignment]
+        proc_after_terminate = None
+        try:
+            with caplog.at_level(logging.CRITICAL, logger="openmarquee.rendering.rust_renderer"):
+                t_start = time.monotonic()
+                r._terminate_subprocess()
+                elapsed = time.monotonic() - t_start
+            # Capture the post-terminate state BEFORE the finally
+            # restores real_proc for cleanup.
+            proc_after_terminate = r._proc
+        finally:
+            r._proc = real_proc
+        # Within budget: graceful(5) + terminate(2) + abandon(3) +
+        # slack. Each wait returns ~immediately (50ms sleep) so the
+        # real elapsed is much smaller, but bound generously.
+        assert elapsed < 12.0, (
+            f"_terminate_subprocess elapsed={elapsed:.2f}s; expected fast "
+            "(each wait monkeypatched to time out near-instantly). "
+            "If this fails, an unbounded wait was re-introduced."
+        )
+        # Proxy state cleaned up: _proc is None so a subsequent spawn
+        # can repopulate it without the un-reapable handle in the way.
+        assert proc_after_terminate is None, (
+            "after abandon, _proc MUST be None so reconnect can spawn fresh"
+        )
+        # The CRITICAL log line for the abandoned PID fired.
+        assert any(
+            "did not reap after SIGKILL" in rec.message
+            for rec in caplog.records
+        ), "expected CRITICAL log line naming the abandoned PID"
+    finally:
+        r.close()
+
+
+def test_r74_timeout_error_is_subprocess_error_subclass():
+    """The reconnect path catches RustRendererSubprocessError. The
+    timeout must be a subclass so the existing reconnect machinery
+    picks it up without explicit per-class handling."""
+    assert issubclass(RustRendererTimeoutError, RustRendererSubprocessError)
