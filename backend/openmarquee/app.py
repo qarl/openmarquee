@@ -92,6 +92,24 @@ _configure_logging()
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Startup: first-boot seed + auto-start playback. Shutdown: stop."""
+    # r67 (2026-06-05): runtime asset verification. Logs CRITICAL if
+    # the COLRv1 emoji font is absent / 0-byte at the canonical
+    # /opt/openmarquee/ui/fonts/ path — otherwise the renderer's COLR
+    # dispatch silently falls back to FontMissing MSDF tofu and the
+    # service keeps reporting healthy. Skipped on dev environments
+    # where /opt/openmarquee/ doesn't exist. Disable in test fixtures
+    # via OPENMARQUEE_DISABLE_ASSET_CHECK=1 (mirrors DISABLE_SEED /
+    # DISABLE_AUTOSTART pattern). Does NOT block startup.
+    if os.environ.get("OPENMARQUEE_DISABLE_ASSET_CHECK") != "1":
+        try:
+            from openmarquee.runtime_assets import (
+                check_runtime_assets,
+                log_runtime_asset_issues,
+            )
+            log_runtime_asset_issues(check_runtime_assets())
+        except Exception:
+            log.exception("startup runtime asset check failed")
+
     # First-boot seed: if no marker file + storage is empty, create a few
     # starter ImageSlides so the operator has something to hit Play on
     # immediately. seed_if_needed logs + stamps a marker so this is a

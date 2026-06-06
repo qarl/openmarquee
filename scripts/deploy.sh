@@ -275,6 +275,22 @@ rsync -avz --rsync-path="sudo rsync" --delete \
     --exclude '._*' \
     "$WHEELS_CACHE/" "$TARGET:$REMOTE_ROOT/wheels/"
 
+# r67 (2026-06-05): post-rsync runtime-asset gate. Verifies
+# /opt/openmarquee/ui/fonts/noto-color-emoji-colrv1.ttf exists +
+# size > 1 MB on the TARGET, AFTER all rsync paths complete but
+# BEFORE install.sh kicks the backend restart. Catches the case
+# where the prep-side download (line 75) shipped a valid font into
+# BUILD_DIR but a subsequent --delete rsync / partial-deploy /
+# manual rm on the target left the canonical path empty.
+#
+# At least 3 silent tofu incidents this session (2026-06-05). The
+# renderer's COLR dispatch at hdmi_logic.rs:733 returns Err on
+# missing font, the worker direct-inserts FontMissing, the MSDF
+# fallback paints tofu, and there's no error log -- operator
+# sees tofu only by visual inspection.
+echo "==> verifying runtime assets on $TARGET"
+bash "$(dirname "$0")/check_runtime_assets.sh" "$TARGET"
+
 echo "==> running install.sh on remote (idempotent provisioning)"
 # install.sh handles venv (Batch 11.1 / sweep #5 #7 requirements.lock
 # pin), systemd unit install, hostapd/dnsmasq/iptables wiring, and

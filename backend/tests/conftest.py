@@ -27,6 +27,15 @@ os.environ.setdefault("OPENMARQUEE_DISABLE_AUTOSTART", "1")
 # PullWorker.start() directly on an isolated FlockSync.
 os.environ.setdefault("OPENMARQUEE_DISABLE_PULL_WORKER", "1")
 
+# r67 (2026-06-05): disable the runtime asset check inside lifespan.
+# The check walks /opt/openmarquee/ui/fonts/; on a dev laptop the
+# directory doesn't exist (the check silently skips with INFO -- safe)
+# but pinning it off here keeps the noise out of the test journal and
+# guarantees no false-positive from a partially-provisioned dev box
+# that DOES have /opt/openmarquee/ but lacks the font. The check is
+# exercised explicitly by test_runtime_assets.py.
+os.environ.setdefault("OPENMARQUEE_DISABLE_ASSET_CHECK", "1")
+
 # Pin the renderer to the in-process mock so tests don't hit DRM init.
 # Without this, every TestClient lifespan tries to open /dev/dri/card0
 # (FileNotFoundError on Mac/CI), logs an exception traceback, falls
