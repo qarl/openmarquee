@@ -787,6 +787,20 @@ impl SlideCache {
                     #[cfg(target_os = "linux")]
                     let prime_us = {
                         let t_prime = std::time::Instant::now();
+                        // r75 subagent BLOCKER-2: snapshot BEFORE the
+                        // prime call. The error-path log emits both
+                        // `before` and `after` so QA can compute
+                        // `after - before` per failed prime:
+                        //   delta == 0: Drop fired, counter balanced
+                        //               -> kernel/VPU slot leak
+                        //   delta >  0: Drop did NOT fire on the
+                        //               Decoder built before failure
+                        //               -> userspace leak (an Arc
+                        //               survived past intended scope)
+                        // Pre-fix the post-prime snapshot alone could
+                        // never distinguish these because Drop fires
+                        // before the error bubbles up.
+                        let counter_before = crate::v4l2::mmal_components_live();
                         match prime_video_decoder(&dem) {
                             Ok(dec_state) => {
                                 self.video_decoders.insert(item_id, dec_state);
@@ -795,6 +809,17 @@ impl SlideCache {
                                 eprintln!(
                                     "ipc: warning -- failed to prime V4L2 decoder for video slide {}: {:#}",
                                     item_id, e
+                                );
+                                eprintln!(
+                                    "[mmal_leak_suspect] kind=video_decode \
+                                     op={:?} slide_id={} \
+                                     mmal_components_live_before={} \
+                                     mmal_components_live_after={} \
+                                     drop_path=automatic call_site=cache_load",
+                                    extract_top_context(&e),
+                                    item_id,
+                                    counter_before,
+                                    crate::v4l2::mmal_components_live(),
                                 );
                             }
                         }
@@ -939,6 +964,9 @@ fn preload_in_worker(
                     // warmup_count=3 for B-frame lookahead. See
                     // PRIME_WARMUP_FOR_PRELOAD docstring for the
                     // CAPTURE-saturation chain.
+                    // r75 subagent BLOCKER-2: snapshot before prime
+                    // so the failure log can emit before+after.
+                    let counter_before = crate::v4l2::mmal_components_live();
                     match crate::video_decode::prime_video_decoder_with_warmup(
                         &dem,
                         crate::video_decode::PRIME_WARMUP_FOR_PRELOAD,
@@ -955,6 +983,20 @@ fn preload_in_worker(
                             eprintln!(
                                 "ipc: preload_worker -- failed to prime V4L2 decoder for video slide {}: {:#}",
                                 item_id, e
+                            );
+                            // r75: same parser-friendly leak-suspect line
+                            // as the synchronous BeginSlide site. call_site
+                            // distinguishes the two paths.
+                            eprintln!(
+                                "[mmal_leak_suspect] kind=video_decode \
+                                 op={:?} slide_id={} \
+                                 mmal_components_live_before={} \
+                                 mmal_components_live_after={} \
+                                 drop_path=automatic call_site=preload_worker",
+                                extract_top_context(&e),
+                                item_id,
+                                counter_before,
+                                crate::v4l2::mmal_components_live(),
                             );
                         }
                     }
@@ -1099,6 +1141,22 @@ fn ok_empty() -> IpcResponse {
 
 fn err(msg: impl Into<String>) -> IpcResponse {
     IpcResponse::Err { error: msg.into() }
+}
+
+/// r75 (2026-06-07): pull the OUTERMOST `.with_context` string out of
+/// an anyhow error chain (e.g. "REQBUFS OUTPUT" or "S_FMT OUTPUT
+/// (H264)") so the structured [mmal_leak_suspect] line can carry a
+/// short op tag that QA can grep + bucket. Falls back to the full
+/// Display of the root cause if the chain is empty or context-less.
+fn extract_top_context(e: &anyhow::Error) -> String {
+    // anyhow chains stack OUTERMOST-first, so the first iteration of
+    // .chain() returns the outermost context which is exactly the
+    // op-tag we attach via .context("REQBUFS OUTPUT") etc. in the
+    // prime path.
+    let mut iter = e.chain();
+    iter.next()
+        .map(|root| root.to_string())
+        .unwrap_or_else(|| e.to_string())
 }
 
 /// Outer loop: read requests until Open arrives. Other ops
@@ -2951,6 +3009,51 @@ mod tests {
 
     fn uuid(n: u8) -> Uuid {
         Uuid::from_bytes([n; 16])
+    }
+
+    // ============================================================
+    // r75 (2026-06-07): MMAL leak-suspect log -- extract_top_context.
+    //
+    // The [mmal_leak_suspect] line carries the outermost anyhow
+    // `.with_context` string as the `op` tag so QA can grep + bucket
+    // failures by failing op (REQBUFS OUTPUT, S_FMT OUTPUT, etc.)
+    // without parsing the full chain. These tests pin the extractor
+    // so a future anyhow API change can't silently lose the tag.
+    // ============================================================
+
+    #[test]
+    fn extract_top_context_returns_outermost_context() {
+        // Realistic shape from the prime path: bail!()/Err()-fail at
+        // the ioctl layer, .context(...) at the V4L2 wrapper layer,
+        // .context(...) again at prime_video_decoder_with_warmup.
+        // The OUTER context is what we want for the QA grep tag.
+        use anyhow::Context;
+        let inner: anyhow::Error = anyhow::anyhow!("EINVAL");
+        let middle: anyhow::Result<()> = Err::<(), _>(inner).context("REQBUFS OUTPUT");
+        let outer: anyhow::Result<()> = middle.context("prime V4L2 decoder");
+        let err = outer.unwrap_err();
+        // anyhow's chain() yields the outermost first.
+        let tag = extract_top_context(&err);
+        assert_eq!(
+            tag, "prime V4L2 decoder",
+            "extract_top_context MUST return the outermost .context() tag"
+        );
+    }
+
+    #[test]
+    fn extract_top_context_returns_root_message_on_bare_anyhow_error() {
+        // r75 subagent NIT-5: the prior name implied this exercised
+        // the `unwrap_or_else` fallback branch, but anyhow::chain()
+        // always yields the root error as the first element so that
+        // branch is unreachable today. What this test actually pins:
+        // a bare `anyhow!()` (no `.with_context()` chain) still
+        // returns a useful op-tag (the bare message), so QA's grep
+        // doesn't see `op=""`. The "fallback" in the function body
+        // is purely defensive against a future anyhow change that
+        // could yield an empty chain.
+        let err: anyhow::Error = anyhow::anyhow!("VIDIOC_REQBUFS EINVAL");
+        let tag = extract_top_context(&err);
+        assert_eq!(tag, "VIDIOC_REQBUFS EINVAL");
     }
 
     fn text_item() -> ContentItem {

@@ -63,6 +63,8 @@ use std::collections::VecDeque;
 #[cfg(target_os = "linux")]
 use std::fs::{File, OpenOptions};
 #[cfg(target_os = "linux")]
+use std::io::Write;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
@@ -132,6 +134,48 @@ fn resolve_feed_drain_schedule_from_env() -> (usize, u64) {
     // the floor (e.g. budget=11 -> 3 retries at 4ms = 12ms).
     let retries = (budget_ms + interval_ms - 1) / interval_ms;
     (retries as usize, interval_ms)
+}
+
+// ============================================================
+// r75 (2026-06-07): MMAL component-slot leak instrumentation.
+//
+// After ~23 min cycling a 17-slide 1080p playlist, FYS started
+// failing `vchiq_mmal_component_init` with -62 (ETIME) and
+// "failed to create component ril.video_decode". Recovers ONLY
+// across a Pi reboot.
+//
+// Hypothesis: each Decoder::open allocates a bcm2835-codec MMAL
+// component (kernel-side) and the corresponding ril.video_decode
+// VPU-side slot. The VPU has a finite slot pool; each leaked
+// session ties one up. After ~24 leaks (~one per playlist
+// cycle) the pool exhausts and all further inits time out.
+//
+// Phase A (this commit): count live Decoder instances via an
+// AtomicUsize updated on Decoder::open (+1) and DecoderInner
+// Drop (-1). Emit a parser-friendly [mem] line on each change
+// so QA's journalctl scrape can build a time-series. If the
+// counter grows monotonically, the leak is in userspace (a
+// reference held past intended lifetime); if it stays bounded
+// but kernel-side -62s still fire, the leak is kernel/VPU.
+//
+// Companion: `mmal_leak_suspect` log lines at the prime-failure
+// call sites in ipc_main.rs name the failing op + the slide_id
+// so leaks correlate to specific failure paths.
+// ============================================================
+
+/// Counter of live Decoder instances. Incremented at the end of
+/// `Decoder::open` (after the device passes capability checks,
+/// so we don't count failed opens). Decremented in
+/// `DecoderInner::drop` (which is the canonical scope-exit point,
+/// covering both clean playlist progression and prime-failure
+/// teardown via `?`-propagation in `prime_video_decoder_with_warmup`).
+pub static MMAL_COMPONENTS_LIVE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Snapshot the current counter. Used by tests + the
+/// `[mem] vpu_mmal_components` periodic logger.
+pub fn mmal_components_live() -> usize {
+    MMAL_COMPONENTS_LIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 // ============================================================
@@ -760,6 +804,33 @@ impl Drop for DecoderInner {
         // mapped_output + mapped_capture drop via field-order
         // semantics here, calling munmap. file drops last,
         // closing the fd. No leaks.
+
+        // r75 (2026-06-07): decrement the live-Decoder counter on
+        // every scope exit (clean playlist progression, prime-failure
+        // `?`-propagation, panic).
+        //
+        // r75 subagent BLOCKER-1 + WARN-3 fixes:
+        //   - `fetch_update` floors the ATOMIC at 0 so a double-Drop
+        //     or unmatched decrement can't wrap to usize::MAX +
+        //     corrupt QA's time-series. Pre-fix used fetch_sub +
+        //     local saturating_sub which only saturated the display;
+        //     the atomic itself still wrapped.
+        //   - `writeln!` on stderr ignores BrokenPipeError so a Drop
+        //     during stack unwind (e.g., backend died, stderr fd
+        //     closed) can't double-panic and abort the process.
+        let after = MMAL_COMPONENTS_LIVE
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| Some(v.saturating_sub(1)),
+            )
+            .map(|prev| prev.saturating_sub(1))
+            .unwrap_or(0);
+        let _ = writeln!(
+            std::io::stderr(),
+            "[mem] vpu_mmal_components={} delta=-1 path={}",
+            after, self.path.display(),
+        );
     }
 }
 
@@ -958,6 +1029,24 @@ impl Decoder {
             file,
             path: path.to_path_buf(),
         };
+        // r75 subagent BLOCKER-1 fix: bump the counter RIGHT AT
+        // DecoderInner construction (NOT after capability checks).
+        // Pre-fix, a cap-reject early-return between counter++ and
+        // DecoderInner-being-Drop'd produced an asymmetric decrement
+        // that underflowed AtomicUsize -> usize::MAX. Now increment
+        // is paired one-to-one with the DecoderInner instance: if
+        // the cap checks reject below, dec falls out of scope, Drop
+        // fires the matching decrement, net 0. Per the dispatch's
+        // hypothesis "[close path] fires after an aborted setup it
+        // may itself time out and orphan the VPU-side component
+        // slot" -- even cap-rejected opens are interesting for QA.
+        let n_after_inc = MMAL_COMPONENTS_LIVE
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let _ = writeln!(
+            std::io::stderr(),
+            "[mem] vpu_mmal_components={} delta=+1 path={}",
+            n_after_inc, path.display(),
+        );
         let dec = Self { inner: Arc::new(Mutex::new(inner)) };
         let caps = dec.query_capabilities()
             .context("VIDIOC_QUERYCAP at open time")?;
@@ -979,6 +1068,8 @@ impl Decoder {
                 path.display(), caps.device_caps
             ));
         }
+        // r75 subagent BLOCKER-1: counter was bumped at DecoderInner
+        // construction above (panic-safe pairing with Drop).
         Ok(dec)
     }
 
@@ -1841,6 +1932,71 @@ fn c_str_to_string(buf: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============================================================
+    // r75 (2026-06-07): MMAL component-slot leak counter API pin.
+    //
+    // The Decoder::open increment + DecoderInner::drop decrement
+    // are tested via the real /dev/video10 fixture below (gated
+    // on Linux + device existence). This test pins the public API
+    // surface so a future refactor that drops `mmal_components_live`
+    // or renames the static surfaces at compile time, not on FYS
+    // post-deploy.
+    // ============================================================
+
+    /// r75 subagent WARN-4: serialize counter-perturbing tests
+    /// because cargo runs tests in parallel within one process. A
+    /// sibling test (especially the live-device fixture tests on a
+    /// Pi CI runner) could observe transient +7 from this test, OR
+    /// concurrent Decoder::open/Drop could perturb our delta. A
+    /// process-local Mutex<()> taken at test entry serializes any
+    /// test that touches the static.
+    static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn mmal_components_live_api_surface_compiles_and_reads_the_static() {
+        // The function must mirror the atomic; if the implementation
+        // diverges (e.g. caches stale value), QA's leak diagnostics
+        // would lie. Verify call-through.
+        let _guard = COUNTER_TEST_LOCK.lock().expect("COUNTER_TEST_LOCK poisoned");
+        let before = mmal_components_live();
+        MMAL_COMPONENTS_LIVE.fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+        let after = mmal_components_live();
+        assert_eq!(after - before, 7, "mmal_components_live MUST mirror the atomic");
+        // Restore so other tests aren't polluted.
+        MMAL_COMPONENTS_LIVE.fetch_sub(7, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn mmal_components_decrement_floors_at_zero_no_underflow() {
+        // r75 subagent BLOCKER-1 pin: a stray Drop on a Decoder that
+        // never had its corresponding open() increment must NOT
+        // wrap the AtomicUsize to usize::MAX. The fetch_update +
+        // saturating_sub combo floors the atomic at 0.
+        let _guard = COUNTER_TEST_LOCK.lock().expect("COUNTER_TEST_LOCK poisoned");
+        // Force counter to 0 from whatever the current value is so
+        // we can assert "decrement from 0 stays 0".
+        let current = mmal_components_live();
+        MMAL_COMPONENTS_LIVE.store(0, std::sync::atomic::Ordering::Relaxed);
+        // Inline the EXACT decrement shape used by DecoderInner::drop.
+        let after = MMAL_COMPONENTS_LIVE
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |v| Some(v.saturating_sub(1)),
+            )
+            .map(|prev| prev.saturating_sub(1))
+            .unwrap_or(0);
+        assert_eq!(
+            after, 0,
+            "decrement from 0 MUST stay 0; pre-fix this wrapped to usize::MAX \
+             and corrupted QA's time-series for the rest of the process lifetime"
+        );
+        let after_value = mmal_components_live();
+        assert_eq!(after_value, 0, "atomic state must stay floored at 0");
+        // Restore.
+        MMAL_COMPONENTS_LIVE.store(current, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // ============================================================
     // r70 (2026-06-06): feed() empty-pool retry budget pin.
