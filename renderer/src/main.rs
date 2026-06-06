@@ -99,6 +99,50 @@ mod v4l2;
 #[cfg(target_os = "linux")]
 mod video_decode;
 
+// r73 (2026-06-06): V4L2 prime warmup-count tunables. Live at
+// crate root (not inside the Linux-gated video_decode module) so
+// cross-platform tests can pin them on the macOS dev host.
+//
+// Each prime_video_decoder*() call QBUFs `1 primer + N warmup`
+// samples into the 4-slot OUTPUT pool. The kernel decodes them
+// into the 4-slot CAPTURE pool; with CAPTURE saturated,
+// bcm2835-codec can't release pinned OUTPUT buffers back to
+// userspace. See PRIME_WARMUP_FOR_PRELOAD for the r73 root-cause
+// chain.
+
+/// Cold-start (immediate-playback) warmup count. r57 chose 3 so
+/// the total feed sequence (1 primer + 3 warmup = 4) fully fills
+/// the 4-slot OUTPUT pool, maximizing the kernel's parallel
+/// decode depth for the bake loop that consumes one CAPTURE
+/// frame per tick within ~33ms.
+pub const PRIME_WARMUP_DEFAULT: usize = 3;
+
+/// r73 (2026-06-06): preload-path warmup count. Used by the r65
+/// async PreloadSlide worker, whose decoder sits idle for ~1s
+/// between prime exit and the transition's first bake call. At
+/// warmup_count=3 the prime QBUFs 4 OUTPUT samples that the
+/// kernel decodes into 4 CAPTURE buffers (CAPTURE pool is also
+/// 4). With CAPTURE fully queued, bcm2835-codec can't release
+/// the pinned OUTPUT buffers back to userspace -- so when the
+/// transition starts ~1s later, drain_output_quiet returns
+/// EAGAIN on every retry (perf data: waited_us=102000 retries=25
+/// on every transition, pool_empty_on_entry=true). r70's 100ms
+/// drain budget hits the ceiling.
+///
+/// =1 chosen as the safer compromise (subagent WARN-2): with
+/// warmup_count=1 the prime QBUFs the primer + 1 warmup sample
+/// (2 total), producing 2 CAPTURE frames -- 2 CAPTURE slots
+/// stay free. The kernel processes + releases the OUTPUT
+/// buffers during the idle window. At handoff start (CUT or
+/// transition), 2 pre-decoded frames are immediately
+/// dequeueable, cushioning the first 2 ticks of bake before
+/// the steady-state decoder pump catches up. warmup_count=0
+/// (primer only) would also avoid the wedge but leaves only
+/// 1 pre-decoded frame, exposing the cold-start hiccup on
+/// cut-into-preloaded-video playlists (which fire preload but
+/// hand off directly via begin_slide, not begin_transition).
+pub const PRIME_WARMUP_FOR_PRELOAD: usize = 1;
+
 use std::path::PathBuf;
 
 use anyhow::{bail, Result};
@@ -1042,6 +1086,82 @@ fn parse_color(s: &str) -> Result<[f32; 4], String> {
 #[cfg(test)]
 mod tests {
     use super::{parse_color, ForcedMode};
+
+    // ============================================================
+    // r73 (2026-06-06): preload warmup count regression lock.
+    //
+    // FYS 1080p workload before r73: every transition errored with
+    // "feed sample 4: all 4 OUTPUT buffers in flight; drain wedged".
+    // Root cause (confirmed via r70's [perf] v4l2_feed_drain_wait
+    // instrumentation showing waited_us=102000 retries=25 on every
+    // wedge): the r65 preload worker called prime_video_decoder()
+    // which queued 1 primer + 3 warmup = 4 samples into a 4-slot
+    // OUTPUT pool. Kernel decoded them into 4 CAPTURE buffers
+    // (CAPTURE pool also 4) -- saturating CAPTURE. bcm2835-codec
+    // can't release OUTPUT buffers back to userspace while the
+    // CAPTURE queue is full. r73 reroutes the preload worker to
+    // prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)
+    // = 0 warmups (primer only), leaving 3 of 4 CAPTURE slots free.
+    //
+    // These tests live in main.rs (binary crate root) NOT in
+    // video_decode.rs (Linux-gated) so the constants get pinned on
+    // macOS dev hosts too.
+    // ============================================================
+
+    #[test]
+    fn prime_warmup_default_is_three() {
+        // Cold-start callers (synchronous BeginSlide, standalone
+        // reel) MUST keep warmup=3 -- the playback loop consumes
+        // CAPTURE at 30fps so CAPTURE never saturates, and the
+        // B-frame lookahead (typical H.264 reorder distance 3-4)
+        // makes the difference between instant first-paint and a
+        // ~100ms cold-start hiccup.
+        assert_eq!(super::PRIME_WARMUP_DEFAULT, 3);
+    }
+
+    #[test]
+    fn prime_warmup_for_preload_is_one() {
+        // Preload path MUST stay strictly less than the OUTPUT
+        // pool size of 4 -- otherwise CAPTURE saturates during
+        // the idle window and bcm2835-codec wedges OUTPUT release.
+        // The exact value (1, subagent WARN-2 safer compromise vs
+        // 0) cushions cut-into-preloaded-video playlists with 2
+        // pre-decoded CAPTURE frames at handoff. See
+        // PRIME_WARMUP_FOR_PRELOAD docstring for the chain.
+        assert_eq!(super::PRIME_WARMUP_FOR_PRELOAD, 1);
+    }
+
+    #[test]
+    fn preload_worker_call_site_uses_warmup_for_preload_constant() {
+        // r73 regression lock against a future refactor that
+        // accidentally reverts ipc_main.rs's preload worker back
+        // to the cold-start-default `prime_video_decoder(&dem)`
+        // call (which would re-introduce the FYS 1080p wedge).
+        //
+        // r73 subagent WARN-1: the original pair-of-substrings
+        // assertion was too weak -- both names appeared in the
+        // comment block AND the call site, so reverting the
+        // call to `prime_video_decoder(&dem)` while leaving the
+        // comment intact would PASS. Tightened to a path-
+        // qualified call expression `crate::video_decode::
+        // prime_video_decoder_with_warmup(` (with open paren),
+        // which is the exact call shape and never appears in
+        // prose comments. Same for the const argument.
+        let src = include_str!("ipc_main.rs");
+        assert!(
+            src.contains("crate::video_decode::prime_video_decoder_with_warmup("),
+            "preload_in_worker MUST contain a path-qualified call expression \
+             `crate::video_decode::prime_video_decoder_with_warmup(`. If you've \
+             reverted to bare `prime_video_decoder(&dem)`, you've re-introduced \
+             the FYS 1080p CAPTURE-saturation wedge -- see r73 commit message."
+        );
+        assert!(
+            src.contains("crate::video_decode::PRIME_WARMUP_FOR_PRELOAD,"),
+            "preload_in_worker MUST pass `crate::video_decode::PRIME_WARMUP_FOR_PRELOAD` \
+             as the warmup argument (note trailing comma -- argument position). \
+             Reverting to PRIME_WARMUP_DEFAULT would re-introduce the wedge."
+        );
+    }
 
     #[test]
     fn parse_color_three_components() {

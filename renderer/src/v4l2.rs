@@ -1471,9 +1471,18 @@ impl Decoder {
         // and is still inside one playback tick at the 1s transition
         // window (paint loop is doing slow work during the transition
         // anyway, so the kernel wait is amortized against the bake
-        // cost). Steady-state video paint is unaffected -- the
-        // wait loop only fires when free_output_slots is empty,
-        // which never happens in steady state.
+        // cost).
+        //
+        // Steady-state video paint rarely enters this loop: the
+        // bake's per-tick feed + next_frame cadence consumes one
+        // OUTPUT and dequeues one CAPTURE per ~33ms, so the pool
+        // self-balances. The wait loop CAN fire outside steady
+        // state -- r73 (2026-06-06) documented the canonical
+        // idle-saturation case: the r65 preload path used to
+        // QBUF 4 samples then sit idle; if CAPTURE saturated
+        // the kernel couldn't release OUTPUT and EVERY transition
+        // hit the 100ms ceiling. r73 reduced preload warmup so
+        // CAPTURE never saturates on that path.
         //
         // OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS env override lets QA
         // tune without recompile. Range-clamped to [10, 1000] so a

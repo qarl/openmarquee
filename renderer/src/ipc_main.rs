@@ -928,7 +928,21 @@ fn preload_in_worker(
                 #[cfg(target_os = "linux")]
                 {
                     let t_prime = std::time::Instant::now();
-                    match crate::video_decode::prime_video_decoder(&dem) {
+                    // r73 (2026-06-06): preload worker uses
+                    // warmup_count=PRIME_WARMUP_FOR_PRELOAD (0) so
+                    // the prime QBUFs only the primer sample. With
+                    // 3 of the 4 CAPTURE slots staying free, the
+                    // bcm2835-codec can release the single OUTPUT
+                    // buffer back to userspace during the idle
+                    // window between preload finish and transition
+                    // start. Cold-start callers still use the default
+                    // warmup_count=3 for B-frame lookahead. See
+                    // PRIME_WARMUP_FOR_PRELOAD docstring for the
+                    // CAPTURE-saturation chain.
+                    match crate::video_decode::prime_video_decoder_with_warmup(
+                        &dem,
+                        crate::video_decode::PRIME_WARMUP_FOR_PRELOAD,
+                    ) {
                         Ok(dec_state) => {
                             let prime_us = t_prime.elapsed().as_micros();
                             eprintln!(

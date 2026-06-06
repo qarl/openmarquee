@@ -91,7 +91,24 @@ impl VideoDecoderState {
 /// / 9.1× p50 improvement vs MMAP), but the default remained MMAP
 /// pending a separate flip decision. Set BEFORE `allocate_buffers`
 /// so REQBUFS uses the right memory type.
+// r73 (2026-06-06): warmup-count constants live at the binary
+// crate root (`main.rs`) so cross-platform tests can pin them on
+// the macOS dev host where the rest of this Linux-only module
+// doesn't compile in. Re-exported here as `pub use` so existing
+// `crate::video_decode::PRIME_WARMUP_*` call sites keep working.
+pub use crate::{PRIME_WARMUP_DEFAULT, PRIME_WARMUP_FOR_PRELOAD};
+
+/// Cold-start prime: delegates to `prime_video_decoder_with_warmup`
+/// with `PRIME_WARMUP_DEFAULT`. Kept as the public entry point so
+/// existing call sites don't have to specify the count.
 pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
+    prime_video_decoder_with_warmup(dem, PRIME_WARMUP_DEFAULT)
+}
+
+pub fn prime_video_decoder_with_warmup(
+    dem: &Mp4Demuxer,
+    warmup_count_requested: usize,
+) -> Result<VideoDecoderState> {
     use std::path::Path;
     use std::time::Instant;
     // r56 Phase A (2026-06-03): sub-phase timing for the prime
@@ -218,7 +235,10 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
     // arrives at the kernel changes (sooner). First-frame output is
     // bit-identical.
     let t_warmup = Instant::now();
-    let warmup_count = 3.min(dem.samples.len().saturating_sub(1));
+    // r73 (2026-06-06): cap warmup against the OUTPUT pool size minus
+    // one slot for the primer that already ran. Caller-requested count
+    // is the upper bound; sample availability is the lower bound.
+    let warmup_count = warmup_count_requested.min(dem.samples.len().saturating_sub(1));
     for _ in 0..warmup_count {
         let s = &dem.samples[next_sample_idx];
         match dec.feed(s) {
@@ -339,6 +359,11 @@ mod tests {
     //! the new module (constants, error paths reachable without a
     //! real V4L2 device).
     use super::*;
+
+    // r73 (2026-06-06): warmup constants + preload-wiring regression
+    // tests live at the binary crate root (main.rs) so they run on
+    // all platforms, not just Linux where THIS test module compiles
+    // in. See main.rs near the PRIME_WARMUP_* constants.
 
     #[test]
     fn v4l2_decoder_path_constant_matches_pi_bcm2835_codec_node() {
