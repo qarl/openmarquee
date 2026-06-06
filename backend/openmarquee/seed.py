@@ -216,7 +216,7 @@ def seed_if_needed(
         #    (15 design frames; the typo + panic-flash live-edits each
         #    expand to 3 quick-cut sub-slides) escalating from a boot log
         #    through synonyms / chant / scream / silence / stadium /
-        #    panic / cooldown, stitched with all 16 device transitions.
+        #    panic / cooldown, stitched with 13 of 16 device transitions.
         #    Replaces the previous Welcome (3-slide) + Freedom (3-slide)
         #    seed per qarl's 2026-05-04 ask after the design handoff.
         demo_slides = _seed_demo_reel_slides(storage, width, height)
@@ -361,7 +361,7 @@ WELCOME_BG_COLOR = "#0A3D4A"
 # A self-running first-boot demo that escalates
 #   boot → FREE → YOUR → SIGN → sentence → Liberate → UNCAGE → typo →
 #   3×3 chaos → chant wall → scream → silence → stadium → panic flash → cooldown
-# stitched with all 16 device transitions. Replaces the previous
+# stitched with 13 of 16 device transitions. Replaces the previous
 # Welcome+Freedom 2-playlist seed per qarl's 2026-05-04 ask.
 #
 # The two "live edit" frames the designer wrote with React state-

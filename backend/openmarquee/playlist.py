@@ -479,7 +479,7 @@ class PlaylistStorage:
     def save(self, playlist: Playlist) -> None:
         """Legacy: replace the default playlist. Coerces the id to
         DEFAULT_PLAYLIST_ID and the name to DEFAULT_PLAYLIST_NAME
-        ("Welcome") so the legacy single-playlist callers don't
+        ("Demo") so the legacy single-playlist callers don't
         accidentally lose the default identity."""
         defaulted = playlist.model_copy(
             update={"id": DEFAULT_PLAYLIST_ID, "name": DEFAULT_PLAYLIST_NAME}
