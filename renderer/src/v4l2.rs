@@ -75,6 +75,66 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 
 // ============================================================
+// r70 (2026-06-06): feed() OUTPUT-pool empty-pool retry schedule.
+// ============================================================
+
+/// Default retry count + interval for feed()'s "wait for kernel
+/// to release an OUTPUT buffer" soft-wait. Pre-r70 was hard-coded
+/// 5 retries × 2ms = 10ms; FYS 1080p workload showed bcm2835-codec
+/// per-frame decode latency at ~30-50ms (single decode cycle alone
+/// already > the old budget), and every transition errored at the
+/// "all OUTPUT buffers in flight" gate.
+///
+/// 25 × 4 = 100ms covers 2-3 full 1080p decode cycles + slack.
+const FEED_DRAIN_DEFAULT_RETRIES: usize = 25;
+const FEED_DRAIN_DEFAULT_INTERVAL_MS: u64 = 4;
+
+/// Min/max bounds for the env-overridable budget. Clamped so a
+/// typo in OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS can't deadlock
+/// the renderer (`=0`) or starve other ops (`=999999`).
+const FEED_DRAIN_MIN_BUDGET_MS: u64 = 10;
+const FEED_DRAIN_MAX_BUDGET_MS: u64 = 1000;
+
+/// r70 subagent WARN-2 + WARN-3: cache the schedule on first
+/// resolution so (a) every feed() call doesn't pay an env::var
+/// alloc, (b) production code never races the test's mutating
+/// env::set_var, and (c) the error-message path shares the
+/// SAME tuple that the loop entry used (no drift). Operator
+/// hot-tuning by env still works -- the cache is per-process,
+/// invalidated by a renderer restart, which is the documented
+/// override workflow.
+static FEED_DRAIN_SCHEDULE: std::sync::OnceLock<(usize, u64)> = std::sync::OnceLock::new();
+
+/// Resolve the retry schedule (count, interval_ms) for the
+/// feed() empty-pool soft-wait. Cached in a OnceLock on first
+/// call; subsequent calls return the same tuple. Interval stays
+/// at the default 4ms; only the count scales with the budget.
+pub(crate) fn feed_drain_retry_schedule() -> (usize, u64) {
+    *FEED_DRAIN_SCHEDULE.get_or_init(resolve_feed_drain_schedule_from_env)
+}
+
+/// Pure resolver -- no caching, no OnceLock interaction. Test
+/// entry point so per-case env mutation actually flows through.
+/// Production path calls this exactly once via the OnceLock in
+/// `feed_drain_retry_schedule()`.
+fn resolve_feed_drain_schedule_from_env() -> (usize, u64) {
+    let interval_ms = FEED_DRAIN_DEFAULT_INTERVAL_MS;
+    let default_budget = (FEED_DRAIN_DEFAULT_RETRIES as u64) * interval_ms;
+    let budget_ms = match std::env::var("OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS") {
+        Ok(s) => s
+            .parse::<u64>()
+            .unwrap_or(default_budget)
+            .clamp(FEED_DRAIN_MIN_BUDGET_MS, FEED_DRAIN_MAX_BUDGET_MS),
+        Err(_) => default_budget,
+    };
+    // Ceiling-divide so a budget that isn't a multiple of
+    // interval_ms still gets at least one full iteration past
+    // the floor (e.g. budget=11 -> 3 retries at 4ms = 12ms).
+    let retries = (budget_ms + interval_ms - 1) / interval_ms;
+    (retries as usize, interval_ms)
+}
+
+// ============================================================
 // V4L2 fourcc helper + format codes.
 // ============================================================
 
@@ -1395,23 +1455,58 @@ impl Decoder {
         // empty after, we'll retry with bounded sleep below.
         self.drain_output_quiet();
 
-        // r48 (subagent 2026-06-03): if the first drain didn't
-        // refill the pool, do up to 5 more drains spaced 2ms
-        // apart before declaring the decoder wedged. Mirrors the
-        // perf-night-r5 next_frame EAGAIN sleep pattern -- under
-        // transient back-pressure (one tick where kernel hasn't
-        // released any OUTPUT buffer yet), feed() should soft-
-        // wait instead of hard-erroring (which propagates as a
+        // r48 (subagent 2026-06-03) original budget: 5 × 2ms = 10ms.
+        // Mirrors the perf-night-r5 next_frame EAGAIN sleep pattern
+        // -- under transient back-pressure (one tick where kernel
+        // hasn't released any OUTPUT buffer yet), feed() should
+        // soft-wait instead of hard-erroring (which propagates as a
         // slide/transition abort via the IPC dispatcher).
-        for _ in 0..5 {
+        //
+        // r70 (2026-06-06) bump to 25 × 4ms = 100ms by default.
+        // FYS observed every 1080p transition errored at "all 4
+        // OUTPUT buffers in flight; drain wedged after 10ms" --
+        // the bcm2835-codec decode latency on 1080p H.264 is
+        // ~30-50ms/frame, far longer than the original 10ms
+        // budget. 100ms covers ~2-3 1080p decode cycles + slack
+        // and is still inside one playback tick at the 1s transition
+        // window (paint loop is doing slow work during the transition
+        // anyway, so the kernel wait is amortized against the bake
+        // cost). Steady-state video paint is unaffected -- the
+        // wait loop only fires when free_output_slots is empty,
+        // which never happens in steady state.
+        //
+        // OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS env override lets QA
+        // tune without recompile. Range-clamped to [10, 1000] so a
+        // typo can't deadlock or zero out the soft-wait.
+        let (retries, interval_ms) = feed_drain_retry_schedule();
+        let t_drain_wait = std::time::Instant::now();
+        let mut retries_used = 0usize;
+        let mut pool_empty_on_entry = false;
+        for _ in 0..retries {
             {
                 let inner = self.inner.lock().unwrap();
                 if !inner.free_output_slots.is_empty() {
                     break;
                 }
+                pool_empty_on_entry = true;
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(interval_ms));
             self.drain_output_quiet();
+            retries_used += 1;
+        }
+        // r70 Phase A instrumentation: emit a perf line when the
+        // wait actually mattered (>1 retry, i.e. crossed the first
+        // sleep beat). Single-sleep transients (kernel woke up
+        // between iter 0 and iter 1) are noise. r70 subagent WARN-4
+        // fix: skip the >1 floor to keep the journal cap'd at the
+        // genuinely-back-pressured case.
+        if retries_used > 1 {
+            eprintln!(
+                "[perf] v4l2_feed_drain_wait waited_us={} retries={} pool_empty_on_entry={}",
+                t_drain_wait.elapsed().as_micros(),
+                retries_used,
+                pool_empty_on_entry,
+            );
         }
 
         let mut inner = self.inner.lock().unwrap();
@@ -1447,11 +1542,14 @@ impl Decoder {
         // playback loop) can decide to drop the slide.
         let pool_capacity = inner.mapped_output.len();
         let Some(buf_idx) = inner.free_output_slots.pop_front() else {
+            // r70 subagent WARN-3: cite the schedule we ACTUALLY
+            // used for the wait, not a fresh read that could
+            // disagree under a process-shared env mutation.
             return Err(anyhow!(
                 "feed: all {} OUTPUT buffers in flight (kernel-owned); \
-                 drain wedged after 10ms retry budget -- decoder may \
-                 need reset",
-                pool_capacity
+                 drain wedged after {}ms retry budget ({} retries x {}ms) \
+                 -- decoder may need reset",
+                pool_capacity, retries * interval_ms as usize, retries, interval_ms
             ));
         };
         if h264_nal.len() > plane_max {
@@ -1734,6 +1832,102 @@ fn c_str_to_string(buf: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============================================================
+    // r70 (2026-06-06): feed() empty-pool retry budget pin.
+    //
+    // FYS 1080p workload errored on every transition with the
+    // pre-r70 10ms budget. r70 bumps the default to 100ms +
+    // makes it env-overridable. These tests pin (a) the default
+    // total budget is ~100ms, (b) env override is honored,
+    // (c) bogus env values clamp to safe bounds rather than
+    // deadlocking or zeroing the soft-wait.
+    // ============================================================
+
+    fn budget_ms(retries: usize, interval_ms: u64) -> u64 {
+        (retries as u64) * interval_ms
+    }
+
+    /// All schedule cases consolidated into ONE test so the
+    /// shared OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS env var
+    /// (set/remove'd per case) can't race a parallel sibling.
+    /// r70 subagent WARN-1 fix: also `#[cfg(not(target_os = "linux"))]`
+    /// gated so it never runs on a Pi where the live-device V4L2
+    /// tests (`decode_test_fixture_*`) call `feed()` in parallel
+    /// and would race the env mutation.
+    ///
+    /// Targets `resolve_feed_drain_schedule_from_env` (the pure
+    /// resolver) NOT `feed_drain_retry_schedule` -- the latter's
+    /// OnceLock caches the FIRST resolution forever, so a
+    /// per-case env-mutation test would only see Case 1's result
+    /// every time. Same invariants verified.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn resolve_feed_drain_schedule_default_env_overrides_and_clamps() {
+        // SAFETY: test mutates a process-wide env var; cargo
+        // runs tests in parallel within one process. This test
+        // is the SOLE owner of OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS
+        // (no other test in any module references it; grep'd
+        // to confirm). Linux-gated above so even live-Pi V4L2
+        // tests in this same crate can't race.
+
+        // ---- Case 1: default budget = 100ms ----
+        unsafe { std::env::remove_var("OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS") };
+        let (retries, interval_ms) = resolve_feed_drain_schedule_from_env();
+        assert_eq!(
+            budget_ms(retries, interval_ms),
+            100,
+            "case 1 default: budget must be 100ms (25 x 4ms); got {} x {}ms",
+            retries, interval_ms,
+        );
+
+        // ---- Case 2: env override inside clamp range ----
+        unsafe { std::env::set_var("OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS", "200") };
+        let (retries, interval_ms) = resolve_feed_drain_schedule_from_env();
+        assert_eq!(
+            budget_ms(retries, interval_ms),
+            200,
+            "case 2: 200ms override must round-trip; got {} x {}ms",
+            retries, interval_ms,
+        );
+
+        unsafe { std::env::set_var("OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS", "60") };
+        let (retries, interval_ms) = resolve_feed_drain_schedule_from_env();
+        assert_eq!(budget_ms(retries, interval_ms), 60, "case 2: 60ms must round-trip");
+
+        // ---- Case 3: typo `=0` clamps to floor (10ms) ----
+        unsafe { std::env::set_var("OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS", "0") };
+        let (retries, interval_ms) = resolve_feed_drain_schedule_from_env();
+        assert!(
+            budget_ms(retries, interval_ms) >= FEED_DRAIN_MIN_BUDGET_MS,
+            "case 3: budget must clamp to >= {}ms; got {}",
+            FEED_DRAIN_MIN_BUDGET_MS,
+            budget_ms(retries, interval_ms),
+        );
+
+        // ---- Case 4: typo `=999999` clamps to ceiling (1000ms) ----
+        unsafe { std::env::set_var("OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS", "999999") };
+        let (retries, interval_ms) = resolve_feed_drain_schedule_from_env();
+        assert_eq!(
+            budget_ms(retries, interval_ms),
+            FEED_DRAIN_MAX_BUDGET_MS,
+            "case 4: budget must clamp to exactly {}ms ceiling; got {}",
+            FEED_DRAIN_MAX_BUDGET_MS,
+            budget_ms(retries, interval_ms),
+        );
+
+        // ---- Case 5: garbage `=notanumber` falls back to default ----
+        unsafe { std::env::set_var("OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS", "notanumber") };
+        let (retries, interval_ms) = resolve_feed_drain_schedule_from_env();
+        assert_eq!(
+            budget_ms(retries, interval_ms),
+            100,
+            "case 5: non-numeric env must fall back to 100ms default",
+        );
+
+        // ---- Cleanup so a later test sees a clean env ----
+        unsafe { std::env::remove_var("OPENMARQUEE_V4L2_FEED_DRAIN_BUDGET_MS") };
+    }
 
     #[test]
     fn fourcc_packs_little_endian() {
