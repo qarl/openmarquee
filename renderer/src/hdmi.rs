@@ -4951,6 +4951,9 @@ pub fn paint_and_present_one_transition_frame(
         let Some((fbo_a, tex_a)) =
             bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_a)?
         else {
+            crate::hdmi_logic::warn_paint_transition_skip(
+                kind, progress, "endpoint_a_no_frame",
+            );
             return Ok(false);
         };
         let inputs_b = match &mut endpoint_b {
@@ -5010,6 +5013,9 @@ pub fn paint_and_present_one_transition_frame(
                 // FYS bug C: the to-endpoint video had no frame this
                 // tick. Free the already-baked from-endpoint FBO and
                 // skip the transition paint for this tick.
+                crate::hdmi_logic::warn_paint_transition_skip(
+                    kind, progress, "endpoint_b_no_frame",
+                );
                 session.gl.delete_framebuffer(fbo_a);
                 session.gl.delete_texture(tex_a);
                 return Ok(false);

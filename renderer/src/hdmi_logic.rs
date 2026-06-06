@@ -2729,6 +2729,86 @@ pub fn fs_for_transition_kind(kind: &str) -> Option<&'static str> {
     }
 }
 
+// ====================================================================
+// r69 (2026-06-06): FYS-bug-C transition frame-skip surfacing.
+//
+// `paint_and_present_one_transition_frame` (hdmi.rs:4759) returns
+// Ok(()) WITHOUT a swap+commit when either endpoint's V4L2 decoder
+// hasn't produced a fresh sample this tick. Previously SILENT --
+// the prior scanout frame held for that tick and the operator saw
+// the transition "stutter" or "look like a cut" with no journal
+// trace.
+//
+// qarl 2026-06-06: "i'm not seeing the transitions. is it possible
+// that many of our transitions don't work at all? they look like
+// cuts to me." Audit (qa/r69-transition-audit.md) confirms all 16
+// spec kinds DO render their shader through the IPC path; the
+// "looks like cuts" symptom is this skip path firing repeatedly
+// inside the transition window because both decoders must
+// produce a fresh sample per tick under 1080p H.264 pressure.
+//
+// The helper below logs the skip ONCE per (kind, 5s) window so
+// the journal sees the symptom without flooding at 30 skips/sec.
+// Dispatch's "throttled, dedupe by kind" guidance.
+// ====================================================================
+
+std::thread_local! {
+    /// Throttle keyed by (kind, reason) so the A-endpoint and
+    /// B-endpoint underrun signals don't mask each other (r69
+    /// subagent NIT-5: chronic A-side underruns must not silence
+    /// occasional B-side underruns on the same transition kind).
+    /// thread_local because `paint_and_present_one_transition_frame`
+    /// is called only from the EglSession owner thread (per the
+    /// session's !Send bound via the GL context). Cleared by
+    /// `reset_paint_transition_skip_throttle` (test-only).
+    static LAST_SKIP_PER_KIND: std::cell::RefCell<
+        std::collections::HashMap<(String, String), std::time::Instant>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+const PAINT_TRANSITION_SKIP_THROTTLE: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// r69: emit a throttled WARN for the FYS-bug-C frame-skip path
+/// in `paint_and_present_one_transition_frame`. Returns `true`
+/// when this call actually emitted, `false` when throttled.
+/// Logged via stderr; the Python `_drain_stderr` routes to
+/// `log.info` so journalctl picks it up at default verbosity.
+///
+/// `reason`: short tag identifying which endpoint underran
+/// ("endpoint_a_no_frame", "endpoint_b_no_frame"). Throttle key
+/// is `(kind, reason)` so each distinct failure mode gets its
+/// own first-emit per 5s window.
+pub fn warn_paint_transition_skip(kind: &str, progress: f32, reason: &str) -> bool {
+    LAST_SKIP_PER_KIND.with(|cell| {
+        let mut map = cell.borrow_mut();
+        let now = std::time::Instant::now();
+        let key = (kind.to_string(), reason.to_string());
+        let should_emit = match map.get(&key) {
+            Some(last) if now.duration_since(*last) < PAINT_TRANSITION_SKIP_THROTTLE => false,
+            _ => true,
+        };
+        if should_emit {
+            // NIT-6: single-line message so the journal stays
+            // grep-friendly without the multi-line continuation
+            // whitespace artifact.
+            eprintln!(
+                "warn: paint_transition skipped frame: kind={:?} progress={:.3} reason={} (FYS bug C; prior scanout frame held; throttled 5s per (kind,reason))",
+                kind, progress, reason
+            );
+            map.insert(key, now);
+        }
+        should_emit
+    })
+}
+
+/// Test-only: clear the per-kind throttle so unit tests start
+/// from a known state. Production paths never call this.
+#[cfg(test)]
+pub fn reset_paint_transition_skip_throttle() {
+    LAST_SKIP_PER_KIND.with(|cell| cell.borrow_mut().clear());
+}
+
 /// Fragment shader: identity blit — sample a texture by UV and
 /// emit unchanged. Used by Phase 5-a's FBO path to push the
 /// offscreen color texture to the default framebuffer with no
@@ -6895,6 +6975,122 @@ mod tests {
             assert!(
                 fs_for_transition_kind(kind).is_some(),
                 "kind {kind:?} should be in the dispatch but isn't"
+            );
+        }
+    }
+
+    // ============================================================
+    // r69 (2026-06-06): FYS bug C frame-skip WARN throttle tests.
+    //
+    // The audit (qa/r69-transition-audit.md) found qarl's
+    // "transitions look like cuts" symptom is the SILENT skip
+    // path in paint_and_present_one_transition_frame when a
+    // V4L2 decoder under-runs. The helper above adds a throttled
+    // WARN; these tests pin the throttling semantics so a future
+    // refactor (e.g. swapping the HashMap for a different store)
+    // can't silently drop the dedupe and flood the journal at
+    // 30 lines/sec inside one transition window.
+    // ============================================================
+
+    #[test]
+    fn warn_paint_transition_skip_first_call_emits() {
+        // Initial state: nothing in the throttle map for this
+        // kind. First call MUST emit so the symptom is visible
+        // the first time it happens.
+        reset_paint_transition_skip_throttle();
+        let emitted = warn_paint_transition_skip(
+            "halftone", 0.25, "endpoint_a_no_frame",
+        );
+        assert!(emitted, "first skip for a kind must emit a warn");
+    }
+
+    #[test]
+    fn warn_paint_transition_skip_dedupes_by_kind_reason_within_window() {
+        // Second call for the same (kind, reason) within 5s MUST
+        // be silent so a 30-fps transition window doesn't produce
+        // 30 lines. r69 subagent NIT-5: throttle key is
+        // (kind, reason) so chronic endpoint_a underruns don't
+        // mask occasional endpoint_b underruns on the same kind.
+        reset_paint_transition_skip_throttle();
+        let first_a = warn_paint_transition_skip(
+            "wipe", 0.10, "endpoint_a_no_frame",
+        );
+        let second_a = warn_paint_transition_skip(
+            "wipe", 0.13, "endpoint_a_no_frame",
+        );
+        let first_b_same_kind = warn_paint_transition_skip(
+            "wipe", 0.17, "endpoint_b_no_frame",
+        );
+        let second_b_same_kind = warn_paint_transition_skip(
+            "wipe", 0.20, "endpoint_b_no_frame",
+        );
+        assert!(first_a, "first A-side skip must emit");
+        assert!(!second_a, "second A-side skip within 5s must be throttled");
+        assert!(
+            first_b_same_kind,
+            "first B-side skip on the SAME kind must emit independently of A's throttle"
+        );
+        assert!(!second_b_same_kind, "second B-side skip within 5s must be throttled");
+    }
+
+    #[test]
+    fn warn_paint_transition_skip_different_kinds_emit_independently() {
+        // Throttle key is the kind STRING — independent kinds
+        // hitting the skip path concurrently each get their own
+        // first-emit. Critical when an operator's playlist
+        // cycles through multiple transition kinds rapidly.
+        reset_paint_transition_skip_throttle();
+        let a = warn_paint_transition_skip("fade", 0.5, "endpoint_a_no_frame");
+        let b = warn_paint_transition_skip("dissolve", 0.5, "endpoint_a_no_frame");
+        let c = warn_paint_transition_skip("flip", 0.5, "endpoint_a_no_frame");
+        assert!(a && b && c, "each distinct kind must emit on its first call");
+        // And each is now individually throttled.
+        let a2 = warn_paint_transition_skip("fade", 0.55, "endpoint_a_no_frame");
+        let b2 = warn_paint_transition_skip("dissolve", 0.55, "endpoint_a_no_frame");
+        let c2 = warn_paint_transition_skip("flip", 0.55, "endpoint_a_no_frame");
+        assert!(!a2 && !b2 && !c2, "follow-up calls for each kind must be throttled");
+    }
+
+    #[test]
+    fn warn_paint_transition_skip_reset_clears_throttle() {
+        // The reset hook is test-only but must actually clear
+        // state — otherwise tests downstream of it would observe
+        // stale throttle keys.
+        reset_paint_transition_skip_throttle();
+        assert!(warn_paint_transition_skip("iris", 0.5, "x"), "first emits");
+        assert!(!warn_paint_transition_skip("iris", 0.5, "x"), "second throttled");
+        reset_paint_transition_skip_throttle();
+        assert!(warn_paint_transition_skip("iris", 0.5, "x"), "post-reset emits again");
+    }
+
+    #[test]
+    fn every_backend_transition_kind_literal_value_resolves() {
+        // r69 audit-time snapshot of the 16 transition kinds in
+        // the backend's Pydantic Literal at
+        // backend/openmarquee/content/__init__.py:41-58. Each
+        // MUST resolve through fs_for_transition_kind to a
+        // dedicated FS_<KIND> shader -- otherwise the backend
+        // sends a value the renderer silently FS_CUT-fallbacks
+        // on, the symptom qarl observed and r69 audited.
+        //
+        // r69 subagent NIT-2 caveat: this array is hardcoded
+        // (cross-language source-of-truth pin would need Python
+        // file parsing). A new kind added to the BACKEND Literal
+        // that's missed in BOTH this array AND in
+        // fs_for_transition_kind will pass silently. Compensating
+        // controls: the audit doc (qa/r69-transition-audit.md)
+        // names all 16 explicitly, and any schema change should
+        // surface in code review.
+        const BACKEND_LITERAL_AT_R69: [&str; 16] = [
+            "cut", "fade", "wipe", "slide", "iris", "scroll",
+            "flip", "marquee", "dissolve", "pixelate", "halftone",
+            "scanline", "glitch", "push", "blinds", "shutter",
+        ];
+        for kind in BACKEND_LITERAL_AT_R69 {
+            assert!(
+                fs_for_transition_kind(kind).is_some(),
+                "backend TransitionKind {kind:?} silently FS_CUT-fallbacks; \
+                 either implement the shader OR remove from the backend Literal"
             );
         }
     }
