@@ -2684,6 +2684,19 @@ fn handle_inner_request(
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
+            // r76 Phase A (2026-06-07): record the begin_transition
+            // timestamp so the FIRST successful endpoint_b bake
+            // inside paint_and_present_one_transition_frame can
+            // emit the gap metric. Done BEFORE ensure_preload_complete
+            // so we measure from the actual call entry (which is
+            // what qarl sees: "transition begins" wall-clock).
+            // r76 subagent WARN-2: thread the from_id (current
+            // slide's id) into the marker so the metric line
+            // names both endpoints per the dispatch's ask.
+            let from_id_for_metric = state.current.as_ref().map(|c| c.slide_id);
+            crate::hdmi_logic::record_transition_begin_for_endpoint_b_metric(
+                from_id_for_metric, p.to_slide_id,
+            );
             // r65 (2026-06-05): join any in-flight async preload
             // for the to-slide BEFORE cache.load so the load
             // short-circuits on the artifacts the worker

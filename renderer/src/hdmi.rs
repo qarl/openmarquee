@@ -5008,7 +5008,29 @@ pub fn paint_and_present_one_transition_frame(
             }
         };
         let (fbo_b, tex_b) = match bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_b) {
-            Ok(Some(p)) => p,
+            Ok(Some(p)) => {
+                // r76 Phase A: emit the begin_transition -> endpoint_b
+                // first-frame gap. Marker is set at BeginTransition;
+                // first Ok(Some(_)) here consumes it. Subsequent
+                // frames in the same transition window see None and
+                // emit nothing.
+                //
+                // r76 subagent WARN-1: gate on Video-bearing
+                // endpoint_b. Text/Image bake_slide_to_fbo Ok(Some)
+                // trivially on first call without touching V4L2, so
+                // emitting the metric there gives wait_ms=0 lines
+                // that pollute QA's dataset. Leave the marker set
+                // for the next BeginTransition to overwrite (which
+                // emits the unconsumed-on-overwrite diagnostic line
+                // for the FAILURE case the dispatch wants to find).
+                if matches!(
+                    endpoint_b,
+                    TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
+                ) {
+                    crate::hdmi_logic::consume_transition_endpoint_b_first_frame_marker();
+                }
+                p
+            }
             Ok(None) => {
                 // FYS bug C: the to-endpoint video had no frame this
                 // tick. Free the already-baked from-endpoint FBO and

@@ -2809,6 +2809,116 @@ pub fn reset_paint_transition_skip_throttle() {
     LAST_SKIP_PER_KIND.with(|cell| cell.borrow_mut().clear());
 }
 
+// ====================================================================
+// r76 Phase A (2026-06-07): characterize the begin_transition ->
+// endpoint_b-first-frame gap.
+//
+// FYS 2026-06-07: every transition fires the r69 skip-throttle WARN
+// (endpoint_b_no_frame, progress < 0.10). r74/r75 dispatch text:
+// "instrument first (don't fix blind)." Add a one-line metric that
+// tells us if the gap is 30ms (one tick we can absorb) or 1500ms
+// (full transition window held). Different fixes apply.
+//
+// Wire:
+//   1. `record_transition_begin_for_endpoint_b_metric(to_id)` is
+//      called from ipc_main.rs's BeginTransition handler.
+//   2. `consume_transition_endpoint_b_first_frame_marker()` is called
+//      from paint_and_present_one_transition_frame's
+//      `bake_slide_to_fbo(inputs_b)` Ok(Some(_)) branch -- ONLY on
+//      a successful endpoint_b bake (Ok(None) skip path doesn't
+//      consume because we want to keep waiting).
+//   3. The consume hook emits `[perf] transition_endpoint_b_ready
+//      slide_id=<to> wait_ms=<n>` and clears the cell so subsequent
+//      frames in the same transition don't re-log.
+//
+// thread_local because paint_and_present_one_transition_frame and
+// the BeginTransition handler are both called only from the IPC
+// main thread (which holds the EglSession's GL context per the
+// session's !Send bound). Single in-flight transition at a time so
+// a single-Option cell is sufficient.
+// ====================================================================
+
+std::thread_local! {
+    static TRANSITION_ENDPOINT_B_METRIC: std::cell::RefCell<
+        Option<(Option<uuid::Uuid>, uuid::Uuid, std::time::Instant)>
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// Called from ipc_main.rs at the BeginTransition handler. Sets the
+/// thread-local marker so the FIRST successful endpoint_b bake
+/// inside paint_and_present_one_transition_frame can emit the gap
+/// metric.
+///
+/// r76 subagent WARN-2: now carries `from_id` (Option in case there
+/// was no current slide, which would be a state-machine bug but
+/// defensive nonetheless). Dispatch explicitly asked for both ids.
+///
+/// r76 subagent WARN-3: if a prior marker is still set when this
+/// fires (e.g. the prior transition's endpoint_b never delivered
+/// -- which is THE diagnostic case we care about), emit an
+/// `[perf] transition_endpoint_b_unconsumed` line BEFORE replacing.
+/// Pre-fix the silent overwrite dropped exactly the data r76 was
+/// built to capture.
+pub fn record_transition_begin_for_endpoint_b_metric(
+    from_id: Option<uuid::Uuid>,
+    to_id: uuid::Uuid,
+) {
+    TRANSITION_ENDPOINT_B_METRIC.with(|cell| {
+        let prior = cell.borrow_mut().replace((
+            from_id, to_id, std::time::Instant::now(),
+        ));
+        if let Some((prev_from, prev_to, prev_at)) = prior {
+            let elapsed_ms = prev_at.elapsed().as_millis();
+            eprintln!(
+                "[perf] transition_endpoint_b_unconsumed from_id={} to_id={} elapsed_ms={} \
+                 reason=marker_overwritten_by_new_BeginTransition",
+                prev_from.map(|u| u.to_string()).unwrap_or_else(|| "none".into()),
+                prev_to, elapsed_ms,
+            );
+        }
+    });
+}
+
+/// Called from hdmi.rs at the endpoint_b bake-success branch in
+/// paint_and_present_one_transition_frame -- ONLY when endpoint_b
+/// is Video-bearing (Video or TextOverVideo). r76 subagent WARN-1:
+/// Text/Image endpoint_b would bake Ok(Some) trivially without
+/// touching V4L2, emitting useless wait_ms=0 lines that polluted
+/// QA's dataset.
+///
+/// If a marker is set, emit `[perf] transition_endpoint_b_ready
+/// from_id=<from> to_id=<to> wait_ms=<n>` and clear the cell.
+/// Subsequent frames of the same transition see None and emit nothing.
+pub fn consume_transition_endpoint_b_first_frame_marker() {
+    TRANSITION_ENDPOINT_B_METRIC.with(|cell| {
+        if let Some((from_id, to_id, begin_at)) = cell.borrow_mut().take() {
+            let wait_ms = begin_at.elapsed().as_millis();
+            eprintln!(
+                "[perf] transition_endpoint_b_ready from_id={} to_id={} wait_ms={}",
+                from_id.map(|u| u.to_string()).unwrap_or_else(|| "none".into()),
+                to_id, wait_ms,
+            );
+        }
+    });
+}
+
+/// Test-only: reset the marker so unit tests start from a known
+/// state.
+#[cfg(test)]
+pub fn reset_transition_endpoint_b_metric_for_tests() {
+    TRANSITION_ENDPOINT_B_METRIC.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
+
+/// Test-only: read the marker (to_id only) without consuming so
+/// unit tests can assert "begin_transition set it" vs "endpoint_b
+/// consumed it."
+#[cfg(test)]
+pub fn peek_transition_endpoint_b_metric_for_tests() -> Option<uuid::Uuid> {
+    TRANSITION_ENDPOINT_B_METRIC.with(|cell| cell.borrow().as_ref().map(|(_, to, _)| *to))
+}
+
 /// Fragment shader: identity blit — sample a texture by UV and
 /// emit unchanged. Used by Phase 5-a's FBO path to push the
 /// offscreen color texture to the default framebuffer with no
@@ -7061,6 +7171,86 @@ mod tests {
         assert!(!warn_paint_transition_skip("iris", 0.5, "x"), "second throttled");
         reset_paint_transition_skip_throttle();
         assert!(warn_paint_transition_skip("iris", 0.5, "x"), "post-reset emits again");
+    }
+
+    // ============================================================
+    // r76 Phase A (2026-06-07): transition_endpoint_b_ready metric
+    // marker tests. The Phase A diagnostic is ONLY useful if the
+    // marker set->consume contract is tight, so pin it.
+    // ============================================================
+
+    #[test]
+    fn transition_endpoint_b_metric_record_then_consume() {
+        reset_transition_endpoint_b_metric_for_tests();
+        let from = uuid::Uuid::from_bytes([1; 16]);
+        let to = uuid::Uuid::from_bytes([2; 16]);
+        // No marker before BeginTransition: peek returns None.
+        assert_eq!(peek_transition_endpoint_b_metric_for_tests(), None);
+        // BeginTransition sets the marker.
+        record_transition_begin_for_endpoint_b_metric(Some(from), to);
+        assert_eq!(peek_transition_endpoint_b_metric_for_tests(), Some(to));
+        // First successful endpoint_b bake consumes (and emits).
+        consume_transition_endpoint_b_first_frame_marker();
+        assert_eq!(
+            peek_transition_endpoint_b_metric_for_tests(), None,
+            "consume MUST clear the marker so subsequent ticks in the same transition don't re-log"
+        );
+    }
+
+    #[test]
+    fn transition_endpoint_b_metric_consume_without_record_is_noop() {
+        reset_transition_endpoint_b_metric_for_tests();
+        // If endpoint_b's bake somehow returns Ok(Some(_)) without a
+        // prior BeginTransition (would mean a bug in dispatcher
+        // ordering, but defensive nonetheless), consume must NOT
+        // panic. Behavior: no log, no state change.
+        consume_transition_endpoint_b_first_frame_marker();
+        assert_eq!(peek_transition_endpoint_b_metric_for_tests(), None);
+    }
+
+    #[test]
+    fn transition_endpoint_b_metric_overwrite_on_new_transition() {
+        // r76 invariant: BeginTransition fires fresh per transition;
+        // an in-flight unconsumed marker (e.g. because the prior
+        // transition aborted without endpoint_b ever delivering)
+        // MUST be overwritten by the new BeginTransition's tuple so
+        // the metric for the new transition measures from the new
+        // t0, not the stale one.
+        //
+        // r76 subagent WARN-3: the prior overwrite was silent;
+        // post-fix the overwrite path emits a
+        // [perf] transition_endpoint_b_unconsumed line before
+        // replacing -- preserving the FAILURE-case data the
+        // dispatch wants to capture. Behavior verified at the
+        // peek level: state still replaces.
+        reset_transition_endpoint_b_metric_for_tests();
+        let from_a = uuid::Uuid::from_bytes([1; 16]);
+        let to_a = uuid::Uuid::from_bytes([2; 16]);
+        let from_b = uuid::Uuid::from_bytes([3; 16]);
+        let to_b = uuid::Uuid::from_bytes([4; 16]);
+        record_transition_begin_for_endpoint_b_metric(Some(from_a), to_a);
+        assert_eq!(peek_transition_endpoint_b_metric_for_tests(), Some(to_a));
+        // New transition without an intervening consume -- emits the
+        // unconsumed line for to_a and replaces with to_b.
+        record_transition_begin_for_endpoint_b_metric(Some(from_b), to_b);
+        assert_eq!(
+            peek_transition_endpoint_b_metric_for_tests(), Some(to_b),
+            "BeginTransition MUST replace the marker so the metric for the new transition is correct"
+        );
+    }
+
+    #[test]
+    fn transition_endpoint_b_metric_record_handles_no_from_id() {
+        // r76 subagent WARN-2 edge: if state.current is None (e.g.
+        // first slide of a session, shouldn't happen for a
+        // begin_transition but defensive), the record API accepts
+        // None and the log line renders from_id=none.
+        reset_transition_endpoint_b_metric_for_tests();
+        let to = uuid::Uuid::from_bytes([5; 16]);
+        record_transition_begin_for_endpoint_b_metric(None, to);
+        assert_eq!(peek_transition_endpoint_b_metric_for_tests(), Some(to));
+        consume_transition_endpoint_b_first_frame_marker();
+        assert_eq!(peek_transition_endpoint_b_metric_for_tests(), None);
     }
 
     #[test]
