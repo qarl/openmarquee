@@ -609,48 +609,238 @@ pub fn prime_video_decoder_for_preload(
     slide_id: uuid::Uuid,
 ) -> Result<VideoDecoderState> {
     use std::time::Instant;
-    // r78 Phase A probe: log first-4-sample classification BEFORE
-    // priming so QA can see whether sample 0 is an IDR (the
-    // dispatch's top hypothesis for why frames_drained=0).
     log_first_samples_nal_types(
         "preload", &slide_id.to_string(), &dem.samples, 4,
     );
-    // r79 Phase A.5: SPS/PPS state probe so QA can see whether
-    // the avcC extradata flowed all the way to the prime call.
     log_preload_decoder_config(slide_id, dem, "preload");
-    // r76 subagent WARN-4: emit a separate `prime_only_us` BEFORE
-    // the drain so QA dashboards that historically tracked
-    // `prime_us` as bring-up cost stay accurate. The outer
-    // preload_worker_prime line in ipc_main.rs measures
-    // prime + drain (up to +500ms-2000ms env-overridden); the
-    // inner prime_only_us isolates the V4L2 bring-up cost.
+
+    // r80 Phase B (2026-06-08): V4L2 m2m drain-and-resume cycle.
     //
-    // Note: if `prime_only_us` is non-zero in the perf line below,
-    // STREAMON succeeded (it's inside prime_video_decoder_with_warmup
-    // and the `?` would propagate STREAMON errors). r78 dispatch
-    // explicitly asked "did STREAMON even run successfully?" -- yes,
-    // implicitly proved by prime_only_us being a real number.
+    // r79 telemetry on FYS empirically REFUTED QA's "SPS/PPS not
+    // reaching the decoder" hypothesis:
+    //   has_sps=true sps_len=36, has_pps=true pps_len=4
+    //   primer_size=173-237 KB (well under plane_max ~1-4 MB)
+    //   sample[0] contains an IDR
+    //   eagain_polls=92-98 (kernel idle, not slow)
+    //   other_errs=0, eos_seen=false
+    //
+    // bcm2835-codec received full SPS+PPS+IDR+warmup samples, no
+    // errors, but emitted zero decoded CAPTURE frames over 500ms.
+    // The V4L2 stateful-decoder spec (per
+    // <https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/dev-decoder.html>)
+    // documents that the kernel holds frames in its reorder buffer
+    // until either (a) more input samples arrive to flush them
+    // (lookahead) or (b) userspace explicitly signals end-of-stream
+    // via V4L2_DEC_CMD_STOP or feed(&[]) with V4L2_BUF_FLAG_LAST.
+    //
+    // r76/r77 already explored (a): warmup_count=1 then =2 still
+    // produced frames_drained=0. r80 ships (b): the canonical
+    // V4L2 m2m drain-resume cycle.
+    //
+    // Sequence:
+    //   1. prime_video_decoder_with_warmup (existing): open, S_FMT,
+    //      REQBUFS, STREAMON, feed primer (SPS+PPS+sample[0]),
+    //      feed warmup samples.
+    //   2. feed(&[]): signals EOS via empty QBUF with FLAG_LAST.
+    //      Sets output_eof_sent=true.
+    //   3. Drain loop: DQBUF CAPTURE frames until kernel signals
+    //      end-of-drain via FLAG_LAST (returned by next_frame as
+    //      Ok(None)). Drop the frames; their Drop re-QBUFs the
+    //      CAPTURE buffer back to the kernel pool.
+    //   4. resume_after_eos: V4L2_DEC_CMD_START to clear EOS state
+    //      kernel-side + clear capture_drained + output_eof_sent
+    //      in our wrapper.
+    //   5. Re-feed primer (SPS+PPS+sample[0]) so the pipeline is
+    //      ready for playback's first bake (matching the post-prime
+    //      contract: next_sample_idx=1, decoder fresh on IDR).
+    //
+    // After this cycle the kernel has been forced to flush its
+    // reorder buffer (proving it CAN emit decoded frames) AND has
+    // been reset to a clean state for playback. The drained frames
+    // are discarded -- they were decoded but we don't keep them.
+    // Bake's first call after handoff will:
+    //   - drain_output_quiet (no-op, free pool already full)
+    //   - feed sample[1]
+    //   - next_frame -> DQBUFs the IDR-decoded frame (kernel
+    //     should emit it during the new primer's decode)
+    // Operator sees frame 0 (the IDR) at handoff.
+    //
+    // If frames_drained=0 STILL post-r80, the kernel doesn't even
+    // flush on EOS -- which would point at a deeper bcm2835-codec
+    // configuration issue. r79's diagnostic line stays in place
+    // so we'd see that immediately.
+
     let t_prime_only = Instant::now();
     let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
     let prime_only_us = t_prime_only.elapsed().as_micros();
+
     let budget_ms = preload_capture_drain_budget_ms();
     let t_drain = Instant::now();
     let mut detail = DrainDetail::default();
-    let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
+    let drained = drain_after_signal_eos(&mut state, budget_ms, &mut detail);
     let drain_us = t_drain.elapsed().as_micros();
+
+    // r80 subagent BLOCKER-2 + WARN-5: graceful degradation when
+    // the kernel never emits FLAG_LAST. If drain budget exhausts
+    // with `eos_seen=false`, the wrapper's `capture_drained` is
+    // still false; `resume_after_eos` short-circuits (v4l2.rs:1510),
+    // leaving `output_eof_sent=true`, and the subsequent re-feed of
+    // the primer would fail at the v4l2.rs:1613 "feed() called
+    // after EOF" guard. Pre-fix the function would silently abort
+    // mid-cycle and the preload's slide entry would never appear in
+    // cache. Better: detect this case, emit a distinct diagnostic
+    // line, and return Err early. The caller (preload_in_worker)
+    // already handles failed preload by logging + falling back to
+    // the synchronous cache.load on first BeginSlide, which uses
+    // `prime_video_decoder` (without the drain cycle). Cold-start
+    // path eventually paints because bake feeds one more sample per
+    // tick -- cumulative input flushes the reorder buffer naturally
+    // even without an EOS signal.
+    if !detail.eos_seen {
+        eprintln!(
+            "[perf] preload_handoff_drain_budget_exhausted slide_id={} budget_ms={} \
+             eagain_polls={} other_errs={} frames_drained={} \
+             reason=kernel_never_signaled_FLAG_LAST",
+            slide_id, budget_ms, detail.eagain_polls, detail.other_errs, drained,
+        );
+        eprintln!(
+            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+            slide_id, drained, prime_only_us, drain_us, budget_ms,
+        );
+        eprintln!(
+            "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
+            slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
+        );
+        // The decoder state is now: capture queued but not drained,
+        // output_eof_sent=true. It's unrecoverable without the full
+        // STOP+drain+START cycle that we just failed. Drop the
+        // VideoDecoderState (its Drop closes the V4L2 fd, kernel
+        // releases the MMAL component) and surface the failure so
+        // the caller falls back cleanly.
+        anyhow::bail!(
+            "preload drain budget exhausted ({}ms) without kernel FLAG_LAST; \
+             slide will fall back to synchronous prime at BeginSlide",
+            budget_ms
+        );
+    }
+
+    // Step 4 + 5: resume + re-prime + restore lookahead. Mirrors
+    // reprime_video_decoder_for_loop's pattern (line 670+) for the
+    // first two steps, with the addition of re-feeding warmup
+    // samples to restore the kernel's B-frame lookahead window
+    // (subagent WARN-3 fix: pre-fix only re-fed the primer, leaving
+    // less lookahead than the original prime_video_decoder_with_warmup
+    // would have produced).
+    state.decoder.resume_after_eos()
+        .context("r80: resume_after_eos before re-priming SPS+PPS+IDR")?;
+    let first_sample = dem.samples.first()
+        .ok_or_else(|| anyhow::anyhow!("r80: MP4 contains zero samples"))?;
+    let header = dem.sps_pps_annexb();
+    let mut primer = Vec::with_capacity(header.len() + first_sample.len());
+    primer.extend_from_slice(&header);
+    primer.extend_from_slice(first_sample);
+    state.decoder.feed(&primer)
+        .context("r80: re-feed SPS+PPS+IDR primer after drain-resume")?;
+    state.next_sample_idx = 1;
+    // r80 subagent WARN-3 fix: re-feed warmup samples too so the
+    // kernel's lookahead pipeline matches the pre-drain state. The
+    // primer alone leaves bake's first call needing to feed more
+    // samples before the kernel emits, regressing first-frame
+    // latency to pre-r5 cold-start (~10s visible) when bcm2835-codec
+    // needs ~3-4 input samples of lookahead.
+    let warmup_count = PRIME_WARMUP_FOR_PRELOAD.min(dem.samples.len().saturating_sub(1));
+    for _ in 0..warmup_count {
+        let s = &dem.samples[state.next_sample_idx];
+        match state.decoder.feed(s) {
+            Ok(()) => state.next_sample_idx += 1,
+            Err(e) => {
+                eprintln!(
+                    "warn: r80 post-resume warmup feed sample {} failed: {:#} \
+                     (continuing without full lookahead)",
+                    state.next_sample_idx, e,
+                );
+                break;
+            }
+        }
+    }
+
+    // r80 subagent BLOCKER-1 fix: the drained frames in step 3 were
+    // NOT frames the operator ever sees -- they were decoded into a
+    // CAPTURE buffer, drained for the drain-resume cycle, and the
+    // buffer re-QBUF'd via Frame::drop. The frames_decoded counter
+    // is read by hdmi.rs:3729 (was_first gate for r62's first-frame
+    // texture cache fast path); leaving it at N>0 would dead-end
+    // the r62 cache_eligible check on EVERY post-r80 preloaded
+    // slide, undoing r62's first-frame-paint win on FYS. Reset to
+    // 0 so the post-r80 state matches what a fresh
+    // prime_video_decoder_with_warmup would have produced.
+    state.frames_decoded = 0;
+
     eprintln!(
         "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
         slide_id, drained, prime_only_us, drain_us, budget_ms,
     );
-    // r78 Phase A: separate detail line so the existing
-    // preload_handoff line stays parser-stable for QA's existing
-    // greps. eagain_polls=N + other_errs=N answers the dispatch's
-    // probe #2 "how many EAGAINs while the kernel did nothing?".
     eprintln!(
         "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
         slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
     );
     Ok(state)
+}
+
+/// r80 Phase B: signal EOS via empty feed, then drain CAPTURE
+/// buffers until the kernel emits V4L2_BUF_FLAG_LAST (which
+/// `next_frame` surfaces as `Ok(None)`). Drops every drained
+/// Frame so its `Drop` re-QBUFs the buffer back to the kernel.
+/// Returns the count drained.
+///
+/// Distinct from `drain_one_capture_for_preload` (the pre-r80
+/// "wait for one frame then exit" function) because we MUST
+/// drain ALL pending frames to reach the FLAG_LAST signal --
+/// otherwise the kernel stays in mid-drain state and
+/// `resume_after_eos` would EBUSY.
+fn drain_after_signal_eos(
+    state: &mut VideoDecoderState,
+    budget_ms: u64,
+    detail: &mut DrainDetail,
+) -> usize {
+    use std::time::{Duration, Instant};
+    // Step 2: signal EOS. feed(&[]) per v4l2.rs:1680 + 1697-1698
+    // sets V4L2_BUF_FLAG_LAST and marks output_eof_sent=true.
+    if let Err(e) = state.decoder.feed(&[]) {
+        eprintln!("[perf] preload_handoff_drain_err err=signal_eos: {:#}", e);
+        detail.other_errs += 1;
+        return 0;
+    }
+    // Step 3: drain CAPTURE until FLAG_LAST.
+    let deadline = Instant::now() + Duration::from_millis(budget_ms);
+    let mut drained = 0usize;
+    while Instant::now() < deadline {
+        match state.decoder.next_frame() {
+            Ok(Some(frame)) => {
+                // Frame::drop re-QBUFs the CAPTURE buffer back to
+                // the kernel pool, freeing it for re-use after
+                // resume_after_eos + re-prime.
+                drop(frame);
+                state.frames_decoded += 1;
+                drained += 1;
+            }
+            Ok(None) => {
+                // FLAG_LAST received: kernel signals end of drain.
+                detail.eos_seen = true;
+                break;
+            }
+            Err(e) if e.to_string().contains("EAGAIN") => {
+                detail.eagain_polls += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => {
+                detail.other_errs += 1;
+                eprintln!("[perf] preload_handoff_drain_err err={:#}", e);
+                break;
+            }
+        }
+    }
+    drained
 }
 
 /// Re-feed the SPS+PPS+IDR headers + first sample to wrap the
