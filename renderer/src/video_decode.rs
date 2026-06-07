@@ -98,11 +98,108 @@ impl VideoDecoderState {
 // `crate::video_decode::PRIME_WARMUP_*` call sites keep working.
 pub use crate::{PRIME_WARMUP_DEFAULT, PRIME_WARMUP_FOR_PRELOAD};
 
+// ====================================================================
+// r78 Phase A (2026-06-08): MP4 sample classification probe.
+//
+// r77 telemetry from FYS: warmup=2 still produced frames_drained=0 on
+// ALL 8 preloads in a 90s soak. r77 also showed that 4x'ing the drain
+// budget (500ms -> 2000ms) didn't help either: input-starvation, not
+// time-starvation.
+//
+// Dispatch hypothesis to verify (Phase A probe, no fix): the MP4's
+// sample[0] may not be an IDR. H.264 NAL unit types (NAL header byte
+// & 0x1f):
+//   1  = non-IDR coded slice (P or B)
+//   5  = IDR slice (random-access point)
+//   7  = SPS
+//   8  = PPS
+// If sample 0 is type 1 (non-IDR) the decoder CANNOT decode it
+// without seeking back to the prior IDR -- which the demuxer doesn't
+// do today. Result: no decoded CAPTURE output regardless of how many
+// warmup samples we feed.
+//
+// This probe parses the NAL header from each of the first N samples
+// and logs the type so QA can see whether the demuxer is starting
+// from an IDR.
+// ====================================================================
+
+/// r78 subagent BLOCKER-1 fix: x264 (and most H.264 encoders) prefix
+/// the IDR slice with AUD (nal_unit_type=9) and/or SEI (type=6) NALs
+/// concatenated into the same Annex-B sample. So `sample[0]`'s FIRST
+/// NAL header byte is typically AUD/SEI, NOT the IDR. Reading only
+/// the first NAL would report `is_idr=false` on every real MP4 and
+/// give QA a false-positive demuxer indictment.
+///
+/// This walks ALL Annex-B NAL units inside the sample (same logic as
+/// `mp4_demux.rs` uses for its own classification) and returns:
+///   - `first_nal_type`: the FIRST NAL header byte's type (for context)
+///   - `contains_idr`: whether ANY NAL in the sample is type 5 (IDR slice)
+fn walk_h264_nal_types(sample: &[u8]) -> (Option<u8>, bool) {
+    let mut first_nal_type: Option<u8> = None;
+    let mut contains_idr = false;
+    let mut i: usize = 0;
+    while i + 4 <= sample.len() {
+        // Recognize 4-byte (`00 00 00 01`) and 3-byte (`00 00 01`)
+        // Annex-B start codes.
+        let header_idx = if sample[i] == 0 && sample[i + 1] == 0 && sample[i + 2] == 0 && sample[i + 3] == 1 {
+            i + 4
+        } else if sample[i] == 0 && sample[i + 1] == 0 && sample[i + 2] == 1 {
+            i + 3
+        } else {
+            i += 1;
+            continue;
+        };
+        if header_idx >= sample.len() {
+            break;
+        }
+        let nut = sample[header_idx] & 0x1f;
+        if first_nal_type.is_none() {
+            first_nal_type = Some(nut);
+        }
+        if nut == 5 {
+            contains_idr = true;
+        }
+        i = header_idx + 1;
+    }
+    (first_nal_type, contains_idr)
+}
+
+/// r78 Phase A: emit a `[perf] preload_sample_dump` line per sample
+/// classification so QA can see whether the demuxer is delivering a
+/// decodable starting sample (one containing an IDR NAL).
+fn log_first_samples_nal_types(label: &str, slide_id: &str, samples: &[Vec<u8>], max: usize) {
+    for (i, s) in samples.iter().enumerate().take(max) {
+        let (first_nal, contains_idr) = walk_h264_nal_types(s);
+        let first_str = first_nal.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into());
+        eprintln!(
+            "[perf] preload_sample_dump label={} slide_id={} i={} size={} first_nal_type={} contains_idr={}",
+            label, slide_id, i, s.len(), first_str, contains_idr,
+        );
+    }
+}
+
 /// Cold-start prime: delegates to `prime_video_decoder_with_warmup`
 /// with `PRIME_WARMUP_DEFAULT`. Kept as the public entry point so
 /// existing call sites don't have to specify the count.
 pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
+    // r78 subagent BLOCKER-2: cross-check probe lives at the
+    // synchronous BeginSlide call site in ipc_main.rs, NOT here.
+    // This function is also reached from the standalone reel
+    // (hdmi.rs:3123) and tests; firing the probe here would flood
+    // unrelated journals + cargo test stderr, masking the actual
+    // BeginSlide signal QA wants.
     prime_video_decoder_with_warmup(dem, PRIME_WARMUP_DEFAULT)
+}
+
+/// r78 Phase A: callable probe for the synchronous BeginSlide path's
+/// cross-check. ipc_main.rs invokes this right before calling
+/// `prime_video_decoder(&dem)` so QA gets one A/B line per
+/// synchronous BeginSlide. Reel + tests don't call this so they
+/// stay quiet.
+pub fn log_synchronous_begin_slide_sample_dump(slide_id: uuid::Uuid, dem: &Mp4Demuxer) {
+    log_first_samples_nal_types(
+        "cold_start", &slide_id.to_string(), &dem.samples, 4,
+    );
 }
 
 pub fn prime_video_decoder_with_warmup(
@@ -360,9 +457,35 @@ fn preload_capture_drain_budget_ms() -> u64 {
 /// Only drains the FIRST frame, then exits -- the dispatch goal is
 /// to unblock kernel-side pipeline progression, not to fully empty
 /// CAPTURE. Subsequent frames stay queued for bake_b to consume.
+/// r78 Phase A telemetry: per-drain accumulators so the
+/// `preload_handoff_drain_detail` line can answer the dispatch's
+/// "how many EAGAINs while kernel did nothing? any non-EAGAIN
+/// errors? did the kernel signal EOS?" probe.
+#[derive(Default)]
+pub struct DrainDetail {
+    pub eagain_polls: usize,
+    pub other_errs: usize,
+    pub eos_seen: bool,
+}
+
+/// Public drain that delegates to the detail-recording variant with
+/// a throwaway detail. Kept for any future caller that doesn't care
+/// about the detail.
 pub fn drain_one_capture_for_preload(
     dec_state: &mut VideoDecoderState,
     budget_ms: u64,
+) -> usize {
+    let mut detail = DrainDetail::default();
+    drain_one_capture_for_preload_with_detail(dec_state, budget_ms, &mut detail)
+}
+
+/// r78 Phase A: detail-recording variant. Same logic; accumulates
+/// per-poll outcomes into `detail` so the caller can emit them on
+/// a separate parser-friendly perf line.
+pub fn drain_one_capture_for_preload_with_detail(
+    dec_state: &mut VideoDecoderState,
+    budget_ms: u64,
+    detail: &mut DrainDetail,
 ) -> usize {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_millis(budget_ms);
@@ -397,6 +520,7 @@ pub fn drain_one_capture_for_preload(
                 // EPIPE / end-of-stream. The decoder has signaled
                 // V4L2_BUF_FLAG_LAST; no more frames will come.
                 // Nothing to drain; bail.
+                detail.eos_seen = true;
                 break;
             }
             Err(e) if e.to_string().contains("EAGAIN") => {
@@ -404,9 +528,11 @@ pub fn drain_one_capture_for_preload(
                 // retry. 5ms poll is intentionally coarser than
                 // hdmi.rs:7685's 3ms -- worker latency is not
                 // user-visible so we save a few syscalls.
+                detail.eagain_polls += 1;
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(e) => {
+                detail.other_errs += 1;
                 // Real decode error (DQBUF returned out-of-range
                 // index, FLAG_ERROR on the buffer, etc.). Log so
                 // QA can see failure mode #3 ("decode silently
@@ -439,22 +565,43 @@ pub fn prime_video_decoder_for_preload(
     slide_id: uuid::Uuid,
 ) -> Result<VideoDecoderState> {
     use std::time::Instant;
+    // r78 Phase A probe: log first-4-sample classification BEFORE
+    // priming so QA can see whether sample 0 is an IDR (the
+    // dispatch's top hypothesis for why frames_drained=0).
+    log_first_samples_nal_types(
+        "preload", &slide_id.to_string(), &dem.samples, 4,
+    );
     // r76 subagent WARN-4: emit a separate `prime_only_us` BEFORE
     // the drain so QA dashboards that historically tracked
     // `prime_us` as bring-up cost stay accurate. The outer
     // preload_worker_prime line in ipc_main.rs measures
     // prime + drain (up to +500ms-2000ms env-overridden); the
     // inner prime_only_us isolates the V4L2 bring-up cost.
+    //
+    // Note: if `prime_only_us` is non-zero in the perf line below,
+    // STREAMON succeeded (it's inside prime_video_decoder_with_warmup
+    // and the `?` would propagate STREAMON errors). r78 dispatch
+    // explicitly asked "did STREAMON even run successfully?" -- yes,
+    // implicitly proved by prime_only_us being a real number.
     let t_prime_only = Instant::now();
     let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
     let prime_only_us = t_prime_only.elapsed().as_micros();
     let budget_ms = preload_capture_drain_budget_ms();
     let t_drain = Instant::now();
-    let drained = drain_one_capture_for_preload(&mut state, budget_ms);
+    let mut detail = DrainDetail::default();
+    let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
     let drain_us = t_drain.elapsed().as_micros();
     eprintln!(
         "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
         slide_id, drained, prime_only_us, drain_us, budget_ms,
+    );
+    // r78 Phase A: separate detail line so the existing
+    // preload_handoff line stays parser-stable for QA's existing
+    // greps. eagain_polls=N + other_errs=N answers the dispatch's
+    // probe #2 "how many EAGAINs while the kernel did nothing?".
+    eprintln!(
+        "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
+        slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
     );
     Ok(state)
 }
@@ -583,6 +730,84 @@ mod tests {
         assert_eq!(preload_capture_drain_budget_ms(), 500);
 
         unsafe { std::env::remove_var("OPENMARQUEE_PRELOAD_CAPTURE_DRAIN_MS") };
+    }
+
+    // ============================================================
+    // r78 Phase A (2026-06-08): NAL classifier pin.
+    //
+    // The probe's diagnostic value hinges on classifying sample 0
+    // correctly. If a future demuxer change emits 3-byte start
+    // codes (`00 00 01`) instead of 4-byte (`00 00 00 01`) the
+    // classifier MUST still pick up the NAL header at the right
+    // offset, otherwise QA's `is_idr` field lies and the probe is
+    // useless.
+    // ============================================================
+
+    #[test]
+    fn walk_h264_nal_types_idr_alone_4byte() {
+        // 4-byte start code + IDR-only (nal_unit_type=5 -> byte 0x65).
+        let sample = vec![0, 0, 0, 1, 0x65, 0xab, 0xcd];
+        let (first, contains_idr) = walk_h264_nal_types(&sample);
+        assert_eq!(first, Some(5));
+        assert!(contains_idr);
+    }
+
+    #[test]
+    fn walk_h264_nal_types_aud_then_idr() {
+        // r78 subagent BLOCKER-1 pin: x264 prefixes the IDR slice
+        // with an AUD (type=9, header byte 0x09) and/or SEI NAL.
+        // Pre-fix the classifier would have returned `first_nal=9
+        // is_idr=false` -- giving QA a false-positive demuxer
+        // indictment. Post-fix: walks all NALs, finds the IDR,
+        // contains_idr=true.
+        let sample = vec![
+            // AUD: 4-byte start code + header 0x09 + payload byte.
+            0, 0, 0, 1, 0x09, 0x10,
+            // IDR slice: 4-byte start code + header 0x65 + payload.
+            0, 0, 0, 1, 0x65, 0xab, 0xcd,
+        ];
+        let (first, contains_idr) = walk_h264_nal_types(&sample);
+        assert_eq!(first, Some(9), "first_nal_type MUST be AUD (9), not IDR");
+        assert!(contains_idr, "MUST find IDR even though AUD prefixes it -- this is the BLOCKER-1 case");
+    }
+
+    #[test]
+    fn walk_h264_nal_types_sei_then_idr_3byte_start_codes() {
+        // Some encoders use 3-byte start codes mid-sample. Defensive.
+        let sample = vec![
+            0, 0, 1, 0x06, 0x05, // SEI prefix
+            0, 0, 0, 1, 0x65, 0xab, // IDR (4-byte start)
+        ];
+        let (first, contains_idr) = walk_h264_nal_types(&sample);
+        assert_eq!(first, Some(6));
+        assert!(contains_idr);
+    }
+
+    #[test]
+    fn walk_h264_nal_types_non_idr_only() {
+        // Non-IDR slice (type=1). contains_idr=false. Useful for
+        // sample 1+ in the dump.
+        let sample = vec![0, 0, 0, 1, 0x61, 0x9a];
+        let (first, contains_idr) = walk_h264_nal_types(&sample);
+        assert_eq!(first, Some(1));
+        assert!(!contains_idr);
+    }
+
+    #[test]
+    fn walk_h264_nal_types_empty_returns_none_no_idr() {
+        let (first, contains_idr) = walk_h264_nal_types(&[]);
+        assert_eq!(first, None);
+        assert!(!contains_idr);
+    }
+
+    #[test]
+    fn walk_h264_nal_types_no_start_codes_returns_none_no_idr() {
+        // Random bytes with no start-code pattern: classifier
+        // reports `first_nal_type=unknown` rather than
+        // misinterpreting byte 0 as a NAL header.
+        let (first, contains_idr) = walk_h264_nal_types(&[0xff, 0x01, 0x02, 0x03]);
+        assert_eq!(first, None);
+        assert!(!contains_idr);
     }
 
     #[test]

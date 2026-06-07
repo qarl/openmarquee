@@ -801,6 +801,19 @@ impl SlideCache {
                         // never distinguish these because Drop fires
                         // before the error bubbles up.
                         let counter_before = crate::v4l2::mmal_components_live();
+                        // r78 Phase A: cross-check probe for the
+                        // synchronous BeginSlide path. The dispatch
+                        // wants to A/B this against the preload's
+                        // preload_sample_dump line; if BOTH paths
+                        // show the same first_nal_type +
+                        // contains_idr classification, the demuxer
+                        // is consistent across paths. r78 subagent
+                        // BLOCKER-2: lives here NOT inside
+                        // prime_video_decoder so reel + tests
+                        // don't flood the journal.
+                        crate::video_decode::log_synchronous_begin_slide_sample_dump(
+                            item_id, &dem,
+                        );
                         match prime_video_decoder(&dem) {
                             Ok(dec_state) => {
                                 self.video_decoders.insert(item_id, dec_state);
