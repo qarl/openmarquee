@@ -953,17 +953,18 @@ fn preload_in_worker(
                 #[cfg(target_os = "linux")]
                 {
                     let t_prime = std::time::Instant::now();
-                    // r73 (2026-06-06): preload worker uses
-                    // warmup_count=PRIME_WARMUP_FOR_PRELOAD (0) so
-                    // the prime QBUFs only the primer sample. With
-                    // 3 of the 4 CAPTURE slots staying free, the
-                    // bcm2835-codec can release the single OUTPUT
-                    // buffer back to userspace during the idle
-                    // window between preload finish and transition
-                    // start. Cold-start callers still use the default
-                    // warmup_count=3 for B-frame lookahead. See
-                    // PRIME_WARMUP_FOR_PRELOAD docstring for the
-                    // CAPTURE-saturation chain.
+                    // r73 (2026-06-06) / r77 (2026-06-07): preload
+                    // worker uses warmup_count=PRIME_WARMUP_FOR_PRELOAD
+                    // (currently 2; see main.rs:PRIME_WARMUP_FOR_PRELOAD
+                    // docstring for the value's history and gated-bump
+                    // protocol). The prime QBUFs primer + warmup
+                    // samples; Phase B's drain consumes the first
+                    // CAPTURE frame so the bcm2835-codec doesn't sit
+                    // in wait-for-userspace during the idle window
+                    // between preload finish and transition start.
+                    // Cold-start callers (synchronous BeginSlide,
+                    // standalone reel) still use the default
+                    // warmup_count=3 for B-frame lookahead.
                     // r75 subagent BLOCKER-2: snapshot before prime
                     // so the failure log can emit before+after.
                     //

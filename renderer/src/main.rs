@@ -117,31 +117,61 @@ mod video_decode;
 /// frame per tick within ~33ms.
 pub const PRIME_WARMUP_DEFAULT: usize = 3;
 
-/// r73 (2026-06-06): preload-path warmup count. Used by the r65
-/// async PreloadSlide worker, whose decoder sits idle for ~1s
-/// between prime exit and the transition's first bake call. At
-/// warmup_count=3 the prime QBUFs 4 OUTPUT samples that the
-/// kernel decodes into 4 CAPTURE buffers (CAPTURE pool is also
-/// 4). With CAPTURE fully queued, bcm2835-codec can't release
-/// the pinned OUTPUT buffers back to userspace -- so when the
-/// transition starts ~1s later, drain_output_quiet returns
-/// EAGAIN on every retry (perf data: waited_us=102000 retries=25
-/// on every transition, pool_empty_on_entry=true). r70's 100ms
-/// drain budget hits the ceiling.
+/// Preload-path warmup count. Used by the r65 async PreloadSlide
+/// worker, whose decoder sits idle for ~1s between prime exit and
+/// the transition's first bake call.
 ///
-/// =1 chosen as the safer compromise (subagent WARN-2): with
-/// warmup_count=1 the prime QBUFs the primer + 1 warmup sample
-/// (2 total), producing 2 CAPTURE frames -- 2 CAPTURE slots
-/// stay free. The kernel processes + releases the OUTPUT
-/// buffers during the idle window. At handoff start (CUT or
-/// transition), 2 pre-decoded frames are immediately
-/// dequeueable, cushioning the first 2 ticks of bake before
-/// the steady-state decoder pump catches up. warmup_count=0
-/// (primer only) would also avoid the wedge but leaves only
-/// 1 pre-decoded frame, exposing the cold-start hiccup on
-/// cut-into-preloaded-video playlists (which fire preload but
-/// hand off directly via begin_slide, not begin_transition).
-pub const PRIME_WARMUP_FOR_PRELOAD: usize = 1;
+/// r73 (2026-06-06) initially set this to 1 to avoid CAPTURE-pool
+/// saturation: at warmup_count=3 the prime QBUFs 4 OUTPUT samples
+/// that the kernel decodes into 4 CAPTURE buffers (CAPTURE pool is
+/// also 4). With CAPTURE fully queued, bcm2835-codec couldn't
+/// release the pinned OUTPUT buffers back to userspace, so when
+/// the transition started ~1s later, drain_output_quiet returned
+/// EAGAIN on every retry (r70 perf data: waited_us=102000
+/// retries=25, pool_empty_on_entry=true).
+///
+/// r77 (2026-06-07) bumps this to 2 after empirical refutation of
+/// the r73 invariant. Phase B telemetry from FYS:
+///   preloads=11
+///   preload_handoff frames_drained=0  (ALL 11)
+///   preload_handoff drain_us=503000   (default 500ms budget timed out)
+/// 4x'ing the drain budget to 2000ms produced ZERO additional
+/// frames. The decoder was input-starved: 1 primer + 1 warmup =
+/// 2 samples isn't enough for bcm2835-codec to produce a decoded
+/// CAPTURE frame. Most-likely cause is that sample 1 is a B-frame
+/// depending on a future P-frame that wasn't fed -- typical H.264
+/// content but content-dependent (open-GOP / baseline-profile
+/// streams behave differently).
+///
+/// =2 means prime feeds 3 samples (primer + 2 warmup). If the
+/// reorder distance is 3-4 (per the existing video_decode.rs
+/// comment), 3 samples should usually be enough to deliver the
+/// IDR's decoded CAPTURE frame.
+///
+/// r73's "saturation wedges OUTPUT release" failure mode now has
+/// a different fix in place: r76 Phase B's post-prime CAPTURE
+/// drain consumes one Frame whose Drop re-QBUFs the buffer back
+/// to the kernel pool. At warmup=2 specifically, the math
+/// independently keeps us safe: 3 OUTPUT samples queued -> kernel
+/// can produce at most 3 CAPTURE frames -> pool of 4 has at
+/// least 1 free slot whether or not the drain succeeds.
+///
+/// r77 subagent BLOCKER: do NOT bump to 3 unconditionally if FYS
+/// still shows frames_drained=0 with =2. At warmup=3 the math
+/// goes back to "4 OUTPUT queued -> 4 CAPTURE produced -> pool
+/// saturates" -- the EXACT r73 wedge. r76's drain only protects
+/// against saturation when it actually dequeues a frame
+/// (frames_drained >= 1). The next bump is gated:
+///   - If FYS shows frames_drained >= 1 with =2 (drain working)
+///     AND transitions still snap-cut, then warmup=3 is the next
+///     experiment, safe under the drain.
+///   - If FYS still shows frames_drained=0 with =2, the drain
+///     ISN'T rescuing us and warmup=3 would re-brick transitions.
+///     Different fix needed: either bump warmup higher in a
+///     separate experiment (with explicit instrumentation
+///     confirming the drain consumes), or revisit content
+///     assumptions (open-GOP / decoder profile mismatch).
+pub const PRIME_WARMUP_FOR_PRELOAD: usize = 2;
 
 use std::path::PathBuf;
 
@@ -1120,15 +1150,27 @@ mod tests {
     }
 
     #[test]
-    fn prime_warmup_for_preload_is_one() {
-        // Preload path MUST stay strictly less than the OUTPUT
-        // pool size of 4 -- otherwise CAPTURE saturates during
-        // the idle window and bcm2835-codec wedges OUTPUT release.
-        // The exact value (1, subagent WARN-2 safer compromise vs
-        // 0) cushions cut-into-preloaded-video playlists with 2
-        // pre-decoded CAPTURE frames at handoff. See
-        // PRIME_WARMUP_FOR_PRELOAD docstring for the chain.
-        assert_eq!(super::PRIME_WARMUP_FOR_PRELOAD, 1);
+    fn prime_warmup_for_preload_is_two() {
+        // r77 (2026-06-07): bumped 1 -> 2 after Phase B telemetry
+        // empirically refuted the r73 invariant. With warmup=1
+        // (primer + 1 sample = 2 OUTPUT-queued total), 11/11
+        // preloads on FYS hit frames_drained=0 even with a
+        // 2000ms drain budget. The single warmup sample was a
+        // B-frame depending on a future P-frame; kernel couldn't
+        // decode anything until the playback loop fed more input.
+        //
+        // =2 means prime feeds 3 samples (primer + 2 warmup).
+        // r76 Phase B's drain helps unblock the wait-for-userspace
+        // state when it consumes a frame.
+        //
+        // r77 subagent BLOCKER: the next bump (to 3) is GATED on
+        // observing frames_drained >= 1 with =2 first. At warmup=3
+        // the math goes back to "4 OUTPUT queued -> 4 CAPTURE
+        // produced -> pool saturates" -- the EXACT r73 wedge.
+        // The drain only protects against saturation when it
+        // actually dequeues a frame. See PRIME_WARMUP_FOR_PRELOAD
+        // docstring for the full gated-bump protocol.
+        assert_eq!(super::PRIME_WARMUP_FOR_PRELOAD, 2);
     }
 
     #[test]
