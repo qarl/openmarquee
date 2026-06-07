@@ -966,10 +966,21 @@ fn preload_in_worker(
                     // CAPTURE-saturation chain.
                     // r75 subagent BLOCKER-2: snapshot before prime
                     // so the failure log can emit before+after.
+                    //
+                    // r76 Phase B (2026-06-07): switched to
+                    // `prime_video_decoder_for_preload` which adds a
+                    // bounded CAPTURE drain after prime. r76 Phase A
+                    // telemetry showed 47/47 transitions with
+                    // endpoint_b NEVER delivering a frame -- prime
+                    // succeeded but bcm2835-codec sat in a wait-
+                    // for-userspace state with CAPTURE queued. The
+                    // drain forces the first DQBUF in the worker
+                    // (which is safe to block; that's its whole job)
+                    // so the kernel pipeline is flowing when bake_b
+                    // runs at transition start.
                     let counter_before = crate::v4l2::mmal_components_live();
-                    match crate::video_decode::prime_video_decoder_with_warmup(
-                        &dem,
-                        crate::video_decode::PRIME_WARMUP_FOR_PRELOAD,
+                    match crate::video_decode::prime_video_decoder_for_preload(
+                        &dem, item_id,
                     ) {
                         Ok(dec_state) => {
                             let prime_us = t_prime.elapsed().as_micros();

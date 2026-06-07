@@ -1138,28 +1138,45 @@ mod tests {
         // to the cold-start-default `prime_video_decoder(&dem)`
         // call (which would re-introduce the FYS 1080p wedge).
         //
-        // r73 subagent WARN-1: the original pair-of-substrings
-        // assertion was too weak -- both names appeared in the
-        // comment block AND the call site, so reverting the
-        // call to `prime_video_decoder(&dem)` while leaving the
-        // comment intact would PASS. Tightened to a path-
-        // qualified call expression `crate::video_decode::
-        // prime_video_decoder_with_warmup(` (with open paren),
-        // which is the exact call shape and never appears in
-        // prose comments. Same for the const argument.
+        // r76 Phase B (2026-06-07) update: preload now calls
+        // `prime_video_decoder_for_preload` which wraps
+        // `prime_video_decoder_with_warmup(PRIME_WARMUP_FOR_PRELOAD)`
+        // PLUS drains the first CAPTURE frame to unblock the
+        // bcm2835-codec wait-for-userspace state. The wrapper is
+        // the canonical preload entry; the regression lock asserts
+        // the preload site goes through it, not the bare prime.
+        //
+        // r73 subagent WARN-1 carried through: path-qualified call
+        // expression with open-paren only appears in code, never in
+        // prose comments.
         let src = include_str!("ipc_main.rs");
         assert!(
-            src.contains("crate::video_decode::prime_video_decoder_with_warmup("),
-            "preload_in_worker MUST contain a path-qualified call expression \
-             `crate::video_decode::prime_video_decoder_with_warmup(`. If you've \
-             reverted to bare `prime_video_decoder(&dem)`, you've re-introduced \
-             the FYS 1080p CAPTURE-saturation wedge -- see r73 commit message."
+            src.contains("crate::video_decode::prime_video_decoder_for_preload("),
+            "preload_in_worker MUST contain a path-qualified call to \
+             `crate::video_decode::prime_video_decoder_for_preload(`. If you've \
+             reverted to bare `prime_video_decoder(&dem)` OR \
+             `prime_video_decoder_with_warmup(...)` directly, you've skipped \
+             r76 Phase B's CAPTURE drain and re-introduced the \
+             transition_endpoint_b_unconsumed regression -- see r76 commit \
+             message."
         );
+        // The wrapper itself MUST call
+        // `prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)`.
+        // r76 subagent WARN-2: a bare `contains("PRIME_WARMUP_FOR_PRELOAD")`
+        // is too weak -- the substring appears in the `pub use` re-export
+        // and in docstrings, so a refactor that calls
+        // `prime_video_decoder_with_warmup(dem, 0)` (or `with_warmup(dem, 3)`)
+        // would still pass. Pin the full call expression with the constant
+        // in argument position.
+        let wrapper_src = include_str!("video_decode.rs");
         assert!(
-            src.contains("crate::video_decode::PRIME_WARMUP_FOR_PRELOAD,"),
-            "preload_in_worker MUST pass `crate::video_decode::PRIME_WARMUP_FOR_PRELOAD` \
-             as the warmup argument (note trailing comma -- argument position). \
-             Reverting to PRIME_WARMUP_DEFAULT would re-introduce the wedge."
+            wrapper_src.contains("prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)"),
+            "prime_video_decoder_for_preload in video_decode.rs MUST contain the \
+             exact call expression \
+             `prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)`. \
+             If you've inlined a different warmup count (e.g. \
+             `with_warmup(dem, 0)`), you've bypassed the r73 CAPTURE-saturation \
+             guard."
         );
     }
 

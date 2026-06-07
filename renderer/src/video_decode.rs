@@ -290,6 +290,175 @@ pub fn prime_video_decoder_with_warmup(
     })
 }
 
+// ====================================================================
+// r76 Phase B (2026-06-07): preload-path CAPTURE drain.
+//
+// r76 Phase A telemetry from FYS: 47/47 transitions showed
+// `transition_endpoint_b_unconsumed` -- endpoint_b's V4L2 decoder
+// produced ZERO frames within the entire transition window. Even
+// though r73 dropped warmup_count to 1 (specifically so CAPTURE
+// wouldn't saturate during the idle window), the preload worker
+// never DQBUFs CAPTURE, so the kernel-side pipeline never
+// progresses past the initial queue. Possible failure modes:
+//
+//   1. Single warmup sample is a B-frame depending on a future
+//      P-frame -> kernel can only decode the IDR primer (1 frame),
+//      then waits. bake_b's first next_frame() should still get
+//      that 1 frame -- but if it doesn't, see below.
+//
+//   2. bcm2835-codec backpressure: after warmup sample queued, the
+//      driver needs userspace to DQBUF SOMETHING before it'll
+//      stream further. Without the drain in worker, by the time
+//      transition fires the driver is in a wait-for-userspace
+//      state. (Suspected primary cause -- matches QA addendum
+//      "session reused but CAPTURE empty" hypothesis.)
+//
+//   3. The decode itself silently failed (no actual frames
+//      produced). Drain telemetry surfaces this case.
+//
+// Fix: drain at least one CAPTURE frame in the worker, bounded by
+// timeout. Frame::drop re-QBUFs the buffer back to the kernel
+// pool, keeping the pipeline flowing. Emit a [perf]
+// preload_handoff line with the drain outcome so QA's next round
+// of data can pinpoint which failure mode we're in.
+//
+// Dispatch path #1 in the r76 Phase B brief: "Block the worker
+// thread on it (it's a worker thread; that's fine -- the point is
+// to have a frame in hand when the transition begins). Cap with a
+// sensible timeout so a bad slide doesn't wedge preload forever."
+// ====================================================================
+
+/// Default drain budget for the preload-path CAPTURE warmup.
+/// 500ms is generous against the bcm2835-codec ~30-50ms per-1080p-
+/// frame decode rate; we'd typically see the IDR delivered within
+/// the first 50ms. Anything past 200ms suggests the warmup sample
+/// can't decode (failure mode #1 above) and the drain falls back
+/// to "wait + log". Env override
+/// OPENMARQUEE_PRELOAD_CAPTURE_DRAIN_MS for QA hot-tune.
+const PRELOAD_CAPTURE_DRAIN_DEFAULT_MS: u64 = 500;
+const PRELOAD_CAPTURE_DRAIN_MIN_MS: u64 = 50;
+const PRELOAD_CAPTURE_DRAIN_MAX_MS: u64 = 2000;
+
+/// Resolve the drain budget. Env override clamped to a safe range
+/// so a typo can't deadlock the worker or zero out the wait.
+fn preload_capture_drain_budget_ms() -> u64 {
+    match std::env::var("OPENMARQUEE_PRELOAD_CAPTURE_DRAIN_MS") {
+        Ok(s) => s
+            .parse::<u64>()
+            .unwrap_or(PRELOAD_CAPTURE_DRAIN_DEFAULT_MS)
+            .clamp(PRELOAD_CAPTURE_DRAIN_MIN_MS, PRELOAD_CAPTURE_DRAIN_MAX_MS),
+        Err(_) => PRELOAD_CAPTURE_DRAIN_DEFAULT_MS,
+    }
+}
+
+/// Drain at least one CAPTURE frame from the primed decoder, bounded
+/// by the configured budget. Returns the number of frames actually
+/// drained (0 on timeout means kernel never delivered a frame --
+/// useful diagnostic). Frame::drop re-QBUFs the buffer back to the
+/// kernel pool, keeping the pipeline flowing.
+///
+/// Only drains the FIRST frame, then exits -- the dispatch goal is
+/// to unblock kernel-side pipeline progression, not to fully empty
+/// CAPTURE. Subsequent frames stay queued for bake_b to consume.
+pub fn drain_one_capture_for_preload(
+    dec_state: &mut VideoDecoderState,
+    budget_ms: u64,
+) -> usize {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(budget_ms);
+    let mut drained = 0usize;
+    // r76 subagent BLOCKER: next_frame()'s actual contract per
+    // v4l2.rs:1786-1798 is:
+    //   Ok(Some(frame))  -- DQBUF succeeded, frame available
+    //   Ok(None)         -- EPIPE / FLAG_LAST = end-of-stream
+    //   Err("would block (EAGAIN)") -- kernel hasn't decoded yet
+    //   Err(other ioctl) -- real decode error
+    // The pre-fix match swapped Ok(None) and Err(EAGAIN) which
+    // would have caused the drain to bail in microseconds with
+    // drained=0 on every poll -- a no-op against the exact
+    // failure mode this fix targets. Canonical pattern mirrors
+    // hdmi.rs:7678-7688's bake_video_slide_to_current_fbo loop.
+    while Instant::now() < deadline {
+        match dec_state.decoder.next_frame() {
+            Ok(Some(frame)) => {
+                // Frame::drop re-QBUFs the CAPTURE buffer back to
+                // the kernel pool via inner.lock() + VIDIOC_QBUF
+                // (v4l2.rs:868+). We don't use the frame's pixels
+                // -- the operator sees the NEXT decoded frame
+                // (sample 1's output instead of sample 0/IDR), a
+                // ~1/30s shift at 30fps; typically imperceptible
+                // on continuous-motion content.
+                drop(frame);
+                dec_state.frames_decoded += 1;
+                drained += 1;
+                break;
+            }
+            Ok(None) => {
+                // EPIPE / end-of-stream. The decoder has signaled
+                // V4L2_BUF_FLAG_LAST; no more frames will come.
+                // Nothing to drain; bail.
+                break;
+            }
+            Err(e) if e.to_string().contains("EAGAIN") => {
+                // Kernel hasn't decoded yet. Short sleep then
+                // retry. 5ms poll is intentionally coarser than
+                // hdmi.rs:7685's 3ms -- worker latency is not
+                // user-visible so we save a few syscalls.
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => {
+                // Real decode error (DQBUF returned out-of-range
+                // index, FLAG_ERROR on the buffer, etc.). Log so
+                // QA can see failure mode #3 ("decode silently
+                // failed") in the [perf] stream. Subagent WARN-3
+                // fix: pre-fix this was a blanket Err(_) => break
+                // that swallowed all diagnostic signal.
+                eprintln!(
+                    "[perf] preload_handoff_drain_err err={:#}",
+                    e
+                );
+                break;
+            }
+        }
+    }
+    drained
+}
+
+/// Preload-path prime: primes the decoder via
+/// `prime_video_decoder_with_warmup(PRIME_WARMUP_FOR_PRELOAD)` then
+/// drains the first CAPTURE frame to unblock the kernel-side
+/// pipeline. Emits `[perf] preload_handoff slide_id=... frames_drained=... drain_us=... budget_ms=...`
+/// so QA can see whether the drain succeeded (frames_drained=1) or
+/// timed out (frames_drained=0 -- decoder produced nothing in the
+/// budget, points at a downstream root cause).
+///
+/// `slide_id` is just for the log; the function doesn't use it for
+/// any V4L2 logic.
+pub fn prime_video_decoder_for_preload(
+    dem: &Mp4Demuxer,
+    slide_id: uuid::Uuid,
+) -> Result<VideoDecoderState> {
+    use std::time::Instant;
+    // r76 subagent WARN-4: emit a separate `prime_only_us` BEFORE
+    // the drain so QA dashboards that historically tracked
+    // `prime_us` as bring-up cost stay accurate. The outer
+    // preload_worker_prime line in ipc_main.rs measures
+    // prime + drain (up to +500ms-2000ms env-overridden); the
+    // inner prime_only_us isolates the V4L2 bring-up cost.
+    let t_prime_only = Instant::now();
+    let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
+    let prime_only_us = t_prime_only.elapsed().as_micros();
+    let budget_ms = preload_capture_drain_budget_ms();
+    let t_drain = Instant::now();
+    let drained = drain_one_capture_for_preload(&mut state, budget_ms);
+    let drain_us = t_drain.elapsed().as_micros();
+    eprintln!(
+        "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+        slide_id, drained, prime_only_us, drain_us, budget_ms,
+    );
+    Ok(state)
+}
+
 /// Re-feed the SPS+PPS+IDR headers + first sample to wrap the
 /// decoder back to the start of the stream. Used by the standalone
 /// reel driver when a video's `next_sample_idx` reaches
@@ -364,6 +533,57 @@ mod tests {
     // tests live at the binary crate root (main.rs) so they run on
     // all platforms, not just Linux where THIS test module compiles
     // in. See main.rs near the PRIME_WARMUP_* constants.
+
+    // ============================================================
+    // r76 Phase B (2026-06-07): preload CAPTURE drain budget.
+    //
+    // r76 Phase A telemetry showed endpoint_b never delivering a
+    // frame -- the bcm2835-codec sits in a wait-for-userspace
+    // state after prime. The drain in the worker thread triggers
+    // the first DQBUF so the kernel pipeline progresses. These
+    // tests pin the budget resolver semantics. The V4L2 drain
+    // itself needs real hardware (gated tests in v4l2::tests::
+    // decode_test_fixture_320x240).
+    // ============================================================
+
+    #[test]
+    fn preload_capture_drain_budget_default_is_500ms() {
+        // Pin the default so a future change has to be deliberate.
+        // SAFETY: test owns the env var; other tests in this module
+        // don't touch it.
+        unsafe { std::env::remove_var("OPENMARQUEE_PRELOAD_CAPTURE_DRAIN_MS") };
+        assert_eq!(preload_capture_drain_budget_ms(), 500);
+    }
+
+    #[test]
+    fn preload_capture_drain_budget_env_override_clamps_and_round_trips() {
+        // Consolidated so the shared env doesn't race with parallel
+        // siblings (same pattern as r70's feed_drain test).
+        // SAFETY: test owns this env var entirely.
+
+        // Inside-range override round-trips.
+        unsafe { std::env::set_var("OPENMARQUEE_PRELOAD_CAPTURE_DRAIN_MS", "1000") };
+        assert_eq!(preload_capture_drain_budget_ms(), 1000);
+
+        unsafe { std::env::set_var("OPENMARQUEE_PRELOAD_CAPTURE_DRAIN_MS", "100") };
+        assert_eq!(preload_capture_drain_budget_ms(), 100);
+
+        // =0 clamps to floor (50ms). A typo can't deadlock by
+        // making every drain timeout-skip immediately.
+        unsafe { std::env::set_var("OPENMARQUEE_PRELOAD_CAPTURE_DRAIN_MS", "0") };
+        assert_eq!(preload_capture_drain_budget_ms(), PRELOAD_CAPTURE_DRAIN_MIN_MS);
+
+        // =999999 clamps to ceiling (2000ms). A typo can't wedge
+        // the worker thread for ~17 minutes.
+        unsafe { std::env::set_var("OPENMARQUEE_PRELOAD_CAPTURE_DRAIN_MS", "999999") };
+        assert_eq!(preload_capture_drain_budget_ms(), PRELOAD_CAPTURE_DRAIN_MAX_MS);
+
+        // Garbage falls back to default.
+        unsafe { std::env::set_var("OPENMARQUEE_PRELOAD_CAPTURE_DRAIN_MS", "notanumber") };
+        assert_eq!(preload_capture_drain_budget_ms(), 500);
+
+        unsafe { std::env::remove_var("OPENMARQUEE_PRELOAD_CAPTURE_DRAIN_MS") };
+    }
 
     #[test]
     fn v4l2_decoder_path_constant_matches_pi_bcm2835_codec_node() {
