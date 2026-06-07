@@ -814,6 +814,13 @@ impl SlideCache {
                         crate::video_decode::log_synchronous_begin_slide_sample_dump(
                             item_id, &dem,
                         );
+                        // r79 Phase A.5: SPS/PPS state probe so QA
+                        // can falsify-or-confirm the "SPS/PPS not
+                        // reaching the decoder" hypothesis from the
+                        // r79 dispatch.
+                        crate::video_decode::log_preload_decoder_config(
+                            item_id, &dem, "cold_start",
+                        );
                         match prime_video_decoder(&dem) {
                             Ok(dec_state) => {
                                 self.video_decoders.insert(item_id, dec_state);

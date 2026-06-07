@@ -202,6 +202,50 @@ pub fn log_synchronous_begin_slide_sample_dump(slide_id: uuid::Uuid, dem: &Mp4De
     );
 }
 
+/// r79 Phase A.5 (2026-06-08): emit the SPS/PPS state at prime time
+/// so QA can confirm parameter sets ARE reaching the decoder. The
+/// dispatch's primary Phase B hypothesis was "SPS/PPS not reaching
+/// the decoder" -- this probe falsifies or confirms it instantly.
+///
+/// Code reading already shows the prime path in
+/// `prime_video_decoder_with_warmup` prepends `dem.sps_pps_annexb()`
+/// (line ~283) to sample 0 before feeding. But the FYS behavior
+/// (kernel idle, eagain_polls=92-98, zero output) is consistent with
+/// "no SPS/PPS reached the decoder" -- which would happen if either:
+///   - the demuxer's `dem.sps` or `dem.pps` were empty for the FYS
+///     MP4s specifically (avcC parsing edge case)
+///   - the primer-feed buffer exceeded the OUTPUT plane size and
+///     feed() silently truncated (it doesn't -- it returns Err, but
+///     the diagnostic helps falsify this)
+///
+/// Emits: `[perf] preload_decoder_config slide_id=... label=...
+/// has_sps=... sps_len=... has_pps=... pps_len=... sample_count=...
+/// sample_0_size=... primer_size=...`.
+///
+/// `primer_size` = `sps_pps_annexb()` total + sample[0] size, which
+/// is exactly what `dec.feed()` receives at the primer-feed call
+/// site. If this exceeds plane_max the kernel rejects with EINVAL
+/// (visible as a non-zero `other_errs` in
+/// `preload_handoff_drain_detail`, but emit it explicitly here so
+/// QA doesn't have to correlate).
+pub fn log_preload_decoder_config(slide_id: uuid::Uuid, dem: &Mp4Demuxer, label: &str) {
+    let has_sps = !dem.sps.is_empty();
+    let has_pps = !dem.pps.is_empty();
+    let sample_0_size = dem.samples.first().map(|s| s.len()).unwrap_or(0);
+    // sps_pps_annexb() prepends `00 00 00 01` start codes before
+    // each parameter set; the total wire-format size is
+    // 4 + sps.len() + 4 + pps.len() per mp4_demux.rs:407-414.
+    let sps_pps_annexb_size = 4 + dem.sps.len() + 4 + dem.pps.len();
+    let primer_size = sps_pps_annexb_size + sample_0_size;
+    eprintln!(
+        "[perf] preload_decoder_config slide_id={} label={} \
+         has_sps={} sps_len={} has_pps={} pps_len={} \
+         sample_count={} sample_0_size={} primer_size={}",
+        slide_id, label, has_sps, dem.sps.len(), has_pps, dem.pps.len(),
+        dem.samples.len(), sample_0_size, primer_size,
+    );
+}
+
 pub fn prime_video_decoder_with_warmup(
     dem: &Mp4Demuxer,
     warmup_count_requested: usize,
@@ -571,6 +615,9 @@ pub fn prime_video_decoder_for_preload(
     log_first_samples_nal_types(
         "preload", &slide_id.to_string(), &dem.samples, 4,
     );
+    // r79 Phase A.5: SPS/PPS state probe so QA can see whether
+    // the avcC extradata flowed all the way to the prime call.
+    log_preload_decoder_config(slide_id, dem, "preload");
     // r76 subagent WARN-4: emit a separate `prime_only_us` BEFORE
     // the drain so QA dashboards that historically tracked
     // `prime_us` as bring-up cost stay accurate. The outer
