@@ -2881,13 +2881,27 @@ pub const FS_NV12_TO_RGB: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_tex_y;
 uniform sampler2D u_tex_uv;
+// r83 Phase B (2026-06-08): y-axis crop fraction. Equals the ratio
+// `display_height / allocated_height` so the shader samples only
+// the source-valid rows of the bcm2835-codec's macroblock-rounded
+// NV12 buffer (1080 -> 1088 = 8 rows of uninitialised green
+// padding). Default 1.0 = no crop, byte-identical to the
+// pre-r83-Phase-B behavior. Both Y and UV planes share the same
+// ratio (NV12 sub-samples UV by 2 on both axes, so the relative
+// padding ratio is identical).
+uniform float u_y_crop_max;
 varying vec2 v_uv;
 void main() {
     // FYS bug 2: the V4L2 codec delivers the NV12 frame bottom-up
     // relative to the top-down convention the image / external-RGB
     // paths use (all share VS_TEXTURED_QUAD + the same quad VBO),
     // so video rendered upside down. Sample with v flipped.
-    vec2 uv_t = vec2(v_uv.x, 1.0 - v_uv.y);
+    // r83 Phase B: scale the flipped v-axis by u_y_crop_max so the
+    // sampling range becomes [0, display_h / allocated_h] instead
+    // of [0, 1]. The padding rows (uv_t.y near 1.0) become
+    // unreachable — the v-flip routes them to the displayed-bottom
+    // axis, so cropping the high-uv.y end removes the green band.
+    vec2 uv_t = vec2(v_uv.x, (1.0 - v_uv.y) * u_y_crop_max);
     // Limited-range Y: [16/255, 235/255] -> [0, 1].
     float y = (texture2D(u_tex_y, uv_t).r - (16.0/255.0)) * (255.0/219.0);
     // GLES2 LUMINANCE_ALPHA: r=L (U here), a=A (V here).
@@ -3224,11 +3238,20 @@ pub const FS_NV12_DMABUF_TO_RGB: &str = r#"#version 100
 #extension GL_OES_EGL_image_external : require
 precision mediump float;
 uniform samplerExternalOES u_tex_external;
+// r83 Phase B (2026-06-08): y-axis crop fraction — see
+// FS_NV12_TO_RGB above for the full rationale. Mesa's external-OES
+// sampler imports the full bcm2835-codec dma_buf allocation
+// (1920x1088 for 1080p), so the same crop applies here as on the
+// MMAP path.
+uniform float u_y_crop_max;
 varying vec2 v_uv;
 void main() {
     // FYS bug 2: V4L2 delivers the frame bottom-up vs the top-down
     // image / external-RGB paths; flip v to render right-side up.
-    vec2 uv_t = vec2(v_uv.x, 1.0 - v_uv.y);
+    // r83 Phase B: scale by u_y_crop_max so sampling stays in the
+    // valid display rows; the bottom-row green padding (uv_t.y near
+    // 1.0) is unreachable.
+    vec2 uv_t = vec2(v_uv.x, (1.0 - v_uv.y) * u_y_crop_max);
     // The Mesa driver decodes NV12 -> RGB for the external-OES
     // sample on the Pi's vc4. Output is RGB in [0,1]; alpha
     // forced to opaque (NV12 has no alpha channel).
@@ -7474,6 +7497,18 @@ mod tests {
         // as `.ra` because GLES2 LUMINANCE_ALPHA returns L in .r
         // and A in .a (we map U->L, V->A on upload).
         assert!(FS_NV12_TO_RGB.contains(".ra"));
+        // r83 Phase B (2026-06-08): the y-axis crop uniform must
+        // be present + applied in the uv_t computation. Pinned so
+        // future shader refactors don't drop the green-line
+        // mitigation.
+        assert!(
+            FS_NV12_TO_RGB.contains("uniform float u_y_crop_max"),
+            "FS_NV12_TO_RGB must declare `uniform float u_y_crop_max` (r83 Phase B)",
+        );
+        assert!(
+            FS_NV12_TO_RGB.contains("(1.0 - v_uv.y) * u_y_crop_max"),
+            "FS_NV12_TO_RGB must apply the y-crop in uv_t (r83 Phase B)",
+        );
     }
 
     #[test]
@@ -7858,6 +7893,19 @@ mod tests {
             "BT.601 math should not be inline -- Mesa handles it");
         assert!(!FS_NV12_DMABUF_TO_RGB.contains("255.0/219.0"),
             "limited-range Y scale should not be inline -- Mesa handles it");
+        // r83 Phase B (2026-06-08): the DMABUF path shares the
+        // y-axis crop with the MMAP path so Mesa's external-OES
+        // import (which sees the full bcm2835-codec allocation,
+        // including the 8 padding rows) gets the same green-line
+        // mitigation.
+        assert!(
+            FS_NV12_DMABUF_TO_RGB.contains("uniform float u_y_crop_max"),
+            "FS_NV12_DMABUF_TO_RGB must declare `uniform float u_y_crop_max` (r83 Phase B)",
+        );
+        assert!(
+            FS_NV12_DMABUF_TO_RGB.contains("(1.0 - v_uv.y) * u_y_crop_max"),
+            "FS_NV12_DMABUF_TO_RGB must apply the y-crop in uv_t (r83 Phase B)",
+        );
     }
 
     #[test]
