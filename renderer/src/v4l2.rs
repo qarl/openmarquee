@@ -183,7 +183,13 @@ pub static MMAL_COMPONENTS_LIVE: std::sync::atomic::AtomicUsize =
 /// r91 (2026-06-08): probe site moved from start_streaming to
 /// Decoder::open (after query_capabilities) per QA r91 dispatch
 /// so it fires BEFORE any prime ioctl (S_FMT/REQBUFS/STREAMON).
-/// Updated consumer site is in Decoder::open, not start_streaming.
+///
+/// r92 (2026-06-08): REVERTED to end of start_streaming. QA's r91
+/// deploy data showed VIDIOC_TRY_DECODER_CMD is destructive on
+/// bcm2835-codec when called pre-STREAMON (17 EINVAL in 60s with
+/// EOS_FLUSH unset). Consumer site is back in start_streaming
+/// (after both STREAMONs), matching r84/r88/r90's known-clean
+/// location.
 static CMD_STOP_PROBE_DONE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1294,37 +1300,27 @@ impl Decoder {
                 path.display(), caps.device_caps
             ));
         }
-        // r91 (2026-06-08): CMD_STOP capability probe MOVED here
-        // from start_streaming per QA r91 dispatch. Fires BEFORE
-        // any prime ioctl (S_FMT/REQBUFS/STREAMON) so both
-        // EOS_FLUSH=on and =off paths see identical probe
-        // history at identical lifecycle points. Gated by
-        // CMD_STOP_PROBE_DONE AtomicBool: only the FIRST
-        // Decoder::open in the process emits the probe line;
-        // subsequent opens skip.
+        // r92 (2026-06-08): REVERTED r91's probe move. r91 moved
+        // the CMD_STOP capability probe HERE (after QUERYCAP,
+        // before any S_FMT/REQBUFS/STREAMON) to test the hypothesis
+        // that probe position relative to streaming state mattered.
+        // QA's r91 deploy data PROVED THE HYPOTHESIS, but in the
+        // worst possible way: the move BROKE the OFF-mode baseline
+        // (17 EINVAL in 60s with EOS_FLUSH unset). VIDIOC_TRY_DECODER_CMD
+        // is empirically NOT non-destructive on bcm2835-codec when
+        // called pre-STREAMON.
         //
-        // Uses VIDIOC_TRY_DECODER_CMD ('V', 97) -- the
-        // spec-documented dry-run that verifies command validity
-        // without issuing it (no FLAG_LAST emission, no kernel
-        // state change, no recovery needed).
-        if !CMD_STOP_PROBE_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let mut probe_cmd = V4l2DecoderCmd {
-                cmd: V4L2_DEC_CMD_STOP,
-                flags: 0,
-                payload: [0u32; 16],
-            };
-            let probe_inner = dec.inner.lock().unwrap();
-            let r_try = unsafe { vidioc_try_decoder_cmd(probe_inner.fd(), &mut probe_cmd) };
-            drop(probe_inner);
-            let try_result_str = match &r_try {
-                Ok(_) => "ok".to_string(),
-                Err(e) => format!("errno_{:?}", e),
-            };
-            eprintln!(
-                "[perf] v4l2_cmd_stop_probe try_cmd_stop={} note=non_destructive_via_VIDIOC_TRY_DECODER_CMD at_open_not_streamon=true",
-                try_result_str,
-            );
-        }
+        // r92 puts the probe back where r84/r90 had it (end of
+        // start_streaming -- after both STREAMONs but before any
+        // OUTPUT QBUFs). This was the known-clean location.
+        //
+        // The smoking-gun conclusion: bcm2835-codec has a quirk
+        // where VIDIOC_(TRY_)DECODER_CMD called at certain lifecycle
+        // points poisons subsequent REQBUFS state. The EOS-flush
+        // body's real CMD_STOP issuance (via signal_eos_via_cmd_stop)
+        // likely fires the same kernel-state quirk -- which would
+        // explain the r85/r87/r90 EOS_FLUSH=1 regression that I
+        // couldn't find by code review.
         // r75 subagent BLOCKER-1: counter was bumped at DecoderInner
         // construction above (panic-safe pairing with Drop).
         Ok(dec)
@@ -1905,12 +1901,35 @@ impl Decoder {
         );
         r_cap.with_context(|| "VIDIOC_STREAMON CAPTURE")?;
         inner.capture_streaming = true;
-        // r91 (2026-06-08): CMD_STOP capability probe MOVED to
-        // Decoder::open (right after QUERYCAP) so it fires
-        // BEFORE any prime ioctl (S_FMT/REQBUFS/STREAMON), per
-        // QA r91 dispatch ask. The AtomicBool gate still ensures
-        // single-fire-per-process. Original r84 probe location
-        // (here, post-STREAMON) removed.
+
+        // r92 (2026-06-08): CMD_STOP capability probe RESTORED
+        // here from Decoder::open. r91's move to Decoder::open
+        // broke OFF-mode baseline (17 EINVAL in 60s with
+        // EOS_FLUSH unset) -- empirically TRY_DECODER_CMD is
+        // destructive on bcm2835-codec when called pre-STREAMON.
+        // r84/r88/r90 had it here (after both STREAMONs) and was
+        // known-clean. Uses VIDIOC_TRY_DECODER_CMD (spec says
+        // non-destructive; r91 data showed lifecycle position
+        // matters).
+        drop(inner);
+        if !CMD_STOP_PROBE_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let mut probe_cmd = V4l2DecoderCmd {
+                cmd: V4L2_DEC_CMD_STOP,
+                flags: 0,
+                payload: [0u32; 16],
+            };
+            let probe_inner = self.inner.lock().unwrap();
+            let r_try = unsafe { vidioc_try_decoder_cmd(probe_inner.fd(), &mut probe_cmd) };
+            drop(probe_inner);
+            let try_result_str = match &r_try {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("errno_{:?}", e),
+            };
+            eprintln!(
+                "[perf] v4l2_cmd_stop_probe try_cmd_stop={} note=non_destructive_via_VIDIOC_TRY_DECODER_CMD at_open_not_streamon=false",
+                try_result_str,
+            );
+        }
         Ok(())
     }
 
@@ -2008,6 +2027,10 @@ impl Decoder {
         Ok(())
     }
 
+    /// **r92 (2026-06-08): BODY NO-OP'D — see inline comment for the
+    /// experiment rationale. The doc-comment below describes r82's
+    /// original intent.**
+    ///
     /// r82 (2026-06-08): signal EOS via `VIDIOC_DECODER_CMD` with
     /// `V4L2_DEC_CMD_STOP`. This is the canonical V4L2 m2m stateful
     /// decoder API for "drain whatever is in the reorder buffer."
@@ -2032,46 +2055,52 @@ impl Decoder {
     /// + drain + CMD_START as a clean cycle that doesn't require
     /// clearing OUTPUT-side userspace state.
     pub fn signal_eos_via_cmd_stop(&self) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
-        // r82 subagent WARN-1: idempotence guard mirroring
-        // resume_after_eos's `if !inner.capture_drained` early-return.
-        // If a future caller invokes signal_eos_via_cmd_stop twice
-        // without an intervening decode cycle, OR after the kernel
-        // already entered drained state via another path, the
-        // second CMD_STOP hits the kernel in a "no active decode"
-        // state -- bcm2835-codec behavior is implementation-defined
-        // (EPERM/EINVAL/no-op vary). Skip cleanly when the wrapper
-        // already knows the EOS state is set.
-        if inner.capture_drained || inner.output_eof_sent {
-            // r85 subagent NIT-7: trace coverage on the gated-skip
-            // path. Today only the r85 preload calls
-            // signal_eos_via_cmd_stop and the gate isn't tripped
-            // there (fresh decoder), but the line documents the
-            // skipped case if a future caller introduces the
-            // pattern.
-            eprintln!(
-                "[perf] v4l2_ioctl op=DECODER_CMD_STOP queue=output result=skipped_already_eos"
-            );
-            return Ok(());
-        }
-        let mut cmd = V4l2DecoderCmd {
-            cmd: V4L2_DEC_CMD_STOP,
-            flags: 0,
-            payload: [0u32; 16],
-        };
-        // SAFETY: ioctl with our owned fd + correctly-sized
-        // V4l2DecoderCmd. Lock held across the ioctl (single-shot,
-        // <1ms; matches resume_after_eos pattern).
-        let r = unsafe { vidioc_decoder_cmd(inner.fd(), &mut cmd) };
-        // r85: ioctl trace per QA dispatch constraint -- when r85's
-        // EOS-flush ships, the trace must cover the new ioctl call
-        // sites so any regression is diagnosable without another
-        // round of probe-and-revert.
+        // r92 (2026-06-08): EXPERIMENT per QA r92 dispatch.
+        //
+        // QA's smoking-gun finding: r91 moved the
+        // VIDIOC_TRY_DECODER_CMD capability probe pre-STREAMON
+        // and broke OFF-mode baseline (17 EINVAL in 60s). This
+        // empirically proves that VIDIOC_(TRY_)DECODER_CMD has
+        // a side effect on bcm2835-codec at certain lifecycle
+        // moments — the kernel docs are wrong (or
+        // under-specified) about non-destructiveness.
+        //
+        // The real VIDIOC_DECODER_CMD V4L2_DEC_CMD_STOP issued
+        // here in the EOS-flush body likely fires the SAME
+        // kernel-state quirk, which would explain the
+        // r85/r87/r90 EOS_FLUSH=1 regression I couldn't find
+        // via code review (the bug isn't in DMABUF code; it's
+        // in CMD_STOP semantics on bcm2835-codec).
+        //
+        // QA's r92 ask #3: "Test by removing CMD_STOP from the
+        // EOS-flush body entirely. If the regression on
+        // EOS_FLUSH=1 goes away (with the body running its
+        // other code but not the signal_eos_via_cmd_stop call),
+        // the hypothesis is confirmed: CMD_STOP itself is
+        // poisonous on bcm2835-codec at the wrong lifecycle
+        // moment."
+        //
+        // This function returns Ok(()) WITHOUT issuing the
+        // ioctl. The EOS-flush body's drain_after_signal_eos
+        // still runs the DQBUF loop but never gets FLAG_LAST
+        // (the kernel was never told to flush). The drain
+        // budget exhausts, the bail path runs, the preload
+        // returns Err and falls back to synchronous cold-start.
+        //
+        // What QA's deploy of r92 will reveal:
+        //   EOS_FLUSH=off: r84-baseline (regression-guard pass)
+        //   EOS_FLUSH=1, default: EOS-flush body runs WITHOUT
+        //     CMD_STOP. If cold-start REQBUFS still EINVALs
+        //     on subsequent slides, CMD_STOP is EXONERATED
+        //     (something else in the body causes corruption).
+        //     If clean, CMD_STOP is CONFIRMED as the bug.
+        //
+        // The function and its trace site stay so the next
+        // round can re-enable the real ioctl behind a new env
+        // var IF QA decides the experiment was inconclusive.
         eprintln!(
-            "[perf] v4l2_ioctl op=DECODER_CMD_STOP queue=output result={}",
-            match &r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+            "[perf] v4l2_ioctl op=DECODER_CMD_STOP queue=output result=skipped_r92_experiment"
         );
-        r.with_context(|| "VIDIOC_DECODER_CMD V4L2_DEC_CMD_STOP")?;
         Ok(())
     }
 
