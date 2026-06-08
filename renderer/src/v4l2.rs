@@ -189,6 +189,53 @@ pub fn mmal_components_live() -> usize {
     MMAL_COMPONENTS_LIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// r89 (2026-06-08): monotonic per-process Decoder-open
+/// sequence counter. Each Decoder::open allocates a unique
+/// 1-indexed value (first open is seq=1 to match the
+/// `vpu_mmal_components` 1-indexed convention on the same
+/// log line) and stores it in DecoderInner. Distinct from
+/// MMAL_COMPONENTS_LIVE which is a LIVE count (incremented and
+/// decremented); this seq is MONOTONIC so each open has a
+/// unique identity even if MMAL_COMPONENTS_LIVE returns to 0
+/// between opens.
+///
+/// Emitted in exactly TWO log lines per Decoder lifetime:
+/// `[mem] decoder_open seq=N mmal_live=M path=...` and the
+/// matching `[mem] decoder_drop seq=N mmal_live=M path=...`.
+/// NOTE: existing ioctl trace lines (S_FMT, REQBUFS, QUERYBUF,
+/// EXPBUF, STREAMON, STREAMOFF, DQBUF, DECODER_CMD, etc.) are
+/// NOT modified -- the per-ioctl `decoder_seq=N` tagging
+/// would touch ~10 trace sites and risk subtle behavior
+/// differences from log-format changes (which the r80-r87
+/// regression cycle has shown is non-trivial to verify). QA
+/// can correlate via the timestamp + ordering between the
+/// `decoder_open` line and subsequent ioctl traces on a fresh
+/// decoder.
+///
+/// Failed-open observability: r89 places the `decoder_open`
+/// line at the same point as the existing `vpu_mmal_components
+/// delta=+1` line, BEFORE the capability checks. On a cap-
+/// rejected open, QA will see paired open seq=N + drop seq=N
+/// lines (the Arc<Mutex<DecoderInner>> Drop fires when `dec`
+/// falls out of scope after `?`). This is intentional — same
+/// behavior as the MMAL counter — and lets QA see the full
+/// lifetime span even on failure paths. A QA script that
+/// expects "open without matching drop = leak" should account
+/// for cap-rejected paired pairs.
+static DECODER_OPEN_SEQ: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Allocate the next monotonic Decoder-open sequence number.
+/// 1-indexed for parity with `vpu_mmal_components` (`fetch_add
+/// + 1` returns the post-increment value, so the first call
+/// returns 1, second returns 2, etc.). `pub(crate)` to match
+/// the single-call-site invariant: only Decoder::open should
+/// bump this counter; a wider caller would desync the seq
+/// from the actual DecoderInner construction count.
+pub(crate) fn next_decoder_open_seq() -> usize {
+    DECODER_OPEN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 // ============================================================
 // V4L2 fourcc helper + format codes.
 // ============================================================
@@ -786,6 +833,13 @@ impl MmapRegion {
 /// are valid.
 #[cfg(target_os = "linux")]
 struct DecoderInner {
+    /// r89 (2026-06-08): monotonic per-process Decoder-open seq.
+    /// Allocated in Decoder::open via next_decoder_open_seq();
+    /// emitted in [mem] decoder_open + decoder_drop lines so QA
+    /// can correlate ioctl ordering across overlapping decoder
+    /// lifetimes (especially the "is this ioctl from a leaked
+    /// prior decoder?" case if the r87 regression recurs).
+    decoder_seq: usize,
     /// Owned device file. Drop closes fd AFTER munmap (we drop
     /// `mapped_output` and `mapped_capture` first via field-order
     /// drop semantics: file is declared LAST in this struct).
@@ -978,6 +1032,14 @@ impl Drop for DecoderInner {
             "[mem] vpu_mmal_components={} delta=-1 path={}",
             after, self.path.display(),
         );
+        // r89 (2026-06-08): seq tag matches the [mem] decoder_open
+        // line emitted in Decoder::open. Lets QA see the full
+        // lifetime span of each decoder (open seq=N ... drop seq=N).
+        let _ = writeln!(
+            std::io::stderr(),
+            "[mem] decoder_drop seq={} mmal_live={} path={}",
+            self.decoder_seq, after, self.path.display(),
+        );
     }
 }
 
@@ -1160,7 +1222,9 @@ impl Decoder {
             .custom_flags(libc::O_NONBLOCK)
             .open(path)
             .with_context(|| format!("open {}", path.display()))?;
+        let decoder_seq_for_inner = next_decoder_open_seq();
         let inner = DecoderInner {
+            decoder_seq: decoder_seq_for_inner,
             capture_buffer_type: CaptureBufferType::Mmap,
             output_format: None,
             capture_format: None,
@@ -1194,6 +1258,16 @@ impl Decoder {
             std::io::stderr(),
             "[mem] vpu_mmal_components={} delta=+1 path={}",
             n_after_inc, path.display(),
+        );
+        // r89 (2026-06-08): monotonic per-process Decoder-open
+        // sequence so QA can distinguish "ioctl from THIS decoder"
+        // from "ioctl from a prior decoder" if the regression
+        // recurs. Distinct from vpu_mmal_components (a live count
+        // that can return to 0).
+        let _ = writeln!(
+            std::io::stderr(),
+            "[mem] decoder_open seq={} mmal_live={} path={}",
+            decoder_seq_for_inner, n_after_inc, path.display(),
         );
         let dec = Self { inner: Arc::new(Mutex::new(inner)) };
         let caps = dec.query_capabilities()
