@@ -612,6 +612,27 @@ pub enum QueueDirection {
     Capture,
 }
 
+/// r81 (2026-06-08): outcome of one `drain_capture_step_no_frame`
+/// poll. The Frame-bypass DQBUF+QBUF helper returns this enum
+/// instead of `Result<Option<Frame>>` so callers can branch on
+/// EAGAIN vs EOS vs got-a-frame without going through anyhow
+/// string-matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStep {
+    /// A CAPTURE buffer was DQBUF'd then immediately re-QBUF'd.
+    /// `is_last` reflects V4L2_BUF_FLAG_LAST -- when true, the
+    /// kernel has signaled end-of-drain and `capture_drained`
+    /// has been set inside the helper.
+    GotFrame { is_last: bool },
+    /// DQBUF returned EAGAIN; caller should sleep + retry within
+    /// the drain budget.
+    WouldBlock,
+    /// DQBUF returned EPIPE OR `capture_drained` was already set
+    /// on entry. Kernel's CAPTURE queue is drained; no more
+    /// frames will arrive without `resume_after_eos`.
+    EndOfStream,
+}
+
 impl QueueDirection {
     fn buf_type(&self) -> u32 {
         match self {
@@ -1754,6 +1775,123 @@ impl Decoder {
                 // will surface them on the next real feed/next_frame).
             }
         }
+    }
+
+    /// r81 (2026-06-08): Frame-bypass DQBUF+QBUF for the preload
+    /// EOS-drain path. The standard `next_frame -> Frame -> Frame::drop
+    /// re-QBUF` path corrupted bcm2835-codec's internal buffer
+    /// accounting when invoked mid-drain (r80 regression on FYS:
+    /// REQBUFS OUTPUT EINVAL on subsequent slides). r81 ships this
+    /// raw helper that DQBUFs then IMMEDIATELY QBUFs the same buffer
+    /// back via raw ioctls -- no Frame construction, no Drop path
+    /// timing relative to capture_drained.
+    ///
+    /// Returns:
+    ///   * `Ok(DrainStep::GotFrame { is_last })` -- DQBUF success.
+    ///     `is_last` reflects the V4L2_BUF_FLAG_LAST bit. The buffer
+    ///     has already been re-QBUF'd before this returns.
+    ///   * `Ok(DrainStep::WouldBlock)` -- EAGAIN; caller should
+    ///     sleep + retry.
+    ///   * `Ok(DrainStep::EndOfStream)` -- EPIPE; kernel queue is
+    ///     drained; sets capture_drained=true mirroring next_frame.
+    ///   * `Err(_)` -- real ioctl error.
+    pub fn drain_capture_step_no_frame(&self) -> Result<DrainStep> {
+        // r81 subagent WARN-6: hold the lock across BOTH ioctls
+        // AND the state mutation. Pre-fix the EPIPE / is_last
+        // branches did drop+relock for the state write -- defeating
+        // the atomicity claim. With a single `let mut inner` we
+        // keep the lock through the whole helper.
+        let mut inner = self.inner.lock().unwrap();
+        if inner.capture_drained {
+            return Ok(DrainStep::EndOfStream);
+        }
+        // r81 subagent NIT: parity with Frame::drop's check.
+        // Defensive against future callers that invoke this after
+        // STREAMOFF (the preload-worker path never does today).
+        if !inner.capture_streaming {
+            return Ok(DrainStep::EndOfStream);
+        }
+        let Some(ref cap_fmt) = inner.capture_format else {
+            return Err(anyhow!("drain_capture_step: capture not formatted"));
+        };
+        let num_planes = cap_fmt.num_planes as usize;
+        // Snapshot the per-plane sizeimage values before the DQBUF
+        // mutates other inner state (defensive against future
+        // edits).
+        let mut sizeimages = [0u32; 8];
+        for p in 0..num_planes {
+            sizeimages[p] = cap_fmt.plane_fmt[p].sizeimage;
+        }
+        let fd = inner.fd();
+
+        // DQBUF.
+        let mut planes_dq = [V4l2Plane::default(); 8];
+        let mut buf_dq = V4l2Buffer {
+            buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            memory: V4L2_MEMORY_MMAP,
+            length: num_planes as u32,
+            m_planes: planes_dq.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        match unsafe { vidioc_dqbuf(fd, &mut buf_dq) } {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EAGAIN) => return Ok(DrainStep::WouldBlock),
+            Err(nix::errno::Errno::EPIPE) => {
+                inner.capture_drained = true;
+                return Ok(DrainStep::EndOfStream);
+            }
+            Err(e) => return Err(anyhow!("drain_capture_step DQBUF: {}", e)),
+        }
+        let is_last = (buf_dq.flags & V4L2_BUF_FLAG_LAST) != 0;
+        // r81 subagent WARN-4: surface FLAG_ERROR. Mirror
+        // next_frame's check at line 1810+. Even if the kernel
+        // also set FLAG_LAST, an error condition on the last
+        // buffer is diagnostically critical: it may be the actual
+        // cause of the r80 EINVAL-on-next-slide regression that
+        // r81's atomic-DQBUF+QBUF theory doesn't address.
+        let had_error = (buf_dq.flags & V4L2_BUF_FLAG_ERROR) != 0;
+        if had_error {
+            eprintln!(
+                "[perf] preload_handoff_drain_flag_error idx={} flags=0x{:x}",
+                buf_dq.index, buf_dq.flags,
+            );
+        }
+        let idx = buf_dq.index;
+
+        // Immediately re-QBUF the SAME buffer index.
+        //
+        // r81 subagent BLOCKER: the "atomic DQBUF+QBUF fixes the
+        // bcm2835-codec corruption" theory does NOT survive a
+        // careful read of r80 -- the kernel sees the same ioctl
+        // pair in both versions; only the userspace lock-release
+        // window between them changes. r81's Frame-bypass keeps
+        // the code structurally cleaner but is unlikely to address
+        // the EINVAL-on-next-slide on its own. Probes added above
+        // are the actual diagnostic surface for the next round.
+        let mut planes_qb = [V4l2Plane::default(); 8];
+        for p in 0..num_planes {
+            planes_qb[p].length = sizeimages[p];
+            planes_qb[p].bytesused = 0;
+        }
+        let mut buf_qb = V4l2Buffer {
+            index: idx,
+            buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            memory: V4L2_MEMORY_MMAP,
+            length: num_planes as u32,
+            m_planes: planes_qb.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        if let Err(e) = unsafe { vidioc_qbuf(fd, &mut buf_qb) } {
+            return Err(anyhow!("drain_capture_step QBUF after DQBUF: {}", e));
+        }
+
+        // FLAG_LAST: kernel-side drain is done. Set the wrapper's
+        // capture_drained mirror per the same convention next_frame
+        // uses at v4l2.rs:1877-1879.
+        if is_last {
+            inner.capture_drained = true;
+        }
+        Ok(DrainStep::GotFrame { is_last })
     }
 
     /// VIDIOC_DQBUF on CAPTURE -> wrap as `Frame`. Returns

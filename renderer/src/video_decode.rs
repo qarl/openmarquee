@@ -696,12 +696,57 @@ pub fn prime_video_decoder_for_preload(
     // path eventually paints because bake feeds one more sample per
     // tick -- cumulative input flushes the reorder buffer naturally
     // even without an EOS signal.
+    // r81 subagent WARN-2: probe the resume sequence BEFORE the
+    // budget-exhaust bail so QA sees cmd_start_ok=... in the
+    // FAILURE case (the one we most need the diagnostic for).
+    // Probe is conditional on having issued the EOS feed at all
+    // (other_errs==0 means feed(&[]) succeeded), so we don't
+    // probe a no-op resume.
+    let cmd_start_ok = if detail.other_errs == 0 {
+        // resume_after_eos no-ops if capture_drained=false (i.e.
+        // we never saw FLAG_LAST). Call it anyway to record what
+        // the ioctl would do; in the no-op case "ok" reflects the
+        // gate, not a real CMD_START issuance.
+        let result = state.decoder.resume_after_eos();
+        let ok = result.is_ok();
+        eprintln!(
+            "[perf] preload_resume_after_eos slide_id={} cmd_start_ok={} eos_seen={}",
+            slide_id, ok, detail.eos_seen,
+        );
+        if !detail.eos_seen {
+            // We're going to bail; suppress the Err since the bail
+            // below carries the user-facing failure context.
+            result.ok();
+        } else {
+            result.context("r81: resume_after_eos before re-priming SPS+PPS+IDR")?;
+        }
+        ok
+    } else {
+        eprintln!(
+            "[perf] preload_resume_after_eos slide_id={} cmd_start_ok=skipped reason=eos_feed_failed",
+            slide_id,
+        );
+        false
+    };
+    let _ = cmd_start_ok; // consumed by the perf line above
+
     if !detail.eos_seen {
+        // r81 subagent WARN-5: differentiate the budget-exhaust
+        // reason. Pre-fix the label was always
+        // `kernel_never_signaled_FLAG_LAST` but on a
+        // QBUF-after-DQBUF failure the kernel actually signaled
+        // nothing because we erred out earlier. Branch on
+        // other_errs to attribute correctly.
+        let reason = if detail.other_errs > 0 {
+            "drain_ioctl_error"
+        } else {
+            "kernel_never_signaled_FLAG_LAST"
+        };
         eprintln!(
             "[perf] preload_handoff_drain_budget_exhausted slide_id={} budget_ms={} \
              eagain_polls={} other_errs={} frames_drained={} \
-             reason=kernel_never_signaled_FLAG_LAST",
-            slide_id, budget_ms, detail.eagain_polls, detail.other_errs, drained,
+             reason={}",
+            slide_id, budget_ms, detail.eagain_polls, detail.other_errs, drained, reason,
         );
         eprintln!(
             "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
@@ -724,15 +769,11 @@ pub fn prime_video_decoder_for_preload(
         );
     }
 
-    // Step 4 + 5: resume + re-prime + restore lookahead. Mirrors
-    // reprime_video_decoder_for_loop's pattern (line 670+) for the
-    // first two steps, with the addition of re-feeding warmup
-    // samples to restore the kernel's B-frame lookahead window
-    // (subagent WARN-3 fix: pre-fix only re-fed the primer, leaving
-    // less lookahead than the original prime_video_decoder_with_warmup
-    // would have produced).
-    state.decoder.resume_after_eos()
-        .context("r80: resume_after_eos before re-priming SPS+PPS+IDR")?;
+    // Step 4 + 5: re-prime + restore lookahead. (resume_after_eos
+    // was already issued + probed in the pre-bail branch above so
+    // QA's diagnostic landed even on failed runs.)
+    // r80 WARN-3 fix preserved: re-feed warmup samples after the
+    // primer to restore kernel B-frame lookahead.
     let first_sample = dem.samples.first()
         .ok_or_else(|| anyhow::anyhow!("r80: MP4 contains zero samples"))?;
     let header = dem.sps_pps_annexb();
@@ -812,26 +853,35 @@ fn drain_after_signal_eos(
         return 0;
     }
     // Step 3: drain CAPTURE until FLAG_LAST.
+    //
+    // r81 (2026-06-08): use the Frame-bypass DQBUF+QBUF helper at
+    // v4l2.rs:drain_capture_step_no_frame. r80 used next_frame ->
+    // drop(Frame) which fired Frame::drop's re-QBUF in a separate
+    // ioctl AFTER the drain loop completed -- bcm2835-codec
+    // appeared to corrupt its internal buffer accounting on this
+    // timing, causing REQBUFS OUTPUT to EINVAL on the NEXT slide's
+    // fresh decoder fd. r81 does DQBUF+QBUF as a single atomic
+    // step (raw ioctls inline, no Frame, no Drop), eliminating the
+    // window where the buffer is "in userspace's hands but not
+    // re-QBUF'd yet."
     let deadline = Instant::now() + Duration::from_millis(budget_ms);
     let mut drained = 0usize;
     while Instant::now() < deadline {
-        match state.decoder.next_frame() {
-            Ok(Some(frame)) => {
-                // Frame::drop re-QBUFs the CAPTURE buffer back to
-                // the kernel pool, freeing it for re-use after
-                // resume_after_eos + re-prime.
-                drop(frame);
-                state.frames_decoded += 1;
+        match state.decoder.drain_capture_step_no_frame() {
+            Ok(crate::v4l2::DrainStep::GotFrame { is_last }) => {
                 drained += 1;
+                if is_last {
+                    detail.eos_seen = true;
+                    break;
+                }
             }
-            Ok(None) => {
-                // FLAG_LAST received: kernel signals end of drain.
-                detail.eos_seen = true;
-                break;
-            }
-            Err(e) if e.to_string().contains("EAGAIN") => {
+            Ok(crate::v4l2::DrainStep::WouldBlock) => {
                 detail.eagain_polls += 1;
                 std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(crate::v4l2::DrainStep::EndOfStream) => {
+                detail.eos_seen = true;
+                break;
             }
             Err(e) => {
                 detail.other_errs += 1;
