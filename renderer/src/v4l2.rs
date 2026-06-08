@@ -1584,8 +1584,17 @@ impl Decoder {
             };
             // SAFETY: _IOWR; kernel fills planes[0..num_planes]
             // with the per-plane length + m.offset for mmap.
-            unsafe { vidioc_querybuf(inner.fd(), &mut buf) }
-                .with_context(|| format!("VIDIOC_QUERYBUF({:?} idx={})", dir, buf_idx))?;
+            // r88 ioctl trace per QA dispatch: DMABUF setup path
+            // had no QUERYBUF coverage. Emit on every iteration
+            // (typically 4 per queue per prime = 8 lines total).
+            let r = unsafe { vidioc_querybuf(inner.fd(), &mut buf) };
+            eprintln!(
+                "[perf] v4l2_ioctl op=QUERYBUF queue={} idx={} result={}",
+                match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+                buf_idx,
+                match &r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+            );
+            r.with_context(|| format!("VIDIOC_QUERYBUF({:?} idx={})", dir, buf_idx))?;
             let mut plane_regions = Vec::with_capacity(num_planes);
             for plane_idx in 0..num_planes {
                 let p = &planes[plane_idx];
@@ -1692,7 +1701,17 @@ impl Decoder {
                 // V4L2_MEMORY_DMABUF for REQBUFS was wrong; the
                 // kernel returned EINVAL on EXPBUF because no
                 // buffer existed at that index).
-                if let Err(e) = unsafe { vidioc_expbuf(inner.fd(), &mut expbuf) } {
+                // r88 ioctl trace per QA dispatch: DMABUF setup
+                // path's main ioctl. If DMABUF=1 is the breaker,
+                // an errno here is the next pinpoint after REQBUFS.
+                let expbuf_r = unsafe { vidioc_expbuf(inner.fd(), &mut expbuf) };
+                eprintln!(
+                    "[perf] v4l2_ioctl op=EXPBUF queue={} idx={} result={}",
+                    match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+                    buf_idx,
+                    match &expbuf_r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+                );
+                if let Err(e) = expbuf_r {
                     cleanup_partial_fds(&mut fds);
                     return Err(anyhow::Error::from(e).context(format!(
                         "VIDIOC_EXPBUF({:?} idx={}) on MMAP-allocated buffer",

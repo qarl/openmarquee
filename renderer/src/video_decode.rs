@@ -528,6 +528,7 @@ fn preload_capture_drain_budget_ms() -> u64 {
 /// requires `systemctl restart openmarquee-backend`. Per-call
 /// resolution still lets QA toggle by setting env + restarting
 /// without rebuilding/redeploying the binary.
+#[allow(dead_code)]
 fn is_eos_flush_enabled() -> bool {
     match std::env::var("OPENMARQUEE_EOS_FLUSH") {
         Ok(s) => {
@@ -660,196 +661,36 @@ pub fn prime_video_decoder_for_preload(
     );
     log_preload_decoder_config(slide_id, dem, "preload");
 
-    // r86 (2026-06-09): KILL-SWITCH ENV VAR per QA dispatch. The
-    // r85 deploy regressed: 25 REQBUFS EINVAL in 95s + 10 dmesg
-    // "leaving buffer N in active state" + 434 text-only fallback
-    // events. The r85 ioctl trace pinpointed a 3-second gap
-    // between S_FMT capture and REQBUFS output (the G_SELECTION
-    // probe inside set_capture_format, now traced as of r86's
-    // change to capture_compose_rect_internal). r86 ships a
-    // runtime opt-in instead of always-on: the EOS-flush body
-    // ONLY runs when `OPENMARQUEE_EOS_FLUSH=1` is set in the
-    // env. Default behavior is the r84-clean baseline (no
-    // EOS-flush; transitions look like cuts, video plays). QA
-    // can A/B at deploy time without a code-level revert.
+    // r88 (2026-06-08): HARD REVERT to r84 baseline body.
     //
-    // When the env var IS set, the r85 EOS-flush body runs --
-    // re-enabled with all r85 instrumentation (DECODER_CMD_STOP,
-    // DECODER_CMD_START, DQBUF/QBUF drain trace, resume_after_eos
-    // probe on bail+success paths).
-
-    let eos_flush_enabled = is_eos_flush_enabled();
-    eprintln!(
-        "[perf] preload_eos_flush_mode slide_id={} enabled={}",
-        slide_id, eos_flush_enabled,
-    );
-
-    if !eos_flush_enabled {
-        // r84-baseline behavior: prime + one-shot drain + emit.
-        let t_prime_only = Instant::now();
-        let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
-        let prime_only_us = t_prime_only.elapsed().as_micros();
-        let budget_ms = preload_capture_drain_budget_ms();
-        let t_drain = Instant::now();
-        let mut detail = DrainDetail::default();
-        let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
-        let drain_us = t_drain.elapsed().as_micros();
-        eprintln!(
-            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
-            slide_id, drained, prime_only_us, drain_us, budget_ms,
-        );
-        eprintln!(
-            "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
-            slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
-        );
-        return Ok(state);
-    }
-
-    // r87 (2026-06-09) explicit marker per QA dispatch ask
-    // ("Even just an `eprintln!('entering EOS-flush prime body')`
-    // at the top of that body would help"). Lets QA confirm
-    // exactly where the ON-branch code begins, even on a path
-    // that fails before reaching downstream EOS-flush traces.
-    eprintln!(
-        "[perf] preload_eos_flush_body_entered slide_id={}",
-        slide_id,
-    );
-
-    // r85 EOS-flush body (gated by OPENMARQUEE_EOS_FLUSH=1).
+    // QA r88 dispatch data: even with r86's kill-switch
+    // (OPENMARQUEE_EOS_FLUSH=off forcing the OFF branch which
+    // already matched r84 baseline structurally), DMABUF=1 still
+    // produces 19+ REQBUFS OUTPUT EINVAL per 60s and the renderer
+    // can't even cold-start with DMABUF=0. r84 binary
+    // (md5 292609a) is clean under the same configuration. So
+    // SOMETHING in the cumulative diff between r84 and HEAD is
+    // breaking DMABUF -- code-reading my r85/r86/r87 changes
+    // doesn't reveal what, but QA's data is conclusive.
     //
-    // r84 ioctl-trace data confirmed CMD_STOP IS supported on bcm2835-
-    // codec (try_cmd_stop=ok); the r80-r82 regressions came from
-    // implementation/ordering bugs, not a missing API. r85 added the
-    // EOS-flush ATOP that baseline with ioctl trace covering every new
-    // ioctl call in the EOS path. r85 still regressed, but the trace
-    // narrowed the search to the 3-second G_SELECTION gap (now also
-    // traced as of r86's change to capture_compose_rect_internal).
-    //
-    // Sequence (matches r82 architecture, NOT r82 H2):
-    //   1. prime_with_warmup: STREAMON + primer + 2 warmup samples.
-    //   2. signal_eos_via_cmd_stop: VIDIOC_DECODER_CMD CMD_STOP.
-    //      bcm2835-codec drains its reorder buffer and emits
-    //      decoded frames; the LAST CAPTURE buffer has
-    //      V4L2_BUF_FLAG_LAST set per V4L2 spec.
-    //   3. drain_after_signal_eos: Frame-bypass DQBUF+QBUF loop
-    //      until FLAG_LAST seen (eos_seen=true). The Frame-bypass
-    //      avoids r81's Frame::drop-timing risk -- DQBUF and
-    //      immediate QBUF inside one inner.lock() scope.
-    //   4. resume_after_eos: VIDIOC_DECODER_CMD CMD_START to clear
-    //      kernel-side EOS state. Sets capture_drained=false.
-    //   5. Re-feed primer (SPS+PPS+sample[0]) + PRIME_WARMUP_FOR_PRELOAD
-    //      warmup samples to restore the kernel's B-frame lookahead
-    //      window (r80 subagent WARN-3 fix).
-    //   6. Reset state.frames_decoded = 0 (r80 subagent BLOCKER-1
-    //      fix preserved -- r62 first-frame cache fast path).
-    //
-    // NOT shipping r82 H2 (CAPTURE drain in stop_streaming_quiet)
-    // -- subagent flagged it as likely theater; the r84 baseline
-    // STREAMOFF is clean per telemetry, so adding H2 back invites
-    // a new failure surface for no proven benefit.
+    // Per QA's r88 dispatch permission ("If the fix is 'revert
+    // r85 entirely' then ship that -- the EOS-flush approach can
+    // be re-attempted later when we understand why r85's
+    // prime-path changes broke DMABUF"), r88 collapses the
+    // kill-switch + EOS-flush body entirely. Function is now
+    // byte-equivalent to r84's preload body. The
+    // `is_eos_flush_enabled()` helper and the r80-r82 dead-code
+    // helpers stay in the file for future re-activation once
+    // the DMABUF interaction is understood; gated by
+    // #[allow(dead_code)].
     let t_prime_only = Instant::now();
     let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
     let prime_only_us = t_prime_only.elapsed().as_micros();
-
     let budget_ms = preload_capture_drain_budget_ms();
     let t_drain = Instant::now();
     let mut detail = DrainDetail::default();
-    let drained = drain_after_signal_eos(&mut state, budget_ms, &mut detail);
+    let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
     let drain_us = t_drain.elapsed().as_micros();
-
-    // r80 BLOCKER-2 fix preserved: bail cleanly on budget exhaust.
-    if !detail.eos_seen {
-        // r85 subagent WARN-3 fix: call resume_after_eos BEFORE
-        // bail so the kernel transitions out of CMD_STOPPED state
-        // before STREAMOFF lands at Drop time. Without this the
-        // kernel-side STOPPED state and the r84-clean STREAMOFF
-        // baseline interact unpredictably (the r82 dmesg
-        // "leaving buffer N in active state" warning chain).
-        // resume_after_eos is idempotent on !capture_drained
-        // (no-ops + returns Ok), so calling it on the bail path
-        // when drain DIDN'T see FLAG_LAST is also safe -- the
-        // wrapper's capture_drained is false so the gate skips
-        // the ioctl. Result still recorded via r85 trace at the
-        // ioctl site (or via the explicit probe line below for
-        // the gated-skip case).
-        let resume_result = state.decoder.resume_after_eos();
-        let resume_ok = resume_result.is_ok();
-        // r85 subagent WARN-1 fix: emit the resume_after_eos probe
-        // on the FAILURE path too. r82_disabled had this; r85
-        // narrowed diagnostic surface by dropping it.
-        eprintln!(
-            "[perf] preload_resume_after_eos slide_id={} cmd_start_ok={} eos_seen={} context=bail_path",
-            slide_id, resume_ok, detail.eos_seen,
-        );
-        // Suppress the resume Err -- the bail below carries the
-        // user-facing failure context.
-        let _ = resume_result;
-
-        let reason = if detail.other_errs > 0 {
-            "drain_ioctl_error"
-        } else {
-            "kernel_never_signaled_FLAG_LAST"
-        };
-        eprintln!(
-            "[perf] preload_handoff_drain_budget_exhausted slide_id={} budget_ms={} \
-             eagain_polls={} other_errs={} frames_drained={} reason={}",
-            slide_id, budget_ms, detail.eagain_polls, detail.other_errs, drained, reason,
-        );
-        eprintln!(
-            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
-            slide_id, drained, prime_only_us, drain_us, budget_ms,
-        );
-        eprintln!(
-            "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
-            slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
-        );
-        anyhow::bail!(
-            "preload drain budget exhausted ({}ms) without kernel FLAG_LAST; \
-             slide will fall back to synchronous prime at BeginSlide",
-            budget_ms
-        );
-    }
-
-    // Step 4: resume kernel via CMD_START (clears capture_drained,
-    // output_eof_sent in our wrapper).
-    let resume_result = state.decoder.resume_after_eos();
-    eprintln!(
-        "[perf] preload_resume_after_eos slide_id={} cmd_start_ok={} eos_seen={} context=success_path",
-        slide_id, resume_result.is_ok(), detail.eos_seen,
-    );
-    resume_result.context("r85: resume_after_eos before re-priming SPS+PPS+IDR")?;
-
-    // Step 5: re-feed primer + warmup samples (mirrors
-    // reprime_video_decoder_for_loop end-of-clip path).
-    let first_sample = dem.samples.first()
-        .ok_or_else(|| anyhow::anyhow!("r85: MP4 contains zero samples"))?;
-    let header = dem.sps_pps_annexb();
-    let mut primer = Vec::with_capacity(header.len() + first_sample.len());
-    primer.extend_from_slice(&header);
-    primer.extend_from_slice(first_sample);
-    state.decoder.feed(&primer)
-        .context("r85: re-feed SPS+PPS+IDR primer after drain-resume")?;
-    state.next_sample_idx = 1;
-    let warmup_count = PRIME_WARMUP_FOR_PRELOAD.min(dem.samples.len().saturating_sub(1));
-    for _ in 0..warmup_count {
-        let s = &dem.samples[state.next_sample_idx];
-        match state.decoder.feed(s) {
-            Ok(()) => state.next_sample_idx += 1,
-            Err(e) => {
-                eprintln!(
-                    "warn: r85 post-resume warmup feed sample {} failed: {:#} \
-                     (continuing without full lookahead)",
-                    state.next_sample_idx, e,
-                );
-                break;
-            }
-        }
-    }
-
-    // Step 6: r80 BLOCKER-1 fix preserved -- reset frames_decoded
-    // so r62's first-frame cache fast path stays alive.
-    state.frames_decoded = 0;
-
     eprintln!(
         "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
         slide_id, drained, prime_only_us, drain_us, budget_ms,
