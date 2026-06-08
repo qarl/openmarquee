@@ -252,6 +252,16 @@ pub fn prime_video_decoder_with_warmup(
 ) -> Result<VideoDecoderState> {
     use std::path::Path;
     use std::time::Instant;
+    // r90 (2026-06-08) probe: per QA r90 dispatch's instrumentation-
+    // only ask. Fires UNCONDITIONALLY (not gated by EOS_FLUSH),
+    // so QA can compare OFF vs ON trace patterns directly. The
+    // warmup_count_requested distinguishes preload (=2) vs
+    // cold-start (=3) call sites without threading slide_id
+    // through the signature.
+    eprintln!(
+        "[perf] prime_with_warmup_entered warmup_count={} mp4_w={} mp4_h={} samples={}",
+        warmup_count_requested, dem.width, dem.height, dem.samples.len(),
+    );
     // r56 Phase A (2026-06-03): sub-phase timing for the prime
     // path. qarl observed per-transition stalls in a 4-video-slide
     // playlist; the "ipc: opened MP4" event lands AT the slide
@@ -528,7 +538,6 @@ fn preload_capture_drain_budget_ms() -> u64 {
 /// requires `systemctl restart openmarquee-backend`. Per-call
 /// resolution still lets QA toggle by setting env + restarting
 /// without rebuilding/redeploying the binary.
-#[allow(dead_code)]
 fn is_eos_flush_enabled() -> bool {
     match std::env::var("OPENMARQUEE_EOS_FLUSH") {
         Ok(s) => {
@@ -661,36 +670,145 @@ pub fn prime_video_decoder_for_preload(
     );
     log_preload_decoder_config(slide_id, dem, "preload");
 
-    // r88 (2026-06-08): HARD REVERT to r84 baseline body.
+    // r90 (2026-06-08): RE-ENABLE r86 kill-switch + r85 EOS-flush
+    // body INSIDE the gate (no new code added to the body itself --
+    // it's the SAME r85 body that was previously dead_code).
     //
-    // QA r88 dispatch data: even with r86's kill-switch
-    // (OPENMARQUEE_EOS_FLUSH=off forcing the OFF branch which
-    // already matched r84 baseline structurally), DMABUF=1 still
-    // produces 19+ REQBUFS OUTPUT EINVAL per 60s and the renderer
-    // can't even cold-start with DMABUF=0. r84 binary
-    // (md5 292609a) is clean under the same configuration. So
-    // SOMETHING in the cumulative diff between r84 and HEAD is
-    // breaking DMABUF -- code-reading my r85/r86/r87 changes
-    // doesn't reveal what, but QA's data is conclusive.
+    // Per QA r90 dispatch's instrumentation-only constraint:
+    // - Default OFF (EOS_FLUSH unset) = r84-baseline = clean
+    // - Setting OPENMARQUEE_EOS_FLUSH=1 enables the body, which QA
+    //   has data-proved reproduces the regression
+    // - The new prime_with_warmup_entered probe (in
+    //   prime_video_decoder_with_warmup at line 254-263) fires
+    //   UNCONDITIONALLY, so QA can A/B the OFF vs ON traces and
+    //   see exactly where they diverge
     //
-    // Per QA's r88 dispatch permission ("If the fix is 'revert
-    // r85 entirely' then ship that -- the EOS-flush approach can
-    // be re-attempted later when we understand why r85's
-    // prime-path changes broke DMABUF"), r88 collapses the
-    // kill-switch + EOS-flush body entirely. Function is now
-    // byte-equivalent to r84's preload body. The
-    // `is_eos_flush_enabled()` helper and the r80-r82 dead-code
-    // helpers stay in the file for future re-activation once
-    // the DMABUF interaction is understood; gated by
-    // #[allow(dead_code)].
+    // r85→r84 diff code-review came up EMPTY for any DMABUF
+    // change (r89 ship); my analysis says the bug shouldn't exist,
+    // but QA's fresh-boot reproduction proves it does. r90 adds
+    // the entry probe so the next round has more data to bisect
+    // on, and re-enables the path so QA can reproduce at will.
+
+    let eos_flush_enabled = is_eos_flush_enabled();
+    eprintln!(
+        "[perf] preload_eos_flush_mode slide_id={} enabled={}",
+        slide_id, eos_flush_enabled,
+    );
+
+    if !eos_flush_enabled {
+        // r84-baseline (default): prime + one-shot drain + emit.
+        let t_prime_only = Instant::now();
+        let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
+        let prime_only_us = t_prime_only.elapsed().as_micros();
+        let budget_ms = preload_capture_drain_budget_ms();
+        let t_drain = Instant::now();
+        let mut detail = DrainDetail::default();
+        let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
+        let drain_us = t_drain.elapsed().as_micros();
+        eprintln!(
+            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+            slide_id, drained, prime_only_us, drain_us, budget_ms,
+        );
+        eprintln!(
+            "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
+            slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
+        );
+        return Ok(state);
+    }
+
+    // r85 EOS-flush body (gated by OPENMARQUEE_EOS_FLUSH=1).
+    //
+    // r90 (2026-06-08) probe: per QA r90 dispatch's explicit ask
+    // for `[perf] eos_flush_branch_entered slide_id=N
+    // path=preload_worker|cold_start`. Fires at the VERY FIRST
+    // line of the EOS-flush-gated body so QA can confirm exactly
+    // which cycle's prime is the first one to take the bad branch.
+    // path=preload_worker because prime_video_decoder_for_preload
+    // is ONLY called from preload_in_worker (the sync BeginSlide
+    // path uses prime_video_decoder, not _for_preload).
+    eprintln!(
+        "[perf] eos_flush_branch_entered slide_id={} path=preload_worker",
+        slide_id,
+    );
+
     let t_prime_only = Instant::now();
     let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
     let prime_only_us = t_prime_only.elapsed().as_micros();
+
     let budget_ms = preload_capture_drain_budget_ms();
     let t_drain = Instant::now();
     let mut detail = DrainDetail::default();
-    let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
+    let drained = drain_after_signal_eos(&mut state, budget_ms, &mut detail);
     let drain_us = t_drain.elapsed().as_micros();
+
+    // r80 BLOCKER-2 fix preserved: bail cleanly on budget exhaust.
+    if !detail.eos_seen {
+        let resume_result = state.decoder.resume_after_eos();
+        let resume_ok = resume_result.is_ok();
+        eprintln!(
+            "[perf] preload_resume_after_eos slide_id={} cmd_start_ok={} eos_seen={} context=bail_path",
+            slide_id, resume_ok, detail.eos_seen,
+        );
+        let _ = resume_result;
+
+        let reason = if detail.other_errs > 0 {
+            "drain_ioctl_error"
+        } else {
+            "kernel_never_signaled_FLAG_LAST"
+        };
+        eprintln!(
+            "[perf] preload_handoff_drain_budget_exhausted slide_id={} budget_ms={} \
+             eagain_polls={} other_errs={} frames_drained={} reason={}",
+            slide_id, budget_ms, detail.eagain_polls, detail.other_errs, drained, reason,
+        );
+        eprintln!(
+            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+            slide_id, drained, prime_only_us, drain_us, budget_ms,
+        );
+        eprintln!(
+            "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
+            slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
+        );
+        anyhow::bail!(
+            "preload drain budget exhausted ({}ms) without kernel FLAG_LAST; \
+             slide will fall back to synchronous prime at BeginSlide",
+            budget_ms
+        );
+    }
+
+    let resume_result = state.decoder.resume_after_eos();
+    eprintln!(
+        "[perf] preload_resume_after_eos slide_id={} cmd_start_ok={} eos_seen={} context=success_path",
+        slide_id, resume_result.is_ok(), detail.eos_seen,
+    );
+    resume_result.context("r85: resume_after_eos before re-priming SPS+PPS+IDR")?;
+
+    let first_sample = dem.samples.first()
+        .ok_or_else(|| anyhow::anyhow!("r85: MP4 contains zero samples"))?;
+    let header = dem.sps_pps_annexb();
+    let mut primer = Vec::with_capacity(header.len() + first_sample.len());
+    primer.extend_from_slice(&header);
+    primer.extend_from_slice(first_sample);
+    state.decoder.feed(&primer)
+        .context("r85: re-feed SPS+PPS+IDR primer after drain-resume")?;
+    state.next_sample_idx = 1;
+    let warmup_count = PRIME_WARMUP_FOR_PRELOAD.min(dem.samples.len().saturating_sub(1));
+    for _ in 0..warmup_count {
+        let s = &dem.samples[state.next_sample_idx];
+        match state.decoder.feed(s) {
+            Ok(()) => state.next_sample_idx += 1,
+            Err(e) => {
+                eprintln!(
+                    "warn: r85 post-resume warmup feed sample {} failed: {:#} \
+                     (continuing without full lookahead)",
+                    state.next_sample_idx, e,
+                );
+                break;
+            }
+        }
+    }
+    state.frames_decoded = 0;
+
     eprintln!(
         "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
         slide_id, drained, prime_only_us, drain_us, budget_ms,
