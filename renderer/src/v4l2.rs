@@ -1226,9 +1226,16 @@ impl Decoder {
         let mut raw: V4l2Capability = unsafe { std::mem::zeroed() };
         // SAFETY: vidioc_querycap is _IOR -- kernel writes the
         // V4l2Capability. fd is owned by inner.file (locked).
-        unsafe {
-            vidioc_querycap(inner.fd(), &mut raw)
-        }.with_context(|| {
+        // r87 (2026-06-09) ioctl trace: QUERYCAP runs inside
+        // Decoder::open BEFORE S_FMT. Was the last untraced ioctl
+        // in the prime path. Adds visibility for QA's "find what
+        // runs between Decoder::open and S_FMT" ask.
+        let r = unsafe { vidioc_querycap(inner.fd(), &mut raw) };
+        eprintln!(
+            "[perf] v4l2_ioctl op=QUERYCAP result={}",
+            match &r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+        );
+        r.with_context(|| {
             format!("VIDIOC_QUERYCAP on {}", inner.path.display())
         })?;
         Ok(Capabilities {

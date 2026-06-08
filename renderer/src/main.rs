@@ -1330,6 +1330,28 @@ mod tests {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // r87 (2026-06-09) startup env-var banner per QA r87 dispatch
+    // ask. r86 telemetry showed EOS_FLUSH=1 systemd drop-in
+    // caused REQBUFS EINVAL on the very first decoder open --
+    // before any of my code's runtime branching could plausibly
+    // diverge from the r84-clean OFF mode. Hypothesis: the
+    // systemd drop-in inadvertently set OTHER env vars that
+    // change the V4L2 init path (e.g. OPENMARQUEE_RENDERER_DMABUF).
+    // r87 banner enumerates EVERY OPENMARQUEE_* env var visible
+    // to this renderer subprocess at spawn time so QA can pin
+    // the diff between OFF and ON modes from the journal.
+    let mut renderer_env_vars: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("OPENMARQUEE_"))
+        .collect();
+    renderer_env_vars.sort_by(|a, b| a.0.cmp(&b.0));
+    if renderer_env_vars.is_empty() {
+        eprintln!("[perf] renderer_startup_env count=0");
+    } else {
+        for (k, v) in &renderer_env_vars {
+            eprintln!("[perf] renderer_startup_env key={} value={:?}", k, v);
+        }
+    }
+
     // qarl-direct perf-profile: enable profile mode at startup
     // if --profile-frames is set. Renderer hot loops check
     // profile::is_enabled() / frames_remaining() to record

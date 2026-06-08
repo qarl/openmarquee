@@ -271,10 +271,27 @@ pub fn prime_video_decoder_with_warmup(
     let dec = v4l2::Decoder::open(path)
         .with_context(|| format!("open V4L2 decoder at {}", V4L2_DECODER_PATH))?;
     let device_open_us = t_device_open.elapsed().as_micros();
-    let use_dmabuf = std::env::var("OPENMARQUEE_RENDERER_DMABUF")
-        .ok()
+    let dmabuf_env = std::env::var("OPENMARQUEE_RENDERER_DMABUF").ok();
+    let use_dmabuf = dmabuf_env
+        .as_deref()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // r87 (2026-06-09): surface the DMA env-var state per prime.
+    // r86's kill-switch revealed that EOS_FLUSH=1 systemd drop-ins
+    // MAY have been setting other env vars too; this probe lets
+    // QA verify exactly which mode the running process sees,
+    // side-by-side with preload_eos_flush_mode. Cost: one eprintln
+    // per prime (microseconds; absorbed by stderr buffer).
+    //
+    // r87 subagent WARN-1: labelled `prime_dmabuf_mode` (not
+    // `preload_dmabuf_mode`) because `prime_video_decoder_with_warmup`
+    // is also reached from cold-start `prime_video_decoder` +
+    // standalone reel paths -- the `preload_*` prefix would
+    // mislead QA's A/B grep into matching unrelated primes.
+    eprintln!(
+        "[perf] prime_dmabuf_mode use_dmabuf={} env_raw={:?}",
+        use_dmabuf, dmabuf_env,
+    );
     if use_dmabuf {
         dec.set_capture_buffer_type(v4l2::CaptureBufferType::DmaBuf);
     }
@@ -687,6 +704,16 @@ pub fn prime_video_decoder_for_preload(
         );
         return Ok(state);
     }
+
+    // r87 (2026-06-09) explicit marker per QA dispatch ask
+    // ("Even just an `eprintln!('entering EOS-flush prime body')`
+    // at the top of that body would help"). Lets QA confirm
+    // exactly where the ON-branch code begins, even on a path
+    // that fails before reaching downstream EOS-flush traces.
+    eprintln!(
+        "[perf] preload_eos_flush_body_entered slide_id={}",
+        slide_id,
+    );
 
     // r85 EOS-flush body (gated by OPENMARQUEE_EOS_FLUSH=1).
     //
