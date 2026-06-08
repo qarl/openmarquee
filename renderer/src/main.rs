@@ -156,22 +156,38 @@ pub const PRIME_WARMUP_DEFAULT: usize = 3;
 /// can produce at most 3 CAPTURE frames -> pool of 4 has at
 /// least 1 free slot whether or not the drain succeeds.
 ///
-/// r77 subagent BLOCKER: do NOT bump to 3 unconditionally if FYS
-/// still shows frames_drained=0 with =2. At warmup=3 the math
-/// goes back to "4 OUTPUT queued -> 4 CAPTURE produced -> pool
-/// saturates" -- the EXACT r73 wedge. r76's drain only protects
-/// against saturation when it actually dequeues a frame
-/// (frames_drained >= 1). The next bump is gated:
-///   - If FYS shows frames_drained >= 1 with =2 (drain working)
-///     AND transitions still snap-cut, then warmup=3 is the next
-///     experiment, safe under the drain.
-///   - If FYS still shows frames_drained=0 with =2, the drain
-///     ISN'T rescuing us and warmup=3 would re-brick transitions.
-///     Different fix needed: either bump warmup higher in a
-///     separate experiment (with explicit instrumentation
-///     confirming the drain consumes), or revisit content
-///     assumptions (open-GOP / decoder profile mismatch).
-pub const PRIME_WARMUP_FOR_PRELOAD: usize = 2;
+/// r93 (2026-06-08) BUMPED TO 3 after the EOS-flush arc
+/// (r80/r81/r82/r85/r87/r91/r92) closed empty. qarl push-back:
+/// "video transitions used to work." The architectural regression
+/// was the r65 async preload + r73 warmup_count split itself:
+/// cold-start at warmup_count=3 produces frames reliably; preload
+/// at warmup=1 (or =2 per r77) never produces frame 0. The whole
+/// CMD_STOP arc was trying to FORCE the kernel to emit a frame the
+/// driver wasn't ready to commit -- r92 proved CMD_STOP itself is
+/// poisonous on bcm2835-codec. Simplest possible fix per QA r93
+/// dispatch: feed more samples (3) at preload, matching cold-start.
+///
+/// Saturation concern (the original r73 invariant):
+///   At warmup=3, prime QBUFs 4 OUTPUT samples; kernel decodes
+///   into 4 CAPTURE buffers; CAPTURE pool is 4 -> saturates;
+///   bcm2835-codec can't release pinned OUTPUT.
+///
+/// Why r93 ships it anyway (per QA dispatch):
+///   1. Cold-start uses warmup=3 in production and works. Proof
+///      saturation isn't always fatal.
+///   2. Existing instrumentation (vpu_mmal_components, REQBUFS
+///      EINVAL, dmesg leaving_buffer) will pin saturation
+///      immediately if it bites. Roll back to =2 + ship Path B
+///      (drain at consumer not producer) if it does.
+///
+/// History:
+/// - r73 (2026-06-06) initially set this to 1 to avoid saturation.
+/// - r77 (2026-06-07) bumped to 2 after Phase B telemetry refuted
+///   r73's invariant: warmup=1 never produced a decoded frame.
+/// - r93 (2026-06-08) bumped to 3 after the EOS-flush arc proved
+///   CMD_STOP isn't a viable signal on bcm2835-codec. Feed more,
+///   don't signal.
+pub const PRIME_WARMUP_FOR_PRELOAD: usize = 3;
 
 use std::path::PathBuf;
 
@@ -1150,27 +1166,16 @@ mod tests {
     }
 
     #[test]
-    fn prime_warmup_for_preload_is_two() {
-        // r77 (2026-06-07): bumped 1 -> 2 after Phase B telemetry
-        // empirically refuted the r73 invariant. With warmup=1
-        // (primer + 1 sample = 2 OUTPUT-queued total), 11/11
-        // preloads on FYS hit frames_drained=0 even with a
-        // 2000ms drain budget. The single warmup sample was a
-        // B-frame depending on a future P-frame; kernel couldn't
-        // decode anything until the playback loop fed more input.
-        //
-        // =2 means prime feeds 3 samples (primer + 2 warmup).
-        // r76 Phase B's drain helps unblock the wait-for-userspace
-        // state when it consumes a frame.
-        //
-        // r77 subagent BLOCKER: the next bump (to 3) is GATED on
-        // observing frames_drained >= 1 with =2 first. At warmup=3
-        // the math goes back to "4 OUTPUT queued -> 4 CAPTURE
-        // produced -> pool saturates" -- the EXACT r73 wedge.
-        // The drain only protects against saturation when it
-        // actually dequeues a frame. See PRIME_WARMUP_FOR_PRELOAD
-        // docstring for the full gated-bump protocol.
-        assert_eq!(super::PRIME_WARMUP_FOR_PRELOAD, 2);
+    fn prime_warmup_for_preload_is_three() {
+        // r93 (2026-06-08): bumped 2 -> 3 after the EOS-flush arc
+        // (r80/r81/r82/r85/r87/r91/r92) closed empty. r92 proved
+        // CMD_STOP is poisonous on bcm2835-codec; trying to FORCE
+        // the kernel to emit a frame at low warmup isn't viable.
+        // Simplest fix per QA r93 dispatch: feed more samples
+        // (3) at preload, matching cold-start's known-working
+        // value. See PRIME_WARMUP_FOR_PRELOAD docstring in main.rs
+        // for the saturation-concern + roll-back-plan history.
+        assert_eq!(super::PRIME_WARMUP_FOR_PRELOAD, 3);
     }
 
     #[test]
