@@ -211,6 +211,14 @@ pub const V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE: u32 = 10;
 pub const V4L2_MEMORY_MMAP: u32 = 1;
 pub const V4L2_MEMORY_DMABUF: u32 = 4;
 
+// r83 Phase A (2026-06-08): VIDIOC_G_SELECTION targets. COMPOSE is
+// the "display this sub-rect of the allocated frame" target for
+// CAPTURE-side queries on a video-decoder m2m device — the rect
+// that excludes the bcm2835-codec's 8-row bottom padding on 1080p
+// H.264. Full enumeration in <linux/videodev2.h>; we only need
+// COMPOSE today.
+pub const V4L2_SEL_TGT_COMPOSE: u32 = 0x0100;
+
 // ============================================================
 // V4L2 buffer flags (subset).
 // ============================================================
@@ -353,6 +361,44 @@ pub struct V4l2DecoderCmd {
     pub payload: [u32; 16],
 }
 
+/// r83 Phase A (2026-06-08): kernel `struct v4l2_rect`. Used as
+/// the embedded `r` field of `struct v4l2_selection`. Signed
+/// `left/top` because the kernel encodes "outside the original
+/// frame" via negative offsets (rare but valid per the API).
+///
+/// References:
+///   - <linux/videodev2.h> struct v4l2_rect
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct V4l2Rect {
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// r83 Phase A (2026-06-08): kernel `struct v4l2_selection`. The
+/// arg-by-pointer struct VIDIOC_G_SELECTION reads + writes. Caller
+/// populates `buf_type` (e.g. `V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE`)
+/// and `target` (e.g. `V4L2_SEL_TGT_COMPOSE` = 0x0100); kernel
+/// fills `r` and `flags`.
+///
+/// Size: 4 + 4 + 4 + 16 + 9*4 = 64 bytes — matches the kernel
+/// definition.
+///
+/// References:
+///   - <linux/videodev2.h> struct v4l2_selection
+///   - <https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/vidioc-g-selection.html>
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct V4l2Selection {
+    pub buf_type: u32,
+    pub target: u32,
+    pub flags: u32,
+    pub r: V4l2Rect,
+    pub reserved: [u32; 9],
+}
+
 /// Single plane's metadata inside a multiplanar v4l2_buffer.
 /// Size: 64 bytes.
 #[repr(C)]
@@ -461,6 +507,16 @@ const _: () = {
     if std::mem::size_of::<V4l2DecoderCmd>() != 72 {
         panic!("V4l2DecoderCmd size mismatch (expected 72)");
     }
+    // r83 Phase A (2026-06-08): VIDIOC_G_SELECTION marshalling
+    // structs. Sizes must match <linux/videodev2.h> exactly so the
+    // ioctl request word (derived from sizeof(T)) lines up with what
+    // the kernel expects.
+    if std::mem::size_of::<V4l2Rect>() != 16 {
+        panic!("V4l2Rect size mismatch (expected 16)");
+    }
+    if std::mem::size_of::<V4l2Selection>() != 64 {
+        panic!("V4l2Selection size mismatch (expected 64)");
+    }
 };
 
 // ============================================================
@@ -517,6 +573,22 @@ nix::ioctl_readwrite!(vidioc_expbuf, b'V', 16, V4l2Exportbuffer);
 // with the r46.3 EINVAL failure mode).
 #[cfg(target_os = "linux")]
 nix::ioctl_readwrite!(vidioc_decoder_cmd, b'V', 96, V4l2DecoderCmd);
+
+// r83 Phase A (2026-06-08): VIDIOC_G_SELECTION -- query the
+// kernel's reported crop / display window for a queue, returning
+// a v4l2_selection {type, target, flags, r=(left, top, width,
+// height), reserved[9]}. Used to ask the CAPTURE pool for its
+// V4L2_SEL_TGT_COMPOSE (= 0x0100) rect, which is the valid
+// display region inside the allocated pixfmt frame. On the
+// bcm2835-codec the allocated CAPTURE height is rounded to the
+// next H.264 macroblock multiple (1080 -> 1088 for 1080p),
+// leaving 8 rows of uninitialised NV12 padding at the bottom
+// that render as luma-0 + chroma-128 -> bright green when
+// sampled by the BT.709 shader. G_SELECTION(COMPOSE) tells us
+// "use only the (0, 0, 1920, 1080) sub-rect, ignore the pad."
+// `_IOWR('V', 60, v4l2_selection)`.
+#[cfg(target_os = "linux")]
+nix::ioctl_readwrite!(vidioc_g_selection, b'V', 60, V4l2Selection);
 
 // ============================================================
 // Higher-level types.
@@ -1290,7 +1362,92 @@ impl Decoder {
             QueueDirection::Output => inner.output_format = Some(neg.clone()),
             QueueDirection::Capture => inner.capture_format = Some(neg.clone()),
         }
+        drop(inner);
+
+        // r83 Phase A (2026-06-08): on CAPTURE S_FMT, query
+        // VIDIOC_G_SELECTION(COMPOSE) to surface whether the kernel
+        // allocated more rows than it's going to fill with valid
+        // pixels (the 1080 -> 1088 macroblock rounding on bcm2835-
+        // codec). Log both the pixfmt dims and the COMPOSE rect
+        // side-by-side so journalctl can confirm or refute the
+        // bottom-row-green hypothesis empirically.
+        //
+        // Probe is best-effort: G_SELECTION can return ENOTTY on
+        // older drivers OR EINVAL on bottom-up queries that the
+        // driver hasn't wired; in either case we log the failure
+        // mode rather than failing S_FMT itself (the rest of the
+        // path still works, just with the misalignment uncorrected).
+        if matches!(dir, QueueDirection::Capture) {
+            match self.capture_compose_rect_internal() {
+                Ok(Some(r)) => eprintln!(
+                    "[perf] v4l2_capture_geometry pixfmt_w={} pixfmt_h={} \
+                     plane_stride={} compose_x={} compose_y={} \
+                     compose_w={} compose_h={}",
+                    neg.width, neg.height,
+                    neg.plane_fmt.first().map(|pf| pf.bytesperline).unwrap_or(0),
+                    r.left, r.top, r.width, r.height,
+                ),
+                Ok(None) => eprintln!(
+                    "[perf] v4l2_capture_geometry pixfmt_w={} pixfmt_h={} \
+                     plane_stride={} compose=unsupported",
+                    neg.width, neg.height,
+                    neg.plane_fmt.first().map(|pf| pf.bytesperline).unwrap_or(0),
+                ),
+                Err(e) => eprintln!(
+                    "[perf] v4l2_capture_geometry pixfmt_w={} pixfmt_h={} \
+                     plane_stride={} compose_err={}",
+                    neg.width, neg.height,
+                    neg.plane_fmt.first().map(|pf| pf.bytesperline).unwrap_or(0),
+                    e,
+                ),
+            }
+        }
         Ok(neg)
+    }
+
+    /// r83 Phase A (2026-06-08): query the kernel's compose rect
+    /// for the CAPTURE queue. Returns `Ok(Some(rect))` on success,
+    /// `Ok(None)` when the driver doesn't implement G_SELECTION
+    /// (errno ENOTTY) or doesn't expose the COMPOSE target (errno
+    /// EINVAL — common on capture-only queues whose alloc dims
+    /// already match the display region). Returns `Err` for
+    /// genuine failures.
+    ///
+    /// On bcm2835-codec the m2m decoder DOES support
+    /// G_SELECTION(COMPOSE) and reports the actually-valid display
+    /// region — for 1080p H.264 input that's (0, 0, 1920, 1080)
+    /// against a (1920, 1088) pixfmt allocation. Callers that
+    /// sample the CAPTURE texture / DMABUF should use this rect
+    /// rather than the pixfmt dims to avoid sampling the bottom 8
+    /// rows of NV12-uninitialised (= green when BT.709-decoded)
+    /// padding.
+    pub fn capture_compose_rect(&self) -> Result<Option<V4l2Rect>> {
+        self.capture_compose_rect_internal()
+    }
+
+    fn capture_compose_rect_internal(&self) -> Result<Option<V4l2Rect>> {
+        let inner = self.inner.lock().unwrap();
+        let mut sel = V4l2Selection {
+            buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            target: V4L2_SEL_TGT_COMPOSE,
+            ..Default::default()
+        };
+        // SAFETY: VIDIOC_G_SELECTION is _IOWR. fd owned by inner.
+        // Caller's sel struct is fully initialised; kernel writes
+        // back `r` + `flags` (+ may overwrite `reserved` as
+        // documented per the API).
+        let r = unsafe { vidioc_g_selection(inner.fd(), &mut sel) };
+        match r {
+            Ok(_) => Ok(Some(sel.r)),
+            // ENOTTY: ioctl not implemented (older driver, or this
+            // device doesn't support the G_SELECTION mechanism).
+            // EINVAL: ioctl implemented but doesn't recognise the
+            // (buf_type, target) combination — typical when the
+            // allocated dims already match the display region and
+            // the driver short-circuits the query.
+            Err(nix::errno::Errno::ENOTTY) | Err(nix::errno::Errno::EINVAL) => Ok(None),
+            Err(e) => Err(anyhow!("VIDIOC_G_SELECTION COMPOSE: {}", e)),
+        }
     }
 
     /// VIDIOC_REQBUFS + VIDIOC_QUERYBUF + mmap for `count`
