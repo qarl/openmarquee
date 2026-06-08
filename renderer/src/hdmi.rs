@@ -4948,6 +4948,16 @@ pub fn paint_and_present_one_transition_frame(
         // this tick (the next advance retries). bake_a's None has
         // already freed its own FBO pair, so there is nothing to
         // clean up here.
+        //
+        // r94 Path B note: bake_a's Ok(None) is NOT wrapped in a
+        // deadline-poll. endpoint_a is the from-slide whose video
+        // decoder has been playing -- its pipeline is warm and an
+        // Ok(None) here means a genuine stall (decoder error, end
+        // of clip, etc.) rather than the cold-start latency Path B
+        // exists to absorb. The asymmetric treatment matches the
+        // observed failure shape: only endpoint_b's just-primed
+        // decoder needs the polling window. If a future symptom
+        // shows endpoint_a stalling, mirror the bake_b loop here.
         let Some((fbo_a, tex_a)) =
             bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_a)?
         else {
@@ -4956,96 +4966,206 @@ pub fn paint_and_present_one_transition_frame(
             );
             return Ok(false);
         };
-        let inputs_b = match &mut endpoint_b {
-            TransitionEndpoint::Text(_) => {
-                let (id, bg, layers, states) =
-                    text_b.as_ref().expect("text_b pre-resolved above");
-                SlideBakeInputs::Text {
-                    slide_id: *id,
-                    bg_kind: bg,
-                    text_layers: layers,
-                    motion_states: Some(states),
+        // r94 Path B (2026-06-08): consumer-side deadline-poll.
+        //
+        // r80-r92 tried to PRE-PROVIDE endpoint_b's first frame at
+        // prime time (via warmup_count, via CMD_STOP EOS-flush, via
+        // ioctl bisecting). r93 proved warmup=3 wedges the renderer
+        // (CAPTURE saturation pins OUTPUT). r92 proved CMD_STOP is
+        // poisonous on bcm2835-codec. Path B inverts the design:
+        // don't pre-provide; consume-with-deadline at the actual
+        // point of need.
+        //
+        // Pre-r94: bake_slide_to_fbo Ok(None) immediately fell
+        // through to "skip swap + hold prior frame" (the cut-like
+        // visual). The kernel got ZERO of the transition window to
+        // produce frame 0.
+        //
+        // r94: on Ok(None), sleep briefly + retry bake_slide_to_fbo
+        // up to OPENMARQUEE_BAKE_B_POLL_DEADLINE_MS (default 100ms,
+        // ~ 3 frames @ 30fps). Each retry feeds another sample (per
+        // bake_video_slide_to_current_fbo's internal feed step) so
+        // the kernel pipeline gets progressively more input.
+        //
+        // Deadline budget math (subagent r94 WARN-1):
+        //   - bake_video_slide_to_current_fbo's INNER retry loop at
+        //     hdmi.rs:7677 = 10 * 3ms = ~30ms per call before
+        //     returning Ok(None).
+        //   - Outer (this) loop's 2ms sleep + ~30ms inner = ~32ms
+        //     per iteration. Default deadline=100ms allows ~3
+        //     iterations -- enough to actually push the kernel
+        //     pipeline forward through cold-start.
+        //
+        // Iteration safety caps (subagent r94 WARN-2 + WARN-3):
+        //   - hard MAX_ITERS=4 cap independent of time. paint runs
+        //     on the IPC main thread (EglSession !Send), so a long
+        //     synchronous poll blocks cancel/health-check IPC ops.
+        //     4 iterations at ~32ms ≈ 128ms cap -- safely under the
+        //     backend's 60s IPC timeout but bounded.
+        //   - Iteration cap also bounded by samples-remaining for
+        //     the video endpoint so the in-bake wrap at
+        //     hdmi.rs:7697 doesn't trigger mid-loop (the wrap's
+        //     V4L2-state reset is dispatcher-side, BEFORE bake;
+        //     wrapping inside Path B would bypass it).
+        //
+        // GL-resource safety: bake_slide_to_fbo's Video branch at
+        // hdmi.rs:8329 deletes its created (fbo, tex) on Ok(None)
+        // before returning, so retrying doesn't leak GL state.
+        //
+        // The new probe `[perf] bake_b_poll_outcome` lets QA see
+        // how many iterations + how long it took. The legacy
+        // `endpoint_b_no_frame` WARN throttle is preserved on the
+        // deadline-exhaust path so existing dashboards still work.
+        const PATH_B_MAX_ITERS: u32 = 4;
+        let bake_b_deadline_ms: u64 = std::env::var("OPENMARQUEE_BAKE_B_POLL_DEADLINE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100);
+        let bake_b_deadline = std::time::Duration::from_millis(bake_b_deadline_ms);
+        let bake_b_start = std::time::Instant::now();
+        // Snapshot the maximum samples we can advance through this
+        // bake call without hitting the in-bake wrap. Re-read each
+        // iteration via `endpoint_b` because Video's next_sample_idx
+        // mutates per inner bake call.
+        let mut bake_b_iterations: u32 = 0;
+        let (fbo_b, tex_b) = loop {
+            bake_b_iterations += 1;
+            // Re-build inputs_b on each iteration. The match consumes
+            // a fresh `&mut endpoint_b` borrow, which is released
+            // when bake_slide_to_fbo consumes the inputs.
+            let inputs_b = match &mut endpoint_b {
+                TransitionEndpoint::Text(_) => {
+                    let (id, bg, layers, states) =
+                        text_b.as_ref().expect("text_b pre-resolved above");
+                    SlideBakeInputs::Text {
+                        slide_id: *id,
+                        bg_kind: bg,
+                        text_layers: layers,
+                        motion_states: Some(states),
+                    }
                 }
-            }
-            TransitionEndpoint::Image(_) => {
-                let (sid, path) = image_b.as_ref().expect("image_b pre-resolved above");
-                SlideBakeInputs::Image {
-                    slide_id: *sid,
-                    asset_path: path.as_path(),
+                TransitionEndpoint::Image(_) => {
+                    let (sid, path) = image_b.as_ref().expect("image_b pre-resolved above");
+                    SlideBakeInputs::Image {
+                        slide_id: *sid,
+                        asset_path: path.as_path(),
+                    }
                 }
-            }
-            TransitionEndpoint::Video {
-                samples,
-                next_sample_idx,
-                frames_decoded,
-                decoder,
-                ..
-            } => SlideBakeInputs::Video {
-                samples: *samples,
-                next_sample_idx: &mut **next_sample_idx,
-                frames_decoded: &mut **frames_decoded,
-                decoder: *decoder,
-            },
-            TransitionEndpoint::TextOverVideo {
-                bg_samples,
-                bg_next_sample_idx,
-                bg_frames_decoded,
-                bg_decoder,
-                ..
-            } => {
-                let (id, layers, states) = text_over_video_b
-                    .as_ref()
-                    .expect("text_over_video_b pre-resolved above");
-                SlideBakeInputs::TextOverVideo {
-                    slide_id: *id,
-                    text_layers: layers,
-                    motion_states: Some(states),
-                    bg_samples: *bg_samples,
-                    bg_next_sample_idx: &mut **bg_next_sample_idx,
-                    bg_frames_decoded: &mut **bg_frames_decoded,
-                    bg_decoder: *bg_decoder,
+                TransitionEndpoint::Video {
+                    samples,
+                    next_sample_idx,
+                    frames_decoded,
+                    decoder,
+                    ..
+                } => SlideBakeInputs::Video {
+                    samples: *samples,
+                    next_sample_idx: &mut **next_sample_idx,
+                    frames_decoded: &mut **frames_decoded,
+                    decoder: *decoder,
+                },
+                TransitionEndpoint::TextOverVideo {
+                    bg_samples,
+                    bg_next_sample_idx,
+                    bg_frames_decoded,
+                    bg_decoder,
+                    ..
+                } => {
+                    let (id, layers, states) = text_over_video_b
+                        .as_ref()
+                        .expect("text_over_video_b pre-resolved above");
+                    SlideBakeInputs::TextOverVideo {
+                        slide_id: *id,
+                        text_layers: layers,
+                        motion_states: Some(states),
+                        bg_samples: *bg_samples,
+                        bg_next_sample_idx: &mut **bg_next_sample_idx,
+                        bg_frames_decoded: &mut **bg_frames_decoded,
+                        bg_decoder: *bg_decoder,
+                    }
                 }
-            }
-        };
-        let (fbo_b, tex_b) = match bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_b) {
-            Ok(Some(p)) => {
-                // r76 Phase A: emit the begin_transition -> endpoint_b
-                // first-frame gap. Marker is set at BeginTransition;
-                // first Ok(Some(_)) here consumes it. Subsequent
-                // frames in the same transition window see None and
-                // emit nothing.
-                //
-                // r76 subagent WARN-1: gate on Video-bearing
-                // endpoint_b. Text/Image bake_slide_to_fbo Ok(Some)
-                // trivially on first call without touching V4L2, so
-                // emitting the metric there gives wait_ms=0 lines
-                // that pollute QA's dataset. Leave the marker set
-                // for the next BeginTransition to overwrite (which
-                // emits the unconsumed-on-overwrite diagnostic line
-                // for the FAILURE case the dispatch wants to find).
-                if matches!(
-                    endpoint_b,
-                    TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
-                ) {
-                    crate::hdmi_logic::consume_transition_endpoint_b_first_frame_marker();
+            };
+            match bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_b) {
+                Ok(Some(p)) => {
+                    // r76 Phase A: emit begin_transition -> endpoint_b
+                    // first-frame gap. r94: also surface poll outcome
+                    // so QA sees how long the kernel pipeline took.
+                    if matches!(
+                        endpoint_b,
+                        TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
+                    ) {
+                        crate::hdmi_logic::consume_transition_endpoint_b_first_frame_marker();
+                    }
+                    let elapsed_us = bake_b_start.elapsed().as_micros();
+                    if bake_b_iterations > 1 {
+                        eprintln!(
+                            "[perf] bake_b_poll_outcome kind={} progress={:.3} \
+                             iterations={} elapsed_us={} result=ok_after_polling \
+                             deadline_ms={}",
+                            kind, progress, bake_b_iterations, elapsed_us, bake_b_deadline_ms,
+                        );
+                    }
+                    break p;
                 }
-                p
-            }
-            Ok(None) => {
-                // FYS bug C: the to-endpoint video had no frame this
-                // tick. Free the already-baked from-endpoint FBO and
-                // skip the transition paint for this tick.
-                crate::hdmi_logic::warn_paint_transition_skip(
-                    kind, progress, "endpoint_b_no_frame",
-                );
-                session.gl.delete_framebuffer(fbo_a);
-                session.gl.delete_texture(tex_a);
-                return Ok(false);
-            }
-            Err(e) => {
-                session.gl.delete_framebuffer(fbo_a);
-                session.gl.delete_texture(tex_a);
-                return Err(e);
+                Ok(None) => {
+                    // r94 Path B: kernel pipeline not ready yet.
+                    // Three independent caps gate the retry:
+                    //   1. Deadline (default 100ms; env-tunable)
+                    //   2. PATH_B_MAX_ITERS=4 (IPC-thread block cap)
+                    //   3. Samples-remaining for Video endpoints
+                    //      (avoid in-bake wrap bypassing the
+                    //      dispatcher-side V4L2 state reset)
+                    let deadline_ok = bake_b_start.elapsed() < bake_b_deadline;
+                    let iter_ok = bake_b_iterations < PATH_B_MAX_ITERS;
+                    let samples_remaining_ok = match &endpoint_b {
+                        TransitionEndpoint::Video {
+                            samples,
+                            next_sample_idx,
+                            ..
+                        }
+                        | TransitionEndpoint::TextOverVideo {
+                            bg_samples: samples,
+                            bg_next_sample_idx: next_sample_idx,
+                            ..
+                        } => {
+                            // Next bake_video call advances by 1; we
+                            // need samples[idx] to exist for the
+                            // upcoming iteration without wrap.
+                            **next_sample_idx < samples.len()
+                        }
+                        _ => true, // Text/Image never returns None
+                    };
+                    if deadline_ok && iter_ok && samples_remaining_ok {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        continue;
+                    }
+                    // Caps exhausted. Fall through to the legacy r69
+                    // skip + WARN behavior.
+                    let elapsed_us = bake_b_start.elapsed().as_micros();
+                    let reason = if !samples_remaining_ok {
+                        "samples_exhausted_in_loop"
+                    } else if !iter_ok {
+                        "iter_cap"
+                    } else {
+                        "deadline_exhausted"
+                    };
+                    eprintln!(
+                        "[perf] bake_b_poll_outcome kind={} progress={:.3} \
+                         iterations={} elapsed_us={} result={} \
+                         deadline_ms={}",
+                        kind, progress, bake_b_iterations, elapsed_us, reason, bake_b_deadline_ms,
+                    );
+                    crate::hdmi_logic::warn_paint_transition_skip(
+                        kind, progress, "endpoint_b_no_frame",
+                    );
+                    session.gl.delete_framebuffer(fbo_a);
+                    session.gl.delete_texture(tex_a);
+                    return Ok(false);
+                }
+                Err(e) => {
+                    session.gl.delete_framebuffer(fbo_a);
+                    session.gl.delete_texture(tex_a);
+                    return Err(e);
+                }
             }
         };
         let cleanup_static = |gl: &glow::Context, vbo: Option<glow::Buffer>| {

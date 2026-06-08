@@ -156,38 +156,34 @@ pub const PRIME_WARMUP_DEFAULT: usize = 3;
 /// can produce at most 3 CAPTURE frames -> pool of 4 has at
 /// least 1 free slot whether or not the drain succeeds.
 ///
-/// r93 (2026-06-08) BUMPED TO 3 after the EOS-flush arc
-/// (r80/r81/r82/r85/r87/r91/r92) closed empty. qarl push-back:
-/// "video transitions used to work." The architectural regression
-/// was the r65 async preload + r73 warmup_count split itself:
-/// cold-start at warmup_count=3 produces frames reliably; preload
-/// at warmup=1 (or =2 per r77) never produces frame 0. The whole
-/// CMD_STOP arc was trying to FORCE the kernel to emit a frame the
-/// driver wasn't ready to commit -- r92 proved CMD_STOP itself is
-/// poisonous on bcm2835-codec. Simplest possible fix per QA r93
-/// dispatch: feed more samples (3) at preload, matching cold-start.
+/// Preload-path warmup count.
 ///
-/// Saturation concern (the original r73 invariant):
-///   At warmup=3, prime QBUFs 4 OUTPUT samples; kernel decodes
-///   into 4 CAPTURE buffers; CAPTURE pool is 4 -> saturates;
-///   bcm2835-codec can't release pinned OUTPUT.
+/// r94 (2026-06-08) ROLLED BACK TO 2. r93's bump to 3 wedged the
+/// renderer on FYS within minutes: the kernel pinned OUTPUT buffers
+/// because CAPTURE saturated (4 OUTPUT QBUFs -> 4 CAPTURE produced
+/// -> 4-slot CAPTURE pool full), the renderer hung on begin_slide
+/// IPC in D-state, backend exhausted retries and fell back to
+/// MockRenderer. r73's saturation invariant was correct after all.
 ///
-/// Why r93 ships it anyway (per QA dispatch):
-///   1. Cold-start uses warmup=3 in production and works. Proof
-///      saturation isn't always fatal.
-///   2. Existing instrumentation (vpu_mmal_components, REQBUFS
-///      EINVAL, dmesg leaving_buffer) will pin saturation
-///      immediately if it bites. Roll back to =2 + ship Path B
-///      (drain at consumer not producer) if it does.
+/// r94 + Path B: keep preload warmup=2 (no saturation) AND add a
+/// deadline-poll at the consumer (bake_b in
+/// paint_and_present_one_transition_frame) so the to-slide decoder
+/// gets the full transition window to produce frame 0 naturally.
+/// See `paint_and_present_one_transition_frame` for the consumer-
+/// side drain implementation and the
+/// `OPENMARQUEE_BAKE_B_POLL_DEADLINE_MS` env knob.
 ///
 /// History:
 /// - r73 (2026-06-06) initially set this to 1 to avoid saturation.
 /// - r77 (2026-06-07) bumped to 2 after Phase B telemetry refuted
-///   r73's invariant: warmup=1 never produced a decoded frame.
-/// - r93 (2026-06-08) bumped to 3 after the EOS-flush arc proved
-///   CMD_STOP isn't a viable signal on bcm2835-codec. Feed more,
-///   don't signal.
-pub const PRIME_WARMUP_FOR_PRELOAD: usize = 3;
+///   r73's invariant under warmup=1.
+/// - r93 (2026-06-08) bumped to 3 to close the EOS-flush arc;
+///   IMMEDIATELY wedged on FYS (r73 was right). Rolled back same
+///   day.
+/// - r94 (2026-06-08) restored to 2 and shipped Path B (consumer-
+///   side deadline-poll) as the actual fix for "transitions
+///   look like cuts."
+pub const PRIME_WARMUP_FOR_PRELOAD: usize = 2;
 
 use std::path::PathBuf;
 
@@ -1166,16 +1162,16 @@ mod tests {
     }
 
     #[test]
-    fn prime_warmup_for_preload_is_three() {
-        // r93 (2026-06-08): bumped 2 -> 3 after the EOS-flush arc
-        // (r80/r81/r82/r85/r87/r91/r92) closed empty. r92 proved
-        // CMD_STOP is poisonous on bcm2835-codec; trying to FORCE
-        // the kernel to emit a frame at low warmup isn't viable.
-        // Simplest fix per QA r93 dispatch: feed more samples
-        // (3) at preload, matching cold-start's known-working
-        // value. See PRIME_WARMUP_FOR_PRELOAD docstring in main.rs
-        // for the saturation-concern + roll-back-plan history.
-        assert_eq!(super::PRIME_WARMUP_FOR_PRELOAD, 3);
+    fn prime_warmup_for_preload_is_two() {
+        // r94 (2026-06-08): rolled back from r93's =3 after the
+        // FYS wedge (CAPTURE saturation kept OUTPUT pinned, renderer
+        // hung on begin_slide). r73's saturation invariant was
+        // empirically correct under preload (where the kernel
+        // can't consume samples between prime and bake_b). Stays
+        // at =2; the "transitions look like cuts" symptom now
+        // gets a CONSUMER-side fix via Path B (bake_b deadline-
+        // poll) instead of producer-side warmup.
+        assert_eq!(super::PRIME_WARMUP_FOR_PRELOAD, 2);
     }
 
     #[test]
