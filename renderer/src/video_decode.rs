@@ -614,6 +614,61 @@ pub fn prime_video_decoder_for_preload(
     );
     log_preload_decoder_config(slide_id, dem, "preload");
 
+    // r84 (2026-06-09): REVERT r80-r82 EOS-flush behavior; restore
+    // r79 baseline. r80 (feed(&[]) + CMD_START + re-prime), r81
+    // (Frame-bypass drain), r82 (CMD_STOP + drain-before-STREAMOFF)
+    // each introduced REGRESSIONS worse than the original
+    // "transitions look like cuts" symptom on FYS. r82 telemetry:
+    // ZERO preload_handoff lines fired, 24 REQBUFS OUTPUT EINVAL
+    // in 90s, 9 dmesg `leaving buffer N in active state` warnings.
+    // (Renumbered from r83 because code2 already shipped r83 Phase A
+    // for the green-line work at ad12813 -- different surface.)
+    // QA dispatch: don't ship another fix; instrument the baseline,
+    // observe what bcm2835-codec accepts, then craft a fix that
+    // matches reality.
+    //
+    // This function now matches r79's body: prime + one-shot drain
+    // (existing pre-r80 behavior) + emit perf lines. The
+    // signal_eos_via_cmd_stop / drain_after_signal_eos / Frame-bypass
+    // helpers remain in v4l2.rs and video_decode.rs UNUSED for now
+    // -- they'll be re-enabled when the r84 ioctl trace + CMD_STOP
+    // probe data tells us which API actually works on
+    // bcm2835-codec.
+    let t_prime_only = Instant::now();
+    let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
+    let prime_only_us = t_prime_only.elapsed().as_micros();
+
+    let budget_ms = preload_capture_drain_budget_ms();
+    let t_drain = Instant::now();
+    let mut detail = DrainDetail::default();
+    let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
+    let drain_us = t_drain.elapsed().as_micros();
+
+    eprintln!(
+        "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+        slide_id, drained, prime_only_us, drain_us, budget_ms,
+    );
+    eprintln!(
+        "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
+        slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
+    );
+    Ok(state)
+}
+
+/// r83: previous r80-r82 preload body kept for reference under
+/// `#[allow(dead_code)]`. Re-enable + adapt when ioctl-trace +
+/// CMD_STOP probe data justifies a specific drain shape.
+#[allow(dead_code)]
+fn prime_video_decoder_for_preload_r82_disabled(
+    dem: &Mp4Demuxer,
+    slide_id: uuid::Uuid,
+) -> Result<VideoDecoderState> {
+    use std::time::Instant;
+    log_first_samples_nal_types(
+        "preload", &slide_id.to_string(), &dem.samples, 4,
+    );
+    log_preload_decoder_config(slide_id, dem, "preload");
+
     // r80 Phase B (2026-06-08): V4L2 m2m drain-and-resume cycle.
     //
     // r79 telemetry on FYS empirically REFUTED QA's "SPS/PPS not

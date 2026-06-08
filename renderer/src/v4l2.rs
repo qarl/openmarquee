@@ -172,6 +172,17 @@ fn resolve_feed_drain_schedule_from_env() -> (usize, u64) {
 pub static MMAL_COMPONENTS_LIVE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// r84 (2026-06-09): one-shot gate for the CMD_STOP capability
+/// probe inside `start_streaming`. Per subagent BLOCKER-2, the
+/// probe should only fire on the first Decoder open in the
+/// process lifetime — the answer is a static capability of the
+/// kernel driver, not something that changes per slide, so
+/// re-probing per Decoder is needless ioctl churn and blast-
+/// radius risk. Set to true on first probe; subsequent
+/// start_streaming calls skip the probe.
+static CMD_STOP_PROBE_DONE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Snapshot the current counter. Used by tests + the
 /// `[mem] vpu_mmal_components` periodic logger.
 pub fn mmal_components_live() -> usize {
@@ -573,6 +584,19 @@ nix::ioctl_readwrite!(vidioc_expbuf, b'V', 16, V4l2Exportbuffer);
 // with the r46.3 EINVAL failure mode).
 #[cfg(target_os = "linux")]
 nix::ioctl_readwrite!(vidioc_decoder_cmd, b'V', 96, V4l2DecoderCmd);
+// r84 (2026-06-09): VIDIOC_TRY_DECODER_CMD = _IOWR('V', 97,
+// v4l2_decoder_cmd) per linux/videodev2.h. Dry-run variant of
+// VIDIOC_DECODER_CMD: verifies whether the command WOULD be
+// accepted by the driver, without actually issuing it. Critical
+// for r84's CMD_STOP capability probe -- the real CMD_STOP on an
+// empty pipeline triggers FLAG_LAST emission immediately
+// (drain-on-empty-queue spec behavior, per the V4L2 stateful-
+// decoder spec), which would stamp a pre-QBUFed CAPTURE buffer
+// with FLAG_LAST and wedge the decoder. TRY has no such side
+// effect -- it returns the same EINVAL/ENOTTY semantics as the
+// real ioctl without touching kernel state.
+#[cfg(target_os = "linux")]
+nix::ioctl_readwrite!(vidioc_try_decoder_cmd, b'V', 97, V4l2DecoderCmd);
 
 // r83 Phase A (2026-06-08): VIDIOC_G_SELECTION -- query the
 // kernel's reported crop / display window for a queue, returning
@@ -851,7 +875,11 @@ impl DecoderInner {
             // SAFETY: fd owned by self.file; kernel reads 4
             // bytes from the pointer. Best-effort teardown; we
             // swallow errors so Drop doesn't panic.
-            unsafe { let _ = vidioc_streamoff(self.fd(), &bt); }
+            let r = unsafe { vidioc_streamoff(self.fd(), &bt) };
+            eprintln!(
+                "[perf] v4l2_ioctl op=STREAMOFF queue=output result={}",
+                match r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+            );
             self.output_streaming = false;
             // r48: STREAMOFF returns all queued OUTPUT buffers to
             // userspace ownership. Repopulate the free pool with
@@ -866,87 +894,22 @@ impl DecoderInner {
             self.free_output_slots = (0..n as u32).collect();
         }
         if self.capture_streaming {
-            // r82 H2 (2026-06-08): drain any active CAPTURE buffers
-            // before STREAMOFF. bcm2835-codec's STREAMOFF
-            // implementation has a known bug where it warns
-            // `videobuf2_common: driver bug: stop_streaming
-            // operation is leaving buffer N in active state` if
-            // userspace held buffers via DQBUF without re-QBUF
-            // OR if the kernel queued buffers it hadn't released
-            // to userspace yet. The warning corresponded to the
-            // r80/r81 cascading REQBUFS EINVAL on the NEXT
-            // slide -- device state corruption from this driver
-            // bug.
-            //
-            // Workaround: DQBUF all queued CAPTURE buffers
-            // non-blocking before STREAMOFF. The kernel then
-            // sees no active buffers and STREAMOFF runs clean.
-            // Best-effort -- swallow all errors so Drop doesn't
-            // panic.
-            //
-            // Note: This drains AT MOST `mapped_capture.len()`
-            // buffers (the pool size, typically 4). Bounded loop;
-            // can't spin even under pathological kernel state.
-            if let Some(ref cap_fmt) = self.capture_format {
-                let num_planes = cap_fmt.num_planes as usize;
-                let pool_size = self.mapped_capture.len();
-                let mut drained = 0usize;
-                let mut last_err: Option<nix::errno::Errno> = None;
-                for _ in 0..pool_size {
-                    let mut planes = [V4l2Plane::default(); 8];
-                    let mut buf = V4l2Buffer {
-                        buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
-                        memory: V4L2_MEMORY_MMAP,
-                        length: num_planes as u32,
-                        m_planes: planes.as_mut_ptr() as u64,
-                        ..Default::default()
-                    };
-                    // SAFETY: non-blocking DQBUF on owned fd;
-                    // kernel writes into buf + planes (both alive
-                    // for the call).
-                    match unsafe { vidioc_dqbuf(self.fd(), &mut buf) } {
-                        Ok(_) => drained += 1,
-                        Err(e) => {
-                            last_err = Some(e);
-                            break;
-                        }
-                    }
-                }
-                // r82 subagent WARN-3+4: instrument what H2
-                // actually does. Subagent flagged that the
-                // success path already re-QBUFs every frame so
-                // the first DQBUF here likely returns EAGAIN
-                // immediately = drained=0 = fix is theater.
-                // Empirically validate on FYS before declaring
-                // r82 closed.
-                //
-                // Subagent WARN-4: don't silently swallow
-                // non-EAGAIN errors. EAGAIN is the normal "no
-                // more queued buffers" signal; anything else is
-                // a driver fault and worth a CRITICAL probe.
-                let last_err_str = match last_err {
-                    Some(nix::errno::Errno::EAGAIN) => "EAGAIN_clean",
-                    Some(e) => {
-                        // Format directly into the perf line so
-                        // QA's grep catches non-EAGAIN faults
-                        // even during teardown. No allocation
-                        // path beyond what the perf line itself
-                        // does.
-                        eprintln!(
-                            "[perf] capture_drain_quiet_break errno={:?} drained={} pool_size={}",
-                            e, drained, pool_size,
-                        );
-                        "non_EAGAIN_see_capture_drain_quiet_break"
-                    }
-                    None => "pool_exhausted",
-                };
-                eprintln!(
-                    "[perf] capture_drain_quiet_before_streamoff drained={} pool_size={} last_err={}",
-                    drained, pool_size, last_err_str,
-                );
-            }
+            // r84 (2026-06-09): REVERT r82 H2 CAPTURE-drain.
+            // r82 telemetry on FYS: zero preload_handoff lines
+            // fired (prime aborted before reaching its own log),
+            // 24 REQBUFS OUTPUT EINVAL in 90s, 9 dmesg "leaving
+            // buffer N in active state" warnings -- worse than
+            // the r80/r81 regression. Reverting to pre-r80
+            // straight STREAMOFF here; r84 ioctl-trace probes
+            // will tell us what bcm2835-codec actually wants.
+            // (Renumbered from r83 because code2 already shipped
+            // r83 Phase A for green-line work.)
             let bt: libc::c_int = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE as libc::c_int;
-            unsafe { let _ = vidioc_streamoff(self.fd(), &bt); }
+            let r = unsafe { vidioc_streamoff(self.fd(), &bt) };
+            eprintln!(
+                "[perf] v4l2_ioctl op=STREAMOFF queue=capture result={}",
+                match r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+            );
             self.capture_streaming = false;
         }
     }
@@ -1337,9 +1300,15 @@ impl Decoder {
         }
         // SAFETY: VIDIOC_S_FMT is _IOWR. Caller's fmt struct is
         // written by the kernel with the negotiated format on Ok.
-        unsafe {
-            vidioc_s_fmt(inner.fd(), &mut fmt)
-        }.with_context(|| {
+        let sfmt_result = unsafe { vidioc_s_fmt(inner.fd(), &mut fmt) };
+        // r84 ioctl trace.
+        eprintln!(
+            "[perf] v4l2_ioctl op=S_FMT queue={} requested_w={} requested_h={} result={}",
+            match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+            width, height,
+            match &sfmt_result { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+        );
+        sfmt_result.with_context(|| {
             format!("VIDIOC_S_FMT ({:?}) on {}", dir, inner.path.display())
         })?;
         // Copy negotiated values back out.
@@ -1490,7 +1459,19 @@ impl Decoder {
             ..Default::default()
         };
         // SAFETY: _IOWR; kernel writes rb.count + rb.capabilities back.
-        unsafe { vidioc_reqbufs(inner.fd(), &mut rb) }
+        let reqbufs_result = unsafe { vidioc_reqbufs(inner.fd(), &mut rb) };
+        // r84 ioctl trace: log every REQBUFS call so QA can pin
+        // EINVAL (or any other failure) to the exact queue + count.
+        eprintln!(
+            "[perf] v4l2_ioctl op=REQBUFS queue={} requested_count={} result={}",
+            match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+            count,
+            match &reqbufs_result {
+                Ok(_) => format!("ok_allocated_{}", rb.count),
+                Err(e) => format!("errno_{:?}", e),
+            },
+        );
+        reqbufs_result
             .with_context(|| format!("VIDIOC_REQBUFS({:?}, memory={})", dir, memory_type))?;
         let allocated_count = rb.count as usize;
         if allocated_count == 0 {
@@ -1693,12 +1674,71 @@ impl Decoder {
         // *const c_int. Kernel reads 4 bytes from the pointer.
         // Pointers live until the ioctl returns (their stack
         // slots outlive the unsafe scope).
-        unsafe { vidioc_streamon(inner.fd(), &bt_out) }
-            .with_context(|| "VIDIOC_STREAMON OUTPUT")?;
+        let r_out = unsafe { vidioc_streamon(inner.fd(), &bt_out) };
+        eprintln!(
+            "[perf] v4l2_ioctl op=STREAMON queue=output result={}",
+            match &r_out { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+        );
+        r_out.with_context(|| "VIDIOC_STREAMON OUTPUT")?;
         inner.output_streaming = true;
-        unsafe { vidioc_streamon(inner.fd(), &bt_cap) }
-            .with_context(|| "VIDIOC_STREAMON CAPTURE")?;
+        let r_cap = unsafe { vidioc_streamon(inner.fd(), &bt_cap) };
+        eprintln!(
+            "[perf] v4l2_ioctl op=STREAMON queue=capture result={}",
+            match &r_cap { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+        );
+        r_cap.with_context(|| "VIDIOC_STREAMON CAPTURE")?;
         inner.capture_streaming = true;
+
+        // r84 CMD_STOP capability probe (subagent-fixed):
+        //
+        // ORIGINAL plan: issue VIDIOC_DECODER_CMD V4L2_DEC_CMD_STOP
+        // then immediately V4L2_DEC_CMD_START to recover.
+        //
+        // SUBAGENT BLOCKER-1: per V4L2 stateful-decoder spec,
+        // CMD_STOP on an EMPTY pipeline (no OUTPUT samples
+        // queued yet — exactly our state immediately after
+        // STREAMON+pre-QBUF-CAPTURE) IMMEDIATELY produces a
+        // CAPTURE buffer with V4L2_BUF_FLAG_LAST set and zero
+        // bytesused, to signal drain-done. That FLAG_LAST stamp
+        // would land on one of our pre-queued CAPTURE buffers
+        // (lines 1620+). When prime's drain helper then DQBUFs
+        // that buffer, `next_frame`'s `is_last` handler sets
+        // `capture_drained=true`, after which EVERY subsequent
+        // DQBUF returns Ok(None) -- the decoder is wedged for
+        // its lifetime. That's the EXACT symptom r80-r82 were
+        // chasing.
+        //
+        // SUBAGENT BLOCKER-2: even a non-destructive probe
+        // shouldn't fire per-Decoder-open (4x per playlist cycle
+        // = 240+ ioctls per hour soak). Gate via AtomicBool to
+        // once per process lifetime.
+        //
+        // FIX: use VIDIOC_TRY_DECODER_CMD (`'V', 97`) instead.
+        // Per V4L2 spec, TRY verifies command validity WITHOUT
+        // issuing it -- no FLAG_LAST emission, no kernel state
+        // change, no recovery needed. Returns same EINVAL/
+        // ENOTTY semantics as the real ioctl. Gated by static
+        // AtomicBool so only the FIRST Decoder::open in the
+        // process emits the probe line.
+        drop(inner);
+        if !CMD_STOP_PROBE_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let mut probe_cmd = V4l2DecoderCmd {
+                cmd: V4L2_DEC_CMD_STOP,
+                flags: 0,
+                payload: [0u32; 16],
+            };
+            let probe_inner = self.inner.lock().unwrap();
+            let r_try = unsafe { vidioc_try_decoder_cmd(probe_inner.fd(), &mut probe_cmd) };
+            drop(probe_inner);
+            let try_result_str = match &r_try {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("errno_{:?}", e),
+            };
+            eprintln!(
+                "[perf] v4l2_cmd_stop_probe try_cmd_stop={} note=non_destructive_via_VIDIOC_TRY_DECODER_CMD",
+                try_result_str,
+            );
+        }
         Ok(())
     }
 
