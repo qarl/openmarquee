@@ -5231,6 +5231,11 @@ pub fn paint_and_present_one_transition_frame(
         let u_src_a = session.gl.get_uniform_location(program, "u_src_a");
         let u_src_b = session.gl.get_uniform_location(program, "u_src_b");
         let u_t = session.gl.get_uniform_location(program, "u_t");
+        // r95 (2026-06-08): u_aspect for the legacy FS_IRIS path. Most
+        // legacy fragment shaders don't declare it, so most kinds
+        // resolve to None and the bind below is a silent no-op.
+        // FS_IRIS specifically uses it for the aspect-correct radius.
+        let u_aspect = session.gl.get_uniform_location(program, "u_aspect");
 
         // v1-spec-delta #10 (slice c-2): when settings have non-
         // identity brightness/gamma, route the transition shader
@@ -5271,6 +5276,12 @@ pub fn paint_and_present_one_transition_frame(
         session.gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
         session.gl.uniform_1_i32(u_src_b.as_ref(), 1);
         session.gl.uniform_1_f32(u_t.as_ref(), progress);
+        // r95: aspect bind for legacy FS_IRIS. No-op when the
+        // shader doesn't declare u_aspect (other legacy shaders).
+        session.gl.uniform_1_f32(
+            u_aspect.as_ref(),
+            (mode_w_u32 as f32) / (mode_h_u32 as f32),
+        );
         session.gl.enable_vertex_attrib_array(a_pos);
         session.gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, 16, 0);
         session.gl.enable_vertex_attrib_array(a_uv);
@@ -9619,6 +9630,7 @@ fn render_transition_single_pass_in_session(
         let a_pos = csp.a_pos;
         let a_uv = csp.a_uv;
         let u_t_loc = csp.u_t.clone();
+        let u_aspect_loc = csp.u_aspect.clone();
         let u_a_bg_loc = csp.u_a_bg.clone();
         let u_b_bg_loc = csp.u_b_bg.clone();
         let u_a_tex_locs = &csp.u_a_tex_locs;
@@ -9672,6 +9684,13 @@ fn render_transition_single_pass_in_session(
                     gl.clear(glow::COLOR_BUFFER_BIT);
                     gl.use_program(Some(program));
                     gl.uniform_1_f32(u_t_loc.as_ref(), t);
+                    // r95: bind u_aspect = framebuffer width / height
+                    // for the aspect-correct iris. Harmless on
+                    // non-iris kinds (uniform unused there).
+                    gl.uniform_1_f32(
+                        u_aspect_loc.as_ref(),
+                        (mode_w_u32 as f32) / (mode_h_u32 as f32),
+                    );
                     gl.uniform_3_f32(
                         u_a_bg_loc.as_ref(),
                         bg_a_color[0],
@@ -10914,6 +10933,11 @@ struct CachedSpProgram {
     a_pos: u32,
     a_uv: u32,
     u_t: Option<glow::NativeUniformLocation>,
+    /// r95 (2026-06-08): u_aspect = mode_w / mode_h. Used by the iris
+    /// arm to make the iris a true screen-pixel circle on non-square
+    /// displays. Other SP shaders declare the uniform but GLSL drops
+    /// it as unused.
+    u_aspect: Option<glow::NativeUniformLocation>,
     u_a_bg: Option<glow::NativeUniformLocation>,
     u_b_bg: Option<glow::NativeUniformLocation>,
     u_a_tex_locs: [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE],
@@ -10961,6 +10985,11 @@ fn cached_transition_sp_program(
         let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
             .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv (sp {kind})"))?;
         let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+        // r95 (2026-06-08): u_aspect for the iris arm. Resolved on
+        // every SP program; non-iris kinds get None (the uniform is
+        // declared in the header but dropped by the GLSL optimizer
+        // when unused), and bind_uniform_1f tolerates None silently.
+        let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
         let u_a_bg = unsafe { gl.get_uniform_location(program, "u_a_bg") };
         let u_b_bg = unsafe { gl.get_uniform_location(program, "u_b_bg") };
         let resolve_slots = |prefix: &str, n: usize| -> [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] {
@@ -10977,6 +11006,7 @@ fn cached_transition_sp_program(
             a_pos,
             a_uv,
             u_t,
+            u_aspect,
             u_a_bg,
             u_b_bg,
             u_a_tex_locs: resolve_slots("u_a_tex", n_a),

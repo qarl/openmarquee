@@ -1516,22 +1516,35 @@ void main() {
 "#;
 
 /// Fragment shader: iris — slide_b reveals through a circle that
-/// expands from screen center to the corners. The `0.71` factor is
-/// `sqrt(0.5)` (≈ 0.7071), the diagonal distance from center
-/// (0.5, 0.5) to the corner (1, 1) in normalized [0, 1] UV space —
-/// so at u_t=1 the circle exactly covers the screen. Mirrors Python
-/// ref `_FRAGMENT_IRIS`.
+/// expands from screen center to the corners.
+///
+/// r95 (2026-06-08): aspect-correct iris. Pre-r95 used
+/// `distance(v_uv, vec2(0.5))` directly with a `0.71` (≈ sqrt(0.5))
+/// half-diagonal constant tuned for square viewports. On a
+/// non-square display (FYS 1360x768 ≈ 1.77), the unit-circle in UV
+/// space maps to a horizontal ellipse on the screen, with `0.71`
+/// over/under-covering on one axis.
+///
+/// Fix: add `u_aspect = width / height` uniform, stretch d.x so
+/// length() is measured in normalized-height units, and scale
+/// t by the half-diagonal in those same units so u_t=1 covers
+/// the farthest corner. Identical math to the SP iris arm in
+/// `push_main_body`.
 pub const FS_IRIS: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_src_a;
 uniform sampler2D u_src_b;
 uniform float u_t;
+uniform float u_aspect;
 varying vec2 v_uv;
 void main() {
     vec4 a = texture2D(u_src_a, v_uv);
     vec4 b = texture2D(u_src_b, v_uv);
-    float r = distance(v_uv, vec2(0.5));
-    float mask = step(r, u_t * 0.71);
+    vec2 d = v_uv - vec2(0.5);
+    d.x *= u_aspect;
+    float r = length(d);
+    float r_max = 0.5 * sqrt(1.0 + u_aspect * u_aspect);
+    float mask = step(r, u_t * r_max);
     gl_FragColor = mix(a, b, mask);
 }
 "#;
@@ -2326,6 +2339,14 @@ pub fn fs_transition_sp_source(kind: &str, n_a: usize, n_b: usize) -> Option<Str
         "precision mediump float;\n"
     });
     s.push_str("uniform vec3 u_a_bg;\nuniform vec3 u_b_bg;\nuniform float u_t;\n");
+    // r95 (2026-06-08): u_aspect = framebuffer width / height. The
+    // iris arm uses it to compute distance() in pixel-isotropic space
+    // so the iris is a true screen-pixel circle, not a UV-space
+    // ellipse. Declared on every SP shader (cost: one unused uniform
+    // declaration on non-iris kinds; GLSL drops it). Other future
+    // radial effects (rays, circular wipe, dot animations) will
+    // reuse this without re-plumbing.
+    s.push_str("uniform float u_aspect;\n");
     for i in 0..n_a {
         s.push_str(&format!(
             "uniform sampler2D u_a_tex{i};\nuniform vec4 u_a_rect{i};\nuniform vec4 u_a_rgba{i};\n"
@@ -2476,12 +2497,29 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
         }
         "iris" => {
             // Radial expansion: B reveals through a circle.
+            //
+            // r95 (2026-06-08): aspect-correct iris. Pre-r95 used
+            // `distance(v_uv, vec2(0.5))` directly, which is
+            // anisotropic in pixel space -- on the 1360x768 panel
+            // (aspect 1.77) the iris rendered as a horizontal
+            // ellipse. Fix: stretch the x component by u_aspect so
+            // `length(d)` is measured in normalized-height units,
+            // then scale t by the half-diagonal in those same units
+            // so u_t=1 covers the farthest corner exactly.
+            //   d = (v_uv - 0.5)
+            //   d.x *= u_aspect             // x in height-normalized
+            //   r = length(d)
+            //   r_max = 0.5 * sqrt(1 + a^2) // half-diagonal
+            //   mask = step(r, u_t * r_max)
             s.push_str("    vec3 ca = u_a_bg;\n");
             push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
             s.push_str("    vec3 cb = u_b_bg;\n");
             push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
-            s.push_str("    float r = distance(v_uv, vec2(0.5));\n");
-            s.push_str("    float mask = step(r, u_t * 0.71);\n");
+            s.push_str("    vec2 d = v_uv - vec2(0.5);\n");
+            s.push_str("    d.x *= u_aspect;\n");
+            s.push_str("    float r = length(d);\n");
+            s.push_str("    float r_max = 0.5 * sqrt(1.0 + u_aspect * u_aspect);\n");
+            s.push_str("    float mask = step(r, u_t * r_max);\n");
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
         }
         "dissolve" => {
@@ -6572,16 +6610,49 @@ mod tests {
     fn fs_iris_targets_gles2_and_pins_uniforms() {
         assert!(FS_IRIS.starts_with("#version 100\n"));
         assert!(FS_IRIS.contains("precision mediump float"));
-        for uniform in ["u_src_a", "u_src_b", "u_t"] {
-            assert!(FS_IRIS.contains(uniform));
+        // r95: u_aspect joins u_t as the iris uniforms (width/height).
+        for uniform in ["u_src_a", "u_src_b", "u_t", "u_aspect"] {
+            assert!(
+                FS_IRIS.contains(uniform),
+                "FS_IRIS missing uniform {uniform}",
+            );
         }
-        // Iris radius math: distance from center (0.5, 0.5),
-        // compared to t * 0.71 (≈ sqrt(0.5), the diagonal half-
-        // length). Pin so a refactor can't accidentally swap to
-        // step(t * 0.71, r) (inverted) or drop the 0.71 (would
-        // leave a strip of slide_a in the corners at t=1).
-        assert!(FS_IRIS.contains("distance(v_uv, vec2(0.5))"));
-        assert!(FS_IRIS.contains("step(r, u_t * 0.71)"));
+        // r95: iris radius math, aspect-corrected. Stretches d.x by
+        // u_aspect so length() is in normalized-height units, then
+        // scales the t-mapped threshold by the half-diagonal in those
+        // same units. Pin all four lines so a refactor can't quietly
+        // drop the aspect correction (which would re-introduce the
+        // ellipse-on-non-square-displays bug).
+        assert!(
+            FS_IRIS.contains("vec2 d = v_uv - vec2(0.5)"),
+            "FS_IRIS missing aspect-correct d setup",
+        );
+        assert!(
+            FS_IRIS.contains("d.x *= u_aspect"),
+            "FS_IRIS missing d.x *= u_aspect (x-stretch to height-normalized)",
+        );
+        assert!(
+            FS_IRIS.contains("float r = length(d)"),
+            "FS_IRIS must use length(d) (not anisotropic distance(v_uv, ...))",
+        );
+        assert!(
+            FS_IRIS.contains("0.5 * sqrt(1.0 + u_aspect * u_aspect)"),
+            "FS_IRIS missing half-diagonal r_max in height-normalized units",
+        );
+        assert!(
+            FS_IRIS.contains("step(r, u_t * r_max)"),
+            "FS_IRIS missing aspect-corrected step threshold",
+        );
+        // r95 regression-guard: the OLD anisotropic shape and the
+        // hard-coded 0.71 constant must not return.
+        assert!(
+            !FS_IRIS.contains("distance(v_uv, vec2(0.5))"),
+            "FS_IRIS must NOT use the pre-r95 anisotropic distance() form",
+        );
+        assert!(
+            !FS_IRIS.contains("u_t * 0.71"),
+            "FS_IRIS must NOT hard-code 0.71 (pre-r95 square-viewport-only constant)",
+        );
     }
 
     #[test]
@@ -7444,7 +7515,23 @@ mod tests {
         let wipe = fs_transition_sp_source("wipe", 0, 0).unwrap();
         assert!(wipe.contains("step(v_uv.x, u_t)"));
         let iris = fs_transition_sp_source("iris", 0, 0).unwrap();
-        assert!(iris.contains("distance(v_uv, vec2(0.5))"));
+        // r95 (2026-06-08): SP iris is now aspect-corrected. Pin the
+        // new math; the OLD anisotropic distance() form must not
+        // return. Header must declare u_aspect.
+        assert!(iris.contains("uniform float u_aspect"));
+        assert!(iris.contains("vec2 d = v_uv - vec2(0.5)"));
+        assert!(iris.contains("d.x *= u_aspect"));
+        assert!(iris.contains("float r = length(d)"));
+        assert!(iris.contains("0.5 * sqrt(1.0 + u_aspect * u_aspect)"));
+        assert!(iris.contains("step(r, u_t * r_max)"));
+        assert!(
+            !iris.contains("distance(v_uv, vec2(0.5))"),
+            "SP iris must NOT use the pre-r95 anisotropic distance() form",
+        );
+        assert!(
+            !iris.contains("u_t * 0.71"),
+            "SP iris must NOT hard-code 0.71 (pre-r95 square-only constant)",
+        );
         let dissolve = fs_transition_sp_source("dissolve", 0, 0).unwrap();
         // P3 (2026-05-09): SP-tier dissolve dropped highp; the IQ
         // hash is mediump-safe so the precision qualifier flips.
@@ -7457,6 +7544,97 @@ mod tests {
     fn fs_transition_sp_source_unsupported_kind_returns_none() {
         assert!(fs_transition_sp_source("glitch", 1, 1).is_none());
         assert!(fs_transition_sp_source("unknown_kind", 1, 1).is_none());
+    }
+
+    #[test]
+    fn iris_pixel_radius_is_rotationally_symmetric_at_each_aspect() {
+        // r95 QA dispatch point 2: at u_t=0.5 the iris pixel-set
+        // should be rotationally symmetric within +/- 1px for any
+        // viewport aspect. Sample 8 directions from center, evaluate
+        // the SHADER FORMULA per direction (binary-search the boundary
+        // pixel-radius where length(d_stretched) == u_t * r_max),
+        // assert max-r minus min-r <= 1px.
+        //
+        // The shader formula mirrored here:
+        //   d_uv = (d_pixel.x / w, d_pixel.y / h)   // pixel -> UV
+        //   d_stretched.x = d_uv.x * aspect          // x-stretch
+        //   d_stretched.y = d_uv.y
+        //   r = length(d_stretched)
+        //   r_max = 0.5 * sqrt(1 + aspect^2)
+        //   inside iris iff r <= u_t * r_max
+        //
+        // Subagent r95 WARN-1 fix: pre-fix this test used the closed
+        // form `threshold * mode_h` which is direction-independent by
+        // construction (the spread was tautologically 0). Now we
+        // evaluate the formula per direction so REMOVING the
+        // `d.x *= aspect` stretch line would produce a
+        // direction-dependent r_px and trip this test.
+        fn iris_boundary_radius_px(
+            mode_w: u32,
+            mode_h: u32,
+            u_t: f32,
+            theta_rad: f32,
+        ) -> f32 {
+            let aspect = mode_w as f32 / mode_h as f32;
+            let r_max = 0.5 * (1.0_f32 + aspect * aspect).sqrt();
+            let threshold = u_t * r_max;
+            let cos_t = theta_rad.cos();
+            let sin_t = theta_rad.sin();
+            // Binary-search r_px on this direction.
+            let (mut lo, mut hi) = (0.0_f32, (mode_w.max(mode_h) as f32) * 2.0);
+            for _ in 0..60 {
+                let mid = 0.5 * (lo + hi);
+                let dx_pixel = cos_t * mid;
+                let dy_pixel = sin_t * mid;
+                // Convert pixel -> UV (shader receives v_uv in [0,1]).
+                let dx_uv = dx_pixel / mode_w as f32;
+                let dy_uv = dy_pixel / mode_h as f32;
+                // Apply the shader's x-stretch.
+                let dx_stretched = dx_uv * aspect;
+                let r = (dx_stretched * dx_stretched + dy_uv * dy_uv).sqrt();
+                if r < threshold { lo = mid; } else { hi = mid; }
+            }
+            0.5 * (lo + hi)
+        }
+        for (mode_w, mode_h) in [(1360u32, 768u32), (1920u32, 1080u32), (800u32, 480u32)] {
+            let mut radii = Vec::new();
+            for i in 0..8 {
+                let theta = (i as f32) * (std::f32::consts::PI * 2.0 / 8.0);
+                radii.push(iris_boundary_radius_px(mode_w, mode_h, 0.5, theta));
+            }
+            let max_r = radii.iter().cloned().fold(f32::MIN, f32::max);
+            let min_r = radii.iter().cloned().fold(f32::MAX, f32::min);
+            let spread = max_r - min_r;
+            assert!(
+                spread <= 1.0,
+                "iris at u_t=0.5 must be rotationally symmetric within +/-1px \
+                 (viewport {}x{}): max_r={} min_r={} spread={} radii={:?}",
+                mode_w, mode_h, max_r, min_r, spread, radii,
+            );
+        }
+    }
+
+    #[test]
+    fn iris_at_u_t_one_covers_screen_corners_for_any_aspect() {
+        // r95 QA dispatch point: at u_t=1 the iris must reach the
+        // farthest corner -- in pixel-isotropic terms the half-
+        // diagonal in normalized-height units. Pin the boundary
+        // radius matches the analytical half-diagonal.
+        for (mode_w, mode_h) in [(1360u32, 768u32), (1920u32, 1080u32), (800u32, 480u32)] {
+            let aspect = mode_w as f32 / mode_h as f32;
+            let r_max = 0.5 * (1.0_f32 + aspect * aspect).sqrt();
+            // Corner radius in pixel-isotropic (normalized-height)
+            // units = sqrt((0.5 * mode_w / mode_h)^2 + 0.5^2)
+            //       = sqrt((0.5*aspect)^2 + 0.25)
+            //       = 0.5 * sqrt(aspect^2 + 1)
+            // Identical to r_max above by construction.
+            let corner_r = 0.5 * (aspect * aspect + 1.0_f32).sqrt();
+            assert!(
+                (corner_r - r_max).abs() < 1e-5,
+                "iris r_max ({}) must equal half-diagonal ({}) at aspect {}",
+                r_max, corner_r, aspect,
+            );
+        }
     }
 
     #[test]
