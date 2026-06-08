@@ -796,6 +796,18 @@ struct DecoderInner {
     output_format: Option<NegotiatedFormat>,
     /// Negotiated CAPTURE format. None until set_capture_format.
     capture_format: Option<NegotiatedFormat>,
+    /// r83 Phase B (2026-06-08): the REQUESTED height passed to
+    /// `set_capture_format` BEFORE the kernel rounded it up to the
+    /// next H.264 macroblock multiple (16 lines). For 1080p input
+    /// this is 1080 while `capture_format.height` is 1088. The GL
+    /// paint path uses the ratio
+    ///   y_crop_max = capture_display_height / capture_format.height
+    /// to crop the bottom-row green padding out of the rendered
+    /// frame. Phase A surfaced this via the
+    /// `[perf] v4l2_capture_geometry` log line (compose=unsupported
+    /// on bcm2835-codec). 0 = sentinel for "not yet set" (no
+    /// CAPTURE format negotiated).
+    capture_display_height: u32,
     /// OUTPUT side mmap'd regions: outer = buffer index, inner =
     /// plane index. Empty until allocate_buffers(Output) runs.
     mapped_output: Vec<Vec<MmapRegion>>,
@@ -1152,6 +1164,7 @@ impl Decoder {
             capture_buffer_type: CaptureBufferType::Mmap,
             output_format: None,
             capture_format: None,
+            capture_display_height: 0,
             mapped_output: Vec::new(),
             mapped_capture: Vec::new(),
             capture_dmabuf_fds: Vec::new(),
@@ -1329,7 +1342,20 @@ impl Decoder {
         let mut inner = self.inner.lock().unwrap();
         match dir {
             QueueDirection::Output => inner.output_format = Some(neg.clone()),
-            QueueDirection::Capture => inner.capture_format = Some(neg.clone()),
+            QueueDirection::Capture => {
+                inner.capture_format = Some(neg.clone());
+                // r83 Phase B (2026-06-08): snapshot the REQUESTED
+                // height — the actually-valid display region inside
+                // the rounded-up allocation. Phase A's
+                // VIDIOC_G_SELECTION(COMPOSE) probe returns ENOTTY
+                // on bcm2835-codec, so we fall back to "what we
+                // asked for" as the source-of-truth display height.
+                // The dispatch authorised this fallback path (Option
+                // 2 from QA's recommendation) — see qa/r83-phase-b
+                // -green-line-fix-2026-06-08.md §"Why
+                // capture_display_height = requested height".
+                inner.capture_display_height = height;
+            }
         }
         drop(inner);
 
@@ -1372,6 +1398,44 @@ impl Decoder {
             }
         }
         Ok(neg)
+    }
+
+    /// r83 Phase B (2026-06-08): the actually-valid display height
+    /// inside the kernel's CAPTURE allocation. Returns `Some(h)` once
+    /// `set_capture_format` has been called (with `h` = the height
+    /// the caller PASSED IN, not the rounded-up dimension the kernel
+    /// negotiated back); `None` until then.
+    ///
+    /// For bcm2835-codec NV12 1080p input this is 1080 while
+    /// `Frame::height()` returns 1088 (the rounded-up allocation).
+    /// The GL paint path uses the ratio `display / allocation` to
+    /// crop the bottom-row green padding out of the rendered frame.
+    /// See `qa/r83-phase-b-green-line-fix-2026-06-08.md`.
+    pub fn capture_display_height(&self) -> Option<u32> {
+        let inner = self.inner.lock().unwrap();
+        let h = inner.capture_display_height;
+        if h == 0 { None } else { Some(h) }
+    }
+
+    /// r83 Phase B (2026-06-08): the y-axis crop fraction for NV12
+    /// shader sampling. Computes `capture_display_height() /
+    /// capture_format.height` as a `f32` in `(0, 1]`. Returns
+    /// `1.0` when the display height equals the allocated height
+    /// (no padding) OR either value isn't yet known (fail-soft to
+    /// "no crop" so existing callers behave as today). The GL paint
+    /// path passes this to `u_y_crop_max` in `FS_NV12_TO_RGB` /
+    /// `FS_NV12_DMABUF_TO_RGB`; the shader uses it to skip the
+    /// uninitialised rows at the top of the texture (high uv.y end,
+    /// which the existing v-flip maps to the bottom of the displayed
+    /// frame on bcm2835-codec).
+    pub fn capture_y_crop_max(&self) -> f32 {
+        let inner = self.inner.lock().unwrap();
+        let display_h = inner.capture_display_height;
+        let alloc_h = inner.capture_format
+            .as_ref()
+            .map(|f| f.height)
+            .unwrap_or(0);
+        compute_y_crop_max(display_h, alloc_h)
     }
 
     /// r83 Phase A (2026-06-08): query the kernel's compose rect
@@ -2436,6 +2500,24 @@ impl Decoder {
     }
 }
 
+/// r83 Phase B (2026-06-08): pure y-axis crop math. Extracted
+/// from `Decoder::capture_y_crop_max` so unit tests don't need a
+/// live `Decoder` (those tests are Linux-gated on `/dev/video10`).
+/// The math: fail-soft to 1.0 (= no crop) on any of:
+///   - display height not yet set (sentinel 0)
+///   - allocated height not yet negotiated (0)
+///   - display >= allocated (would yield a ratio >= 1.0; identity)
+/// Otherwise return `display / allocated` as f32 in (0, 1).
+///
+/// Cross-platform (no `#[cfg(target_os = "linux")]` gating) so the
+/// host-side unit tests on Mac can exercise it.
+fn compute_y_crop_max(display_h: u32, alloc_h: u32) -> f32 {
+    if display_h == 0 || alloc_h == 0 || display_h >= alloc_h {
+        return 1.0;
+    }
+    (display_h as f32) / (alloc_h as f32)
+}
+
 // ============================================================
 // Mac-side public types for cross-platform syntax checking. On
 // macOS, Decoder + Frame don't exist (no V4L2). The structs
@@ -2655,6 +2737,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<V4l2Buffer>(), 88);
         assert_eq!(std::mem::size_of::<V4l2Timecode>(), 16);
         assert_eq!(std::mem::size_of::<V4l2Requestbuffers>(), 20);
+        // r83 Phase A: G_SELECTION marshalling structs.
+        assert_eq!(std::mem::size_of::<V4l2Rect>(), 16);
+        assert_eq!(std::mem::size_of::<V4l2Selection>(), 64);
         // Field-offset guard for V4l2Format: union starts at
         // offset 8 (after 4-byte type + 4-byte alignment pad),
         // NOT at offset 4. A piece-2b subagent caught the
@@ -2673,6 +2758,36 @@ mod tests {
         let mut buf = [0u8; 16];
         buf[..14].copy_from_slice(b"bcm2835-codec\0");
         assert_eq!(c_str_to_string(&buf), "bcm2835-codec");
+    }
+
+    #[test]
+    fn compute_y_crop_max_no_crop_when_dims_unknown_or_equal() {
+        // r83 Phase B math. Fail-soft to 1.0 (= no crop, byte-
+        // identical to pre-Phase-B behavior) for the four
+        // "we don't know enough" branches.
+        assert_eq!(compute_y_crop_max(0, 0), 1.0);
+        assert_eq!(compute_y_crop_max(0, 1088), 1.0);
+        assert_eq!(compute_y_crop_max(1080, 0), 1.0);
+        assert_eq!(compute_y_crop_max(1080, 1080), 1.0);
+        // Defensive: display > allocated would have been a kernel
+        // bug; clamp to 1.0 rather than emit ratio > 1.0 (which
+        // would sample past the end of the texture).
+        assert_eq!(compute_y_crop_max(1100, 1088), 1.0);
+    }
+
+    #[test]
+    fn compute_y_crop_max_returns_ratio_for_padded_capture() {
+        // 1080p H.264 via bcm2835-codec: 1080 valid lines inside a
+        // 1088 macroblock-rounded allocation.
+        let r = compute_y_crop_max(1080, 1088);
+        let expected = 1080.0_f32 / 1088.0_f32;
+        assert!((r - expected).abs() < 1e-6, "got {r} expected {expected}");
+        // 720p: 720 in a 720-allocation = no padding = identity.
+        assert_eq!(compute_y_crop_max(720, 720), 1.0);
+        // Off-aligned 1081 -> 1088 (hypothetical 2-row pad).
+        let r2 = compute_y_crop_max(1081, 1088);
+        let expected2 = 1081.0_f32 / 1088.0_f32;
+        assert!((r2 - expected2).abs() < 1e-6, "got {r2} expected {expected2}");
     }
 
     #[test]

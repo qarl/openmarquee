@@ -7718,6 +7718,16 @@ unsafe fn bake_video_slide_to_current_fbo(
     // transform.) The whole panel is still cleared black below as a
     // safety net; a cover quad leaves no bars.
     let cover_vbo = cover_quad_vbo(session.gl, f_w, f_h, mode_w, mode_h)?;
+    // r83 Phase B (2026-06-08): the bcm2835-codec rounds 1080 ->
+    // 1088 rows on CAPTURE. Querying VIDIOC_G_SELECTION(COMPOSE)
+    // would tell us the actual display window but the driver
+    // returns ENOTTY (Phase A confirmed via the `[perf]
+    // v4l2_capture_geometry` probe). Fallback: use the requested
+    // CAPTURE height (snapshotted at `set_capture_format` time)
+    // vs the negotiated allocation. y_crop_max defaults to 1.0
+    // when the source dims aren't known (= no crop, identical to
+    // pre-Phase-B behavior).
+    let y_crop_max = decoder.capture_y_crop_max();
     // V4L2 piece 4d: branch on the Frame's transport mode. DmaBuf
     // path (piece 4a-c) skips the per-frame Y/UV CPU upload + uses
     // an EGLImage-bound external-OES sampler. MMAP path (piece
@@ -7752,6 +7762,7 @@ unsafe fn bake_video_slide_to_current_fbo(
                 f_w,
                 f_h,
                 stride,
+                y_crop_max,
             )?
         };
         if let Some(t) = t_blit {
@@ -7864,7 +7875,9 @@ unsafe fn bake_video_slide_to_current_fbo(
     );
     let t_phase_shader = std::time::Instant::now();
     // FYS bug B: cover_vbo cover-fits the frame to the panel.
-    let blit_result = run_nv12_blit_pass(gl, cover_vbo, y_tex, uv_tex);
+    // r83 Phase B: y_crop_max was computed at the top of this
+    // helper from `decoder.capture_y_crop_max()`.
+    let blit_result = run_nv12_blit_pass(gl, cover_vbo, y_tex, uv_tex, y_crop_max);
     gl.delete_texture(y_tex);
     gl.delete_texture(uv_tex);
     // Restore GL_UNPACK_ALIGNMENT to the default (4). Bumped to 1
@@ -10920,6 +10933,9 @@ struct CachedNv12Program {
     a_uv: u32,
     u_tex_y: Option<glow::NativeUniformLocation>,
     u_tex_uv: Option<glow::NativeUniformLocation>,
+    /// r83 Phase B: y-axis crop fraction (display_h / allocated_h).
+    /// Default 1.0 = no crop; set by `run_nv12_blit_pass`.
+    u_y_crop_max: Option<glow::NativeUniformLocation>,
 }
 
 std::thread_local! {
@@ -10945,7 +10961,10 @@ fn cached_nv12_program(gl: &glow::Context) -> Result<CachedNv12Program> {
             .ok_or_else(|| anyhow!("FS_NV12_TO_RGB VS missing a_uv"))?;
         let u_tex_y = unsafe { gl.get_uniform_location(program, "u_tex_y") };
         let u_tex_uv = unsafe { gl.get_uniform_location(program, "u_tex_uv") };
-        let cnp = CachedNv12Program { program, a_pos, a_uv, u_tex_y, u_tex_uv };
+        let u_y_crop_max = unsafe { gl.get_uniform_location(program, "u_y_crop_max") };
+        let cnp = CachedNv12Program {
+            program, a_pos, a_uv, u_tex_y, u_tex_uv, u_y_crop_max,
+        };
         c.set(Some(cnp));
         Ok(cnp)
     })
@@ -10964,6 +10983,7 @@ unsafe fn run_nv12_blit_pass(
     vbo: glow::NativeBuffer,
     y_tex: glow::NativeTexture,
     uv_tex: glow::NativeTexture,
+    y_crop_max: f32,
 ) -> Result<()> {
     use glow::HasContext;
     let cnp = cached_nv12_program(gl)?;
@@ -10974,6 +10994,17 @@ unsafe fn run_nv12_blit_pass(
     gl.active_texture(glow::TEXTURE1);
     gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
     gl.uniform_1_i32(cnp.u_tex_uv.as_ref(), 1);
+    // r83 Phase B: skip the bottom-row green padding by clamping
+    // the flipped-v sampling range to [0, y_crop_max] where
+    // y_crop_max = display_h / allocated_h. Caller passes 1.0 for
+    // no-crop / unknown-source-dims. We set this every pass
+    // defensively even when the value is constant — GLES2 DOES
+    // preserve uniform values across `gl.use_program` calls on the
+    // same program object, but the FIRST frame would otherwise
+    // read Mesa's default of 0, which would short-circuit
+    // `(1.0 - v_uv.y) * 0` for every texel and collapse the entire
+    // frame to texture row 0.
+    gl.uniform_1_f32(cnp.u_y_crop_max.as_ref(), y_crop_max);
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
     gl.enable_vertex_attrib_array(cnp.a_pos);
     gl.vertex_attrib_pointer_f32(cnp.a_pos, 2, glow::FLOAT, false, 16, 0);
@@ -11262,6 +11293,9 @@ struct CachedNv12DmaBufProgram {
     a_pos: u32,
     a_uv: u32,
     u_tex_external: Option<glow::NativeUniformLocation>,
+    /// r83 Phase B: y-axis crop fraction; mirrors `CachedNv12Program`.
+    /// Default 1.0; set by `run_nv12_dmabuf_blit_pass`.
+    u_y_crop_max: Option<glow::NativeUniformLocation>,
 }
 
 #[cfg(target_os = "linux")]
@@ -11290,7 +11324,12 @@ fn cached_nv12_dmabuf_program(gl: &glow::Context) -> Result<CachedNv12DmaBufProg
         let u_tex_external = unsafe {
             gl.get_uniform_location(program, "u_tex_external")
         };
-        let cnp = CachedNv12DmaBufProgram { program, a_pos, a_uv, u_tex_external };
+        let u_y_crop_max = unsafe {
+            gl.get_uniform_location(program, "u_y_crop_max")
+        };
+        let cnp = CachedNv12DmaBufProgram {
+            program, a_pos, a_uv, u_tex_external, u_y_crop_max,
+        };
         c.set(Some(cnp));
         Ok(cnp)
     })
@@ -11350,6 +11389,7 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     width: u32,
     height: u32,
     stride: u32,
+    y_crop_max: f32,
 ) -> Result<bool> {
     use glow::HasContext;
     // Lazy-resolve EGL+GLES extension entry points. None -> caller
@@ -11445,6 +11485,11 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
         // Texture is ALREADY bound + the image associated above;
         // just set the sampler uniform to TEXTURE0.
         gl.uniform_1_i32(cnp.u_tex_external.as_ref(), 0);
+        // r83 Phase B: mirror the MMAP-path crop. y_crop_max=1.0 is
+        // the no-crop default; caller passes the
+        // `Decoder::capture_y_crop_max()` value to skip
+        // bcm2835-codec's bottom-row green padding.
+        gl.uniform_1_f32(cnp.u_y_crop_max.as_ref(), y_crop_max);
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         gl.enable_vertex_attrib_array(cnp.a_pos);
         gl.vertex_attrib_pointer_f32(cnp.a_pos, 2, glow::FLOAT, false, 16, 0);
