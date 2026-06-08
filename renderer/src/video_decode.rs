@@ -492,6 +492,35 @@ fn preload_capture_drain_budget_ms() -> u64 {
     }
 }
 
+/// r86 (2026-06-09): runtime kill-switch for the r85 EOS-flush
+/// body. Set `OPENMARQUEE_EOS_FLUSH=1` (or
+/// "true"/"yes"/"on"/"enable"/"enabled") to enable. Default is
+/// DISABLED -- r86 deploy == r84 baseline (no EOS-flush;
+/// transitions look like cuts; video plays).
+///
+/// Per QA r86 dispatch constraint: "A kill-switch env var would
+/// let me A/B at deploy time. Consider adding one to bypass the
+/// new code via runtime config — fast roll-back is more
+/// valuable than always-on fix."
+///
+/// Resolved on every `prime_video_decoder_for_preload` call (no
+/// caching) so a fresh-fork process inherits the current env-var
+/// value at spawn time. Per subagent NIT-4: env-var changes made
+/// via `systemctl set-environment OPENMARQUEE_EOS_FLUSH=1` only
+/// take effect on the NEXT renderer subprocess fork, which today
+/// requires `systemctl restart openmarquee-backend`. Per-call
+/// resolution still lets QA toggle by setting env + restarting
+/// without rebuilding/redeploying the binary.
+fn is_eos_flush_enabled() -> bool {
+    match std::env::var("OPENMARQUEE_EOS_FLUSH") {
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            matches!(v.as_str(), "1" | "true" | "yes" | "on" | "enable" | "enabled")
+        }
+        Err(_) => false,
+    }
+}
+
 /// Drain at least one CAPTURE frame from the primed decoder, bounded
 /// by the configured budget. Returns the number of frames actually
 /// drained (0 on timeout means kernel never delivered a frame --
@@ -614,17 +643,60 @@ pub fn prime_video_decoder_for_preload(
     );
     log_preload_decoder_config(slide_id, dem, "preload");
 
-    // r85 (2026-06-09): RE-ENABLE EOS-flush via CMD_STOP. r84
-    // ioctl-trace data confirmed CMD_STOP IS supported on bcm2835-
+    // r86 (2026-06-09): KILL-SWITCH ENV VAR per QA dispatch. The
+    // r85 deploy regressed: 25 REQBUFS EINVAL in 95s + 10 dmesg
+    // "leaving buffer N in active state" + 434 text-only fallback
+    // events. The r85 ioctl trace pinpointed a 3-second gap
+    // between S_FMT capture and REQBUFS output (the G_SELECTION
+    // probe inside set_capture_format, now traced as of r86's
+    // change to capture_compose_rect_internal). r86 ships a
+    // runtime opt-in instead of always-on: the EOS-flush body
+    // ONLY runs when `OPENMARQUEE_EOS_FLUSH=1` is set in the
+    // env. Default behavior is the r84-clean baseline (no
+    // EOS-flush; transitions look like cuts, video plays). QA
+    // can A/B at deploy time without a code-level revert.
+    //
+    // When the env var IS set, the r85 EOS-flush body runs --
+    // re-enabled with all r85 instrumentation (DECODER_CMD_STOP,
+    // DECODER_CMD_START, DQBUF/QBUF drain trace, resume_after_eos
+    // probe on bail+success paths).
+
+    let eos_flush_enabled = is_eos_flush_enabled();
+    eprintln!(
+        "[perf] preload_eos_flush_mode slide_id={} enabled={}",
+        slide_id, eos_flush_enabled,
+    );
+
+    if !eos_flush_enabled {
+        // r84-baseline behavior: prime + one-shot drain + emit.
+        let t_prime_only = Instant::now();
+        let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
+        let prime_only_us = t_prime_only.elapsed().as_micros();
+        let budget_ms = preload_capture_drain_budget_ms();
+        let t_drain = Instant::now();
+        let mut detail = DrainDetail::default();
+        let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
+        let drain_us = t_drain.elapsed().as_micros();
+        eprintln!(
+            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+            slide_id, drained, prime_only_us, drain_us, budget_ms,
+        );
+        eprintln!(
+            "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
+            slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
+        );
+        return Ok(state);
+    }
+
+    // r85 EOS-flush body (gated by OPENMARQUEE_EOS_FLUSH=1).
+    //
+    // r84 ioctl-trace data confirmed CMD_STOP IS supported on bcm2835-
     // codec (try_cmd_stop=ok); the r80-r82 regressions came from
-    // implementation/ordering bugs, not a missing API. r84 trace
-    // showed the r79 baseline ioctl sequence is clean
-    // (S_FMT/REQBUFS/STREAMON all result=ok, STREAMOFF clean too).
-    // r85 adds the EOS-flush ATOP that baseline with ioctl trace
-    // covering every new ioctl call in the EOS path
-    // (DECODER_CMD_STOP, DQBUFs in drain, DECODER_CMD_START), so
-    // any new regression is diagnosable from the trace without
-    // another probe-and-revert round.
+    // implementation/ordering bugs, not a missing API. r85 added the
+    // EOS-flush ATOP that baseline with ioctl trace covering every new
+    // ioctl call in the EOS path. r85 still regressed, but the trace
+    // narrowed the search to the 3-second G_SELECTION gap (now also
+    // traced as of r86's change to capture_compose_rect_internal).
     //
     // Sequence (matches r82 architecture, NOT r82 H2):
     //   1. prime_with_warmup: STREAMON + primer + 2 warmup samples.

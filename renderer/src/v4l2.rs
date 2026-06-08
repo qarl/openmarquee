@@ -1469,7 +1469,25 @@ impl Decoder {
         // Caller's sel struct is fully initialised; kernel writes
         // back `r` + `flags` (+ may overwrite `reserved` as
         // documented per the API).
+        //
+        // r86 (2026-06-09): trace this ioctl. r85 telemetry on
+        // FYS showed a 3-second untraced gap between S_FMT capture
+        // and REQBUFS output that turned out to live HERE — this
+        // is the ONLY ioctl between those two traced sites in the
+        // prime sequence. The G_SELECTION call returns ENOTTY on
+        // bcm2835-codec (no COMPOSE target), but the elapsed time
+        // of the call itself was previously invisible to the
+        // trace. r86 adds the missing coverage so QA can confirm
+        // or refute the "G_SELECTION takes 3s post-EOS-flush"
+        // hypothesis empirically.
+        let t_g_sel = std::time::Instant::now();
         let r = unsafe { vidioc_g_selection(inner.fd(), &mut sel) };
+        let g_sel_us = t_g_sel.elapsed().as_micros();
+        eprintln!(
+            "[perf] v4l2_ioctl op=G_SELECTION queue=capture target=COMPOSE elapsed_us={} result={}",
+            g_sel_us,
+            match &r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+        );
         match r {
             Ok(_) => Ok(Some(sel.r)),
             // ENOTTY: ioctl not implemented (older driver, or this
