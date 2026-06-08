@@ -181,7 +181,16 @@ fn log_first_samples_nal_types(label: &str, slide_id: &str, samples: &[Vec<u8>],
 /// Cold-start prime: delegates to `prime_video_decoder_with_warmup`
 /// with `PRIME_WARMUP_DEFAULT`. Kept as the public entry point so
 /// existing call sites don't have to specify the count.
-pub fn prime_video_decoder(dem: &Mp4Demuxer) -> Result<VideoDecoderState> {
+pub fn prime_video_decoder(dem: &Mp4Demuxer, caller: &'static str) -> Result<VideoDecoderState> {
+    // r91 (2026-06-08) probe: per QA r91 dispatch, explicit
+    // caller tag so QA can distinguish cold_start from reel
+    // (both use warmup_count=3). The synchronous BeginSlide path
+    // passes "cold_start"; the standalone reel passes "reel";
+    // tests pass "test".
+    eprintln!(
+        "[perf] prime_entry caller={} warmup_count={}",
+        caller, PRIME_WARMUP_DEFAULT,
+    );
     // r78 subagent BLOCKER-2: cross-check probe lives at the
     // synchronous BeginSlide call site in ipc_main.rs, NOT here.
     // This function is also reached from the standalone reel
@@ -665,6 +674,12 @@ pub fn prime_video_decoder_for_preload(
     slide_id: uuid::Uuid,
 ) -> Result<VideoDecoderState> {
     use std::time::Instant;
+    // r91 (2026-06-08) probe per QA dispatch: caller-tagged
+    // prime_entry. Fires regardless of EOS_FLUSH gate.
+    eprintln!(
+        "[perf] prime_entry caller=preload_worker warmup_count={}",
+        PRIME_WARMUP_FOR_PRELOAD,
+    );
     log_first_samples_nal_types(
         "preload", &slide_id.to_string(), &dem.samples, 4,
     );
@@ -1385,7 +1400,7 @@ mod tests {
         }
         let dem = crate::mp4_demux::Mp4Demuxer::open(&fixture_path)
             .expect("open 320x240.mp4 test fixture");
-        let err = prime_video_decoder(&dem)
+        let err = prime_video_decoder(&dem, "test")
             .expect_err("/dev/video10 absent should fail prime");
         let msg = format!("{err:#}");
         assert!(

@@ -3120,7 +3120,7 @@ pub fn render_video_slide_in_session(
         .with_context(|| {
             format!("open MP4 for reel video render: {}", asset_path.display())
         })?;
-    let mut state = crate::video_decode::prime_video_decoder(&dem)
+    let mut state = crate::video_decode::prime_video_decoder(&dem, "reel")
         .with_context(|| {
             format!(
                 "prime V4L2 decoder for reel video {}",

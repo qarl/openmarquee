@@ -173,13 +173,17 @@ pub static MMAL_COMPONENTS_LIVE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// r84 (2026-06-09): one-shot gate for the CMD_STOP capability
-/// probe inside `start_streaming`. Per subagent BLOCKER-2, the
-/// probe should only fire on the first Decoder open in the
-/// process lifetime — the answer is a static capability of the
-/// kernel driver, not something that changes per slide, so
-/// re-probing per Decoder is needless ioctl churn and blast-
-/// radius risk. Set to true on first probe; subsequent
-/// start_streaming calls skip the probe.
+/// probe. Per subagent BLOCKER-2, the probe should only fire on
+/// the first Decoder open in the process lifetime — the answer
+/// is a static capability of the kernel driver, not something
+/// that changes per slide, so re-probing per Decoder is
+/// needless ioctl churn and blast-radius risk. Set to true on
+/// first probe; subsequent Decoder::open calls skip the probe.
+///
+/// r91 (2026-06-08): probe site moved from start_streaming to
+/// Decoder::open (after query_capabilities) per QA r91 dispatch
+/// so it fires BEFORE any prime ioctl (S_FMT/REQBUFS/STREAMON).
+/// Updated consumer site is in Decoder::open, not start_streaming.
 static CMD_STOP_PROBE_DONE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1290,6 +1294,37 @@ impl Decoder {
                 path.display(), caps.device_caps
             ));
         }
+        // r91 (2026-06-08): CMD_STOP capability probe MOVED here
+        // from start_streaming per QA r91 dispatch. Fires BEFORE
+        // any prime ioctl (S_FMT/REQBUFS/STREAMON) so both
+        // EOS_FLUSH=on and =off paths see identical probe
+        // history at identical lifecycle points. Gated by
+        // CMD_STOP_PROBE_DONE AtomicBool: only the FIRST
+        // Decoder::open in the process emits the probe line;
+        // subsequent opens skip.
+        //
+        // Uses VIDIOC_TRY_DECODER_CMD ('V', 97) -- the
+        // spec-documented dry-run that verifies command validity
+        // without issuing it (no FLAG_LAST emission, no kernel
+        // state change, no recovery needed).
+        if !CMD_STOP_PROBE_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            let mut probe_cmd = V4l2DecoderCmd {
+                cmd: V4L2_DEC_CMD_STOP,
+                flags: 0,
+                payload: [0u32; 16],
+            };
+            let probe_inner = dec.inner.lock().unwrap();
+            let r_try = unsafe { vidioc_try_decoder_cmd(probe_inner.fd(), &mut probe_cmd) };
+            drop(probe_inner);
+            let try_result_str = match &r_try {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("errno_{:?}", e),
+            };
+            eprintln!(
+                "[perf] v4l2_cmd_stop_probe try_cmd_stop={} note=non_destructive_via_VIDIOC_TRY_DECODER_CMD at_open_not_streamon=true",
+                try_result_str,
+            );
+        }
         // r75 subagent BLOCKER-1: counter was bumped at DecoderInner
         // construction above (panic-safe pairing with Drop).
         Ok(dec)
@@ -1870,57 +1905,12 @@ impl Decoder {
         );
         r_cap.with_context(|| "VIDIOC_STREAMON CAPTURE")?;
         inner.capture_streaming = true;
-
-        // r84 CMD_STOP capability probe (subagent-fixed):
-        //
-        // ORIGINAL plan: issue VIDIOC_DECODER_CMD V4L2_DEC_CMD_STOP
-        // then immediately V4L2_DEC_CMD_START to recover.
-        //
-        // SUBAGENT BLOCKER-1: per V4L2 stateful-decoder spec,
-        // CMD_STOP on an EMPTY pipeline (no OUTPUT samples
-        // queued yet — exactly our state immediately after
-        // STREAMON+pre-QBUF-CAPTURE) IMMEDIATELY produces a
-        // CAPTURE buffer with V4L2_BUF_FLAG_LAST set and zero
-        // bytesused, to signal drain-done. That FLAG_LAST stamp
-        // would land on one of our pre-queued CAPTURE buffers
-        // (lines 1620+). When prime's drain helper then DQBUFs
-        // that buffer, `next_frame`'s `is_last` handler sets
-        // `capture_drained=true`, after which EVERY subsequent
-        // DQBUF returns Ok(None) -- the decoder is wedged for
-        // its lifetime. That's the EXACT symptom r80-r82 were
-        // chasing.
-        //
-        // SUBAGENT BLOCKER-2: even a non-destructive probe
-        // shouldn't fire per-Decoder-open (4x per playlist cycle
-        // = 240+ ioctls per hour soak). Gate via AtomicBool to
-        // once per process lifetime.
-        //
-        // FIX: use VIDIOC_TRY_DECODER_CMD (`'V', 97`) instead.
-        // Per V4L2 spec, TRY verifies command validity WITHOUT
-        // issuing it -- no FLAG_LAST emission, no kernel state
-        // change, no recovery needed. Returns same EINVAL/
-        // ENOTTY semantics as the real ioctl. Gated by static
-        // AtomicBool so only the FIRST Decoder::open in the
-        // process emits the probe line.
-        drop(inner);
-        if !CMD_STOP_PROBE_DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let mut probe_cmd = V4l2DecoderCmd {
-                cmd: V4L2_DEC_CMD_STOP,
-                flags: 0,
-                payload: [0u32; 16],
-            };
-            let probe_inner = self.inner.lock().unwrap();
-            let r_try = unsafe { vidioc_try_decoder_cmd(probe_inner.fd(), &mut probe_cmd) };
-            drop(probe_inner);
-            let try_result_str = match &r_try {
-                Ok(_) => "ok".to_string(),
-                Err(e) => format!("errno_{:?}", e),
-            };
-            eprintln!(
-                "[perf] v4l2_cmd_stop_probe try_cmd_stop={} note=non_destructive_via_VIDIOC_TRY_DECODER_CMD",
-                try_result_str,
-            );
-        }
+        // r91 (2026-06-08): CMD_STOP capability probe MOVED to
+        // Decoder::open (right after QUERYCAP) so it fires
+        // BEFORE any prime ioctl (S_FMT/REQBUFS/STREAMON), per
+        // QA r91 dispatch ask. The AtomicBool gate still ensures
+        // single-fire-per-process. Original r84 probe location
+        // (here, post-STREAMON) removed.
         Ok(())
     }
 

@@ -821,7 +821,7 @@ impl SlideCache {
                         crate::video_decode::log_preload_decoder_config(
                             item_id, &dem, "cold_start",
                         );
-                        match prime_video_decoder(&dem) {
+                        match prime_video_decoder(&dem, "cold_start") {
                             Ok(dec_state) => {
                                 self.video_decoders.insert(item_id, dec_state);
                             }
