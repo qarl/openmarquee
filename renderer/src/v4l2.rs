@@ -1805,6 +1805,13 @@ impl Decoder {
         // still healthy; the IDR re-feed below restarts decoding
         // naturally without needing the kernel-state transition.
         if !inner.capture_drained {
+            // r85 subagent WARN-2: trace coverage on the gated-skip
+            // path so the diagnostic doesn't go silent on this
+            // early-return (the path most commonly hit from
+            // reprime_video_decoder_for_loop's standalone-reel wrap).
+            eprintln!(
+                "[perf] v4l2_ioctl op=DECODER_CMD_START queue=output result=skipped_not_drained"
+            );
             return Ok(());
         }
         let mut cmd = V4l2DecoderCmd {
@@ -1818,8 +1825,12 @@ impl Decoder {
         // Lock held across the ioctl: intentional. The call is
         // <1ms + there are no concurrent callers at the wrap
         // site (single-threaded IPC dispatcher).
-        unsafe { vidioc_decoder_cmd(inner.fd(), &mut cmd) }
-            .with_context(|| "VIDIOC_DECODER_CMD V4L2_DEC_CMD_START")?;
+        let r = unsafe { vidioc_decoder_cmd(inner.fd(), &mut cmd) };
+        eprintln!(
+            "[perf] v4l2_ioctl op=DECODER_CMD_START queue=output result={}",
+            match &r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+        );
+        r.with_context(|| "VIDIOC_DECODER_CMD V4L2_DEC_CMD_START")?;
         inner.capture_drained = false;
         inner.output_eof_sent = false;
         Ok(())
@@ -1860,6 +1871,15 @@ impl Decoder {
         // (EPERM/EINVAL/no-op vary). Skip cleanly when the wrapper
         // already knows the EOS state is set.
         if inner.capture_drained || inner.output_eof_sent {
+            // r85 subagent NIT-7: trace coverage on the gated-skip
+            // path. Today only the r85 preload calls
+            // signal_eos_via_cmd_stop and the gate isn't tripped
+            // there (fresh decoder), but the line documents the
+            // skipped case if a future caller introduces the
+            // pattern.
+            eprintln!(
+                "[perf] v4l2_ioctl op=DECODER_CMD_STOP queue=output result=skipped_already_eos"
+            );
             return Ok(());
         }
         let mut cmd = V4l2DecoderCmd {
@@ -1870,8 +1890,16 @@ impl Decoder {
         // SAFETY: ioctl with our owned fd + correctly-sized
         // V4l2DecoderCmd. Lock held across the ioctl (single-shot,
         // <1ms; matches resume_after_eos pattern).
-        unsafe { vidioc_decoder_cmd(inner.fd(), &mut cmd) }
-            .with_context(|| "VIDIOC_DECODER_CMD V4L2_DEC_CMD_STOP")?;
+        let r = unsafe { vidioc_decoder_cmd(inner.fd(), &mut cmd) };
+        // r85: ioctl trace per QA dispatch constraint -- when r85's
+        // EOS-flush ships, the trace must cover the new ioctl call
+        // sites so any regression is diagnosable without another
+        // round of probe-and-revert.
+        eprintln!(
+            "[perf] v4l2_ioctl op=DECODER_CMD_STOP queue=output result={}",
+            match &r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+        );
+        r.with_context(|| "VIDIOC_DECODER_CMD V4L2_DEC_CMD_STOP")?;
         Ok(())
     }
 
@@ -2159,7 +2187,51 @@ impl Decoder {
             m_planes: planes_dq.as_mut_ptr() as u64,
             ..Default::default()
         };
-        match unsafe { vidioc_dqbuf(fd, &mut buf_dq) } {
+        let dq_result = unsafe { vidioc_dqbuf(fd, &mut buf_dq) };
+        // r85 (with subagent NIT-6 throttle): ioctl trace inside
+        // the EOS-drain loop. Subagent flagged that EAGAIN-busy
+        // loops can hit ~100 lines per failed preload (500ms budget
+        // / 5ms sleep). Emit ALL non-EAGAIN outcomes
+        // (ok / EPIPE / other errno -- the diagnostically critical
+        // ones) and throttle EAGAIN-only emissions to first +
+        // every 25th via a per-call counter snapshotted from the
+        // wrapper state. Outcome lines still flow on the FIRST
+        // EAGAIN so QA sees the start of any drain.
+        let is_eagain = matches!(&dq_result, Err(nix::errno::Errno::EAGAIN));
+        // Count EAGAINs cheaply via a thread-local counter scoped
+        // to this Decoder call site -- no allocation, no atomic.
+        thread_local! {
+            static DRAIN_EAGAIN_TICK: std::cell::Cell<u32> = std::cell::Cell::new(0);
+        }
+        let should_emit = if is_eagain {
+            DRAIN_EAGAIN_TICK.with(|c| {
+                let t = c.get();
+                c.set(t.wrapping_add(1));
+                t == 0 || t % 25 == 0
+            })
+        } else {
+            // Reset the counter so the next drain cycle starts fresh.
+            DRAIN_EAGAIN_TICK.with(|c| c.set(0));
+            true
+        };
+        if should_emit {
+            let dq_result_str = match &dq_result {
+                Ok(_) => {
+                    let is_last_flag = (buf_dq.flags & V4L2_BUF_FLAG_LAST) != 0;
+                    if is_last_flag {
+                        format!("ok_idx{}_FLAG_LAST", buf_dq.index)
+                    } else {
+                        format!("ok_idx{}", buf_dq.index)
+                    }
+                }
+                Err(e) => format!("errno_{:?}", e),
+            };
+            eprintln!(
+                "[perf] v4l2_ioctl op=DQBUF queue=capture context=drain_eos result={}",
+                dq_result_str,
+            );
+        }
+        match dq_result {
             Ok(_) => {}
             Err(nix::errno::Errno::EAGAIN) => return Ok(DrainStep::WouldBlock),
             Err(nix::errno::Errno::EPIPE) => {
@@ -2207,7 +2279,13 @@ impl Decoder {
             m_planes: planes_qb.as_mut_ptr() as u64,
             ..Default::default()
         };
-        if let Err(e) = unsafe { vidioc_qbuf(fd, &mut buf_qb) } {
+        let qb_result = unsafe { vidioc_qbuf(fd, &mut buf_qb) };
+        eprintln!(
+            "[perf] v4l2_ioctl op=QBUF queue=capture context=drain_eos_reqbuf idx={} result={}",
+            idx,
+            match &qb_result { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+        );
+        if let Err(e) = qb_result {
             return Err(anyhow!("drain_capture_step QBUF after DQBUF: {}", e));
         }
 
