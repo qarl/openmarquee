@@ -7547,6 +7547,117 @@ mod tests {
     }
 
     #[test]
+    fn every_fs_for_transition_kind_link_site_resolves_u_aspect() {
+        // r96 (2026-06-08): regression-lock against the r95 follow-up
+        // bug. r95 added u_aspect plumbing to the SP arm + ONE legacy
+        // link site (paint_and_present_one_transition_frame), but
+        // missed three other paths that also link a program from
+        // `fs_for_transition_kind`:
+        //   - capture_legacy_3pass_mid (PNG capture path)
+        //   - render_transition_animated_in_session (standalone reel)
+        //   - cached_composite_program (SB + composite paths)
+        //   - cached_cut_composite_program (cut composite paths)
+        // FYS observed the iris still rendering oval because the live
+        // hot path went through one of those untraced sites and
+        // u_aspect was never bound.
+        //
+        // This test reads hdmi.rs as a string and asserts that every
+        // line containing `get_uniform_location(program, "u_t")` is
+        // accompanied (within 10 lines downstream) by a corresponding
+        // `get_uniform_location(program, "u_aspect")`. Source-level
+        // regression-lock; any future path that adds a new
+        // fs_for_transition_kind-based shader will fail this test
+        // unless it also resolves u_aspect.
+        let src = include_str!("hdmi.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut u_t_sites: Vec<usize> = Vec::new();
+        let mut u_aspect_sites: Vec<usize> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if line.contains(r#"get_uniform_location(program, "u_t")"#) {
+                u_t_sites.push(i);
+            }
+            if line.contains(r#"get_uniform_location(program, "u_aspect")"#) {
+                u_aspect_sites.push(i);
+            }
+        }
+        // Every u_t resolution site must have a u_aspect resolution
+        // within 10 lines downstream (typical ordering: u_t then
+        // u_aspect on the next line per r95+r96 convention).
+        for u_t_line in &u_t_sites {
+            let nearby = u_aspect_sites.iter().any(|a| {
+                let delta = (*a as isize) - (*u_t_line as isize);
+                (0..=10).contains(&delta)
+            });
+            assert!(
+                nearby,
+                "hdmi.rs line {} resolves u_t without a nearby u_aspect resolution; \
+                 r96 regression-lock requires every fs_for_transition_kind link site \
+                 to also resolve u_aspect for the iris arm. Failing line: {}",
+                u_t_line + 1,
+                lines.get(*u_t_line).unwrap_or(&""),
+            );
+        }
+        // r96 subagent WARN-1: tighten floor to exact count so a
+        // future refactor that drops one of the seven sites can't
+        // silently pass. The 7 expected sites are:
+        //   1. paint_and_present_one_transition_frame (r95)
+        //   2. capture_legacy_3pass_mid (r96)
+        //   3. render_fade_composite (r96, convention-pin)
+        //   4. render_transition_animated_in_session (r96)
+        //   5. cached_transition_sp_program (r95, SP resolver)
+        //   6. cached_composite_program (r96)
+        //   7. cached_cut_composite_program (r96, symmetry-pin)
+        assert_eq!(
+            u_aspect_sites.len(),
+            7,
+            "r96 regression-lock expected EXACTLY 7 u_aspect resolution sites \
+             in hdmi.rs, found {}. If you've added a new transition-shader link \
+             site that also needs u_aspect, bump this count; if you've removed \
+             one, re-audit the diff so the dropped site wasn't load-bearing for \
+             the iris arm.",
+            u_aspect_sites.len(),
+        );
+    }
+
+    #[test]
+    fn every_u_aspect_resolve_site_has_a_matching_bind() {
+        // r96 subagent WARN-2: the resolve-coverage test is one-way.
+        // A future site could resolve u_aspect to satisfy the
+        // regression-lock above yet skip the
+        // `gl.uniform_1_f32(u_aspect.as_ref(), aspect)` call at
+        // draw time -- exactly the r95->r96 failure mode but at the
+        // bind step instead of resolve. This test counts BIND-site
+        // occurrences and asserts at least as many as RESOLVE
+        // sites.
+        let src = include_str!("hdmi.rs");
+        let mut resolve_count = 0usize;
+        let mut bind_count = 0usize;
+        for line in src.lines() {
+            if line.contains(r#"get_uniform_location(program, "u_aspect")"#) {
+                resolve_count += 1;
+            }
+            // Match either local `u_aspect.as_ref()` /
+            // `u_aspect_loc.as_ref()` or struct-field
+            // `ccp.u_aspect.as_ref()` / `active_ccp.u_aspect.as_ref()`
+            // / `csp.u_aspect.clone()`.
+            if line.contains("u_aspect.as_ref()")
+                || line.contains("u_aspect_loc.as_ref()")
+                || line.contains("u_aspect.clone()")
+            {
+                bind_count += 1;
+            }
+        }
+        assert!(
+            bind_count >= resolve_count,
+            "r96 regression-lock: every u_aspect resolve site must have at \
+             least one matching bind site (or downstream clone). Found {} \
+             resolves but only {} binds in hdmi.rs.",
+            resolve_count,
+            bind_count,
+        );
+    }
+
+    #[test]
     fn iris_pixel_radius_is_rotationally_symmetric_at_each_aspect() {
         // r95 QA dispatch point 2: at u_t=0.5 the iris pixel-set
         // should be rotationally symmetric within +/- 1px for any

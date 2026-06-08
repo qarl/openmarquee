@@ -5781,6 +5781,13 @@ pub fn capture_sb_transition_mid_to_png(
                 xform_b[0], xform_b[1], xform_b[2], xform_b[3],
             );
             gl.uniform_1_f32(ccp.u_t.as_ref(), t);
+            // r96: bind u_aspect for the iris arm (and any other
+            // aspect-dependent transition). No-op for shaders that
+            // don't declare it.
+            gl.uniform_1_f32(
+                ccp.u_aspect.as_ref(),
+                (mode_w as f32) / (mode_h as f32),
+            );
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             let stride = (4 * std::mem::size_of::<f32>()) as i32;
             gl.enable_vertex_attrib_array(ccp.a_pos);
@@ -5967,6 +5974,9 @@ fn capture_legacy_3pass_transition_mid_to_png(
             let u_src_a = unsafe { gl.get_uniform_location(program, "u_src_a") };
             let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
             let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+            // r96: u_aspect for the iris arm. None for shaders that
+            // don't declare it (silent no-op bind).
+            let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
 
             // Textured-quad VBO with full-screen NDC + identity UV.
             // Same vertex layout as VS_TEXTURED_QUAD callers across
@@ -6000,6 +6010,10 @@ fn capture_legacy_3pass_transition_mid_to_png(
                 gl.bind_texture(glow::TEXTURE_2D, Some(tex_b));
                 gl.uniform_1_i32(u_src_b.as_ref(), 1);
                 gl.uniform_1_f32(u_t.as_ref(), t);
+                gl.uniform_1_f32(
+                    u_aspect.as_ref(),
+                    (mode_w as f32) / (mode_h as f32),
+                );
 
                 let stride = (4 * std::mem::size_of::<f32>()) as i32;
                 gl.enable_vertex_attrib_array(a_pos);
@@ -6215,6 +6229,13 @@ pub fn capture_fullres_transition_mid_to_png(
                     xform_b[0], xform_b[1], xform_b[2], xform_b[3],
                 );
                 gl.uniform_1_f32(ccp.u_t.as_ref(), t);
+                // r96: bind u_aspect for the iris arm (and any
+                // other aspect-dependent transition). No-op for
+                // shaders that don't declare it.
+                gl.uniform_1_f32(
+                    ccp.u_aspect.as_ref(),
+                    (mode_w as f32) / (mode_h as f32),
+                );
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 let stride = (4 * std::mem::size_of::<f32>()) as i32;
                 gl.enable_vertex_attrib_array(ccp.a_pos);
@@ -8845,9 +8866,18 @@ pub fn render_fade_composite(
             let u_src_a = gl.get_uniform_location(program, "u_src_a");
             let u_src_b = gl.get_uniform_location(program, "u_src_b");
             let u_t = gl.get_uniform_location(program, "u_t");
+            // r96: keep u_aspect resolution as a convention across
+            // every transition-style link site so the r96 coverage
+            // test stays uniform. FS_FADE doesn't declare it; the
+            // bind below is a no-op.
+            let u_aspect = gl.get_uniform_location(program, "u_aspect");
             gl.uniform_1_i32(u_src_a.as_ref(), 0);
             gl.uniform_1_i32(u_src_b.as_ref(), 1);
             gl.uniform_1_f32(u_t.as_ref(), t);
+            gl.uniform_1_f32(
+                u_aspect.as_ref(),
+                (mode_w as f32) / (mode_h as f32),
+            );
 
             let stride = (4 * std::mem::size_of::<f32>()) as i32;
             gl.enable_vertex_attrib_array(a_pos);
@@ -9105,6 +9135,9 @@ fn render_transition_animated_in_session(
         let u_src_a = unsafe { gl.get_uniform_location(program, "u_src_a") };
         let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
         let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+        // r96: u_aspect for the iris arm. None for shaders that
+        // don't declare it (silent no-op bind).
+        let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
 
         // -- Per-frame loop. The loop body is wrapped in an IIFE so
         // the cleanup_static call below runs UNCONDITIONALLY even
@@ -9255,6 +9288,12 @@ fn render_transition_animated_in_session(
                 gl.uniform_1_i32(u_src_a.as_ref(), 0);
                 gl.uniform_1_i32(u_src_b.as_ref(), 1);
                 gl.uniform_1_f32(u_t.as_ref(), t);
+                // r96: bind u_aspect for the iris arm. No-op for
+                // shaders that don't declare it.
+                gl.uniform_1_f32(
+                    u_aspect.as_ref(),
+                    (mode_w_u32 as f32) / (mode_h_u32 as f32),
+                );
 
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -10287,6 +10326,13 @@ fn render_transition_scissored_bake_in_session(
                         xform_b[0], xform_b[1], xform_b[2], xform_b[3],
                     );
                     gl.uniform_1_f32(active_ccp.u_t.as_ref(), t);
+                    // r96: bind u_aspect for the iris arm (and any
+                    // other aspect-dependent transition). No-op for
+                    // shaders that don't declare it.
+                    gl.uniform_1_f32(
+                        active_ccp.u_aspect.as_ref(),
+                        (mode_w_u32 as f32) / (mode_h_u32 as f32),
+                    );
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                     let stride = (4 * std::mem::size_of::<f32>()) as i32;
                     gl.enable_vertex_attrib_array(active_ccp.a_pos);
@@ -12271,6 +12317,12 @@ struct CachedCompositeProgram {
     u_src_a: Option<glow::NativeUniformLocation>,
     u_src_b: Option<glow::NativeUniformLocation>,
     u_t: Option<glow::NativeUniformLocation>,
+    /// r96 (2026-06-08): u_aspect = mode_w / mode_h, for the iris
+    /// arm and any other aspect-dependent transition shader. Bound
+    /// alongside u_t on every ccp draw site. Resolves to None for
+    /// kinds whose FS doesn't declare u_aspect (silent no-op
+    /// bind).
+    u_aspect: Option<glow::NativeUniformLocation>,
     u_a_xform: Option<glow::NativeUniformLocation>,
     u_b_xform: Option<glow::NativeUniformLocation>,
 }
@@ -12304,6 +12356,10 @@ fn cached_composite_program(gl: &glow::Context, kind: &str) -> Result<CachedComp
         let u_src_a = unsafe { gl.get_uniform_location(program, "u_src_a") };
         let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
         let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+        // r96: u_aspect for the iris arm (and other aspect-dependent
+        // transition shaders). None for kinds whose FS doesn't
+        // declare it; gl.uniform_1_f32(None, _) is a no-op.
+        let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
         let u_a_xform = unsafe { gl.get_uniform_location(program, "u_a_xform") };
         let u_b_xform = unsafe { gl.get_uniform_location(program, "u_b_xform") };
         let ccp = CachedCompositeProgram {
@@ -12313,6 +12369,7 @@ fn cached_composite_program(gl: &glow::Context, kind: &str) -> Result<CachedComp
             u_src_a,
             u_src_b,
             u_t,
+            u_aspect,
             u_a_xform,
             u_b_xform,
         };
@@ -12377,6 +12434,9 @@ fn cached_cut_composite_program(
         let u_src_a = unsafe { gl.get_uniform_location(program, "u_src_a") };
         let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
         let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+        // r96: u_aspect kept for shape parity with cached_composite_program.
+        // FS_CUT_A/FS_CUT_B don't declare u_aspect, so this resolves to None.
+        let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
         let u_a_xform = unsafe { gl.get_uniform_location(program, "u_a_xform") };
         let u_b_xform = unsafe { gl.get_uniform_location(program, "u_b_xform") };
         let ccp = CachedCompositeProgram {
@@ -12386,6 +12446,7 @@ fn cached_cut_composite_program(
             u_src_a,
             u_src_b,
             u_t,
+            u_aspect,
             u_a_xform,
             u_b_xform,
         };
