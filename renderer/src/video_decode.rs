@@ -683,25 +683,30 @@ pub fn prime_video_decoder_for_preload(
     // r80 subagent BLOCKER-2 + WARN-5: graceful degradation when
     // the kernel never emits FLAG_LAST. If drain budget exhausts
     // with `eos_seen=false`, the wrapper's `capture_drained` is
-    // still false; `resume_after_eos` short-circuits (v4l2.rs:1510),
-    // leaving `output_eof_sent=true`, and the subsequent re-feed of
-    // the primer would fail at the v4l2.rs:1613 "feed() called
-    // after EOF" guard. Pre-fix the function would silently abort
-    // mid-cycle and the preload's slide entry would never appear in
-    // cache. Better: detect this case, emit a distinct diagnostic
-    // line, and return Err early. The caller (preload_in_worker)
-    // already handles failed preload by logging + falling back to
-    // the synchronous cache.load on first BeginSlide, which uses
-    // `prime_video_decoder` (without the drain cycle). Cold-start
-    // path eventually paints because bake feeds one more sample per
-    // tick -- cumulative input flushes the reorder buffer naturally
+    // still false; `resume_after_eos` short-circuits (v4l2.rs:1510)
+    // and the decoder is left in mid-EOS state -- the kernel
+    // believes a CMD_STOP is pending but no FLAG_LAST arrived. The
+    // subsequent re-prime would queue OUTPUT samples against a
+    // half-stopped queue with undefined behavior. (Pre-r82 with
+    // feed(&[]) the failure mode was a "feed() called after EOF"
+    // guard trip at v4l2.rs:1613 because feed(&[]) set
+    // output_eof_sent=true; r82 H1's CMD_STOP doesn't set that
+    // wrapper flag, so the failure mode is different but the
+    // remedy is the same: bail.) Better: detect this case, emit a
+    // distinct diagnostic line, and return Err early. The caller
+    // (preload_in_worker) already handles failed preload by
+    // logging + falling back to the synchronous cache.load on
+    // first BeginSlide, which uses `prime_video_decoder` (without
+    // the drain cycle). Cold-start path eventually paints because
+    // bake feeds one more sample per tick -- cumulative input
+    // flushes the reorder buffer naturally
     // even without an EOS signal.
     // r81 subagent WARN-2: probe the resume sequence BEFORE the
     // budget-exhaust bail so QA sees cmd_start_ok=... in the
     // FAILURE case (the one we most need the diagnostic for).
-    // Probe is conditional on having issued the EOS feed at all
-    // (other_errs==0 means feed(&[]) succeeded), so we don't
-    // probe a no-op resume.
+    // Probe is conditional on having issued the EOS signal at all
+    // (other_errs==0 means r82's signal_eos_via_cmd_stop succeeded),
+    // so we don't probe a no-op resume.
     let cmd_start_ok = if detail.other_errs == 0 {
         // resume_after_eos no-ops if capture_drained=false (i.e.
         // we never saw FLAG_LAST). Call it anyway to record what
@@ -845,10 +850,25 @@ fn drain_after_signal_eos(
     detail: &mut DrainDetail,
 ) -> usize {
     use std::time::{Duration, Instant};
-    // Step 2: signal EOS. feed(&[]) per v4l2.rs:1680 + 1697-1698
-    // sets V4L2_BUF_FLAG_LAST and marks output_eof_sent=true.
-    if let Err(e) = state.decoder.feed(&[]) {
-        eprintln!("[perf] preload_handoff_drain_err err=signal_eos: {:#}", e);
+    // Step 2: signal EOS via VIDIOC_DECODER_CMD V4L2_DEC_CMD_STOP.
+    //
+    // r80/r81 used `feed(&[])` (empty OUTPUT QBUF with
+    // V4L2_BUF_FLAG_LAST). r81 telemetry on FYS proved this
+    // doesn't work on bcm2835-codec: 96/96 preloads ended with
+    // eos_seen=false, kernel never emitted FLAG_LAST on CAPTURE.
+    // The `videobuf2 driver bug: stop_streaming ... buffer N in
+    // active state` warning then fired during teardown,
+    // corrupting device state for the next slide's REQBUFS.
+    //
+    // r82 H1 (2026-06-08): switch to VIDIOC_DECODER_CMD CMD_STOP.
+    // This is the canonical V4L2 m2m stateful decoder API per
+    // kernel docs dev-decoder.html. Unlike feed(&[]) this doesn't
+    // set output_eof_sent in our wrapper, so the post-drain
+    // re-prime works without needing resume_after_eos to clear
+    // the flag (though resume_after_eos is still issued to clear
+    // the kernel-side EOS state via CMD_START).
+    if let Err(e) = state.decoder.signal_eos_via_cmd_stop() {
+        eprintln!("[perf] preload_handoff_drain_err err=cmd_stop: {:#}", e);
         detail.other_errs += 1;
         return 0;
     }

@@ -794,6 +794,85 @@ impl DecoderInner {
             self.free_output_slots = (0..n as u32).collect();
         }
         if self.capture_streaming {
+            // r82 H2 (2026-06-08): drain any active CAPTURE buffers
+            // before STREAMOFF. bcm2835-codec's STREAMOFF
+            // implementation has a known bug where it warns
+            // `videobuf2_common: driver bug: stop_streaming
+            // operation is leaving buffer N in active state` if
+            // userspace held buffers via DQBUF without re-QBUF
+            // OR if the kernel queued buffers it hadn't released
+            // to userspace yet. The warning corresponded to the
+            // r80/r81 cascading REQBUFS EINVAL on the NEXT
+            // slide -- device state corruption from this driver
+            // bug.
+            //
+            // Workaround: DQBUF all queued CAPTURE buffers
+            // non-blocking before STREAMOFF. The kernel then
+            // sees no active buffers and STREAMOFF runs clean.
+            // Best-effort -- swallow all errors so Drop doesn't
+            // panic.
+            //
+            // Note: This drains AT MOST `mapped_capture.len()`
+            // buffers (the pool size, typically 4). Bounded loop;
+            // can't spin even under pathological kernel state.
+            if let Some(ref cap_fmt) = self.capture_format {
+                let num_planes = cap_fmt.num_planes as usize;
+                let pool_size = self.mapped_capture.len();
+                let mut drained = 0usize;
+                let mut last_err: Option<nix::errno::Errno> = None;
+                for _ in 0..pool_size {
+                    let mut planes = [V4l2Plane::default(); 8];
+                    let mut buf = V4l2Buffer {
+                        buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+                        memory: V4L2_MEMORY_MMAP,
+                        length: num_planes as u32,
+                        m_planes: planes.as_mut_ptr() as u64,
+                        ..Default::default()
+                    };
+                    // SAFETY: non-blocking DQBUF on owned fd;
+                    // kernel writes into buf + planes (both alive
+                    // for the call).
+                    match unsafe { vidioc_dqbuf(self.fd(), &mut buf) } {
+                        Ok(_) => drained += 1,
+                        Err(e) => {
+                            last_err = Some(e);
+                            break;
+                        }
+                    }
+                }
+                // r82 subagent WARN-3+4: instrument what H2
+                // actually does. Subagent flagged that the
+                // success path already re-QBUFs every frame so
+                // the first DQBUF here likely returns EAGAIN
+                // immediately = drained=0 = fix is theater.
+                // Empirically validate on FYS before declaring
+                // r82 closed.
+                //
+                // Subagent WARN-4: don't silently swallow
+                // non-EAGAIN errors. EAGAIN is the normal "no
+                // more queued buffers" signal; anything else is
+                // a driver fault and worth a CRITICAL probe.
+                let last_err_str = match last_err {
+                    Some(nix::errno::Errno::EAGAIN) => "EAGAIN_clean",
+                    Some(e) => {
+                        // Format directly into the perf line so
+                        // QA's grep catches non-EAGAIN faults
+                        // even during teardown. No allocation
+                        // path beyond what the perf line itself
+                        // does.
+                        eprintln!(
+                            "[perf] capture_drain_quiet_break errno={:?} drained={} pool_size={}",
+                            e, drained, pool_size,
+                        );
+                        "non_EAGAIN_see_capture_drain_quiet_break"
+                    }
+                    None => "pool_exhausted",
+                };
+                eprintln!(
+                    "[perf] capture_drain_quiet_before_streamoff drained={} pool_size={} last_err={}",
+                    drained, pool_size, last_err_str,
+                );
+            }
             let bt: libc::c_int = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE as libc::c_int;
             unsafe { let _ = vidioc_streamoff(self.fd(), &bt); }
             self.capture_streaming = false;
@@ -1546,6 +1625,56 @@ impl Decoder {
             .with_context(|| "VIDIOC_DECODER_CMD V4L2_DEC_CMD_START")?;
         inner.capture_drained = false;
         inner.output_eof_sent = false;
+        Ok(())
+    }
+
+    /// r82 (2026-06-08): signal EOS via `VIDIOC_DECODER_CMD` with
+    /// `V4L2_DEC_CMD_STOP`. This is the canonical V4L2 m2m stateful
+    /// decoder API for "drain whatever is in the reorder buffer."
+    ///
+    /// r80/r81 attempted EOS via `feed(&[])` (empty OUTPUT buffer
+    /// with V4L2_BUF_FLAG_LAST). r81 telemetry on FYS showed
+    /// bcm2835-codec NEVER responded to that signal -- 96/96
+    /// preloads ended with `eos_seen=false` and CAPTURE remained
+    /// EAGAIN for the full 500ms drain budget. The
+    /// `videobuf2_common: driver bug: stop_streaming operation is
+    /// leaving buffer N in active state` kernel warning then fired
+    /// during teardown.
+    ///
+    /// Per kernel docs (`dev-decoder.html`):
+    ///   "To gracefully end the stream, the client may issue
+    ///    VIDIOC_DECODER_CMD with V4L2_DEC_CMD_STOP. The driver
+    ///    will then drain any remaining frames and mark the last
+    ///    CAPTURE buffer with V4L2_BUF_FLAG_LAST."
+    ///
+    /// Unlike `feed(&[])` this does NOT set `output_eof_sent` in
+    /// our wrapper -- bcm2835-codec apparently treats CMD_STOP
+    /// + drain + CMD_START as a clean cycle that doesn't require
+    /// clearing OUTPUT-side userspace state.
+    pub fn signal_eos_via_cmd_stop(&self) -> Result<()> {
+        let inner = self.inner.lock().unwrap();
+        // r82 subagent WARN-1: idempotence guard mirroring
+        // resume_after_eos's `if !inner.capture_drained` early-return.
+        // If a future caller invokes signal_eos_via_cmd_stop twice
+        // without an intervening decode cycle, OR after the kernel
+        // already entered drained state via another path, the
+        // second CMD_STOP hits the kernel in a "no active decode"
+        // state -- bcm2835-codec behavior is implementation-defined
+        // (EPERM/EINVAL/no-op vary). Skip cleanly when the wrapper
+        // already knows the EOS state is set.
+        if inner.capture_drained || inner.output_eof_sent {
+            return Ok(());
+        }
+        let mut cmd = V4l2DecoderCmd {
+            cmd: V4L2_DEC_CMD_STOP,
+            flags: 0,
+            payload: [0u32; 16],
+        };
+        // SAFETY: ioctl with our owned fd + correctly-sized
+        // V4l2DecoderCmd. Lock held across the ioctl (single-shot,
+        // <1ms; matches resume_after_eos pattern).
+        unsafe { vidioc_decoder_cmd(inner.fd(), &mut cmd) }
+            .with_context(|| "VIDIOC_DECODER_CMD V4L2_DEC_CMD_STOP")?;
         Ok(())
     }
 
