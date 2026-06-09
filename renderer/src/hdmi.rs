@@ -340,6 +340,30 @@ pub struct EglSession<'a> {
     /// paint targets default fb directly (zero overhead).
     scene_fbo: Option<glow::NativeFramebuffer>,
     scene_tex: Option<glow::NativeTexture>,
+    /// r102.2 (2026-06-09): cached transition endpoint FBO+tex
+    /// pair for endpoint_a. Pre-r102.2 the transition path
+    /// allocated a fresh ~8 MB FBO+tex per tick in
+    /// `paint_and_present_one_transition_frame` via
+    /// `create_slide_fbo_pair`; vc4 V3D's lazy GC retained the
+    /// BO under queue back-pressure, leaking ~1 BO per
+    /// transition. With the cache, exactly ONE FBO+tex pair
+    /// exists per (EglSession, mode_w, mode_h) for the a-side;
+    /// reused across every tick. Invalidated + reallocated if
+    /// the mode dims change (rare; HDMI hot-plug or rotation).
+    /// Cleared via `cleanup_resources` at session teardown.
+    transition_fbo_a: Option<glow::NativeFramebuffer>,
+    transition_tex_a: Option<glow::NativeTexture>,
+    /// r102.2: same-shape cache for endpoint_b. Two separate
+    /// slots (NOT a single shared one) because the transition
+    /// shader samples both endpoints simultaneously and they
+    /// must be distinct textures.
+    transition_fbo_b: Option<glow::NativeFramebuffer>,
+    transition_tex_b: Option<glow::NativeTexture>,
+    /// r102.2: dims the cached transition_fbo_a/b were
+    /// allocated against. Invalidates the cache on mode change
+    /// (HDMI hot-plug, rotation flip). `None` while the cache
+    /// is empty.
+    transition_fbo_dims: Option<(u32, u32)>,
     /// STREAM/VLC slice-9 follow-up: persistent texture for the
     /// external-frame push-paint path. Allocated once with
     /// glTexImage2D and thereafter updated in place with
@@ -698,6 +722,11 @@ where
         session_start: std::time::Instant::now(),
         scene_fbo: None,
         scene_tex: None,
+        transition_fbo_a: None,
+        transition_tex_a: None,
+        transition_fbo_b: None,
+        transition_tex_b: None,
+        transition_fbo_dims: None,
         external_frame_tex: None,
         external_nv12_tex: None,
         current_settings: crate::content::Settings::default(),
@@ -924,6 +953,20 @@ where
         if let Some(tex) = session.scene_tex.take() {
             gl.delete_texture(tex);
         }
+        // r102.2: free the cached transition FBO+tex pairs.
+        if let Some(fbo) = session.transition_fbo_a.take() {
+            gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.transition_tex_a.take() {
+            gl.delete_texture(tex);
+        }
+        if let Some(fbo) = session.transition_fbo_b.take() {
+            gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.transition_tex_b.take() {
+            gl.delete_texture(tex);
+        }
+        session.transition_fbo_dims = None;
         if let Some((tex, _, _)) = session.external_frame_tex.take() {
             gl.delete_texture(tex);
         }
@@ -4984,8 +5027,27 @@ pub fn paint_and_present_one_transition_frame(
         // observed failure shape: only endpoint_b's just-primed
         // decoder needs the polling window. If a future symptom
         // shows endpoint_a stalling, mirror the bake_b loop here.
+        // r102.2: thread the cached transition FBO+tex pair for
+        // side A. Pre-r102.2 each tick allocated ~8 MB of fresh
+        // FBO+tex via create_slide_fbo_pair / make_slide_fbo; vc4
+        // V3D lazy GC retained ~1 BO per transition. The cache
+        // eliminates the churn -- exactly ONE pair per
+        // (EglSession, mode_w, mode_h) for side A across the
+        // session's lifetime. Kill switch
+        // OPENMARQUEE_TRANSITION_FBO_CACHE=off falls back to
+        // per-tick alloc.
+        let cached_pair_a = if crate::v4l2::is_transition_fbo_cache_enabled() {
+            Some(ensure_transition_fbo_pair(
+                session,
+                TransitionFboSide::A,
+                mode_w_u32,
+                mode_h_u32,
+            )?)
+        } else {
+            None
+        };
         let Some((fbo_a, tex_a)) =
-            bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_a)?
+            bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, cached_pair_a, inputs_a)?
         else {
             crate::hdmi_logic::warn_paint_transition_skip(
                 kind, progress, "endpoint_a_no_frame",
@@ -5053,6 +5115,22 @@ pub fn paint_and_present_one_transition_frame(
         // bake call without hitting the in-bake wrap. Re-read each
         // iteration via `endpoint_b` because Video's next_sample_idx
         // mutates per inner bake call.
+        // r102.2 subagent WARN-2: hoist the side-B cache resolve
+        // OUT of the Path B retry loop. The first iteration's
+        // cache-miss does the allocate; subsequent retries get
+        // the same handle (no work). Mirrors bake_a's pattern at
+        // line 5039 (single resolve before the call) and keeps
+        // env-read + borrow cost off the retry hot loop.
+        let cached_pair_b = if crate::v4l2::is_transition_fbo_cache_enabled() {
+            Some(ensure_transition_fbo_pair(
+                session,
+                TransitionFboSide::B,
+                mode_w_u32,
+                mode_h_u32,
+            )?)
+        } else {
+            None
+        };
         let mut bake_b_iterations: u32 = 0;
         let (fbo_b, tex_b) = loop {
             bake_b_iterations += 1;
@@ -5110,7 +5188,7 @@ pub fn paint_and_present_one_transition_frame(
                     }
                 }
             };
-            match bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, inputs_b) {
+            match bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, cached_pair_b, inputs_b) {
                 Ok(Some(p)) => {
                     // r76 Phase A: emit begin_transition -> endpoint_b
                     // first-frame gap. r94: also surface poll outcome
@@ -5194,12 +5272,19 @@ pub fn paint_and_present_one_transition_frame(
                 }
             }
         };
+        // r102.2: only delete the FBO+tex handles when the cache
+        // is disabled (we allocated fresh this tick). When the
+        // cache is enabled, session::cleanup_resources owns the
+        // handles and frees them at session teardown.
+        let cache_enabled = crate::v4l2::is_transition_fbo_cache_enabled();
         let cleanup_static = |gl: &glow::Context, vbo: Option<glow::Buffer>| {
             if let Some(vbo) = vbo { gl.delete_buffer(vbo); }
-            gl.delete_framebuffer(fbo_a);
-            gl.delete_texture(tex_a);
-            gl.delete_framebuffer(fbo_b);
-            gl.delete_texture(tex_b);
+            if !cache_enabled {
+                gl.delete_framebuffer(fbo_a);
+                gl.delete_texture(tex_a);
+                gl.delete_framebuffer(fbo_b);
+                gl.delete_texture(tex_b);
+            }
         };
         let program = match link_program(session.gl, VS_TEXTURED_QUAD, fs) {
             Ok(p) => p,
@@ -6775,6 +6860,105 @@ unsafe fn ensure_scene_fbo(session: &mut EglSession, w: u32, h: u32) -> Result<(
     Ok((fbo, tex))
 }
 
+/// r102.2 (2026-06-09): per-side identifier for the cached
+/// transition FBO+tex pair. The transition shader samples both
+/// endpoints simultaneously, so the cache holds two slots --
+/// the side enum tells the helper which one to return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionFboSide {
+    A,
+    B,
+}
+
+/// r102.2 (2026-06-09): allocate-once-and-reuse FBO+tex pair
+/// for the given transition endpoint side. Analogous to
+/// `ensure_scene_fbo`. On cache hit (same side, same dims),
+/// returns the existing pair. On cache miss, allocates via
+/// `create_slide_fbo_pair` and stores. On dim change vs the
+/// cached `transition_fbo_dims`, BOTH side caches are
+/// invalidated + freed before reallocating -- the
+/// transition shader needs matching dims between a and b.
+///
+/// Caller responsibilities:
+/// - Bind the returned FBO + glViewport before painting.
+/// - glClear the prior tick's content before drawing fresh.
+/// - DO NOT delete the returned handles -- session teardown
+///   handles cleanup.
+unsafe fn ensure_transition_fbo_pair(
+    session: &mut EglSession,
+    side: TransitionFboSide,
+    w: u32,
+    h: u32,
+) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
+    use glow::HasContext;
+    let dims_changed = match session.transition_fbo_dims {
+        Some((cw, ch)) => cw != w || ch != h,
+        None => false,
+    };
+    if dims_changed {
+        // Free BOTH sides; the transition shader needs the pair
+        // to share dims. Easier to invalidate both than to
+        // size-check per-side.
+        if let Some(fbo) = session.transition_fbo_a.take() {
+            session.gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.transition_tex_a.take() {
+            session.gl.delete_texture(tex);
+        }
+        if let Some(fbo) = session.transition_fbo_b.take() {
+            session.gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.transition_tex_b.take() {
+            session.gl.delete_texture(tex);
+        }
+        session.transition_fbo_dims = None;
+    }
+    let (slot_fbo, slot_tex) = match side {
+        TransitionFboSide::A => (&mut session.transition_fbo_a, &mut session.transition_tex_a),
+        TransitionFboSide::B => (&mut session.transition_fbo_b, &mut session.transition_tex_b),
+    };
+    if let (Some(fbo), Some(tex)) = (*slot_fbo, *slot_tex) {
+        return Ok((fbo, tex));
+    }
+    let (fbo, tex) = create_slide_fbo_pair(session.gl, w, h)?;
+    // r102.2 subagent WARN-1: set the dims sentinel BEFORE the
+    // slot assignments so a future refactor that adds a panic-
+    // bubble between can't leave the cache in a (slot=Some,
+    // dims=None) partial state that the dims_changed check
+    // would silently skip. With dims-set-first, the only
+    // observable partial state is (slot=None, dims=Some) which
+    // matches a fresh-allocation-pending case the existing
+    // logic already tolerates.
+    session.transition_fbo_dims = Some((w, h));
+    *slot_fbo = Some(fbo);
+    *slot_tex = Some(tex);
+    Ok((fbo, tex))
+}
+
+/// r102.2 (2026-06-09): branch-level "reuse or allocate" helper
+/// used by every `bake_slide_to_fbo` branch. When `existing` is
+/// Some, binds the cached FBO + returns the pair as-is (caller
+/// is responsible for glViewport + glClear). When None, falls
+/// through to `create_slide_fbo_pair` exactly as pre-r102.2.
+///
+/// Centralizes the reuse logic so the cache rollout is one
+/// helper call per branch instead of a match-block per branch.
+unsafe fn prepare_bake_fbo_pair(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    existing: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
+) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
+    use glow::HasContext;
+    match existing {
+        Some((fbo, tex)) => {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            Ok((fbo, tex))
+        }
+        None => create_slide_fbo_pair(gl, mode_w, mode_h),
+    }
+}
+
 /// CRIT-A (2026-05-10): cached FS_BRIGHT_GAMMA program + resolved
 /// attribute / uniform locations. P2-G (2026-05-10) extracted the
 /// fullscreen-quad VBO into a shared `cached_textured_quad_vbo`
@@ -8119,8 +8303,42 @@ unsafe fn make_slide_fbo(
     // (render_fade_composite, render_transition_animated_in_session
     // legacy 3-pass path) which run outside a session.
     runtime_glyph_ctx: Option<crate::glyph_cache::RuntimeGlyphCtx<'_>>,
+    // r102.2 (2026-06-09): when Some, REUSE the provided FBO+tex
+    // pair instead of allocating fresh. Caller is responsible
+    // for the cache lifecycle (session::cleanup_resources frees
+    // it at teardown). When None, allocate as pre-r102.2.
+    existing_fbo_pair: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
 ) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
     use glow::HasContext;
+    // r102.2: cache-reuse path. When the caller threaded an
+    // existing pair, bind it + clear + run paint_slide. Skip
+    // alloc + skip error-path delete (caller owns the cache).
+    if let Some((fbo, tex)) = existing_fbo_pair {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        gl.clear_color(0.0, 0.0, 0.0, 0.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+        let paint_result = paint_slide(
+            gl,
+            mode_w,
+            mode_h,
+            bg_kind,
+            text_layers,
+            motion_states,
+            current_unix_seconds(),
+            glyph_cache,
+            None,
+            tex_cache,
+            runtime_glyph_ctx,
+        );
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        paint_result?;
+        return Ok((fbo, tex));
+    }
+    // r102.2 (UNCHANGED below): legacy allocate-fresh path used
+    // when existing_fbo_pair is None (kill switch / standalone
+    // callers). Surface area of change is confined to the
+    // cache-hit branch above.
     let tex = gl
         .create_texture()
         .map_err(|e| anyhow!("glGenTextures(slide_fbo): {e}"))?;
@@ -8426,6 +8644,22 @@ unsafe fn bake_slide_to_fbo(
     session: &mut EglSession,
     mode_w: u32,
     mode_h: u32,
+    // r102.2 (2026-06-09): when Some, REUSE the provided
+    // FBO+tex pair instead of allocating fresh via
+    // `create_slide_fbo_pair` / `make_slide_fbo`. The
+    // transition caller (paint_and_present_one_transition_frame)
+    // passes Some from a per-(EglSession, mode_w, mode_h) cache
+    // when OPENMARQUEE_TRANSITION_FBO_CACHE is enabled
+    // (default), eliminating the ~8 MB/tick vc4 BO churn that
+    // r102 audit identified as the V3D leak source. Each
+    // branch is responsible for binding + glClear before
+    // drawing into the reused pair.
+    //
+    // When None: legacy pre-r102.2 behavior -- branch allocates
+    // a fresh pair. Used by callers that don't have a stable
+    // session cache slot (none today; reserved for future
+    // standalone-helper reuse).
+    existing_fbo_pair: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
     inputs: SlideBakeInputs<'_>,
 ) -> Result<Option<(glow::NativeFramebuffer, glow::NativeTexture)>> {
     use glow::HasContext;
@@ -8477,6 +8711,8 @@ unsafe fn bake_slide_to_fbo(
                 .expect("slide_caches entry initialized above");
             // Text always bakes — wrap in Some (only Video can
             // return Ok(None), the FYS-bug-C "no frame this tick").
+            // r102.2: thread existing_fbo_pair so the cached
+            // session.transition_fbo_a/b is reused across ticks.
             make_slide_fbo(
                 session.gl,
                 mode_w,
@@ -8487,6 +8723,7 @@ unsafe fn bake_slide_to_fbo(
                 Some(&mut cache.glyph),
                 Some(&mut cache.tex),
                 runtime_glyph_ctx,
+                existing_fbo_pair,
             )
             .map(Some)
         }
@@ -8499,10 +8736,13 @@ unsafe fn bake_slide_to_fbo(
             let (cached_tex, img_w, img_h) = session
                 .image_slide_tex_cache
                 .ensure(session.gl, slide_id, asset_path)?;
-            let (fbo, tex) = create_slide_fbo_pair(session.gl, mode_w, mode_h)?;
-            // create_slide_fbo_pair leaves FBO bound; paint into it
-            // via the cached-blit helper (no decode, no upload —
-            // just one fullscreen cover-fit draw), then unbind to the
+            // r102.2: reuse the transition FBO+tex pair when the
+            // caller threaded one through; allocate fresh
+            // otherwise.
+            let (fbo, tex) = prepare_bake_fbo_pair(session.gl, mode_w, mode_h, existing_fbo_pair)?;
+            // The helper leaves FBO bound; paint into it via the
+            // cached-blit helper (no decode, no upload — just one
+            // fullscreen cover-fit draw), then unbind to the
             // default fb (mirrors make_slide_fbo's cleanup
             // discipline on the text branch).
             let paint_result = blit_cached_image_slide_to_current_fbo(
@@ -8510,8 +8750,14 @@ unsafe fn bake_slide_to_fbo(
             );
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             if let Err(e) = paint_result {
-                session.gl.delete_framebuffer(fbo);
-                session.gl.delete_texture(tex);
+                // r102.2: only delete on allocate-fresh path;
+                // reusing the cached pair must not free it (the
+                // session still owns the handles and the next
+                // tick will rebind them).
+                if existing_fbo_pair.is_none() {
+                    session.gl.delete_framebuffer(fbo);
+                    session.gl.delete_texture(tex);
+                }
                 return Err(e);
             }
             Ok(Some((fbo, tex)))
@@ -8523,7 +8769,7 @@ unsafe fn bake_slide_to_fbo(
             frames_decoded,
             decoder,
         } => {
-            let (fbo, tex) = create_slide_fbo_pair(session.gl, mode_w, mode_h)?;
+            let (fbo, tex) = prepare_bake_fbo_pair(session.gl, mode_w, mode_h, existing_fbo_pair)?;
             let paint_result = bake_video_slide_to_current_fbo(
                 session,
                 samples,
@@ -8554,13 +8800,20 @@ unsafe fn bake_slide_to_fbo(
                     // video-involved transition aborted the moment
                     // either decoder bubbled (almost always tick 1,
                     // with the just-primed to-slide decoder cold).
-                    session.gl.delete_framebuffer(fbo);
-                    session.gl.delete_texture(tex);
+                    // r102.2: same cache-vs-fresh rule as the
+                    // Image branch -- only delete when the FBO
+                    // was freshly allocated here.
+                    if existing_fbo_pair.is_none() {
+                        session.gl.delete_framebuffer(fbo);
+                        session.gl.delete_texture(tex);
+                    }
                     Ok(None)
                 }
                 Err(e) => {
-                    session.gl.delete_framebuffer(fbo);
-                    session.gl.delete_texture(tex);
+                    if existing_fbo_pair.is_none() {
+                        session.gl.delete_framebuffer(fbo);
+                        session.gl.delete_texture(tex);
+                    }
                     Err(e)
                 }
             }
@@ -8618,9 +8871,11 @@ unsafe fn bake_slide_to_fbo(
                     .slide_caches
                     .insert(slide_id, SlideRenderCache::new(layers_len));
             }
-            let (fbo, tex) = create_slide_fbo_pair(session.gl, mode_w, mode_h)?;
+            // r102.2: reuse cached transition FBO+tex pair when
+            // the caller threaded one through.
+            let (fbo, tex) = prepare_bake_fbo_pair(session.gl, mode_w, mode_h, existing_fbo_pair)?;
             // Phase 1: bake video frame INTO the just-created FBO
-            // (still bound by create_slide_fbo_pair).
+            // (still bound by prepare_bake_fbo_pair).
             let video_result = bake_video_slide_to_current_fbo(
                 session,
                 bg_samples,
@@ -8634,19 +8889,23 @@ unsafe fn bake_slide_to_fbo(
                 Ok(Some(_path)) => true,
                 Ok(None) => {
                     // FYS bug C analog: no video frame ready this
-                    // tick. Free the FBO and return Ok(None) so
-                    // the transition caller skips the swap+commit
-                    // and the next advance retries. Identical
-                    // semantics to the Video-only branch above.
+                    // tick. r102.2: only free the FBO+tex if WE
+                    // allocated it (existing_fbo_pair was None).
+                    // When reusing the cached pair, the next tick
+                    // will rebind + reclear.
                     session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                    session.gl.delete_framebuffer(fbo);
-                    session.gl.delete_texture(tex);
+                    if existing_fbo_pair.is_none() {
+                        session.gl.delete_framebuffer(fbo);
+                        session.gl.delete_texture(tex);
+                    }
                     return Ok(None);
                 }
                 Err(e) => {
                     session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                    session.gl.delete_framebuffer(fbo);
-                    session.gl.delete_texture(tex);
+                    if existing_fbo_pair.is_none() {
+                        session.gl.delete_framebuffer(fbo);
+                        session.gl.delete_texture(tex);
+                    }
                     return Err(e);
                 }
             };
@@ -8692,8 +8951,10 @@ unsafe fn bake_slide_to_fbo(
             );
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             if let Err(e) = paint_result {
-                session.gl.delete_framebuffer(fbo);
-                session.gl.delete_texture(tex);
+                if existing_fbo_pair.is_none() {
+                    session.gl.delete_framebuffer(fbo);
+                    session.gl.delete_texture(tex);
+                }
                 return Err(e);
             }
             Ok(Some((fbo, tex)))
@@ -8820,8 +9081,8 @@ pub fn render_fade_composite(
             // will Tofu here — acceptable since this helper is
             // exercised by direct-mode CLI invocations + tests, not
             // the IPC sidecar production reel.
-            let (fbo_a, tex_a) = make_slide_fbo(gl, mode_w, mode_h, &bg_a, &layers_a, None, None, None, None)?;
-            let (fbo_b, tex_b) = match make_slide_fbo(gl, mode_w, mode_h, &bg_b, &layers_b, None, None, None, None) {
+            let (fbo_a, tex_a) = make_slide_fbo(gl, mode_w, mode_h, &bg_a, &layers_a, None, None, None, None, None)?;
+            let (fbo_b, tex_b) = match make_slide_fbo(gl, mode_w, mode_h, &bg_b, &layers_b, None, None, None, None, None) {
                 Ok(pair) => pair,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
@@ -9106,9 +9367,9 @@ fn render_transition_animated_in_session(
         // reel transition baking goes through bake_slide_to_fbo
         // which DOES thread runtime_glyph_ctx (above). Leaving
         // None here preserves the legacy path's behavior.
-        let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a, None, None, None, None)? };
+        let (fbo_a, tex_a) = unsafe { make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_a, &layers_a, None, None, None, None, None)? };
         let (fbo_b, tex_b) = unsafe {
-            match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b, None, None, None, None) {
+            match make_slide_fbo(gl, mode_w_u32, mode_h_u32, &bg_b, &layers_b, None, None, None, None, None) {
                 Ok(pair) => pair,
                 Err(e) => {
                     gl.delete_framebuffer(fbo_a);
@@ -15104,6 +15365,52 @@ impl ObjectProps {
             .find(|(n, _)| n == name)
             .map(|(_, id)| *id)
             .ok_or_else(|| anyhow!("property {name:?} not found on object"))
+    }
+}
+
+#[cfg(test)]
+mod r102_2_tests {
+    /// Kill-switch tests for
+    /// `crate::v4l2::is_transition_fbo_cache_enabled` live in
+    /// `v4l2.rs`'s tests module because hdmi.rs is
+    /// linux-cfg-gated and would not be compiled by
+    /// `cargo test` on macOS dev hosts. The source-pin test
+    /// below DOES run here on Linux targets where hdmi.rs is
+    /// compiled.
+
+    #[test]
+    fn r102_2_session_struct_has_transition_fbo_fields() {
+        // Source-level regression-lock: pin the EglSession field
+        // names so a future refactor that drops or renames them
+        // surfaces here instead of as a silent leak regression.
+        // Reads hdmi.rs as a string; assert the field
+        // declarations exist verbatim.
+        let src = include_str!("hdmi.rs");
+        for field in [
+            "transition_fbo_a: Option<glow::NativeFramebuffer>",
+            "transition_tex_a: Option<glow::NativeTexture>",
+            "transition_fbo_b: Option<glow::NativeFramebuffer>",
+            "transition_tex_b: Option<glow::NativeTexture>",
+            "transition_fbo_dims: Option<(u32, u32)>",
+        ] {
+            assert!(
+                src.contains(field),
+                "r102.2 EglSession field missing or renamed: `{field}`",
+            );
+        }
+        // And the cleanup paths in cleanup_resources MUST free
+        // the cache; assert both *_take() calls exist.
+        for take in [
+            "session.transition_fbo_a.take()",
+            "session.transition_tex_a.take()",
+            "session.transition_fbo_b.take()",
+            "session.transition_tex_b.take()",
+        ] {
+            assert!(
+                src.contains(take),
+                "r102.2 cleanup_resources missing `{take}` -- handle would leak at session teardown",
+            );
+        }
     }
 }
 

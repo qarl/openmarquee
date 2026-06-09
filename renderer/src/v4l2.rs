@@ -249,6 +249,25 @@ pub fn is_egl_image_cache_enabled() -> bool {
     }
 }
 
+/// r102.2 (2026-06-09): runtime kill-switch for the transition
+/// FBO+tex cache (hdmi.rs `ensure_transition_fbo_pair`). Default
+/// ENABLED. Set `OPENMARQUEE_TRANSITION_FBO_CACHE=off` (or
+/// `0`/`false`/`no`/`disable`/`disabled`) to fall back to the
+/// pre-r102.2 per-tick `create_slide_fbo_pair` +
+/// `cleanup_static` churn that vc4 V3D lazy-GC retained as a
+/// BO leak. Co-located with the r101 EGLImage cache kill switch
+/// for cohesion -- both are env-var helpers used by the
+/// renderer's leak-mitigation surfaces.
+pub fn is_transition_fbo_cache_enabled() -> bool {
+    match std::env::var("OPENMARQUEE_TRANSITION_FBO_CACHE") {
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no" | "disable" | "disabled")
+        }
+        Err(_) => true,
+    }
+}
+
 /// r102.1 (2026-06-09): snapshot of vc4 V3D BO counts from
 /// `/sys/kernel/debug/dri/0/bo_stats`. `None` for the count
 /// fields when the debugfs node is absent or unreadable or
@@ -3612,6 +3631,52 @@ mod tests {
             src.contains("egl_image_destroy_exit"),
             "r101.1 instrumentation missing: per-handle exit probe `egl_image_destroy_exit`",
         );
+    }
+
+    #[test]
+    fn is_transition_fbo_cache_enabled_defaults_to_on() {
+        // r102.2: kill-switch defaults ON; co-located here with
+        // the EGLImage cache kill-switch tests because hdmi.rs
+        // (where the actual cache lives) is linux-cfg-gated.
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("OPENMARQUEE_TRANSITION_FBO_CACHE").ok();
+        std::env::remove_var("OPENMARQUEE_TRANSITION_FBO_CACHE");
+        assert!(
+            is_transition_fbo_cache_enabled(),
+            "default (env unset) must enable the cache",
+        );
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_TRANSITION_FBO_CACHE", v);
+        }
+    }
+
+    #[test]
+    fn is_transition_fbo_cache_enabled_off_values_disable() {
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("OPENMARQUEE_TRANSITION_FBO_CACHE").ok();
+        for off in ["0", "off", "false", "no", "disable", "disabled", "OFF"] {
+            std::env::set_var("OPENMARQUEE_TRANSITION_FBO_CACHE", off);
+            assert!(
+                !is_transition_fbo_cache_enabled(),
+                "value {off:?} must disable the cache",
+            );
+        }
+        for on in ["1", "on", "yes", "enable", "enabled", "", "garbage"] {
+            std::env::set_var("OPENMARQUEE_TRANSITION_FBO_CACHE", on);
+            assert!(
+                is_transition_fbo_cache_enabled(),
+                "value {on:?} must keep the cache enabled (default-on policy)",
+            );
+        }
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_TRANSITION_FBO_CACHE", v);
+        } else {
+            std::env::remove_var("OPENMARQUEE_TRANSITION_FBO_CACHE");
+        }
     }
 
     #[test]
