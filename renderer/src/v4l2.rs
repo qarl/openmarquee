@@ -262,33 +262,69 @@ pub struct V3dBoSnapshot {
     pub v3d_mem_kb: Option<u64>,
 }
 
-/// r102.1 (2026-06-09): pure parser for `/sys/kernel/debug/dri/0/bo_stats`
-/// contents. Split out of `read_v3d_bo_snapshot` so the parsing
-/// logic is unit-testable against synthetic input without
-/// touching the filesystem. Mirrors the `parse_cma_lines`
-/// (v4l2.rs:3182) pattern -- the established codebase
-/// convention for debugfs parsers.
+/// r102.1.1 (2026-06-09): pure parser for
+/// `/sys/kernel/debug/dri/0/bo_stats`. Split out of
+/// `read_v3d_bo_snapshot` so the parsing logic is unit-testable
+/// against synthetic input. Mirrors the `parse_cma_lines`
+/// (v4l2.rs:3182) pattern.
 ///
-/// vc4 kernel 6.12 format example (tab-separated):
-///   num bos allocated:\t33
-///   size bos allocated:\t88611 kb
-///   num bos used:\t31
-///   size bos used:\t88543 kb
+/// **FYS-empirical format** (raspberry-pi-64 kernel; QA-captured
+/// 2026-06-09 via `sudo -u openmarquee cat`):
 ///
-/// We parse only the "allocated" totals; "used" / "purgeable" /
-/// cache lines are silently skipped. If a future kernel renames
-/// the keys, the parser returns defaulted Nones and the probe
-/// line emits `?` -- observable in the journal, not a wedge.
+/// ```text
+///                           dumb:   2040kb BOs (1)
+///                            V3D: 109972kb BOs (45)
+///                     V3D shader:     80kb BOs (20)
+///                           kernel:   5280kb BOs (4)
+///                         binner:  16384kb BOs (1)
+/// ```
+///
+/// We extract ONLY the `V3D:` line (NOT `V3D shader:` -- different
+/// category). Match shape: `V3D: <kb>kb BOs (<count>)`. Returns
+/// defaulted Nones if the line is missing or malformed.
+///
+/// r102.1 (parent) targeted a HYPOTHETICAL kernel-6.12 format
+/// (`num bos allocated:` / `size bos allocated:`) that turned out
+/// NOT to match FYS. The hypothetical-format tests were green but
+/// the parser was wrong against real input. r102.1.1 reworks
+/// against the empirically-captured format + retains tolerance
+/// for the hypothetical one (legacy fallback) so a future kernel
+/// upgrade isn't a sudden parser break.
 pub fn parse_v3d_bo_stats(contents: &str) -> V3dBoSnapshot {
     let mut out = V3dBoSnapshot::default();
     for line in contents.lines() {
         let line = line.trim();
+        // r102.1.1: FYS-empirical format. The strip_prefix
+        // intentionally uses "V3D:" (with colon) so it doesn't
+        // match "V3D shader:" -- two distinct allocator
+        // categories that must NOT be summed.
+        if let Some(rest) = line.strip_prefix("V3D:") {
+            let rest = rest.trim();
+            // Format: "109972kb BOs (45)" -- single space between
+            // "kb" and "BOs" on FYS; tolerate other whitespace
+            // counts via `split_once`.
+            if let Some((kb_part, count_part)) = rest.split_once("kb BOs (") {
+                if let Ok(kb) = kb_part.trim().parse::<u64>() {
+                    out.v3d_mem_kb = Some(kb);
+                }
+                let count_str = count_part.trim_end_matches(')').trim();
+                if let Ok(n) = count_str.parse::<u32>() {
+                    out.v3d_bos = Some(n);
+                }
+            }
+            continue;
+        }
+        // r102.1.1: legacy hypothetical-format fallback. Kept so
+        // a future kernel change away from the FYS format
+        // doesn't silently break. Don't `continue` on match
+        // here because the file may emit BOTH formats in a
+        // transition window (highly unlikely but cheap to
+        // tolerate).
         if let Some(rest) = line.strip_prefix("num bos allocated:") {
             if let Ok(n) = rest.trim().parse::<u32>() {
                 out.v3d_bos = Some(n);
             }
         } else if let Some(rest) = line.strip_prefix("size bos allocated:") {
-            // Format: "size bos allocated:\t88611 kb"
             let cleaned = rest.trim().trim_end_matches(" kb").trim_end_matches("kb").trim();
             if let Ok(n) = cleaned.parse::<u64>() {
                 out.v3d_mem_kb = Some(n);
@@ -296,6 +332,22 @@ pub fn parse_v3d_bo_stats(contents: &str) -> V3dBoSnapshot {
         }
     }
     out
+}
+
+/// r102.1.1 (2026-06-09): one-shot debug dump of the raw bo_stats
+/// bytes when the parser returns defaulted Nones for the first
+/// time in a process lifetime. QA asked for this so a future
+/// format drift surfaces the actual file contents in the journal
+/// rather than silently emitting `?` sentinels forever.
+///
+/// Fires AT MOST once per process. Truncates the dump to 512
+/// chars so a runaway file doesn't blow the log.
+// r102.1.1 subagent WARN: a prior version cfg-gated this on
+// linux-vs-not-linux with identical bodies. Single declaration
+// is correct; the dump call site is also cross-platform.
+std::thread_local! {
+    static V3D_BO_STATS_DUMPED: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// r102.1 (2026-06-09): read `/sys/kernel/debug/dri/0/bo_stats`
@@ -311,11 +363,45 @@ pub fn parse_v3d_bo_stats(contents: &str) -> V3dBoSnapshot {
 /// fields. QA can chmod +r the bo_stats file at deploy time if
 /// needed.
 pub fn read_v3d_bo_snapshot() -> V3dBoSnapshot {
+    use std::io::Write;
     let contents = match std::fs::read_to_string("/sys/kernel/debug/dri/0/bo_stats") {
         Ok(s) => s,
         Err(_) => return V3dBoSnapshot::default(),
     };
-    parse_v3d_bo_stats(&contents)
+    let snap = parse_v3d_bo_stats(&contents);
+    // r102.1.1: one-shot raw-bytes dump on first parse failure.
+    // The parent r102.1 shipped a parser tuned to a hypothetical
+    // kernel format that didn't match FYS; we silently emitted
+    // `?` for every probe until QA caught it via the workaround.
+    // Dump the actual file contents once so a future format
+    // drift is visible in the journal instead of silent.
+    if snap.v3d_bos.is_none() && snap.v3d_mem_kb.is_none() {
+        V3D_BO_STATS_DUMPED.with(|dumped| {
+            if !dumped.get() {
+                dumped.set(true);
+                // r102.1.1 subagent BLOCKER fix: `&contents[..512]`
+                // panics on a non-char-boundary slice. Today's
+                // bo_stats is pure ASCII so it works, but the
+                // dump fires precisely on parser failure (i.e.
+                // when the format is unexpected and could
+                // hypothetically contain non-ASCII). Use
+                // `get(..512)` which returns None on non-
+                // boundary; fall back to the full contents in
+                // that case. Instrumentation MUST NOT affect
+                // renderer liveness (documented invariant).
+                let truncated = contents
+                    .get(..512)
+                    .unwrap_or(contents.as_str());
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[mem] v3d_bo_stats_parse_failed first_time=true bytes={} raw_truncated_512=\"{}\"",
+                    contents.len(),
+                    truncated.replace('\n', "\\n").replace('"', "\\\""),
+                );
+            }
+        });
+    }
+    snap
 }
 
 /// r102.1 (2026-06-09): emit a `[mem] v3d_bos_at_phase ...`
@@ -3343,18 +3429,70 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn parse_v3d_bo_stats_happy_path_tab_separated() {
-        // r102.1 subagent WARN-1: pin the kernel-6.12 tab-
-        // separated format the parser was written against. If
-        // a future kernel rename breaks this, we catch it
-        // here instead of on FYS.
+    fn parse_v3d_bo_stats_fys_empirical_format() {
+        // r102.1.1 (2026-06-09): pin the ACTUAL FYS kernel
+        // format QA captured 2026-06-09 via
+        // `sudo -u openmarquee cat /sys/kernel/debug/dri/0/bo_stats`.
+        // The r102.1 parent shipped against a hypothetical
+        // kernel-6.12 format (`num bos allocated:`) that didn't
+        // match FYS at all -- parser returned None for every
+        // probe even though the file was readable. This test
+        // pins the real format so a future regression that
+        // touches the parser doesn't silently lose FYS support
+        // again.
+        let contents = "\
+                          dumb:   2040kb BOs (1)\n\
+                           V3D: 109972kb BOs (45)\n\
+                    V3D shader:     80kb BOs (20)\n\
+                          kernel:   5280kb BOs (4)\n\
+                        binner:  16384kb BOs (1)\n";
+        let snap = parse_v3d_bo_stats(contents);
+        assert_eq!(snap.v3d_bos, Some(45), "V3D BO count must parse to 45");
+        assert_eq!(snap.v3d_mem_kb, Some(109972), "V3D mem must parse to 109972 kb");
+    }
+
+    #[test]
+    fn parse_v3d_bo_stats_excludes_v3d_shader_category() {
+        // r102.1.1: `V3D:` and `V3D shader:` are DISTINCT
+        // categories on FYS. The parser's strip_prefix("V3D:")
+        // intentionally rejects "V3D shader:" because shader
+        // BOs aren't what QA is tracking. Pin so a future
+        // refactor that loosens the prefix match (e.g. to
+        // "V3D" without colon) catches this case.
+        //
+        // r102.1.1 subagent NIT: place `V3D:` BEFORE
+        // `V3D shader:` so a loosened prefix wouldn't be
+        // rescued by a later overwrite. Also assert against
+        // an isolated `V3D shader:`-only input (no `V3D:`
+        // line) to pin that shader alone produces all-None.
+        let mixed = "\
+            V3D: 109972kb BOs (45)\n\
+            V3D shader: 80kb BOs (20)\n";
+        let snap_mixed = parse_v3d_bo_stats(mixed);
+        assert_eq!(snap_mixed.v3d_bos, Some(45));
+        assert_eq!(snap_mixed.v3d_mem_kb, Some(109972));
+
+        let shader_only = "\
+            V3D shader: 80kb BOs (20)\n\
+            kernel: 100kb BOs (2)\n";
+        let snap_shader = parse_v3d_bo_stats(shader_only);
+        assert_eq!(
+            snap_shader.v3d_bos, None,
+            "V3D shader alone must not satisfy the V3D: prefix",
+        );
+        assert_eq!(snap_shader.v3d_mem_kb, None);
+    }
+
+    #[test]
+    fn parse_v3d_bo_stats_legacy_hypothetical_format_still_works() {
+        // r102.1.1: legacy fallback for the hypothetical
+        // kernel-6.12 format the r102.1 parent targeted. Kept
+        // in case a future kernel upgrade renames back to
+        // this shape. Lower priority than the FYS-empirical
+        // format but cheap to retain.
         let contents = "\
             num bos allocated:\t33\n\
-            size bos allocated:\t88611 kb\n\
-            num bos used:\t31\n\
-            size bos used:\t88543 kb\n\
-            num purgeable bos:\t2\n\
-            size purgeable bos:\t68 kb\n";
+            size bos allocated:\t88611 kb\n";
         let snap = parse_v3d_bo_stats(contents);
         assert_eq!(snap.v3d_bos, Some(33));
         assert_eq!(snap.v3d_mem_kb, Some(88611));

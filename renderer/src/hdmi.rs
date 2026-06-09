@@ -4767,23 +4767,32 @@ pub fn paint_and_present_one_transition_frame(
     progress: f32,
 ) -> Result<()> {
     use glow::HasContext;
-    // r102.1 (2026-06-09): V3D BO leak probe. Throttle to FIRST
-    // and LAST tick of each transition so QA can bracket the
-    // transition's BO delta without log-volume blowup. First-tick
-    // detection: progress < ~0.05 (~2 ticks of 45 at 30fps × 1.5s).
-    // Last-tick detection: progress > ~0.95 (~2 ticks). Other
-    // ticks skip the probe.
+    // r102.1.1 (2026-06-09): V3D BO leak probe. Throttle to
+    // FIRST and LAST tick of each transition so QA can bracket
+    // the transition's BO delta without log-volume blowup.
     //
-    // r102.1 subagent WARN-2: thresholds assume 1.0-1.5s
-    // transitions at 30fps (the canonical config today). For
-    // SHORTER transitions (e.g. 0.3s = 9 ticks → 0.111/tick), the
-    // entry threshold still fires on tick 0 but the exit
-    // threshold may not fire at all if the last tick lands at
-    // 0.889 < 0.95. QA's bracket-delta math degrades gracefully
-    // (missing exit biases the per-transition delta high) but
-    // doesn't wedge. If a future feature ships transitions
-    // <0.5s, replace this gate with a tick-counter on
-    // EglSession.
+    // r102.1 (parent) had TWO bugs caught by QA on FYS:
+    //   1. The probe CALL was clobbered when the WARN-2 comment
+    //      block was added (the `if progress < 0.05 { log... }`
+    //      line went missing entirely). transition_paint_entry
+    //      never fired in the journal because there was no
+    //      caller, not because the threshold was wrong.
+    //   2. Even if the call was present, `progress < 0.05` was
+    //      too tight: Python backend sends the first paint at
+    //      progress > 0.05 (likely 0.066 = tick 1 of 15 at 33ms
+    //      per tick, OR a post-prime gap that consumes the
+    //      first 30-50ms of the transition window).
+    //
+    // r102.1.1 restores the missing call AND widens the entry
+    // threshold to 0.20 so the first 3-9 ticks of a 1.0-1.5s
+    // transition catch the boundary regardless of where Python
+    // pushes its first paint. Exit threshold (0.95) shipped
+    // working in r102.1 (it was on the success arm at the
+    // function tail, untouched by the comment-clobber); kept
+    // as-is.
+    if progress < 0.20 {
+        crate::v4l2::log_v3d_bos_at_phase("transition_paint_entry", None);
+    }
     let fs = match fs_for_transition_kind(kind) {
         Some(s) => s,
         None => {
