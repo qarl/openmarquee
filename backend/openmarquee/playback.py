@@ -53,6 +53,107 @@ log = logging.getLogger(__name__)
 _STREAM_CONNECT_TIMEOUT_S = 3.0
 
 
+# r98 (2026-06-09): preload scheduling design-space knobs.
+#
+# OPENMARQUEE_PRELOAD_MODE selects HOW the next-slide preload fires:
+#   - 'defer' (default; r97 behavior): time-based 1.0 s before
+#     slide-end; Rust IPC arm short-circuits to defer when an
+#     active video decoder + incoming video-bg are both true
+#   - 'lead': time-based, OPENMARQUEE_PRELOAD_LEAD_MS before
+#     slide-end. Rust skips the defer check so the preload reaches
+#     prime_video_decoder_for_preload even under codec contention.
+#     Use to measure whether extended lead time gives the contended
+#     second decoder enough VPU cycles to have a first frame ready
+#     by BeginTransition.
+#   - 'max': event-driven, fires PreloadSlide(N+1) immediately
+#     after begin_slide(N) returns. Maximum possible lead time for
+#     any playlist structure (= full duration of slide N). Rust
+#     skips defer. OPENMARQUEE_PRELOAD_LEAD_MS is IGNORED in this
+#     mode.
+#
+# All three modes preserve the existing single-video and mixed-bg
+# paths; the lead/max modes only matter when the slide flow has
+# back-to-back video-bg slides where r97's defer would otherwise
+# skip the preload.
+_DEFAULT_PRELOAD_LEAD_MS = 1000
+_PRELOAD_LEAD_MIN_MS = 100
+_PRELOAD_LEAD_MAX_MS = 10000
+
+# Canonical preload mode strings. Lowercase form is the stored
+# value; the parser normalises mixed-case env input via .lower().
+PRELOAD_MODE_DEFER = "defer"
+PRELOAD_MODE_LEAD = "lead"
+PRELOAD_MODE_MAX = "max"
+_PRELOAD_MODES = frozenset({PRELOAD_MODE_DEFER, PRELOAD_MODE_LEAD, PRELOAD_MODE_MAX})
+
+
+def _resolve_preload_mode(env: dict[str, str] | None = None) -> str:
+    """r98: read OPENMARQUEE_PRELOAD_MODE env var with validation.
+
+    Returns one of ('defer', 'lead', 'max'). Default 'defer' (r97
+    behavior). Case-insensitive on the input; whitespace-trimmed.
+    Empty / unset / unrecognised → warn (only for non-empty
+    unrecognised) + fall back to 'defer'.
+
+    Parameter `env` exists for unit-testability; production callers
+    pass None to read from os.environ.
+    """
+    import os
+
+    raw = (env if env is not None else os.environ).get("OPENMARQUEE_PRELOAD_MODE")
+    if raw is None:
+        return PRELOAD_MODE_DEFER
+    normalized = raw.strip().lower()
+    if normalized == "":
+        return PRELOAD_MODE_DEFER
+    if normalized in _PRELOAD_MODES:
+        return normalized
+    log.warning(
+        "OPENMARQUEE_PRELOAD_MODE=%r not a recognised mode "
+        "(expected defer/lead/max); using default 'defer'",
+        raw,
+    )
+    return PRELOAD_MODE_DEFER
+
+
+def _resolve_preload_lead_seconds(env: dict[str, str] | None = None) -> float:
+    """r98: read OPENMARQUEE_PRELOAD_LEAD_MS env var with validation.
+
+    Returns the lead time in seconds (float). Default 1.0 s
+    (matching the r61 baseline). Clamps to [100, 10000] ms; invalid
+    inputs (non-integer string, negative, etc.) log a warning and
+    fall back to the default.
+
+    Used by `lead` mode only; `defer` mode hard-codes 1.0 s and
+    `max` mode IGNORES this knob (event-driven trigger). Parameter
+    `env` exists for unit-testability.
+    """
+    import os
+
+    raw = (env if env is not None else os.environ).get("OPENMARQUEE_PRELOAD_LEAD_MS")
+    if raw is None or raw == "":
+        return _DEFAULT_PRELOAD_LEAD_MS / 1000.0
+    try:
+        value_ms = int(raw)
+    except ValueError:
+        log.warning(
+            "OPENMARQUEE_PRELOAD_LEAD_MS=%r is not an integer; using default %d ms",
+            raw,
+            _DEFAULT_PRELOAD_LEAD_MS,
+        )
+        return _DEFAULT_PRELOAD_LEAD_MS / 1000.0
+    if value_ms < _PRELOAD_LEAD_MIN_MS or value_ms > _PRELOAD_LEAD_MAX_MS:
+        log.warning(
+            "OPENMARQUEE_PRELOAD_LEAD_MS=%d outside [%d, %d]; using default %d ms",
+            value_ms,
+            _PRELOAD_LEAD_MIN_MS,
+            _PRELOAD_LEAD_MAX_MS,
+            _DEFAULT_PRELOAD_LEAD_MS,
+        )
+        return _DEFAULT_PRELOAD_LEAD_MS / 1000.0
+    return value_ms / 1000.0
+
+
 def web_refresh_due(
     last_fetch_monotonic: float | None,
     now_monotonic: float,
@@ -1121,7 +1222,60 @@ class PlaybackLoop:
         # operators CAN set 100-2000 ms via the API. For sub-2-s
         # slides the transition pays the cold prime cost as before
         # -- no worse than r57.
-        preload_lead_seconds = 1.0  # QA revert from r62 2.0 (visible 2s-before-stall per qarl); r65 will fix the underlying renderer-blocking PreloadSlide
+        # r98 (2026-06-09): preload scheduling mode + lead time.
+        # OPENMARQUEE_PRELOAD_MODE selects how to schedule the
+        # next-slide preload:
+        #   - 'defer' (default; r97 behavior): 1.0 s before slide-end;
+        #     Rust IPC arm short-circuits to defer on contention
+        #   - 'lead': time-based, OPENMARQUEE_PRELOAD_LEAD_MS before
+        #     slide-end. Rust skips defer; QA can sweep lead times
+        #     to measure whether the contended decoder primes in
+        #     time
+        #   - 'max': event-driven, fires preload IMMEDIATELY after
+        #     begin_slide(N) returns. Maximum possible lead time =
+        #     full duration of slide N. Rust skips defer.
+        preload_mode = _resolve_preload_mode()
+        preload_lead_seconds = _resolve_preload_lead_seconds()
+        log.info(
+            "playback: preload_mode=%s preload_lead_seconds=%.3f s "
+            "(OPENMARQUEE_PRELOAD_MODE + OPENMARQUEE_PRELOAD_LEAD_MS env overrides)",
+            preload_mode,
+            preload_lead_seconds,
+        )
+
+        # r98 'max' mode: fire PreloadSlide(N+1) IMMEDIATELY after
+        # begin_slide(N) returns. The post-loop transition handoff
+        # then has the full duration of slide N as warmup window for
+        # decoder #2. Mutates preloaded_next_id so the in-tick-loop
+        # trigger below short-circuits + doesn't re-fire.
+        if (
+            preload_mode == PRELOAD_MODE_MAX
+            and next_item is not None
+            and not self._stop_event.is_set()
+            and not self._pause_event.is_set()
+        ):
+            try:
+                await asyncio.to_thread(
+                    self._renderer.preload_slide,
+                    next_item.id,
+                )
+                log.debug(
+                    "playback: preload_mode=max fired preload for next id=%s "
+                    "at begin_slide(N) for current id=%s",
+                    next_item.id,
+                    item.id,
+                )
+            except Exception as e:
+                log.warning(
+                    "playback: preload_mode=max preload_slide for next id=%s "
+                    "failed (non-fatal; will retry at BeginSlide): %s",
+                    next_item.id,
+                    e,
+                )
+            # Mark as preloaded regardless of success so the in-tick
+            # trigger doesn't re-fire (matches the in-loop behavior
+            # at the success / failure branches below).
+            preloaded_next_id = next_item.id
         while True:
             if self._stop_event.is_set() or self._pause_event.is_set():
                 break

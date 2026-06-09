@@ -181,6 +181,74 @@ pub fn should_defer_preload_for_codec_contention(
     active_decoder_count >= 1 && bg_is_video
 }
 
+/// r98 (2026-06-09): preload scheduling mode, set via
+/// `OPENMARQUEE_PRELOAD_MODE` env var. Three modes — see
+/// `parse_preload_mode` for parsing semantics and
+/// `docs/hardware-ceilings.md` for the dual-1080p design-space
+/// rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreloadMode {
+    /// r97 behavior (default): skip preload when an active video
+    /// decoder is live AND the incoming preload's bg is video. The
+    /// Python playback loop fires PreloadSlide at the canonical 1.0s
+    /// before slide-end; the Rust IPC arm short-circuits to defer.
+    Defer,
+    /// Force preload through (Rust skips the defer check). Python
+    /// reads `OPENMARQUEE_PRELOAD_LEAD_MS` for the time-before-
+    /// slide-end trigger. Pairs the rust + python sides to let QA
+    /// sweep "what lead time gives the contended second decoder
+    /// enough VPU cycles to have a first frame ready by
+    /// BeginTransition?"
+    Lead,
+    /// Force preload through (Rust skips the defer check). Python
+    /// fires PreloadSlide for slide N immediately after slide N-1's
+    /// `begin_slide_load` event — the maximum possible lead time
+    /// for any playlist structure. `OPENMARQUEE_PRELOAD_LEAD_MS` is
+    /// IGNORED in this mode.
+    Max,
+}
+
+/// r98 (2026-06-09): parse `OPENMARQUEE_PRELOAD_MODE` into the enum.
+/// Accepts "defer" / "lead" / "max" (case-insensitive). `None` /
+/// empty / unrecognised → warn + default to `Defer` (r97 behavior).
+///
+/// Parameter `raw` exists for unit-testability; production callers
+/// pass `std::env::var("OPENMARQUEE_PRELOAD_MODE").ok().as_deref()`.
+pub fn parse_preload_mode(raw: Option<&str>) -> PreloadMode {
+    match raw {
+        None => PreloadMode::Defer,
+        Some(s) => {
+            let normalized = s.trim();
+            if normalized.is_empty() {
+                return PreloadMode::Defer;
+            }
+            if normalized.eq_ignore_ascii_case("defer") {
+                PreloadMode::Defer
+            } else if normalized.eq_ignore_ascii_case("lead") {
+                PreloadMode::Lead
+            } else if normalized.eq_ignore_ascii_case("max") {
+                PreloadMode::Max
+            } else {
+                eprintln!(
+                    "warn: OPENMARQUEE_PRELOAD_MODE={normalized:?} not a \
+                     recognised mode (expected defer/lead/max); using default \
+                     'defer' (r97 behavior)"
+                );
+                PreloadMode::Defer
+            }
+        }
+    }
+}
+
+/// r98 (2026-06-09): hot-path reader. The PreloadSlide IPC arm
+/// consults this on every defer-eligible preload to decide whether
+/// the r97 defer check should run. `std::env::var` is a libc
+/// `getenv` shared-state lookup; per-call cost is negligible.
+pub fn preload_mode() -> PreloadMode {
+    let raw = std::env::var("OPENMARQUEE_PRELOAD_MODE").ok();
+    parse_preload_mode(raw.as_deref())
+}
+
 /// never observe a partial JSON file even if the renderer crashes
 /// mid-write. The `.tmp` is co-located in the same directory as the
 /// target so the rename stays atomic.
@@ -3048,10 +3116,22 @@ fn handle_inner_request(
                     Some(crate::content::ContentItem::Image(_)) => false,
                     None => false,
                 };
-                if should_defer_preload_for_codec_contention(
-                    active_decoder_count,
-                    bg_is_video,
-                ) {
+                // r98 (2026-06-09): preload-mode gate. The r97 defer
+                // logic runs only when OPENMARQUEE_PRELOAD_MODE is
+                // 'defer' (default). 'lead' and 'max' modes force
+                // preload through so QA can sweep the dual-1080p
+                // experiment design space — the Python side governs
+                // WHEN preload fires (time-based vs event-driven);
+                // the Rust side just stops short-circuiting it.
+                // When the mode is not 'defer', the r97
+                // `preload_deferred_for_codec_contention` probe does
+                // NOT fire because the deferral branch is bypassed.
+                if preload_mode() == PreloadMode::Defer
+                    && should_defer_preload_for_codec_contention(
+                        active_decoder_count,
+                        bg_is_video,
+                    )
+                {
                     let us = t_enqueue.elapsed().as_micros();
                     // List the active decoder ids so QA can correlate
                     // which decoder #1 is the contention partner.
@@ -4629,6 +4709,115 @@ mod tests {
             src.contains("was_deferred=true"),
             "PreloadSlide deferred branch must emit a preload_handoff with was_deferred=true",
         );
+    }
+
+    // ============================================================
+    // r98 (2026-06-09): OPENMARQUEE_PRELOAD_MODE env-var parsing.
+    //
+    // Three modes (case-insensitive):
+    //   - "defer" / unset / empty            -> PreloadMode::Defer   (r97 behavior)
+    //   - "lead" / "Lead" / "LEAD"           -> PreloadMode::Lead
+    //   - "max"  / "Max"  / "MAX"            -> PreloadMode::Max
+    //   - anything else                      -> PreloadMode::Defer + warn
+    // ============================================================
+
+    #[test]
+    fn parse_preload_mode_default_when_unset() {
+        // Default is r97 behavior (defer). Unset env = None => Defer.
+        assert_eq!(super::parse_preload_mode(None), super::PreloadMode::Defer);
+    }
+
+    #[test]
+    fn parse_preload_mode_recognises_defer() {
+        for raw in ["defer", "Defer", "DEFER", "DeFeR"] {
+            assert_eq!(
+                super::parse_preload_mode(Some(raw)),
+                super::PreloadMode::Defer,
+                "raw={raw:?} should parse as Defer",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_preload_mode_recognises_lead() {
+        for raw in ["lead", "Lead", "LEAD", "LeAd"] {
+            assert_eq!(
+                super::parse_preload_mode(Some(raw)),
+                super::PreloadMode::Lead,
+                "raw={raw:?} should parse as Lead",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_preload_mode_recognises_max() {
+        for raw in ["max", "Max", "MAX", "MaX"] {
+            assert_eq!(
+                super::parse_preload_mode(Some(raw)),
+                super::PreloadMode::Max,
+                "raw={raw:?} should parse as Max",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_preload_mode_garbage_falls_back_to_default() {
+        // Unrecognised inputs should warn but never crash; safer
+        // default is r97 behavior (Defer). Includes empty-string +
+        // whitespace-only + true/false/0/1 (the old r98-draft
+        // booleans shouldn't accidentally parse as a mode) + typos.
+        for raw in [
+            "", "   ", "true", "false", "1", "0", "deferred", "ahead",
+            "maximum", "leed", "null",
+        ] {
+            assert_eq!(
+                super::parse_preload_mode(Some(raw)),
+                super::PreloadMode::Defer,
+                "raw={raw:?} should fall back to Defer",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_preload_mode_handles_whitespace_around_value() {
+        // Defensive: shell drop-in env files sometimes leave a
+        // trailing newline or space. `trim()` should normalise.
+        assert_eq!(super::parse_preload_mode(Some("  defer\n")), super::PreloadMode::Defer);
+        assert_eq!(super::parse_preload_mode(Some(" lead ")), super::PreloadMode::Lead);
+        assert_eq!(super::parse_preload_mode(Some("\tmax\t")), super::PreloadMode::Max);
+    }
+
+    #[test]
+    fn preload_mode_call_site_is_present_in_preload_arm() {
+        // Source-grep regression-lock: the `PreloadSlide` IPC arm
+        // MUST gate the defer call behind
+        // `preload_mode() == PreloadMode::Defer`. A refactor that
+        // drops the gate would mean QA can't bypass the defer for
+        // the 1080p experiment via OPENMARQUEE_PRELOAD_MODE.
+        let src = include_str!("ipc_main.rs");
+        assert!(
+            src.contains("preload_mode() == PreloadMode::Defer"),
+            "PreloadSlide arm must gate defer behind \
+             `preload_mode() == PreloadMode::Defer` to honor OPENMARQUEE_PRELOAD_MODE",
+        );
+        // The mode check must come BEFORE
+        // should_defer_preload_for_codec_contention so the && short-
+        // circuit bypasses the contention predicate entirely when
+        // mode != Defer.
+        let mode_idx = src.find("preload_mode() == PreloadMode::Defer");
+        let defer_idx = src.rfind("should_defer_preload_for_codec_contention(\n");
+        match (mode_idx, defer_idx) {
+            (Some(k), Some(d)) => assert!(
+                k < d,
+                "mode check must appear BEFORE the defer predicate so the \
+                 && short-circuit bypasses contention check in lead/max modes \
+                 (k={k} d={d})",
+            ),
+            _ => panic!(
+                "expected both preload_mode() == PreloadMode::Defer and \
+                 should_defer_preload_for_codec_contention(\\n in ipc_main.rs source",
+            ),
+        }
     }
 
     #[test]

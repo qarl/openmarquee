@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import functools
 import io
+import logging
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -2012,3 +2013,114 @@ def test_record_tick_first_warn_fires_during_startup_window(renderer, caplog, mo
     ]
     assert len(warns) == 1
     assert "tick over budget" in warns[0].message
+
+
+# ============================================================
+# r98 (2026-06-09): OPENMARQUEE_PRELOAD_MODE + OPENMARQUEE_PRELOAD_LEAD_MS
+# env-var parsing.
+# ============================================================
+
+
+class TestResolvePreloadMode:
+    def test_default_when_unset(self):
+        from openmarquee.playback import _resolve_preload_mode
+
+        assert _resolve_preload_mode(env={}) == "defer"
+
+    def test_recognises_canonical_modes(self):
+        from openmarquee.playback import _resolve_preload_mode
+
+        assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "defer"}) == "defer"
+        assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "lead"}) == "lead"
+        assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "max"}) == "max"
+
+    def test_case_insensitive(self):
+        from openmarquee.playback import _resolve_preload_mode
+
+        for raw in ["DEFER", "Defer", "DeFeR"]:
+            assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": raw}) == "defer"
+        for raw in ["LEAD", "Lead", "lEaD"]:
+            assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": raw}) == "lead"
+        for raw in ["MAX", "Max", "mAx"]:
+            assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": raw}) == "max"
+
+    def test_whitespace_around_value_normalised(self):
+        from openmarquee.playback import _resolve_preload_mode
+
+        assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "  defer\n"}) == "defer"
+        assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": " lead "}) == "lead"
+        assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "\tmax\t"}) == "max"
+
+    def test_empty_string_silently_defaults(self, caplog):
+        # Empty string is operator-typo-equivalent (unset drop-in),
+        # not a real misconfiguration -- silently default, no warn.
+        from openmarquee.playback import _resolve_preload_mode
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": ""}) == "defer"
+        assert not any("OPENMARQUEE_PRELOAD_MODE" in r.message for r in caplog.records)
+
+    def test_garbage_warns_and_defaults(self, caplog):
+        # Unrecognised non-empty value should WARN (operator typo or
+        # bad config) and fall back to defer for safety.
+        from openmarquee.playback import _resolve_preload_mode
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "deferred"}) == "defer"
+            assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "true"}) == "defer"
+            assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "maximum"}) == "defer"
+        warn_messages = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        # 3 distinct unrecognised values -> 3 warnings.
+        assert sum(1 for m in warn_messages if "OPENMARQUEE_PRELOAD_MODE" in m) == 3
+
+
+class TestResolvePreloadLeadSeconds:
+    def test_default_when_unset(self):
+        from openmarquee.playback import _resolve_preload_lead_seconds
+
+        assert _resolve_preload_lead_seconds(env={}) == 1.0
+
+    def test_default_when_empty_string(self):
+        from openmarquee.playback import _resolve_preload_lead_seconds
+
+        assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": ""}) == 1.0
+
+    def test_valid_in_range(self):
+        from openmarquee.playback import _resolve_preload_lead_seconds
+
+        assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "500"}) == 0.5
+        assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "3000"}) == 3.0
+        assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "4000"}) == 4.0
+        # Range boundaries.
+        assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "100"}) == 0.1
+        assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "10000"}) == 10.0
+
+    def test_below_min_falls_back_with_warn(self, caplog):
+        from openmarquee.playback import _resolve_preload_lead_seconds
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "50"}) == 1.0
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "0"}) == 1.0
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "-1"}) == 1.0
+        assert sum(1 for r in caplog.records if "OPENMARQUEE_PRELOAD_LEAD_MS" in r.message) == 3
+
+    def test_above_max_falls_back_with_warn(self, caplog):
+        from openmarquee.playback import _resolve_preload_lead_seconds
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert (
+                _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "10001"}) == 1.0
+            )
+            assert (
+                _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "99999"}) == 1.0
+            )
+        assert sum(1 for r in caplog.records if "OPENMARQUEE_PRELOAD_LEAD_MS" in r.message) == 2
+
+    def test_non_integer_falls_back_with_warn(self, caplog):
+        from openmarquee.playback import _resolve_preload_lead_seconds
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "3.14"}) == 1.0
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "abc"}) == 1.0
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "µs"}) == 1.0
+        assert sum(1 for r in caplog.records if "OPENMARQUEE_PRELOAD_LEAD_MS" in r.message) == 3
