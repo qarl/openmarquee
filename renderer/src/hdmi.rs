@@ -7905,6 +7905,18 @@ unsafe fn bake_video_slide_to_current_fbo(
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
+            // r101: thread the EGLImage cache slot. Lookup is by
+            // (decoder, capture_buffer_index). The cache_enabled
+            // env helper gates whether we use the cache (default
+            // ON; OPENMARQUEE_EGL_IMAGE_CACHE=off falls back to
+            // pre-r101 per-frame create+destroy). When disabled we
+            // pass None so the function takes the leaky-but-
+            // historical path.
+            let cache_slot = if crate::v4l2::is_egl_image_cache_enabled() {
+                Some((decoder, frame.capture_buffer_index()))
+            } else {
+                None
+            };
             run_nv12_dmabuf_blit_pass(
                 gl,
                 cover_vbo,
@@ -7915,6 +7927,7 @@ unsafe fn bake_video_slide_to_current_fbo(
                 f_h,
                 stride,
                 y_crop_max,
+                cache_slot,
             )?
         };
         if let Some(t) = t_blit {
@@ -11586,6 +11599,14 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     height: u32,
     stride: u32,
     y_crop_max: f32,
+    // r101 (2026-06-09): EGLImage cache slot. `Some((decoder, idx))`
+    // -> look up Decoder::cached_egl_image(idx); if None, lazy-create
+    // + insert. DO NOT destroy at function end (cleanup happens in
+    // DecoderInner::Drop). `None` -> fall back to pre-r101 per-frame
+    // create+destroy (set by callers when
+    // OPENMARQUEE_EGL_IMAGE_CACHE=off is the operator's kill switch
+    // OR when the caller doesn't have a Decoder ref to thread).
+    egl_image_cache: Option<(&crate::v4l2::Decoder, u32)>,
 ) -> Result<bool> {
     use glow::HasContext;
     // Lazy-resolve EGL+GLES extension entry points. None -> caller
@@ -11622,21 +11643,58 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     ];
     // SAFETY: eps.create_image is a Mesa-loaded extern "C" fn ptr
     // matching the eglCreateImageKHR spec. display.as_ptr() is the
-    // raw EGLDisplay; ctx = NULL because EGL_LINUX_DMA_BUF_EXT is
-    // a client-buffer import and doesn't need a context.
-    let egl_image = (eps.create_image)(
-        display.as_ptr(),
-        std::ptr::null_mut(),  // EGL_NO_CONTEXT
-        EGL_LINUX_DMA_BUF_EXT,
-        std::ptr::null_mut(),  // buffer = NULL for dma_buf
-        attribs.as_ptr(),
-    );
-    if egl_image.is_null() {
-        return Err(anyhow!(
-            "eglCreateImageKHR(LINUX_DMA_BUF_EXT, fd={}, w={}, h={}, stride={}) -> EGL_NO_IMAGE",
-            fd, width, height, stride
-        ));
-    }
+    // r101 (2026-06-09): when egl_image_cache is Some, use
+    // Decoder::get_or_init_egl_image to atomically check+create+
+    // insert under one Mutex acquisition. Subagent WARN-4 caught
+    // that the prior two-call pattern (cached_egl_image then
+    // cache_egl_image) opens a double-create race window if a
+    // future caller is multi-threaded. The atomic helper closes
+    // that window. When egl_image_cache is None (kill switch),
+    // create per-frame + destroy at the end (the leaky path,
+    // kept for A/B rollback).
+    let (egl_image, suppress_destroy_at_end) = if let Some((decoder, idx)) = egl_image_cache {
+        let create_one = || -> Result<crate::v4l2::EglImageHandle> {
+            let img = (eps.create_image)(
+                display.as_ptr(),
+                std::ptr::null_mut(),  // EGL_NO_CONTEXT
+                EGL_LINUX_DMA_BUF_EXT,
+                std::ptr::null_mut(),  // buffer = NULL for dma_buf
+                attribs.as_ptr(),
+            );
+            if img.is_null() {
+                return Err(anyhow!(
+                    "eglCreateImageKHR(LINUX_DMA_BUF_EXT, fd={}, w={}, h={}, stride={}) -> EGL_NO_IMAGE (cache path)",
+                    fd, width, height, stride
+                ));
+            }
+            Ok(crate::v4l2::EglImageHandle {
+                image: img,
+                display: display.as_ptr(),
+                destroy_fn: eps.destroy_image,
+            })
+        };
+        let (handle, _created) = decoder.get_or_init_egl_image(idx, create_one)?;
+        (handle.image, true)
+    } else {
+        // Pre-r101 path: per-frame create+destroy. Leaks one
+        // kernel dmabuf ref per call on Mesa+vc4 -- the bug r101
+        // exists to fix. Kept behind the OPENMARQUEE_EGL_IMAGE_CACHE
+        // kill switch so QA can A/B if the cache itself regresses.
+        let img = (eps.create_image)(
+            display.as_ptr(),
+            std::ptr::null_mut(),  // EGL_NO_CONTEXT
+            EGL_LINUX_DMA_BUF_EXT,
+            std::ptr::null_mut(),  // buffer = NULL for dma_buf
+            attribs.as_ptr(),
+        );
+        if img.is_null() {
+            return Err(anyhow!(
+                "eglCreateImageKHR(LINUX_DMA_BUF_EXT, fd={}, w={}, h={}, stride={}) -> EGL_NO_IMAGE (no-cache path)",
+                fd, width, height, stride
+            ));
+        }
+        (img, false)
+    };
     // Create + bind the external-OES texture. Set min/mag filter
     // to LINEAR; CLAMP_TO_EDGE both axes (the spec lists wrap as
     // one of the supported parameters on TEXTURE_EXTERNAL_OES;
@@ -11652,12 +11710,18 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     let tex = match gl.create_texture() {
         Ok(t) => t,
         Err(e) => {
-            let destroyed = (eps.destroy_image)(display.as_ptr(), egl_image);
-            if destroyed == 0 {
-                eprintln!(
-                    "warn: eglDestroyImageKHR returned EGL_FALSE for fd={} during create_texture-fail cleanup",
-                    fd
-                );
+            // r101: only destroy if we created locally (no-cache
+            // path). Cache hit/miss with the cache enabled means
+            // the EGLImage is owned by Decoder; let
+            // DecoderInner::Drop handle teardown.
+            if !suppress_destroy_at_end {
+                let destroyed = (eps.destroy_image)(display.as_ptr(), egl_image);
+                if destroyed == 0 {
+                    eprintln!(
+                        "warn: eglDestroyImageKHR returned EGL_FALSE for fd={} during create_texture-fail cleanup",
+                        fd
+                    );
+                }
             }
             return Err(anyhow!("glGenTextures(external-OES): {e}"));
         }
@@ -11705,12 +11769,20 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     // the dma_buf at the right moment.
     gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, None);
     gl.delete_texture(tex);
-    let destroyed = (eps.destroy_image)(display.as_ptr(), egl_image);
-    if destroyed == 0 {
-        // EGL_FALSE -- surfacing as a warn rather than an Err
-        // because the paint already happened + the next frame's
-        // re-import will catch any persistent leak.
-        eprintln!("warn: eglDestroyImageKHR returned EGL_FALSE for fd={}", fd);
+    // r101: only destroy at the end when the cache is disabled
+    // (no-cache pre-r101 path). When the cache is enabled the
+    // EGLImage is owned by Decoder.capture_egl_images and will be
+    // destroyed in DecoderInner::Drop -- destroying it here would
+    // either invalidate the cache for the next frame OR fire the
+    // Mesa+vc4 leak that r101 exists to plug.
+    if !suppress_destroy_at_end {
+        let destroyed = (eps.destroy_image)(display.as_ptr(), egl_image);
+        if destroyed == 0 {
+            // EGL_FALSE -- surfacing as a warn rather than an Err
+            // because the paint already happened + the next frame's
+            // re-import will catch any persistent leak.
+            eprintln!("warn: eglDestroyImageKHR returned EGL_FALSE for fd={}", fd);
+        }
     }
 
     blit_result?;

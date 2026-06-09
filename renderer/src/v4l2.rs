@@ -199,6 +199,56 @@ pub fn mmal_components_live() -> usize {
     MMAL_COMPONENTS_LIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// r101 (2026-06-09): per-Decoder cached EGLImage handle. One per
+/// CAPTURE buffer index; the paint helper looks it up on every
+/// frame, lazy-creates if None, and DecoderInner::Drop tears each
+/// one down via `destroy_fn(display, image)` BEFORE the matching
+/// dmabuf fd is closed.
+///
+/// Carries its own destroy_fn + display so DecoderInner::Drop
+/// doesn't need access to an `EglSession` to call eglDestroyImage.
+/// `image` and `display` are opaque pointers (EGLImage / EGLDisplay
+/// per the spec); `destroy_fn` is the resolved
+/// `eglDestroyImageKHR` entry point. All three are constant for
+/// the lifetime of the handle.
+///
+/// Copy because cache lookups need to return a value (the Mutex
+/// guard scope is too short to lend a reference). Send because
+/// EGL opaque handles are sendable per the EGL spec and function
+/// pointers are Send.
+#[derive(Copy, Clone, Debug)]
+#[cfg(target_os = "linux")]
+pub struct EglImageHandle {
+    pub image: *mut std::ffi::c_void,
+    pub display: *mut std::ffi::c_void,
+    pub destroy_fn: unsafe extern "C" fn(
+        dpy: *mut std::ffi::c_void,
+        image: *mut std::ffi::c_void,
+    ) -> u32,
+}
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for EglImageHandle {}
+
+/// r101 (2026-06-09): runtime kill-switch for the EGLImage cache.
+/// Default ENABLED. Set `OPENMARQUEE_EGL_IMAGE_CACHE=off` (or
+/// `0`/`false`/`disable`/`disabled`) to fall back to the pre-r101
+/// per-frame create+destroy path. The kill-switch lets QA A/B at
+/// deploy time if the cache itself introduces a regression.
+///
+/// Not Linux-gated: the helper is a pure env-var read with no
+/// V4L2 / EGL dependency, so cross-platform tests can pin the
+/// parser without skipping on macOS.
+pub fn is_egl_image_cache_enabled() -> bool {
+    match std::env::var("OPENMARQUEE_EGL_IMAGE_CACHE") {
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no" | "disable" | "disabled")
+        }
+        Err(_) => true,
+    }
+}
+
 /// r89 (2026-06-08): monotonic per-process Decoder-open
 /// sequence counter. Each Decoder::open allocates a unique
 /// 1-indexed value (first open is seq=1 to match the
@@ -899,6 +949,25 @@ struct DecoderInner {
     /// kernel keeps the underlying buffer alive via EGL's
     /// reference, but a use-after-close on the fd itself is UB).
     capture_dmabuf_fds: Vec<std::os::fd::RawFd>,
+    /// r101 (2026-06-09): cached EGLImage per CAPTURE buffer index.
+    /// Empty until allocate_buffers; resized to capture_dmabuf_fds.len()
+    /// with all-None. Lazy-populated by the paint helper on first
+    /// frame from each buffer index (one cache miss per buffer
+    /// across the decoder's lifetime, not per frame).
+    ///
+    /// Plugs the Mesa+vc4 dmabuf-ref leak: pre-r101 the paint helper
+    /// called eglCreateImage + eglDestroyImage on EVERY frame. Mesa
+    /// returns EGL_TRUE from destroyImage but does NOT decrement the
+    /// kernel dmabuf ref, leaking ~3 MB CMA per frame at 1080p. With
+    /// the cache, exactly ONE EGLImage exists per (Decoder,
+    /// buffer_index) pair; destroyImage fires exactly once on
+    /// DecoderInner::Drop, before close(fd) of the matching
+    /// capture_dmabuf_fds entry.
+    ///
+    /// Each handle stores its display + destroy_fn so DecoderInner::
+    /// Drop has everything it needs without re-resolving EGL entry
+    /// points.
+    capture_egl_images: Vec<Option<EglImageHandle>>,
     /// Buffer indices currently checked-out as Frames. Used to
     /// guard against double-DQBUF returning the same index --
     /// shouldn't happen with V4L2's contract but worth a sanity
@@ -1007,6 +1076,46 @@ impl Drop for DecoderInner {
         // close(2) for the fds here, munmap via field-order for
         // mapped_capture below. The kernel reference-counts the
         // underlying buffer memory; freeing both views is safe.
+        // r101 (2026-06-09): destroy cached EGLImages BEFORE closing
+        // dmabuf fds. Order matters: destroy_image on a closed fd
+        // would fail (and on Mesa+vc4 leak the kernel dmabuf ref
+        // again, the exact bug this cache is fixing). The
+        // destroy_fn + display are carried by each handle so we
+        // don't need access to an EglSession here.
+        //
+        // Empirical hardware finding (r100 audit + r99 bufinfo):
+        // Mesa returns EGL_TRUE from destroy_image but does NOT
+        // decrement the kernel dmabuf ref on the per-frame path.
+        // With the cache, exactly one destroy fires per buffer
+        // index across the Decoder's lifetime, so the leak is
+        // BOUNDED to that one phantom ref per buffer (or zero, if
+        // Mesa happens to drop the ref correctly on the only-
+        // destroy-once path -- TBD on FYS).
+        let mut destroyed = 0usize;
+        let mut failed = 0usize;
+        for slot in self.capture_egl_images.drain(..) {
+            if let Some(h) = slot {
+                // SAFETY: handle.destroy_fn is the eglDestroyImageKHR
+                // entry point resolved + stored when the EGLImage
+                // was lazy-created. display + image were owned by
+                // EGL at create time; the destroy call hands them
+                // back. Function pointer + opaque pointers; no
+                // Rust references involved.
+                let r = unsafe { (h.destroy_fn)(h.display, h.image) };
+                if r == 0 {
+                    failed += 1;
+                } else {
+                    destroyed += 1;
+                }
+            }
+        }
+        if destroyed > 0 || failed > 0 {
+            let _ = writeln!(
+                std::io::stderr(),
+                "[perf] egl_image_destroyed count={} failed={} drop_path=DecoderInner",
+                destroyed, failed,
+            );
+        }
         for fd in self.capture_dmabuf_fds.drain(..) {
             // SAFETY: fd was returned by VIDIOC_EXPBUF + owned by
             // self until now; close(2) is the matched teardown.
@@ -1152,6 +1261,15 @@ impl Frame {
     pub fn stride(&self) -> u32 {
         self.stride
     }
+
+    /// r101 (2026-06-09): the CAPTURE buffer index this Frame
+    /// borrows. Used by the EGLImage cache so the paint helper
+    /// can look up `Decoder::cached_egl_image(idx)` for THIS
+    /// buffer-index slot. Pre-r101 the index was opaque (only
+    /// referenced internally by Frame::Drop's re-QBUF).
+    pub fn capture_buffer_index(&self) -> u32 {
+        self.capture_buffer_index
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1242,6 +1360,7 @@ impl Decoder {
             mapped_output: Vec::new(),
             mapped_capture: Vec::new(),
             capture_dmabuf_fds: Vec::new(),
+            capture_egl_images: Vec::new(),
             capture_in_flight: Vec::new(),
             output_streaming: false,
             capture_streaming: false,
@@ -1613,6 +1732,157 @@ impl Decoder {
         }
     }
 
+    /// r101 (2026-06-09): atomic get-or-init for the cached EGLImage
+    /// at CAPTURE buffer index `idx`. Holds the Decoder Mutex for
+    /// the entire check-create-insert sequence so a future
+    /// multi-threaded caller can't double-create (subagent WARN-4).
+    ///
+    /// On cache hit: returns `Ok(handle)`, `created=false`.
+    /// On cache miss: invokes `create()` while holding the lock,
+    /// stores the returned handle, returns it with `created=true`.
+    /// If `create()` returns `Err`, the slot stays None and the
+    /// error is propagated unchanged.
+    ///
+    /// The `create` closure is called WITH THE MUTEX HELD. Today's
+    /// renderer-side caller doesn't take any other Decoder Mutex
+    /// inside `create` (eglCreateImageKHR is GL/EGL state, not
+    /// Decoder state), so the held-lock window is bounded by the
+    /// EGL call (~1-2 ms). A future caller that re-enters the
+    /// Decoder Mutex inside `create` would deadlock; document
+    /// loud.
+    ///
+    /// On out-of-range idx, calls `create()` (so the caller's
+    /// EGLImage isn't wasted), then DESTROYS it via the carried
+    /// destroy_fn (so the kernel dmabuf ref isn't pinned) and
+    /// returns the same handle with `created=true`. The caller
+    /// would just be storing a handle whose underlying kernel
+    /// buffer they don't own; we make the out-of-range case loud
+    /// instead of silently leaking.
+    pub fn get_or_init_egl_image<F>(
+        &self,
+        idx: u32,
+        create: F,
+    ) -> Result<(EglImageHandle, bool)>
+    where
+        F: FnOnce() -> Result<EglImageHandle>,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(Some(h)) = inner.capture_egl_images.get(idx as usize).copied() {
+            return Ok((h, false));
+        }
+        // Cache miss (or out-of-range). Create regardless so we
+        // know whether the EGL call succeeded; insert only if the
+        // slot exists.
+        let handle = create()?;
+        if let Some(slot) = inner.capture_egl_images.get_mut(idx as usize) {
+            if let Some(prior) = slot.take() {
+                // Reachable only if another thread inserted between
+                // our lookup and create — shouldn't happen with the
+                // single-lock structure, but defensive destroy in
+                // case of a future logic change.
+                let _ = unsafe { (prior.destroy_fn)(prior.display, prior.image) };
+            }
+            *slot = Some(handle);
+        } else {
+            // Out-of-range: destroy the just-created handle so the
+            // kernel ref isn't pinned. Same loud-leak-at-misuse
+            // semantics as cache_egl_image.
+            let _ = unsafe { (handle.destroy_fn)(handle.display, handle.image) };
+            let _ = writeln!(
+                std::io::stderr(),
+                "warn: get_or_init_egl_image idx={} out of range (cache len={}); \
+                 destroyed the rejected handle inline.",
+                idx,
+                inner.capture_egl_images.len(),
+            );
+        }
+        Ok((handle, true))
+    }
+
+    /// r101 (2026-06-09): cached EGLImage lookup for CAPTURE buffer
+    /// index. Returns `Some(handle)` if a prior paint already
+    /// imported that buffer; `None` if not yet cached (paint helper
+    /// should create one + `cache_egl_image` it). Returns `None`
+    /// for out-of-range indices to keep the paint helper's lookup
+    /// path crash-free even if a future refactor mis-sequences
+    /// allocate_buffers / paint.
+    ///
+    /// **Prefer `get_or_init_egl_image` for the create-on-miss
+    /// pattern** -- it serializes check+create+insert under one
+    /// Mutex acquisition. `cached_egl_image` is kept for read-only
+    /// inspection (tests + debug probes).
+    pub fn cached_egl_image(&self, idx: u32) -> Option<EglImageHandle> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .capture_egl_images
+            .get(idx as usize)
+            .and_then(|s| s.as_ref())
+            .copied()
+    }
+
+    /// r101 (2026-06-09): insert a freshly-created EGLImage into
+    /// the per-buffer cache. Caller is responsible for ensuring the
+    /// handle is valid (i.e. `eglCreateImageKHR` returned non-null
+    /// + display + destroy_fn are correctly resolved). The handle
+    /// will be destroyed in DecoderInner::Drop via
+    /// `destroy_fn(display, image)`.
+    ///
+    /// No-op for out-of-range indices (defensive: index validity
+    /// is the caller's responsibility but the cache must not
+    /// panic on a stale buffer_index from a freshly-recreated
+    /// decoder).
+    ///
+    /// Overwrites any prior cached handle WITHOUT destroying it.
+    /// Today's callers cache at most once per buffer index across
+    /// the Decoder's lifetime (lazy-create-on-miss); the overwrite
+    /// path is reachable only if a future caller violates that
+    /// contract, in which case the prior handle would leak ONCE.
+    /// We prefer that to silently dropping the new handle (which
+    /// would leak the new image forever) -- the overwrite at
+    /// least keeps the in-cache handle current with the buffer
+    /// the paint helper is about to sample.
+    pub fn cache_egl_image(&self, idx: u32, handle: EglImageHandle) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(slot) = inner.capture_egl_images.get_mut(idx as usize) {
+            // r101 subagent WARN-1: if a prior cached handle exists
+            // (overwrite path — possible if a future caller violates
+            // the lazy-create-once contract), DROP the prior in a
+            // loud way (destroy through the carried fn) rather than
+            // silently losing it. The overwrite-without-destroy code
+            // path was a one-handle leak per misuse; with the
+            // destroy, misuse is observable in
+            // `egl_image_destroyed count=N` perf line but doesn't
+            // grow CMA.
+            if let Some(prior) = slot.take() {
+                // SAFETY: destroy_fn + display + image are the
+                // ones we stored when this slot was first
+                // populated. Calling destroy on a still-valid
+                // EGLImage is the spec-correct teardown.
+                let _ = unsafe { (prior.destroy_fn)(prior.display, prior.image) };
+            }
+            *slot = Some(handle);
+            return;
+        }
+        // r101 subagent WARN-1: if the index is out of range, DO NOT
+        // silently drop the freshly-created handle (which would leak
+        // the kernel dmabuf ref forever -- the exact bug class r101
+        // exists to fix). Destroy it via the carried fn so the leak
+        // becomes a one-shot waste at misuse-time instead of
+        // a permanent CMA pin. Reachable only on caller bug today
+        // (buffer_index is bounded by V4L2 DQBUF), but a future
+        // refactor that re-runs allocate_buffers would invite this.
+        let _ = unsafe { (handle.destroy_fn)(handle.display, handle.image) };
+        let _ = writeln!(
+            std::io::stderr(),
+            "warn: cache_egl_image idx={} out of range (cache len={}); \
+             destroyed the rejected handle inline. This indicates a \
+             caller bug or stale buffer_index from a re-allocated \
+             decoder.",
+            idx,
+            inner.capture_egl_images.len(),
+        );
+    }
+
     /// VIDIOC_REQBUFS + VIDIOC_QUERYBUF + mmap for `count`
     /// buffers on the given queue. Call AFTER set_*_format.
     pub fn allocate_buffers(
@@ -1855,6 +2125,25 @@ impl Decoder {
                 fds.push(expbuf.fd);
             }
             inner.capture_dmabuf_fds = fds;
+            // r101: size the EGLImage cache to match the dmabuf fd
+            // pool; entries are populated lazily on first paint
+            // from each buffer index.
+            //
+            // r101 subagent WARN-2: destroy any prior cached handles
+            // before .clear(), so a future re-allocation flow
+            // (REQBUFS(0) -> REQBUFS(N'), retry, hypothetical reuse)
+            // doesn't silently drop EGL refs. Today's code calls
+            // allocate_buffers exactly once per Decoder, but the
+            // structural fix is one drain loop and keeps the
+            // contract "EGLImages outlive the function only via
+            // the cache or via Drop" intact under refactor.
+            for slot in inner.capture_egl_images.drain(..) {
+                if let Some(h) = slot {
+                    let _ = unsafe { (h.destroy_fn)(h.display, h.image) };
+                }
+            }
+            let n = inner.capture_dmabuf_fds.len();
+            inner.capture_egl_images.resize(n, None);
         }
         Ok(())
     }
@@ -2822,6 +3111,84 @@ mod tests {
     /// process-local Mutex<()> taken at test entry serializes any
     /// test that touches the static.
     static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ============================================================
+    // r101 (2026-06-09): EGLImage cache regression-lock tests.
+    // ============================================================
+
+    #[test]
+    fn is_egl_image_cache_enabled_defaults_to_on() {
+        // r101 subagent WARN-3: take the same COUNTER_TEST_LOCK
+        // serializer the rest of this test module uses, because
+        // cargo runs tests in parallel and two tests both mutating
+        // OPENMARQUEE_EGL_IMAGE_CACHE can interleave their set/
+        // assert in flaky-failure-inducing ways.
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Default (env var unset) = cache enabled. r101 ships with
+        // the kill-switch OFF (i.e. cache ON) so QA's first deploy
+        // exercises the new code path.
+        let prior = std::env::var("OPENMARQUEE_EGL_IMAGE_CACHE").ok();
+        std::env::remove_var("OPENMARQUEE_EGL_IMAGE_CACHE");
+        assert!(
+            is_egl_image_cache_enabled(),
+            "default (env unset) must enable the cache",
+        );
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_EGL_IMAGE_CACHE", v);
+        }
+    }
+
+    #[test]
+    fn is_egl_image_cache_enabled_off_values_disable() {
+        // r101 subagent WARN-3: take the COUNTER_TEST_LOCK -- see
+        // is_egl_image_cache_enabled_defaults_to_on.
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The kill switch accepts the standard "off" lexicon so an
+        // operator's runbook reads naturally regardless of which
+        // form they remember.
+        let prior = std::env::var("OPENMARQUEE_EGL_IMAGE_CACHE").ok();
+        for off in ["0", "off", "false", "no", "disable", "disabled", "OFF", "FaLsE"] {
+            std::env::set_var("OPENMARQUEE_EGL_IMAGE_CACHE", off);
+            assert!(
+                !is_egl_image_cache_enabled(),
+                "value {off:?} must disable the cache",
+            );
+        }
+        // And any non-off value (including unrecognized) defaults
+        // to enabled: explicit operator intent to disable is
+        // required.
+        for on in ["1", "on", "yes", "enable", "enabled", "", "garbage"] {
+            std::env::set_var("OPENMARQUEE_EGL_IMAGE_CACHE", on);
+            assert!(
+                is_egl_image_cache_enabled(),
+                "value {on:?} must keep the cache enabled (default-on policy)",
+            );
+        }
+        // Restore.
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_EGL_IMAGE_CACHE", v);
+        } else {
+            std::env::remove_var("OPENMARQUEE_EGL_IMAGE_CACHE");
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn egl_image_handle_is_copy_and_send() {
+        // Compile-time pin: the cache lookup returns by value so
+        // the Mutex guard scope can release quickly. Send is
+        // required because the renderer is single-threaded today
+        // but the cache field lives inside an Arc<Mutex<...>>;
+        // Send keeps a future async-handler refactor unblocked.
+        fn assert_copy<T: Copy>() {}
+        fn assert_send<T: Send>() {}
+        assert_copy::<EglImageHandle>();
+        assert_send::<EglImageHandle>();
+    }
 
     #[test]
     fn mmal_components_live_api_surface_compiles_and_reads_the_static() {
