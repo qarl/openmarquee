@@ -249,6 +249,24 @@ pub fn is_egl_image_cache_enabled() -> bool {
     }
 }
 
+/// r102.3 (2026-06-09): runtime kill-switch for the transition
+/// program (link_program) + textured-quad VBO cache in the
+/// live-3-pass transition path. Default ENABLED. Set
+/// `OPENMARQUEE_TRANSITION_PROGRAM_CACHE=off` to fall back to
+/// the pre-r102.3 per-tick link + buffer create + delete churn
+/// that vc4 V3D lazy-GC retained as ~108 MB / 4 min of the
+/// non-FBO+tex transition leak. Co-located with the r101 EGLImage
+/// + r102.2 transition-FBO kill switches for cohesion.
+pub fn is_transition_program_cache_enabled() -> bool {
+    match std::env::var("OPENMARQUEE_TRANSITION_PROGRAM_CACHE") {
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no" | "disable" | "disabled")
+        }
+        Err(_) => true,
+    }
+}
+
 /// r102.2 (2026-06-09): runtime kill-switch for the transition
 /// FBO+tex cache (hdmi.rs `ensure_transition_fbo_pair`). Default
 /// ENABLED. Set `OPENMARQUEE_TRANSITION_FBO_CACHE=off` (or
@@ -3631,6 +3649,51 @@ mod tests {
             src.contains("egl_image_destroy_exit"),
             "r101.1 instrumentation missing: per-handle exit probe `egl_image_destroy_exit`",
         );
+    }
+
+    #[test]
+    fn is_transition_program_cache_enabled_defaults_to_on() {
+        // r102.3: kill switch defaults ON; co-located here with
+        // the EGLImage cache + transition FBO cache kill switches.
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("OPENMARQUEE_TRANSITION_PROGRAM_CACHE").ok();
+        std::env::remove_var("OPENMARQUEE_TRANSITION_PROGRAM_CACHE");
+        assert!(
+            is_transition_program_cache_enabled(),
+            "default (env unset) must enable the cache",
+        );
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_TRANSITION_PROGRAM_CACHE", v);
+        }
+    }
+
+    #[test]
+    fn is_transition_program_cache_enabled_off_values_disable() {
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("OPENMARQUEE_TRANSITION_PROGRAM_CACHE").ok();
+        for off in ["0", "off", "false", "no", "disable", "disabled", "OFF"] {
+            std::env::set_var("OPENMARQUEE_TRANSITION_PROGRAM_CACHE", off);
+            assert!(
+                !is_transition_program_cache_enabled(),
+                "value {off:?} must disable the cache",
+            );
+        }
+        for on in ["1", "on", "yes", "enable", "enabled", "", "garbage"] {
+            std::env::set_var("OPENMARQUEE_TRANSITION_PROGRAM_CACHE", on);
+            assert!(
+                is_transition_program_cache_enabled(),
+                "value {on:?} must keep the cache enabled (default-on policy)",
+            );
+        }
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_TRANSITION_PROGRAM_CACHE", v);
+        } else {
+            std::env::remove_var("OPENMARQUEE_TRANSITION_PROGRAM_CACHE");
+        }
     }
 
     #[test]

@@ -7599,18 +7599,22 @@ mod tests {
         }
         // r96 subagent WARN-1: tighten floor to exact count so a
         // future refactor that drops one of the seven sites can't
-        // silently pass. The 7 expected sites are:
-        //   1. paint_and_present_one_transition_frame (r95)
+        // silently pass. The 8 expected sites are:
+        //   1. paint_and_present_one_transition_frame (r95, kept
+        //      under the r102.3 kill-switch fallback path so the
+        //      A/B test still has the legacy resolve)
         //   2. capture_legacy_3pass_mid (r96)
         //   3. render_fade_composite (r96, convention-pin)
         //   4. render_transition_animated_in_session (r96)
         //   5. cached_transition_sp_program (r95, SP resolver)
         //   6. cached_composite_program (r96)
         //   7. cached_cut_composite_program (r96, symmetry-pin)
+        //   8. cached_legacy_transition_program (r102.3, live-3-pass
+        //      struct cache for the new default code path)
         assert_eq!(
             u_aspect_sites.len(),
-            7,
-            "r96 regression-lock expected EXACTLY 7 u_aspect resolution sites \
+            8,
+            "r96 regression-lock expected EXACTLY 8 u_aspect resolution sites \
              in hdmi.rs, found {}. If you've added a new transition-shader link \
              site that also needs u_aspect, bump this count; if you've removed \
              one, re-audit the diff so the dropped site wasn't load-bearing for \

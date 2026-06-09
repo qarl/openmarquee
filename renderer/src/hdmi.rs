@@ -898,6 +898,12 @@ where
     clear_dynamic_atlas_colr_lookup();
     session.dynamic_atlas_page_colr.delete(&gl);
     clear_transition_program_cache(&gl);
+    // r102.3 subagent NIT-2: order matters -- the legacy cache
+    // holds entries that REFERENCE program handles freed above.
+    // Reversed order works today (NativeProgram is Copy + HashMap
+    // drop is just dealloc) but the future-proof rule is
+    // "drain the dependent cache after the owner cache."
+    clear_legacy_transition_program_cache();
     clear_transition_sp_program_cache(&gl);
     clear_composite_program_cache(&gl);
     clear_blit_program_cache(&gl);
@@ -5286,67 +5292,121 @@ pub fn paint_and_present_one_transition_frame(
                 gl.delete_texture(tex_b);
             }
         };
-        let program = match link_program(session.gl, VS_TEXTURED_QUAD, fs) {
-            Ok(p) => p,
-            Err(e) => {
-                cleanup_static(session.gl, None);
-                return Err(e);
-            }
+        // r102.3 (2026-06-09): cache the program + locations + VBO
+        // when OPENMARQUEE_TRANSITION_PROGRAM_CACHE is enabled
+        // (default). Pre-r102.3 per-tick link_program +
+        // create_buffer were the dominant remaining V3D leak
+        // surface after r102.2 plugged the FBO+tex churn
+        // (~108 MB / 4 min on 720p per QA's r102.2 verify).
+        //
+        // Cache-disabled path (=off kill switch) takes the legacy
+        // allocate-and-delete codepath unchanged so QA can A/B at
+        // deploy time.
+        let program_cache_enabled = crate::v4l2::is_transition_program_cache_enabled();
+        let (program, a_pos, a_uv, u_src_a, u_src_b, u_t, u_aspect) = if program_cache_enabled {
+            let cached = match cached_legacy_transition_program(session.gl, fs) {
+                Ok(c) => c,
+                Err(e) => {
+                    cleanup_static(session.gl, None);
+                    return Err(e);
+                }
+            };
+            (
+                cached.program,
+                cached.a_pos,
+                cached.a_uv,
+                cached.u_src_a,
+                cached.u_src_b,
+                cached.u_t,
+                cached.u_aspect,
+            )
+        } else {
+            // Legacy per-tick path (kill-switch fallback). Mirrors
+            // the pre-r102.3 shape verbatim.
+            let program = match link_program(session.gl, VS_TEXTURED_QUAD, fs) {
+                Ok(p) => p,
+                Err(e) => {
+                    cleanup_static(session.gl, None);
+                    return Err(e);
+                }
+            };
+            let a_pos = match session.gl.get_attrib_location(program, "a_pos") {
+                Some(loc) => loc,
+                None => {
+                    cleanup_static(session.gl, None);
+                    session.gl.delete_program(program);
+                    return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos"));
+                }
+            };
+            let a_uv = match session.gl.get_attrib_location(program, "a_uv") {
+                Some(loc) => loc,
+                None => {
+                    cleanup_static(session.gl, None);
+                    session.gl.delete_program(program);
+                    return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv"));
+                }
+            };
+            let u_src_a = session.gl.get_uniform_location(program, "u_src_a");
+            let u_src_b = session.gl.get_uniform_location(program, "u_src_b");
+            let u_t = session.gl.get_uniform_location(program, "u_t");
+            let u_aspect = session.gl.get_uniform_location(program, "u_aspect");
+            (program, a_pos, a_uv, u_src_a, u_src_b, u_t, u_aspect)
         };
-        // Build the textured-quad VBO inline (mirrors
-        // render_transition_animated_in_session). a_pos / a_uv
-        // attribs at offsets 0 / 8 with stride 16.
-        let vbo = match session.gl.create_buffer() {
-            Ok(b) => b,
-            Err(e) => {
-                cleanup_static(session.gl, None);
-                session.gl.delete_program(program);
-                return Err(anyhow!("glGenBuffers(transition-frame): {e}"));
+        // r102.3: VBO from per-session cache when enabled (single
+        // 64-byte fullscreen-quad buffer reused across every
+        // transition tick of every kind). cached_textured_quad_vbo
+        // already exists and is used by run_blit_pass /
+        // run_overlay_blend_pass; this just adds the live-3-pass
+        // site as another consumer.
+        let vbo = if program_cache_enabled {
+            match cached_textured_quad_vbo(session.gl) {
+                Ok(b) => b,
+                Err(e) => {
+                    // Don't delete the cached program -- it's
+                    // owned by LEGACY_TRANSITION_PROGRAMS_V2.
+                    cleanup_static(session.gl, None);
+                    return Err(e);
+                }
             }
+        } else {
+            // Legacy per-tick alloc path (kill-switch fallback).
+            let vbo = match session.gl.create_buffer() {
+                Ok(b) => b,
+                Err(e) => {
+                    cleanup_static(session.gl, None);
+                    session.gl.delete_program(program);
+                    return Err(anyhow!("glGenBuffers(transition-frame): {e}"));
+                }
+            };
+            let verts: [f32; 16] = [
+                -1.0, -1.0, 0.0, 0.0,
+                 1.0, -1.0, 1.0, 0.0,
+                -1.0,  1.0, 0.0, 1.0,
+                 1.0,  1.0, 1.0, 1.0,
+            ];
+            session.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            let bytes = std::slice::from_raw_parts(
+                verts.as_ptr() as *const u8,
+                std::mem::size_of_val(&verts),
+            );
+            session.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+            vbo
         };
-        let verts: [f32; 16] = [
-            -1.0, -1.0, 0.0, 0.0,
-             1.0, -1.0, 1.0, 0.0,
-            -1.0,  1.0, 0.0, 1.0,
-             1.0,  1.0, 1.0, 1.0,
-        ];
+        // r102.3 subagent BLOCKER-1: ensure GL_ARRAY_BUFFER points
+        // at our quad VBO BEFORE vertex_attrib_pointer_f32 below
+        // snapshots whatever buffer is currently bound. The
+        // `cached_textured_quad_vbo` helper only binds on its
+        // first-create path; on every subsequent cache hit it
+        // returns the handle without binding, and the prior
+        // bake_a/bake_b may have left a `cover_quad_vbo` (video)
+        // or a text VBO bound. Without this rebind, tick 0 paints
+        // correctly (cache miss = bind happened in the helper)
+        // but every subsequent tick draws the wrong geometry.
+        // Mirrors the SP path at hdmi.rs's transition_sp_quad_vbo
+        // bind site + every other `cached_textured_quad_vbo`
+        // consumer (run_bright_gamma_pass / run_blit_pass /
+        // run_overlay_blend_pass / run_present_pass).
         session.gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-        let bytes = std::slice::from_raw_parts(
-            verts.as_ptr() as *const u8,
-            std::mem::size_of_val(&verts),
-        );
-        session.gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-        // r38b (2026-06-02): the prior `?`-bubble shape at a_pos /
-        // a_uv / ensure_scene_fbo leaked the cleanup_static resource
-        // set (fbo_a + tex_a + fbo_b + tex_b + vbo + program ≈ 16 MB
-        // of bake-target GLES storage) on the failure path. Mirror
-        // the link_program / create_buffer match-arm pattern above:
-        // explicit cleanup + delete_program before propagating the
-        // error. See qa/r38b-hdmi-cma-deep-read-2026-06-02.md §3.4.
-        let a_pos = match session.gl.get_attrib_location(program, "a_pos") {
-            Some(loc) => loc,
-            None => {
-                cleanup_static(session.gl, Some(vbo));
-                session.gl.delete_program(program);
-                return Err(anyhow!("VS_TEXTURED_QUAD missing a_pos"));
-            }
-        };
-        let a_uv = match session.gl.get_attrib_location(program, "a_uv") {
-            Some(loc) => loc,
-            None => {
-                cleanup_static(session.gl, Some(vbo));
-                session.gl.delete_program(program);
-                return Err(anyhow!("VS_TEXTURED_QUAD missing a_uv"));
-            }
-        };
-        let u_src_a = session.gl.get_uniform_location(program, "u_src_a");
-        let u_src_b = session.gl.get_uniform_location(program, "u_src_b");
-        let u_t = session.gl.get_uniform_location(program, "u_t");
-        // r95 (2026-06-08): u_aspect for the legacy FS_IRIS path. Most
-        // legacy fragment shaders don't declare it, so most kinds
-        // resolve to None and the bind below is a silent no-op.
-        // FS_IRIS specifically uses it for the aspect-correct radius.
-        let u_aspect = session.gl.get_uniform_location(program, "u_aspect");
 
         // v1-spec-delta #10 (slice c-2): when settings have non-
         // identity brightness/gamma, route the transition shader
@@ -5364,8 +5424,14 @@ pub fn paint_and_present_one_transition_frame(
             match ensure_scene_fbo(session, mode_w_u32, mode_h_u32) {
                 Ok(handle) => Some(handle),
                 Err(e) => {
-                    cleanup_static(session.gl, Some(vbo));
-                    session.gl.delete_program(program);
+                    // r102.3: same cache-vs-fresh rule as the
+                    // success path above.
+                    if program_cache_enabled {
+                        cleanup_static(session.gl, None);
+                    } else {
+                        cleanup_static(session.gl, Some(vbo));
+                        session.gl.delete_program(program);
+                    }
                     return Err(e);
                 }
             }
@@ -5402,8 +5468,17 @@ pub fn paint_and_present_one_transition_frame(
         session.gl.disable_vertex_attrib_array(a_uv);
 
         // Cleanup static (per-call FBOs + program + VBO).
-        cleanup_static(session.gl, Some(vbo));
-        session.gl.delete_program(program);
+        // r102.3: when program_cache_enabled, the program is owned
+        // by LEGACY_TRANSITION_PROGRAMS_V2 and the VBO by
+        // TEXTURED_QUAD_VBO -- both freed at session teardown.
+        // Skip the per-tick deletes; pass None for vbo so
+        // cleanup_static doesn't free the cached buffer either.
+        if program_cache_enabled {
+            cleanup_static(session.gl, None);
+        } else {
+            cleanup_static(session.gl, Some(vbo));
+            session.gl.delete_program(program);
+        }
 
         // v1-spec-delta #10 (slice c-2) + FYS bug 5: present pass
         // from the logical scene FBO to the panel-native default fb
@@ -11271,6 +11346,95 @@ fn clear_transition_program_cache(gl: &glow::Context) {
     });
 }
 
+/// r102.3 (2026-06-09): cached attribute + uniform locations for
+/// the live-3-pass transition program. Pre-r102.3 the live IPC
+/// path (paint_and_present_one_transition_frame, hdmi.rs:5289+)
+/// re-linked the program AND re-resolved all 7 locations on
+/// every tick. The link is the expensive operation that vc4 V3D
+/// lazy-GC retained as the ~108 MB / 4 min non-bracket leak
+/// QA's r102.1.1 probe surfaced after r102.2 plugged the FBO+tex
+/// leak. The struct cache mirrors `CachedCompositeProgram`
+/// shape minus the u_a_xform/u_b_xform fields (legacy 3-pass
+/// doesn't atlas-pack so it doesn't need them).
+#[derive(Copy, Clone)]
+pub(crate) struct CachedLegacyTransitionProgram {
+    pub program: glow::NativeProgram,
+    pub a_pos: u32,
+    pub a_uv: u32,
+    pub u_src_a: Option<glow::NativeUniformLocation>,
+    pub u_src_b: Option<glow::NativeUniformLocation>,
+    pub u_t: Option<glow::NativeUniformLocation>,
+    /// r96: u_aspect for the legacy FS_IRIS path. Most legacy
+    /// shaders don't declare it so this resolves to None for
+    /// most kinds and the bind is a silent no-op.
+    pub u_aspect: Option<glow::NativeUniformLocation>,
+}
+
+std::thread_local! {
+    static LEGACY_TRANSITION_PROGRAMS_V2: std::cell::RefCell<
+        std::collections::HashMap<*const u8, CachedLegacyTransitionProgram>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// r102.3 (2026-06-09): resolve (and cache) the live-3-pass
+/// transition program + all 7 locations for a given fragment
+/// shader source. The underlying program is shared with
+/// `TRANSITION_PROGRAMS` (the standalone-reel path's cache);
+/// `cached_transition_program` is called here so a program is
+/// link'd AT MOST ONCE per fs across both code paths.
+///
+/// Returns the same `CachedLegacyTransitionProgram` on every
+/// call for the same fs. None for VS missing a_pos/a_uv (signals
+/// shader-source corruption; surfaces as an error to the
+/// caller which is the live IPC sidecar).
+pub(crate) fn cached_legacy_transition_program(
+    gl: &glow::Context,
+    fs: &'static str,
+) -> Result<CachedLegacyTransitionProgram> {
+    use glow::HasContext;
+    LEGACY_TRANSITION_PROGRAMS_V2.with(|c| {
+        let mut cache = c.borrow_mut();
+        let key = fs.as_ptr();
+        if let Some(&entry) = cache.get(&key) {
+            return Ok(entry);
+        }
+        // Share the underlying linked program with the
+        // standalone reel's cache so we don't double-link.
+        let program = cached_transition_program(gl, fs)?;
+        let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_pos (cached_legacy_transition_program)"))?;
+        let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+            .ok_or_else(|| anyhow!("VS_TEXTURED_QUAD missing a_uv (cached_legacy_transition_program)"))?;
+        let u_src_a = unsafe { gl.get_uniform_location(program, "u_src_a") };
+        let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
+        let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
+        let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        let entry = CachedLegacyTransitionProgram {
+            program,
+            a_pos,
+            a_uv,
+            u_src_a,
+            u_src_b,
+            u_t,
+            u_aspect,
+        };
+        cache.insert(key, entry);
+        Ok(entry)
+    })
+}
+
+/// r102.3 (2026-06-09): session-teardown cleanup. The
+/// underlying program handles are owned by
+/// `TRANSITION_PROGRAMS` (and freed by
+/// `clear_transition_program_cache`); this just drains the
+/// location-cache entries so the HashMap doesn't retain stale
+/// pointers.
+fn clear_legacy_transition_program_cache() {
+    LEGACY_TRANSITION_PROGRAMS_V2.with(|c| {
+        c.borrow_mut().clear();
+    });
+}
+
 /// QA-direct (2026-05-08, post-clock_nanosleep): cached per-program
 /// state so that the per-call uniform-location lookups (~14 string
 /// hash queries through the GLES2 driver) and attribute-location
@@ -15377,6 +15541,73 @@ mod r102_2_tests {
     /// `cargo test` on macOS dev hosts. The source-pin test
     /// below DOES run here on Linux targets where hdmi.rs is
     /// compiled.
+
+    #[test]
+    fn r102_3_live_3pass_uses_cached_legacy_transition_program() {
+        // r102.3 source-pin regression-lock: the live 3-pass
+        // hot path in `paint_and_present_one_transition_frame`
+        // MUST use `cached_legacy_transition_program` (the
+        // r102.3 struct cache) on the cache-enabled path -- if a
+        // future refactor reintroduces per-tick
+        // `link_program(VS_TEXTURED_QUAD, fs)` to that function,
+        // the V3D BO leak comes back.
+        //
+        // We assert (a) the symbol exists, (b) it is called from
+        // inside the function body, and (c) the kill-switch
+        // fallback STILL contains the legacy `link_program`
+        // call (so the A/B path keeps working).
+        let src = include_str!("hdmi.rs");
+        assert!(
+            src.contains("fn cached_legacy_transition_program("),
+            "r102.3 helper missing or renamed -- live 3-pass cache is gone",
+        );
+        assert!(
+            src.contains("cached_legacy_transition_program(session.gl, fs)"),
+            "r102.3 helper not called from paint_and_present_one_transition_frame",
+        );
+        // The kill-switch fallback path MUST still contain
+        // link_program for A/B testing; assert it survives.
+        assert!(
+            src.contains("link_program(session.gl, VS_TEXTURED_QUAD, fs)"),
+            "r102.3 kill-switch fallback path missing -- the =off A/B can't reproduce pre-r102.3 behavior",
+        );
+    }
+
+    #[test]
+    fn r102_3_cached_vbo_is_rebound_before_vertex_attrib_pointer() {
+        // r102.3 subagent BLOCKER-1 regression-lock: the
+        // `cached_textured_quad_vbo` helper only binds
+        // GL_ARRAY_BUFFER on its first-create path; on every
+        // cache hit it returns the handle without binding. If a
+        // future refactor removes the `bind_buffer` call between
+        // the VBO fetch and the `vertex_attrib_pointer_f32`
+        // calls, tick 0 still works (cache miss = helper bound)
+        // but every subsequent tick snapshots whatever buffer
+        // bake_a/bake_b left bound -- garbled or black
+        // transition frames.
+        //
+        // Find the `cached_textured_quad_vbo(session.gl)` call
+        // and assert a `bind_buffer(glow::ARRAY_BUFFER, Some(vbo))`
+        // exists between it and the next
+        // `vertex_attrib_pointer_f32` invocation.
+        let src = include_str!("hdmi.rs");
+        let from = src
+            .find("cached_textured_quad_vbo(session.gl)")
+            .expect("cached_textured_quad_vbo call missing from hdmi.rs");
+        let tail = &src[from..];
+        let to = tail
+            .find("vertex_attrib_pointer_f32")
+            .expect("no vertex_attrib_pointer_f32 after cached_textured_quad_vbo");
+        let window = &tail[..to];
+        assert!(
+            window.contains("bind_buffer(glow::ARRAY_BUFFER, Some(vbo))"),
+            "r102.3 BLOCKER-1 regression: live-3-pass missing the \
+             GL_ARRAY_BUFFER rebind between cached_textured_quad_vbo \
+             and vertex_attrib_pointer_f32. The cache helper only \
+             binds on first-create; subsequent ticks inherit whatever \
+             bake_a/bake_b left bound (cover_quad_vbo, text VBO, etc).",
+        );
+    }
 
     #[test]
     fn r102_2_session_struct_has_transition_fbo_fields() {
