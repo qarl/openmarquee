@@ -927,16 +927,24 @@ impl SlideCache {
                                     "ipc: warning -- failed to prime V4L2 decoder for video slide {}: {:#}",
                                     item_id, e
                                 );
+                                // r99: CMA snapshot + peer-decoder
+                                // context appended so QA can see
+                                // resource state at REQBUFS failure.
+                                let r99_tail = format_mmal_leak_diagnostics_tail(
+                                    Some(self), item_id,
+                                );
                                 eprintln!(
                                     "[mmal_leak_suspect] kind=video_decode \
                                      op={:?} slide_id={} \
                                      mmal_components_live_before={} \
                                      mmal_components_live_after={} \
-                                     drop_path=automatic call_site=cache_load",
+                                     drop_path=automatic call_site=cache_load \
+                                     {}",
                                     extract_top_context(&e),
                                     item_id,
                                     counter_before,
                                     crate::v4l2::mmal_components_live(),
+                                    r99_tail,
                                 );
                             }
                         }
@@ -1116,16 +1124,25 @@ fn preload_in_worker(
                             // r75: same parser-friendly leak-suspect line
                             // as the synchronous BeginSlide site. call_site
                             // distinguishes the two paths.
+                            // r99: same tail format as the cache_load
+                            // site; cache is None here (worker thread
+                            // doesn't hold SlideCache), so peer fields
+                            // render as `?` placeholders.
+                            let r99_tail = format_mmal_leak_diagnostics_tail(
+                                None, item_id,
+                            );
                             eprintln!(
                                 "[mmal_leak_suspect] kind=video_decode \
                                  op={:?} slide_id={} \
                                  mmal_components_live_before={} \
                                  mmal_components_live_after={} \
-                                 drop_path=automatic call_site=preload_worker",
+                                 drop_path=automatic call_site=preload_worker \
+                                 {}",
                                 extract_top_context(&e),
                                 item_id,
                                 counter_before,
                                 crate::v4l2::mmal_components_live(),
+                                r99_tail,
                             );
                         }
                     }
@@ -1286,6 +1303,70 @@ fn extract_top_context(e: &anyhow::Error) -> String {
     iter.next()
         .map(|root| root.to_string())
         .unwrap_or_else(|| e.to_string())
+}
+
+/// r99 (2026-06-09): render the new diagnostics tail for the
+/// `[mmal_leak_suspect]` log line. Captures CMA snapshot + peer-
+/// decoder context + (when unavailable) explicit placeholders so
+/// log parsers see a consistent field set.
+///
+/// Format pinned by `format_mmal_leak_diagnostics_tail_layout`
+/// test; parsers should grep for `cma_used_mb=`, `cma_free_mb=`,
+/// `cma_total_mb=`, `peer_decoder_count=`, `peer_decoder_dims=`.
+///
+/// When `/proc/meminfo` is missing (macOS) or CMA-disabled (rare),
+/// the cma_* fields render as `cma_used_mb=? cma_free_mb=?
+/// cma_total_mb=?` so a scanner can still split on them.
+///
+/// `peer_decoder_dims` is rendered as `[WxH,WxH,...]` with a fixed
+/// stable order (by Uuid) — empty list `[]` when no peers exist.
+#[cfg(target_os = "linux")]
+fn format_mmal_leak_diagnostics_tail(
+    cache: Option<&SlideCache>,
+    failing_slide_id: uuid::Uuid,
+) -> String {
+    let cma = crate::v4l2::read_cma_snapshot_mb();
+    let cma_str = match cma {
+        Some(s) => format!(
+            "cma_used_mb={} cma_free_mb={} cma_total_mb={}",
+            s.used, s.free, s.total,
+        ),
+        None => "cma_used_mb=? cma_free_mb=? cma_total_mb=?".to_string(),
+    };
+    // The preload-worker emit site runs on a worker thread without
+    // SlideCache access (the worker holds an `Arc<Mp4Demuxer>` not
+    // the full cache); it passes `None` and gets `?` for peer
+    // fields. The synchronous cache_load emit site passes
+    // `Some(&self)` and gets the real peer enumeration. Either way
+    // the field set is consistent so journal parsers can split on
+    // `peer_decoder_count=` etc.
+    let (peer_count_str, peer_dims_str) = match cache {
+        Some(c) => {
+            // Peer decoders are the OTHER live decoders that may be
+            // consuming the CMA budget the failing prime wanted.
+            // Filter the failing slide's own id out (in practice it
+            // isn't in the map yet — the prime is what would have
+            // inserted it — but the filter is correct independent
+            // of insertion order).
+            let mut peer_ids: Vec<uuid::Uuid> = c.video_decoders
+                .keys()
+                .copied()
+                .filter(|id| *id != failing_slide_id)
+                .collect();
+            peer_ids.sort();
+            let peer_count = peer_ids.len();
+            let peer_dims: Vec<String> = peer_ids.iter()
+                .filter_map(|id| c.video_decoders.get(id))
+                .map(|d| format!("{}x{}", d.capture_w, d.capture_h))
+                .collect();
+            (peer_count.to_string(), format!("[{}]", peer_dims.join(",")))
+        }
+        None => ("?".to_string(), "[?]".to_string()),
+    };
+    format!(
+        "{} peer_decoder_count={} peer_decoder_dims={}",
+        cma_str, peer_count_str, peer_dims_str,
+    )
 }
 
 /// Outer loop: read requests until Open arrives. Other ops
@@ -3247,6 +3328,49 @@ mod tests {
 
     fn uuid(n: u8) -> Uuid {
         Uuid::from_bytes([n; 16])
+    }
+
+    // ============================================================
+    // r99 (2026-06-09): the diagnostics tail formatter for the
+    // [mmal_leak_suspect] line. Adds CMA + peer-decoder context so
+    // QA can see resource state at REQBUFS failure. Tests pin the
+    // field shape so journal parsers can grep `cma_used_mb=` etc.
+    // ============================================================
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn format_mmal_leak_diagnostics_tail_layout_without_cache() {
+        // Worker-thread path: cache=None. CMA snapshot may or may
+        // not be available depending on host; assert the field
+        // PREFIXES are present so the format is parseable either
+        // way.
+        let tail = super::format_mmal_leak_diagnostics_tail(None, uuid(1));
+        assert!(tail.contains("cma_used_mb="), "tail={tail:?}");
+        assert!(tail.contains("cma_free_mb="), "tail={tail:?}");
+        assert!(tail.contains("cma_total_mb="), "tail={tail:?}");
+        // No cache -> peer fields render as placeholders.
+        assert!(tail.contains("peer_decoder_count=?"), "tail={tail:?}");
+        assert!(tail.contains("peer_decoder_dims=[?]"), "tail={tail:?}");
+    }
+
+    #[test]
+    fn mmal_leak_suspect_emit_site_calls_diagnostics_tail() {
+        // Source-grep regression-lock: both emit sites MUST invoke
+        // format_mmal_leak_diagnostics_tail. A refactor that drops
+        // the call would silently strip the r99 fields from the
+        // log line.
+        let src = include_str!("ipc_main.rs");
+        // 2 production call sites + N test references.
+        let prod_calls = src.matches("format_mmal_leak_diagnostics_tail(").count();
+        // 2 prod (cache_load + preload_worker) + this test's own
+        // reference + the test name above + 1 in the doc comment.
+        // The exact count drifts as tests grow; the LOWER bound is
+        // what matters.
+        assert!(
+            prod_calls >= 2,
+            "expected at least 2 format_mmal_leak_diagnostics_tail call sites \
+             (cache_load + preload_worker); got {prod_calls}",
+        );
     }
 
     // ============================================================

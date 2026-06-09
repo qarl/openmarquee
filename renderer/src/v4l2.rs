@@ -1665,8 +1665,30 @@ impl Decoder {
                 Err(e) => format!("errno_{:?}", e),
             },
         );
-        reqbufs_result
-            .with_context(|| format!("VIDIOC_REQBUFS({:?}, memory={})", dir, memory_type))?;
+        // r99 (2026-06-09): on REQBUFS failure, embed errno + buffer
+        // params into the with_context message so the parent's
+        // [mmal_leak_suspect] log line surfaces the actual ioctl
+        // errno + the resource ask. extract_top_context (in
+        // ipc_main.rs) picks up THIS string verbatim and renders it
+        // as op="<msg>". Format intentionally machine-parseable: a
+        // grep for `errno=ENOMEM` on the journal scans both this
+        // message and the outer log line consistently.
+        let sizeimage = fmt.plane_fmt.first().map(|pf| pf.sizeimage).unwrap_or(0);
+        let total_alloc_kb = (sizeimage as u64).saturating_mul(count as u64) / 1024;
+        let errno_for_ctx = reqbufs_result.as_ref().err().copied();
+        reqbufs_result.with_context(|| {
+            let errno_str = errno_for_ctx
+                .map(|e| format!("{:?}", e))
+                .unwrap_or_else(|| "UNKNOWN".to_string());
+            format_reqbufs_failure_context(
+                dir,
+                memory_type,
+                &errno_str,
+                count,
+                sizeimage,
+                total_alloc_kb,
+            )
+        })?;
         let allocated_count = rb.count as usize;
         if allocated_count == 0 {
             return Err(anyhow!(
@@ -2655,6 +2677,93 @@ fn compute_y_crop_max(display_h: u32, alloc_h: u32) -> f32 {
     (display_h as f32) / (alloc_h as f32)
 }
 
+/// r99 (2026-06-09): canonical format for a REQBUFS failure's
+/// with_context message. Embeds errno + buffer params so the
+/// downstream `[mmal_leak_suspect]` log line (rendered by
+/// ipc_main.rs's `extract_top_context`) surfaces the actual kernel
+/// rejection reason + the resource shape the renderer was asking
+/// for. Cross-platform so Mac-side unit tests cover the format.
+///
+/// Format pinned by `format_reqbufs_failure_context_layout` test;
+/// parsers should grep for `errno=`, `requested_buffers=`,
+/// `total_alloc_kb=` keys.
+pub fn format_reqbufs_failure_context(
+    dir: QueueDirection,
+    memory_type: u32,
+    errno_str: &str,
+    count: u32,
+    sizeimage: u32,
+    total_alloc_kb: u64,
+) -> String {
+    format!(
+        "VIDIOC_REQBUFS({:?}, memory={}) errno={} requested_buffers={} \
+         plane_sizeimage={} buffer_size_kb={} total_alloc_kb={}",
+        dir, memory_type, errno_str, count,
+        sizeimage, (sizeimage as u64) / 1024, total_alloc_kb,
+    )
+}
+
+/// r99 (2026-06-09): snapshot of the kernel's CMA carveout state
+/// at the moment of a REQBUFS failure. Sourced from
+/// `/proc/meminfo` lines `CmaTotal:` + `CmaFree:`. The `used` field
+/// is the derived `total - free`. All values in MB (1024 KiB).
+///
+/// Linux-gated: `/proc/meminfo` is unavailable on macOS dev hosts;
+/// `read_cma_snapshot_mb` returns `None` there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CmaSnapshotMb {
+    pub total: u64,
+    pub free: u64,
+    pub used: u64,
+}
+
+/// r99 (2026-06-09): parse `/proc/meminfo` looking for `CmaTotal:`
+/// + `CmaFree:` lines. Returns `None` on macOS (where the file
+/// doesn't exist) or when either line is absent (e.g. CMA-disabled
+/// kernel). One syscall on a slow path — fine.
+///
+/// Cross-platform signature; the body parses `/proc/meminfo` on
+/// Linux and returns `None` immediately on other targets. Pure
+/// parser `parse_cma_lines` is broken out so unit tests can run on
+/// every host without needing the file present.
+#[cfg(target_os = "linux")]
+pub fn read_cma_snapshot_mb() -> Option<CmaSnapshotMb> {
+    let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_cma_lines(&contents)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_cma_snapshot_mb() -> Option<CmaSnapshotMb> {
+    None
+}
+
+/// r99 (2026-06-09): pure parser for `/proc/meminfo`'s CMA lines.
+/// Expected line shape: `CmaTotal:         262144 kB`. Returns
+/// `Some(CmaSnapshotMb { total, free, used })` only when BOTH
+/// `CmaTotal:` and `CmaFree:` are present; otherwise `None`.
+///
+/// Cross-platform — Mac-side tests pass synthetic content.
+pub fn parse_cma_lines(contents: &str) -> Option<CmaSnapshotMb> {
+    let mut total_kib: Option<u64> = None;
+    let mut free_kib: Option<u64> = None;
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("CmaTotal:") {
+            total_kib = rest.split_whitespace().next()
+                .and_then(|s| s.parse::<u64>().ok());
+        } else if let Some(rest) = line.strip_prefix("CmaFree:") {
+            free_kib = rest.split_whitespace().next()
+                .and_then(|s| s.parse::<u64>().ok());
+        }
+    }
+    let total = total_kib? / 1024;
+    let free = free_kib? / 1024;
+    Some(CmaSnapshotMb {
+        total,
+        free,
+        used: total.saturating_sub(free),
+    })
+}
+
 // ============================================================
 // Mac-side public types for cross-platform syntax checking. On
 // macOS, Decoder + Frame don't exist (no V4L2). The structs
@@ -2910,6 +3019,89 @@ mod tests {
         // bug; clamp to 1.0 rather than emit ratio > 1.0 (which
         // would sample past the end of the texture).
         assert_eq!(compute_y_crop_max(1100, 1088), 1.0);
+    }
+
+    #[test]
+    fn format_reqbufs_failure_context_layout() {
+        // r99: pin the with_context message shape so log parsers
+        // can rely on it. extract_top_context renders this string
+        // verbatim into the `op=` field of the [mmal_leak_suspect]
+        // line.
+        let msg = format_reqbufs_failure_context(
+            QueueDirection::Output,
+            V4L2_MEMORY_MMAP,
+            "ENOMEM",
+            4,
+            2_097_152,  // 2 MiB sizeimage (typical 1080p H264 OUTPUT)
+            8192,
+        );
+        assert!(msg.contains("VIDIOC_REQBUFS(Output, memory=1)"));
+        assert!(msg.contains("errno=ENOMEM"));
+        assert!(msg.contains("requested_buffers=4"));
+        assert!(msg.contains("plane_sizeimage=2097152"));
+        assert!(msg.contains("buffer_size_kb=2048"));
+        assert!(msg.contains("total_alloc_kb=8192"));
+    }
+
+    #[test]
+    fn format_reqbufs_failure_context_handles_zero_sizeimage() {
+        // Defensive: when fmt.plane_fmt is empty (sentinel 0),
+        // buffer_size_kb should be 0 (not panic / divide error).
+        let msg = format_reqbufs_failure_context(
+            QueueDirection::Capture,
+            V4L2_MEMORY_MMAP,
+            "EBUSY",
+            4,
+            0,
+            0,
+        );
+        assert!(msg.contains("plane_sizeimage=0"));
+        assert!(msg.contains("buffer_size_kb=0"));
+        assert!(msg.contains("total_alloc_kb=0"));
+    }
+
+    #[test]
+    fn parse_cma_lines_extracts_total_and_free() {
+        // r99: canonical /proc/meminfo shape (Linux 6.12 on
+        // Pi Zero 2 W with cma=256M). The bcm2835-codec test bed.
+        let contents = "\
+MemTotal:         469228 kB
+MemFree:          198456 kB
+CmaTotal:         262144 kB
+CmaFree:          213256 kB
+SwapTotal:        102396 kB
+";
+        let snap = parse_cma_lines(contents).expect("must parse");
+        assert_eq!(snap.total, 256);  // 262144 / 1024
+        assert_eq!(snap.free, 208);   // 213256 / 1024 = 208 (int div)
+        assert_eq!(snap.used, 48);    // 256 - 208
+    }
+
+    #[test]
+    fn parse_cma_lines_returns_none_when_cma_disabled() {
+        // Kernel with CONFIG_CMA disabled: /proc/meminfo has no
+        // CmaTotal: line. Must return None, not panic.
+        let contents = "\
+MemTotal:         469228 kB
+MemFree:          198456 kB
+";
+        assert!(parse_cma_lines(contents).is_none());
+    }
+
+    #[test]
+    fn parse_cma_lines_returns_none_when_only_total_present() {
+        // Half-populated case (shouldn't happen but defensive):
+        // CmaTotal: alone with no CmaFree: returns None.
+        let contents = "CmaTotal: 262144 kB\n";
+        assert!(parse_cma_lines(contents).is_none());
+    }
+
+    #[test]
+    fn parse_cma_lines_ignores_malformed_values() {
+        // A garbled CmaTotal: that fails to parse should return
+        // None (not crash).
+        let contents = "CmaTotal: not_a_number kB\nCmaFree: 213256 kB\n";
+        assert!(parse_cma_lines(contents).is_none());
     }
 
     #[test]
