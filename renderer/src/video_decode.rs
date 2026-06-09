@@ -721,7 +721,7 @@ pub fn prime_video_decoder_for_preload(
         let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
         let drain_us = t_drain.elapsed().as_micros();
         eprintln!(
-            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={} was_deferred=false",
             slide_id, drained, prime_only_us, drain_us, budget_ms,
         );
         eprintln!(
@@ -777,7 +777,7 @@ pub fn prime_video_decoder_for_preload(
             slide_id, budget_ms, detail.eagain_polls, detail.other_errs, drained, reason,
         );
         eprintln!(
-            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={} was_deferred=false",
             slide_id, drained, prime_only_us, drain_us, budget_ms,
         );
         eprintln!(
@@ -825,7 +825,7 @@ pub fn prime_video_decoder_for_preload(
     state.frames_decoded = 0;
 
     eprintln!(
-        "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+        "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={} was_deferred=false",
         slide_id, drained, prime_only_us, drain_us, budget_ms,
     );
     eprintln!(
@@ -989,7 +989,7 @@ fn prime_video_decoder_for_preload_r82_disabled(
             slide_id, budget_ms, detail.eagain_polls, detail.other_errs, drained, reason,
         );
         eprintln!(
-            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={} was_deferred=false",
             slide_id, drained, prime_only_us, drain_us, budget_ms,
         );
         eprintln!(
@@ -1058,7 +1058,7 @@ fn prime_video_decoder_for_preload_r82_disabled(
     state.frames_decoded = 0;
 
     eprintln!(
-        "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={}",
+        "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={} was_deferred=false",
         slide_id, drained, prime_only_us, drain_us, budget_ms,
     );
     eprintln!(

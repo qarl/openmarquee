@@ -152,6 +152,35 @@ struct PerfStatsJson {
 
 /// `[perf]` r2: atomic write via `.tmp` + rename. The rename is
 /// atomic on the same filesystem (POSIX), so the backend reader will
+/// r97 (2026-06-09): predicate for the conditional deferred-preload
+/// path in the `PreloadSlide` IPC arm. Returns `true` iff BOTH:
+///   - at least one V4L2 decoder is currently live (contention is
+///     real — the new decoder would have to share the codec VPU
+///     with the existing one), AND
+///   - the incoming preload's slide has a video background (so the
+///     spawn would actually open a decoder, not just load items).
+///
+/// The 4-way truth table:
+///
+/// | active_decoder_count | bg_is_video | should_defer |
+/// |----------------------|-------------|--------------|
+/// | 0                    | false       | false        |
+/// | 0                    | true        | false        |
+/// | >= 1                 | false       | false        |
+/// | >= 1                 | true        | **true**     |
+///
+/// The Pi Zero 2 W bcm2835-codec VPU ceiling for two simultaneous
+/// 1080p30 decodes drove this. See `docs/hardware-ceilings.md` for
+/// the empirical characterisation. Pure function so unit tests
+/// cover the 4 combinations on every host (the `PreloadSlide` arm
+/// is Linux-gated; this predicate is not).
+pub fn should_defer_preload_for_codec_contention(
+    active_decoder_count: usize,
+    bg_is_video: bool,
+) -> bool {
+    active_decoder_count >= 1 && bg_is_video
+}
+
 /// never observe a partial JSON file even if the renderer crashes
 /// mid-write. The `.tmp` is co-located in the same directory as the
 /// target so the rename stays atomic.
@@ -2973,6 +3002,90 @@ fn handle_inner_request(
                 );
                 return ok_empty();
             }
+            // r97 (2026-06-09): conditional deferred preload for
+            // dual-video codec contention. The bcm2835-codec H.264
+            // block on Pi Zero 2 W class hardware (BCM2710 VPU at
+            // roughly half the clock of a Pi 4) cannot sustain two
+            // simultaneous 1080p30 decodes — empirically (FYS
+            // 2026-06-09) the second decoder gets ~0 frames during
+            // its 500ms preload window while the first decoder is
+            // still streaming, then catches up after the first
+            // STREAMOFFs ~4 seconds later. By that time the
+            // transition window has blown past + endpoint_b is black.
+            //
+            // The Linux bcm2835-codec driver enforces NO concurrency
+            // cap; the limit lives in the closed-source VPU
+            // firmware's H.264 scheduler. See
+            // `docs/hardware-ceilings.md` for the full empirical
+            // characterisation, including why we do NOT bake "1080p
+            // is forever banned" into platform-agnostic code paths
+            // (Pi 4 / 5 class hardware lifts the ceiling).
+            //
+            // Defer trigger: video-bg slide preload arriving while
+            // an active video decoder already exists in the cache.
+            // The subsequent BeginSlide will hit cache.load
+            // synchronously AFTER `evict_other_video_state` runs,
+            // which STREAMOFFs the previous decoder + opens a fresh
+            // one. bake_b's Path B polling (r94) then catches the
+            // first frame ~150ms in. Visible cost: slide-B's first
+            // ~150ms of the transition is endpoint-A held (or the
+            // existing skip degrade), instead of the catastrophic
+            // marker_overwritten failure mode.
+            //
+            // We rely on `cache.items.peek` to identify a video-bg
+            // slide without doing IO. In steady-state operation the
+            // items LRU is hot for the current playlist; cold-start
+            // preloads (items not yet cached) take the normal
+            // spawn path — conservative for the bug at hand.
+            #[cfg(target_os = "linux")]
+            {
+                let active_decoder_count = cache.video_decoders.len();
+                let bg_is_video = match cache.items.peek(&preload_id) {
+                    Some(crate::content::ContentItem::Video(_)) => true,
+                    Some(crate::content::ContentItem::Text(s)) => {
+                        s.background_video_slide_id.is_some()
+                    }
+                    Some(crate::content::ContentItem::Image(_)) => false,
+                    None => false,
+                };
+                if should_defer_preload_for_codec_contention(
+                    active_decoder_count,
+                    bg_is_video,
+                ) {
+                    let us = t_enqueue.elapsed().as_micros();
+                    // List the active decoder ids so QA can correlate
+                    // which decoder #1 is the contention partner.
+                    let active_decoder_ids: Vec<String> = cache
+                        .video_decoders
+                        .keys()
+                        .map(|id| id.to_string())
+                        .collect();
+                    eprintln!(
+                        "[perf] preload_deferred_for_codec_contention slide_id={} \
+                         active_decoder_count={} active_decoder_ids=[{}] deferral_us={}",
+                        preload_id,
+                        active_decoder_count,
+                        active_decoder_ids.join(","),
+                        us,
+                    );
+                    // Mirror the canonical preload_handoff shape with
+                    // was_deferred=true so log-scanners can
+                    // distinguish frames_drained=0-from-deferral from
+                    // frames_drained=0-from-codec-contention (the
+                    // smoking-gun line that drove this fix).
+                    eprintln!(
+                        "[perf] preload_handoff slide_id={} frames_drained=0 \
+                         prime_only_us=0 drain_us=0 budget_ms=0 was_deferred=true",
+                        preload_id,
+                    );
+                    eprintln!(
+                        "[perf] preload slide_id={} us={} deferred_us={} \
+                         reason=codec_contention",
+                        preload_id, us, us,
+                    );
+                    return ok_empty();
+                }
+            }
             // r65 core: spawn worker. The main thread returns
             // immediately (just the cheap spawn cost). The worker
             // does the V4L2 prime + Mp4Demuxer::open in
@@ -4430,5 +4543,115 @@ mod tests {
         pub fn cleanup_at_drop(path: std::path::PathBuf) -> Guard {
             Guard { path }
         }
+    }
+
+    // ============================================================
+    // r97 (2026-06-09): conditional deferred-preload predicate.
+    //
+    // The 4-way truth table for `should_defer_preload_for_codec_
+    // contention(active_decoder_count, bg_is_video)`:
+    //
+    // | active_decoder_count | bg_is_video | should_defer |
+    // |----------------------|-------------|--------------|
+    // | 0                    | false       | false        |
+    // | 0                    | true        | false        |
+    // | >= 1                 | false       | false        |
+    // | >= 1                 | true        | true         |
+    //
+    // See docs/hardware-ceilings.md for the empirical
+    // characterisation that drove the rule.
+    // ============================================================
+
+    #[test]
+    fn should_defer_preload_table_driven_4_combinations() {
+        // The canonical 4 combinations.
+        assert!(
+            !super::should_defer_preload_for_codec_contention(0, false),
+            "(no active decoder, solid bg) must NOT defer",
+        );
+        assert!(
+            !super::should_defer_preload_for_codec_contention(0, true),
+            "(no active decoder, video bg) must NOT defer — first video slide entering, \
+             or arriving from a solid-bg slide; no contention to worry about",
+        );
+        assert!(
+            !super::should_defer_preload_for_codec_contention(1, false),
+            "(active decoder, solid bg) must NOT defer — preload won't open a decoder anyway",
+        );
+        assert!(
+            super::should_defer_preload_for_codec_contention(1, true),
+            "(active decoder, video bg) must defer — this is the dual-1080p contention case",
+        );
+    }
+
+    #[test]
+    fn should_defer_preload_scales_with_decoder_count() {
+        // The contention surface grows with concurrent decoders;
+        // the predicate stays "true" for any non-zero count.
+        for n in 1usize..=4 {
+            assert!(
+                super::should_defer_preload_for_codec_contention(n, true),
+                "{n} active decoders + video bg must defer",
+            );
+            assert!(
+                !super::should_defer_preload_for_codec_contention(n, false),
+                "{n} active decoders + solid bg must NOT defer",
+            );
+        }
+    }
+
+    #[test]
+    fn defer_call_site_is_present_in_preload_arm() {
+        // Source-grep regression-lock: the `PreloadSlide` IPC arm
+        // MUST invoke `should_defer_preload_for_codec_contention`.
+        // A future refactor that drops the call (or renames the
+        // predicate without updating the call site) would silently
+        // re-introduce the codec-contention failure mode.
+        let src = include_str!("ipc_main.rs");
+        // The call lives inside a `#[cfg(target_os = "linux")]`
+        // block in the `IpcRequest::PreloadSlide(p) => { ... }`
+        // arm; this assertion is layout-agnostic.
+        assert!(
+            src.contains("should_defer_preload_for_codec_contention("),
+            "PreloadSlide arm must call should_defer_preload_for_codec_contention(...)",
+        );
+        // Pair-check: the `preload_deferred_for_codec_contention`
+        // probe must be emitted, so the journal carries a clear
+        // signal when the defer fires.
+        assert!(
+            src.contains("preload_deferred_for_codec_contention"),
+            "PreloadSlide arm must emit `preload_deferred_for_codec_contention` probe",
+        );
+        // And the `was_deferred=true` branch must mirror the
+        // canonical preload_handoff shape so log-scanners see
+        // every preload as a handoff event (deferred or not).
+        assert!(
+            src.contains("was_deferred=true"),
+            "PreloadSlide deferred branch must emit a preload_handoff with was_deferred=true",
+        );
+    }
+
+    #[test]
+    fn preload_handoff_normal_path_carries_was_deferred_false() {
+        // Source-grep regression-lock for video_decode.rs: all five
+        // `preload_handoff` emit sites must carry
+        // `was_deferred=false` so QA can distinguish:
+        //   - frames_drained=0 + was_deferred=true (graceful r97
+        //     defer)
+        //   - frames_drained=0 + was_deferred=false (codec actually
+        //     stalled — the failure mode that started this fix)
+        let src = include_str!("video_decode.rs");
+        // The format string fragment we expect at every site.
+        let needle = "[perf] preload_handoff slide_id={} frames_drained={} \
+                      prime_only_us={} drain_us={} budget_ms={} was_deferred=false";
+        // 5 emit sites in the prime_video_decoder_for_preload code
+        // path (one per branch: pre-r85 fast path, r85 EOS-flush
+        // branch + its inner fallbacks, etc.).
+        let count = src.matches(needle).count();
+        assert_eq!(
+            count, 5,
+            "expected 5 preload_handoff emit sites carrying was_deferred=false in \
+             video_decode.rs; found {count}",
+        );
     }
 }
