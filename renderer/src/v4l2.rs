@@ -1091,10 +1091,51 @@ impl Drop for DecoderInner {
         // BOUNDED to that one phantom ref per buffer (or zero, if
         // Mesa happens to drop the ref correctly on the only-
         // destroy-once path -- TBD on FYS).
+        // r101.1 (2026-06-09): per-handle entry+exit instrumentation.
+        // r101 deploy wedged FYS post-soak with `begin_slide` 60s
+        // timeouts + ZERO `egl_image_destroyed` summary lines in
+        // the wedge window. r101 summary line was conditional on
+        // `destroyed > 0 || failed > 0`, so a decoder with no
+        // cached images emitted nothing -- ambiguous between
+        // "Drop ran cleanly with empty cache" and "Drop entered the
+        // destroy loop and hung on the first call." This
+        // instrumentation distinguishes them:
+        //
+        //   - egl_image_destroy_entry idx=N -- BEFORE each call
+        //   - egl_image_destroy_exit  idx=N elapsed_us=N result=...
+        //     -- AFTER each call (only emitted if destroy returned)
+        //   - egl_image_destroy_loop_summary ... -- ALWAYS at end
+        //     (even count=0), so a wedge after entry-without-exit
+        //     stands out vs a clean empty-cache Drop
+        //
+        // glFlush mitigation deliberately NOT added in r101.1: a
+        // pre-flush via eglWaitClient would block on the same GPU
+        // work the destroy is presumably blocking on; it's not a
+        // mitigation for "destroy hangs on pending GPU state"
+        // unless we have evidence destroy is failing for a state-
+        // not-current reason. The entry/exit probe is what tells
+        // us which one. If H1 confirms the hang is in destroy
+        // entry, r101.2 can layer a real mitigation (offload to
+        // background thread / per-destroy timeout / etc).
+        // r101.1 subagent NIT-1: `loop_elapsed_us` captured here is
+        // inflated by the per-iteration writeln! syscall overhead
+        // and is NOT the load-bearing measurement for diagnosing
+        // H1. The per-handle `elapsed_us` (captured tightly around
+        // each `destroy_fn` call below) is the accurate destroy
+        // cost; `loop_elapsed_us` is a coarse upper-bound for
+        // wedge-detection-via-summary-absence only.
+        let loop_start = std::time::Instant::now();
         let mut destroyed = 0usize;
         let mut failed = 0usize;
+        let mut visited = 0usize;
         for slot in self.capture_egl_images.drain(..) {
             if let Some(h) = slot {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[perf] egl_image_destroy_entry idx={} drop_path=DecoderInner",
+                    visited,
+                );
+                let t_entry = std::time::Instant::now();
                 // SAFETY: handle.destroy_fn is the eglDestroyImageKHR
                 // entry point resolved + stored when the EGLImage
                 // was lazy-created. display + image were owned by
@@ -1102,20 +1143,35 @@ impl Drop for DecoderInner {
                 // back. Function pointer + opaque pointers; no
                 // Rust references involved.
                 let r = unsafe { (h.destroy_fn)(h.display, h.image) };
+                let elapsed_us = t_entry.elapsed().as_micros();
+                let result = if r == 0 { "fail" } else { "ok" };
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[perf] egl_image_destroy_exit idx={} elapsed_us={} result={} drop_path=DecoderInner",
+                    visited, elapsed_us, result,
+                );
                 if r == 0 {
                     failed += 1;
                 } else {
                     destroyed += 1;
                 }
+                visited += 1;
+            } else {
+                visited += 1;
             }
         }
-        if destroyed > 0 || failed > 0 {
-            let _ = writeln!(
-                std::io::stderr(),
-                "[perf] egl_image_destroyed count={} failed={} drop_path=DecoderInner",
-                destroyed, failed,
-            );
-        }
+        let loop_elapsed_us = loop_start.elapsed().as_micros();
+        // r101.1: summary line ALWAYS fires, including empty-cache
+        // case (visited=0). This is the load-bearing diagnostic
+        // for distinguishing "Drop ran cleanly with no cached
+        // images" (visited=0 destroyed=0) from "Drop hung at first
+        // destroy call" (an entry line with no matching exit and
+        // no summary -- the wedge signal).
+        let _ = writeln!(
+            std::io::stderr(),
+            "[perf] egl_image_destroy_loop_summary visited={} destroyed={} failed={} loop_elapsed_us={} drop_path=DecoderInner",
+            visited, destroyed, failed, loop_elapsed_us,
+        );
         for fd in self.capture_dmabuf_fds.drain(..) {
             // SAFETY: fd was returned by VIDIOC_EXPBUF + owned by
             // self until now; close(2) is the matched teardown.
@@ -3174,6 +3230,56 @@ mod tests {
         } else {
             std::env::remove_var("OPENMARQUEE_EGL_IMAGE_CACHE");
         }
+    }
+
+    #[test]
+    fn r101_1_drop_destroy_loop_emits_summary_always() {
+        // r101.1 (2026-06-09): pin the always-fires summary line by
+        // reading v4l2.rs as source. r101 (parent) summary was
+        // gated on `destroyed > 0 || failed > 0`; the empty-cache
+        // case emitted NOTHING. r101.1 moves the summary out of the
+        // conditional so QA can distinguish "Drop ran cleanly with
+        // no cached images" from "Drop hung inside the first
+        // destroy call" -- the wedge signal.
+        //
+        // Reads src/v4l2.rs as a string and asserts the
+        // `egl_image_destroy_loop_summary` writeln! call is NOT
+        // immediately preceded by `if destroyed > 0 || failed > 0
+        // {`. Source-level regression-lock; a future refactor that
+        // re-gates the summary on destroyed>0 will fail.
+        let src = include_str!("v4l2.rs");
+        // Find the ACTUAL writeln! invocation (not the doc-comment
+        // mention earlier in the function). The writeln uses a
+        // string literal with the probe-name prefix.
+        let needle = "\"[perf] egl_image_destroy_loop_summary";
+        let summary_pos = src.find(needle).unwrap_or_else(|| {
+            panic!(
+                "r101.1 instrumentation missing: '{needle}' not found in v4l2.rs",
+            )
+        });
+        // Look backward ~600 chars for the immediately-preceding
+        // control-flow context. The summary writeln! must NOT be
+        // inside an `if destroyed` or `if failed` arm.
+        let preceding = &src[summary_pos.saturating_sub(600)..summary_pos];
+        assert!(
+            preceding.contains("loop_elapsed_us"),
+            "r101.1 instrumentation drift: expected `let loop_elapsed_us = loop_start.elapsed().as_micros();` \
+             immediately preceding the summary writeln!, found:\n---preceding---\n{preceding}\n---end---",
+        );
+        assert!(
+            !preceding.contains("if destroyed > 0 || failed > 0"),
+            "r101.1 regression: summary writeln! re-gated on destroyed>0||failed>0. \
+             The always-fires policy is load-bearing for the wedge diagnostic.",
+        );
+        // And the entry+exit per-handle probes must exist too.
+        assert!(
+            src.contains("egl_image_destroy_entry"),
+            "r101.1 instrumentation missing: per-handle entry probe `egl_image_destroy_entry`",
+        );
+        assert!(
+            src.contains("egl_image_destroy_exit"),
+            "r101.1 instrumentation missing: per-handle exit probe `egl_image_destroy_exit`",
+        );
     }
 
     #[test]
