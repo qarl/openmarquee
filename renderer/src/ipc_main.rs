@@ -693,6 +693,13 @@ impl SlideCache {
         self.video_demuxers.retain(|k, _| keep_ids.contains(k));
         #[cfg(target_os = "linux")]
         self.video_decoders.retain(|k, _| keep_ids.contains(k));
+        // r102.1: V3D BO probe at evict_other_video_state exit.
+        // Decoder Drops (and any associated GL state cleanup) have
+        // just fired; this snapshot captures the post-eviction
+        // baseline so QA can compare against the next BeginSlide
+        // delta.
+        #[cfg(target_os = "linux")]
+        crate::v4l2::log_v3d_bos_at_phase("evict_other_video_state_exit", None);
     }
 
     /// r46 (2026-06-02): when `item_id` is a TextSlide with
@@ -2794,6 +2801,10 @@ fn handle_inner_request(
             err("Open already called; nested Open is not supported")
         }
         IpcRequest::BeginSlide(p) => {
+            // r102.1: V3D BO probe at BeginSlide entry. Brackets
+            // the slide-change boundary so QA can compare slide-
+            // change delta vs transition-paint delta.
+            crate::v4l2::log_v3d_bos_at_phase("begin_slide_load_entry", Some(p.slide_id));
             // r65 subagent (WARN fix): opportunistically drain
             // stale pending_preloads (e.g. PreloadSlide(A) fired
             // but operator changed playlist before A's slot).
@@ -2894,6 +2905,11 @@ fn handle_inner_request(
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
+            // r102.1: V3D BO probe at BeginTransition entry.
+            // Brackets the transition kick-off so QA can sum
+            // begin->paint_entry->paint_exit deltas across
+            // a single transition.
+            crate::v4l2::log_v3d_bos_at_phase("begin_transition_load_entry", Some(p.to_slide_id));
             // r76 Phase A (2026-06-07): record the begin_transition
             // timestamp so the FIRST successful endpoint_b bake
             // inside paint_and_present_one_transition_frame can

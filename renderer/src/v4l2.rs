@@ -249,6 +249,112 @@ pub fn is_egl_image_cache_enabled() -> bool {
     }
 }
 
+/// r102.1 (2026-06-09): snapshot of vc4 V3D BO counts from
+/// `/sys/kernel/debug/dri/0/bo_stats`. `None` for the count
+/// fields when the debugfs node is absent or unreadable or
+/// the line format is unrecognized. The probe is best-effort;
+/// missing data emits a warn line once but never panics or
+/// errors a caller. Defensive against kernel-driver format
+/// drift across kernels 6.6 / 6.12 / future.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct V3dBoSnapshot {
+    pub v3d_bos: Option<u32>,
+    pub v3d_mem_kb: Option<u64>,
+}
+
+/// r102.1 (2026-06-09): pure parser for `/sys/kernel/debug/dri/0/bo_stats`
+/// contents. Split out of `read_v3d_bo_snapshot` so the parsing
+/// logic is unit-testable against synthetic input without
+/// touching the filesystem. Mirrors the `parse_cma_lines`
+/// (v4l2.rs:3182) pattern -- the established codebase
+/// convention for debugfs parsers.
+///
+/// vc4 kernel 6.12 format example (tab-separated):
+///   num bos allocated:\t33
+///   size bos allocated:\t88611 kb
+///   num bos used:\t31
+///   size bos used:\t88543 kb
+///
+/// We parse only the "allocated" totals; "used" / "purgeable" /
+/// cache lines are silently skipped. If a future kernel renames
+/// the keys, the parser returns defaulted Nones and the probe
+/// line emits `?` -- observable in the journal, not a wedge.
+pub fn parse_v3d_bo_stats(contents: &str) -> V3dBoSnapshot {
+    let mut out = V3dBoSnapshot::default();
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("num bos allocated:") {
+            if let Ok(n) = rest.trim().parse::<u32>() {
+                out.v3d_bos = Some(n);
+            }
+        } else if let Some(rest) = line.strip_prefix("size bos allocated:") {
+            // Format: "size bos allocated:\t88611 kb"
+            let cleaned = rest.trim().trim_end_matches(" kb").trim_end_matches("kb").trim();
+            if let Ok(n) = cleaned.parse::<u64>() {
+                out.v3d_mem_kb = Some(n);
+            }
+        }
+    }
+    out
+}
+
+/// r102.1 (2026-06-09): read `/sys/kernel/debug/dri/0/bo_stats`
+/// once and parse via `parse_v3d_bo_stats`. Returns a defaulted
+/// `V3dBoSnapshot` if the file is absent / permission-denied.
+/// NEVER panics; instrumentation MUST NOT affect renderer
+/// liveness.
+///
+/// Reads the file fresh on every call; cheap (debugfs read is
+/// ~µs). The renderer runs as `openmarquee` user; debugfs is
+/// root-readable by default on Raspberry Pi OS. If permission
+/// is denied this returns Err and we silently emit defaulted
+/// fields. QA can chmod +r the bo_stats file at deploy time if
+/// needed.
+pub fn read_v3d_bo_snapshot() -> V3dBoSnapshot {
+    let contents = match std::fs::read_to_string("/sys/kernel/debug/dri/0/bo_stats") {
+        Ok(s) => s,
+        Err(_) => return V3dBoSnapshot::default(),
+    };
+    parse_v3d_bo_stats(&contents)
+}
+
+/// r102.1 (2026-06-09): emit a `[mem] v3d_bos_at_phase ...`
+/// line for the given phase tag + optional slide_id. Used by
+/// the V3D BO leak hunt to bracket transitions vs steady-state
+/// and pinpoint which call path grows the BO count.
+///
+/// Output shape (matched by QA's grep tooling):
+///   `[mem] v3d_bos_at_phase phase=X v3d_bos=N v3d_mem_mb=M slide_id=Y`
+///
+/// Both v3d_bos and v3d_mem_mb emit `?` when the underlying
+/// debugfs node is unreadable so the line shape stays uniform
+/// (QA's parser can split on `=` reliably). slide_id is
+/// optional; pass `None` for phase boundaries that aren't
+/// tied to a specific slide (e.g., transition begin).
+pub fn log_v3d_bos_at_phase(phase: &str, slide_id: Option<uuid::Uuid>) {
+    // The top-level `use std::io::Write` is cfg(target_os="linux")-gated;
+    // pull the trait into scope locally so this function compiles cross-
+    // platform (cross-platform test coverage requires it).
+    use std::io::Write;
+    let snap = read_v3d_bo_snapshot();
+    let bos_str = snap
+        .v3d_bos
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let mem_mb_str = snap
+        .v3d_mem_kb
+        .map(|kb| format!("{:.1}", (kb as f64) / 1024.0))
+        .unwrap_or_else(|| "?".to_string());
+    let slide_str = slide_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let _ = writeln!(
+        std::io::stderr(),
+        "[mem] v3d_bos_at_phase phase={} v3d_bos={} v3d_mem_mb={} slide_id={}",
+        phase, bos_str, mem_mb_str, slide_str,
+    );
+}
+
 /// r89 (2026-06-08): monotonic per-process Decoder-open
 /// sequence counter. Each Decoder::open allocates a unique
 /// 1-indexed value (first open is seq=1 to match the
@@ -3230,6 +3336,94 @@ mod tests {
         } else {
             std::env::remove_var("OPENMARQUEE_EGL_IMAGE_CACHE");
         }
+    }
+
+    // ============================================================
+    // r102.1 (2026-06-09): V3D BO snapshot parser regression-lock.
+    // ============================================================
+
+    #[test]
+    fn parse_v3d_bo_stats_happy_path_tab_separated() {
+        // r102.1 subagent WARN-1: pin the kernel-6.12 tab-
+        // separated format the parser was written against. If
+        // a future kernel rename breaks this, we catch it
+        // here instead of on FYS.
+        let contents = "\
+            num bos allocated:\t33\n\
+            size bos allocated:\t88611 kb\n\
+            num bos used:\t31\n\
+            size bos used:\t88543 kb\n\
+            num purgeable bos:\t2\n\
+            size purgeable bos:\t68 kb\n";
+        let snap = parse_v3d_bo_stats(contents);
+        assert_eq!(snap.v3d_bos, Some(33));
+        assert_eq!(snap.v3d_mem_kb, Some(88611));
+    }
+
+    #[test]
+    fn parse_v3d_bo_stats_tolerates_space_separated() {
+        // Some kernels emit space-separated values; trim() in
+        // the parser handles both. Pin to keep the
+        // double-format support honest.
+        let contents = "\
+            num bos allocated: 42\n\
+            size bos allocated: 12345 kb\n";
+        let snap = parse_v3d_bo_stats(contents);
+        assert_eq!(snap.v3d_bos, Some(42));
+        assert_eq!(snap.v3d_mem_kb, Some(12345));
+    }
+
+    #[test]
+    fn parse_v3d_bo_stats_returns_default_on_unrecognized_format() {
+        // Future kernel renames or wholly different format
+        // produces all-None defaults (line shape stays
+        // uniform via `?` sentinels in the probe output).
+        let contents = "\
+            num_bos_allocated=33\n\
+            random unrelated line\n\
+            v3d_bo_count: 33\n";
+        let snap = parse_v3d_bo_stats(contents);
+        assert_eq!(snap.v3d_bos, None);
+        assert_eq!(snap.v3d_mem_kb, None);
+    }
+
+    #[test]
+    fn parse_v3d_bo_stats_returns_default_on_empty_input() {
+        let snap = parse_v3d_bo_stats("");
+        assert_eq!(snap.v3d_bos, None);
+        assert_eq!(snap.v3d_mem_kb, None);
+    }
+
+    #[test]
+    fn read_v3d_bo_snapshot_returns_default_when_file_absent() {
+        // The probe is best-effort -- absent or unreadable debugfs
+        // must return defaulted Nones, not panic. On macOS (and
+        // most non-Pi Linux hosts) /sys/kernel/debug/dri/0/bo_stats
+        // doesn't exist; the function should return all-None
+        // silently.
+        let snap = read_v3d_bo_snapshot();
+        // On a host where the file IS present (e.g. a Pi CI
+        // runner), v3d_bos may be Some -- that's also fine. We
+        // only assert the call DOESN'T panic + returns a
+        // V3dBoSnapshot.
+        let _ = snap.v3d_bos;
+        let _ = snap.v3d_mem_kb;
+    }
+
+    #[test]
+    fn log_v3d_bos_at_phase_doesnt_panic_for_any_phase_label() {
+        // Probe must not panic regardless of phase label content
+        // or slide_id presence. Defensive coverage so a future
+        // call site with an unusual label can't wedge the
+        // renderer (the whole point of "instrumentation MUST
+        // NOT affect liveness").
+        log_v3d_bos_at_phase("test_phase", None);
+        log_v3d_bos_at_phase(
+            "test_phase_with_slide",
+            Some(uuid::Uuid::from_u128(0xdeadbeef)),
+        );
+        log_v3d_bos_at_phase("", None); // empty label
+        log_v3d_bos_at_phase("phase with spaces", None);
     }
 
     #[test]

@@ -4767,6 +4767,23 @@ pub fn paint_and_present_one_transition_frame(
     progress: f32,
 ) -> Result<()> {
     use glow::HasContext;
+    // r102.1 (2026-06-09): V3D BO leak probe. Throttle to FIRST
+    // and LAST tick of each transition so QA can bracket the
+    // transition's BO delta without log-volume blowup. First-tick
+    // detection: progress < ~0.05 (~2 ticks of 45 at 30fps × 1.5s).
+    // Last-tick detection: progress > ~0.95 (~2 ticks). Other
+    // ticks skip the probe.
+    //
+    // r102.1 subagent WARN-2: thresholds assume 1.0-1.5s
+    // transitions at 30fps (the canonical config today). For
+    // SHORTER transitions (e.g. 0.3s = 9 ticks → 0.111/tick), the
+    // entry threshold still fires on tick 0 but the exit
+    // threshold may not fire at all if the last tick lands at
+    // 0.889 < 0.95. QA's bracket-delta math degrades gracefully
+    // (missing exit biases the per-transition delta high) but
+    // doesn't wedge. If a future feature ships transitions
+    // <0.5s, replace this gate with a tick-counter on
+    // EglSession.
     let fs = match fs_for_transition_kind(kind) {
         Some(s) => s,
         None => {
@@ -5356,6 +5373,12 @@ pub fn paint_and_present_one_transition_frame(
     session.scanout_prev_bo = session.scanout_current_bo.take();
     session.scanout_current_bo = Some(new_bo);
     session.scanout_current_fb = Some(new_fb);
+    // r102.1: last-tick probe. progress > 0.95 catches the final
+    // 2-3 ticks; QA sums the entry/exit delta across N transitions
+    // to confirm or refute candidate #1.
+    if progress > 0.95 {
+        crate::v4l2::log_v3d_bos_at_phase("transition_paint_exit", None);
+    }
     Ok(())
 }
 
