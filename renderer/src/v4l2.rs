@@ -441,6 +441,56 @@ pub fn read_v3d_bo_snapshot() -> V3dBoSnapshot {
     snap
 }
 
+/// r103.1 (2026-06-09): throttle helper for the steady-state
+/// video-paint probe. Emits on the FIRST paint of a decoder's
+/// lifetime (count==1) and every 30 paints after (1 sec at
+/// 30fps). Split out as a pure fn so the policy is unit-
+/// testable.
+///
+/// `count` is `frames_decoded` AFTER the increment for the
+/// current paint. count==0 means the paint produced no frame
+/// (Ok(None) skip) and the probe is skipped.
+pub fn should_emit_steady_state_video_probe(count: usize) -> bool {
+    count == 1 || (count > 0 && count % 30 == 0)
+}
+
+/// r103.1 (2026-06-09): emit a `[mem] v3d_bos_at_phase ...` line
+/// with an additional `path=` tag identifying the video paint
+/// transport (DMABUF vs MMAP). Differentiates the DMABUF-cache
+/// hit pattern from the MMAP fall-through pattern so QA can
+/// pinpoint which branch contributes to the residual V3D leak.
+///
+/// Output shape:
+///   `[mem] v3d_bos_at_phase phase=X v3d_bos=N v3d_mem_mb=M slide_id=Y path=Z`
+///
+/// Sibling to `log_v3d_bos_at_phase` (which omits path=);
+/// non-video phase boundaries should keep using that. Video
+/// paint probes use this one.
+pub fn log_v3d_bos_at_phase_with_path(
+    phase: &str,
+    slide_id: Option<uuid::Uuid>,
+    path: &str,
+) {
+    use std::io::Write;
+    let snap = read_v3d_bo_snapshot();
+    let bos_str = snap
+        .v3d_bos
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let mem_mb_str = snap
+        .v3d_mem_kb
+        .map(|kb| format!("{:.1}", (kb as f64) / 1024.0))
+        .unwrap_or_else(|| "?".to_string());
+    let slide_str = slide_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let _ = writeln!(
+        std::io::stderr(),
+        "[mem] v3d_bos_at_phase phase={} v3d_bos={} v3d_mem_mb={} slide_id={} path={}",
+        phase, bos_str, mem_mb_str, slide_str, path,
+    );
+}
+
 /// r102.1 (2026-06-09): emit a `[mem] v3d_bos_at_phase ...`
 /// line for the given phase tag + optional slide_id. Used by
 /// the V3D BO leak hunt to bracket transitions vs steady-state
@@ -3649,6 +3699,37 @@ mod tests {
             src.contains("egl_image_destroy_exit"),
             "r101.1 instrumentation missing: per-handle exit probe `egl_image_destroy_exit`",
         );
+    }
+
+    #[test]
+    fn should_emit_steady_state_video_probe_throttle() {
+        // r103.1: probe fires on count==1 (first paint of a
+        // decoder's lifetime, i.e. start of a slide-hold) AND
+        // every 30 paints thereafter (~1 sec at 30fps).
+        // count==0 means Ok(None) skip (no frame ready) and
+        // MUST be silent so QA's grep doesn't see noise from
+        // warmup ticks.
+        assert!(!should_emit_steady_state_video_probe(0), "count=0 (skip) must NOT emit");
+        assert!(should_emit_steady_state_video_probe(1), "count=1 (first paint) MUST emit");
+        for n in 2..30 {
+            assert!(
+                !should_emit_steady_state_video_probe(n),
+                "count={n} (mid-second) must NOT emit",
+            );
+        }
+        for k in 1..5 {
+            let n = 30 * k;
+            assert!(
+                should_emit_steady_state_video_probe(n),
+                "count={n} (every 30 paints, ~{}s into hold) MUST emit",
+                k,
+            );
+            assert!(
+                !should_emit_steady_state_video_probe(n + 1),
+                "count={} (just after a 30-mark) must NOT emit",
+                n + 1,
+            );
+        }
     }
 
     #[test]

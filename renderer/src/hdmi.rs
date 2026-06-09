@@ -8237,6 +8237,21 @@ unsafe fn bake_video_slide_to_current_fbo(
             // advance would starve the codec of CAPTURE buffers.
             drop(frame);
             *frames_decoded += 1;
+            // r103.1: steady-state video-paint probe. Throttle to
+            // first paint of decoder lifetime (count==1) + every
+            // 30 paints (~1 sec at 30fps). Tag path=DMABUF so QA
+            // can verify the DMABUF branch is the active one and
+            // measure the per-second V3D delta during a slide-
+            // hold (i.e. BETWEEN transitions, where existing
+            // probes don't reach).
+            if crate::v4l2::should_emit_steady_state_video_probe(*frames_decoded) {
+                let phase = if *frames_decoded == 1 {
+                    "steady_state_video_paint_first"
+                } else {
+                    "steady_state_video_paint_after_N"
+                };
+                crate::v4l2::log_v3d_bos_at_phase_with_path(phase, None, "DMABUF");
+            }
             return Ok(Some("DMABUF"));
         }
         // DMABUF fall-through: don't record shader since we didn't
@@ -8350,6 +8365,19 @@ unsafe fn bake_video_slide_to_current_fbo(
     // advance starves the codec of CAPTURE buffers.
     drop(frame);
     *frames_decoded += 1;
+    // r103.1: steady-state video-paint probe, MMAP twin of the
+    // DMABUF probe above. If MMAP runs at ALL on FYS 720p
+    // single-video this is what proves it; the path=MMAP tag in
+    // the journal answers "does the leak source live in the
+    // MMAP fall-through pattern" directly.
+    if crate::v4l2::should_emit_steady_state_video_probe(*frames_decoded) {
+        let phase = if *frames_decoded == 1 {
+            "steady_state_video_paint_first"
+        } else {
+            "steady_state_video_paint_after_N"
+        };
+        crate::v4l2::log_v3d_bos_at_phase_with_path(phase, None, "MMAP");
+    }
     Ok(Some("MMAP"))
 }
 
