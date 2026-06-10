@@ -373,6 +373,14 @@ pub struct EglSession<'a> {
     /// content only when content actually exists.
     transition_fbo_a_painted: bool,
     transition_fbo_b_painted: bool,
+    /// r109 (2026-06-10): last `progress` value passed to
+    /// `paint_and_present_one_transition_frame`. Used to detect
+    /// transition boundaries threshold-independently: within a
+    /// single transition, `progress` monotonically increases
+    /// from ~0 to ~1; the FIRST tick of a NEW transition has
+    /// `progress < last_transition_progress`. Initialized to
+    /// 1.0 so the very first call detects as new-transition.
+    last_transition_progress: f32,
     /// STREAM/VLC slice-9 follow-up: persistent texture for the
     /// external-frame push-paint path. Allocated once with
     /// glTexImage2D and thereafter updated in place with
@@ -738,6 +746,7 @@ where
         transition_fbo_dims: None,
         transition_fbo_a_painted: false,
         transition_fbo_b_painted: false,
+        last_transition_progress: 1.0,
         external_frame_tex: None,
         external_nv12_tex: None,
         current_settings: crate::content::Settings::default(),
@@ -4853,6 +4862,24 @@ pub fn paint_and_present_one_transition_frame(
     if progress < 0.20 {
         crate::v4l2::log_v3d_bos_at_phase("transition_paint_entry", None);
     }
+    // r109 (2026-06-10) subagent BLOCKER-1 fix: detect new-
+    // transition threshold-independently. Within a single
+    // transition, `progress` monotonically increases from ~0 to
+    // ~1; the first tick of a NEW transition has `progress <
+    // last_transition_progress`. Reset the per-side painted
+    // flags so the bake_b priming retries fire at the start of
+    // each transition, regardless of the product's
+    // transition_ms default (500ms → first tick progress ≈
+    // 0.066, which a `progress < 0.05` trigger would miss).
+    if progress < session.last_transition_progress {
+        session.transition_fbo_a_painted = false;
+        session.transition_fbo_b_painted = false;
+        eprintln!(
+            "[perf] r109_new_transition_detected prev_progress={:.3} cur_progress={:.3}",
+            session.last_transition_progress, progress,
+        );
+    }
+    session.last_transition_progress = progress;
     let fs = match fs_for_transition_kind(kind) {
         Some(s) => s,
         None => {
@@ -5346,7 +5373,33 @@ pub fn paint_and_present_one_transition_frame(
                     // kernel state.
                     let decouple_enabled_local =
                         crate::v4l2::is_feed_drain_decouple_enabled();
-                    if !decouple_enabled_local
+                    // r109 (2026-06-10): break the chicken-and-
+                    // egg deadlock. The reuse-cached-b path below
+                    // requires `session.transition_fbo_b_painted
+                    // == true`, which is ONLY set on a successful
+                    // `Ok(Some(p))` bake_b. Under dual-1080p VPU
+                    // contention bake_b's non-blocking single
+                    // attempt returns Ok(None) every tick (codec
+                    // serving bake_a). r106 disabled Path B
+                    // retries under decouple ON, so bake_b NEVER
+                    // succeeded → painted stayed false forever →
+                    // reuse never engaged → every tick returned
+                    // Ok(false) → composite never ran. No iris
+                    // visible on the glass for the full 1.5s
+                    // transition window.
+                    //
+                    // r109 fix: allow Path B blocking retries
+                    // when EITHER (a) decouple is OFF (pre-r106
+                    // preserved) OR (b) the cache hasn't been
+                    // painted yet for THIS transition (priming).
+                    // The `_painted` flag is reset at function
+                    // entry on new-transition detection, so
+                    // trigger (b) carries the priming + stale-
+                    // content defense at every transition
+                    // boundary, threshold-independently.
+                    let need_blocking_retries = !decouple_enabled_local
+                        || !session.transition_fbo_b_painted;
+                    if need_blocking_retries
                         && deadline_ok
                         && iter_ok
                         && samples_remaining_ok
@@ -16018,6 +16071,57 @@ mod r102_2_tests {
             "r106: expected >=2 reset sites for transition_fbo_a_painted \
              (dim-change + fresh-alloc), found {}",
             src.matches("transition_fbo_a_painted = false").count(),
+        );
+    }
+
+    #[test]
+    fn r109_bake_b_priming_retries_and_new_transition_reset_present() {
+        // r109 (2026-06-10): pin the chicken-and-egg deadlock
+        // fix surface. Three regression hazards a future
+        // refactor could re-introduce:
+        //   1. Drop the `!session.transition_fbo_b_painted`
+        //      term from `need_blocking_retries` → bake_b
+        //      never gets priming retries → dual-1080p
+        //      transitions wedge invisibly.
+        //   2. Drop the new-transition-detection reset at
+        //      paint_and_present_one_transition_frame entry →
+        //      `_painted` flags stay sticky across transitions
+        //      → second transition reuses prior-B content.
+        //   3. Drop the `last_transition_progress` field on
+        //      EglSession → no way to detect new transitions.
+        let src = include_str!("hdmi.rs");
+        assert!(
+            src.contains("need_blocking_retries"),
+            "r109: missing `need_blocking_retries` binding in \
+             bake_b Path B retry block. Without it the deadlock \
+             returns and dual-1080p transitions go invisible.",
+        );
+        assert!(
+            src.contains("!session.transition_fbo_b_painted"),
+            "r109: missing `!session.transition_fbo_b_painted` \
+             priming trigger in `need_blocking_retries`. The \
+             reuse path requires painted=true; without priming \
+             retries the flag never sets and the deadlock returns.",
+        );
+        assert!(
+            src.contains("last_transition_progress"),
+            "r109: missing `last_transition_progress` field on \
+             EglSession -- no way to detect new transitions \
+             threshold-independently.",
+        );
+        assert!(
+            src.contains("r109_new_transition_detected"),
+            "r109: missing new-transition-detected probe at \
+             paint_and_present_one_transition_frame entry. \
+             Without it the painted flags stay sticky across \
+             transitions and trigger (b) can't carry the stale-\
+             content defense.",
+        );
+        assert!(
+            src.contains("trigger=") && src.contains("\"priming\""),
+            "r109 subagent WARN-3: missing trigger= tag on \
+             bake_b_poll_outcome. QA needs to distinguish \
+             decouple_off vs priming retries in journal.",
         );
     }
 
