@@ -181,6 +181,36 @@ pub fn should_defer_preload_for_codec_contention(
     active_decoder_count >= 1 && bg_is_video
 }
 
+/// r104 (2026-06-09): pure-logic predicate for the
+/// BeginTransition serialization gate. Returns `Some(from_dec_id)`
+/// when the outgoing slide's bg-video decoder MUST be evicted
+/// before the incoming slide's bg-video decoder is primed.
+/// Returns `None` when NO eviction should fire (either side
+/// has no video bg, both sides share the same bg id, or
+/// serialization is disabled).
+///
+/// Pure function for unit-testability; the production caller in
+/// the BeginTransition handler passes the env-helper result for
+/// `serialize_enabled`.
+pub fn serialization_eviction_target(
+    serialize_enabled: bool,
+    from_bg_id: Option<uuid::Uuid>,
+    to_bg_id: Option<uuid::Uuid>,
+) -> Option<uuid::Uuid> {
+    if !serialize_enabled {
+        return None;
+    }
+    let from = from_bg_id?;
+    let to = to_bg_id?;
+    if from == to {
+        // Same-bg-video on both sides: a single decoder serves
+        // both. Don't evict (the paint side already routes both
+        // endpoints to the shared decoder).
+        return None;
+    }
+    Some(from)
+}
+
 /// r98 (2026-06-09): preload scheduling mode, set via
 /// `OPENMARQUEE_PRELOAD_MODE` env var. Three modes — see
 /// `parse_preload_mode` for parsing semantics and
@@ -700,6 +730,47 @@ impl SlideCache {
         // delta.
         #[cfg(target_os = "linux")]
         crate::v4l2::log_v3d_bos_at_phase("evict_other_video_state_exit", None);
+    }
+
+    /// r104 (2026-06-09): targeted single-decoder eviction for video
+    /// decoder serialization. Drops `cache.video_decoders[dec_id]`
+    /// and `cache.video_demuxers[dec_id]` (if present) so the
+    /// bcm2835-codec firmware sees exactly ONE decoder at a time on
+    /// Pi Zero 2 W (single-VPU hardware ceiling for concurrent
+    /// 1080p H.264 streams).
+    ///
+    /// Distinct from `evict_other_video_state` which keeps a slice
+    /// of ids; this is the surgical "drop THIS specific bg-decoder"
+    /// op called from the BeginTransition handler when both
+    /// endpoints carry video bgs.
+    ///
+    /// `cache.items` is NOT touched -- the slide's ContentItem
+    /// stays in the LRU because the paint side will treat it as a
+    /// Text-only endpoint for the transition window (handled in
+    /// the endpoint construction path).
+    ///
+    /// Synchronous: dropping the VideoDecoderState fires
+    /// DecoderInner::Drop which STREAMOFFs both queues + closes
+    /// the V4L2 fd. Returns the number of decoders actually
+    /// dropped (0 or 1) so the caller can emit a per-call probe
+    /// line.
+    #[cfg(target_os = "linux")]
+    fn evict_video_decoder_for_serialization(&mut self, dec_id: uuid::Uuid) -> usize {
+        let had_decoder = self.video_decoders.remove(&dec_id).is_some();
+        let had_demuxer = self.video_demuxers.remove(&dec_id).is_some();
+        // The demuxer is cheap to recreate from cache.load, but
+        // dropping it here keeps the pair consistent so a future
+        // BeginSlide for this id doesn't end up in a half-loaded
+        // state.
+        if had_decoder || had_demuxer {
+            eprintln!(
+                "[perf] video_decoder_serialization_evict dec_id={} dropped_decoder={} dropped_demuxer={}",
+                dec_id, had_decoder, had_demuxer,
+            );
+            1
+        } else {
+            0
+        }
     }
 
     /// r46 (2026-06-02): when `item_id` is a TextSlide with
@@ -2496,16 +2567,38 @@ fn run_paint_hook(
             // 'b' kind, it's keyed by the TextSlide's
             // background_video_slide_id. Other kinds: None (no
             // decoder needed).
-            let from_dec_id: Option<uuid::Uuid> = match cache.items.peek(&from_id) {
+            let from_dec_id_raw: Option<uuid::Uuid> = match cache.items.peek(&from_id) {
                 Some(ContentItem::Text(s)) => s.background_video_slide_id,
                 Some(ContentItem::Video(_)) => Some(from_id),
                 _ => None,
             };
-            let to_dec_id: Option<uuid::Uuid> = match cache.items.peek(&to_id) {
+            let to_dec_id_raw: Option<uuid::Uuid> = match cache.items.peek(&to_id) {
                 Some(ContentItem::Text(s)) => s.background_video_slide_id,
                 Some(ContentItem::Video(_)) => Some(to_id),
                 _ => None,
             };
+            // r104: when the BeginTransition serialization gate
+            // dropped from-side's bg decoder, the ContentItem still
+            // carries `background_video_slide_id` but
+            // cache.video_decoders no longer has the entry. Filter
+            // the raw id through `cache.video_decoders.contains_key`
+            // so the paint-side endpoint resolves to Text instead
+            // of erroring out. The to-side is the just-primed
+            // decoder so its raw id is always present; the same
+            // filter applies symmetrically as defense-in-depth.
+            //
+            // Without serialization enabled (kill-switch =off), this
+            // filter is still applied -- it's strictly more
+            // permissive than the pre-r104 hard-error path and
+            // matches the semantics of "if the decoder is gone, the
+            // bg is gone for this paint." Pre-r104 callers never
+            // hit the soft path because the only way a decoder
+            // could be missing was a logic bug; r104 makes the soft
+            // path the canonical recovery.
+            let from_dec_id = from_dec_id_raw
+                .filter(|id| cache.video_decoders.contains_key(id));
+            let to_dec_id = to_dec_id_raw
+                .filter(|id| cache.video_decoders.contains_key(id));
 
             // Same-decoder transitions would need two &mut to the
             // same `VideoDecoderState` entry — impossible in safe
@@ -2661,30 +2754,37 @@ fn run_paint_hook(
             cache.items.get(&to_id);
             let endpoint_a = match cache.items.peek(&from_id) {
                 Some(ContentItem::Text(s)) => {
-                    if let Some(bg_id) = s.background_video_slide_id {
-                        // r50: text-over-video. Decoder lookup id
-                        // = bg_id (the referenced VideoSlide), NOT
-                        // the text slide id. Demuxer also keyed by
-                        // bg_id.
-                        let demuxer = match cache.video_demuxers.get(&bg_id) {
-                            Some(d) => d,
-                            None => return err(format!(
-                                "paint_transition: from text-over-video bg demuxer {bg_id} missing \
-                                 (text slide {from_id} background_video_slide_id)",
-                            )),
-                        };
-                        let dec_state = from_dec_state
-                            .take()
-                            .expect("from_dec_state set above for 'b' kind");
-                        hdmi::TransitionEndpoint::TextOverVideo {
-                            text_slide: s,
-                            bg_samples: demuxer.samples.as_slice(),
-                            bg_next_sample_idx: &mut dec_state.next_sample_idx,
-                            bg_frames_decoded: &mut dec_state.frames_decoded,
-                            bg_decoder: &dec_state.decoder,
+                    // r104: pre-r104 this branch unconditionally
+                    // resolved bg_video_id into a TextOverVideo
+                    // endpoint + asserted from_dec_state.is_some()
+                    // via `.expect(...)`. r104's BeginTransition
+                    // serialization gate may have evicted the bg
+                    // decoder; in that case from_dec_state is None
+                    // and the slide must paint as Text (no video
+                    // bg) for the transition window. The bg
+                    // returns on the next BeginSlide cycle.
+                    //
+                    // Gate the TextOverVideo arm on BOTH
+                    // background_video_slide_id being set AND
+                    // from_dec_state being Some. The demuxer is
+                    // also dropped by the eviction so the same
+                    // is_some() check covers it.
+                    let video_bg_resolved = s
+                        .background_video_slide_id
+                        .and_then(|bg_id| {
+                            cache.video_demuxers.get(&bg_id).map(|d| (bg_id, d))
+                        });
+                    match (video_bg_resolved, from_dec_state.take()) {
+                        (Some((_bg_id, demuxer)), Some(dec_state)) => {
+                            hdmi::TransitionEndpoint::TextOverVideo {
+                                text_slide: s,
+                                bg_samples: demuxer.samples.as_slice(),
+                                bg_next_sample_idx: &mut dec_state.next_sample_idx,
+                                bg_frames_decoded: &mut dec_state.frames_decoded,
+                                bg_decoder: &dec_state.decoder,
+                            }
                         }
-                    } else {
-                        hdmi::TransitionEndpoint::Text(s)
+                        _ => hdmi::TransitionEndpoint::Text(s),
                     }
                 }
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
@@ -2708,26 +2808,28 @@ fn run_paint_hook(
             };
             let endpoint_b = match cache.items.peek(&to_id) {
                 Some(ContentItem::Text(s)) => {
-                    if let Some(bg_id) = s.background_video_slide_id {
-                        let demuxer = match cache.video_demuxers.get(&bg_id) {
-                            Some(d) => d,
-                            None => return err(format!(
-                                "paint_transition: to text-over-video bg demuxer {bg_id} missing \
-                                 (text slide {to_id} background_video_slide_id)",
-                            )),
-                        };
-                        let dec_state = to_dec_state
-                            .take()
-                            .expect("to_dec_state set above for 'b' kind");
-                        hdmi::TransitionEndpoint::TextOverVideo {
-                            text_slide: s,
-                            bg_samples: demuxer.samples.as_slice(),
-                            bg_next_sample_idx: &mut dec_state.next_sample_idx,
-                            bg_frames_decoded: &mut dec_state.frames_decoded,
-                            bg_decoder: &dec_state.decoder,
+                    // r104: same soft-fallback shape as endpoint_a
+                    // above. The to-side's bg decoder is typically
+                    // the just-primed one so this path is exercised
+                    // by either a serialization-related race or a
+                    // pre-existing bug; either way Text-only is
+                    // safer than a paint_transition wedge.
+                    let video_bg_resolved = s
+                        .background_video_slide_id
+                        .and_then(|bg_id| {
+                            cache.video_demuxers.get(&bg_id).map(|d| (bg_id, d))
+                        });
+                    match (video_bg_resolved, to_dec_state.take()) {
+                        (Some((_bg_id, demuxer)), Some(dec_state)) => {
+                            hdmi::TransitionEndpoint::TextOverVideo {
+                                text_slide: s,
+                                bg_samples: demuxer.samples.as_slice(),
+                                bg_next_sample_idx: &mut dec_state.next_sample_idx,
+                                bg_frames_decoded: &mut dec_state.frames_decoded,
+                                bg_decoder: &dec_state.decoder,
+                            }
                         }
-                    } else {
-                        hdmi::TransitionEndpoint::Text(s)
+                        _ => hdmi::TransitionEndpoint::Text(s),
                     }
                 }
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
@@ -2923,6 +3025,84 @@ fn handle_inner_request(
             crate::hdmi_logic::record_transition_begin_for_endpoint_b_metric(
                 from_id_for_metric, p.to_slide_id,
             );
+            // r104 (2026-06-09): video-decoder serialization for
+            // Pi Zero 2 W's single bcm2835-codec VPU. When BOTH
+            // endpoints carry bg-video AND the bg ids differ,
+            // force STREAMOFF + close of the outgoing decoder
+            // BEFORE the to-slide cache.load primes the incoming
+            // one. At most ONE video decoder exists at a time on
+            // the firmware-side codec scheduler.
+            //
+            // Visible cost: ~150-300 ms blank at transition entry
+            // while decoder #2 primes. The existing FYS bug C skip
+            // path (Path B polling in the bake_b loop) absorbs it;
+            // endpoint A goes Text-only (no video bg) for the
+            // transition window because its decoder is gone --
+            // handled in the endpoint construction below.
+            //
+            // Kill switch: OPENMARQUEE_VIDEO_DECODER_SERIALIZE=off
+            // falls back to the pre-r104 concurrent-decoder
+            // behavior so QA can A/B at deploy time.
+            // r104 subagent BLOCKER-2 fix: scope-narrow the
+            // serialization gate to TEXT-with-bg-video only
+            // (not pure Video::Video slides). The endpoint
+            // construction's Video arm still does
+            // `from_dec_state.take().expect()` which would
+            // panic on a V->V transition after eviction. Pure
+            // V->V keeps the legacy concurrent-decoder
+            // behavior (still wedges on dual-1080p but isn't
+            // the Sanity Check canonical case); follow-up
+            // (r104.1) can extend if pure V->V dual-1080p
+            // becomes the active product surface.
+            #[cfg(target_os = "linux")]
+            let r104_evicted_id: Option<uuid::Uuid> = {
+                let serialize_enabled =
+                    crate::v4l2::is_video_decoder_serialization_enabled();
+                let from_id_for_eviction =
+                    state.current.as_ref().map(|c| c.slide_id);
+                let from_bg_id = from_id_for_eviction.and_then(|id| {
+                    match cache.items.peek(&id) {
+                        Some(ContentItem::Text(s)) => s.background_video_slide_id,
+                        _ => None,
+                    }
+                });
+                let to_bg_id = match cache.items.peek(&p.to_slide_id) {
+                    Some(ContentItem::Text(s)) => s.background_video_slide_id,
+                    _ => None,
+                };
+                if let Some(evict_id) = serialization_eviction_target(
+                    serialize_enabled, from_bg_id, to_bg_id,
+                ) {
+                    let t_evict = std::time::Instant::now();
+                    let dropped =
+                        cache.evict_video_decoder_for_serialization(evict_id);
+                    // r104 subagent WARN-5 fix: format Option<Uuid>
+                    // as `UUID|none` (the established slide_id=
+                    // pattern) instead of Debug-style
+                    // `Some(UUID)|None` so QA's `=`-split parser
+                    // sees uniform key=value pairs.
+                    let from_bg_str = from_bg_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    let to_bg_str = to_bg_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_string());
+                    eprintln!(
+                        "[perf] begin_transition_serialization \
+                         evict_id={} dropped={} elapsed_us={} from_bg={} to_bg={}",
+                        evict_id,
+                        dropped,
+                        t_evict.elapsed().as_micros(),
+                        from_bg_str,
+                        to_bg_str,
+                    );
+                    Some(evict_id)
+                } else {
+                    None
+                }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let r104_evicted_id: Option<uuid::Uuid> = None;
             // r65 (2026-06-05): join any in-flight async preload
             // for the to-slide BEFORE cache.load so the load
             // short-circuits on the artifacts the worker
@@ -2954,9 +3134,22 @@ fn handle_inner_request(
             // The from-slide id comes from PlaybackState.current
             // (begin_transition itself derives it the same way and
             // errors below if there's no current slide).
-            if let Some(from_id) = state.current.as_ref().map(|c| c.slide_id) {
-                if let Err(e) = cache.load(content_root, from_id) {
-                    return err(format!("begin_transition load failed: {e:#}"));
+            //
+            // r104 subagent BLOCKER-1 fix: SKIP this re-prime when
+            // r104 just evicted the from-side bg decoder. `cache.
+            // load` would recursively re-prime the just-dropped
+            // decoder via the TextOverVideo bg-id chase, defeating
+            // the entire serialization gate. The paint path no
+            // longer hard-errors on missing decoder (r104's
+            // endpoint construction soft-falls back to Text), so
+            // M1's defensive re-prime is unnecessary when r104
+            // fired. Without r104 (kill switch =off) the re-prime
+            // still runs for pre-r104 correctness.
+            if r104_evicted_id.is_none() {
+                if let Some(from_id) = state.current.as_ref().map(|c| c.slide_id) {
+                    if let Err(e) = cache.load(content_root, from_id) {
+                        return err(format!("begin_transition load failed: {e:#}"));
+                    }
                 }
             }
             // Bug 8 / Fix A: same skip-marker check as BeginSlide,
@@ -3341,6 +3534,151 @@ mod tests {
         IpcResponse, OpResult,
     };
     use uuid::Uuid;
+
+    // ============================================================
+    // r104 (2026-06-09): video-decoder serialization predicate
+    // tests. Pure-logic surface; production paint side is heavy
+    // (V4L2 + GL) so the unit tests pin the gate function shape.
+    // ============================================================
+
+    #[test]
+    fn r104_serialization_evicts_when_both_endpoints_have_distinct_video_bgs() {
+        let bg_a = Uuid::from_u128(0xa);
+        let bg_b = Uuid::from_u128(0xb);
+        assert_eq!(
+            serialization_eviction_target(true, Some(bg_a), Some(bg_b)),
+            Some(bg_a),
+            "both-video-bg case must evict the FROM-side decoder",
+        );
+    }
+
+    #[test]
+    fn r104_serialization_skips_when_kill_switch_off() {
+        let bg_a = Uuid::from_u128(0xa);
+        let bg_b = Uuid::from_u128(0xb);
+        assert_eq!(
+            serialization_eviction_target(false, Some(bg_a), Some(bg_b)),
+            None,
+            "kill switch OFF must skip eviction (pre-r104 behavior)",
+        );
+    }
+
+    #[test]
+    fn r104_serialization_keeps_decoder_when_from_is_solid_bg() {
+        // QA mandated test #2: single-video + solid keeps decoder
+        // open across solid (no force-evict).
+        let bg_b = Uuid::from_u128(0xb);
+        assert_eq!(
+            serialization_eviction_target(true, None, Some(bg_b)),
+            None,
+            "from-side without bg-video must NOT trigger eviction",
+        );
+    }
+
+    #[test]
+    fn r104_serialization_keeps_decoder_when_to_is_solid_bg() {
+        // Mirror case: video-bg → solid-bg transition. Outgoing
+        // decoder stays open (it's still the active one when the
+        // playlist returns to it on cycle).
+        let bg_a = Uuid::from_u128(0xa);
+        assert_eq!(
+            serialization_eviction_target(true, Some(bg_a), None),
+            None,
+            "to-side without bg-video must NOT trigger eviction",
+        );
+    }
+
+    #[test]
+    fn r104_serialization_skips_when_same_bg_video_on_both_sides() {
+        // Same-bg-id case: a single decoder serves both. r50's
+        // shared-bg-video path; do NOT evict (would kill the
+        // active steady-state).
+        let bg = Uuid::from_u128(0xa);
+        assert_eq!(
+            serialization_eviction_target(true, Some(bg), Some(bg)),
+            None,
+            "same bg-video on both sides must NOT trigger eviction",
+        );
+    }
+
+    #[test]
+    fn r104_serialization_no_op_when_neither_side_has_bg_video() {
+        // text/text transitions (no bg video at all) shouldn't
+        // touch the decoder state.
+        assert_eq!(
+            serialization_eviction_target(true, None, None),
+            None,
+        );
+    }
+
+    #[test]
+    fn r104_m1_reprime_skipped_when_serialization_evicted_from_decoder() {
+        // r104 subagent BLOCKER-1 regression-lock: the M1
+        // (Hardening C3) re-prime at the bottom of the
+        // BeginTransition handler calls `cache.load(from_id)`
+        // which recursively re-primes the just-evicted from-side
+        // bg decoder via the TextOverVideo bg-id chase. Without
+        // gating, r104's eviction is immediately undone and the
+        // dual-1080p wedge persists. Pin that the re-prime is
+        // gated on `r104_evicted_id.is_none()`.
+        let src = include_str!("ipc_main.rs");
+        let handler_start = src
+            .find("IpcRequest::BeginTransition(p) => {")
+            .expect("BeginTransition handler must exist");
+        // The M1 re-prime block contains the comment
+        // "also re-prime the FROM-slide"; find from handler
+        // start so we don't false-match an unrelated load.
+        let m1_marker = src[handler_start..]
+            .find("Hardening C3 / M1")
+            .expect("M1 re-prime block missing");
+        let m1_window = &src[handler_start + m1_marker
+            ..handler_start + m1_marker + 1500];
+        assert!(
+            m1_window.contains("r104_evicted_id.is_none()"),
+            "r104 BLOCKER-1: M1 re-prime block must be gated on \
+             `r104_evicted_id.is_none()` so cache.load doesn't \
+             recursively re-prime the just-evicted from-side bg \
+             decoder. Found window:\n---\n{m1_window}\n---",
+        );
+    }
+
+    #[test]
+    fn r104_serialization_gate_lives_in_begin_transition_handler() {
+        // QA mandated test #3: pin that the serialization gate is
+        // at the BeginTransition entry, not buried in
+        // evict_other_video_state. Source-level regression-lock:
+        // assert the BeginTransition handler call site for the
+        // gate exists between the IpcRequest::BeginTransition(p)
+        // match arm header and the `cache.load(content_root,
+        // p.to_slide_id)` invocation. If a future refactor moves
+        // the gate downstream (e.g. into the paint path), the
+        // ~150-300 ms decoder prime window would land AFTER
+        // BeginTransition responds, racing with the first Advance
+        // tick.
+        let src = include_str!("ipc_main.rs");
+        let handler_start = src
+            .find("IpcRequest::BeginTransition(p) => {")
+            .expect("BeginTransition handler must exist");
+        let cache_load_marker = src[handler_start..]
+            .find("cache.load(content_root, p.to_slide_id)")
+            .expect("cache.load(to_slide_id) must follow the handler entry");
+        let prologue = &src[handler_start..handler_start + cache_load_marker];
+        assert!(
+            prologue.contains("evict_video_decoder_for_serialization"),
+            "r104 serialization gate must call \
+             evict_video_decoder_for_serialization BEFORE \
+             cache.load(to_slide_id) so decoder #1's STREAMOFF \
+             precedes decoder #2's prime on the single-VPU \
+             firmware. Found prologue:\n---\n{prologue}\n---",
+        );
+        assert!(
+            prologue.contains("serialization_eviction_target"),
+            "r104 serialization gate must use the pure-logic \
+             serialization_eviction_target predicate so the gate's \
+             decision is unit-testable independent of the V4L2 \
+             plumbing.",
+        );
+    }
 
     fn uuid(n: u8) -> Uuid {
         Uuid::from_bytes([n; 16])

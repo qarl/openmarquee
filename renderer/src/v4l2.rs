@@ -441,6 +441,33 @@ pub fn read_v3d_bo_snapshot() -> V3dBoSnapshot {
     snap
 }
 
+/// r104 (2026-06-09): runtime kill-switch for video-decoder
+/// serialization. Default ENABLED. Set
+/// `OPENMARQUEE_VIDEO_DECODER_SERIALIZE=off` (or
+/// `0`/`false`/`no`/`disable`/`disabled`) to fall back to the
+/// pre-r104 concurrent-decoder behavior that wedges dual-1080p
+/// on Pi Zero 2 W's single bcm2835-codec VPU.
+///
+/// When enabled, the BeginTransition handler force-evicts the
+/// outgoing slide's bg-video decoder BEFORE priming the
+/// incoming slide's bg-video decoder, so at most ONE video
+/// decoder exists at any time on the firmware-side codec
+/// scheduler. The visible cost is a brief blank (~150-300 ms)
+/// at transition entry while decoder #2 primes; the existing
+/// FYS bug C skip path holds the prior frame gracefully.
+///
+/// Co-located with the other renderer leak-mitigation kill
+/// switches.
+pub fn is_video_decoder_serialization_enabled() -> bool {
+    match std::env::var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE") {
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no" | "disable" | "disabled")
+        }
+        Err(_) => true,
+    }
+}
+
 /// r103.1 (2026-06-09): throttle helper for the steady-state
 /// video-paint probe. Emits on the FIRST paint of a decoder's
 /// lifetime (count==1) and every 30 paints after (1 sec at
@@ -3699,6 +3726,49 @@ mod tests {
             src.contains("egl_image_destroy_exit"),
             "r101.1 instrumentation missing: per-handle exit probe `egl_image_destroy_exit`",
         );
+    }
+
+    #[test]
+    fn is_video_decoder_serialization_enabled_defaults_to_on() {
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE").ok();
+        std::env::remove_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE");
+        assert!(
+            is_video_decoder_serialization_enabled(),
+            "default (env unset) must enable serialization on Pi Zero 2 W",
+        );
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE", v);
+        }
+    }
+
+    #[test]
+    fn is_video_decoder_serialization_enabled_off_values_disable() {
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE").ok();
+        for off in ["0", "off", "false", "no", "disable", "disabled", "OFF"] {
+            std::env::set_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE", off);
+            assert!(
+                !is_video_decoder_serialization_enabled(),
+                "value {off:?} must disable serialization",
+            );
+        }
+        for on in ["1", "on", "yes", "enable", "enabled", "", "garbage"] {
+            std::env::set_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE", on);
+            assert!(
+                is_video_decoder_serialization_enabled(),
+                "value {on:?} must keep serialization enabled (default-on policy)",
+            );
+        }
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE", v);
+        } else {
+            std::env::remove_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE");
+        }
     }
 
     #[test]
