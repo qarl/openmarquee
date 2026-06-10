@@ -3384,13 +3384,37 @@ fn handle_inner_request(
                     p.to_slide_id
                 ));
             }
-            match state.begin_transition(
+            // r104.3 (2026-06-09): instrumentation -- probe right
+            // before state.begin_transition so we confirm we
+            // reached here. r104.2 showed
+            // `begin_transition_serialization` fires 24x but
+            // `paint_transition_entry` never fires -- which means
+            // either state.begin_transition errored (state.pending
+            // stays None -> Advance returns PaintSlide), OR an
+            // err path between the serialization probe and here
+            // intercepted the handler.
+            eprintln!(
+                "[perf] begin_transition_before_state_begin to={} kind={}",
+                p.to_slide_id, p.kind,
+            );
+            let bt_result = state.begin_transition(
                 p.to_slide_id,
                 p.to_duration_ms,
                 &p.kind,
                 p.transition_ms,
                 p.t0_ms,
-            ) {
+            );
+            match &bt_result {
+                Ok(()) => eprintln!(
+                    "[perf] begin_transition_state_ok to={} pending_set=true",
+                    p.to_slide_id,
+                ),
+                Err(e) => eprintln!(
+                    "[perf] begin_transition_state_err to={} err={}",
+                    p.to_slide_id, e,
+                ),
+            }
+            match bt_result {
                 Ok(()) => ok_empty(),
                 Err(e) => err(format!("begin_transition: {e}")),
             }
@@ -3401,6 +3425,35 @@ fn handle_inner_request(
             // actual paint_slide / paint_transition calls that
             // turn the OpResult into pixels-on-screen.
             let cmd = state.advance(p.t_ms);
+            // r104.3 (2026-06-09): probe what state.advance
+            // returned. Tags one of {paint_slide, paint_transition,
+            // slide_complete, idle}. If we see lots of paint_slide
+            // when a transition was just begun, state.pending is
+            // None (BeginTransition never actually called
+            // state.begin_transition). If we see paint_transition,
+            // the issue is downstream in run_paint_hook.
+            let cmd_tag = match &cmd {
+                crate::playback::AdvanceCommand::PaintSlide { .. } => "paint_slide",
+                crate::playback::AdvanceCommand::PaintTransition { .. } => "paint_transition",
+                crate::playback::AdvanceCommand::SlideComplete { .. } => "slide_complete",
+                crate::playback::AdvanceCommand::Idle => "idle",
+            };
+            // Throttle to once per 30 calls (~1 sec) so we don't
+            // drown the journal. Use a thread-local counter.
+            std::thread_local! {
+                static ADVANCE_PROBE_COUNTER: std::cell::Cell<u32> =
+                    const { std::cell::Cell::new(0) };
+            }
+            ADVANCE_PROBE_COUNTER.with(|c| {
+                let n = c.get();
+                if n % 30 == 0 {
+                    eprintln!(
+                        "[perf] advance_outcome cmd={} t_ms={} call_idx={}",
+                        cmd_tag, p.t_ms, n,
+                    );
+                }
+                c.set(n.wrapping_add(1));
+            });
             IpcResponse::Ok {
                 result: advance_command_to_op_result(cmd),
             }
