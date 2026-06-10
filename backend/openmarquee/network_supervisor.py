@@ -665,7 +665,7 @@ class NetworkSupervisor:
             self._last_sta_channel = None
         self._current_ap_channel: int | None = None
         self._current_sta_freq_mhz: int | None = None
-        self.diagnostics.push(
+        self._emit(
             "state_machine",
             "info",
             f"supervisor booted in state={self._state.value} "
@@ -687,6 +687,31 @@ class NetworkSupervisor:
     def snapshot_diagnostics(self) -> list[DiagnosticEvent]:
         return self.diagnostics.snapshot()
 
+    def _emit(self, source: str, severity: str, message: str) -> None:
+        """P1.2-A (2026-06-10): dual-emit helper. Pushes to the
+        diagnostics ring buffer (for the API endpoint) AND emits a
+        parseable line to the Python logger (for journalctl grep
+        during observe-only soak).
+
+        Line shape on the journal:
+            [network-supervisor] source=<src> severity=<sev> message=<msg>
+
+        QA's grep pattern: `journalctl -u openmarquee-backend |
+        grep '\\[network-supervisor\\]'`.
+
+        Severity routing: info -> log.info, warn -> log.warning,
+        error -> log.error. Unknown severities fall through to
+        log.info.
+        """
+        self.diagnostics.push(source, severity, message)
+        line = f"[network-supervisor] source={source} severity={severity} message={message}"
+        if severity == "warn":
+            log.warning(line)
+        elif severity == "error":
+            log.error(line)
+        else:
+            log.info(line)
+
     def apply_event(self, event: SupervisorEvent) -> SupervisorState:
         """Drive the state machine. Records the (event, state-in,
         state-out) tuple in the ring buffer + persists the new state.
@@ -696,7 +721,7 @@ class NetworkSupervisor:
         """
         new_state = next_state(self._state, event, fallback_mutex=self.config.fallback_mutex_mode)
         if new_state is None:
-            self.diagnostics.push(
+            self._emit(
                 "state_machine",
                 "info",
                 f"no transition for event={event.value} from state={self._state.value} (ignored)",
@@ -704,7 +729,7 @@ class NetworkSupervisor:
             return self._state
         prev = self._state
         self._state = new_state
-        self.diagnostics.push(
+        self._emit(
             "state_machine",
             "info",
             f"transition {prev.value} -> {new_state.value} on event={event.value}",
@@ -722,7 +747,11 @@ class NetworkSupervisor:
         if chan is not None:
             self._last_sta_channel = chan
         decision = decide_channel_follow(freq_mhz, self._current_ap_channel, fallback_channel=6)
-        self.diagnostics.push(
+        # P1.2-A: emit channel-follow decisions to the journal as
+        # well as the ring buffer. QA reads these during the
+        # observe-only soak to validate the decisions against
+        # journalctl reality before greenlighting the take-over.
+        self._emit(
             "channel_follow",
             "info",
             f"sta_freq_mhz={freq_mhz} sta_channel={chan} "
@@ -735,14 +764,19 @@ class NetworkSupervisor:
         return decision
 
     def _default_actuator(self, decision: ChannelFollowDecision) -> None:
-        """Default channel-follow actuator: log only. Follow-up
-        commit wires this to actual hostapd-config rewrite + restart.
-        Kept as a strategy slot so tests can inject a recorder.
+        """Default channel-follow actuator: log only. P1.2-A keeps
+        this as the OBSERVE-ONLY actuator — no subprocess + no
+        hostapd config rewrite. P1.2-B's take-over commit wires
+        this to actual hostapd-config rewrite + restart.
+
+        The dual-emit makes the would-have-done decision visible in
+        journalctl so QA can validate it BEFORE the take-over
+        actuator goes active.
         """
-        self.diagnostics.push(
+        self._emit(
             "channel_follow",
             "info",
-            f"actuator (P1.1 stub): would regenerate hostapd.conf "
+            f"actuator (observe-only): would regenerate hostapd.conf "
             f"channel={decision.target_channel} + restart hostapd "
             f"(reason={decision.reason})",
         )
@@ -769,18 +803,21 @@ class NetworkSupervisor:
     # ----- FastAPI lifecycle hooks -----
 
     async def lifespan_start(self) -> None:
-        """Called from FastAPI's lifespan startup. P1.1 stubs the
-        actual wpa_supplicant polling loop; the supervisor's
-        skeleton is alive + observable via API immediately.
+        """Called from FastAPI's lifespan startup. P1.2-A: the
+        actual wpa_supplicant polling loop now runs in
+        `network_supervisor_loop.supervisor_observe_loop` as a
+        separate asyncio task — app.py spawns it; this hook just
+        announces the lifecycle boundary in the journal.
         """
-        self.diagnostics.push(
+        self._emit(
             "state_machine",
             "info",
-            "lifespan_start (P1.1: skeleton only; wpa_supplicant polling is a follow-up commit)",
+            "lifespan_start (P1.2-A: observe-only; wpa_supplicant polling "
+            "live + channel-follow actuator stubbed)",
         )
 
     async def lifespan_stop(self) -> None:
-        self.diagnostics.push("state_machine", "info", "lifespan_stop")
+        self._emit("state_machine", "info", "lifespan_stop")
 
 
 # ============================================================

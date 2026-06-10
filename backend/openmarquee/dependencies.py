@@ -927,3 +927,40 @@ def _live_manager_singleton():
 def get_live_manager():
     """Dependency provider for the live-takeover manager."""
     return _live_manager_singleton()
+
+
+# ============================================================
+# P1.2-A (2026-06-10): network supervisor singleton.
+# ============================================================
+#
+# The supervisor's NetworkSupervisor instance is process-wide. The
+# observe-only asyncio loop (network_supervisor_loop.py) and the
+# API endpoint (api_network_supervisor.py) share the same instance.
+#
+# Settings are read once at construction time; the fallback flag
+# is currently NOT live-reloadable (set at boot from
+# OPENMARQUEE_NETWORK_FALLBACK_MUTEX_MODE OR settings on first
+# call). Live reload is a P3 concern when the operator-controllable
+# "Setup Mode" UI lands.
+
+
+@lru_cache
+def _network_supervisor_singleton():
+    from openmarquee.network_supervisor import NetworkSupervisor, SupervisorConfig
+
+    storage = _settings_storage_singleton()
+    settings = storage.load()
+    config = SupervisorConfig(
+        fallback_mutex_mode=settings.network_fallback_mutex_mode,
+    )
+    return NetworkSupervisor(config=config)
+
+
+def get_network_supervisor():
+    """Dependency provider for the network supervisor.
+
+    Returns the process-wide NetworkSupervisor instance. The supervisor
+    starts in OBSERVE-ONLY mode (P1.2-A); the take-over commit
+    (P1.2-B) flips the active actuator on.
+    """
+    return _network_supervisor_singleton()

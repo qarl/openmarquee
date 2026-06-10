@@ -20,11 +20,12 @@ from openmarquee.api_auth import router as auth_router
 from openmarquee.api_backgrounds import router as backgrounds_router
 from openmarquee.api_flock import router as flock_router
 from openmarquee.api_live import router as live_router
+from openmarquee.api_network_supervisor import router as network_supervisor_router
+from openmarquee.api_perf import router as perf_router
 from openmarquee.api_playback import router as playback_router
 from openmarquee.api_playlist import router as playlist_router
 from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
-from openmarquee.api_perf import router as perf_router
 from openmarquee.api_system import router as system_router
 from openmarquee.auth_middleware import AuthMiddleware
 from openmarquee.content.migrations import migrate_050608_bg_to_000000
@@ -106,6 +107,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 check_runtime_assets,
                 log_runtime_asset_issues,
             )
+
             log_runtime_asset_issues(check_runtime_assets())
         except Exception:
             log.exception("startup runtime asset check failed")
@@ -213,15 +215,39 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # a per-request syscall. Cheap: ~sub-ms /proc read + dict update.
     # Disabled in test fixtures alongside DISABLE_AUTOSTART since they
     # don't run the full lifespan worker set.
-    cma_sampler_handle: "asyncio.Task[None] | None" = None
+    cma_sampler_handle: asyncio.Task[None] | None = None
     if os.environ.get("OPENMARQUEE_DISABLE_AUTOSTART") != "1":
         try:
             from openmarquee.perf_stats import cma_sampler_task
-            cma_sampler_handle = asyncio.create_task(
-                cma_sampler_task(), name="cma-sampler"
-            )
+
+            cma_sampler_handle = asyncio.create_task(cma_sampler_task(), name="cma-sampler")
         except Exception:
             log.exception("startup CMA sampler autostart failed")
+
+    # P1.2-A (2026-06-10) onboarding rework: network supervisor
+    # observe-only loop. Polls wpa_supplicant control socket events
+    # + periodically queries `iw dev wlan0 info` for STA freq. Drives
+    # the state machine + records every channel-follow DECISION (no
+    # subprocess actuation in P1.2-A). Tests opt out via
+    # OPENMARQUEE_DISABLE_NETWORK_SUPERVISOR=1 (also opts out under
+    # the umbrella DISABLE_AUTOSTART flag).
+    network_supervisor_handle: asyncio.Task[None] | None = None
+    if (
+        os.environ.get("OPENMARQUEE_DISABLE_AUTOSTART") != "1"
+        and os.environ.get("OPENMARQUEE_DISABLE_NETWORK_SUPERVISOR") != "1"
+    ):
+        try:
+            from openmarquee.dependencies import get_network_supervisor
+            from openmarquee.network_supervisor_loop import supervisor_observe_loop
+
+            supervisor = get_network_supervisor()
+            await supervisor.lifespan_start()
+            network_supervisor_handle = asyncio.create_task(
+                supervisor_observe_loop(supervisor),
+                name="network-supervisor-observe",
+            )
+        except Exception:
+            log.exception("startup network supervisor autostart failed")
     yield
     # Tear down any active live session BEFORE the playback loop stops
     # so the session's close() can resume() the loop cleanly even though
@@ -240,6 +266,20 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         cma_sampler_handle.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await cma_sampler_handle
+    # P1.2-A: cancel the network supervisor observe loop. The loop
+    # catches CancelledError + closes the wpa_supplicant socket
+    # cleanly before propagating, so this await both joins the task
+    # and flushes the socket teardown.
+    if network_supervisor_handle is not None:
+        network_supervisor_handle.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await network_supervisor_handle
+        try:
+            from openmarquee.dependencies import get_network_supervisor
+
+            await get_network_supervisor().lifespan_stop()
+        except Exception:
+            log.exception("shutdown network supervisor lifespan_stop failed")
     # Close the renderer last -- after the playback loop has stopped
     # writing frames -- so we don't free its buffers mid-render.
     renderer = get_renderer()
@@ -378,6 +418,11 @@ app.include_router(system_router)
 # telemetry snapshot. No auth (read-only, no PII, Tailscale-gated).
 app.include_router(perf_router)
 app.include_router(flock_router)
+# P1.2-A (2026-06-10) onboarding rework: GET /api/network-supervisor/state
+# exposes the supervisor's state machine + diagnostics ring buffer for
+# QA observability during the observe-only soak. No mutations from this
+# surface in P1.2-A.
+app.include_router(network_supervisor_router)
 
 # Dev tooling (preview page, manual play endpoint) is mounted by default
 # because the device is its own captive-portal AP with no inbound internet.

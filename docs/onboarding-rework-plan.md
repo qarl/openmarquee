@@ -398,6 +398,95 @@ criteria, not polish.** Specifically:
 
 ---
 
+## §D.2 — P1.2-A deliverables (2026-06-10 — observe-only soak)
+
+Shipped after QA's GO on (A) — sequenced ahead of P1.2-B
+take-over per the de-risk pattern.
+
+1. `backend/openmarquee/network_supervisor_loop.py` (NEW, ~250 LOC):
+   - `parse_iw_freq_mhz(iw_output) -> int | None` — pure parser for
+     the `channel <N> (<MHZ> MHz)` line of `iw dev wlan0 info`.
+   - `poll_sta_freq_mhz()` async — best-effort subprocess of
+     `iw dev wlan0 info`. Returns None on Mac dev / missing iw /
+     timeout / no-association.
+   - `supervisor_observe_loop(supervisor)` async — the long-running
+     task. Maintains a `WpaSupplicantSocketClient` connection with
+     30s reconnect cadence on failure, drains parsed wpa events
+     into the supervisor every 500ms, polls STA freq every 10s.
+     Logs missing-binary / missing-socket conditions ONCE (no
+     stderr spam on Mac dev). On cancel, closes the socket
+     client + re-raises CancelledError.
+   - `_iw_binary_present()` — cheap which-style PATH probe.
+
+2. `backend/openmarquee/api_network_supervisor.py` (NEW):
+   - `GET /api/network-supervisor/state` — read-only observability
+     surface. Returns the supervisor's state + STA freq + AP
+     channel + fallback flag + diagnostics ring buffer (last 5
+     min).
+
+3. `backend/openmarquee/network_supervisor.py` (MODIFIED):
+   - New `_emit(source, severity, message)` helper dual-emits to
+     BOTH the diagnostics ring buffer AND the Python logger with
+     a stable `[network-supervisor] source=... severity=...
+     message=...` prefix. QA's grep pattern: `journalctl -u
+     openmarquee-backend | grep '\[network-supervisor\]'`.
+   - Load-bearing pushes (boot, state transitions, channel-follow
+     decisions, default actuator) routed through `_emit`. Volume-
+     heavy pushes (wpa raw events received) stay ring-buffer-only
+     to keep journal noise bounded.
+   - `_default_actuator` reworded to "observe-only" — explicit
+     about no subprocess from the P1.2-A loop.
+   - `lifespan_start` updated to match the new shape.
+
+4. `backend/openmarquee/dependencies.py`:
+   - `_network_supervisor_singleton` + `get_network_supervisor()` —
+     process-wide singleton constructed from `SystemSettings.
+     network_fallback_mutex_mode` at first call.
+
+5. `backend/openmarquee/app.py`:
+   - Imports `network_supervisor_router` + includes in the router
+     list.
+   - Lifespan startup spawns `supervisor_observe_loop` as an
+     asyncio task (gated by `OPENMARQUEE_DISABLE_AUTOSTART` AND
+     `OPENMARQUEE_DISABLE_NETWORK_SUPERVISOR` env vars).
+   - Lifespan shutdown cancels the task + calls
+     `supervisor.lifespan_stop`.
+
+6. `backend/tests/test_network_supervisor_loop.py` (NEW, ~270 LOC):
+   - 7 parametrized parse tests + 4 async loop tests (happy path,
+     wpa event drives state machine, missing-socket survives,
+     STA-freq poll cadence) + 2 smoke tests (interval defaults,
+     binary probe returns bool).
+
+7. `backend/tests/test_api_network_supervisor.py` (NEW): 2 tests
+   for the state endpoint shape + the read-only invariant.
+
+**Acceptance criteria for QA's P1.2-A live-fire soak on
+openMarqueeDev:**
+
+- Deploy main P1.2-A binary; service starts cleanly.
+- `journalctl -u openmarquee-backend | grep '\[network-supervisor\]'`
+  shows the parsed wpa events + state transitions + channel-follow
+  decisions in real time.
+- 30-min soak with the dev Pi joined to `pikazo` covers at least
+  one association event (boot) and ideally one
+  disassociate/reassociate round-trip.
+- No subprocess actuation occurs (`grep -E '\b(systemctl|nmcli|iw
+  set|hostapd_cli)\b'` over the observe-loop journal returns
+  empty).
+- The API endpoint at `/api/network-supervisor/state` returns the
+  shape pinned by the test suite.
+
+**P1.2-A EXPLICITLY DEFERS** (P1.2-B):
+- NM unmanage of wlan0
+- wpa_supplicant@wlan0.service take-over
+- wifi_station.py shim activation
+- Active channel-follow actuator (hostapd config rewrite +
+  systemctl restart hostapd)
+- Pre-flight Tailscale connectivity check
+- Self-healing rollback watchdog timer
+- Fallback_mutex_mode end-to-end smoke
+
 ## §D.1 — P1.1 deliverables (2026-06-10 — supervisor skeleton)
 
 Shipped AFTER QA's §C answers on 2026-06-10. Limited to the
