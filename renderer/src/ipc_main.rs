@@ -2591,6 +2591,18 @@ fn run_paint_hook(
             }
         }
         OpResult::PaintTransition { from, to, kind, progress } => {
+            // r104.2 (2026-06-09): instrumentation entry probe.
+            // QA observed r104.1 ships `begin_transition_serialization`
+            // firing 24x over 4 min but `transition_paint entries=0`
+            // -- meaning paint_and_present_one_transition_frame is
+            // never reached. paint_transition handler must be
+            // erring out somewhere downstream of BeginTransition's
+            // success. This entry probe + tagged err probes below
+            // tell us EXACTLY which `return err(...)` site fires.
+            eprintln!(
+                "[perf] paint_transition_entry from={} to={} kind={} progress={:.3}",
+                from, to, kind, progress,
+            );
             // Phase 8 slice 6 (2026-05-16): build TransitionEndpoint
             // per-kind from cache state. Video endpoints route their
             // V4L2 decoder state from `cache.video_decoders` +
@@ -2624,7 +2636,10 @@ fn run_paint_hook(
                 }
                 Some(ContentItem::Image(_)) => 'i',
                 Some(ContentItem::Video(_)) => 'v',
-                None => return err(format!("paint_transition: from slide {from_id} not in cache")),
+                None => {
+                    eprintln!("[perf] paint_transition_err site=1 reason=from_slide_not_in_cache from={}", from_id);
+                    return err(format!("paint_transition: from slide {from_id} not in cache"));
+                },
             };
             let to_kind = match cache.items.peek(&to_id) {
                 Some(ContentItem::Text(s)) => {
@@ -2632,7 +2647,10 @@ fn run_paint_hook(
                 }
                 Some(ContentItem::Image(_)) => 'i',
                 Some(ContentItem::Video(_)) => 'v',
-                None => return err(format!("paint_transition: to slide {to_id} not in cache")),
+                None => {
+                    eprintln!("[perf] paint_transition_err site=2 reason=to_slide_not_in_cache to={}", to_id);
+                    return err(format!("paint_transition: to slide {to_id} not in cache"));
+                },
             };
 
             // r50: resolve the V4L2 decoder lookup id per side.
@@ -2683,12 +2701,23 @@ fn run_paint_hook(
             // (idempotent bakes).
             if let (Some(fid), Some(tid)) = (from_dec_id, to_dec_id) {
                 if fid == tid {
+                    eprintln!("[perf] paint_transition_err site=3 reason=same_decoder_both_sides id={}", fid);
                     return err(format!(
                         "paint_transition: same decoder id on both sides ({fid}) not supported \
                          (e.g. two text-over-video slides sharing one bg video)",
                     ));
                 }
             }
+            // r104.2: tagged probe for the dual-1080p r104.1 path.
+            // Shows: which kinds, whether dec_ids resolved through
+            // the contains_key filter, and whether we're on the
+            // r104.1 (skip-to-bg) or pre-r104 path.
+            eprintln!(
+                "[perf] paint_transition_dec_state from_kind={} to_kind={} from_dec_id={} to_dec_id={}",
+                from_kind, to_kind,
+                from_dec_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string()),
+                to_dec_id.map(|id| id.to_string()).unwrap_or_else(|| "none".to_string()),
+            );
 
             // Resolve V4L2 decoder state &muts up-front. Single
             // get_mut for single-decoder; `iter_mut` for dual-
@@ -2714,12 +2743,14 @@ fn run_paint_hook(
                         }
                     }
                     if a.is_none() {
+                        eprintln!("[perf] paint_transition_err site=4 reason=from_dec_state_missing_both id={}", fid);
                         return err(format!(
                             "paint_transition: from decoder {fid} state missing \
                              (from_kind={from_kind})",
                         ));
                     }
                     if b.is_none() {
+                        eprintln!("[perf] paint_transition_err site=5 reason=to_dec_state_missing_both id={}", tid);
                         return err(format!(
                             "paint_transition: to decoder {tid} state missing \
                              (to_kind={to_kind})",
@@ -2730,6 +2761,7 @@ fn run_paint_hook(
                 (Some(fid), None) => {
                     let a = cache.video_decoders.get_mut(&fid);
                     if a.is_none() {
+                        eprintln!("[perf] paint_transition_err site=6 reason=from_dec_state_missing_some_none id={}", fid);
                         return err(format!(
                             "paint_transition: from decoder {fid} state missing \
                              (from_kind={from_kind})",
@@ -2740,6 +2772,7 @@ fn run_paint_hook(
                 (None, Some(tid)) => {
                     let b = cache.video_decoders.get_mut(&tid);
                     if b.is_none() {
+                        eprintln!("[perf] paint_transition_err site=7 reason=to_dec_state_missing_none_some id={}", tid);
                         return err(format!(
                             "paint_transition: to decoder {tid} state missing \
                              (to_kind={to_kind})",
@@ -2769,17 +2802,28 @@ fn run_paint_hook(
             if let Some(fid) = from_dec_id {
                 let dem = match cache.video_demuxers.get(&fid) {
                     Some(d) => d,
-                    None => return err(format!(
-                        "paint_transition: from demuxer {fid} missing for wrap-check",
-                    )),
+                    None => {
+                        eprintln!("[perf] paint_transition_err site=8 reason=from_demuxer_missing_wrap_check id={}", fid);
+                        return err(format!(
+                            "paint_transition: from demuxer {fid} missing for wrap-check",
+                        ));
+                    },
                 };
                 let dec = from_dec_state
                     .as_deref_mut()
                     .expect("from_dec_state set above for from_dec_id Some(_)");
                 if dec.next_sample_idx >= dem.samples.len() {
+                    // r104.2: probe BEFORE reprime so we see if it
+                    // even tries; pairs with site=9 below if it
+                    // throws.
+                    eprintln!(
+                        "[perf] paint_transition_from_reprime_attempt id={} next_sample_idx={} samples_len={}",
+                        fid, dec.next_sample_idx, dem.samples.len(),
+                    );
                     if let Err(e) =
                         crate::video_decode::reprime_video_decoder_for_loop(dec, dem)
                     {
+                        eprintln!("[perf] paint_transition_err site=9 reason=from_reprime_failed id={} err={:#}", fid, e);
                         return err(format!(
                             "paint_transition: from decoder reprime_video_decoder_for_loop failed: {e:#}",
                         ));
@@ -2789,9 +2833,12 @@ fn run_paint_hook(
             if let Some(tid) = to_dec_id {
                 let dem = match cache.video_demuxers.get(&tid) {
                     Some(d) => d,
-                    None => return err(format!(
-                        "paint_transition: to demuxer {tid} missing for wrap-check",
-                    )),
+                    None => {
+                        eprintln!("[perf] paint_transition_err site=10 reason=to_demuxer_missing_wrap_check id={}", tid);
+                        return err(format!(
+                            "paint_transition: to demuxer {tid} missing for wrap-check",
+                        ));
+                    },
                 };
                 let dec = to_dec_state
                     .as_deref_mut()
@@ -2800,6 +2847,7 @@ fn run_paint_hook(
                     if let Err(e) =
                         crate::video_decode::reprime_video_decoder_for_loop(dec, dem)
                     {
+                        eprintln!("[perf] paint_transition_err site=11 reason=to_reprime_failed id={} err={:#}", tid, e);
                         return err(format!(
                             "paint_transition: to decoder reprime_video_decoder_for_loop failed: {e:#}",
                         ));
@@ -2864,9 +2912,12 @@ fn run_paint_hook(
                 Some(ContentItem::Video(_)) => {
                     let demuxer = match cache.video_demuxers.get(&from_id) {
                         Some(d) => d,
-                        None => return err(format!(
-                            "paint_transition: from video {from_id} demuxer missing",
-                        )),
+                        None => {
+                            eprintln!("[perf] paint_transition_err site=13 reason=from_video_demuxer_missing id={}", from_id);
+                            return err(format!(
+                                "paint_transition: from video {from_id} demuxer missing",
+                            ));
+                        },
                     };
                     let dec_state =
                         from_dec_state.take().expect("from_dec_state set above for 'v' kind");
@@ -2909,9 +2960,12 @@ fn run_paint_hook(
                 Some(ContentItem::Video(_)) => {
                     let demuxer = match cache.video_demuxers.get(&to_id) {
                         Some(d) => d,
-                        None => return err(format!(
-                            "paint_transition: to video {to_id} demuxer missing",
-                        )),
+                        None => {
+                            eprintln!("[perf] paint_transition_err site=14 reason=to_video_demuxer_missing id={}", to_id);
+                            return err(format!(
+                                "paint_transition: to video {to_id} demuxer missing",
+                            ));
+                        },
                     };
                     let dec_state =
                         to_dec_state.take().expect("to_dec_state set above for 'v' kind");
@@ -2925,6 +2979,18 @@ fn run_paint_hook(
                 None => unreachable!("to_id presence verified above"),
             };
 
+            // r104.2: pre-invoke probe -- if this fires but the
+            // existing transition_paint_entry probe (inside
+            // paint_and_present_one_transition_frame) does NOT,
+            // the function returned without crossing its top-of-
+            // body probe. Currently the in-fn probe is gated on
+            // progress<0.20; if QA sees this line without the
+            // in-fn probe for progress>=0.20 ticks that's
+            // consistent + expected.
+            eprintln!(
+                "[perf] paint_transition_invoke kind={} progress={:.3}",
+                kind, progress,
+            );
             if let Err(e) = hdmi::paint_and_present_one_transition_frame(
                 session,
                 card,
@@ -2935,6 +3001,7 @@ fn run_paint_hook(
                 &kind,
                 progress,
             ) {
+                eprintln!("[perf] paint_transition_err site=12 reason=paint_and_present_failed err={:#}", e);
                 return err(format!("paint_transition failed: {e:#}"));
             }
             // Re-pack: from/to are Copy (Uuid), progress is Copy
