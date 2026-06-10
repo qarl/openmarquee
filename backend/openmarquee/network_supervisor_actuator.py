@@ -33,8 +33,10 @@ small wrappers tests monkeypatch.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
+import socket as _socket
 import subprocess
 from pathlib import Path
 
@@ -44,7 +46,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_HOSTAPD_CONF = Path("/etc/hostapd/hostapd.conf")
 DEFAULT_AP_IFACE = "ap0"
-NETCTL_BINARY = "/usr/local/sbin/openmarquee-netctl"
+NETCTL_SOCKET_PATH = "/run/openmarquee/netctl.sock"
 NETCTL_TIMEOUT_S = 15.0
 IW_VERIFY_TIMEOUT_S = 5.0
 
@@ -95,31 +97,74 @@ def _run_netctl_hostapd_write_and_restart(
     *,
     timeout_s: float = NETCTL_TIMEOUT_S,
 ) -> None:
-    """P1.2-B.1: privilege-boundary invocation for the hostapd
-    write+restart. Pipes the new config into netctl via STDIN;
-    the helper installs to /etc/hostapd/hostapd.conf atomically
-    + restarts hostapd. Sync (subprocess.run) to match the
-    actuator's blocking semantics.
+    """P1.2-B.2: privilege-boundary invocation via the
+    socket-activated root daemon. QA verified that sudo cannot
+    function under NoNewPrivileges=true on the backend service;
+    the Unix-socket transport sidesteps that — the daemon runs as
+    root via a systemd template service, the backend just speaks
+    the protocol.
+
+    Sync (blocking) to match the actuator's blocking semantics
+    inside the supervisor's sync apply_sta_freq. The actuator
+    fires only on STA frequency CHANGE (boot association + rare
+    router CSA) so ~5s of blocking once per change is acceptable.
+
+    Raises HostapdActuationError on any failure (connect, timeout,
+    non-OK response from daemon).
     """
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.settimeout(timeout_s)
     try:
-        result = subprocess.run(
-            ["sudo", "-n", NETCTL_BINARY, "hostapd-write-and-restart"],
-            input=new_conf.encode("utf-8"),
-            capture_output=True,
-            timeout=timeout_s,
-            check=False,
-        )
-    except FileNotFoundError as e:
-        raise HostapdActuationError(f"sudo binary not found: {e}") from e
-    except subprocess.TimeoutExpired as e:
+        try:
+            sock.connect(NETCTL_SOCKET_PATH)
+        except FileNotFoundError as e:
+            raise HostapdActuationError(
+                f"netctl socket not found at {NETCTL_SOCKET_PATH}: {e}"
+            ) from e
+        except OSError as e:
+            raise HostapdActuationError(f"netctl socket connect failed: {e}") from e
+        try:
+            sock.sendall(b"hostapd-write-and-restart\n")
+            sock.sendall(new_conf.encode("utf-8"))
+            sock.shutdown(_socket.SHUT_WR)
+        except OSError as e:
+            raise HostapdActuationError(
+                f"netctl hostapd-write-and-restart: send failed ({e})"
+            ) from e
+        # Read until daemon closes its end.
+        chunks: list[bytes] = []
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                # Cap response so a chatty daemon can't blow memory.
+                if sum(len(c) for c in chunks) > 8192:
+                    break
+        except TimeoutError as e:
+            raise HostapdActuationError(
+                f"netctl hostapd-write-and-restart: response timed out after {timeout_s:.0f}s"
+            ) from e
+        except OSError as e:
+            raise HostapdActuationError(
+                f"netctl hostapd-write-and-restart: recv failed ({e})"
+            ) from e
+        response = b"".join(chunks).decode("utf-8", errors="replace").rstrip("\n")
+        if response == "OK":
+            return
+        if response.startswith("ERR "):
+            raise HostapdActuationError(f"netctl hostapd-write-and-restart: {response[4:]}")
+        if not response:
+            raise HostapdActuationError(
+                "netctl hostapd-write-and-restart: empty response (daemon closed before reply?)"
+            )
         raise HostapdActuationError(
-            f"netctl hostapd-write-and-restart timed out after {timeout_s:.0f}s"
-        ) from e
-    if result.returncode != 0:
-        raise HostapdActuationError(
-            f"netctl hostapd-write-and-restart failed (rc={result.returncode}): "
-            f"{result.stderr.decode('utf-8', errors='replace')!r}"
+            f"netctl hostapd-write-and-restart: unexpected response {response!r}"
         )
+    finally:
+        with contextlib.suppress(Exception):
+            sock.close()
 
 
 def _iw_dev_info(iface: str, *, timeout_s: float = IW_VERIFY_TIMEOUT_S) -> str:

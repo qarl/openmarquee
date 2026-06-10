@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""P1.2-B.2 (2026-06-10) socket-activated root daemon for the
+network-control privilege boundary.
+
+QA verified that NoNewPrivileges=true on the backend service
+BLOCKS sudo entirely ("sudo: The 'no new privileges' flag is set,
+which prevents sudo from running as root"). This daemon runs as
+root via a systemd template service activated by
+openmarquee-netctl.socket; each connection spawns a fresh
+instance with STDIN/STDOUT bound to the socket. No privilege
+transition happens in the backend process — it just talks to
+this already-root daemon over a Unix socket whose access is
+restricted by SocketUser=root + SocketGroup=openmarquee +
+SocketMode=0660.
+
+Protocol (one round-trip per connection):
+    Client → Server:
+        Line 1: <subcommand>\\n
+        Optional payload: <bytes>  (for write-* subcommands)
+        Client closes write side (SHUT_WR) signaling end of payload
+    Server → Client:
+        Line 1: "OK\\n"  on success
+        OR
+        Line 1: "ERR <message>\\n"  on failure
+        Server closes connection
+
+The actual file writes + systemctl calls are delegated to the
+existing /usr/local/sbin/openmarquee-netctl bash helper, which
+remains the trusted root code that does the work; this daemon is
+a thin IPC adapter on top of it. Allowlist + payload-size cap are
+enforced HERE in addition to the bash helper's checks (defense in
+depth).
+"""
+
+from __future__ import annotations
+
+import logging
+import logging.handlers
+import subprocess
+import sys
+
+HELPER = "/usr/local/sbin/openmarquee-netctl"
+
+ALLOWLIST = frozenset(
+    {
+        "nm-write-unmanaged-wlan0",
+        "nm-remove-unmanaged-wlan0",
+        "nm-reload",
+        "wpa-write-wlan0-conf",
+        "wpa-enable-wlan0",
+        "wpa-stop-wlan0",
+        "hostapd-write-and-restart",
+    }
+)
+
+# Belt-and-braces caps per QA dispatch:
+#   "subcommand line read capped, payload size cap (64KB)"
+MAX_SUBCOMMAND_LINE_BYTES = 256
+MAX_PAYLOAD_BYTES = 64 * 1024
+HELPER_TIMEOUT_S = 30
+
+
+def _respond(line: str) -> None:
+    """Write a single response line + flush. stdout is bound to the
+    socket by systemd's StandardOutput=socket."""
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+def _setup_journal_logging() -> logging.Logger:
+    """Route diagnostics to the systemd journal (StandardError=journal
+    in the unit). Each connection's log lines are tagged so the
+    operator can grep them out of journalctl -t openmarquee-netctl-daemon."""
+    logger = logging.getLogger("openmarquee-netctl-daemon")
+    logger.setLevel(logging.INFO)
+    # systemd's journal absorbs stderr; a plain StreamHandler is fine.
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.propagate = False
+    return logger
+
+
+def main() -> int:
+    log = _setup_journal_logging()
+
+    # Read subcommand line (cap to MAX_SUBCOMMAND_LINE_BYTES).
+    first_line = sys.stdin.buffer.readline(MAX_SUBCOMMAND_LINE_BYTES)
+    if not first_line:
+        _respond("ERR empty request\n")
+        log.warning("rejected empty request")
+        return 1
+    subcommand = first_line.rstrip(b"\n").decode("ascii", errors="replace").strip()
+    if subcommand not in ALLOWLIST:
+        _respond(f"ERR unknown subcommand: {subcommand!r}\n")
+        log.warning("rejected unknown subcommand: %r", subcommand)
+        return 1
+
+    # Read remaining bytes as payload (cap at MAX_PAYLOAD_BYTES + 1
+    # so we can detect oversize by checking len(payload) >
+    # MAX_PAYLOAD_BYTES).
+    payload = sys.stdin.buffer.read(MAX_PAYLOAD_BYTES + 1)
+    if len(payload) > MAX_PAYLOAD_BYTES:
+        _respond(f"ERR payload exceeds {MAX_PAYLOAD_BYTES}B\n")
+        log.warning(
+            "rejected oversize payload for subcommand=%s (bytes=%d)",
+            subcommand,
+            len(payload),
+        )
+        return 1
+
+    # Delegate to the existing trusted bash helper. The helper does
+    # the actual file writes + systemctl calls + argv-validation +
+    # atomic install_from_stdin. This daemon is a thin IPC adapter.
+    try:
+        result = subprocess.run(
+            [HELPER, subcommand],
+            input=payload,
+            capture_output=True,
+            timeout=HELPER_TIMEOUT_S,
+            check=False,
+        )
+    except FileNotFoundError as e:
+        _respond(f"ERR helper not found: {e}\n")
+        log.error("helper missing at %s: %s", HELPER, e)
+        return 1
+    except subprocess.TimeoutExpired:
+        _respond(f"ERR helper timed out after {HELPER_TIMEOUT_S}s\n")
+        log.error("helper timed out subcommand=%s", subcommand)
+        return 1
+
+    if result.returncode != 0:
+        # Trim stderr so a chatty helper can't blow back through the
+        # socket response.
+        stderr_text = result.stderr.decode("utf-8", errors="replace")[:1024].rstrip()
+        _respond(f"ERR helper rc={result.returncode}: {stderr_text}\n")
+        log.warning(
+            "helper failed subcommand=%s rc=%d stderr=%r",
+            subcommand,
+            result.returncode,
+            stderr_text,
+        )
+        return 1
+
+    _respond("OK\n")
+    log.info("ok subcommand=%s payload_bytes=%d", subcommand, len(payload))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

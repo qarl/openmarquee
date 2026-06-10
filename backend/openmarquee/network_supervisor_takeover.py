@@ -321,7 +321,7 @@ network={{
 """
 
 
-NETCTL_BINARY = "/usr/local/sbin/openmarquee-netctl"
+NETCTL_SOCKET_PATH = "/run/openmarquee/netctl.sock"
 
 
 async def _run_netctl(
@@ -330,47 +330,68 @@ async def _run_netctl(
     stdin_input: str | None = None,
     timeout_s: float = SYSTEMCTL_TIMEOUT_S,
 ) -> None:
-    """P1.2-B.1 (2026-06-10): privilege-boundary invocation. The
-    backend runs under NoNewPrivileges=true + ProtectSystem=strict
-    so direct file writes to /etc/ and systemctl commands fail
-    with EROFS / permission errors. The privileged helper at
-    NETCTL_BINARY is granted via sudoers (NOPASSWD on a strict
-    subcommand allowlist).
+    """P1.2-B.2 (2026-06-10): privilege-boundary invocation via the
+    socket-activated root daemon. QA verified that
+    NoNewPrivileges=true on the backend service BLOCKS sudo
+    entirely; this socket transport sidesteps that — the daemon
+    runs as root via a systemd template service, the backend just
+    speaks the protocol over a Unix socket whose access is
+    restricted to SocketGroup=openmarquee.
 
-    File content for write-* subcommands flows through STDIN, never
-    argv (the sudoers allowlist matches only `... <subcommand>`
-    with no trailing args, blocking argv-injection of file bytes).
+    Protocol (one round-trip per call):
+        Client → Server:
+            Line 1: <subcommand>\\n
+            Optional payload: <bytes>  (write-* subcommands)
+            Client closes write side (SHUT_WR)
+        Server → Client:
+            Line 1: "OK\\n"  on success
+            OR
+            Line 1: "ERR <message>\\n"  on failure
 
-    Raises RuntimeError on subprocess failure / timeout / non-zero
-    exit. Caller (TakeoverOrchestrator / HostapdChannelActuator)
+    Raises RuntimeError on connect failure / timeout / non-OK
+    response. Caller (TakeoverOrchestrator / HostapdChannelActuator)
     treats any failure as "this step did not succeed" + propagates
     appropriately (rollback on attempt-time failure;
     HostapdActuationError on actuator-time failure).
     """
-    cmd = ["sudo", "-n", NETCTL_BINARY, subcommand]
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE if stdin_input is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(NETCTL_SOCKET_PATH),
+            timeout=timeout_s,
         )
     except FileNotFoundError as e:
-        raise RuntimeError(f"sudo binary not found: {e}") from e
-    encoded_input = stdin_input.encode("utf-8") if stdin_input is not None else None
-    try:
-        _stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=encoded_input), timeout=timeout_s
-        )
+        raise RuntimeError(f"netctl socket not found at {NETCTL_SOCKET_PATH}: {e}") from e
     except TimeoutError as e:
+        raise RuntimeError(f"netctl socket connect timed out after {timeout_s:.0f}s") from e
+    except OSError as e:
+        raise RuntimeError(f"netctl socket connect failed: {e}") from e
+    try:
+        writer.write(subcommand.encode("ascii") + b"\n")
+        if stdin_input is not None:
+            writer.write(stdin_input.encode("utf-8"))
+        await writer.drain()
+        writer.write_eof()
+        # Read the single response line; daemon writes OK\n or
+        # ERR <msg>\n then closes.
+        try:
+            response_line = await asyncio.wait_for(reader.readline(), timeout=timeout_s)
+        except TimeoutError as e:
+            raise RuntimeError(
+                f"netctl {subcommand}: response read timed out after {timeout_s:.0f}s"
+            ) from e
+        response = response_line.decode("utf-8", errors="replace").rstrip("\n")
+        if response == "OK":
+            return
+        if response.startswith("ERR "):
+            raise RuntimeError(f"netctl {subcommand}: {response[4:]}")
+        if not response:
+            raise RuntimeError(f"netctl {subcommand}: empty response (daemon closed before reply?)")
+        raise RuntimeError(f"netctl {subcommand}: unexpected response {response!r}")
+    finally:
         with contextlib.suppress(Exception):
-            proc.kill()
-        raise RuntimeError(f"netctl {subcommand} timed out after {timeout_s:.0f}s") from e
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"netctl {subcommand} failed (rc={proc.returncode}): "
-            f"{stderr.decode('utf-8', errors='replace')!r}"
-        )
+            writer.close()
+        with contextlib.suppress(Exception):
+            await writer.wait_closed()
 
 
 class TakeoverOrchestrator:

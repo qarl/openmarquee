@@ -398,6 +398,148 @@ criteria, not polish.** Specifically:
 
 ---
 
+## §D.5 — P1.2-B.2 deliverables (2026-06-10 — socket-activated daemon, sudo retired)
+
+Shipped after QA's verify of P1.2-B.1 caught a second
+production-reality bug. P1.2-B.1's "sudo works under NNP" bet
+was wrong: `sudo: The "no new privileges" flag is set, which
+prevents sudo from running as root`. Plus the state-file path
+`/var/lib/openmarquee/network-state.json` was outside the
+backend's `ReadWritePaths=/var/openmarquee` sandbox so every
+`save_persisted_state` raised "Read-only file system" and the
+rollback cooldown record was lost.
+
+QA's preferred Option B (over polkit + dbus): socket-activated
+root companion. Backend connects to `/run/openmarquee/netctl.sock`;
+systemd template service spawns a fresh root daemon per
+connection with STDIN/STDOUT bound to the socket. No privilege
+escalation in the backend process — the daemon is already root.
+NNP is irrelevant.
+
+### What this commit ships (10 files)
+
+1. **`system/openmarquee-netctl-daemon` (NEW Python ~150 LOC)** —
+   per-connection IPC adapter. Reads subcommand line from STDIN
+   (cap 256 bytes), validates against the 7-subcommand allowlist,
+   reads payload bytes (cap 64KB belt-and-braces), invokes the
+   existing bash helper at `/usr/local/sbin/openmarquee-netctl
+   <subcommand>` with the payload piped to stdin, writes
+   `OK\n` or `ERR <message>\n` to STDOUT. Diagnostics to the
+   systemd journal tagged `openmarquee-netctl-daemon`.
+
+2. **`system/openmarquee-netctl.socket` (NEW)** — listens on
+   `/run/openmarquee/netctl.sock` with `Accept=yes`,
+   `SocketUser=root` + `SocketGroup=openmarquee` + `SocketMode=0660`.
+   Only the backend user (member of group `openmarquee`) can
+   connect.
+
+3. **`system/openmarquee-netctl@.service` (NEW)** — template
+   service. `User=root`, `StandardInput=socket`,
+   `StandardOutput=socket`, `StandardError=journal`. Per-
+   connection one-shot.
+
+4. **`scripts/install.sh` (MODIFIED)** — installs the daemon at
+   `/usr/local/sbin/openmarquee-netctl-daemon` mode 0755 root:root,
+   stages the socket + template unit into `/etc/systemd/system/`,
+   `systemctl enable + start openmarquee-netctl.socket`. The bash
+   helper from P1.2-B.1 is still installed (the daemon delegates
+   to it).
+
+5. **`system/openmarquee-sudoers` (MODIFIED)** — REMOVED the 7
+   `openmarquee-netctl <subcmd>` grants. Sudo is dead under NNP;
+   they were unreachable. Kept the 2 nmcli grants (production
+   `wifi_station.py` still has them) with a note that those
+   likely fail silently too — auditing is P1.2-C work.
+
+6. **`backend/openmarquee/network_supervisor.py` (MODIFIED)** —
+   `DEFAULT_STATE_FILE` moved from `/var/lib/openmarquee/network-state.json`
+   to `/var/openmarquee/network-state.json` (inside the sandbox's
+   `ReadWritePaths=`). Consistent with playlist / settings / auth
+   which all live in `/var/openmarquee/`.
+
+7. **`backend/openmarquee/network_supervisor_takeover.py` (MODIFIED)** —
+   `_run_netctl` replaced sudo+subprocess with
+   `asyncio.open_unix_connection(NETCTL_SOCKET_PATH)`. Same
+   contract (subcommand allowlist on server side; payload via
+   stdin); only the transport changed. Constants:
+   `NETCTL_SOCKET_PATH = "/run/openmarquee/netctl.sock"`.
+
+8. **`backend/openmarquee/network_supervisor_actuator.py`
+   (MODIFIED)** — `_run_netctl_hostapd_write_and_restart` replaced
+   sudo+subprocess with sync `socket.AF_UNIX + SOCK_STREAM`
+   connect + sendall + shutdown(SHUT_WR) + recv loop. Cap on
+   response bytes (8KB) prevents a chatty daemon blowing memory.
+   Post-verify via `iw dev ap0 info` unchanged (read-only).
+
+9. **`backend/tests/test_network_supervisor_actuator.py` (MODIFIED)** —
+   tests monkeypatch `_run_netctl_hostapd_write_and_restart`
+   directly (records payload list) instead of mocking `subprocess.run`
+   for sudo. Same coverage: happy path + each failure shape +
+   post-verify mismatch (the load-bearing P1.2-A.1 NIT) +
+   missing iw + timeout + payload-contract test pinning
+   `channel=11` in the netctl payload.
+
+10. **`docs/onboarding-rework-plan.md` (MODIFIED)** — this §D.5
+    section.
+
+### Privilege transport diff vs P1.2-B.1
+
+| Concern | P1.2-B.1 | P1.2-B.2 |
+|---|---|---|
+| Privilege boundary | `sudo` -> bash helper | Unix socket -> systemd template -> bash helper |
+| Works under NoNewPrivileges? | **NO** (verified by QA) | **YES** (no privilege transition in backend) |
+| argv-validation gates | Helper `$#` + sudoers no-trailing-args | Daemon allowlist + helper `$#` |
+| File content carrier | STDIN to helper via sudo | STDIN to daemon via socket -> STDIN to helper |
+| Payload size cap | None (sudo doesn't care) | 64KB enforced in daemon |
+| Connect AuthN | sudo's PAM stack | `SocketGroup=openmarquee SocketMode=0660` |
+| Spawn cost per call | sudo + bash | systemd-spawn + python + bash |
+| Failure shape on backend | `RuntimeError(rc=N stderr)` | `RuntimeError(ERR <msg>)` |
+
+### Audit: what's still in-process (no privilege needed)
+
+| Operation | Why it doesn't need netctl |
+|---|---|
+| Read `/etc/hostapd/hostapd.conf` | `ProtectSystem=strict` allows reads |
+| `iw dev ap0 info` (post-verify) | Read-only netlink query; no CAP_NET_ADMIN |
+| `iw dev wlan0 info` (STA freq poll) | Same |
+| `tailscale status --json` (pre-flight) | Read-only |
+| Read+write `/var/openmarquee/network-state.json` | Inside `ReadWritePaths=` |
+| Wpa_supplicant ctrl socket events | Read via SOCK_DGRAM client |
+
+### Sandbox-path move audit
+
+| State file | Old path | New path |
+|---|---|---|
+| `network-state.json` | `/var/lib/openmarquee/` ❌ | `/var/openmarquee/` ✓ |
+| `playlist.json` | `/var/openmarquee/` ✓ | unchanged |
+| `settings.json` | `/var/openmarquee/` ✓ | unchanged |
+| `auth.json` (?) | `/var/openmarquee/` ✓ | unchanged |
+
+### Verify procedure for QA's third attempt
+
+Same recipe as P1.2-B and P1.2-B.1 (no env-var changes; the
+systemd drop-in for `OPENMARQUEE_NETWORK_TAKEOVER_ENABLED=1` you
+already set is still in place). The first deploy-side change to
+watch for:
+
+```
+sudo systemctl status openmarquee-netctl.socket    # listening
+sudo systemctl list-sockets | grep openmarquee     # bound at /run/openmarquee/netctl.sock
+ls -la /run/openmarquee/netctl.sock                 # owner root:openmarquee, mode srw-rw----
+```
+
+Then the take-over flip path:
+
+```
+sudo journalctl -u openmarquee-backend | grep network-takeover
+sudo journalctl -t openmarquee-netctl-daemon       # per-connection daemon logs
+nmcli device status                                 # wlan0 -> unmanaged
+systemctl status wpa_supplicant@wlan0.service      # active
+```
+
+Wifi bounce, rollback drill, fallback_mutex — all the same as
+P1.2-B's verify procedure.
+
 ## §D.4 — P1.2-B.1 deliverables (2026-06-10 — privilege boundary)
 
 Shipped after QA's live verify caught the production-reality bug

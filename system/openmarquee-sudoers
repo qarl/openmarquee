@@ -32,22 +32,19 @@
 openmarquee ALL=(root) NOPASSWD: /usr/bin/nmcli device wifi connect *
 openmarquee ALL=(root) NOPASSWD: /usr/bin/nmcli connection delete *
 
-# P1.2-B.1 (2026-06-10): privileged network-control helper. The
-# openMarquee backend runs under NoNewPrivileges=true +
-# ProtectSystem=strict (system/openmarquee-backend.service), so it
-# cannot write /etc/ nor restart system services directly. The
-# helper at /usr/local/sbin/openmarquee-netctl is the privilege
-# boundary; its subcommand allowlist + STDIN-only file content
-# prevent argv injection. Subcommands documented in
-# system/openmarquee-netctl.
+# NOTE (P1.2-B.2, 2026-06-10): the 7 `openmarquee-netctl <subcmd>`
+# grants from P1.2-B.1 were REMOVED here. QA's dev-Pi verify
+# confirmed sudo cannot function under NoNewPrivileges=true on
+# the backend service ("sudo: The 'no new privileges' flag is
+# set, which prevents sudo from running as root"). The
+# privileged-network ops now go through a socket-activated root
+# daemon (system/openmarquee-netctl.socket +
+# openmarquee-netctl@.service); no sudo needed.
 #
-# Scope must stay tight: any NEW privileged operation needs (a) a
-# new subcommand in the helper and (b) an extension here. Do NOT
-# relax this to a generic `openmarquee-netctl *` form.
-openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl nm-write-unmanaged-wlan0
-openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl nm-remove-unmanaged-wlan0
-openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl nm-reload
-openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl wpa-write-wlan0-conf
-openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl wpa-enable-wlan0
-openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl wpa-stop-wlan0
-openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl hostapd-write-and-restart
+# The two nmcli grants above are RETAINED for now because
+# wifi_station.py's sudo path is still in production code BUT QA
+# flagged in the P1.2-B.2 dispatch that those calls likely fail
+# silently under NNP too — sudo just exits non-zero + the wifi-
+# station handler logs WARNING + sets state="failed" without any
+# escalation signal. Auditing/migrating wifi_station to the netctl
+# socket is P1.2-C work.

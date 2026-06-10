@@ -800,19 +800,39 @@ done
 # parse it otherwise). visudo -c validates the full /etc/sudoers tree
 # including the .d/ fragments; abort the install if validation trips.
 
-# P1.2-B.1 (2026-06-10): privileged network-control helper. The
+# P1.2-B.2 (2026-06-10): privileged network-control daemon. The
 # openMarquee backend runs under NoNewPrivileges=true +
-# ProtectSystem=strict so cannot write /etc or restart system
-# services directly. The helper at /usr/local/sbin/openmarquee-netctl
-# crosses the privilege boundary; the sudoers grant just below
-# allows the backend user to invoke it. install.sh ships both in
-# lock-step; see system/openmarquee-netctl docstring + system/
-# openmarquee-sudoers for the contract.
+# ProtectSystem=strict (system/openmarquee-backend.service); sudo
+# from inside that sandbox is BLOCKED by NNP. The privilege
+# transition now happens via a socket-activated systemd template
+# service: openmarquee-netctl.socket listens at
+# /run/openmarquee/netctl.sock with SocketGroup=openmarquee so the
+# backend can connect; openmarquee-netctl@.service spawns
+# openmarquee-netctl-daemon as root per connection, with
+# STDIN/STDOUT bound to the socket. The bash helper at
+# /usr/local/sbin/openmarquee-netctl is the actual root code that
+# does the file writes + systemctl calls; the daemon is a thin
+# IPC adapter.
 say "Stage openmarquee-netctl privilege-boundary helper"
 NETCTL_DST="${ROOT_PREFIX}/usr/local/sbin/openmarquee-netctl"
 if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-netctl" ]; then
     run mkdir -p "$(dirname "$NETCTL_DST")"
     run install -m 0755 -o root -g root "${OPT_DIR}/system/openmarquee-netctl" "$NETCTL_DST"
+fi
+say "Stage openmarquee-netctl-daemon (socket-activated root daemon)"
+NETCTL_DAEMON_DST="${ROOT_PREFIX}/usr/local/sbin/openmarquee-netctl-daemon"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-netctl-daemon" ]; then
+    run mkdir -p "$(dirname "$NETCTL_DAEMON_DST")"
+    run install -m 0755 -o root -g root "${OPT_DIR}/system/openmarquee-netctl-daemon" "$NETCTL_DAEMON_DST"
+fi
+say "Stage openmarquee-netctl systemd socket + template unit"
+NETCTL_SOCKET_DST="${SYSTEMD_DIR}/openmarquee-netctl.socket"
+NETCTL_TEMPLATE_DST="${SYSTEMD_DIR}/openmarquee-netctl@.service"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-netctl.socket" ]; then
+    run install -m 0644 "${OPT_DIR}/system/openmarquee-netctl.socket" "$NETCTL_SOCKET_DST"
+fi
+if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-netctl@.service" ]; then
+    run install -m 0644 "${OPT_DIR}/system/openmarquee-netctl@.service" "$NETCTL_TEMPLATE_DST"
 fi
 
 say "Stage openmarquee-sudoers"
@@ -1164,6 +1184,15 @@ run systemctl enable openmarquee-wifi-powersave-off.service
 # See qa/r59-cma-watchdog-default-decision-2026-06-04.md.
 run systemctl enable openmarquee-cma-watchdog.timer
 run systemctl start openmarquee-cma-watchdog.timer || true
+
+# P1.2-B.2 (2026-06-10): enable the netctl socket so the take-over
+# orchestrator can hit /run/openmarquee/netctl.sock. The matching
+# template unit (openmarquee-netctl@.service) is spawned per-
+# connection by systemd; we don't enable it directly. Best-effort
+# start: if the .socket fails to bind (e.g. dir-create race), the
+# next service restart picks it up cleanly.
+run systemctl enable openmarquee-netctl.socket
+run systemctl start openmarquee-netctl.socket || true
 
 # r60 subagent (BLOCKER fix): only fire the best-wifi oneshot mid-
 # install when we're NOT running under an interactive ssh session.

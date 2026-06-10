@@ -1,0 +1,30 @@
+[Unit]
+Description=openMarquee netctl per-connection handler
+Documentation=https://github.com/qarl/openmarquee docs/onboarding-rework-plan.md
+# Bound to the socket unit so a `systemctl stop openmarquee-netctl.socket`
+# stops new connections cleanly and existing instances finish their
+# one-shot work.
+Requires=openmarquee-netctl.socket
+After=openmarquee-netctl.socket
+
+[Service]
+Type=simple
+# Privilege transition happens HERE — the daemon runs as root via
+# the systemd unit so the backend (User=openmarquee with
+# NoNewPrivileges=true) doesn't need to escalate. Backend just
+# connects to the socket; systemd binds STDIN/STDOUT of this
+# instance to the accepted connection.
+User=root
+ExecStart=/usr/local/sbin/openmarquee-netctl-daemon
+# Bind STDIN + STDOUT to the accepted socket connection. The
+# daemon reads the subcommand line + payload from STDIN and writes
+# the OK/ERR response line to STDOUT.
+StandardInput=socket
+StandardOutput=socket
+# Diagnostics land in the journal; grep via
+#   journalctl -t openmarquee-netctl-daemon
+StandardError=journal
+SyslogIdentifier=openmarquee-netctl-daemon
+TimeoutStartSec=30
+# Don't restart per-connection instances; each one is a one-shot.
+Restart=no

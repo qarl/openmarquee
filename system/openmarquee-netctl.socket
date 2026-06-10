@@ -1,0 +1,27 @@
+[Unit]
+Description=openMarquee netctl privilege-boundary IPC socket
+Documentation=https://github.com/qarl/openmarquee docs/onboarding-rework-plan.md
+
+[Socket]
+# Per-connection root daemon (Accept=yes) listens at this Unix
+# socket path. Backend (User=openmarquee) connects + speaks the
+# subcommand protocol; the systemd-spawned handler runs as root via
+# openmarquee-netctl@.service.
+ListenStream=/run/openmarquee/netctl.sock
+# Per-connection instances; the handler service is a template
+# (openmarquee-netctl@.service) and each accept() spawns a fresh
+# instance. Simpler than a long-running daemon + the protocol is
+# one-shot (subcommand + payload + response then close).
+Accept=yes
+# Backend user must be able to connect; others (non-root non-
+# openmarquee) must not.
+SocketUser=root
+SocketGroup=openmarquee
+SocketMode=0660
+# Ensure /run/openmarquee/ exists with appropriate ownership before
+# the socket binds. Owned by root + the openmarquee group; mode 0750
+# so the backend can traverse but not write the directory.
+DirectoryMode=0750
+
+[Install]
+WantedBy=sockets.target

@@ -64,8 +64,15 @@ DIAGNOSTICS_WINDOW_SECONDS = 300.0
 
 # Path the supervisor uses to persist last-known state across reboots
 # (state machine resumes at the right entry point after a power cycle).
-# /var/lib/openmarquee/ is the canonical openMarquee mutable state dir.
-DEFAULT_STATE_FILE = Path("/var/lib/openmarquee/network-state.json")
+#
+# P1.2-B.2 (2026-06-10): moved from /var/lib/openmarquee/ to
+# /var/openmarquee/. The backend service runs with
+# ReadWritePaths=/var/openmarquee under ProtectSystem=strict; the
+# original /var/lib/ path was NOT in the sandbox so save_persisted_state
+# raised "Read-only file system" on every transition during QA's verify.
+# /var/openmarquee/ is where every other state file lives (playlist,
+# settings, auth) so this is consistent with existing convention.
+DEFAULT_STATE_FILE = Path("/var/openmarquee/network-state.json")
 
 # wpa_supplicant control socket. Even when NM manages wlan0, NM uses
 # a singleton wpa_supplicant whose socket is at this path on Bookworm,

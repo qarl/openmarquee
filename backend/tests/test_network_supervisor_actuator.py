@@ -117,49 +117,58 @@ def _mock_subprocess_run(returncode: int = 0, stderr: bytes = b"", stdout: bytes
     return _impl
 
 
+def _netctl_ok_recorder(monkeypatch) -> list[str]:
+    """P1.2-B.2: monkeypatch the actuator's netctl-socket call to
+    record the payload (the new hostapd.conf bytes) without touching
+    a real Unix socket. Returns the list of payloads passed.
+    """
+    captured: list[str] = []
+
+    def _stub(new_conf, **kwargs):
+        captured.append(new_conf)
+
+    monkeypatch.setattr(
+        "openmarquee.network_supervisor_actuator._run_netctl_hostapd_write_and_restart",
+        _stub,
+    )
+    return captured
+
+
+def _netctl_raising(monkeypatch, exc):
+    """Make the netctl call raise the given exception."""
+
+    def _stub(new_conf, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(
+        "openmarquee.network_supervisor_actuator._run_netctl_hostapd_write_and_restart",
+        _stub,
+    )
+
+
 class TestHostapdChannelActuator:
     def test_happy_path_rewrites_config_and_verifies(self, hostapd_conf_file: Path, monkeypatch):
-        """P1.2-B.1: the write+restart goes through `sudo -n
-        /usr/local/sbin/openmarquee-netctl hostapd-write-and-restart`
-        with new config piped via STDIN. Post-verify uses `iw dev
-        ap0 info`."""
-        calls = []
+        """P1.2-B.2: write+restart goes through the netctl socket
+        daemon; new hostapd.conf is the payload. Post-verify via
+        `iw dev ap0 info`."""
+        payloads = _netctl_ok_recorder(monkeypatch)
 
-        def _dispatch(cmd, **kwargs):
-            if cmd[0] == "sudo":
-                # The actuator pipes the new conf via STDIN
-                # (kwargs["input"] = encoded new config).
-                calls.append(("sudo", cmd, kwargs.get("input")))
-                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
-            if cmd[0] == "iw":
-                calls.append(("iw", cmd, None))
-                return subprocess.CompletedProcess(
-                    cmd,
-                    0,
-                    stdout=b"Interface ap0\n\tchannel 11 (2462 MHz), width: 20 MHz\n",
-                    stderr=b"",
-                )
-            raise AssertionError(f"unexpected subprocess: {cmd}")
+        def _iw_dispatch(cmd, **kwargs):
+            assert cmd[0] == "iw"
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=b"Interface ap0\n\tchannel 11 (2462 MHz), width: 20 MHz\n",
+                stderr=b"",
+            )
 
-        monkeypatch.setattr(subprocess, "run", _dispatch)
+        monkeypatch.setattr(subprocess, "run", _iw_dispatch)
         actuator = HostapdChannelActuator(hostapd_conf_path=hostapd_conf_file)
         actuator(_decision(11))
-        # Hops in order: netctl (sudo) then iw.
-        assert calls[0][0] == "sudo"
-        assert calls[0][1][:4] == [
-            "sudo",
-            "-n",
-            "/usr/local/sbin/openmarquee-netctl",
-            "hostapd-write-and-restart",
-        ]
-        # The new config was passed via STDIN; channel=11 in the
-        # piped bytes.
-        piped = calls[0][2]
-        assert piped is not None
-        assert b"channel=11" in piped
-        assert b"channel=6" not in piped
-        # Post-verify via iw.
-        assert calls[1][0] == "iw"
+        # The new config (with channel=11 substituted) was the netctl payload.
+        assert len(payloads) == 1
+        assert "channel=11" in payloads[0]
+        assert "channel=6" not in payloads[0]
 
     def test_raises_when_target_channel_is_none(self, hostapd_conf_file: Path):
         actuator = HostapdChannelActuator(hostapd_conf_path=hostapd_conf_file)
@@ -172,116 +181,96 @@ class TestHostapdChannelActuator:
         with pytest.raises(HostapdActuationError, match="failed to read"):
             actuator(_decision(11))
 
-    def test_raises_when_netctl_returns_nonzero(self, hostapd_conf_file: Path, monkeypatch):
-        """P1.2-B.1: netctl returning non-zero (e.g. systemctl
-        restart hostapd failed inside the helper) propagates as
+    def test_raises_when_netctl_daemon_returns_err(self, hostapd_conf_file: Path, monkeypatch):
+        """P1.2-B.2: daemon ERR response (e.g. systemctl restart
+        hostapd failed inside the helper) propagates as
         HostapdActuationError."""
-
-        def _dispatch(cmd, **kwargs):
-            if cmd[0] == "sudo":
-                return subprocess.CompletedProcess(
-                    cmd, 1, stdout=b"", stderr=b"hostapd unit failed"
-                )
-            raise AssertionError(f"unexpected: {cmd}")
-
-        monkeypatch.setattr(subprocess, "run", _dispatch)
+        _netctl_raising(
+            monkeypatch,
+            HostapdActuationError(
+                "netctl hostapd-write-and-restart: helper rc=1: hostapd unit failed"
+            ),
+        )
         actuator = HostapdChannelActuator(hostapd_conf_path=hostapd_conf_file)
-        with pytest.raises(HostapdActuationError, match="netctl hostapd-write-and-restart"):
+        with pytest.raises(HostapdActuationError, match="hostapd-write-and-restart"):
             actuator(_decision(11))
 
     def test_raises_on_post_verify_mismatch(self, hostapd_conf_file: Path, monkeypatch):
-        """The load-bearing P1.2-A.1 NIT promoted to P1.2-B BLOCKER:
-        systemctl restart returning 0 does NOT guarantee hostapd is
-        beaconing on the target channel. iw post-verify catches the
-        mismatch + raises so the supervisor doesn't advance
-        _current_ap_channel optimistically.
+        """The load-bearing P1.2-A.1 NIT (P1.2-B BLOCKER): systemctl
+        restart returning 0 does NOT guarantee hostapd is beaconing
+        on the target channel. iw post-verify catches the mismatch +
+        raises so the supervisor doesn't advance _current_ap_channel
+        optimistically.
         """
+        _netctl_ok_recorder(monkeypatch)
 
-        def _dispatch(cmd, **kwargs):
-            if cmd[0] == "sudo":
-                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
-            if cmd[0] == "iw":
-                # hostapd actually beaconing on ch 6, NOT target ch 11.
-                return subprocess.CompletedProcess(
-                    cmd,
-                    0,
-                    stdout=b"Interface ap0\n\tchannel 6 (2437 MHz)\n",
-                    stderr=b"",
-                )
-            raise AssertionError(f"unexpected: {cmd}")
+        def _iw_dispatch(cmd, **kwargs):
+            assert cmd[0] == "iw"
+            # hostapd actually beaconing on ch 6, NOT target ch 11.
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=b"Interface ap0\n\tchannel 6 (2437 MHz)\n",
+                stderr=b"",
+            )
 
-        monkeypatch.setattr(subprocess, "run", _dispatch)
+        monkeypatch.setattr(subprocess, "run", _iw_dispatch)
         actuator = HostapdChannelActuator(hostapd_conf_path=hostapd_conf_file)
         with pytest.raises(HostapdActuationError, match="post-verify mismatch"):
             actuator(_decision(11))
 
     def test_raises_when_iw_binary_missing(self, hostapd_conf_file: Path, monkeypatch):
-        def _dispatch(cmd, **kwargs):
-            if cmd[0] == "sudo":
-                return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
-            if cmd[0] == "iw":
-                raise FileNotFoundError(2, "No such file or directory", "iw")
-            raise AssertionError(f"unexpected: {cmd}")
+        _netctl_ok_recorder(monkeypatch)
 
-        monkeypatch.setattr(subprocess, "run", _dispatch)
+        def _iw_dispatch(cmd, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "iw")
+
+        monkeypatch.setattr(subprocess, "run", _iw_dispatch)
         actuator = HostapdChannelActuator(hostapd_conf_path=hostapd_conf_file)
         with pytest.raises(HostapdActuationError, match="iw binary not found"):
             actuator(_decision(11))
 
     def test_raises_on_netctl_timeout(self, hostapd_conf_file: Path, monkeypatch):
-        def _dispatch(cmd, **kwargs):
-            if cmd[0] == "sudo":
-                raise subprocess.TimeoutExpired(cmd, timeout=kwargs.get("timeout", 15))
-            raise AssertionError(f"unexpected: {cmd}")
-
-        monkeypatch.setattr(subprocess, "run", _dispatch)
+        """P1.2-B.2: timeout inside the socket call (e.g. daemon
+        hung) propagates as HostapdActuationError."""
+        _netctl_raising(
+            monkeypatch,
+            HostapdActuationError("netctl hostapd-write-and-restart: response timed out after 15s"),
+        )
         actuator = HostapdChannelActuator(hostapd_conf_path=hostapd_conf_file)
         with pytest.raises(HostapdActuationError, match="timed out"):
             actuator(_decision(11))
 
 
 # ============================================================
-# Atomicity: write happens via tempfile + rename.
+# Socket-protocol contract (P1.2-B.2): the new config goes through
+# the netctl socket as payload, not via argv. The daemon spawned by
+# the systemd template receives subcommand on line 1 + payload
+# bytes after.
 # ============================================================
 
 
-def test_actuator_pipes_new_conf_through_netctl_stdin(hostapd_conf_file, monkeypatch):
-    """P1.2-B.1: the new config text is piped to netctl via STDIN,
-    NOT via argv. (argv-injection of file bytes is the reason the
-    sudoers grant blocks trailing args on the helper.)
+def test_actuator_passes_new_conf_as_netctl_payload(hostapd_conf_file, monkeypatch):
+    """P1.2-B.2: the actuator's call to
+    _run_netctl_hostapd_write_and_restart passes the new conf as
+    the first arg (which the helper sends over the socket as the
+    payload after the subcommand line). This pins the privilege-
+    boundary contract."""
+    payloads = _netctl_ok_recorder(monkeypatch)
 
-    The actuator no longer writes hostapd.conf directly — that's
-    netctl's job. This test exercises the argv shape + STDIN
-    payload that lands at sudo."""
-    captured: dict = {}
+    def _iw_dispatch(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=b"\tchannel 11 (2462 MHz)\n",
+            stderr=b"",
+        )
 
-    def _dispatch(cmd, **kwargs):
-        if cmd[0] == "sudo":
-            captured["argv"] = cmd
-            captured["input"] = kwargs.get("input")
-            return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
-        if cmd[0] == "iw":
-            return subprocess.CompletedProcess(
-                cmd,
-                0,
-                stdout=b"\tchannel 11 (2462 MHz)\n",
-                stderr=b"",
-            )
-        raise AssertionError(f"unexpected: {cmd}")
-
-    monkeypatch.setattr(subprocess, "run", _dispatch)
+    monkeypatch.setattr(subprocess, "run", _iw_dispatch)
     actuator = HostapdChannelActuator(hostapd_conf_path=hostapd_conf_file)
     actuator(_decision(11))
-    # argv = sudo -n <netctl> hostapd-write-and-restart — exactly
-    # 4 elements (the sudoers grant matches this exact shape).
-    assert captured["argv"] == [
-        "sudo",
-        "-n",
-        "/usr/local/sbin/openmarquee-netctl",
-        "hostapd-write-and-restart",
-    ]
-    # The new config is in stdin, with channel=11 substituted in.
-    piped = captured["input"]
-    assert piped is not None
-    assert b"channel=11" in piped
-    assert b"channel=6" not in piped
+    assert len(payloads) == 1
+    # The payload is a str (the actuator's helper handles the
+    # encode-and-send) and contains the substituted channel.
+    assert "channel=11" in payloads[0]
+    assert "channel=6" not in payloads[0]
