@@ -441,12 +441,34 @@ pub fn read_v3d_bo_snapshot() -> V3dBoSnapshot {
     snap
 }
 
-/// r104 (2026-06-09): runtime kill-switch for video-decoder
-/// serialization. Default ENABLED. Set
-/// `OPENMARQUEE_VIDEO_DECODER_SERIALIZE=off` (or
-/// `0`/`false`/`no`/`disable`/`disabled`) to fall back to the
-/// pre-r104 concurrent-decoder behavior that wedges dual-1080p
-/// on Pi Zero 2 W's single bcm2835-codec VPU.
+/// r104 (2026-06-09) / r105 (2026-06-10): runtime kill-switch
+/// for video-decoder serialization. **r105: default DISABLED**
+/// (opt-in only).
+///
+/// History:
+/// - r104 shipped this with default ENABLED to unblock
+///   dual-1080p, but that REGRESSED dual-720p (where the
+///   codec handles concurrent decodes fine and pre-r104 both
+///   videos played during transition).
+/// - r104.1 attempted to mitigate via defer-eviction-to-
+///   BeginSlide; downstream paint_transition routing bug we
+///   could not close after 3 instrument rounds (r104.2/.3).
+/// - r105 flips the default to DISABLED so the canonical
+///   (720p) workloads get pre-r104 known-good behavior on
+///   fresh deploys. Dual-1080p operators opt-in via the env
+///   var (recipe: `systemctl set-environment
+///   OPENMARQUEE_VIDEO_DECODER_SERIALIZE=on`).
+///
+/// Polarity (r105):
+/// - Default (env unset OR off-lexicon) -> DISABLED
+///   (pre-r104 concurrent-decoder behavior).
+/// - On-lexicon (`1`/`on`/`true`/`yes`/`enable`/`enabled`,
+///   case-insens, trimmed) -> ENABLED (r104 +
+///   r104.1/.2/.3 logic engaged).
+/// - Any other value -> DEFAULT DISABLED (errs on the side
+///   of "do not break 720p"; r104's previous default-ENABLED
+///   policy was the wrong-direction default for the canonical
+///   workload).
 ///
 /// When enabled, the BeginTransition handler force-evicts the
 /// outgoing slide's bg-video decoder BEFORE priming the
@@ -462,9 +484,12 @@ pub fn is_video_decoder_serialization_enabled() -> bool {
     match std::env::var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE") {
         Ok(s) => {
             let v = s.trim().to_ascii_lowercase();
-            !matches!(v.as_str(), "0" | "off" | "false" | "no" | "disable" | "disabled")
+            matches!(
+                v.as_str(),
+                "1" | "on" | "true" | "yes" | "enable" | "enabled",
+            )
         }
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -3729,15 +3754,20 @@ mod tests {
     }
 
     #[test]
-    fn is_video_decoder_serialization_enabled_defaults_to_on() {
+    fn r105_is_video_decoder_serialization_enabled_defaults_to_off() {
+        // r105 (2026-06-10): polarity flip. Default is now OFF
+        // (pre-r104 concurrent-decoder behavior) so canonical
+        // 720p workloads aren't regressed. Dual-1080p operators
+        // opt-in via the env var.
         let _guard = COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE").ok();
         std::env::remove_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE");
         assert!(
-            is_video_decoder_serialization_enabled(),
-            "default (env unset) must enable serialization on Pi Zero 2 W",
+            !is_video_decoder_serialization_enabled(),
+            "r105: default (env unset) must DISABLE serialization \
+             so pre-r104 concurrent-decoder behavior holds on 720p",
         );
         if let Some(v) = prior {
             std::env::set_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE", v);
@@ -3745,23 +3775,33 @@ mod tests {
     }
 
     #[test]
-    fn is_video_decoder_serialization_enabled_off_values_disable() {
+    fn r105_is_video_decoder_serialization_enabled_on_values_opt_in() {
         let _guard = COUNTER_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prior = std::env::var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE").ok();
-        for off in ["0", "off", "false", "no", "disable", "disabled", "OFF"] {
-            std::env::set_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE", off);
-            assert!(
-                !is_video_decoder_serialization_enabled(),
-                "value {off:?} must disable serialization",
-            );
-        }
-        for on in ["1", "on", "yes", "enable", "enabled", "", "garbage"] {
+        // r105: on-lexicon opts in (operator explicit intent
+        // for hardware tiers where dual-1080p contention
+        // actually matters).
+        for on in ["1", "on", "true", "yes", "enable", "enabled", "ON", "TrUe"] {
             std::env::set_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE", on);
             assert!(
                 is_video_decoder_serialization_enabled(),
-                "value {on:?} must keep serialization enabled (default-on policy)",
+                "r105: value {on:?} must opt-in to serialization",
+            );
+        }
+        // r105: every other value (including the OLD off-lexicon
+        // and unrecognised values) keeps serialization DISABLED.
+        // This is the polarity flip vs r104.
+        for off in [
+            "0", "off", "false", "no", "disable", "disabled",
+            "OFF", "garbage", "", "yep",
+        ] {
+            std::env::set_var("OPENMARQUEE_VIDEO_DECODER_SERIALIZE", off);
+            assert!(
+                !is_video_decoder_serialization_enabled(),
+                "r105: value {off:?} must keep serialization DISABLED \
+                 (default-off policy; only on-lexicon opts in)",
             );
         }
         if let Some(v) = prior {
