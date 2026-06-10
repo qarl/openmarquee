@@ -364,6 +364,15 @@ pub struct EglSession<'a> {
     /// (HDMI hot-plug, rotation flip). `None` while the cache
     /// is empty.
     transition_fbo_dims: Option<(u32, u32)>,
+    /// r106 (2026-06-10): per-side "has-been-painted-this-cycle"
+    /// flags. Set to true after a successful bake fills the
+    /// cached FBO. Cleared when the pair is freshly allocated
+    /// (so the first Ok(None) tick of a fresh transition does
+    /// NOT paint undefined GL contents). Used by the r106
+    /// decoupled feed-drain path so Ok(None) reuses cached
+    /// content only when content actually exists.
+    transition_fbo_a_painted: bool,
+    transition_fbo_b_painted: bool,
     /// STREAM/VLC slice-9 follow-up: persistent texture for the
     /// external-frame push-paint path. Allocated once with
     /// glTexImage2D and thereafter updated in place with
@@ -727,6 +736,8 @@ where
         transition_fbo_b: None,
         transition_tex_b: None,
         transition_fbo_dims: None,
+        transition_fbo_a_painted: false,
+        transition_fbo_b_painted: false,
         external_frame_tex: None,
         external_nv12_tex: None,
         current_settings: crate::content::Settings::default(),
@@ -5052,14 +5063,46 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
-        let Some((fbo_a, tex_a)) =
-            bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, cached_pair_a, inputs_a)?
-        else {
-            crate::hdmi_logic::warn_paint_transition_skip(
-                kind, progress, "endpoint_a_no_frame",
-            );
-            return Ok(false);
+        // r106 (2026-06-10): on Ok(None) (no frame this tick),
+        // if the cached transition_fbo_a has been painted on a
+        // prior tick AND the decouple kill switch is enabled,
+        // REUSE the cached pair instead of skipping the tick.
+        // Visible result: bake_a re-shows the previous frame
+        // until the codec catches up, instead of a 100%-skip
+        // wedge. Falls back to the pre-r106 skip-tick behavior
+        // when the FBO has never been painted (first-tick-of-
+        // first-transition) or when decouple is disabled.
+        let bake_a_result = bake_slide_to_fbo(
+            session, mode_w_u32, mode_h_u32, cached_pair_a, inputs_a,
+        )?;
+        let (fbo_a, tex_a, bake_a_was_fresh) = match bake_a_result {
+            Some((f, t)) => (f, t, true),
+            None => {
+                let decouple_enabled = crate::v4l2::is_feed_drain_decouple_enabled();
+                if decouple_enabled && session.transition_fbo_a_painted {
+                    if let Some((f, t)) = cached_pair_a {
+                        eprintln!(
+                            "[perf] paint_transition_reuse_cached_a kind={} progress={:.3}",
+                            kind, progress,
+                        );
+                        (f, t, false)
+                    } else {
+                        crate::hdmi_logic::warn_paint_transition_skip(
+                            kind, progress, "endpoint_a_no_frame",
+                        );
+                        return Ok(false);
+                    }
+                } else {
+                    crate::hdmi_logic::warn_paint_transition_skip(
+                        kind, progress, "endpoint_a_no_frame",
+                    );
+                    return Ok(false);
+                }
+            }
         };
+        if bake_a_was_fresh && cached_pair_a.is_some() {
+            session.transition_fbo_a_painted = true;
+        }
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
         //
         // r80-r92 tried to PRE-PROVIDE endpoint_b's first frame at
@@ -5214,6 +5257,12 @@ pub fn paint_and_present_one_transition_frame(
                             kind, progress, bake_b_iterations, elapsed_us, bake_b_deadline_ms,
                         );
                     }
+                    // r106: mark the cached b-pair as painted-
+                    // with-content so future Ok(None) ticks may
+                    // reuse it instead of skipping.
+                    if cached_pair_b.is_some() {
+                        session.transition_fbo_b_painted = true;
+                    }
                     break p;
                 }
                 Ok(None) => {
@@ -5244,7 +5293,25 @@ pub fn paint_and_present_one_transition_frame(
                         }
                         _ => true, // Text/Image never returns None
                     };
-                    if deadline_ok && iter_ok && samples_remaining_ok {
+                    // r106 (2026-06-10): when feed-drain decouple
+                    // is enabled (default), zero retries here --
+                    // the bake_b call is already non-blocking and
+                    // a single Ok(None) means "no frame this
+                    // tick; reuse the cached previous-frame
+                    // content if available". Path B's retry was
+                    // designed for the pre-r106 blocking-feed
+                    // pattern where bake was a single attempt
+                    // with a 30ms inner EAGAIN wait; under
+                    // decouple ON the inner loop is gone and
+                    // retries here would just re-ask the same
+                    // kernel state.
+                    let decouple_enabled_local =
+                        crate::v4l2::is_feed_drain_decouple_enabled();
+                    if !decouple_enabled_local
+                        && deadline_ok
+                        && iter_ok
+                        && samples_remaining_ok
+                    {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                         continue;
                     }
@@ -5264,16 +5331,48 @@ pub fn paint_and_present_one_transition_frame(
                          deadline_ms={}",
                         kind, progress, bake_b_iterations, elapsed_us, reason, bake_b_deadline_ms,
                     );
+                    // r106 (2026-06-10): if decouple ON AND
+                    // transition_fbo_b has prior-paint content,
+                    // REUSE cached_pair_b instead of skipping
+                    // the tick. The transition shader will
+                    // composite slide A's fresh frame with
+                    // slide B's previous frame -- visible
+                    // result is "slide B's video plays at
+                    // whatever rate the codec delivers"
+                    // instead of "transition wedges at 0
+                    // frames".
+                    let decouple_enabled = crate::v4l2::is_feed_drain_decouple_enabled();
+                    if decouple_enabled && session.transition_fbo_b_painted {
+                        if let Some(reuse) = cached_pair_b {
+                            eprintln!(
+                                "[perf] paint_transition_reuse_cached_b kind={} progress={:.3}",
+                                kind, progress,
+                            );
+                            break reuse;
+                        }
+                    }
                     crate::hdmi_logic::warn_paint_transition_skip(
                         kind, progress, "endpoint_b_no_frame",
                     );
-                    session.gl.delete_framebuffer(fbo_a);
-                    session.gl.delete_texture(tex_a);
+                    // r106 subagent BLOCKER-1 (pre-existing,
+                    // r106 makes more reachable): only delete
+                    // fbo_a/tex_a when the r102.2 cache is OFF.
+                    // When cache is ON, fbo_a/tex_a are the
+                    // session-owned cached handles --
+                    // delete here would dangle
+                    // session.transition_fbo_a / _tex_a and
+                    // cleanup_resources would double-free.
+                    if !crate::v4l2::is_transition_fbo_cache_enabled() {
+                        session.gl.delete_framebuffer(fbo_a);
+                        session.gl.delete_texture(tex_a);
+                    }
                     return Ok(false);
                 }
                 Err(e) => {
-                    session.gl.delete_framebuffer(fbo_a);
-                    session.gl.delete_texture(tex_a);
+                    if !crate::v4l2::is_transition_fbo_cache_enabled() {
+                        session.gl.delete_framebuffer(fbo_a);
+                        session.gl.delete_texture(tex_a);
+                    }
                     return Err(e);
                 }
             }
@@ -6987,6 +7086,10 @@ unsafe fn ensure_transition_fbo_pair(
             session.gl.delete_texture(tex);
         }
         session.transition_fbo_dims = None;
+        // r106: dim-change invalidates the painted flags too;
+        // the newly allocated FBO will have undefined contents.
+        session.transition_fbo_a_painted = false;
+        session.transition_fbo_b_painted = false;
     }
     let (slot_fbo, slot_tex) = match side {
         TransitionFboSide::A => (&mut session.transition_fbo_a, &mut session.transition_tex_a),
@@ -7007,6 +7110,15 @@ unsafe fn ensure_transition_fbo_pair(
     session.transition_fbo_dims = Some((w, h));
     *slot_fbo = Some(fbo);
     *slot_tex = Some(tex);
+    // r106: freshly allocated pair has UNDEFINED color
+    // attachment contents (GL spec). Clear the painted flag for
+    // THIS side so the r106 reuse-on-Ok(None) path falls back
+    // to the legacy skip-tick until a successful bake fills
+    // the pair.
+    match side {
+        TransitionFboSide::A => session.transition_fbo_a_painted = false,
+        TransitionFboSide::B => session.transition_fbo_b_painted = false,
+    }
     Ok((fbo, tex))
 }
 
@@ -8096,42 +8208,84 @@ unsafe fn bake_video_slide_to_current_fbo(
         // reel path (render_video_slide_in_session at hdmi.rs:3025-
         // 3034) already follows this pattern.
     }
-    let s = &samples[*next_sample_idx];
-    decoder
-        .feed(s)
-        .with_context(|| format!("feed sample {}", *next_sample_idx))?;
-    *next_sample_idx += 1;
-    if let Some(t) = t_feed_start {
-        eprintln!("[firstframe] feed={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
-    }
-    let t_dqbuf_start = if profile_first { Some(std::time::Instant::now()) } else { None };
-    // perf-night r5 (2026-05-26): boost EAGAIN budget from 5*2ms=10ms
-    // to 10*3ms=30ms. r3 baseline showed cold-start ticks exhaust the
-    // 10ms budget then early-return wasted (no paint, no decode
-    // progress). 30ms covers bcm2835-codec's slow path AND still
-    // leaves 3ms inside the 33ms 30fps frame budget for GL work
-    // (r4 DMABUF data: compose+present p99 ~1.9ms). Tradeoff:
-    // occasional 30ms ticks during warmup window vs. fewer wasted
-    // advances. Combined with prime-time warmup pre-feed in
-    // video_decode.rs, steady-state should rarely exceed 5*3ms=15ms
-    // (decoder pipeline pre-filled, dqbuf wakes on first/second
-    // retry).
+    // r106 (2026-06-10): when feed-drain decouple is enabled
+    // (default), top up samples non-blockingly into every free
+    // OUTPUT slot + a single non-blocking next_frame() attempt.
+    // No sleeps; the caller (paint_and_present_one_transition_
+    // frame) handles Ok(None) by reusing the prior tick's
+    // cached FBO content. When the kill switch is off, fall back
+    // to the pre-r106 blocking feed + 10x3ms inner loop.
+    let decouple_enabled = crate::v4l2::is_feed_drain_decouple_enabled();
     let mut frame_opt: Option<crate::v4l2::Frame> = None;
-    for _ in 0..10 {
-        match decoder.next_frame() {
-            Ok(Some(f)) => {
-                frame_opt = Some(f);
-                break;
+    if decouple_enabled {
+        // Top up: feed samples until OUTPUT pool is full or
+        // demuxer samples exhausted (no wrap-around here; the
+        // caller's wrap-and-reprime handles end-of-clip).
+        let mut topped_up = 0usize;
+        while *next_sample_idx < samples.len() {
+            let sample = &samples[*next_sample_idx];
+            match decoder.try_feed_nonblocking(sample) {
+                Ok(true) => {
+                    *next_sample_idx += 1;
+                    topped_up += 1;
+                }
+                Ok(false) => break,
+                Err(e) => {
+                    return Err(e).context(format!(
+                        "try_feed_nonblocking sample {}",
+                        *next_sample_idx,
+                    ));
+                }
             }
-            Ok(None) => break,
-            Err(e) if e.to_string().contains("EAGAIN") => {
-                std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        if let Some(t) = t_feed_start {
+            eprintln!(
+                "[firstframe] feed_topup={:.2}ms count={}",
+                t.elapsed().as_secs_f64() * 1000.0, topped_up,
+            );
+        }
+        let t_dqbuf_start = if profile_first { Some(std::time::Instant::now()) } else { None };
+        // Single non-blocking DQBUF attempt. If EAGAIN, return
+        // Ok(None) up to the caller -- they'll paint the cached
+        // FBO content (r102.2) under r106's contract.
+        match decoder.next_frame() {
+            Ok(Some(f)) => frame_opt = Some(f),
+            Ok(None) => {} // EOS; treated as no-frame this tick.
+            Err(ref e) if e.to_string().contains("EAGAIN") => {
+                // no-frame this tick; frame_opt stays None.
             }
             Err(e) => return Err(e).context("next_frame"),
         }
-    }
-    if let Some(t) = t_dqbuf_start {
-        eprintln!("[firstframe] dqbuf={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+        if let Some(t) = t_dqbuf_start {
+            eprintln!("[firstframe] dqbuf_nonblock={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+    } else {
+        // Pre-r106 path: blocking feed + 10x3ms EAGAIN loop.
+        let s = &samples[*next_sample_idx];
+        decoder
+            .feed(s)
+            .with_context(|| format!("feed sample {}", *next_sample_idx))?;
+        *next_sample_idx += 1;
+        if let Some(t) = t_feed_start {
+            eprintln!("[firstframe] feed={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
+        let t_dqbuf_start = if profile_first { Some(std::time::Instant::now()) } else { None };
+        for _ in 0..10 {
+            match decoder.next_frame() {
+                Ok(Some(f)) => {
+                    frame_opt = Some(f);
+                    break;
+                }
+                Ok(None) => break,
+                Err(e) if e.to_string().contains("EAGAIN") => {
+                    std::thread::sleep(std::time::Duration::from_millis(3));
+                }
+                Err(e) => return Err(e).context("next_frame"),
+            }
+        }
+        if let Some(t) = t_dqbuf_start {
+            eprintln!("[firstframe] dqbuf={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
     }
     let Some(frame) = frame_opt else {
         // No frame ready this tick. Caller should skip swap+commit.
@@ -15634,6 +15788,65 @@ mod r102_2_tests {
              and vertex_attrib_pointer_f32. The cache helper only \
              binds on first-create; subsequent ticks inherit whatever \
              bake_a/bake_b left bound (cover_quad_vbo, text VBO, etc).",
+        );
+    }
+
+    #[test]
+    fn r106_session_has_painted_flags_and_reuse_paths() {
+        // r106 (2026-06-10): pin the EglSession painted flags
+        // (per-side "has the transition FBO ever been written"
+        // tracking) AND the bake_a/bake_b Ok(None) reuse paths
+        // that gate the previous-frame-paint on those flags.
+        // If a future refactor drops the flags or the reuse
+        // branches, the dual-1080p unblock regresses silently.
+        let src = include_str!("hdmi.rs");
+        for field in [
+            "transition_fbo_a_painted: bool",
+            "transition_fbo_b_painted: bool",
+        ] {
+            assert!(
+                src.contains(field),
+                "r106 EglSession painted flag missing or renamed: `{field}`",
+            );
+        }
+        assert!(
+            src.contains("session.transition_fbo_a_painted = true"),
+            "r106: bake_a success path must set transition_fbo_a_painted=true \
+             so subsequent Ok(None) ticks can reuse cached content",
+        );
+        assert!(
+            src.contains("session.transition_fbo_b_painted = true"),
+            "r106: bake_b success path must set transition_fbo_b_painted=true",
+        );
+        assert!(
+            src.contains("paint_transition_reuse_cached_a"),
+            "r106: bake_a Ok(None) reuse-cached probe missing -- regression \
+             would re-introduce the skip-tick behavior on dual-1080p",
+        );
+        assert!(
+            src.contains("paint_transition_reuse_cached_b"),
+            "r106: bake_b Ok(None) reuse-cached probe missing",
+        );
+        // r106 subagent WARN-4: also pin the RESET-false sites
+        // (dim-change + fresh-alloc). If a future refactor drops
+        // the resets, painted=true would persist across genuinely-
+        // invalidated caches -> reuse-of-undefined-GL-memory.
+        assert!(
+            src.contains("session.transition_fbo_a_painted = false"),
+            "r106: missing reset-to-false for transition_fbo_a_painted \
+             (must fire on dim-change AND fresh-alloc)",
+        );
+        assert!(
+            src.contains("session.transition_fbo_b_painted = false"),
+            "r106: missing reset-to-false for transition_fbo_b_painted",
+        );
+        // At least 2 occurrences each (dim-change + fresh-alloc
+        // per side).
+        assert!(
+            src.matches("transition_fbo_a_painted = false").count() >= 2,
+            "r106: expected >=2 reset sites for transition_fbo_a_painted \
+             (dim-change + fresh-alloc), found {}",
+            src.matches("transition_fbo_a_painted = false").count(),
         );
     }
 

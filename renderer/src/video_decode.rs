@@ -575,6 +575,14 @@ pub struct DrainDetail {
     pub eagain_polls: usize,
     pub other_errs: usize,
     pub eos_seen: bool,
+    /// r106 (2026-06-10): cumulative count of samples top-up-fed
+    /// during the drain window. Pre-r106 the drain loop fed
+    /// nothing here -- the codec input pool stayed at the 3 AUs
+    /// from prime time. r106's top-up keeps feeding whenever
+    /// `try_feed_nonblocking` returns true, pushing the codec
+    /// past its dual-1080p contention threshold. Emitted on the
+    /// `preload_handoff_drain_detail` perf line for QA visibility.
+    pub eagain_topup_fed_count: usize,
 }
 
 /// Public drain that delegates to the detail-recording variant with
@@ -591,10 +599,81 @@ pub fn drain_one_capture_for_preload(
 /// r78 Phase A: detail-recording variant. Same logic; accumulates
 /// per-poll outcomes into `detail` so the caller can emit them on
 /// a separate parser-friendly perf line.
+/// r106 (2026-06-10): non-blocking top-up feed helper.
+/// Feeds samples from `dem.samples[next_sample_idx..]` into the
+/// decoder's OUTPUT pool until either:
+/// - the pool has no free slot (returns Ok, count of fed
+///   samples >= 0),
+/// - the demuxer's samples are exhausted (no wrap-around;
+///   caller handles wrap via reprime if needed),
+/// - a feed call returns Err (propagated).
+///
+/// Used by the r106 decoupled feed-drain pattern so each
+/// transition tick keeps every active decoder's input pool
+/// well-stocked without blocking. Returns Ok(fed_count) on
+/// success.
+#[cfg(target_os = "linux")]
+pub fn top_up_feed_nonblocking(
+    dec_state: &mut VideoDecoderState,
+    dem: &Mp4Demuxer,
+) -> Result<usize> {
+    let mut fed = 0usize;
+    while dec_state.next_sample_idx < dem.samples.len() {
+        let sample = &dem.samples[dec_state.next_sample_idx];
+        match dec_state.decoder.try_feed_nonblocking(sample) {
+            Ok(true) => {
+                dec_state.next_sample_idx += 1;
+                fed += 1;
+            }
+            Ok(false) => {
+                // Pool full. Stop here; caller will retry on the
+                // next tick.
+                break;
+            }
+            Err(e) => {
+                return Err(e).context(format!(
+                    "top_up_feed_nonblocking: feed sample {} failed",
+                    dec_state.next_sample_idx,
+                ));
+            }
+        }
+    }
+    Ok(fed)
+}
+
 pub fn drain_one_capture_for_preload_with_detail(
     dec_state: &mut VideoDecoderState,
     budget_ms: u64,
     detail: &mut DrainDetail,
+) -> usize {
+    // r106 (2026-06-10): when no Mp4Demuxer is provided, fall
+    // back to the original drain-only behavior (pre-r106). This
+    // overload preserves backward compatibility for tests + any
+    // future caller that genuinely wants drain-only.
+    drain_one_capture_for_preload_with_detail_and_topup(
+        dec_state, budget_ms, detail, None,
+    )
+}
+
+/// r106 (2026-06-10): drain variant that ALSO tops up the
+/// decoder's input pool on every EAGAIN poll. The root cause
+/// of the dual-1080p wedge was that the pre-r106 preload path
+/// fed exactly 3 AUs (primer + warmup=2) then drained a starved
+/// pipeline -- the firmware can't decode 1080p with so few
+/// inputs under contention. Per QA's live-fire proof, ffmpeg
+/// succeeds because it keeps ~16 AUs queued.
+///
+/// When `dem` is `Some`, each EAGAIN iteration calls
+/// `top_up_feed_nonblocking` to push more samples into OUTPUT
+/// slots that have freed up since the last attempt. Returns the
+/// same `drained` count (0 or 1) -- the drain semantics are
+/// unchanged; only the feed cadence improves.
+pub fn drain_one_capture_for_preload_with_detail_and_topup(
+    dec_state: &mut VideoDecoderState,
+    budget_ms: u64,
+    detail: &mut DrainDetail,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    dem: Option<&Mp4Demuxer>,
 ) -> usize {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_millis(budget_ms);
@@ -638,6 +717,34 @@ pub fn drain_one_capture_for_preload_with_detail(
                 // hdmi.rs:7685's 3ms -- worker latency is not
                 // user-visible so we save a few syscalls.
                 detail.eagain_polls += 1;
+                // r106 (2026-06-10): top-up feed on every EAGAIN
+                // poll when the demuxer is available. The pre-
+                // r106 path looped here for 503ms feeding
+                // ZERO samples; ffmpeg succeeds by keeping ~16
+                // AUs queued. We push as many samples as the
+                // OUTPUT pool will accept this iteration --
+                // typically 0-4 samples depending on how many
+                // slots the kernel released since the last
+                // try_feed_nonblocking call.
+                #[cfg(target_os = "linux")]
+                if let Some(dem) = dem {
+                    match top_up_feed_nonblocking(dec_state, dem) {
+                        Ok(fed) => {
+                            if fed > 0 {
+                                detail.eagain_topup_fed_count += fed;
+                            }
+                        }
+                        Err(err) => {
+                            // Don't bail the whole drain; the
+                            // err might be transient. Log + keep
+                            // trying.
+                            eprintln!(
+                                "[perf] preload_topup_feed_err err={:#}",
+                                err
+                            );
+                        }
+                    }
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
             Err(e) => {
@@ -718,15 +825,30 @@ pub fn prime_video_decoder_for_preload(
         let budget_ms = preload_capture_drain_budget_ms();
         let t_drain = Instant::now();
         let mut detail = DrainDetail::default();
-        let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
+        // r106 (2026-06-10): when feed-drain decouple is enabled
+        // (default), thread the Mp4Demuxer through so the drain
+        // loop tops up the codec input pool on every EAGAIN
+        // iteration. Pre-r106 path fed exactly 3 AUs and then
+        // sat polling a starved decoder for 503ms; r106 keeps
+        // pushing samples as long as OUTPUT slots free up.
+        let decouple_enabled = crate::v4l2::is_feed_drain_decouple_enabled();
+        let drained = if decouple_enabled {
+            drain_one_capture_for_preload_with_detail_and_topup(
+                &mut state, budget_ms, &mut detail, Some(dem),
+            )
+        } else {
+            drain_one_capture_for_preload_with_detail(
+                &mut state, budget_ms, &mut detail,
+            )
+        };
         let drain_us = t_drain.elapsed().as_micros();
         eprintln!(
-            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={} was_deferred=false",
-            slide_id, drained, prime_only_us, drain_us, budget_ms,
+            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={} was_deferred=false decouple={}",
+            slide_id, drained, prime_only_us, drain_us, budget_ms, decouple_enabled,
         );
         eprintln!(
-            "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
-            slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
+            "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={} eagain_topup_fed_count={}",
+            slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen, detail.eagain_topup_fed_count,
         );
         return Ok(state);
     }
