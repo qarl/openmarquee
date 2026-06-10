@@ -5281,6 +5281,24 @@ pub fn paint_and_present_one_transition_frame(
             None
         };
         let mut bake_b_iterations: u32 = 0;
+        // r109.2 (2026-06-10) per QA dispatch: snapshot the
+        // bake_b decoder's next_sample_idx BEFORE the loop so
+        // we can report `fed_count` (delta) on the
+        // bake_b_poll_outcome line. Tells QA how many AUs we
+        // actually pushed to B during the priming window — if
+        // it's <8, our top-up isn't filling B's queue and
+        // pool-depth alone won't help; if it's ≥8 but bake_b
+        // still gets no frame, the firmware is still
+        // deprioritizing despite a deep queue.
+        // r109.2 subagent NIT-2: keep this snapshot's
+        // non-feed-endpoint fallback symmetric with the
+        // cur_idx readback below (`_ => bake_b_start_sample_idx`)
+        // so Text/Image end up with fed_count=0 via identity.
+        let bake_b_start_sample_idx: usize = match &endpoint_b {
+            TransitionEndpoint::Video { next_sample_idx, .. } => **next_sample_idx,
+            TransitionEndpoint::TextOverVideo { bg_next_sample_idx, .. } => **bg_next_sample_idx,
+            _ => 0, // Text/Image; cur_idx falls back to this same 0 → delta=0
+        };
         let (fbo_b, tex_b) = loop {
             bake_b_iterations += 1;
             // Re-build inputs_b on each iteration. The match consumes
@@ -5361,11 +5379,19 @@ pub fn paint_and_present_one_transition_frame(
                             } else {
                                 "other"
                             };
+                        // r109.2: fed_count = AUs we pushed to B
+                        // during the priming window.
+                        let cur_idx = match &endpoint_b {
+                            TransitionEndpoint::Video { next_sample_idx, .. } => **next_sample_idx,
+                            TransitionEndpoint::TextOverVideo { bg_next_sample_idx, .. } => **bg_next_sample_idx,
+                            _ => bake_b_start_sample_idx,
+                        };
+                        let fed_count = cur_idx.saturating_sub(bake_b_start_sample_idx);
                         eprintln!(
                             "[perf] bake_b_poll_outcome kind={} progress={:.3} \
                              iterations={} elapsed_us={} result=ok_after_polling \
-                             deadline_ms={} trigger={}",
-                            kind, progress, bake_b_iterations, elapsed_us, bake_b_deadline_ms, trigger,
+                             deadline_ms={} trigger={} fed_count={}",
+                            kind, progress, bake_b_iterations, elapsed_us, bake_b_deadline_ms, trigger, fed_count,
                         );
                     }
                     // r106: mark the cached b-pair as painted-
@@ -5483,11 +5509,23 @@ pub fn paint_and_present_one_transition_frame(
                         } else {
                             "other"
                         };
+                    // r109.2: fed_count = AUs pushed to B during
+                    // the priming window. Tells QA whether our
+                    // top-up is filling B's queue (low fed_count
+                    // → priming is feed-starved, not depth-
+                    // starved) or whether the firmware is still
+                    // deprioritizing B despite a full queue.
+                    let cur_idx = match &endpoint_b {
+                        TransitionEndpoint::Video { next_sample_idx, .. } => **next_sample_idx,
+                        TransitionEndpoint::TextOverVideo { bg_next_sample_idx, .. } => **bg_next_sample_idx,
+                        _ => bake_b_start_sample_idx,
+                    };
+                    let fed_count = cur_idx.saturating_sub(bake_b_start_sample_idx);
                     eprintln!(
                         "[perf] bake_b_poll_outcome kind={} progress={:.3} \
                          iterations={} elapsed_us={} result={} \
-                         deadline_ms={} trigger={}",
-                        kind, progress, bake_b_iterations, elapsed_us, reason, bake_b_deadline_ms, trigger,
+                         deadline_ms={} trigger={} fed_count={}",
+                        kind, progress, bake_b_iterations, elapsed_us, reason, bake_b_deadline_ms, trigger, fed_count,
                     );
                     // r109.1 (2026-06-10) subagent WARN-1 fix: a
                     // failed priming attempt burns the latch so

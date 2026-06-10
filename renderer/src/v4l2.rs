@@ -441,6 +441,44 @@ pub fn read_v3d_bo_snapshot() -> V3dBoSnapshot {
     snap
 }
 
+/// r109.2 (2026-06-10): OUTPUT pool depth for video-bg
+/// decoders. ffmpeg's v4l2_m2m allocates ~16 OUTPUT buffers
+/// and keeps the queue deep, which the bcm2835-codec firmware
+/// schedules favorably under dual-1080p contention. Our pre-
+/// r109.2 default was 4, which under contention drains to
+/// empty between paint ticks and the firmware deprioritizes B.
+/// QA evidence (r109.1 deploy): bake_b priming exhausted at
+/// 300ms AND 800ms hot-tuned deadline — decoder B got ZERO
+/// frames despite the codec being able to do dual-1080p
+/// (proven by the ffmpeg live-fire). Depth = the missing
+/// variable.
+///
+/// CMA cost per OUTPUT buffer at 1080p H.264 ≈ 2 MiB
+/// (bcm2835-codec OUTPUT sizeimage; see test fixture at line
+/// ~4352). r109.2 subagent WARN-1 corrected the initial
+/// ~768KB estimate.
+///
+/// Default 8 buffers × 2 MiB = ~16 MB per decoder. Dual-1080p
+/// (2 decoders) = ~32 MB during transitions. Net delta vs
+/// pre-r109.2's 4-buffer floor: +16 MB. Comfortably within
+/// post-r101/r102 CMA headroom (>60 MB).
+///
+/// Upper clamp = 16 (matches ffmpeg ballpark). 16 × 2 MiB × 2
+/// decoders = ~64 MB during dual-1080p — still safe. Operators
+/// pushing the clamp would hit the firmware's diminishing-
+/// returns curve well before CMA pressure becomes a concern.
+///
+/// `OPENMARQUEE_V4L2_OUTPUT_POOL_DEPTH` env override; clamped
+/// to [4, 16] so a typo can't bottom out below the pre-r109.2
+/// floor or balloon CMA.
+pub fn output_pool_depth() -> u32 {
+    let n = std::env::var("OPENMARQUEE_V4L2_OUTPUT_POOL_DEPTH")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(8);
+    n.clamp(4, 16)
+}
+
 /// r106 (2026-06-10): runtime kill-switch for the
 /// feed/drain decoupling fix. Default ENABLED.
 ///

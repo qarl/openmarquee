@@ -341,10 +341,23 @@ pub fn prime_video_decoder_with_warmup(
         }
     );
     let t_reqbufs = Instant::now();
-    dec.allocate_buffers(v4l2::QueueDirection::Output, 4)
+    // r109.2 (2026-06-10): env-tunable OUTPUT pool depth.
+    // Default bumped from 4 → 8 to match ffmpeg's deeper queue
+    // depth, which empirical evidence (ffmpeg live-fire on FYS)
+    // shows the bcm2835-codec firmware schedules favorably
+    // under dual-1080p contention. QA r109.1 verify confirmed
+    // bake_b priming exhausted at 300ms AND 800ms — the codec
+    // CAN serve B but only when our input queue stays as
+    // committed as A's.
+    let output_pool = v4l2::output_pool_depth();
+    dec.allocate_buffers(v4l2::QueueDirection::Output, output_pool)
         .context("REQBUFS OUTPUT")?;
     dec.allocate_buffers(v4l2::QueueDirection::Capture, 4)
         .context("REQBUFS CAPTURE")?;
+    eprintln!(
+        "[perf] prime_video_output_pool_depth depth={}",
+        output_pool,
+    );
     let reqbufs_us = t_reqbufs.elapsed().as_micros();
     let t_streamon = Instant::now();
     dec.start_streaming().context("STREAMON")?;
