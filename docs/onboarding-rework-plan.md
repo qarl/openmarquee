@@ -398,6 +398,185 @@ criteria, not polish.** Specifically:
 
 ---
 
+## §D.3 — P1.2-B deliverables (2026-06-10 — NM take-over + active actuator)
+
+Shipped after QA's 42-min P1.2-A.1 soak passed (259 decision lines,
+253× already_on_target + 2× follow_sta initial, ZERO warns, ZERO
+actuation subprocesses). Per the locked sequence in QA dispatch
+2026-06-10.
+
+### Modules shipped
+
+1. **`backend/openmarquee/network_supervisor_actuator.py` (NEW, ~210 LOC):**
+   - `HostapdChannelActuator(hostapd_conf_path, ap_iface)` — active
+     actuator that:
+     1. Reads `/etc/hostapd/hostapd.conf`
+     2. Substitutes `channel=<N>` with the decision's target
+     3. Atomic-writes via tempfile + `os.replace`
+     4. `systemctl restart hostapd.service` (blocking, 15s timeout)
+     5. **POST-VERIFY** via `iw dev ap0 info` — confirms hostapd is
+        actually beaconing on the target channel. Raises
+        `HostapdActuationError` if not.
+   - Sync (uses `subprocess.run`) because `apply_sta_freq` is sync.
+     Fires only on STA frequency change — boot association + rare
+     router CSA. ~5s of blocking per change is acceptable.
+   - Pure helpers `_substitute_channel` + `_parse_iw_dev_info_channel`
+     for unit testability.
+
+2. **`backend/openmarquee/network_supervisor_takeover.py` (NEW, ~450 LOC):**
+   - `parse_tailscale_status_json(raw)` — pure parser for
+     `tailscale status --json`. Returns `TailscalePreflightResult`
+     with structured failure reasons.
+   - `tailscale_preflight_check()` — async subprocess wrapper.
+     On Mac dev / missing binary / non-zero exit: `ok=False`.
+   - `RollbackWatchdog(timeout_s, rollback_cb)` — arm-before-flip
+     self-healing timer. `arm()` is idempotent; `disarm()` cancels
+     cleanly; on timeout `rollback_cb` is awaited then `fired=True`.
+   - `render_nm_unmanage_drop_in(iface="wlan0")` — pure renderer.
+   - `render_wpa_supplicant_conf(ssid, psk, country="US")` — pure
+     renderer.
+   - `TakeoverPreconditions` dataclass + `evaluate_preconditions(...)`
+     — 6 gates: env flag, NM dir exists, credentials present,
+     Tailscale ok, not-already-active, rollback-cooldown-clear.
+   - `TakeoverOrchestrator(supervisor, paths)` — composes the flip:
+     1. ARM watchdog FIRST (per QA dispatch)
+     2. Write NM unmanage drop-in for wlan0
+     3. Reload NM
+     4. Render `wpa_supplicant-wlan0.conf` with operator credentials
+     5. Enable + start `wpa_supplicant@wlan0.service`
+     6. Caller (observe loop) calls `mark_associated()` on
+        CTRL-EVENT-CONNECTED → disarms watchdog + persists
+        `takeover_active=True`
+     7. On watchdog timeout (3 min default): rollback runs
+        automatically — deletes drop-in, reloads NM, stops
+        `wpa_supplicant@wlan0`, persists `rollback_fired_at`
+   - `run_takeover_attempt_if_eligible(...)` — lifespan-friendly
+     one-shot entry point. Spawned by `app.py` at startup; runs
+     once + exits.
+
+3. **`backend/openmarquee/network_supervisor.py` (MODIFIED):**
+   - `PersistedState` gains `takeover_active: bool = False` and
+     `rollback_fired_at: float | None = None`. Schema version
+     bumped 1 → 2.
+   - `NetworkSupervisor` exposes `takeover_active`,
+     `rollback_fired_at`, `set_takeover_active(bool)`,
+     `mark_rollback_fired()`, `set_channel_follow_actuator(callable)`.
+     The last lets the take-over orchestrator swap in the active
+     actuator after a successful flip.
+
+4. **`backend/openmarquee/wifi_station.py` (MODIFIED):**
+   - `apply_enabled` short-circuits with a clear "failed" state +
+     diagnostic detail when `supervisor.takeover_active` is True.
+     Prevents confusing nmcli errors when an operator submits new
+     credentials via the settings UI during a live take-over.
+     Full settings-write delegation to `supervisor.apply_credentials`
+     is deferred to P1.2-C.
+
+5. **`backend/openmarquee/app.py` (MODIFIED):**
+   - Lifespan startup spawns `run_takeover_attempt_if_eligible` as
+     a separate one-shot task alongside the observe-loop. Env-gated
+     by `OPENMARQUEE_DISABLE_NETWORK_TAKEOVER` (test/CI opt-out)
+     AND the orchestrator's own `OPENMARQUEE_NETWORK_TAKEOVER_ENABLED`
+     opt-in (default OFF).
+   - Shutdown cancels the take-over evaluator if still running.
+     The watchdog itself (when armed) continues independently — it
+     holds its own asyncio.Task.
+
+6. **Tests (NEW + extended; +25 across 2 new test files):**
+   - `test_network_supervisor_actuator.py` (NEW, ~190 LOC): pure
+     helpers + actuator happy path + each failure shape (target
+     None, conf unreadable, systemctl non-zero, **post-verify
+     mismatch**, iw binary missing, systemctl timeout) + atomic
+     write semantics.
+   - `test_network_supervisor_takeover.py` (NEW, ~290 LOC):
+     Tailscale parser, NM drop-in + wpa_supplicant renderers,
+     watchdog fire/disarm/idempotency, orchestrator flip + persistence,
+     rollback path (drop-in deletion + systemctl ordering), **end-to-end
+     watchdog-fires-rollback**, all 5 preconditions failure modes
+     individually + the all-met case.
+   - `test_network_supervisor.py` (EXTENDED): schema_version
+     round-trip updated to v2.
+
+### Env-gating + opt-in semantics
+
+The take-over is **OFF by default**. Three env-var gates:
+
+- `OPENMARQUEE_DISABLE_AUTOSTART=1` → skip supervisor entirely
+  (umbrella test/CI flag).
+- `OPENMARQUEE_DISABLE_NETWORK_SUPERVISOR=1` → spawn neither
+  observe nor take-over.
+- `OPENMARQUEE_NETWORK_TAKEOVER_ENABLED=1` → REQUIRED to opt in to
+  take-over. Without it, the supervisor stays observe-only even
+  when all other preconditions (Tailscale, credentials, etc.) are
+  met.
+
+On openMarqueeDev, QA opts in via a systemd drop-in for
+`openmarquee-backend.service`:
+
+```
+[Service]
+Environment=OPENMARQUEE_NETWORK_TAKEOVER_ENABLED=1
+```
+
+After `systemctl daemon-reload + systemctl restart openmarquee-backend`,
+the take-over evaluator runs once at next startup.
+
+### Verify procedure for openMarqueeDev
+
+Per QA dispatch §"GO":
+
+1. **Pre-flight check:** confirm Tailscale is the OOB path —
+   `tailscale ping <peer>` succeeds before the flip.
+2. **Take-over verify:** deploy P1.2-B; opt in via env var; restart
+   service; watch journal:
+   - `journalctl -u openmarquee-backend | grep network-takeover`
+     should show the flip + arm + STA association
+   - `nmcli device status` should show wlan0 as `unmanaged`
+   - `systemctl status wpa_supplicant@wlan0.service` should be
+     active
+3. **Wifi bounce verify** (the soak gap from P1.2-A.1):
+   ```
+   wpa_cli -i wlan0 disconnect
+   sleep 20
+   wpa_cli -i wlan0 reconnect
+   ```
+   Confirm:
+   - State machine walks `LINGER|ONLINE → DEGRADED → LINGER|ONLINE`
+     (note: my state machine collapses CONNECTING → LINGER in the
+     reassociation path; if QA wants the explicit intermediate
+     CONNECTING state, ship as P1.2-B.1)
+   - Watchdog stays disarmed (because the supervisor sees
+     STA_ASSOCIATED before the 3-min timeout)
+   - Tailscale session survives the wifi blip
+4. **Rollback-watchdog drill** (per QA dispatch §"Reminder on the
+   rollback watchdog"):
+   - Set `settings.wifi_station_ssid` to a BOGUS SSID
+   - Restart backend
+   - Observe the take-over attempt + the 3-min watchdog fire
+   - Confirm rollback restores wlan0 to NM management
+5. **fallback_mutex end-to-end:** set `network_fallback_mutex_mode=true`
+   in settings; restart; verify CONNECTING → ONLINE (skips LINGER);
+   verify hostapd state matches the mutex contract
+   (note: enforcement of "AP off when STA up" lands in P1.3 — the
+   state machine flag is wired but the AP-control side-effects
+   are observed-only in P1.2-B).
+
+### What's NOT in P1.2-B (deferred to P1.2-C / P3+)
+
+- **Operator credential delegation** through
+  `supervisor.apply_credentials` (P1.2-C): the wifi_station shim
+  currently warns + fails when takeover is active; the full
+  delegation path replaces nmcli with wpa_cli RECONFIGURE.
+- **nmcli profile migration** to wpa_supplicant blocks (P1.2-C).
+- **DEGRADED active recovery** (P3): periodic `wpa_cli reconnect`
+  during DEGRADED state. P1.2-B relies on the operator OR
+  wpa_supplicant's own retry behavior.
+- **AP-control side-effects** for fallback_mutex_mode (P3): the
+  state machine flag is wired but `hostapd start/stop` on
+  ONLINE/DEGRADED transitions lands in P3.
+- **`scan-and-pick-best` absorption** (P3): `best-wifi.sh` and
+  `wifi-watchdog` cron still run in parallel.
+
 ## §D.2 — P1.2-A deliverables (2026-06-10 — observe-only soak)
 
 Shipped after QA's GO on (A) — sequenced ahead of P1.2-B

@@ -422,6 +422,11 @@ class PersistedState:
     """Subset of supervisor state that survives a reboot. Written
     atomically to `DEFAULT_STATE_FILE` so a crash mid-write doesn't
     leave a half-parsed file.
+
+    P1.2-B (2026-06-10) added `takeover_active` + `rollback_fired_at`
+    so the take-over orchestrator can resume idempotently across
+    backend restarts and so a recently-fired rollback prevents an
+    immediate re-attempt.
     """
 
     state: SupervisorState
@@ -429,7 +434,13 @@ class PersistedState:
     last_sta_channel: int | None = None
     last_transition_monotonic: float | None = None
     boot_counter_consumed: bool = False
-    schema_version: int = 1
+    # P1.2-B: persisted across restarts so the orchestrator's
+    # idempotency check can short-circuit when a take-over is
+    # already live, and so a recently-fired rollback enforces a
+    # cooldown before the next attempt.
+    takeover_active: bool = False
+    rollback_fired_at: float | None = None
+    schema_version: int = 2
 
 
 def load_persisted_state(path: Path = DEFAULT_STATE_FILE) -> PersistedState | None:
@@ -455,6 +466,8 @@ def load_persisted_state(path: Path = DEFAULT_STATE_FILE) -> PersistedState | No
             last_sta_channel=data.get("last_sta_channel"),
             last_transition_monotonic=data.get("last_transition_monotonic"),
             boot_counter_consumed=data.get("boot_counter_consumed", False),
+            takeover_active=data.get("takeover_active", False),
+            rollback_fired_at=data.get("rollback_fired_at"),
             schema_version=data.get("schema_version", 1),
         )
     except (json.JSONDecodeError, KeyError, ValueError) as e:
@@ -478,6 +491,8 @@ def save_persisted_state(state: PersistedState, path: Path = DEFAULT_STATE_FILE)
         "last_sta_channel": state.last_sta_channel,
         "last_transition_monotonic": state.last_transition_monotonic,
         "boot_counter_consumed": state.boot_counter_consumed,
+        "takeover_active": state.takeover_active,
+        "rollback_fired_at": state.rollback_fired_at,
         "schema_version": state.schema_version,
     }
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -659,12 +674,21 @@ class NetworkSupervisor:
             self._state = persisted.state
             self._last_sta_ssid = persisted.last_sta_ssid
             self._last_sta_channel = persisted.last_sta_channel
+            self._takeover_active = persisted.takeover_active
+            self._rollback_fired_at = persisted.rollback_fired_at
         else:
             self._state = SupervisorState.SETUP
             self._last_sta_ssid = None
             self._last_sta_channel = None
+            self._takeover_active = False
+            self._rollback_fired_at = None
         self._current_ap_channel: int | None = None
         self._current_sta_freq_mhz: int | None = None
+        # P1.2-B (2026-06-10): one-shot hook fired on the FIRST
+        # STA_ASSOCIATED after the take-over orchestrator installs
+        # it. See set_takeover_associated_hook for the wiring
+        # rationale.
+        self._takeover_associated_hook: Callable[[], object] | None = None
         self._emit(
             "state_machine",
             "info",
@@ -683,6 +707,98 @@ class NetworkSupervisor:
     @property
     def current_ap_channel(self) -> int | None:
         return self._current_ap_channel
+
+    # P1.2-B take-over state accessors / mutators -----------------
+
+    @property
+    def takeover_active(self) -> bool:
+        """True iff the supervisor has executed a successful take-over
+        flip in this session OR resumed from a persisted state where
+        a prior take-over was active. The take-over orchestrator
+        consults this to skip re-attempting; the observe loop uses
+        it to install the active actuator vs the observe-only stub.
+        """
+        return self._takeover_active
+
+    @property
+    def rollback_fired_at(self) -> float | None:
+        """time.monotonic() at the moment the rollback watchdog last
+        fired, or None if no rollback has ever fired in the persisted
+        history. The orchestrator uses this to enforce a cooldown
+        window before re-attempting take-over."""
+        return self._rollback_fired_at
+
+    def set_takeover_active(self, active: bool) -> None:
+        """Called by the take-over orchestrator on a successful flip
+        (STA associated within the watchdog window) or on rollback.
+        Persists immediately so a backend crash mid-window doesn't
+        lose the marker."""
+        self._takeover_active = active
+        if active:
+            # Successful take-over implicitly clears the rollback
+            # marker — the cooldown is satisfied.
+            self._rollback_fired_at = None
+        self._emit(
+            "takeover",
+            "info",
+            f"takeover_active={active} rollback_fired_at={self._rollback_fired_at}",
+        )
+        self._persist()
+
+    def set_takeover_associated_hook(self, hook: Callable[[], object] | None) -> None:
+        """P1.2-B (2026-06-10): the take-over orchestrator
+        installs a one-shot hook here after a successful flip; the
+        supervisor fires it on the FIRST STA_ASSOCIATED event after
+        installation, then clears the slot so it never re-fires.
+
+        Sacred-review BLOCKER fix: without this wiring,
+        `mark_associated` was defined but unreachable, so the
+        rollback watchdog would fire 3 min after a SUCCESSFUL flip
+        because the supervisor never told the orchestrator that STA
+        had associated. The hook closes that loop.
+
+        `hook` may be sync OR async; the supervisor handles both:
+        sync hooks are invoked directly; async hooks are scheduled
+        via `asyncio.create_task` on the running event loop. Passing
+        `None` clears the slot (used by rollback to disarm the
+        association hook).
+        """
+        self._takeover_associated_hook = hook
+
+    def set_channel_follow_actuator(
+        self,
+        actuator: Callable[[ChannelFollowDecision], None],
+    ) -> None:
+        """Replace the channel-follow actuator at runtime. P1.2-B uses
+        this to swap the observe-only stub for the active
+        `HostapdChannelActuator` after a successful take-over flip.
+
+        Per the actuator contract documented on `apply_sta_freq`:
+        actuators MUST return normally on success and raise on
+        failure. The new actuator takes effect on the NEXT
+        apply_sta_freq call.
+        """
+        self._channel_follow_actuator = actuator
+        self._emit(
+            "channel_follow",
+            "info",
+            f"actuator replaced (class={actuator.__class__.__name__})",
+        )
+
+    def mark_rollback_fired(self) -> None:
+        """Called by the orchestrator's rollback() — records that a
+        rollback just fired so the cooldown check at evaluate_
+        preconditions returns False until the cooldown window
+        elapses."""
+        self._takeover_active = False
+        self._rollback_fired_at = time.monotonic()
+        self._emit(
+            "takeover",
+            "warn",
+            f"rollback fired at monotonic={self._rollback_fired_at:.1f}; "
+            "takeover_active=False persisted",
+        )
+        self._persist()
 
     def snapshot_diagnostics(self) -> list[DiagnosticEvent]:
         return self.diagnostics.snapshot()
@@ -735,6 +851,39 @@ class NetworkSupervisor:
             f"transition {prev.value} -> {new_state.value} on event={event.value}",
         )
         self._persist()
+        # P1.2-B: fire the take-over associated hook on the first
+        # STA_ASSOCIATED event after a successful flip. One-shot:
+        # clear the slot immediately so subsequent associations
+        # don't re-trigger the orchestrator's bookkeeping.
+        if event == SupervisorEvent.STA_ASSOCIATED and self._takeover_associated_hook is not None:
+            hook = self._takeover_associated_hook
+            self._takeover_associated_hook = None
+            try:
+                result = hook()
+            except Exception as e:  # noqa: BLE001 — log + continue
+                self._emit(
+                    "takeover",
+                    "warn",
+                    f"takeover_associated_hook raised synchronously: {e!r}",
+                )
+            else:
+                # If the hook is async, schedule it on the running
+                # loop. Test environments without a loop see a
+                # RuntimeError and we degrade silently — tests that
+                # care about the hook firing assert it directly.
+                import inspect as _inspect
+
+                if _inspect.isawaitable(result):
+                    import asyncio as _asyncio
+
+                    try:
+                        _asyncio.get_running_loop().create_task(result)
+                    except RuntimeError:
+                        # No running loop (sync test context). Drive
+                        # the coroutine to completion synchronously
+                        # via asyncio.run so the hook side-effect
+                        # still applies.
+                        _asyncio.run(result)
         return self._state
 
     def apply_sta_freq(self, freq_mhz: int) -> ChannelFollowDecision:
@@ -829,6 +978,8 @@ class NetworkSupervisor:
                     last_sta_ssid=self._last_sta_ssid,
                     last_sta_channel=self._last_sta_channel,
                     last_transition_monotonic=time.monotonic(),
+                    takeover_active=self._takeover_active,
+                    rollback_fired_at=self._rollback_fired_at,
                 ),
                 path=self.config.state_file,
             )

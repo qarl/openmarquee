@@ -331,9 +331,10 @@ class TestStatePersistence:
         assert loaded.last_sta_ssid == "qarl"
         assert loaded.last_sta_channel == 11
         # schema_version survives the round-trip so future format
-        # bumps can detect old-shape files + migrate (sacred review
-        # NIT #2; per docs/onboarding-rework-plan.md §D.1).
-        assert loaded.schema_version == 1
+        # bumps can detect old-shape files + migrate. P1.2-B bumped
+        # the version 1 -> 2 to mark the addition of `takeover_active`
+        # + `rollback_fired_at`.
+        assert loaded.schema_version == 2
         # tmp file should be cleaned up by os.replace
         assert not state_file.with_suffix(state_file.suffix + ".tmp").exists()
 

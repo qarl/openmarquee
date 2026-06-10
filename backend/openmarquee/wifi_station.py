@@ -129,6 +129,25 @@ _STATE_LOCK = threading.Lock()  # protects _STATE reads + writes
 _APPLY_LOCK = threading.Lock()  # serializes apply() calls (per-interface)
 
 
+def _supervisor_has_taken_over() -> bool:
+    """P1.2-B (2026-06-10): true iff the network supervisor has
+    successfully executed a take-over flip + the take-over is still
+    active. Imported lazily to avoid circular imports with the
+    supervisor module.
+
+    Returns False on import failure / supervisor not yet
+    instantiated — the nmcli path stays the default until the
+    supervisor declares ownership.
+    """
+    try:
+        from openmarquee.dependencies import get_network_supervisor
+
+        supervisor = get_network_supervisor()
+        return bool(supervisor.takeover_active)
+    except Exception:
+        return False
+
+
 def current_state() -> WifiStationState:
     """Snapshot of the current state. Safe to call from any thread."""
     with _STATE_LOCK:
@@ -396,6 +415,23 @@ def apply_enabled(
     -- the in-memory _STATE singleton is the contract surface.
     """
     with _APPLY_LOCK:
+        # P1.2-B (2026-06-10): when the network supervisor has
+        # taken over wlan0 from NetworkManager, nmcli can no longer
+        # touch wlan0 (the unmanaged drop-in steered it away).
+        # Surface an actionable failure mode instead of letting
+        # nmcli return a confusing "Device wlan0 not found" error.
+        # P1.2-C will replace this branch with a delegation through
+        # the supervisor's apply_credentials path.
+        if _supervisor_has_taken_over():
+            detail = (
+                "wifi-station apply via nmcli is disabled because the "
+                "network supervisor has taken over wlan0 (P1.2-B "
+                "take-over active). Operator credential updates land "
+                "in P1.2-C via the supervisor's apply_credentials path."
+            )
+            log.warning("wifi station: %s", detail)
+            _set_state("failed", detail=detail, ssid=ssid)
+            return False
         # Idempotent short-circuit (step 1).
         active = _active_connection_for_device()
         if active == ssid and _is_device_connected():

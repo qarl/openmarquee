@@ -232,6 +232,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # OPENMARQUEE_DISABLE_NETWORK_SUPERVISOR=1 (also opts out under
     # the umbrella DISABLE_AUTOSTART flag).
     network_supervisor_handle: asyncio.Task[None] | None = None
+    network_takeover_handle: asyncio.Task[None] | None = None
     if (
         os.environ.get("OPENMARQUEE_DISABLE_AUTOSTART") != "1"
         and os.environ.get("OPENMARQUEE_DISABLE_NETWORK_SUPERVISOR") != "1"
@@ -246,6 +247,25 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 supervisor_observe_loop(supervisor),
                 name="network-supervisor-observe",
             )
+            # P1.2-B (2026-06-10): take-over evaluation. Env-gated by
+            # OPENMARQUEE_NETWORK_TAKEOVER_ENABLED=1 (default OFF
+            # so existing dev / FYS deployments are unchanged). The
+            # task runs ONCE: evaluates preconditions (Tailscale,
+            # creds, NM dir, idempotency); if all met, executes the
+            # flip + arms the rollback watchdog, then exits. Observe
+            # loop continues independently.
+            if os.environ.get("OPENMARQUEE_DISABLE_NETWORK_TAKEOVER") != "1":
+                from openmarquee.network_supervisor_takeover import (
+                    run_takeover_attempt_if_eligible,
+                )
+
+                network_takeover_handle = asyncio.create_task(
+                    run_takeover_attempt_if_eligible(
+                        supervisor=supervisor,
+                        settings_storage=get_settings_storage(),
+                    ),
+                    name="network-supervisor-takeover",
+                )
         except Exception:
             log.exception("startup network supervisor autostart failed")
     yield
@@ -274,6 +294,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         network_supervisor_handle.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await network_supervisor_handle
+        # P1.2-B: cancel the take-over evaluator if it's still
+        # running. The orchestrator's watchdog (if armed) is held
+        # by the supervisor singleton; the watchdog continues to
+        # fire from its asyncio.Task scope, decoupled from this
+        # one-shot evaluator task.
+        if network_takeover_handle is not None:
+            network_takeover_handle.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await network_takeover_handle
         try:
             from openmarquee.dependencies import get_network_supervisor
 
