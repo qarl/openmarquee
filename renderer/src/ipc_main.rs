@@ -2712,6 +2712,23 @@ fn run_paint_hook(
             }
         }
         OpResult::PaintTransition { from, to, kind, progress } => {
+            // r107.3 (2026-06-10): probes (a)+(b) confirmed
+            // ~540 calls/100s enter the match with
+            // result_variant=PaintTransition, but the existing
+            // paint_transition_entry probe (line below) NEVER
+            // fires. Adding a UNIQUE-STRING probe at the very
+            // first byte of the arm body, before ANY existing
+            // code (incl. the now-suspect r104.2 probe). No
+            // throttle: every call must emit. If THIS probe
+            // doesn't fire while probe (b) confirms the
+            // dispatch SEES PaintTransition, the arm is
+            // somehow being skipped at runtime -- name it
+            // r107_3_pt_arm_zero_byte (uniquely identifiable
+            // grep target with no naming collision possible).
+            eprintln!(
+                "r107_3_pt_arm_zero_byte from={} to={} kind={} progress={:.3}",
+                from, to, kind, progress,
+            );
             // r104.2 (2026-06-09): instrumentation entry probe.
             // QA observed r104.1 ships `begin_transition_serialization`
             // firing 24x over 4 min but `transition_paint entries=0`
@@ -3134,7 +3151,40 @@ fn run_paint_hook(
             }
         }
         // Non-paint OpResults: pass through unchanged.
-        other => IpcResponse::Ok { result: other },
+        other => {
+            // r107.3 (2026-06-10): if a PaintTransition variant
+            // somehow falls through to this catch-all (compiler
+            // bug, ABI mismatch with the playback-crate enum
+            // discriminant, anything), it'll show up here with
+            // variant=PaintTransition. Throttled lightly so a
+            // bug here doesn't flood the journal. UNIQUE STRING
+            // so naming collisions are impossible.
+            std::thread_local! {
+                static R107_3_OTHER_COUNTER: std::cell::Cell<u32> =
+                    const { std::cell::Cell::new(0) };
+            }
+            R107_3_OTHER_COUNTER.with(|c| {
+                let n = c.get();
+                c.set(n.wrapping_add(1));
+                if n % 30 == 0 {
+                    let variant = match &other {
+                        OpResult::Idle => "Idle",
+                        OpResult::PaintSlide { .. } => "PaintSlide",
+                        OpResult::PaintTransition { .. } => "PaintTransition",
+                        OpResult::SlideComplete { .. } => "SlideComplete",
+                        OpResult::OpenOk { .. } => "OpenOk",
+                        OpResult::CaptureOk { .. } => "CaptureOk",
+                        OpResult::ProfileDumpOk { .. } => "ProfileDumpOk",
+                        OpResult::Empty => "Empty",
+                    };
+                    eprintln!(
+                        "r107_3_other_arm call_idx={} variant={}",
+                        n, variant,
+                    );
+                }
+            });
+            IpcResponse::Ok { result: other }
+        }
     };
 
     // perf-night r1.1 hotfix: emit per-IPC-paint phase + advance the
