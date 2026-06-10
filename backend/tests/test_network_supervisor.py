@@ -460,7 +460,14 @@ class TestNetworkSupervisor:
         events = sup.snapshot_diagnostics()
         assert any("no transition" in e.message for e in events)
 
-    def test_apply_sta_freq_fires_actuator_on_change(self, tmp_path: Path):
+    def test_apply_sta_freq_fires_actuator_on_change_then_settles(self, tmp_path: Path):
+        """P1.2-A.1 (QA soak finding): after a successful actuator
+        return, `_current_ap_channel` advances to the target so the
+        NEXT poll sees `already_on_target` instead of re-firing.
+        Without this fix the observe-only soak emitted
+        regenerate_needed=True every 10 s (and P1.2-B would
+        restart hostapd in a loop).
+        """
         invocations: list[ChannelFollowDecision] = []
         config = SupervisorConfig(state_file=tmp_path / "network-state.json")
         sup = NetworkSupervisor(
@@ -471,11 +478,65 @@ class TestNetworkSupervisor:
         assert decision.regenerate_needed is True
         assert decision.target_channel == 11
         assert len(invocations) == 1
-        # Second call to same freq should not re-fire (no change).
-        sup._current_ap_channel = 11  # simulate post-actuator state
+        # P1.2-A.1: successful actuation (no exception raised by
+        # `list.append`) should advance the supervisor's cached AP
+        # channel to the target.
+        assert sup.current_ap_channel == 11
+        # Second call to same freq is a no-op: `already_on_target`.
         invocations.clear()
-        sup.apply_sta_freq(2462)
+        decision2 = sup.apply_sta_freq(2462)
+        assert decision2.regenerate_needed is False
+        assert "already" in decision2.reason
         assert len(invocations) == 0
+
+    def test_actuator_failure_does_not_advance_cached_ap_channel(self, tmp_path: Path):
+        """P1.2-A.1: a failing actuator must NOT advance the
+        cached AP channel; the next poll then RE-tries (the
+        correct retry-on-failure behavior). For P1.2-B this means
+        a failed hostapd-restart causes the supervisor to retry on
+        the next STA-freq poll rather than wedging the AP on the
+        old channel forever.
+        """
+        config = SupervisorConfig(state_file=tmp_path / "network-state.json")
+
+        def _failing_actuator(decision: ChannelFollowDecision) -> None:
+            raise RuntimeError("simulated hostapd restart failure")
+
+        sup = NetworkSupervisor(
+            config=config,
+            channel_follow_actuator=_failing_actuator,
+        )
+        # AP should NOT advance because actuator raised.
+        sup.apply_sta_freq(2462)
+        assert sup.current_ap_channel is None
+        # Subsequent freq poll fires the actuator AGAIN (correct
+        # retry behavior; for a real flapping hostapd this would
+        # keep retrying until success, with the DEGRADED branch
+        # taking over the broader recovery).
+        decision = sup.apply_sta_freq(2462)
+        assert decision.regenerate_needed is True
+        # Warn diagnostic must be in the ring buffer so QA can grep
+        # for actuator failures in the journal.
+        warn_messages = [
+            e.message
+            for e in sup.snapshot_diagnostics()
+            if e.severity == "warn" and "actuator failed" in e.message
+        ]
+        assert len(warn_messages) == 2, f"expected 2 warn lines, got {warn_messages}"
+
+    def test_observe_only_default_actuator_advances_simulated_state(self, tmp_path: Path):
+        """P1.2-A.1: the OBSERVE-ONLY default actuator returns
+        normally (no exception), so `apply_sta_freq` should still
+        advance `_current_ap_channel`. The QA-flagged soak issue
+        was specifically against this default actuator path.
+        """
+        config = SupervisorConfig(state_file=tmp_path / "network-state.json")
+        sup = NetworkSupervisor(config=config)  # default actuator
+        sup.apply_sta_freq(2447)  # channel 8 — QA's pikazo capture
+        assert sup.current_ap_channel == 8
+        # The very next poll for the same freq is a no-op.
+        decision = sup.apply_sta_freq(2447)
+        assert decision.regenerate_needed is False
 
     def test_fallback_mutex_mode_skips_linger(self, tmp_path: Path):
         sup = self._make(tmp_path, fallback_mutex=True)

@@ -475,7 +475,15 @@ openMarqueeDev:**
   set|hostapd_cli)\b'` over the observe-loop journal returns
   empty).
 - The API endpoint at `/api/network-supervisor/state` returns the
-  shape pinned by the test suite.
+  shape pinned by the test suite. **Auth-gated** — same bearer-
+  token middleware as the rest of `/api/*`. Soak-side observability
+  goes through `journalctl` (no token required); a curl-side check
+  needs `Authorization: Bearer <token>` per QA decision 2026-06-10.
+  (Decision rationale: the diagnostics ring buffer can include MAC
+  addresses + SSID fields from CTRL-EVENT-CONNECTED parsing — not
+  catastrophic but not appropriate for an unauthenticated endpoint
+  either. The marginal value of an unauthenticated endpoint over
+  the journalctl path doesn't justify the disclosure surface.)
 
 **P1.2-A EXPLICITLY DEFERS** (P1.2-B):
 - NM unmanage of wlan0

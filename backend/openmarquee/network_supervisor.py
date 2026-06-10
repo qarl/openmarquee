@@ -740,7 +740,17 @@ class NetworkSupervisor:
     def apply_sta_freq(self, freq_mhz: int) -> ChannelFollowDecision:
         """Record the STA's current frequency + ask the channel-
         follow engine for the AP-side decision. Calls the actuator
-        if regeneration is needed.
+        if regeneration is needed; on the actuator's successful
+        return (no exception) advances ``_current_ap_channel`` to
+        the decision target so the NEXT decision settles instead of
+        re-firing on every poll.
+
+        The on-success advance is what prevents the P1.2-A soak's
+        "regenerate_needed=True every 10 s" log spam + (in P1.2-B
+        with a live hostapd actuator) prevents an infinite
+        hostapd-restart loop. The contract for custom actuators:
+        return normally on success; raise on failure so we don't
+        advance the cached AP-channel optimistically.
         """
         self._current_sta_freq_mhz = freq_mhz
         chan = freq_to_channel(freq_mhz)
@@ -760,7 +770,29 @@ class NetworkSupervisor:
             f"regenerate_needed={decision.regenerate_needed} reason={decision.reason}",
         )
         if decision.regenerate_needed:
-            self._channel_follow_actuator(decision)
+            try:
+                self._channel_follow_actuator(decision)
+            except Exception as e:
+                # Actuator failure means the AP is NOT on the new
+                # channel; keep _current_ap_channel pointing at the
+                # last known-good value so the next poll retries.
+                # In P1.2-B with a real hostapd actuator this means
+                # we re-attempt the restart on the next freq event
+                # (the supervisor's DEGRADED branch handles the
+                # broader recovery).
+                self._emit(
+                    "channel_follow",
+                    "warn",
+                    f"actuator failed (target_channel={decision.target_channel} "
+                    f"reason={decision.reason}): {e!r}; will retry on next freq poll",
+                )
+            else:
+                # On successful actuation, advance the cached AP
+                # channel so subsequent polls see "already on
+                # target" and skip the actuator. P1.2-A.1 fix
+                # (QA's soak finding: without this, every 10 s
+                # poll re-emits regenerate_needed=True).
+                self._current_ap_channel = decision.target_channel
         return decision
 
     def _default_actuator(self, decision: ChannelFollowDecision) -> None:
@@ -768,6 +800,14 @@ class NetworkSupervisor:
         this as the OBSERVE-ONLY actuator — no subprocess + no
         hostapd config rewrite. P1.2-B's take-over commit wires
         this to actual hostapd-config rewrite + restart.
+
+        Returns normally — `apply_sta_freq` interprets that as
+        "actuation succeeded" and advances ``_current_ap_channel``.
+        For the observe-only path the advance is a SIMULATION of
+        success so QA's soak log doesn't repeat regenerate_needed
+        every poll; the simulation is sound because we're not
+        actually making any change the simulation could disagree
+        with.
 
         The dual-emit makes the would-have-done decision visible in
         journalctl so QA can validate it BEFORE the take-over
