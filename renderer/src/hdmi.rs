@@ -4969,6 +4969,29 @@ pub fn paint_and_present_one_transition_frame(
     // Ok(false) = FYS bug C skip (a video endpoint had no frame
     // ready this tick) — caller skips the swap+commit.
     let work: Result<bool> = (|| unsafe {
+        // r108 (2026-06-10): position probe at closure TOP. The
+        // existing transition_tick probe (line ~5560) fires 0×
+        // on FYS clean-boot data while paint_transition_entry
+        // fires 2363× over 10 min. r108 ships throttled probes
+        // at EVERY major position in the closure to pinpoint
+        // where the early exit happens. Each probe uses the
+        // SAME throttle shape (n % 30 == 0) so a throttle
+        // issue can't hide the divergence between them.
+        {
+            std::thread_local! {
+                static R108_POS_CLOSURE_TOP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            R108_POS_CLOSURE_TOP.with(|c| {
+                let n = c.get();
+                c.set(n.wrapping_add(1));
+                if n % 30 == 0 {
+                    eprintln!(
+                        "r108_pos closure_top call_idx={} progress={:.3}",
+                        n, progress,
+                    );
+                }
+            });
+        }
         // Two sequential bakes via the dispatcher. For Text
         // endpoints, `bake_slide_to_fbo` does the slide_caches
         // prewarm + `get_mut` internally. The `&mut session`
@@ -5102,6 +5125,22 @@ pub fn paint_and_present_one_transition_frame(
         };
         if bake_a_was_fresh && cached_pair_a.is_some() {
             session.transition_fbo_a_painted = true;
+        }
+        // r108: post-bake_a position probe.
+        {
+            std::thread_local! {
+                static R108_POS_POST_BAKE_A: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            R108_POS_POST_BAKE_A.with(|c| {
+                let n = c.get();
+                c.set(n.wrapping_add(1));
+                if n % 30 == 0 {
+                    eprintln!(
+                        "r108_pos post_bake_a call_idx={} progress={:.3}",
+                        n, progress,
+                    );
+                }
+            });
         }
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
         //
@@ -5377,6 +5416,23 @@ pub fn paint_and_present_one_transition_frame(
                 }
             }
         };
+        // r108: post-bake_b position probe (right after the
+        // bake_b loop breaks with the (fbo, tex) pair).
+        {
+            std::thread_local! {
+                static R108_POS_POST_BAKE_B: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            R108_POS_POST_BAKE_B.with(|c| {
+                let n = c.get();
+                c.set(n.wrapping_add(1));
+                if n % 30 == 0 {
+                    eprintln!(
+                        "r108_pos post_bake_b call_idx={} progress={:.3}",
+                        n, progress,
+                    );
+                }
+            });
+        }
         // r102.2: only delete the FBO+tex handles when the cache
         // is disabled (we allocated fresh this tick). When the
         // cache is enabled, session::cleanup_resources owns the
@@ -5537,6 +5593,53 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
+        // r108: pre-tick position probe (right BEFORE the
+        // existing transition_tick block; same throttle shape).
+        // If THIS fires but transition_tick stays 0, the issue
+        // is INSIDE the transition_tick block (glReadPixels
+        // failing silently, closure capture issue, etc.).
+        {
+            std::thread_local! {
+                static R108_POS_PRE_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            R108_POS_PRE_TICK.with(|c| {
+                let n = c.get();
+                c.set(n.wrapping_add(1));
+                if n % 30 == 0 {
+                    eprintln!(
+                        "r108_pos pre_tick call_idx={} progress={:.3}",
+                        n, progress,
+                    );
+                }
+            });
+        }
+        // r108: glow-free minimal transition_tick variant.
+        // EXACT same throttle shape as the existing
+        // transition_tick block below (subagent WARN-1 fix):
+        // `let n = if progress < 0.05 { 0 } else { c.get() };
+        // if n < 3 || n % 10 == 0`. The only behavioral
+        // difference vs the existing transition_tick is the
+        // absence of the read_corner / glReadPixels work. If
+        // THIS fires but transition_tick doesn't, the
+        // glReadPixels block inside transition_tick is failing
+        // /wedging silently. If neither fires while pre_tick
+        // does, an early exit lives between pre_tick and the
+        // transition_tick block.
+        {
+            std::thread_local! {
+                static R108_TT_MIN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+            }
+            R108_TT_MIN.with(|c| {
+                let n = if progress < 0.05 { 0 } else { c.get() };
+                c.set(n + 1);
+                if n < 3 || n % 10 == 0 {
+                    eprintln!(
+                        "r108_transition_tick_minimal u_t={:.3} tick={} fbo_a={:?} fbo_b={:?}",
+                        progress, n, fbo_a, fbo_b,
+                    );
+                }
+            });
+        }
         // r107 (2026-06-10): per-tick transition probe per QA
         // dispatch. QA's kmsgrab capture pipeline shows transitions
         // PAINT for the full 1500ms window but the wipe/iris never
