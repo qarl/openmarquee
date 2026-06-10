@@ -5537,6 +5537,74 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
+        // r107 (2026-06-10): per-tick transition probe per QA
+        // dispatch. QA's kmsgrab capture pipeline shows transitions
+        // PAINT for the full 1500ms window but the wipe/iris never
+        // appears -- every painted frame shows 100% endpoint-B
+        // content. Three hypotheses:
+        //   H1 - side mixup: both bakes paint into same FBO/tex
+        //        slot (r106 threading bug or r102.2 cache lookup)
+        //   H2 - u_t ~= 1.0 from first tick (progress source bad)
+        //   H3 - present path samples steady-state bake not the
+        //        composite output
+        //
+        // This probe captures fbo/tex IDs + 1-pixel color signature
+        // from each FBO corner. Hearth = orange-dominant (high R);
+        // Aurora = teal-dominant (high G+B). If fbo_a/fbo_b IDs
+        // differ but BOTH signatures match -> H1 confirmed (same
+        // content in both slots). If IDs differ AND sigs differ
+        // (A=orange, B=teal) -> not H1, look at u_t. progress
+        // field in the same line covers H2.
+        //
+        // Throttle: first 3 ticks of each transition + every 10th
+        // tick. Per-thread counter resets on progress<0.05.
+        {
+            use glow::HasContext;
+            std::thread_local! {
+                static R107_TICK_COUNTER: std::cell::Cell<u32> =
+                    const { std::cell::Cell::new(0) };
+            }
+            R107_TICK_COUNTER.with(|c| {
+                let n = if progress < 0.05 { 0 } else { c.get() };
+                c.set(n + 1);
+                if n < 3 || n % 10 == 0 {
+                    // Read 1 pixel from corner (0,0) of each FBO.
+                    // glReadPixels reads from the currently-bound
+                    // READ_FRAMEBUFFER -- bind, read, restore.
+                    let read_corner = |fbo: glow::NativeFramebuffer| -> [u8; 4] {
+                        let mut px = [0u8; 4];
+                        unsafe {
+                            session.gl.bind_framebuffer(
+                                glow::READ_FRAMEBUFFER, Some(fbo),
+                            );
+                            session.gl.read_pixels(
+                                0, 0, 1, 1,
+                                glow::RGBA, glow::UNSIGNED_BYTE,
+                                glow::PixelPackData::Slice(Some(&mut px)),
+                            );
+                            session.gl.bind_framebuffer(
+                                glow::READ_FRAMEBUFFER, None,
+                            );
+                        }
+                        px
+                    };
+                    let sig_a = read_corner(fbo_a);
+                    let sig_b = read_corner(fbo_b);
+                    eprintln!(
+                        "[perf] transition_tick kind={} u_t={:.3} tick={} \
+                         fbo_a={:?} fbo_b={:?} tex_a={:?} tex_b={:?} \
+                         sig_a=R{}G{}B{}A{} sig_b=R{}G{}B{}A{} \
+                         same_fbo={} same_sig={}",
+                        kind, progress, n,
+                        fbo_a, fbo_b, tex_a, tex_b,
+                        sig_a[0], sig_a[1], sig_a[2], sig_a[3],
+                        sig_b[0], sig_b[1], sig_b[2], sig_b[3],
+                        fbo_a == fbo_b,
+                        sig_a == sig_b,
+                    );
+                }
+            });
+        }
         // Bind transition target: scene FBO (non-identity) or
         // default fb (identity).
         let transition_target = scene_for_post_pass.map(|(fbo, _)| fbo);
