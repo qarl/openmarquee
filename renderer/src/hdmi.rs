@@ -373,6 +373,16 @@ pub struct EglSession<'a> {
     /// content only when content actually exists.
     transition_fbo_a_painted: bool,
     transition_fbo_b_painted: bool,
+    /// r109.1 (2026-06-10): per-transition latch — set after
+    /// the FIRST priming attempt completes (whether success or
+    /// failure) so subsequent ticks within the same transition
+    /// don't repeat the ~300ms blocking retry. Reset at
+    /// new-transition detection alongside the `_painted` flags.
+    /// Without this latch, a transition where priming
+    /// persistently fails would block the IPC thread for ~1.5s
+    /// (every tick × 300ms deadline) instead of QA's intended
+    /// "one blocking hit per transition".
+    transition_fbo_b_priming_burned: bool,
     /// r109 (2026-06-10): last `progress` value passed to
     /// `paint_and_present_one_transition_frame`. Used to detect
     /// transition boundaries threshold-independently: within a
@@ -746,6 +756,7 @@ where
         transition_fbo_dims: None,
         transition_fbo_a_painted: false,
         transition_fbo_b_painted: false,
+        transition_fbo_b_priming_burned: false,
         last_transition_progress: 1.0,
         external_frame_tex: None,
         external_nv12_tex: None,
@@ -4874,6 +4885,9 @@ pub fn paint_and_present_one_transition_frame(
     if progress < session.last_transition_progress {
         session.transition_fbo_a_painted = false;
         session.transition_fbo_b_painted = false;
+        // r109.1: reset the priming-burned latch so this new
+        // transition gets a fresh ~300ms blocking attempt.
+        session.transition_fbo_b_priming_burned = false;
         eprintln!(
             "[perf] r109_new_transition_detected prev_progress={:.3} cur_progress={:.3}",
             session.last_transition_progress, progress,
@@ -5220,10 +5234,30 @@ pub fn paint_and_present_one_transition_frame(
         // `endpoint_b_no_frame` WARN throttle is preserved on the
         // deadline-exhaust path so existing dashboards still work.
         const PATH_B_MAX_ITERS: u32 = 4;
+        // r109.1 (2026-06-10): per-case deadline. r109's
+        // priming retry needs more patience than r94's steady-
+        // state quick-check: the bcm2835-codec needs ~50-200ms
+        // to surface B's first frame under dual-1080p contention.
+        // FYS data showed iter_cap=4 × ~2ms sleep = ~8ms strangled
+        // the priming retry, never approaching the 100ms
+        // deadline. r109.1 uses 300ms for the priming case
+        // (decouple ON + !painted_b → first tick of each
+        // transition) and keeps 100ms for the legacy steady-state
+        // case (decouple OFF). One blocking ~100-300ms hit on
+        // the FIRST tick of each transition is invisible at
+        // 1500ms transition windows.
+        // r109.1 (2026-06-10) subagent WARN-1 fix: also gate on
+        // `!_priming_burned` so a transition where priming fails
+        // gets exactly ONE blocking attempt (not one per tick of
+        // a failing transition). The latch resets on new-
+        // transition detection.
+        let priming_now = crate::v4l2::is_feed_drain_decouple_enabled()
+            && !session.transition_fbo_b_painted
+            && !session.transition_fbo_b_priming_burned;
         let bake_b_deadline_ms: u64 = std::env::var("OPENMARQUEE_BAKE_B_POLL_DEADLINE_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
+            .unwrap_or(if priming_now { 300 } else { 100 });
         let bake_b_deadline = std::time::Duration::from_millis(bake_b_deadline_ms);
         let bake_b_start = std::time::Instant::now();
         // Snapshot the maximum samples we can advance through this
@@ -5316,11 +5350,22 @@ pub fn paint_and_present_one_transition_frame(
                     }
                     let elapsed_us = bake_b_start.elapsed().as_micros();
                     if bake_b_iterations > 1 {
+                        // r109 subagent WARN-3 / r109.1 BLOCKER-1
+                        // fix: tag the trigger so QA can verify
+                        // which condition engaged the retries.
+                        let trigger =
+                            if !crate::v4l2::is_feed_drain_decouple_enabled() {
+                                "decouple_off"
+                            } else if priming_now {
+                                "priming"
+                            } else {
+                                "other"
+                            };
                         eprintln!(
                             "[perf] bake_b_poll_outcome kind={} progress={:.3} \
                              iterations={} elapsed_us={} result=ok_after_polling \
-                             deadline_ms={}",
-                            kind, progress, bake_b_iterations, elapsed_us, bake_b_deadline_ms,
+                             deadline_ms={} trigger={}",
+                            kind, progress, bake_b_iterations, elapsed_us, bake_b_deadline_ms, trigger,
                         );
                     }
                     // r106: mark the cached b-pair as painted-
@@ -5340,7 +5385,20 @@ pub fn paint_and_present_one_transition_frame(
                     //      (avoid in-bake wrap bypassing the
                     //      dispatcher-side V4L2 state reset)
                     let deadline_ok = bake_b_start.elapsed() < bake_b_deadline;
-                    let iter_ok = bake_b_iterations < PATH_B_MAX_ITERS;
+                    // r109.1 (2026-06-10): during priming, let
+                    // the deadline bind -- not the iter cap.
+                    // FYS data on r109 showed iter_cap=4 × 2ms
+                    // sleep = ~8ms strangled the priming retry,
+                    // never approaching the deadline. The codec
+                    // needs ~50-200ms to surface B's first frame
+                    // under dual-1080p contention; the iter cap
+                    // was sized for r94's steady-state quick
+                    // checks, not priming.
+                    let iter_ok = if priming_now {
+                        true
+                    } else {
+                        bake_b_iterations < PATH_B_MAX_ITERS
+                    };
                     let samples_remaining_ok = match &endpoint_b {
                         TransitionEndpoint::Video {
                             samples,
@@ -5417,12 +5475,29 @@ pub fn paint_and_present_one_transition_frame(
                     } else {
                         "deadline_exhausted"
                     };
+                    let trigger =
+                        if !crate::v4l2::is_feed_drain_decouple_enabled() {
+                            "decouple_off"
+                        } else if priming_now {
+                            "priming"
+                        } else {
+                            "other"
+                        };
                     eprintln!(
                         "[perf] bake_b_poll_outcome kind={} progress={:.3} \
                          iterations={} elapsed_us={} result={} \
-                         deadline_ms={}",
-                        kind, progress, bake_b_iterations, elapsed_us, reason, bake_b_deadline_ms,
+                         deadline_ms={} trigger={}",
+                        kind, progress, bake_b_iterations, elapsed_us, reason, bake_b_deadline_ms, trigger,
                     );
+                    // r109.1 (2026-06-10) subagent WARN-1 fix: a
+                    // failed priming attempt burns the latch so
+                    // subsequent ticks of this transition skip
+                    // the ~300ms blocking retry. The latch
+                    // resets at the NEXT new-transition
+                    // detection (see paint_and_present entry).
+                    if priming_now {
+                        session.transition_fbo_b_priming_burned = true;
+                    }
                     // r106 (2026-06-10): if decouple ON AND
                     // transition_fbo_b has prior-paint content,
                     // REUSE cached_pair_b instead of skipping
