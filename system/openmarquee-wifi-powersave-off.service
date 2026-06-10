@@ -1,0 +1,34 @@
+[Unit]
+Description=openMarquee — disable WiFi power-save on wlan0 + ap0 (P1.0)
+Documentation=https://github.com/qarl/openmarquee docs/onboarding-rework-plan.md
+# brcmfmac power-save on the BCM43438 causes dropped beacons + stalled
+# connections under light load (per docs/onboarding-rework-plan.md §A
+# contributor #2). Pre-P1.0 the wifi-watchdog only WARNed when
+# power_save was ON; nothing enforced OFF. This service does.
+#
+# Ordering: run after the radio is up + after openmarquee-ap0.service
+# has created ap0 (so we can hit both interfaces). Don't run before
+# NM/wpa_supplicant — power_save is per-vif and can be reset by
+# reassociation, so we want to set it AFTER initial association
+# attempts as well. For now: boot-time oneshot. P1.1's supervisor
+# will also re-fire this on every reassociation event.
+After=openmarquee-ap0.service NetworkManager.service network-online.target
+# NOTE: do NOT `Wants=openmarquee-ap0.service`. r60 ships AP-side
+# units masked by default (install.sh L1115-1116); a soft Wants= on a
+# masked unit produces "Failed to start ... (masked)" journal noise
+# at every boot. The script handles missing ap0 gracefully + still
+# enforces power_save off on wlan0. After= only gives the ordering
+# hint without making us bring ap0 up.
+# Wait for the physical radio + (if present) virtual interface
+# before trying to set power_save. sys-subsystem-net-devices-*.device
+# fires when an iface is up at link level.
+After=sys-subsystem-net-devices-wlan0.device sys-subsystem-net-devices-ap0.device
+Wants=sys-subsystem-net-devices-wlan0.device
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/openmarquee/system/openmarquee-wifi-powersave-off.sh
+
+[Install]
+WantedBy=multi-user.target

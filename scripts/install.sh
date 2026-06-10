@@ -305,7 +305,8 @@ say "Install systemd units"
 run mkdir -p "$SYSTEMD_DIR"
 for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tailscale.service \
             openmarquee-cma-watchdog.service openmarquee-cma-watchdog.timer \
-            openmarquee-best-wifi.service openmarquee-best-wifi.timer; do
+            openmarquee-best-wifi.service openmarquee-best-wifi.timer \
+            openmarquee-wifi-powersave-off.service; do
     SRC="${OPT_DIR}/system/${unit}"
     DST="${SYSTEMD_DIR}/${unit}"
     if already_done -f "$DST" && already_done "$SRC" -nt "$DST"; then
@@ -328,7 +329,8 @@ done
 # them. Idempotent: chmod +x on an already-executable file is a no-op.
 say "Ensure +x on system/*.sh helpers"
 for sh_helper in openmarquee-ap0-setup.sh openmarquee-firstboot.sh openmarquee-tailscale.sh \
-                 openmarquee-cma-watchdog.sh openmarquee-best-wifi.sh; do
+                 openmarquee-cma-watchdog.sh openmarquee-best-wifi.sh \
+                 openmarquee-wifi-powersave-off.sh; do
     SH_PATH="${OPT_DIR}/system/${sh_helper}"
     if [ "$DRY_RUN" -eq 1 ] || [ -f "$SH_PATH" ]; then
         run chmod +x "$SH_PATH"
@@ -1125,6 +1127,17 @@ run systemctl enable openmarquee-backend.service
 # to avoid boot-time double-fire on the .service); enabling the
 # timer wires the unit pair into the boot dependency graph.
 run systemctl enable openmarquee-best-wifi.timer
+
+# P1.0 (2026-06-10, onboarding rework): WiFi power-save off on wlan0 +
+# ap0. brcmfmac defaults power_save=on which causes dropped beacons /
+# stalled associations under light load — exactly the "intermittent /
+# unspecified" failure shape the onboarding spec is fixing. Pre-P1.0
+# the wifi-watchdog only WARNed; nothing enforced OFF. This oneshot
+# enforces at every boot. ap0 may be masked (r60 ships AP off by
+# default); the script logs missing-iface gracefully so it's safe to
+# enable unconditionally. See docs/onboarding-rework-plan.md §A
+# contributor #2 + §D item #4.
+run systemctl enable openmarquee-wifi-powersave-off.service
 
 # r38c CMA-pressure watchdog -- timer fires the oneshot every 60s,
 # oneshot reads /proc/meminfo and restarts openmarquee-backend.service

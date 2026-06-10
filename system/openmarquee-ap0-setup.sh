@@ -63,3 +63,49 @@ ip link set dev "$AP_IFACE" up
 #    so the directive is in place before NM ever sees ap0.
 
 echo "ap0 up: $AP_IPV4 on MAC $AP0_MAC (parent $PHY_IFACE mac $WLAN0_MAC)"
+
+# P1.0 (2026-06-10): channel-value diagnostics. Spec smoking-gun: any
+# divergence between the STA-side channel + the AP-side channel IS
+# the channel-mismatch root cause. Log both at every ap0 bring-up so
+# `journalctl -t openmarquee-ap0` can reconstruct the boot-time
+# decision. See docs/onboarding-rework-plan.md §A contributor #1 +
+# §D item #3.
+#
+# Best-effort: on a freshly-booted board wlan0 may not yet be
+# associated, in which case `iw dev wlan0 link` returns "Not
+# connected" and the channel/freq fields are absent. Log the
+# absence so the journal still records that we tried.
+LOG_TAG="openmarquee-ap0"
+STA_LINK=$(iw dev "$PHY_IFACE" link 2>/dev/null || echo "")
+STA_FREQ=$(echo "$STA_LINK" | awk '/freq/ {print $2}' | head -1)
+if [ -n "$STA_FREQ" ]; then
+    # 2.4 GHz channel from frequency (MHz): channel 1 = 2412, +5 MHz
+    # per channel up to channel 14 (2484, Japan-only). For 5 GHz the
+    # mapping isn't linear; we only care about 2.4 GHz here since
+    # the BCM43438 is 2.4 GHz only and ap0 must match.
+    if [ "$STA_FREQ" -ge 2412 ] && [ "$STA_FREQ" -le 2484 ]; then
+        if [ "$STA_FREQ" -eq 2484 ]; then
+            STA_CHAN=14
+        else
+            STA_CHAN=$(( (STA_FREQ - 2412) / 5 + 1 ))
+        fi
+        logger -t "$LOG_TAG" \
+            "sta_channel iface=$PHY_IFACE freq_mhz=$STA_FREQ channel=$STA_CHAN"
+    else
+        logger -t "$LOG_TAG" \
+            "sta_channel iface=$PHY_IFACE freq_mhz=$STA_FREQ channel=unknown_5ghz_or_other"
+    fi
+else
+    logger -t "$LOG_TAG" \
+        "sta_channel iface=$PHY_IFACE state=not_associated (boot or post-disconnect)"
+fi
+
+# AP-side: the hostapd channel is read from /etc/hostapd/hostapd.conf
+# at hostapd start (P1.0 doesn't dynamically re-template that file
+# yet — P1.1's supervisor will). Log what's CURRENTLY configured so
+# the journal has both halves of the comparison.
+HOSTAPD_CHAN=$(awk -F'=' '/^channel=/ {print $2}' /etc/hostapd/hostapd.conf 2>/dev/null \
+    | tr -d '[:space:]' \
+    || echo "unknown")
+logger -t "$LOG_TAG" \
+    "ap_channel iface=$AP_IFACE configured_channel=${HOSTAPD_CHAN:-unknown} (P1.1 supervisor will derive from sta_channel)"
