@@ -256,7 +256,7 @@ These are spec items where the implementation choice is non-obvious
 or conflicts with existing architecture. **Surfacing per dispatch's
 "flag, don't guess" rule.**
 
-### C.1 — Interface naming: `ap0` vs `uap0`
+### C.1 — Interface naming: `ap0` vs `uap0` [RESOLVED 2026-06-10]
 
 The spec uses `uap0` throughout. Existing code uses `ap0` across
 12+ files (hostapd, dnsmasq, ap0-setup.sh, NM unmanaged conf,
@@ -269,10 +269,26 @@ virtual interface; the `u` prefix conventionally signals
 the network stack + would break in-place upgrades on FYS-class
 deployments (NM unmanaged conf keyed on interface-name).
 
-**Plan should explicitly note** this difference so a future reader
-of the spec doesn't think the implementation is non-compliant.
+**Resolution (QA 2026-06-10):** KEEP `ap0`. **Spec-divergence
+note:** the canonical spec at
+`~/project/openmarquee/qa/spec-onboarding-ap-sta-concurrent-2026-06-10.md`
+uses `uap0`; the implementation uses `ap0`. Reading the spec
+literally, substitute `ap0` everywhere `uap0` appears. This is
+cosmetic — no functional difference.
 
-### C.2 — Full NM displacement vs hybrid
+### C.2 — Full NM displacement vs hybrid [RESOLVED 2026-06-10]
+
+**Resolution (QA 2026-06-10):** FULL NM displacement, per the spec.
+De-risk via:
+1. Keep the shim approach for `wifi_station.py` (compatibility
+   layer over the new supervisor).
+2. Land behind the fallback mode flag (`network_fallback_mutex_mode`)
+   so a regression can flip back to NM-managed wlan0 without
+   reinstall.
+3. Sequence the nmcli-profile migration (convert existing
+   `/etc/NetworkManager/system-connections/*` to
+   `wpa_supplicant-wlan0.conf` blocks) as its own commit with its
+   own tests.
 
 The spec is explicit: take the radio away from NM (BOTH
 interfaces). The current code is a hybrid: NM owns wlan0 STA, the
@@ -304,7 +320,18 @@ FYS is uncomfortable. The alternative (hybrid + supervisor-drives-
 nmcli) is implementable but doesn't address the "NM contention"
 likely-contributor in §A.
 
-### C.3 — `ONLINE = AP off` as default
+### C.3 — `ONLINE = AP off` as default [RESOLVED 2026-06-10]
+
+**Resolution (QA 2026-06-10):** the plan's migration approach is
+correct. **One addition:** when the supervisor lands, the
+`settings.wifi_ap_enabled` field's semantics CHANGE from "AP runs
+24/7" to "Setup Mode allowed." The settings UI copy must be updated
+to match the spec's naming convention: rename the field's UI label
+to "Setup Mode" everywhere. The wire protocol field name stays
+`wifi_ap_enabled` for API compatibility; only the UI copy + the
+runtime semantics change. Sequence the UI rename as its own commit
+during P3.
+
 
 Spec says ONLINE is the default steady state and ONLINE means AP
 off. Current defaults: `wifi_ap_enabled=true` in `settings.py:216`.
@@ -327,19 +354,28 @@ on supervisor startup:
 it. I'll implement it but flag for review on the migration log
 line.
 
-### C.4 — Marquee status surface IPC: which shape?
+### C.4 — Marquee status surface IPC: which shape? [DEFERRED 2026-06-10]
+
+**Resolution (QA 2026-06-10):** new IPC op (shape (a)) confirmed.
+Parked until P4; QA will coordinate the renderer side with
+code-Jimmy when supervisor work reaches P4.
+
 
 P4 needs a renderer IPC op for system status cards. Three shapes
 proposed above (a/b/c). **Recommendation (a)** — lowest latency.
 **Flag for code-Jimmy coordination via QA.**
 
-### C.5 — dnsmasq IP range
+### C.5 — dnsmasq IP range [RESOLVED 2026-06-10]
 
 Spec uses `192.168.4.0/24`; code uses `10.0.0.0/24`. Cosmetic. Keep
 existing `10.0.0.0/24` (in-place upgrade safety; clients holding
 old leases).
 
-### C.6 — Best-wifi.sh fate
+**Resolution (QA 2026-06-10):** KEEP `10.0.0.0/24`. **Spec-divergence
+note:** reading the spec literally, substitute `10.0.0.x` everywhere
+`192.168.4.x` appears. Captive-portal IP is `10.0.0.1`.
+
+### C.6 — Best-wifi.sh fate [RESOLVED 2026-06-10]
 
 The r60 best-wifi.sh implements scan-and-pick-best across known
 SSIDs (qarl-direct r60 spec). Spec doesn't address this. The
@@ -348,9 +384,99 @@ absorbing this means we lose the r60 dispatch's separate
 "safety contract" (in-band ssh safety + hysteresis). Plan must
 re-implement these inside the supervisor's STA-selection logic.
 
+**Resolution (QA 2026-06-10):** supervisor absorbs +
+re-implements the r60 safety contracts. **These contracts protect
+QA's remote-access SSH during dev — treat as P1.1 acceptance
+criteria, not polish.** Specifically:
+- In-band SSH guard: before changing wlan0 connections, verify
+  the current SSH session is reachable via a path that won't be
+  broken by the switch (Tailscale tailnet path counts; same-wlan
+  path doesn't).
+- Hysteresis: don't switch unless candidate is >= 8 percentage
+  points stronger than current (NM's SIGNAL units, NOT raw dBm —
+  see r60 dispatch's BLOCKER fix).
+
 ---
 
-## §D — P1.0 deliverables (this commit)
+## §D.1 — P1.1 deliverables (2026-06-10 — supervisor skeleton)
+
+Shipped AFTER QA's §C answers on 2026-06-10. Limited to the
+SKELETON; the actual NM displacement + wifi_station.py shim +
+nmcli-profile migration are sequenced as follow-up commits per
+QA's de-risk plan.
+
+1. `backend/openmarquee/network_supervisor.py` (NEW, ~620 LOC):
+   - `SupervisorState` enum + `SupervisorEvent` enum
+   - `next_state(state, event, fallback_mutex=False)` — pure
+     functional state-transition table; `fallback_mutex=True`
+     short-circuits CONNECTING → ONLINE (skips LINGER), matching
+     spec §"Fallback position"
+   - `freq_to_channel(freq_mhz)` — Python mirror of the P1.0
+     shell math (authoritative reference now)
+   - `decide_channel_follow(sta_freq, current_ap_channel)` — pure
+     decision function returning `ChannelFollowDecision`
+   - `DiagnosticsRingBuffer` — 5-min sliding-window in-memory
+     event store; eviction on push + on snapshot
+   - `hysteresis_allows_switch(candidate, current, threshold=8)` —
+     r60 acceptance criterion (NM SIGNAL units, not dBm)
+   - `in_band_ssh_guard_safe_to_switch(tailscale, lan_only)` —
+     r60 acceptance criterion (Tailscale path is safe; LAN-only
+     SSH blocks the switch)
+   - `PersistedState` + `load_persisted_state` /
+     `save_persisted_state` — atomic .tmp+rename JSON persistence
+     at `/var/lib/openmarquee/network-state.json`; corrupt file
+     returns None (defensive — caller starts from SETUP)
+   - `WpaSupplicantSocketClient` — DGRAM client + ATTACH +
+     non-blocking receive; works against either NM's singleton
+     wpa_supplicant or our own (after the take-over commit)
+   - `parse_wpa_event(raw)` — pure parser for CTRL-EVENT-* lines;
+     maps to `SupervisorEvent` vocabulary
+   - `NetworkSupervisor` — the orchestrator; lifespan_start /
+     lifespan_stop hooks for FastAPI integration;
+     `apply_event` / `apply_sta_freq` are the write surface;
+     `snapshot_diagnostics` / `supervisor_to_dict` are the read
+     surface
+
+2. `backend/openmarquee/settings.py`:
+   - `network_fallback_mutex_mode: bool = False` — the fallback
+     flag QA mandated (de-risk via runtime flip without
+     reinstall).
+
+3. `backend/tests/test_network_supervisor.py` (NEW, ~430 LOC):
+   60 tests covering the transition table (every state × event
+   tuple incl. both fallback regimes), freq math, ring buffer,
+   channel-follow decision, both r60 acceptance contracts,
+   persistence round-trip + corrupt-file recovery, wpa event
+   parser, and the supervisor's end-to-end skeleton.
+
+4. `backend/tests/test_api_settings.py` (MODIFIED): adds the new
+   field to the round-trip expected-dict.
+
+5. `docs/onboarding-rework-plan.md`: §C answers from QA folded in
+   ([RESOLVED 2026-06-10] markers on §C.1, C.2, C.3, C.4, C.5,
+   C.6); this §D.1 section documents what P1.1 actually shipped.
+
+**P1.1 EXPLICITLY DEFERS** (separate follow-up commits per QA's
+de-risk sequence):
+- Extending `NetworkManager-openmarquee-unmanaged.conf` to also
+  unmanage wlan0 (the active take-over moment)
+- `wpa_supplicant@wlan0.service` enablement
+- `wifi_station.py` shim (so existing nmcli callers keep working
+  through the supervisor)
+- nmcli connection profile migration tool
+- Scan-and-pick-best absorption (`best-wifi.sh` keeps running)
+- iw event ring buffer (dmesg snapshot via subprocess)
+- Active channel-follow actuator (current implementation logs to
+  ring buffer only; doesn't write hostapd.conf or systemctl
+  restart hostapd yet)
+
+This commit ships a fully testable + observable skeleton that
+runs on openMarqueeDev today. QA can verify state-machine
+transitions via the journal + (when the API wiring lands) via
+`/api/network-supervisor/state` without committing to the
+take-over.
+
+## §D.0 — P1.0 deliverables (2026-06-09 — diagnostics-first wins)
 
 In parallel with QA reviewing the plan above:
 

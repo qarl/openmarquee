@@ -296,6 +296,22 @@ class SystemSettings(BaseModel):
             "HTTPS FQDN so operator bookmarks resolve to a secure context."
         ),
     )
+    network_fallback_mutex_mode: bool = Field(
+        default=False,
+        description=(
+            "P1.1 onboarding-rework (2026-06-10): fallback flag for "
+            "the network-supervisor. When False (default), the "
+            "supervisor runs the spec's preferred concurrent regime "
+            "(AP + STA share the radio's single channel; AP follows "
+            "STA channel; LINGER grace window). When True, the "
+            "supervisor enforces the comitup pattern: AP and STA are "
+            "mutually exclusive (AP off when STA up). QA can flip "
+            "this at runtime without reinstall if firmware bugs "
+            "surface in concurrent mode. See "
+            "docs/onboarding-rework-plan.md §C.2 + spec §"
+            '"Fallback position".'
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod

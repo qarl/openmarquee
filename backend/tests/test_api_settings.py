@@ -86,6 +86,11 @@ def test_put_then_get_round_trip(client: TestClient):
         # round-trip test exhaustive, and so the expected-dict check
         # below sees the field on the response side too.
         "tailscale_https_enabled": True,
+        # P1.1 onboarding-rework (2026-06-10): new
+        # network_fallback_mutex_mode field on Settings — default
+        # False. Same rationale as tailscale_https_enabled: include
+        # in payload so the round-trip dict matches.
+        "network_fallback_mutex_mode": False,
         "flock_sync_enabled": True,
         "ui_first_run_seen": False,
     }
