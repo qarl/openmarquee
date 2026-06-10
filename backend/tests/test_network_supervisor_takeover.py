@@ -178,14 +178,14 @@ def _stub_paths(tmp_path: Path) -> TakeoverPaths:
 
 @pytest.fixture
 def netctl_recorder(monkeypatch):
-    """P1.2-B.1: replace the orchestrator's _run_netctl with a
-    recording stub. Returns the list of (subcommand, stdin_input)
-    tuples — both pieces are part of the privilege boundary
-    contract (stdin = file content; sudoers grant blocks argv args)."""
-    calls: list[tuple[str, str | None]] = []
+    """P1.2-B.1/B.3: replace the orchestrator's _run_netctl with a
+    recording stub. Returns the list of (subcommand, stdin_input,
+    timeout_s) tuples — all three are part of the privilege
+    boundary + per-op-timeout contract."""
+    calls: list[tuple[str, str | None, float]] = []
 
     async def _stub_netctl(subcommand, *, stdin_input=None, timeout_s=15.0):
-        calls.append((subcommand, stdin_input))
+        calls.append((subcommand, stdin_input, timeout_s))
 
     monkeypatch.setattr(
         "openmarquee.network_supervisor_takeover._run_netctl",
@@ -198,10 +198,15 @@ def netctl_recorder(monkeypatch):
 async def test_orchestrator_attempt_drives_netctl_subcommands(
     tmp_path: Path, netctl_recorder, monkeypatch
 ):
-    """P1.2-B.1: the orchestrator no longer writes files directly.
-    Every privileged step goes through `_run_netctl(subcommand,
-    stdin_input=...)`. This test pins the exact sequence + the
-    stdin content for the write-* steps."""
+    """P1.2-B.3: the attempt flip sequence is now 5 steps. After
+    nm-reload (which un-manages wlan0 from NetworkManager's
+    profile), the orchestrator MUST stop NM's singleton
+    wpa_supplicant.service via `nm-supplicant-stop` BEFORE writing
+    our wpa_supplicant config + enabling wpa_supplicant@wlan0
+    — NM's supplicant still holds the nl80211 ifname after
+    unmanage, so without the stop the enable fails status=255
+    "another wpa_supplicant process already running" (QA verify
+    #3 finding)."""
     sup = _make_supervisor(tmp_path)
     paths = _stub_paths(tmp_path)
     orch = TakeoverOrchestrator(supervisor=sup, paths=paths, rollback_timeout_s=10.0)
@@ -217,11 +222,12 @@ async def test_orchestrator_attempt_drives_netctl_subcommands(
         wifi_station_ssid="pikazo",
         wifi_station_password="hunter2",
     )
-    # 4 subcommands in order: nm write, nm reload, wpa write, wpa enable.
+    # 5 subcommands in the canonical P1.2-B.3 order.
     subcmds = [c[0] for c in netctl_recorder]
     assert subcmds == [
         "nm-write-unmanaged-wlan0",
         "nm-reload",
+        "nm-supplicant-stop",
         "wpa-write-wlan0-conf",
         "wpa-enable-wlan0",
     ]
@@ -229,11 +235,22 @@ async def test_orchestrator_attempt_drives_netctl_subcommands(
     nm_stdin = netctl_recorder[0][1]
     assert nm_stdin is not None
     assert "interface-name:wlan0" in nm_stdin
-    # wpa_supplicant config carries the operator's credentials.
-    wpa_stdin = netctl_recorder[2][1]
+    # wpa_supplicant config carries the operator's credentials
+    # (now at index 3 — was 2 before B.3's supplicant-stop insert).
+    wpa_stdin = netctl_recorder[3][1]
     assert wpa_stdin is not None
     assert 'ssid="pikazo"' in wpa_stdin
     assert 'psk="hunter2"' in wpa_stdin
+    # P1.2-B.3 per-op timeouts: wpa-enable-wlan0 + nm-supplicant-stop
+    # use the SLOW bucket (60s) because systemctl enable --now and
+    # service-state transitions can exceed the 15s fast cap. Fast
+    # ops (nm writes, nm reload) stay at 15s.
+    timeouts = {c[0]: c[2] for c in netctl_recorder}
+    assert timeouts["nm-write-unmanaged-wlan0"] == 15.0
+    assert timeouts["nm-reload"] == 15.0
+    assert timeouts["nm-supplicant-stop"] == 60.0
+    assert timeouts["wpa-write-wlan0-conf"] == 15.0
+    assert timeouts["wpa-enable-wlan0"] == 60.0
     # Watchdog armed.
     assert watchdog.armed is True
     await watchdog.disarm()
@@ -262,15 +279,27 @@ async def test_orchestrator_mark_associated_disarms_and_persists(
 async def test_orchestrator_rollback_runs_netctl_revert_sequence(
     tmp_path: Path, netctl_recorder, monkeypatch
 ):
-    """P1.2-B.1: rollback runs nm-remove-unmanaged, wpa-stop, nm-reload
-    in that order. Each step suppresses its own exception so a
-    partial-state can still be partially repaired."""
+    """P1.2-B.3: rollback now runs 4 steps. The new
+    `nm-supplicant-start` companion to attempt's
+    `nm-supplicant-stop` brings NM's singleton supplicant back so
+    NetworkManager can resume managing wlan0. Each step suppresses
+    its own exception so a partial-state can still be partially
+    repaired."""
     sup = _make_supervisor(tmp_path)
     paths = _stub_paths(tmp_path)
     orch = TakeoverOrchestrator(supervisor=sup, paths=paths, rollback_timeout_s=10.0)
     await orch.rollback()
     subcmds = [c[0] for c in netctl_recorder]
-    assert subcmds == ["nm-remove-unmanaged-wlan0", "wpa-stop-wlan0", "nm-reload"]
+    assert subcmds == [
+        "nm-remove-unmanaged-wlan0",
+        "wpa-stop-wlan0",
+        "nm-supplicant-start",
+        "nm-reload",
+    ]
+    # Slow ops (wpa-stop + nm-supplicant-start) use the slow timeout.
+    timeouts = {c[0]: c[2] for c in netctl_recorder}
+    assert timeouts["wpa-stop-wlan0"] == 60.0
+    assert timeouts["nm-supplicant-start"] == 60.0
     # Supervisor state reflects rollback.
     assert sup.takeover_active is False
     assert sup.rollback_fired_at is not None

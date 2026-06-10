@@ -398,6 +398,128 @@ criteria, not polish.** Specifically:
 
 ---
 
+## §D.6 — P1.2-B.3 deliverables (2026-06-10 — 3 verify-bounce fixes)
+
+Shipped after QA's third dev-Pi verify (the first to actually
+WORK end-to-end — the daemon executed `nm-write-unmanaged-wlan0`
+as root with the 410-byte NM-drop-in payload, and the rollback
+path again ran clean with no connectivity loss). Three findings:
+
+### 1. `/run/openmarquee/` was unreachable to the backend user
+
+QA observed: `/run/openmarquee/` was created `root:root 0750` by
+systemd (the .socket unit's `DirectoryMode=0750` sets mode but
+the OWNER is whatever process creates the parent dir — PID 1 =
+root). With group=root and mode 0750, the openmarquee backend
+user had no path to traverse INTO the directory to reach the
+socket file.
+
+**Fix:** `system/openmarquee-tmpfiles.conf` (NEW) creates
+`/run/openmarquee/` as `root:openmarquee 0750` via systemd-
+tmpfiles. install.sh stages to `/etc/tmpfiles.d/openmarquee.conf`
+and runs `systemd-tmpfiles --create` immediately so the next
+`systemctl start openmarquee-netctl.socket` finds the dir with
+correct ownership without a reboot.
+
+The socket file inside (`/run/openmarquee/netctl.sock`) keeps
+`SocketUser=root SocketGroup=openmarquee SocketMode=0660`. The
+backend (member of group openmarquee) now traverses into the
+dir (group-x via 0750's group bit) AND reads/writes the socket
+(group-rw via 0660's group bits). Non-root non-openmarquee
+processes still can't reach either.
+
+### 2. 15s socket read timeout too short for slow systemd ops
+
+QA observed: the take-over flip died at `wpa-enable-wlan0` with
+"response read timed out after 15s". `systemctl enable --now
+wpa_supplicant@wlan0.service` under boot load takes 20-30s
+including unit-state transitions; the 15s cap killed it mid-op.
+The daemon-side `BrokenPipe` confirmed the client hung up
+mid-op.
+
+**Fix:** per-op timeouts. `network_supervisor_takeover.py`
+splits the netctl timeout into FAST (15s) and SLOW (60s) buckets:
+
+| Op | Bucket | Why |
+|---|---|---|
+| `nm-write-unmanaged-wlan0` | FAST 15s | atomic file write |
+| `nm-reload` | FAST 15s | dbus signal |
+| `nm-supplicant-stop` | SLOW 60s | systemctl stop on a busy service |
+| `wpa-write-wlan0-conf` | FAST 15s | atomic file write |
+| `wpa-enable-wlan0` | SLOW 60s | systemctl enable --now + unit start + initial association |
+| `wpa-stop-wlan0` | SLOW 60s | systemctl stop on a failing-to-associate unit |
+| `nm-supplicant-start` | SLOW 60s | systemctl start + dbus reconnect |
+
+The daemon-side `HELPER_TIMEOUT_S` also bumped 30 → 90 so the
+backend's 60s cap has headroom + the underlying `subprocess.run`
+on the helper doesn't itself time out first.
+
+### 3. NM's wpa_supplicant singleton owned wlan0 after unmanage
+
+The architectural gap QA spotted: `nm-reload` un-manages wlan0
+from NetworkManager's perspective, but NM's `wpa_supplicant.service`
+singleton still HOLDS the nl80211 ifname. When we then enable
+`wpa_supplicant@wlan0.service`, it fails status=255 "You may
+have another wpa_supplicant process already running."
+
+**Fix:** add `nm-supplicant-stop` between `nm-reload` and
+`wpa-write-wlan0-conf` in the flip sequence, and add
+`nm-supplicant-start` between `wpa-stop-wlan0` and `nm-reload` in
+rollback. On this device NM's supplicant only serves wlan0 (ap0
+is hostapd-driven), so stopping it is safe.
+
+Flip sequence (5 steps, was 4):
+```
+1. nm-write-unmanaged-wlan0   (NEW unmanage conf)
+2. nm-reload                  (NM picks up the conf)
+3. nm-supplicant-stop         (P1.2-B.3: release nl80211 ifname)
+4. wpa-write-wlan0-conf       (our config)
+5. wpa-enable-wlan0           (our wpa_supplicant@wlan0)
+```
+
+Rollback sequence (4 steps, was 3):
+```
+1. nm-remove-unmanaged-wlan0   (drop unmanage conf)
+2. wpa-stop-wlan0              (free our wpa_supplicant@wlan0)
+3. nm-supplicant-start         (P1.2-B.3: NM gets its supplicant back)
+4. nm-reload                   (NM resumes managing wlan0)
+```
+
+QA noted: "the supervisor observe-loop ALSO holds a socket to
+NM's supplicant ctrl — make sure the loop re-attaches to OUR
+supplicant post-flip." The existing observe-loop in
+`network_supervisor_loop.py` ALREADY handles reconnect on
+OSError via close+next-tick-reconnect with a 30s cadence; after
+NM's supplicant stops + ours starts at the same `/var/run/wpa_supplicant/wlan0`
+ctrl path, the loop will reconnect within 30s. Documented here
++ deferred to P1.3 if QA wants tighter re-attach signaling.
+
+### Files
+
+| File | Change |
+|---|---|
+| `system/openmarquee-tmpfiles.conf` | NEW — creates `/run/openmarquee/` root:openmarquee 0750 |
+| `system/openmarquee-netctl` | + 2 subcommands: `nm-supplicant-stop`, `nm-supplicant-start` |
+| `system/openmarquee-netctl-daemon` | + 2 ALLOWLIST entries; bumped HELPER_TIMEOUT_S 30 → 90 |
+| `scripts/install.sh` | + tmpfiles stage + `systemd-tmpfiles --create` |
+| `backend/openmarquee/network_supervisor_takeover.py` | + `NETCTL_FAST_TIMEOUT_S` / `NETCTL_SLOW_TIMEOUT_S` constants; attempt + rollback sequence updated; per-op timeouts on slow ops |
+| `backend/tests/test_network_supervisor_takeover.py` | sequence assertions updated; timeout assertions added; `netctl_recorder` fixture now records `timeout_s` |
+| `docs/onboarding-rework-plan.md` | this §D.6 |
+
+### Parallel-arc coordination note
+
+QA flagged that my P1.2-B.x backend pushes mid-renderer-arc
+caused code-Jimmy to lose edits twice (worktree file-state
+sync). My discipline going forward:
+- `git fetch origin && git pull --ff-only` BEFORE every commit
+- Stage explicitly with file paths (never `git add .` or `git add -A`)
+- `git diff --cached --stat` check before commit — only my lane's files
+- Restore renderer/ if anything leaks in (P1.2-B.2's sacred review
+  caught r109 in my worktree from the shared `/tmp/openmarquee-main` clone)
+
+P1.2-B.3 was rebased onto main 57cb65f (code-Jimmy's r109) before
+this commit.
+
 ## §D.5 — P1.2-B.2 deliverables (2026-06-10 — socket-activated daemon, sudo retired)
 
 Shipped after QA's verify of P1.2-B.1 caught a second

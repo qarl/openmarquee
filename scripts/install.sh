@@ -835,6 +835,25 @@ if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-netctl@.service" 
     run install -m 0644 "${OPT_DIR}/system/openmarquee-netctl@.service" "$NETCTL_TEMPLATE_DST"
 fi
 
+# P1.2-B.3 (2026-06-10): create /run/openmarquee/ as root:openmarquee
+# 0750 via systemd-tmpfiles. The socket unit's DirectoryMode=0750
+# alone created the dir root:root which the backend (openmarquee
+# user) couldn't TRAVERSE — QA's verify caught this. tmpfiles
+# definitions live in /etc/tmpfiles.d/ and are applied on boot via
+# systemd-tmpfiles-setup.service; we also run --create at install
+# time so the socket can bind without a reboot.
+say "Stage openmarquee tmpfiles (/run/openmarquee/ perms)"
+TMPFILES_DST="${ROOT_PREFIX}/etc/tmpfiles.d/openmarquee.conf"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-tmpfiles.conf" ]; then
+    run mkdir -p "$(dirname "$TMPFILES_DST")"
+    run install -m 0644 "${OPT_DIR}/system/openmarquee-tmpfiles.conf" "$TMPFILES_DST"
+    # Apply now so the next `systemctl start openmarquee-netctl.socket`
+    # finds /run/openmarquee/ with correct ownership without a reboot.
+    if [ "$DRY_RUN" -eq 0 ]; then
+        run systemd-tmpfiles --create "$TMPFILES_DST" || true
+    fi
+fi
+
 say "Stage openmarquee-sudoers"
 SUDOERS_DST="${ROOT_PREFIX}/etc/sudoers.d/openmarquee"
 if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-sudoers" ]; then

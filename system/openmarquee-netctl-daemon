@@ -46,6 +46,12 @@ ALLOWLIST = frozenset(
         "nm-write-unmanaged-wlan0",
         "nm-remove-unmanaged-wlan0",
         "nm-reload",
+        # P1.2-B.3 (2026-06-10): release/restart NM's singleton
+        # wpa_supplicant.service so OUR wpa_supplicant@wlan0
+        # instance can claim the wlan0 interface. NM unmanage
+        # alone does NOT free the nl80211 ifname.
+        "nm-supplicant-stop",
+        "nm-supplicant-start",
         "wpa-write-wlan0-conf",
         "wpa-enable-wlan0",
         "wpa-stop-wlan0",
@@ -57,7 +63,12 @@ ALLOWLIST = frozenset(
 #   "subcommand line read capped, payload size cap (64KB)"
 MAX_SUBCOMMAND_LINE_BYTES = 256
 MAX_PAYLOAD_BYTES = 64 * 1024
-HELPER_TIMEOUT_S = 30
+# P1.2-B.3: bumped 30 -> 90 because `systemctl enable --now
+# wpa_supplicant@wlan0` under boot load takes longer than the
+# pre-bump 30s (QA's verify hit "response read timed out after
+# 15s" on the backend side; the daemon side needs comparable
+# headroom for the underlying systemctl call).
+HELPER_TIMEOUT_S = 90
 
 
 def _respond(line: str) -> None:

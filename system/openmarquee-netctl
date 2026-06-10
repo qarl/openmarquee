@@ -43,6 +43,12 @@ P1.2-B network take-over commands (read content from stdin where applicable):
                                    (file content via STDIN)
     nm-remove-unmanaged-wlan0      Delete the NM unmanaged drop-in
     nm-reload                      systemctl reload NetworkManager
+    nm-supplicant-stop             systemctl stop wpa_supplicant.service
+                                   (P1.2-B.3: release NM's singleton wpa_supplicant's
+                                    hold on wlan0 BEFORE enabling our own
+                                    wpa_supplicant@wlan0.service)
+    nm-supplicant-start            systemctl start wpa_supplicant.service
+                                   (rollback companion to nm-supplicant-stop)
     wpa-write-wlan0-conf           Write wpa_supplicant-wlan0.conf
                                    (file content via STDIN; mode 0600)
     wpa-enable-wlan0               systemctl enable --now wpa_supplicant@wlan0.service
@@ -50,7 +56,7 @@ P1.2-B network take-over commands (read content from stdin where applicable):
     hostapd-write-and-restart      Write hostapd.conf (STDIN) + systemctl restart hostapd
 
 If you need a new privileged operation, add a new subcommand here
-AND extend system/openmarquee-sudoers.
+AND extend system/openmarquee-netctl-daemon's ALLOWLIST.
 EOF
     exit 64  # EX_USAGE
 }
@@ -89,6 +95,25 @@ case "$cmd" in
     nm-reload)
         [ $# -eq 1 ] || usage
         systemctl reload NetworkManager
+        ;;
+    nm-supplicant-stop)
+        # P1.2-B.3: stop NM's singleton wpa_supplicant.service so
+        # our wpa_supplicant@wlan0.service can claim the wlan0
+        # interface (NM's supplicant doesn't release wlan0 on
+        # `nmcli unmanaged` — it keeps holding the nl80211 ifname
+        # which makes our instance fail status=255
+        # "another wpa_supplicant process already running"). On
+        # this device NM's supplicant only serves wlan0; ap0 is
+        # hostapd-driven, so stopping it is safe.
+        [ $# -eq 1 ] || usage
+        systemctl stop wpa_supplicant.service
+        ;;
+    nm-supplicant-start)
+        # Rollback companion to nm-supplicant-stop. Brings NM's
+        # singleton back so NetworkManager can resume managing
+        # wlan0 after the rollback.
+        [ $# -eq 1 ] || usage
+        systemctl start wpa_supplicant.service
         ;;
     wpa-write-wlan0-conf)
         [ $# -eq 1 ] || usage

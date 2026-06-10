@@ -43,8 +43,16 @@ DEFAULT_NM_DIR = Path("/etc/NetworkManager")
 DEFAULT_ROLLBACK_TIMEOUT_S = 180.0
 
 # Subprocess hop timeouts.
-NM_RELOAD_TIMEOUT_S = 15.0
-SYSTEMCTL_TIMEOUT_S = 15.0
+# P1.2-B.3 (2026-06-10): split the netctl per-op timeout into
+# fast + slow buckets. The previous flat 15s cap killed
+# wpa-enable-wlan0 mid-flip on the dev Pi — `systemctl enable
+# --now wpa_supplicant@wlan0.service` under boot load takes
+# 20-30s including service-state transitions. Fast ops (file
+# writes, reloads, stops) still cap at 15s; the slow class
+# (enable/restart on systemd units) gets 60s.
+NETCTL_FAST_TIMEOUT_S = 15.0
+NETCTL_SLOW_TIMEOUT_S = 60.0
+NM_RELOAD_TIMEOUT_S = NETCTL_FAST_TIMEOUT_S
 TAILSCALE_STATUS_TIMEOUT_S = 5.0
 
 TAKEOVER_ENV_FLAG = "OPENMARQUEE_NETWORK_TAKEOVER_ENABLED"
@@ -328,7 +336,7 @@ async def _run_netctl(
     subcommand: str,
     *,
     stdin_input: str | None = None,
-    timeout_s: float = SYSTEMCTL_TIMEOUT_S,
+    timeout_s: float = NETCTL_FAST_TIMEOUT_S,
 ) -> None:
     """P1.2-B.2 (2026-06-10): privilege-boundary invocation via the
     socket-activated root daemon. QA verified that
@@ -491,9 +499,19 @@ class TakeoverOrchestrator:
                 "nm-write-unmanaged-wlan0",
                 stdin_input=render_nm_unmanage_drop_in("wlan0"),
             )
-            # 3. Reload NM so it picks up the new conf.
+            # 3. Reload NM so it picks up the new conf. NM stops
+            #    managing wlan0 here, but its singleton
+            #    wpa_supplicant.service still HOLDS the nl80211
+            #    ifname (see step 4 — P1.2-B.3 fix).
             await _run_netctl("nm-reload", timeout_s=NM_RELOAD_TIMEOUT_S)
-            # 4. Render wpa_supplicant-wlan0.conf with the operator's
+            # 4. P1.2-B.3: stop NM's singleton wpa_supplicant.service
+            #    so our wpa_supplicant@wlan0.service can claim the
+            #    interface. Without this, step 6's enable fails
+            #    status=255 "another wpa_supplicant process already
+            #    running" — NM unmanage releases NM's profile but
+            #    NOT its supplicant's hold on the nl80211 ifname.
+            await _run_netctl("nm-supplicant-stop", timeout_s=NETCTL_SLOW_TIMEOUT_S)
+            # 5. Render wpa_supplicant-wlan0.conf with the operator's
             #    credentials. Same privilege-boundary crossing.
             await _run_netctl(
                 "wpa-write-wlan0-conf",
@@ -503,8 +521,11 @@ class TakeoverOrchestrator:
                     country=country,
                 ),
             )
-            # 5. Enable + start wpa_supplicant@wlan0.service.
-            await _run_netctl("wpa-enable-wlan0")
+            # 6. Enable + start wpa_supplicant@wlan0.service. SLOW
+            #    timeout (60s) per P1.2-B.3: systemctl enable --now
+            #    under boot load takes 20-30s including the unit's
+            #    initial scan + association.
+            await _run_netctl("wpa-enable-wlan0", timeout_s=NETCTL_SLOW_TIMEOUT_S)
             # 6. Install the one-shot association hook on the
             #    supervisor so the FIRST STA_ASSOCIATED event after
             #    the flip disarms the watchdog + persists
@@ -552,14 +573,22 @@ class TakeoverOrchestrator:
         # mark_associated against a no-longer-meaningful state.
         self.supervisor.set_takeover_associated_hook(None)
         # 1. Delete the NM drop-in (NM will pick up wlan0 again on
-        #    reload). All three subprocess hops go through netctl
-        #    so the same privilege grant covers rollback.
+        #    reload). All netctl hops go through the privileged
+        #    socket helper so the same daemon covers rollback.
         with contextlib.suppress(Exception):
             await _run_netctl("nm-remove-unmanaged-wlan0")
-        # 2. Stop wpa_supplicant@wlan0.service (avoid contention).
+        # 2. Stop wpa_supplicant@wlan0.service (avoid contention with
+        #    NM's singleton supplicant we're about to bring back).
+        #    SLOW timeout per P1.2-B.3 since systemctl stop on a
+        #    failing-to-associate unit can take time.
         with contextlib.suppress(Exception):
-            await _run_netctl("wpa-stop-wlan0")
-        # 3. Reload NM.
+            await _run_netctl("wpa-stop-wlan0", timeout_s=NETCTL_SLOW_TIMEOUT_S)
+        # 3. P1.2-B.3 (companion to attempt step 4): bring NM's
+        #    singleton wpa_supplicant.service back so NM can
+        #    resume managing wlan0 after the rollback.
+        with contextlib.suppress(Exception):
+            await _run_netctl("nm-supplicant-start", timeout_s=NETCTL_SLOW_TIMEOUT_S)
+        # 4. Reload NM.
         with contextlib.suppress(Exception):
             await _run_netctl("nm-reload", timeout_s=NM_RELOAD_TIMEOUT_S)
         # 4. Persist rollback marker so we don't re-attempt
