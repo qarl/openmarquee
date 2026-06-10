@@ -321,26 +321,54 @@ network={{
 """
 
 
-async def _systemctl(args: list[str], *, timeout_s: float = SYSTEMCTL_TIMEOUT_S) -> None:
-    """Helper: run `systemctl <args>` with timeout. Raises on failure."""
+NETCTL_BINARY = "/usr/local/sbin/openmarquee-netctl"
+
+
+async def _run_netctl(
+    subcommand: str,
+    *,
+    stdin_input: str | None = None,
+    timeout_s: float = SYSTEMCTL_TIMEOUT_S,
+) -> None:
+    """P1.2-B.1 (2026-06-10): privilege-boundary invocation. The
+    backend runs under NoNewPrivileges=true + ProtectSystem=strict
+    so direct file writes to /etc/ and systemctl commands fail
+    with EROFS / permission errors. The privileged helper at
+    NETCTL_BINARY is granted via sudoers (NOPASSWD on a strict
+    subcommand allowlist).
+
+    File content for write-* subcommands flows through STDIN, never
+    argv (the sudoers allowlist matches only `... <subcommand>`
+    with no trailing args, blocking argv-injection of file bytes).
+
+    Raises RuntimeError on subprocess failure / timeout / non-zero
+    exit. Caller (TakeoverOrchestrator / HostapdChannelActuator)
+    treats any failure as "this step did not succeed" + propagates
+    appropriately (rollback on attempt-time failure;
+    HostapdActuationError on actuator-time failure).
+    """
+    cmd = ["sudo", "-n", NETCTL_BINARY, subcommand]
     try:
         proc = await asyncio.create_subprocess_exec(
-            "systemctl",
-            *args,
+            *cmd,
+            stdin=asyncio.subprocess.PIPE if stdin_input is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError as e:
-        raise RuntimeError(f"systemctl binary not found: {e}") from e
+        raise RuntimeError(f"sudo binary not found: {e}") from e
+    encoded_input = stdin_input.encode("utf-8") if stdin_input is not None else None
     try:
-        _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        _stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=encoded_input), timeout=timeout_s
+        )
     except TimeoutError as e:
         with contextlib.suppress(Exception):
             proc.kill()
-        raise RuntimeError(f"systemctl {' '.join(args)} timed out") from e
+        raise RuntimeError(f"netctl {subcommand} timed out after {timeout_s:.0f}s") from e
     if proc.returncode != 0:
         raise RuntimeError(
-            f"systemctl {' '.join(args)} failed (rc={proc.returncode}): "
+            f"netctl {subcommand} failed (rc={proc.returncode}): "
             f"{stderr.decode('utf-8', errors='replace')!r}"
         )
 
@@ -433,23 +461,29 @@ class TakeoverOrchestrator:
         await watchdog.arm()
         self._watchdog = watchdog
         try:
-            # 2. Write the NM unmanage drop-in for wlan0.
-            self.paths.nm_unmanage_path.parent.mkdir(parents=True, exist_ok=True)
-            self.paths.nm_unmanage_path.write_text(render_nm_unmanage_drop_in("wlan0"))
+            # 2. Write the NM unmanage drop-in for wlan0 via the
+            #    privileged netctl helper. P1.2-B.1: the backend
+            #    can't write /etc directly under
+            #    ProtectSystem=strict; sudo to netctl crosses the
+            #    privilege boundary.
+            await _run_netctl(
+                "nm-write-unmanaged-wlan0",
+                stdin_input=render_nm_unmanage_drop_in("wlan0"),
+            )
             # 3. Reload NM so it picks up the new conf.
-            await _systemctl(["reload", "NetworkManager"], timeout_s=NM_RELOAD_TIMEOUT_S)
+            await _run_netctl("nm-reload", timeout_s=NM_RELOAD_TIMEOUT_S)
             # 4. Render wpa_supplicant-wlan0.conf with the operator's
-            #    credentials.
-            self.paths.wpa_conf_path.parent.mkdir(parents=True, exist_ok=True)
-            self.paths.wpa_conf_path.write_text(
-                render_wpa_supplicant_conf(
+            #    credentials. Same privilege-boundary crossing.
+            await _run_netctl(
+                "wpa-write-wlan0-conf",
+                stdin_input=render_wpa_supplicant_conf(
                     wifi_station_ssid,
                     wifi_station_password,
                     country=country,
-                )
+                ),
             )
             # 5. Enable + start wpa_supplicant@wlan0.service.
-            await _systemctl(["enable", "--now", "wpa_supplicant@wlan0.service"])
+            await _run_netctl("wpa-enable-wlan0")
             # 6. Install the one-shot association hook on the
             #    supervisor so the FIRST STA_ASSOCIATED event after
             #    the flip disarms the watchdog + persists
@@ -497,15 +531,16 @@ class TakeoverOrchestrator:
         # mark_associated against a no-longer-meaningful state.
         self.supervisor.set_takeover_associated_hook(None)
         # 1. Delete the NM drop-in (NM will pick up wlan0 again on
-        #    reload).
-        with contextlib.suppress(FileNotFoundError):
-            self.paths.nm_unmanage_path.unlink()
+        #    reload). All three subprocess hops go through netctl
+        #    so the same privilege grant covers rollback.
+        with contextlib.suppress(Exception):
+            await _run_netctl("nm-remove-unmanaged-wlan0")
         # 2. Stop wpa_supplicant@wlan0.service (avoid contention).
         with contextlib.suppress(Exception):
-            await _systemctl(["stop", "wpa_supplicant@wlan0.service"])
+            await _run_netctl("wpa-stop-wlan0")
         # 3. Reload NM.
         with contextlib.suppress(Exception):
-            await _systemctl(["reload", "NetworkManager"], timeout_s=NM_RELOAD_TIMEOUT_S)
+            await _run_netctl("nm-reload", timeout_s=NM_RELOAD_TIMEOUT_S)
         # 4. Persist rollback marker so we don't re-attempt
         #    immediately on next backend restart.
         self.supervisor.mark_rollback_fired()

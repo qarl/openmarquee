@@ -177,28 +177,34 @@ def _stub_paths(tmp_path: Path) -> TakeoverPaths:
 
 
 @pytest.fixture
-def systemctl_recorder(monkeypatch):
-    """Replace the orchestrator's _systemctl with a recording stub."""
-    calls: list[list[str]] = []
+def netctl_recorder(monkeypatch):
+    """P1.2-B.1: replace the orchestrator's _run_netctl with a
+    recording stub. Returns the list of (subcommand, stdin_input)
+    tuples — both pieces are part of the privilege boundary
+    contract (stdin = file content; sudoers grant blocks argv args)."""
+    calls: list[tuple[str, str | None]] = []
 
-    async def _stub_systemctl(args, *, timeout_s=15.0):
-        calls.append(list(args))
+    async def _stub_netctl(subcommand, *, stdin_input=None, timeout_s=15.0):
+        calls.append((subcommand, stdin_input))
 
     monkeypatch.setattr(
-        "openmarquee.network_supervisor_takeover._systemctl",
-        _stub_systemctl,
+        "openmarquee.network_supervisor_takeover._run_netctl",
+        _stub_netctl,
     )
     return calls
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_attempt_writes_files_and_calls_systemctl(
-    tmp_path: Path, systemctl_recorder, monkeypatch
+async def test_orchestrator_attempt_drives_netctl_subcommands(
+    tmp_path: Path, netctl_recorder, monkeypatch
 ):
+    """P1.2-B.1: the orchestrator no longer writes files directly.
+    Every privileged step goes through `_run_netctl(subcommand,
+    stdin_input=...)`. This test pins the exact sequence + the
+    stdin content for the write-* steps."""
     sup = _make_supervisor(tmp_path)
     paths = _stub_paths(tmp_path)
     orch = TakeoverOrchestrator(supervisor=sup, paths=paths, rollback_timeout_s=10.0)
-    # Pre-flight Tailscale: pass via direct stub.
 
     async def _ok_tailscale():
         return TailscalePreflightResult(ok=True, reason="ok", local_node_ip="100.x.y.z")
@@ -211,22 +217,31 @@ async def test_orchestrator_attempt_writes_files_and_calls_systemctl(
         wifi_station_ssid="pikazo",
         wifi_station_password="hunter2",
     )
-    # NM drop-in + wpa_supplicant conf both written.
-    assert paths.nm_unmanage_path.exists()
-    assert "wlan0" in paths.nm_unmanage_path.read_text()
-    assert paths.wpa_conf_path.exists()
-    assert 'ssid="pikazo"' in paths.wpa_conf_path.read_text()
-    # systemctl reload NetworkManager AND enable wpa_supplicant@wlan0.
-    assert ["reload", "NetworkManager"] in systemctl_recorder
-    assert ["enable", "--now", "wpa_supplicant@wlan0.service"] in systemctl_recorder
+    # 4 subcommands in order: nm write, nm reload, wpa write, wpa enable.
+    subcmds = [c[0] for c in netctl_recorder]
+    assert subcmds == [
+        "nm-write-unmanaged-wlan0",
+        "nm-reload",
+        "wpa-write-wlan0-conf",
+        "wpa-enable-wlan0",
+    ]
+    # NM unmanage drop-in content carries wlan0 directive.
+    nm_stdin = netctl_recorder[0][1]
+    assert nm_stdin is not None
+    assert "interface-name:wlan0" in nm_stdin
+    # wpa_supplicant config carries the operator's credentials.
+    wpa_stdin = netctl_recorder[2][1]
+    assert wpa_stdin is not None
+    assert 'ssid="pikazo"' in wpa_stdin
+    assert 'psk="hunter2"' in wpa_stdin
+    # Watchdog armed.
     assert watchdog.armed is True
-    # Cleanup: disarm so we don't leak the timer task.
     await watchdog.disarm()
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_mark_associated_disarms_and_persists(
-    tmp_path: Path, systemctl_recorder, monkeypatch
+    tmp_path: Path, netctl_recorder, monkeypatch
 ):
     sup = _make_supervisor(tmp_path)
     paths = _stub_paths(tmp_path)
@@ -244,19 +259,18 @@ async def test_orchestrator_mark_associated_disarms_and_persists(
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_rollback_cleans_drop_in(
-    tmp_path: Path, systemctl_recorder, monkeypatch
+async def test_orchestrator_rollback_runs_netctl_revert_sequence(
+    tmp_path: Path, netctl_recorder, monkeypatch
 ):
+    """P1.2-B.1: rollback runs nm-remove-unmanaged, wpa-stop, nm-reload
+    in that order. Each step suppresses its own exception so a
+    partial-state can still be partially repaired."""
     sup = _make_supervisor(tmp_path)
     paths = _stub_paths(tmp_path)
-    # Pre-populate the NM drop-in so we can verify rollback deletes it.
-    paths.nm_unmanage_path.write_text("simulated")
     orch = TakeoverOrchestrator(supervisor=sup, paths=paths, rollback_timeout_s=10.0)
     await orch.rollback()
-    assert not paths.nm_unmanage_path.exists()
-    # systemctl stop wpa_supplicant@wlan0 + reload NetworkManager.
-    assert ["stop", "wpa_supplicant@wlan0.service"] in systemctl_recorder
-    assert ["reload", "NetworkManager"] in systemctl_recorder
+    subcmds = [c[0] for c in netctl_recorder]
+    assert subcmds == ["nm-remove-unmanaged-wlan0", "wpa-stop-wlan0", "nm-reload"]
     # Supervisor state reflects rollback.
     assert sup.takeover_active is False
     assert sup.rollback_fired_at is not None
@@ -264,7 +278,7 @@ async def test_orchestrator_rollback_cleans_drop_in(
 
 @pytest.mark.asyncio
 async def test_orchestrator_rollback_fires_via_watchdog_on_timeout(
-    tmp_path: Path, systemctl_recorder, monkeypatch
+    tmp_path: Path, netctl_recorder, monkeypatch
 ):
     """End-to-end self-healing path: attempt() arms the watchdog;
     if mark_associated never fires, the watchdog runs rollback().
@@ -284,8 +298,10 @@ async def test_orchestrator_rollback_fires_via_watchdog_on_timeout(
         if watchdog.fired:
             break
     assert watchdog.fired is True
-    # Rollback deleted the drop-in + persisted the marker.
-    assert not paths.nm_unmanage_path.exists()
+    # Rollback ran the netctl revert sequence (attempt's 4 calls +
+    # rollback's 3 calls = 7 total).
+    subcmds = [c[0] for c in netctl_recorder]
+    assert "nm-remove-unmanaged-wlan0" in subcmds
     assert sup.rollback_fired_at is not None
 
 
@@ -403,7 +419,7 @@ async def test_evaluate_blocks_when_tailscale_down(tmp_path: Path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_apply_event_sta_associated_disarms_watchdog(
-    tmp_path: Path, systemctl_recorder, monkeypatch
+    tmp_path: Path, netctl_recorder, monkeypatch
 ):
     """Sacred-review BLOCKER regression-lock (P1.2-B): the
     orchestrator MUST install its mark_associated hook on the
@@ -449,7 +465,7 @@ async def test_apply_event_sta_associated_disarms_watchdog(
 
 @pytest.mark.asyncio
 async def test_rollback_clears_takeover_associated_hook(
-    tmp_path: Path, systemctl_recorder, monkeypatch
+    tmp_path: Path, netctl_recorder, monkeypatch
 ):
     """Defensive: rollback must clear the hook so a delayed
     STA_ASSOCIATED post-rollback doesn't re-trigger mark_associated

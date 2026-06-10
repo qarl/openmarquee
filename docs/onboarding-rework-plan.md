@@ -398,6 +398,123 @@ criteria, not polish.** Specifically:
 
 ---
 
+## §D.4 — P1.2-B.1 deliverables (2026-06-10 — privilege boundary)
+
+Shipped after QA's live verify caught the production-reality bug
+QA's sacred review and my unit tests both missed: the backend
+runs as user `openmarquee` under `NoNewPrivileges=true` +
+`ProtectSystem=strict` (see `system/openmarquee-backend.service`),
+so direct file writes to `/etc/` and `systemctl` invocations fail
+with EROFS / permission errors. The rollback path worked perfectly
+on the first failed flip (no connectivity loss, observe-only
+preserved, watchdog disarmed clean) — the architecture is sound;
+just needed the privilege boundary.
+
+### What this commit ships (10 files)
+
+1. **`system/openmarquee-netctl` (NEW ~100 LOC)** — the privilege-
+   boundary helper. Bash script with strict argv contract:
+   ```
+   openmarquee-netctl <command>
+       nm-write-unmanaged-wlan0       # STDIN = NM drop-in content
+       nm-remove-unmanaged-wlan0
+       nm-reload
+       wpa-write-wlan0-conf           # STDIN = wpa config (mode 0600)
+       wpa-enable-wlan0
+       wpa-stop-wlan0
+       hostapd-write-and-restart      # STDIN = hostapd config
+   ```
+   File content for write-* subcommands flows through STDIN,
+   never argv (the sudoers grant blocks trailing args). Each
+   write uses atomic tempfile + `mv -f` in the same directory.
+
+2. **`system/openmarquee-sudoers` (MODIFIED)** — adds 7 NOPASSWD
+   grants, one per netctl subcommand. **No wildcards** — the
+   subcommand allowlist is the security boundary. Adding a new
+   privileged operation requires (a) new subcommand in the
+   helper, (b) new grant here.
+
+3. **`scripts/install.sh` (MODIFIED)** — installs the helper to
+   `/usr/local/sbin/openmarquee-netctl` with mode 0755 owner
+   root:root. Runs BEFORE the sudoers stage so `visudo -c`
+   validation has a valid target binary path to anchor against.
+
+4. **`backend/openmarquee/network_supervisor_takeover.py`
+   (MODIFIED)** — replaced direct `paths.nm_unmanage_path.write_text(...)`
+   and `_systemctl(["reload", ...])` calls with `_run_netctl(
+   subcommand, stdin_input=...)`. Same orchestrator semantics
+   (arm watchdog FIRST, mark_associated hook, immediate-rollback
+   on exception), just routed through sudo to netctl. Replaced
+   `_systemctl()` helper with `_run_netctl()`.
+
+5. **`backend/openmarquee/network_supervisor_actuator.py`
+   (MODIFIED)** — replaced the tempfile + os.replace + systemctl
+   restart pattern with a single `_run_netctl_hostapd_write_and_restart`
+   call. The new conf text is piped via STDIN. Atomic-write
+   responsibility moves into the helper (`install_from_stdin`
+   shell function). Post-verify via `iw dev ap0 info` unchanged
+   (read-only, no privilege escalation needed).
+
+6. **`backend/tests/test_network_supervisor_actuator.py`
+   (MODIFIED)** — tests now mock `sudo` invocations + assert the
+   STDIN payload content. Added `test_actuator_pipes_new_conf_through_netctl_stdin`
+   pinning the exact argv shape: `["sudo", "-n", "/usr/local/sbin/openmarquee-netctl",
+   "hostapd-write-and-restart"]`. Defense against argv-injection
+   regression.
+
+7. **`backend/tests/test_network_supervisor_takeover.py`
+   (MODIFIED)** — renamed `systemctl_recorder` fixture to
+   `netctl_recorder` returning `[(subcommand, stdin_input), ...]`
+   tuples. Tests pin the exact subcommand sequence + the STDIN
+   payload for the write-* steps.
+
+8. **`docs/onboarding-rework-plan.md` (MODIFIED)** — this §D.4
+   section documents the privilege-boundary design + audit.
+
+### Privilege audit (the "every subprocess/file-write" review QA asked for)
+
+| Operation                                          | P1.2-B path                           | P1.2-B.1 path                            |
+| -------------------------------------------------- | ------------------------------------- | ---------------------------------------- |
+| Write /etc/NetworkManager/conf.d/...-wlan0.conf    | `path.write_text` ❌                  | `netctl nm-write-unmanaged-wlan0` ✓       |
+| Delete the NM drop-in                              | `path.unlink` ❌                      | `netctl nm-remove-unmanaged-wlan0` ✓      |
+| systemctl reload NetworkManager                    | `subprocess(systemctl ...)` ❌        | `netctl nm-reload` ✓                      |
+| Write /etc/wpa_supplicant/wpa_supplicant-wlan0.conf| `path.write_text` ❌                  | `netctl wpa-write-wlan0-conf` ✓           |
+| systemctl enable --now wpa_supplicant@wlan0        | `subprocess(systemctl ...)` ❌        | `netctl wpa-enable-wlan0` ✓               |
+| systemctl stop wpa_supplicant@wlan0                | `subprocess(systemctl ...)` ❌        | `netctl wpa-stop-wlan0` ✓                 |
+| Write /etc/hostapd/hostapd.conf                    | `tempfile + os.replace` ❌            | `netctl hostapd-write-and-restart` ✓     |
+| systemctl restart hostapd                          | `subprocess(systemctl ...)` ❌        | (combined with write above) ✓             |
+| `iw dev ap0 info` (post-verify)                    | `subprocess(iw ...)` ✓                | unchanged — read-only doesn't need root  |
+| `iw dev wlan0 info` (STA freq poll in observe loop)| `subprocess(iw ...)` ✓                | unchanged                                |
+| `tailscale status --json` (pre-flight)             | `subprocess(tailscale ...)` ✓         | unchanged                                |
+| Read `/etc/hostapd/hostapd.conf` (actuator)        | `path.read_text` ✓                    | unchanged — `ProtectSystem=strict` allows reads |
+| Read/write `/var/openmarquee/network-state.json`   | `path.write_text` ✓                   | unchanged — already in `ReadWritePaths=` |
+
+**Privilege boundary contract:** the helper validates `$# -eq 1`
+on every subcommand so the sudoers `... <subcommand>` form can't
+be tricked into accepting extra args. File content arrives via
+STDIN (not argv) to prevent injection of arbitrary file bytes.
+Pinned paths in the helper (no `$1`-based file paths) prevent
+write-arbitrary-file attacks. The `install_from_stdin` helper
+chowns to root:root + mv's atomically.
+
+### NoNewPrivileges + sudo compatibility
+
+`NoNewPrivileges=true` blocks setuid escalation, which is normally
+how sudo elevates. Production evidence (wifi_station.py's
+nmcli-via-sudo calls have worked since shipping) confirms sudo
+DOES function on Debian Bookworm under NNP — likely via the
+nss-systemd / pam_systemd pipeline that doesn't require setuid.
+Verified by reference: the existing sudoers grant for nmcli is
+production-tested.
+
+If P1.2-B.1's QA verify on the dev Pi shows sudo failing under
+NNP after all, the fallback is option (B) from QA's dispatch:
+template oneshot systemd units invoked via `systemctl start
+openmarquee-net-takeover.service`, gated by a polkit rule
+granting the openmarquee user the `org.freedesktop.systemd1.manage-units`
+right scoped to `openmarquee-net-*`. Flag this as a known
+fallback path; don't implement until needed.
+
 ## §D.3 — P1.2-B deliverables (2026-06-10 — NM take-over + active actuator)
 
 Shipped after QA's 42-min P1.2-A.1 soak passed (259 decision lines,

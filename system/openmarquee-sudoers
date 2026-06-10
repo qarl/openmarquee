@@ -31,3 +31,23 @@
 
 openmarquee ALL=(root) NOPASSWD: /usr/bin/nmcli device wifi connect *
 openmarquee ALL=(root) NOPASSWD: /usr/bin/nmcli connection delete *
+
+# P1.2-B.1 (2026-06-10): privileged network-control helper. The
+# openMarquee backend runs under NoNewPrivileges=true +
+# ProtectSystem=strict (system/openmarquee-backend.service), so it
+# cannot write /etc/ nor restart system services directly. The
+# helper at /usr/local/sbin/openmarquee-netctl is the privilege
+# boundary; its subcommand allowlist + STDIN-only file content
+# prevent argv injection. Subcommands documented in
+# system/openmarquee-netctl.
+#
+# Scope must stay tight: any NEW privileged operation needs (a) a
+# new subcommand in the helper and (b) an extension here. Do NOT
+# relax this to a generic `openmarquee-netctl *` form.
+openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl nm-write-unmanaged-wlan0
+openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl nm-remove-unmanaged-wlan0
+openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl nm-reload
+openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl wpa-write-wlan0-conf
+openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl wpa-enable-wlan0
+openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl wpa-stop-wlan0
+openmarquee ALL=(root) NOPASSWD: /usr/local/sbin/openmarquee-netctl hostapd-write-and-restart

@@ -799,6 +799,22 @@ done
 # /etc/sudoers.d/openmarquee MUST be mode 0440 (sudoers refuses to
 # parse it otherwise). visudo -c validates the full /etc/sudoers tree
 # including the .d/ fragments; abort the install if validation trips.
+
+# P1.2-B.1 (2026-06-10): privileged network-control helper. The
+# openMarquee backend runs under NoNewPrivileges=true +
+# ProtectSystem=strict so cannot write /etc or restart system
+# services directly. The helper at /usr/local/sbin/openmarquee-netctl
+# crosses the privilege boundary; the sudoers grant just below
+# allows the backend user to invoke it. install.sh ships both in
+# lock-step; see system/openmarquee-netctl docstring + system/
+# openmarquee-sudoers for the contract.
+say "Stage openmarquee-netctl privilege-boundary helper"
+NETCTL_DST="${ROOT_PREFIX}/usr/local/sbin/openmarquee-netctl"
+if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-netctl" ]; then
+    run mkdir -p "$(dirname "$NETCTL_DST")"
+    run install -m 0755 -o root -g root "${OPT_DIR}/system/openmarquee-netctl" "$NETCTL_DST"
+fi
+
 say "Stage openmarquee-sudoers"
 SUDOERS_DST="${ROOT_PREFIX}/etc/sudoers.d/openmarquee"
 if [ "$DRY_RUN" -eq 1 ] || [ -f "${OPT_DIR}/system/openmarquee-sudoers" ]; then

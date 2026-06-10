@@ -9,6 +9,12 @@ critical correctness piece — `systemctl restart hostapd.service`
 returning 0 does NOT guarantee hostapd is actually beaconing on
 the target channel.
 
+P1.2-B.1: the hostapd.conf rewrite + systemctl restart go through
+the privileged netctl helper (sudo grant in
+system/openmarquee-sudoers + script in system/openmarquee-netctl).
+The backend's NoNewPrivileges + ProtectSystem=strict makes direct
+file writes to /etc and systemctl invocations fail otherwise.
+
 Sync subprocess: the actuator fires from inside the supervisor's
 sync apply_sta_freq, which is called from the observe loop's
 async tick. We use blocking `subprocess.run` because:
@@ -28,10 +34,8 @@ small wrappers tests monkeypatch.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import subprocess
-import tempfile
 from pathlib import Path
 
 from openmarquee.network_supervisor import ChannelFollowDecision
@@ -40,7 +44,8 @@ log = logging.getLogger(__name__)
 
 DEFAULT_HOSTAPD_CONF = Path("/etc/hostapd/hostapd.conf")
 DEFAULT_AP_IFACE = "ap0"
-SYSTEMCTL_TIMEOUT_S = 15.0
+NETCTL_BINARY = "/usr/local/sbin/openmarquee-netctl"
+NETCTL_TIMEOUT_S = 15.0
 IW_VERIFY_TIMEOUT_S = 5.0
 
 
@@ -85,26 +90,34 @@ def _parse_iw_dev_info_channel(iw_output: str) -> int | None:
         return None
 
 
-def _systemctl_restart(unit: str, *, timeout_s: float = SYSTEMCTL_TIMEOUT_S) -> None:
-    """Run `systemctl restart <unit>` (blocking) with a timeout.
-    Raises HostapdActuationError on non-zero exit / timeout / spawn
-    failure."""
+def _run_netctl_hostapd_write_and_restart(
+    new_conf: str,
+    *,
+    timeout_s: float = NETCTL_TIMEOUT_S,
+) -> None:
+    """P1.2-B.1: privilege-boundary invocation for the hostapd
+    write+restart. Pipes the new config into netctl via STDIN;
+    the helper installs to /etc/hostapd/hostapd.conf atomically
+    + restarts hostapd. Sync (subprocess.run) to match the
+    actuator's blocking semantics.
+    """
     try:
         result = subprocess.run(
-            ["systemctl", "restart", unit],
+            ["sudo", "-n", NETCTL_BINARY, "hostapd-write-and-restart"],
+            input=new_conf.encode("utf-8"),
             capture_output=True,
             timeout=timeout_s,
             check=False,
         )
     except FileNotFoundError as e:
-        raise HostapdActuationError(f"systemctl binary not found: {e}") from e
+        raise HostapdActuationError(f"sudo binary not found: {e}") from e
     except subprocess.TimeoutExpired as e:
         raise HostapdActuationError(
-            f"systemctl restart {unit} timed out after {timeout_s:.0f}s"
+            f"netctl hostapd-write-and-restart timed out after {timeout_s:.0f}s"
         ) from e
     if result.returncode != 0:
         raise HostapdActuationError(
-            f"systemctl restart {unit} failed (rc={result.returncode}): "
+            f"netctl hostapd-write-and-restart failed (rc={result.returncode}): "
             f"{result.stderr.decode('utf-8', errors='replace')!r}"
         )
 
@@ -165,7 +178,9 @@ class HostapdChannelActuator:
                 f"decision.target_channel is None (reason={decision.reason}); refusing"
             )
 
-        # 1. Read current hostapd.conf.
+        # 1. Read current hostapd.conf. Read is permitted under
+        #    ProtectSystem=strict (it only blocks writes); we render
+        #    the new content in-process then hand both off to netctl.
         try:
             current_text = self.hostapd_conf_path.read_text()
         except OSError as e:
@@ -174,25 +189,11 @@ class HostapdChannelActuator:
         # 2. Substitute channel.
         new_text = _substitute_channel(current_text, decision.target_channel)
 
-        # 3. Atomic write: tempfile in same dir + os.replace.
-        try:
-            tmp_dir = self.hostapd_conf_path.parent
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                dir=str(tmp_dir),
-                delete=False,
-                prefix=".",
-                suffix=".hostapd.conf.tmp",
-            ) as tmp:
-                tmp.write(new_text)
-                tmp_name = tmp.name
-            os.replace(tmp_name, self.hostapd_conf_path)
-        except OSError as e:
-            raise HostapdActuationError(f"failed to write {self.hostapd_conf_path}: {e}") from e
-
-        # 4. Restart hostapd.
-        _systemctl_restart("hostapd.service")
+        # 3+4. Atomic write + systemctl restart through the privileged
+        #      netctl helper (P1.2-B.1). The backend can't write /etc
+        #      directly under ProtectSystem=strict; sudo to netctl
+        #      crosses the privilege boundary.
+        _run_netctl_hostapd_write_and_restart(new_text)
 
         # 5. Post-verify via iw — the load-bearing reality check.
         iw_output = _iw_dev_info(self.ap_iface)
