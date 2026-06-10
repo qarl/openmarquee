@@ -834,6 +834,79 @@ impl SlideCache {
     /// without an entry; downstream paint paths fall back via
     /// the existing UnsupportedSlide wire (Python:
     /// `RustRendererUnsupportedSlideError`).
+    /// r104.1 (2026-06-09): TextSlide content loader that
+    /// DELIBERATELY SKIPS the recursive bg-video prime. Used by
+    /// the BeginTransition handler under serialization mode so
+    /// the to-slide's text content is ready for paint but its
+    /// bg-video decoder stays unprimed for the duration of the
+    /// transition window. The bg-video decoder primes at the
+    /// subsequent BeginSlide (after eviction of from-side via
+    /// `evict_other_video_state`) so AT MOST ONE video decoder
+    /// is ever live on the bcm2835-codec single VPU.
+    ///
+    /// Pre-r104.1 (default `load`): on a TextSlide cache hit,
+    /// `ensure_bg_video_for_text_slide` recursively re-primed
+    /// the bg-video. On a fresh load, the same recursive prime
+    /// fired from line 922. r104.1 skips both for the
+    /// transition-window-only call site.
+    ///
+    /// For non-Text items (Image, Video) this method is
+    /// identical to `load` -- there's no bg-video chase to
+    /// skip. The "skip" only applies to TextSlide's bg-video
+    /// reference.
+    fn load_skip_bg_video(
+        &mut self,
+        content_root: &std::path::Path,
+        item_id: uuid::Uuid,
+    ) -> Result<()> {
+        let item_json_path = content_root.join(item_id.to_string()).join("item.json");
+        let on_disk_mtime = std::fs::metadata(&item_json_path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        if self.items.get(&item_id).is_some() {
+            if self.item_mtimes.get(&item_id).copied() == on_disk_mtime {
+                let video_needs_reprime = Self::video_reprime_needed(
+                    matches!(
+                        self.items.get(&item_id),
+                        Some(ContentItem::Video(_))
+                    ),
+                    self.video_skip.contains(&item_id),
+                    self.video_demuxers.contains_key(&item_id),
+                    self.has_video_decoder(item_id),
+                );
+                if !video_needs_reprime {
+                    // r104.1: skip `ensure_bg_video_for_text_slide`
+                    // -- that's the whole point of this method.
+                    return Ok(());
+                }
+            } else {
+                eprintln!(
+                    "ipc: slide {item_id} item.json drifted on disk; refreshing cache"
+                );
+                self.invalidate(item_id);
+            }
+        }
+        let loaded = if let Some(s) = find_text_slide(content_root, item_id)? {
+            self.items.insert(item_id, ContentItem::Text(s));
+            true
+        } else if let Some(s) = find_image_slide(content_root, item_id)? {
+            self.items.insert(item_id, ContentItem::Image(s));
+            true
+        } else { false };
+        if loaded {
+            if let Some(m) = on_disk_mtime {
+                self.item_mtimes.insert(item_id, m);
+            }
+            // r104.1: SKIP the recursive bg-video prime.
+            return Ok(());
+        }
+        // For Video items, delegate to the full loader -- pure
+        // Video slides aren't text-with-bg-video and r104.1's
+        // skip semantics don't apply. (Pure V->V is also out of
+        // r104's scope per BLOCKER-2 narrowing.)
+        self.load(content_root, item_id)
+    }
+
     fn load(&mut self, content_root: &std::path::Path, item_id: uuid::Uuid) -> Result<()> {
         // Bug 1 (qarl 2026-05-16): on-disk mtime check defeats the
         // contains_key short-circuit when the operator edits a slide.
@@ -3025,42 +3098,85 @@ fn handle_inner_request(
             crate::hdmi_logic::record_transition_begin_for_endpoint_b_metric(
                 from_id_for_metric, p.to_slide_id,
             );
-            // r104 (2026-06-09): video-decoder serialization for
-            // Pi Zero 2 W's single bcm2835-codec VPU. When BOTH
-            // endpoints carry bg-video AND the bg ids differ,
-            // force STREAMOFF + close of the outgoing decoder
-            // BEFORE the to-slide cache.load primes the incoming
-            // one. At most ONE video decoder exists at a time on
-            // the firmware-side codec scheduler.
+            // r104.1 subagent BLOCKER-1 fix: join the async
+            // preload artifacts INTO cache.items BEFORE the
+            // serialization flag computation reads
+            // `cache.items.peek(&p.to_slide_id)`. Pre-fix
+            // ordering had the flag-check happening before
+            // `ensure_preload_complete`, so on fresh-boot
+            // first-loop through a playlist (where the
+            // to-slide hasn't been the current slide yet),
+            // `cache.items.peek` returned None → predicate
+            // returned None → default cache.load ran → both
+            // decoders went live → dual-1080p wedge persisted
+            // until the 2nd+ playlist loop (when the LRU had
+            // warmed). qarl's wall trial would have hit this
+            // every fresh-boot. Move ensure_preload_complete
+            // ABOVE the flag block so cache.items.peek sees
+            // the joined preload artifacts.
+            ensure_preload_complete(cache, p.to_slide_id);
+            // r104.1 (2026-06-09): video-decoder serialization
+            // for Pi Zero 2 W's single bcm2835-codec VPU --
+            // PIVOTED from "evict from + prime to at
+            // BeginTransition" (r104) to "skip to-side bg prime
+            // at BeginTransition; BeginSlide already does the
+            // single-decoder eviction-then-prime correctly."
             //
-            // Visible cost: ~150-300 ms blank at transition entry
-            // while decoder #2 primes. The existing FYS bug C skip
-            // path (Path B polling in the bake_b loop) absorbs it;
-            // endpoint A goes Text-only (no video bg) for the
-            // transition window because its decoder is gone --
-            // handled in the endpoint construction below.
+            // Why pivoted: r104 made the OUTGOING video bg
+            // disappear for the entire 1500ms transition (decoder
+            // #1 evicted at BeginTransition entry, slide A bg
+            // went to solid for the duration). Visible result
+            // on the wall was uglier than the design predicted.
+            //
+            // r104.1 behavior under serialize-enabled mode:
+            //   - from-side bg decoder STAYS ALIVE through the
+            //     whole transition (outgoing video plays
+            //     normally as iris/wipe reveals slide B)
+            //   - to-side bg decoder is NOT primed at
+            //     BeginTransition (endpoint_b paint falls back
+            //     to Text-only -- solid bg masked by the
+            //     iris/wipe shader during reveal)
+            //   - At the subsequent BeginSlide for slide B,
+            //     `evict_other_video_state(&[B, bg_B])` drops
+            //     decoder #1 + `cache.load(B)` primes decoder
+            //     #2 -- the canonical single-decoder swap that
+            //     was already in place before r104. Brief
+            //     ~60-118ms blank on slide B at slide-entry
+            //     while decoder #2 produces its first frame
+            //     (acceptable per qarl visual judgment).
+            //
+            // The serialization predicate's name
+            // (`serialization_eviction_target`) reads as a
+            // misnomer now (we no longer evict here) but the
+            // LOGIC is identical: "is this a dual-bg-video
+            // transition that needs the single-decoder
+            // invariant?" Same Some-iff-both-distinct-Some
+            // shape.
+            //
+            // Defensive evict-if-preload-fired for the to-side
+            // bg: a lead/max PreloadMode could prime decoder #2
+            // before BeginTransition fires (rare; the default
+            // defer mode skips preload). Single-decoder
+            // invariant requires we drop it even though the
+            // load below will skip the prime path.
             //
             // Kill switch: OPENMARQUEE_VIDEO_DECODER_SERIALIZE=off
-            // falls back to the pre-r104 concurrent-decoder
-            // behavior so QA can A/B at deploy time.
-            // r104 subagent BLOCKER-2 fix: scope-narrow the
-            // serialization gate to TEXT-with-bg-video only
-            // (not pure Video::Video slides). The endpoint
-            // construction's Video arm still does
-            // `from_dec_state.take().expect()` which would
-            // panic on a V->V transition after eviction. Pure
-            // V->V keeps the legacy concurrent-decoder
-            // behavior (still wedges on dual-1080p but isn't
-            // the Sanity Check canonical case); follow-up
-            // (r104.1) can extend if pure V->V dual-1080p
-            // becomes the active product surface.
+            // routes through the default `cache.load` (which
+            // primes to-side bg) and keeps decoder #1 alive --
+            // i.e. pre-r104 concurrent-decoder behavior. A/B
+            // mode reproduces the dual-1080p wedge.
+            //
+            // r104 subagent BLOCKER-2 narrowing preserved:
+            // pure Video::Video stays on the legacy path
+            // (`from_bg_id` / `to_bg_id` only resolve for
+            // Text-with-bg-video; pure Video doesn't trigger).
             #[cfg(target_os = "linux")]
-            let r104_evicted_id: Option<uuid::Uuid> = {
+            let r104_1_skip_to_bg_prime: bool = {
                 let serialize_enabled =
                     crate::v4l2::is_video_decoder_serialization_enabled();
-                let from_id_for_eviction =
+                let from_id_for_check =
                     state.current.as_ref().map(|c| c.slide_id);
-                let from_bg_id = from_id_for_eviction.and_then(|id| {
+                let from_bg_id = from_id_for_check.and_then(|id| {
                     match cache.items.peek(&id) {
                         Some(ContentItem::Text(s)) => s.background_video_slide_id,
                         _ => None,
@@ -3070,57 +3186,103 @@ fn handle_inner_request(
                     Some(ContentItem::Text(s)) => s.background_video_slide_id,
                     _ => None,
                 };
-                if let Some(evict_id) = serialization_eviction_target(
+                if serialization_eviction_target(
                     serialize_enabled, from_bg_id, to_bg_id,
-                ) {
-                    let t_evict = std::time::Instant::now();
-                    let dropped =
-                        cache.evict_video_decoder_for_serialization(evict_id);
-                    // r104 subagent WARN-5 fix: format Option<Uuid>
-                    // as `UUID|none` (the established slide_id=
-                    // pattern) instead of Debug-style
-                    // `Some(UUID)|None` so QA's `=`-split parser
-                    // sees uniform key=value pairs.
+                ).is_some() {
+                    // Defensive evict-if-preload-fired. r97
+                    // defer mode (default) skips preload when
+                    // codec contention is detected, so this
+                    // branch is rare. lead/max modes may prime
+                    // bg_B before BeginTransition; drop it now
+                    // to keep the single-decoder invariant.
+                    //
+                    // r104.1 subagent WARN-2: this call drops
+                    // BOTH `video_decoders[to_bg_id]` AND
+                    // `video_demuxers[to_bg_id]` per
+                    // `evict_video_decoder_for_serialization`
+                    // semantics. The demuxer cost (~70-200 ms of
+                    // mp4-parse warmup) gets re-paid at slide B's
+                    // BeginSlide. Acceptable trade for the
+                    // single-decoder invariant.
+                    if let Some(bg_id) = to_bg_id {
+                        if cache.video_decoders.contains_key(&bg_id) {
+                            let t_evict = std::time::Instant::now();
+                            let dropped = cache
+                                .evict_video_decoder_for_serialization(bg_id);
+                            // r104.1 subagent WARN-4: same grep-
+                            // continuity rule as the skip_to_bg
+                            // variant above.
+                            eprintln!(
+                                "[perf] begin_transition_serialization \
+                                 variant=preload_evict evict_id={} dropped={} elapsed_us={}",
+                                bg_id,
+                                dropped,
+                                t_evict.elapsed().as_micros(),
+                            );
+                        }
+                    }
                     let from_bg_str = from_bg_id
                         .map(|id| id.to_string())
                         .unwrap_or_else(|| "none".to_string());
                     let to_bg_str = to_bg_id
                         .map(|id| id.to_string())
                         .unwrap_or_else(|| "none".to_string());
+                    // r104.1 subagent WARN-4: keep the
+                    // `begin_transition_serialization` substring
+                    // contiguous so QA's r104 grep tooling
+                    // (matching `begin_transition_serialization`
+                    // with a word boundary or trailing space)
+                    // continues to capture the gate-active
+                    // signal across the r104 -> r104.1 rename.
+                    // The new suffix distinguishes the variant.
                     eprintln!(
                         "[perf] begin_transition_serialization \
-                         evict_id={} dropped={} elapsed_us={} from_bg={} to_bg={}",
-                        evict_id,
-                        dropped,
-                        t_evict.elapsed().as_micros(),
-                        from_bg_str,
-                        to_bg_str,
+                         variant=skip_to_bg from_bg={} to_bg={}",
+                        from_bg_str, to_bg_str,
                     );
-                    Some(evict_id)
+                    true
                 } else {
-                    None
+                    false
                 }
             };
             #[cfg(not(target_os = "linux"))]
-            let r104_evicted_id: Option<uuid::Uuid> = None;
+            let r104_1_skip_to_bg_prime: bool = false;
             // r65 (2026-06-05): join any in-flight async preload
             // for the to-slide BEFORE cache.load so the load
             // short-circuits on the artifacts the worker
             // produced. Identical semantics to the BeginSlide
             // path above; emits the same [perf]
             // begin_slide_wait line.
-            ensure_preload_complete(cache, p.to_slide_id);
+            //
+            // r104.1 subagent BLOCKER-1 fix: this call was MOVED
+            // ABOVE the serialization flag block (search for
+            // `ensure_preload_complete` earlier in this match
+            // arm). Pre-fix the flag-check at line ~3120
+            // ran BEFORE preload was joined, missing fresh-boot
+            // first-loop because cache.items hadn't seen the
+            // to-slide yet.
             // r58 (2026-06-04): time the to-slide cache.load so QA
             // can see PreloadSlide wins on the transition path too.
             // Same heuristic as begin_slide_load above.
+            //
+            // r104.1: route through `load_skip_bg_video` when
+            // serialization mode determined we should NOT prime
+            // the to-side bg-video at BeginTransition. Default
+            // path (kill switch off OR not a dual-bg transition)
+            // uses `cache.load` exactly as pre-r104.
             let t_load = std::time::Instant::now();
-            if let Err(e) = cache.load(content_root, p.to_slide_id) {
+            let load_result = if r104_1_skip_to_bg_prime {
+                cache.load_skip_bg_video(content_root, p.to_slide_id)
+            } else {
+                cache.load(content_root, p.to_slide_id)
+            };
+            if let Err(e) = load_result {
                 return err(format!("begin_transition load failed: {e:#}"));
             }
             let load_us = t_load.elapsed().as_micros();
             eprintln!(
-                "[perf] begin_transition_load slide_id={} load_us={}",
-                p.to_slide_id, load_us,
+                "[perf] begin_transition_load slide_id={} load_us={} skip_bg={}",
+                p.to_slide_id, load_us, r104_1_skip_to_bg_prime,
             );
             // Hardening C3 / M1 (2026-05-21): also re-prime the
             // FROM-slide. The transition paint path fetches the
@@ -3135,21 +3297,14 @@ fn handle_inner_request(
             // (begin_transition itself derives it the same way and
             // errors below if there's no current slide).
             //
-            // r104 subagent BLOCKER-1 fix: SKIP this re-prime when
-            // r104 just evicted the from-side bg decoder. `cache.
-            // load` would recursively re-prime the just-dropped
-            // decoder via the TextOverVideo bg-id chase, defeating
-            // the entire serialization gate. The paint path no
-            // longer hard-errors on missing decoder (r104's
-            // endpoint construction soft-falls back to Text), so
-            // M1's defensive re-prime is unnecessary when r104
-            // fired. Without r104 (kill switch =off) the re-prime
-            // still runs for pre-r104 correctness.
-            if r104_evicted_id.is_none() {
-                if let Some(from_id) = state.current.as_ref().map(|c| c.slide_id) {
-                    if let Err(e) = cache.load(content_root, from_id) {
-                        return err(format!("begin_transition load failed: {e:#}"));
-                    }
+            // r104.1: M1 re-prime can ALWAYS run now (no gate). The
+            // r104 BLOCKER-1 gate is no longer needed because r104.1
+            // doesn't evict at BeginTransition; the from-side
+            // decoder is alive by construction, and `cache.load`
+            // short-circuits cheaply on the hit path.
+            if let Some(from_id) = state.current.as_ref().map(|c| c.slide_id) {
+                if let Err(e) = cache.load(content_root, from_id) {
+                    return err(format!("begin_transition load failed: {e:#}"));
                 }
             }
             // Bug 8 / Fix A: same skip-marker check as BeginSlide,
@@ -3612,71 +3767,120 @@ mod tests {
     }
 
     #[test]
-    fn r104_m1_reprime_skipped_when_serialization_evicted_from_decoder() {
-        // r104 subagent BLOCKER-1 regression-lock: the M1
-        // (Hardening C3) re-prime at the bottom of the
-        // BeginTransition handler calls `cache.load(from_id)`
-        // which recursively re-primes the just-evicted from-side
-        // bg decoder via the TextOverVideo bg-id chase. Without
-        // gating, r104's eviction is immediately undone and the
-        // dual-1080p wedge persists. Pin that the re-prime is
-        // gated on `r104_evicted_id.is_none()`.
+    fn r104_1_begin_transition_does_not_evict_from_side_decoder() {
+        // r104.1: outgoing video must SURVIVE the transition
+        // window. Pin that the BeginTransition handler does NOT
+        // call `evict_video_decoder_for_serialization` on the
+        // FROM-side bg-decoder. The only acceptable eviction
+        // call inside the handler is the defensive
+        // preload-already-fired evict on the TO-side
+        // (begin_transition_serialization_preload_evict).
+        //
+        // Source-pin: in the BeginTransition handler body,
+        // every `evict_video_decoder_for_serialization` call
+        // must be in the preload-evict block whose probe line
+        // is `begin_transition_serialization_preload_evict`.
+        // If a future refactor reintroduces a from-side
+        // eviction, the test surfaces it.
         let src = include_str!("ipc_main.rs");
         let handler_start = src
             .find("IpcRequest::BeginTransition(p) => {")
             .expect("BeginTransition handler must exist");
-        // The M1 re-prime block contains the comment
-        // "also re-prime the FROM-slide"; find from handler
-        // start so we don't false-match an unrelated load.
-        let m1_marker = src[handler_start..]
-            .find("Hardening C3 / M1")
-            .expect("M1 re-prime block missing");
-        let m1_window = &src[handler_start + m1_marker
-            ..handler_start + m1_marker + 1500];
+        // Find the end of the BeginTransition arm by locating
+        // the next top-level match arm marker. The
+        // `IpcRequest::PreloadSlide` arm follows by file order
+        // -- use it as the upper bound.
+        let handler_end = src[handler_start..]
+            .find("IpcRequest::PreloadSlide")
+            .map(|o| handler_start + o)
+            .unwrap_or(src.len());
+        let handler_body = &src[handler_start..handler_end];
+        // Count eviction calls inside the handler body.
+        // Count actual CALL sites (trailing open-paren), not
+        // doc-comment mentions. The r104.1 design comments
+        // reference the function by name multiple times to
+        // explain semantics; only the calls count.
+        let evict_count = handler_body
+            .matches("evict_video_decoder_for_serialization(")
+            .count();
+        // Allowed evictions: the defensive preload-evict
+        // block (1) -- nothing else. If r104.1 ever reintroduces
+        // a from-side eviction, the count climbs and the test
+        // surfaces it loudly with the current vs expected.
+        assert_eq!(
+            evict_count, 1,
+            "r104.1: BeginTransition handler should contain EXACTLY \
+             ONE evict_video_decoder_for_serialization call (the \
+             defensive preload-already-fired evict on to-side). \
+             Found {} occurrences -- a future refactor may have \
+             reintroduced from-side eviction, which would regress \
+             r104.1's 'outgoing video survives the transition' \
+             contract.",
+            evict_count,
+        );
+        // Also pin the defensive evict's probe line so we
+        // catch a rename that breaks QA's grep tooling.
+        // Per subagent WARN-4 the line keeps the substring
+        // `begin_transition_serialization` and uses a
+        // `variant=` tag to distinguish skip_to_bg vs
+        // preload_evict.
         assert!(
-            m1_window.contains("r104_evicted_id.is_none()"),
-            "r104 BLOCKER-1: M1 re-prime block must be gated on \
-             `r104_evicted_id.is_none()` so cache.load doesn't \
-             recursively re-prime the just-evicted from-side bg \
-             decoder. Found window:\n---\n{m1_window}\n---",
+            handler_body.contains("variant=preload_evict"),
+            "r104.1 defensive preload-evict probe line missing.",
+        );
+        assert!(
+            handler_body.contains("variant=skip_to_bg"),
+            "r104.1 gate-active probe line missing.",
+        );
+        assert!(
+            handler_body.matches("begin_transition_serialization")
+                .count() >= 2,
+            "r104.1 grep-continuity: both probe lines must contain \
+             `begin_transition_serialization` substring so QA's r104 \
+             tooling keeps matching.",
         );
     }
 
     #[test]
-    fn r104_serialization_gate_lives_in_begin_transition_handler() {
-        // QA mandated test #3: pin that the serialization gate is
-        // at the BeginTransition entry, not buried in
-        // evict_other_video_state. Source-level regression-lock:
-        // assert the BeginTransition handler call site for the
-        // gate exists between the IpcRequest::BeginTransition(p)
-        // match arm header and the `cache.load(content_root,
-        // p.to_slide_id)` invocation. If a future refactor moves
-        // the gate downstream (e.g. into the paint path), the
-        // ~150-300 ms decoder prime window would land AFTER
-        // BeginTransition responds, racing with the first Advance
-        // tick.
+    fn r104_1_begin_transition_routes_through_load_skip_bg_video() {
+        // r104.1 pivot: the to-side load at BeginTransition
+        // MUST route through `cache.load_skip_bg_video` when
+        // serialization is enabled, so the bg-video decoder
+        // for slide B does NOT get primed during the
+        // transition. The unprimed bg makes endpoint_b's paint
+        // fall back to Text-only (solid bg) for the transition
+        // window -- masked by the iris/wipe shader.
+        //
+        // Pin both: (a) the new method exists, (b) the
+        // BeginTransition handler selects between
+        // load/load_skip_bg_video based on the r104_1 flag.
         let src = include_str!("ipc_main.rs");
+        assert!(
+            src.contains("fn load_skip_bg_video("),
+            "r104.1 helper missing -- BeginTransition can't \
+             defer the bg-video prime to BeginSlide.",
+        );
         let handler_start = src
             .find("IpcRequest::BeginTransition(p) => {")
             .expect("BeginTransition handler must exist");
-        let cache_load_marker = src[handler_start..]
-            .find("cache.load(content_root, p.to_slide_id)")
-            .expect("cache.load(to_slide_id) must follow the handler entry");
-        let prologue = &src[handler_start..handler_start + cache_load_marker];
+        let handler_end = src[handler_start..]
+            .find("IpcRequest::PreloadSlide")
+            .map(|o| handler_start + o)
+            .unwrap_or(src.len());
+        let handler_body = &src[handler_start..handler_end];
         assert!(
-            prologue.contains("evict_video_decoder_for_serialization"),
-            "r104 serialization gate must call \
-             evict_video_decoder_for_serialization BEFORE \
-             cache.load(to_slide_id) so decoder #1's STREAMOFF \
-             precedes decoder #2's prime on the single-VPU \
-             firmware. Found prologue:\n---\n{prologue}\n---",
+            handler_body.contains(
+                "cache.load_skip_bg_video(content_root, p.to_slide_id)",
+            ),
+            "r104.1: BeginTransition handler must call \
+             cache.load_skip_bg_video for the to-slide when \
+             serialization mode is enabled.",
         );
         assert!(
-            prologue.contains("serialization_eviction_target"),
-            "r104 serialization gate must use the pure-logic \
-             serialization_eviction_target predicate so the gate's \
-             decision is unit-testable independent of the V4L2 \
-             plumbing.",
+            handler_body.contains("r104_1_skip_to_bg_prime"),
+            "r104.1: the route-selection flag `r104_1_skip_to_bg_prime` \
+             must drive the load_skip_bg_video vs cache.load \
+             choice.",
         );
     }
 
