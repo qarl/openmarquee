@@ -5580,7 +5580,7 @@ pub fn paint_and_present_one_transition_frame(
                             session.gl.read_pixels(
                                 0, 0, 1, 1,
                                 glow::RGBA, glow::UNSIGNED_BYTE,
-                                glow::PixelPackData::Slice(Some(&mut px)),
+                                glow::PixelPackData::Slice(&mut px[..]),
                             );
                             session.gl.bind_framebuffer(
                                 glow::READ_FRAMEBUFFER, None,
