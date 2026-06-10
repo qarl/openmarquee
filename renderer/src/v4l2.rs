@@ -464,9 +464,16 @@ pub fn read_v3d_bo_snapshot() -> V3dBoSnapshot {
 /// post-r101/r102 CMA headroom (>60 MB).
 ///
 /// Upper clamp = 16 (matches ffmpeg ballpark). 16 × 2 MiB × 2
-/// decoders = ~64 MB during dual-1080p — still safe. Operators
-/// pushing the clamp would hit the firmware's diminishing-
-/// returns curve well before CMA pressure becomes a concern.
+/// decoders = ~64 MB during dual-1080p — alone, this fits.
+///
+/// **CMA budget interaction with [`capture_pool_depth`]**: the
+/// post-r101/r102 headroom (~60 MB free) is a SINGLE budget
+/// shared by both pools. At combined clamp ceilings (16 OUT
+/// + 12 CAP) dual-1080p costs ~64 + ~75 = ~138 MB — way over
+/// headroom. Defaults (8/8) come in at ~32 + ~50 = ~82 MB
+/// which is also tight. Operators pushing one knob to its
+/// ceiling must reduce the OTHER knob to stay within CMA
+/// budget — there is NO automatic runtime check.
 ///
 /// `OPENMARQUEE_V4L2_OUTPUT_POOL_DEPTH` env override; clamped
 /// to [4, 16] so a typo can't bottom out below the pre-r109.2
@@ -477,6 +484,39 @@ pub fn output_pool_depth() -> u32 {
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(8);
     n.clamp(4, 16)
+}
+
+/// r109.3 (2026-06-10): CAPTURE pool depth for video-bg
+/// decoders. ffmpeg's v4l2_m2m default num_capture_buffers=20
+/// — under contention the firmware may only schedule decode
+/// work when it has ample empty CAPTURE slots to fill. 4 may
+/// be below its batch threshold, which would explain why
+/// r109.2's OUTPUT-only bump didn't unwedge B (QA dispatch).
+///
+/// CMA cost per CAPTURE buffer at 1080p NV12 = ~3.1 MB
+/// (1920 × 1080 × 1.5 bytes per pixel). ffmpeg's 20-buffer
+/// default would be ~62 MB per decoder, ~124 MB for dual-
+/// 1080p — too fat for our budget. Default = 8 (per QA's
+/// "try 8-12" suggestion); clamped to [4, 12].
+///
+/// **CMA budget interaction with [`output_pool_depth`]**: see
+/// the cross-knob note on that helper. Both knobs draw from
+/// the same ~60 MB headroom; pushing one to its ceiling
+/// requires reducing the other. There is NO automatic runtime
+/// check.
+///
+/// Applies to ALL video-bg priming (single-1080p slides as
+/// well as dual-1080p transitions). Single-1080p CAPTURE
+/// cost rises from ~12 MB (pre-r109.3) to ~25 MB (r109.3
+/// default), per the headroom-for-contention design.
+///
+/// `OPENMARQUEE_V4L2_CAPTURE_POOL_DEPTH` env override.
+pub fn capture_pool_depth() -> u32 {
+    let n = std::env::var("OPENMARQUEE_V4L2_CAPTURE_POOL_DEPTH")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(8);
+    n.clamp(4, 12)
 }
 
 /// r106 (2026-06-10): runtime kill-switch for the

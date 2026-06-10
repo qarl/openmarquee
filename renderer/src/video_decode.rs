@@ -350,13 +350,21 @@ pub fn prime_video_decoder_with_warmup(
     // CAN serve B but only when our input queue stays as
     // committed as A's.
     let output_pool = v4l2::output_pool_depth();
+    let capture_pool = v4l2::capture_pool_depth();
     dec.allocate_buffers(v4l2::QueueDirection::Output, output_pool)
         .context("REQBUFS OUTPUT")?;
-    dec.allocate_buffers(v4l2::QueueDirection::Capture, 4)
+    // r109.3 (2026-06-10): env-tunable CAPTURE pool depth.
+    // ffmpeg's v4l2_m2m allocates 20 CAPTURE buffers by default;
+    // r109.2 bumped OUTPUT but left CAPTURE at 4, and QA r109.2
+    // verify (postponed by FYS reboot) suspected the firmware
+    // batch-schedules decode work only when CAPTURE has ample
+    // empty slots. Default 8; clamped [4, 12] for CMA budget
+    // headroom (1080p NV12 ~3.1 MB per CAPTURE buffer).
+    dec.allocate_buffers(v4l2::QueueDirection::Capture, capture_pool)
         .context("REQBUFS CAPTURE")?;
     eprintln!(
-        "[perf] prime_video_output_pool_depth depth={}",
-        output_pool,
+        "[perf] prime_video_pool_depth output={} capture={}",
+        output_pool, capture_pool,
     );
     let reqbufs_us = t_reqbufs.elapsed().as_micros();
     let t_streamon = Instant::now();
