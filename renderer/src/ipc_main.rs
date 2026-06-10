@@ -2345,13 +2345,108 @@ fn run_paint_hook(
     // cloning. Previously this took &IpcResponse and returned
     // resp.clone() per arm, which for PaintTransition heap-allocated
     // a fresh kind: String each frame (~30 Hz steady-state).
+    // r107.2 (2026-06-10): trace what run_paint_hook ACTUALLY
+    // receives. r104.2 + r107 probes inside the
+    // OpResult::PaintTransition arm never fire on FYS even
+    // though session_transitions increments and r104.3
+    // advance_outcome cmd=paint_transition appears in journal.
+    // QA's r95-redux diagnosis: probes on dead path. This
+    // probe at the very top of run_paint_hook tells us
+    // unambiguously what variant the hook sees. Throttled to
+    // every 30th call.
+    {
+        std::thread_local! {
+            static R107_2_HOOK_ENTRY_COUNTER: std::cell::Cell<u32> =
+                const { std::cell::Cell::new(0) };
+        }
+        R107_2_HOOK_ENTRY_COUNTER.with(|c| {
+            let n = c.get();
+            c.set(n.wrapping_add(1));
+            if n % 30 == 0 {
+                let variant = match &resp {
+                    IpcResponse::Ok { result } => match result {
+                        OpResult::Idle => "Ok:Idle",
+                        OpResult::PaintSlide { .. } => "Ok:PaintSlide",
+                        OpResult::PaintTransition { .. } => "Ok:PaintTransition",
+                        OpResult::SlideComplete { .. } => "Ok:SlideComplete",
+                        OpResult::OpenOk { .. } => "Ok:OpenOk",
+                        OpResult::CaptureOk { .. } => "Ok:CaptureOk",
+                        OpResult::ProfileDumpOk { .. } => "Ok:ProfileDumpOk",
+                        OpResult::Empty => "Ok:Empty",
+                    },
+                    IpcResponse::Err { .. } => "Err",
+                };
+                eprintln!(
+                    "[perf] run_paint_hook_entry call_idx={} resp_variant={}",
+                    n, variant,
+                );
+            }
+        });
+    }
     let result = match resp {
         IpcResponse::Ok { result } => result,
         // Pass through errors unchanged.
         e @ IpcResponse::Err { .. } => return e,
     };
+    // r107.2: probe right before the dispatch match. If this
+    // fires with variant=PaintTransition but the
+    // paint_transition_entry probe doesn't, the match itself
+    // mis-dispatches (compiler issue, or there's a separate
+    // OpResult enum being mismatched at the type level).
+    {
+        std::thread_local! {
+            static R107_2_DISPATCH_COUNTER: std::cell::Cell<u32> =
+                const { std::cell::Cell::new(0) };
+        }
+        R107_2_DISPATCH_COUNTER.with(|c| {
+            let n = c.get();
+            c.set(n.wrapping_add(1));
+            if n % 30 == 0 {
+                let variant = match &result {
+                    OpResult::Idle => "Idle",
+                    OpResult::PaintSlide { .. } => "PaintSlide",
+                    OpResult::PaintTransition { .. } => "PaintTransition",
+                    OpResult::SlideComplete { .. } => "SlideComplete",
+                    OpResult::OpenOk { .. } => "OpenOk",
+                    OpResult::CaptureOk { .. } => "CaptureOk",
+                    OpResult::ProfileDumpOk { .. } => "ProfileDumpOk",
+                    OpResult::Empty => "Empty",
+                };
+                eprintln!(
+                    "[perf] run_paint_hook_dispatch call_idx={} result_variant={}",
+                    n, variant,
+                );
+            }
+        });
+    }
     let out = match result {
         OpResult::PaintSlide { slide_id, t_in_slide_ms } => {
+            // r107.2 (2026-06-10): probe at the PaintSlide
+            // arm entry. If transitions are silently routed
+            // through PaintSlide-text-over-video while the
+            // python backend tracks them as "transitions" via
+            // some other mechanism, this probe shows it.
+            // Throttled to every 30th call. The
+            // paint_text_over_video sub-branch has its own
+            // probe so we can see exactly which slide-shape
+            // is dispatched.
+            {
+                std::thread_local! {
+                    static R107_2_SLIDE_ARM_COUNTER: std::cell::Cell<u32> =
+                        const { std::cell::Cell::new(0) };
+                }
+                R107_2_SLIDE_ARM_COUNTER.with(|c| {
+                    let n = c.get();
+                    c.set(n.wrapping_add(1));
+                    if n % 30 == 0 {
+                        eprintln!(
+                            "[perf] run_paint_hook_paint_slide_arm \
+                             call_idx={} slide_id={} t_in_slide_ms={}",
+                            n, slide_id, t_in_slide_ms,
+                        );
+                    }
+                });
+            }
             // Clone the borrow shape we need so we can take a
             // mutable borrow on cache.video_decoders later for
             // the Video branch without re-entering the borrow.
@@ -2464,6 +2559,32 @@ fn run_paint_hook(
                                 "paint_dispatch",
                                 t_dispatch.elapsed().as_nanos() as u64,
                             );
+                            // r107.2 (2026-06-10): probe at the
+                            // text-over-video PaintSlide call.
+                            // QA hypothesis: if the invisible-
+                            // transition bug is "transitions are
+                            // routed through the PaintSlide text-
+                            // over-video sub-branch", this
+                            // probe will fire heavily during the
+                            // transition window. Throttled to
+                            // every 30th call.
+                            {
+                                std::thread_local! {
+                                    static R107_2_TOV_SLIDE_COUNTER: std::cell::Cell<u32> =
+                                        const { std::cell::Cell::new(0) };
+                                }
+                                R107_2_TOV_SLIDE_COUNTER.with(|c| {
+                                    let n = c.get();
+                                    c.set(n.wrapping_add(1));
+                                    if n % 30 == 0 {
+                                        eprintln!(
+                                            "[perf] paint_text_over_video_slide \
+                                             call_idx={} slide_id={} t_in_slide_ms={}",
+                                            n, slide_id, t_in_slide_ms,
+                                        );
+                                    }
+                                });
+                            }
                             if let Err(e) = hdmi::paint_and_present_one_text_over_video_slide_frame(
                                 session,
                                 card,
