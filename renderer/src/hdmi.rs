@@ -5281,6 +5281,56 @@ pub fn paint_and_present_one_transition_frame(
             None
         };
         let mut bake_b_iterations: u32 = 0;
+        // r109.4 (2026-06-10) per QA dispatch: instrument the
+        // V4L2 pool state for B at priming entry, AND attempt
+        // a CAPTURE drain wake-up. fed_count=0 across 141
+        // iterations on FYS proves the OUTPUT pool stayed full
+        // — codec isn't consuming B during the priming window.
+        // Hypothesis: codec deprioritizes B because A's CAPTURE
+        // is being continuously drained but B's isn't during
+        // the 5s slide hold. Aggressive CAPTURE drain at
+        // priming entry signals "B is consuming" to the codec
+        // scheduler.
+        // r109.4 subagent NIT-3 fix: guard the whole block on
+        // a Video / TextOverVideo endpoint so Text/Image don't
+        // emit a vacuous probe line. The endpoint shape only
+        // ever has a decoder for these two variants.
+        let is_b_video_kind = matches!(
+            &endpoint_b,
+            TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. },
+        );
+        if priming_now && is_b_video_kind {
+            // r109.4 subagent NIT-2 fix: snapshot the OUTPUT
+            // pool state BOTH before and after the wake drain.
+            // drain_capture_to_wake internally calls next_frame
+            // which invokes drain_output_quiet — that DQBUFs
+            // any codec-completed OUTPUT buffers back to the
+            // free pool. The pre/post delta distinguishes QA's
+            // hypothesis (a) "OUTPUT genuinely full, codec
+            // parked" from "(c) accounting bug masking
+            // available slots".
+            let (free_pre, total_out) = match &endpoint_b {
+                TransitionEndpoint::Video { decoder, .. } => decoder.output_pool_state(),
+                TransitionEndpoint::TextOverVideo { bg_decoder, .. } => bg_decoder.output_pool_state(),
+                _ => (0, 0),
+            };
+            let wake_drain = match &endpoint_b {
+                TransitionEndpoint::Video { decoder, .. } => decoder.drain_capture_to_wake(16),
+                TransitionEndpoint::TextOverVideo { bg_decoder, .. } => bg_decoder.drain_capture_to_wake(16),
+                _ => Ok(0),
+            };
+            let wake_drained = wake_drain.unwrap_or(0);
+            let (free_post, _) = match &endpoint_b {
+                TransitionEndpoint::Video { decoder, .. } => decoder.output_pool_state(),
+                TransitionEndpoint::TextOverVideo { bg_decoder, .. } => bg_decoder.output_pool_state(),
+                _ => (0, 0),
+            };
+            eprintln!(
+                "[perf] bake_b_priming_entry kind={} progress={:.3} \
+                 output_pool_free_pre={}/{} free_post={} wake_drained={}",
+                kind, progress, free_pre, total_out, free_post, wake_drained,
+            );
+        }
         // r109.2 (2026-06-10) per QA dispatch: snapshot the
         // bake_b decoder's next_sample_idx BEFORE the loop so
         // we can report `fed_count` (delta) on the

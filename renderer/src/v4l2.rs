@@ -3096,6 +3096,50 @@ impl Decoder {
         inner.free_output_slots.iter().copied().collect()
     }
 
+    /// r109.4 (2026-06-10): production accessor for the OUTPUT
+    /// pool state. Returns `(free_count, total_capacity)`. Used
+    /// by the bake_b priming instrumentation to see whether
+    /// `try_feed_nonblocking` is returning `Ok(false)` because
+    /// the pool is genuinely full (codec not consuming) or
+    /// because of some other accounting bug.
+    pub fn output_pool_state(&self) -> (usize, usize) {
+        let inner = self.inner.lock().unwrap();
+        let free = inner.free_output_slots.len();
+        let total = inner.mapped_output.len();
+        (free, total)
+    }
+
+    /// r109.4 (2026-06-10): aggressive CAPTURE drain.
+    /// Drains all pending CAPTURE buffers (DQBUF then re-QBUF
+    /// each, like Frame::drop). Returns the count drained.
+    /// Used by the bake_b priming entry to give the codec
+    /// scheduler signal that B is actively consuming output —
+    /// QA hypothesis (3) on r109.3: the codec deprioritizes
+    /// B because A's CAPTURE is being continuously drained but
+    /// B's isn't during the slide hold.
+    ///
+    /// Non-blocking: stops on EAGAIN. Cap at `max_drain` to
+    /// avoid infinite-loop pathology.
+    pub fn drain_capture_to_wake(&self, max_drain: usize) -> Result<usize> {
+        let mut drained = 0usize;
+        while drained < max_drain {
+            match self.next_frame() {
+                Ok(Some(frame)) => {
+                    // Frame::drop re-QBUFs back into the pool.
+                    drop(frame);
+                    drained += 1;
+                }
+                Ok(None) => break, // EOS
+                Err(ref e) if e.to_string().contains("EAGAIN") => break,
+                Err(e) => {
+                    return Err(anyhow::Error::from(anyhow!("{}", e)))
+                        .context("drain_capture_to_wake: next_frame errored");
+                }
+            }
+        }
+        Ok(drained)
+    }
+
     /// r106 (2026-06-10): non-blocking feed primitive. Returns
     /// `Ok(true)` if the sample was QBUF'd into an OUTPUT slot;
     /// `Ok(false)` if all OUTPUT slots are kernel-owned right now
