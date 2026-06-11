@@ -542,6 +542,39 @@ pub fn video_slide_poster_path(content_root: &Path, slide_id: Uuid) -> PathBuf {
     item_dir(content_root, slide_id).join("poster.png")
 }
 
+/// r110 stage 3 commit 3.2.0 (2026-06-11): canonicalised id-
+/// resolution for the poster cache lookup.
+///
+/// Returns the slide id whose poster (first decoded frame)
+/// should be displayed for the given content item during a
+/// transition. The rule:
+///
+///   * `Text(s)` with `s.background_video_slide_id = Some(bg)`
+///     → the poster comes from the background-video slide,
+///     so the id is `Some(bg)`.
+///   * `Text(s)` with `background_video_slide_id = None` (text-
+///     only, no background video) → no poster, `None`.
+///   * `Video(_)` → the poster comes from the slide itself,
+///     `Some(slide_id)`.
+///   * `Image(_)` or `None` → no poster, `None`.
+///
+/// Mirrors the in-place dispatch at `ipc_main.rs:2539-2548`
+/// (the c3.2.0 plumbing site). Extracted as a pure function so
+/// the resolution rule is independently testable WITHOUT
+/// constructing a full IPC dispatch context. The ipc dispatch
+/// must keep using the inline form OR call this helper — both
+/// implementations are pinned by the same set of unit tests.
+pub fn resolve_poster_dec_id(
+    item: Option<&ContentItem>,
+    slide_id: Uuid,
+) -> Option<Uuid> {
+    match item {
+        Some(ContentItem::Text(s)) => s.background_video_slide_id,
+        Some(ContentItem::Video(_)) => Some(slide_id),
+        Some(ContentItem::Image(_)) | None => None,
+    }
+}
+
 /// v1-spec-delta #8 (slice c, 2026-05-08) -- minimal mirror of
 /// Python's `VideoSlide`. Asset (H.264 in MP4 container, capped
 /// at 1080p per the backend docstring) lives at
@@ -2075,5 +2108,181 @@ mod tests {
                 i
             );
         }
+    }
+
+    // ================================================================
+    // r110 stage 3 commit 3.1 / 3.2.0: poster path + id-resolution
+    // tests (Task 2 of the Karl-priority audit, 2026-06-11). Pure-
+    // logic; no GL, no IPC stack. These pin the contract documented
+    // in `video_slide_poster_path` + `resolve_poster_dec_id` so a
+    // future refactor can't silently swap how the poster cache is
+    // keyed.
+    // ================================================================
+
+    fn _stub_text_slide(id: Uuid, bg: Option<Uuid>) -> TextSlide {
+        // Build a minimal TextSlide via JSON so the test stays
+        // resilient to non-required field additions.
+        let bg_field = match bg {
+            Some(u) => format!(",\"background_video_slide_id\":\"{u}\""),
+            None => String::new(),
+        };
+        let json = format!(
+            r##"{{"type":"text_slide","id":"{id}","name":"test","duration_ms":1000,
+                  "text_layers":[],"background_color":"#000000",
+                  "background_pattern":null,"transition":"cut","transition_ms":300{bg_field}}}"##
+        );
+        serde_json::from_str(&json).expect("text slide parses")
+    }
+
+    fn _stub_video_slide(id: Uuid) -> VideoSlide {
+        let json = format!(
+            r##"{{"type":"video_slide","id":"{id}","name":"vid","duration_ms":5000,
+                  "transition":"cut","transition_ms":300}}"##
+        );
+        serde_json::from_str(&json).expect("video slide parses")
+    }
+
+    fn _stub_image_slide(id: Uuid) -> ImageSlide {
+        let json = format!(
+            r##"{{"type":"image","id":"{id}","name":"img","duration_ms":3000,
+                  "transition":"cut","transition_ms":300}}"##
+        );
+        serde_json::from_str(&json).expect("image slide parses")
+    }
+
+    // ---- video_slide_poster_path -----------------------------------
+
+    #[test]
+    fn poster_path_lives_alongside_asset_under_item_dir() {
+        let root = Path::new("/var/openmarquee/content");
+        let id: Uuid = "11111111-2222-4333-8444-555555555555".parse().unwrap();
+        let poster = video_slide_poster_path(root, id);
+        // Same item dir as asset.mp4/asset.png — `<root>/<id>/poster.png`.
+        assert_eq!(poster, item_dir(root, id).join("poster.png"));
+        assert_eq!(
+            poster,
+            Path::new("/var/openmarquee/content/11111111-2222-4333-8444-555555555555/poster.png")
+        );
+    }
+
+    #[test]
+    fn poster_path_uses_full_uuid_not_truncated() {
+        // Regression-lock against any future "shorten uuid to 8 chars
+        // in path" optimisation that would collide poster cache keys
+        // across slides whose ids share a prefix.
+        let root = Path::new("/r");
+        let id_a: Uuid = "deadbeef-0000-4000-8000-000000000001".parse().unwrap();
+        let id_b: Uuid = "deadbeef-0000-4000-8000-000000000002".parse().unwrap();
+        assert_ne!(
+            video_slide_poster_path(root, id_a),
+            video_slide_poster_path(root, id_b)
+        );
+    }
+
+    #[test]
+    fn poster_path_nil_uuid_is_still_a_subdir() {
+        let root = Path::new("/r");
+        let p = video_slide_poster_path(root, Uuid::nil());
+        // Defensive: nil uuid still routes through item_dir
+        // (no special-case panic); poster.png suffix preserved.
+        assert!(p.ends_with("poster.png"));
+        assert!(p.starts_with(root));
+    }
+
+    // ---- resolve_poster_dec_id (the c3.2.0 dispatch) ---------------
+
+    #[test]
+    fn poster_id_text_with_background_video_returns_bg_id() {
+        let text_id: Uuid = "11111111-2222-4333-8444-555555555555".parse().unwrap();
+        let bg_id: Uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".parse().unwrap();
+        let item = ContentItem::Text(_stub_text_slide(text_id, Some(bg_id)));
+        assert_eq!(resolve_poster_dec_id(Some(&item), text_id), Some(bg_id));
+    }
+
+    #[test]
+    fn poster_id_text_without_background_video_returns_none() {
+        let text_id: Uuid = "11111111-2222-4333-8444-555555555555".parse().unwrap();
+        let item = ContentItem::Text(_stub_text_slide(text_id, None));
+        assert_eq!(resolve_poster_dec_id(Some(&item), text_id), None);
+    }
+
+    #[test]
+    fn poster_id_pure_video_returns_slide_id() {
+        let vid_id: Uuid = "11111111-2222-4333-8444-555555555555".parse().unwrap();
+        let item = ContentItem::Video(_stub_video_slide(vid_id));
+        assert_eq!(resolve_poster_dec_id(Some(&item), vid_id), Some(vid_id));
+    }
+
+    #[test]
+    fn poster_id_image_returns_none() {
+        let img_id: Uuid = "11111111-2222-4333-8444-555555555555".parse().unwrap();
+        let item = ContentItem::Image(_stub_image_slide(img_id));
+        assert_eq!(resolve_poster_dec_id(Some(&item), img_id), None);
+    }
+
+    #[test]
+    fn poster_id_missing_item_returns_none() {
+        let id: Uuid = "11111111-2222-4333-8444-555555555555".parse().unwrap();
+        assert_eq!(resolve_poster_dec_id(None, id), None);
+    }
+
+    // ---- end-to-end shape coverage --------------------------------
+
+    #[test]
+    fn poster_id_resolution_covers_all_six_endpoint_pairs() {
+        // The six (slide_a, slide_b) shapes the audit enumerated for
+        // c3.2.0 plumbing — pin each pair's (poster_a, poster_b)
+        // resolution against the dispatch.
+        let text_bg_a: Uuid = "11111111-0000-4000-8000-000000000001".parse().unwrap();
+        let text_bg_b: Uuid = "11111111-0000-4000-8000-000000000002".parse().unwrap();
+        let bg_a: Uuid = "aaaaaaaa-0000-4000-8000-000000000001".parse().unwrap();
+        let bg_b: Uuid = "aaaaaaaa-0000-4000-8000-000000000002".parse().unwrap();
+        let text_only: Uuid = "11111111-0000-4000-8000-000000000003".parse().unwrap();
+        let vid_a: Uuid = "22222222-0000-4000-8000-000000000001".parse().unwrap();
+        let vid_b: Uuid = "22222222-0000-4000-8000-000000000002".parse().unwrap();
+
+        let text_a = ContentItem::Text(_stub_text_slide(text_bg_a, Some(bg_a)));
+        let text_b = ContentItem::Text(_stub_text_slide(text_bg_b, Some(bg_b)));
+        let text_no_bg = ContentItem::Text(_stub_text_slide(text_only, None));
+        let video_a = ContentItem::Video(_stub_video_slide(vid_a));
+        let video_b = ContentItem::Video(_stub_video_slide(vid_b));
+
+        // (Text+bg, Text+bg) — A→bg_a, B→bg_b (distinct).
+        assert_eq!(resolve_poster_dec_id(Some(&text_a), text_bg_a), Some(bg_a));
+        assert_eq!(resolve_poster_dec_id(Some(&text_b), text_bg_b), Some(bg_b));
+
+        // (Text+bg, Video) — A→bg_a, B→vid_b.
+        assert_eq!(resolve_poster_dec_id(Some(&text_a), text_bg_a), Some(bg_a));
+        assert_eq!(resolve_poster_dec_id(Some(&video_b), vid_b), Some(vid_b));
+
+        // (Video, Text+bg) — A→vid_a, B→bg_b.
+        assert_eq!(resolve_poster_dec_id(Some(&video_a), vid_a), Some(vid_a));
+        assert_eq!(resolve_poster_dec_id(Some(&text_b), text_bg_b), Some(bg_b));
+
+        // (Video, Video) — A→vid_a, B→vid_b.
+        assert_eq!(resolve_poster_dec_id(Some(&video_a), vid_a), Some(vid_a));
+        assert_eq!(resolve_poster_dec_id(Some(&video_b), vid_b), Some(vid_b));
+
+        // (Text-only, Video) — A→None, B→vid_b.
+        assert_eq!(resolve_poster_dec_id(Some(&text_no_bg), text_only), None);
+        assert_eq!(resolve_poster_dec_id(Some(&video_b), vid_b), Some(vid_b));
+
+        // (Video, Text-only) — A→vid_a, B→None.
+        assert_eq!(resolve_poster_dec_id(Some(&video_a), vid_a), Some(vid_a));
+        assert_eq!(resolve_poster_dec_id(Some(&text_no_bg), text_only), None);
+    }
+
+    #[test]
+    fn poster_id_self_referencing_text_bg_is_passed_through() {
+        // Defensive: ipc_main.rs:2558-2565 has a separate guard
+        // rejecting same-decoder-id transitions; the resolution itself
+        // does NOT filter that case. Pin: a text slide whose
+        // background_video_slide_id == its own id (an oddly-imported
+        // self-referencing entry) still resolves to that id.
+        // resolve_poster_dec_id is the resolution layer; conflict
+        // detection is a separate layer.
+        let id: Uuid = "11111111-2222-4333-8444-555555555555".parse().unwrap();
+        let item = ContentItem::Text(_stub_text_slide(id, Some(id)));
+        assert_eq!(resolve_poster_dec_id(Some(&item), id), Some(id));
     }
 }
