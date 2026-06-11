@@ -3421,7 +3421,40 @@ impl Decoder {
         // pipeline moving.
         self.drain_output_quiet();
         let inner = self.inner.lock().unwrap();
+        // r110 stage 3 commit 2 (2026-06-11) per QA priority
+        // reorder: audit instrumentation for the "141 polls vs
+        // 8 DQBUF-able frames" bug from r109.4 era. Hypothesis:
+        // bcm2835-codec spuriously sets V4L2_BUF_FLAG_LAST on a
+        // mid-stream frame (known quirk per project memory:
+        // "CMD_STOP on empty pipeline triggers FLAG_LAST
+        // emission"), the `is_last` arm below latches
+        // capture_drained=true, and subsequent next_frame calls
+        // short-circuit here returning Ok(None). bake_video
+        // interprets Ok(None) as no-frame → 141 polls of no
+        // progress while the codec is actually decoding into
+        // CAPTURE buffers we never read.
+        //
+        // Throttled to 1/sec so a true post-EOS sequence (where
+        // this fires every paint tick) doesn't drown the
+        // journal. Counters auto-reset every 30s so a transient
+        // latch shows up as a fresh burst on the next window.
         if inner.capture_drained {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static LAST_EMIT_NS: AtomicU64 = AtomicU64::new(0);
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let last = LAST_EMIT_NS.load(Ordering::Relaxed);
+            if now_ns.saturating_sub(last) > 1_000_000_000 {
+                LAST_EMIT_NS.store(now_ns, Ordering::Relaxed);
+                eprintln!(
+                    "[perf] next_frame_capture_drained_early_return \
+                     (codec emitted FLAG_LAST at some prior DQBUF; \
+                     all subsequent next_frame calls return Ok(None) \
+                     until resume_after_eos clears the latch)"
+                );
+            }
             return Ok(None);
         }
         let Some(ref cap_fmt) = inner.capture_format else {
@@ -3534,6 +3567,22 @@ impl Decoder {
             }
             if is_last {
                 inner_w.capture_drained = true;
+                // r110 stage 3 commit 2 (2026-06-11): unthrottled
+                // probe so QA can pinpoint EXACTLY which DQBUF
+                // triggered the latch. If this fires mid-stream
+                // (not at known end-of-clip), the bcm2835-codec
+                // FLAG_LAST quirk is confirmed as the 141-poll
+                // root cause. Unthrottled because legitimate
+                // FLAG_LAST fires at most once per slide cycle —
+                // log volume is bounded.
+                eprintln!(
+                    "[perf] next_frame_flag_last_seen buf_idx={} \
+                     frames_since_streamon={} \
+                     (sets capture_drained=true; subsequent \
+                     next_frame returns Ok(None) until clear)",
+                    idx,
+                    inner_w.mapped_capture.len(),
+                );
             }
         }
         Ok(Some(Frame {
