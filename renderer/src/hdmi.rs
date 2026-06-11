@@ -8154,7 +8154,10 @@ unsafe fn bake_external_nv12_to_current_fbo(
 }
 
 /// Phase 8 slice 2 (2026-05-16) — drain one V4L2 NV12 frame and
-/// blit it via the BT.601 NV12→RGB shader into the currently-bound
+/// blit it via the BT.709 NV12→RGB shader into the currently-bound
+// r110 c3.1.1 (2026-06-11): stale "BT.601" corrected to "BT.709";
+// the shader at hdmi_logic.rs:3133-3137 uses ITU-R BT.709 Annex B
+// limited-range coefficients (1.5748 / 0.1873 / 0.4681 / 1.8556).
 /// framebuffer. Mirrors `bake_image_slide_to_current_fbo`'s
 /// contract: caller binds the destination FBO (default fb or an
 /// FBO) before calling, and handles any post-pass / scanout /
@@ -11837,7 +11840,9 @@ fn cached_nv12_program(gl: &glow::Context) -> Result<CachedNv12Program> {
 
 /// V4L2 piece 3d: draw a `vbo` quad sampling `y_tex` (Y plane,
 /// GL_LUMINANCE) and `uv_tex` (UV plane, GL_LUMINANCE_ALPHA) through
-/// the BT.601 limited-range NV12 -> RGB shader. Caller binds the
+/// the BT.709 limited-range NV12 -> RGB shader. Caller binds the
+// r110 c3.1.1 (2026-06-11): stale "BT.601" corrected to "BT.709";
+// the shader at hdmi_logic.rs:3133-3137 is ITU-R BT.709 Annex B.
 /// destination FBO + viewport beforehand. The two source textures
 /// must already be uploaded; this pass does no allocation -- just
 /// the per-frame draw. `vbo` is a 4-vert interleaved `[x,y,u,v]`

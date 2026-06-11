@@ -473,30 +473,71 @@ pub fn image_slide_asset_path(content_root: &Path, slide_id: Uuid) -> PathBuf {
 /// so the renderer can rely on full-resolution poster contract.
 ///
 /// **Color-space contract (load-bearing for invisible handoff)**:
-/// the bcm2835-codec emits NV12 in **BT.601 limited range** by
-/// default. The renderer's NV12 → RGB blit shader assumes BT.601
-/// limited-range matrices. The import recipe MUST match BT.601
-/// limited range or expect a subtle hue/sat seam at handoff. QA
-/// has kmsgrab+detile pixel comparison ready to catch any seam
-/// objectively.
+/// the poster must replicate WHAT THE RENDERER DISPLAYS, NOT
+/// what is colorimetrically correct for the content. The
+/// renderer's NV12 → RGB blit shader (hdmi_logic.rs:3133-3137)
+/// applies **ITU-R BT.709 Annex B limited-range** coefficients
+/// UNCONDITIONALLY to every video, ignoring per-content
+/// color_matrix / color_range metadata. So a content-tagged-601
+/// (or, more commonly, color_space=UNKNOWN / untagged) MP4
+/// displayed via our 709 shader and a poster extracted via 709
+/// will match each other (seam invisible) — which is the
+/// requirement. Matching the SOURCE's authored color space
+/// instead would expose any 601-vs-709 source as a seam at
+/// handoff.
+///
+/// **The untagged-metadata case IS our case**, not an edge:
+/// the typical asset imported through our pipeline has
+/// `color_space=UNKNOWN` / no color_matrix metadata at all
+/// (verified on FYS by QA r110 c3.1.1 ground-truth
+/// measurement). ffmpeg's default behavior for untagged YUV
+/// is to assume BT.601 limited and convert accordingly, so
+/// the recipe MUST force `in_color_matrix=bt709:in_range=
+/// limited` on the input filter or the default behavior will
+/// silently produce a BT.601 conversion — visibly wrong vs
+/// the 709-shader live output.
+///
+/// **Empirical validation (QA r110 c3.1.1 on FYS, 1280x704
+/// untagged test-loop bg video)**, deltas vs FS_NV12_TO_RGB
+/// ground-truth in 8-bit units:
+///
+/// - ffmpeg DEFAULT recipe (silently BT.601): mean dRGB
+///   5.2/3.8/0.3, max 8/7/3 → VISIBLE warm pop at handoff
+/// - Forced `in_color_matrix=bt709:in_range=limited`: mean
+///   dRGB 2.2/1.7/0.7, max 3/3/3 → noise floor (chroma
+///   upsample method differences), INVISIBLE
+///
+/// Measurement artifacts: `/tmp/seam_measure.py` +
+/// `/tmp/poster_*.png` + `/tmp/frame0.nv12` on QA's side;
+/// rerun whenever the NV12 shader or color contract changes.
+///
+/// Historical hazard (r110 c3.1.1 chain-of-trust failure):
+/// stale comments at v4l2.rs:~853 + early c3.1 docstring + an
+/// earlier QA directive all said "BT.601" — the shader source
+/// is the only authority. v1.0 release review flagged the v4l2
+/// comments as stale at the time but they survived as a
+/// ride-along.
 ///
 /// **Import recipe (NOT renderer-side; backend owns this)** —
-/// default BT.601 limited-range to match the codec:
+/// BT.709 limited-range UNCONDITIONALLY (no per-content
+/// fallback paragraph; do NOT branch on the source's authored
+/// color space):
 /// ```text
 /// ffmpeg -i <asset.mp4> -vframes 1 \
 ///   -pix_fmt yuv420p \
-///   -color_range tv -colorspace bt601 -color_primaries bt601 -color_trc bt601 \
-///   -vf "scale=<panel_w>:<panel_h>:flags=lanczos" \
+///   -vf "scale=<panel_w>:<panel_h>:flags=lanczos:in_color_matrix=bt709:in_range=limited" \
+///   -color_range tv -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
 ///   <poster.png>
 /// ```
 ///
-/// **Fallback**: if QA's pixel-compare surfaces a seam under
-/// BT.601, the source MP4 may have been authored at BT.709;
-/// switch the recipe to
-/// `-color_range tv -colorspace bt709 -color_primaries bt709 -color_trc bt709`
-/// to match the source's authored color space (and audit whether
-/// the codec actually honored the source's color_range / matrix
-/// metadata on emission — bcm2835-codec sometimes ignores it).
+/// The `in_color_matrix=bt709` + `in_range=limited` on the
+/// scale/zscale filter forces ffmpeg's YUV→RGB conversion to use
+/// the same matrix the renderer's shader uses, regardless of
+/// what the source MP4 was authored at. The `-color_range tv
+/// -colorspace bt709 ...` flags on the output tag the PNG's
+/// chunk metadata for any downstream tooling that respects it
+/// (the renderer doesn't read this — it uploads RGBA8 verbatim
+/// and the shader runs its fixed matrix on the live video).
 pub fn video_slide_poster_path(content_root: &Path, slide_id: Uuid) -> PathBuf {
     item_dir(content_root, slide_id).join("poster.png")
 }
