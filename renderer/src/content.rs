@@ -458,6 +458,49 @@ pub fn image_slide_asset_path(content_root: &Path, slide_id: Uuid) -> PathBuf {
     item_dir(content_root, slide_id).join("asset.png")
 }
 
+/// r110 stage 3 commit 3.1 (2026-06-11): poster PNG path for a
+/// VideoSlide under the poster frozen-entry strategy.
+///
+/// The poster is the FIRST DECODED FRAME of the video, extracted
+/// at IMPORT TIME by the backend (ffmpeg recipe below) and stored
+/// alongside the source MP4. The renderer composites the poster
+/// as slide B's visual during the transition window; B's 1080p
+/// decoder starts only after slide A teardown completes; B's first
+/// decoded frame == poster so the handoff is pixel-invisible.
+///
+/// Path: `<content_root>/<id>/poster.png`. Separate from
+/// `asset.png` (existing video-slide thumbnail at smaller dims)
+/// so the renderer can rely on full-resolution poster contract.
+///
+/// **Color-space contract (load-bearing for invisible handoff)**:
+/// the bcm2835-codec emits NV12 in **BT.601 limited range** by
+/// default. The renderer's NV12 → RGB blit shader assumes BT.601
+/// limited-range matrices. The import recipe MUST match BT.601
+/// limited range or expect a subtle hue/sat seam at handoff. QA
+/// has kmsgrab+detile pixel comparison ready to catch any seam
+/// objectively.
+///
+/// **Import recipe (NOT renderer-side; backend owns this)** —
+/// default BT.601 limited-range to match the codec:
+/// ```text
+/// ffmpeg -i <asset.mp4> -vframes 1 \
+///   -pix_fmt yuv420p \
+///   -color_range tv -colorspace bt601 -color_primaries bt601 -color_trc bt601 \
+///   -vf "scale=<panel_w>:<panel_h>:flags=lanczos" \
+///   <poster.png>
+/// ```
+///
+/// **Fallback**: if QA's pixel-compare surfaces a seam under
+/// BT.601, the source MP4 may have been authored at BT.709;
+/// switch the recipe to
+/// `-color_range tv -colorspace bt709 -color_primaries bt709 -color_trc bt709`
+/// to match the source's authored color space (and audit whether
+/// the codec actually honored the source's color_range / matrix
+/// metadata on emission — bcm2835-codec sometimes ignores it).
+pub fn video_slide_poster_path(content_root: &Path, slide_id: Uuid) -> PathBuf {
+    item_dir(content_root, slide_id).join("poster.png")
+}
+
 /// v1-spec-delta #8 (slice c, 2026-05-08) -- minimal mirror of
 /// Python's `VideoSlide`. Asset (H.264 in MP4 container, capped
 /// at 1080p per the backend docstring) lives at

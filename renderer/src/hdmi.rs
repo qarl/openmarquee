@@ -265,6 +265,27 @@ pub const IMAGE_BG_CACHE_CAPACITY: usize = 6;
 
 pub type ImageBgCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u32)>;
 
+/// r110 stage 3 commit 3.1 (2026-06-11): per-session cache for
+/// VideoSlide poster textures (poster frozen-entry strategy).
+///
+/// Same shape as `ImageBgCache` — PNG-on-disk → GL texture, keyed
+/// by full filesystem path so the LRU eviction observes natural
+/// load patterns. Separate cache so poster textures don't compete
+/// for slots with image-slide backgrounds.
+///
+/// Capacity is intentionally modest: at the poster strategy's
+/// steady state only the CURRENT slide and (during transition)
+/// the NEXT slide's posters need to be hot. A small cache that
+/// evicts to disk between transitions is correct.
+pub type PosterCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u32)>;
+
+/// r110 stage 3 commit 3.1: capacity for `PosterCache`. Sized for
+/// "current + next 2 slides hot" with one slot of slack for
+/// preload-mode=max scenarios that warm further out. Each entry =
+/// ~3 MB at 1080p RGBA (1920 × 1080 × 4), so 4 entries = ~12 MB
+/// VRAM peak. Fits comfortably in our budget.
+pub const POSTER_CACHE_CAPACITY: usize = 4;
+
 pub struct EglSession<'a> {
     egl_lib: &'a egl::DynamicInstance<egl::EGL1_5>,
     display: egl::Display,
@@ -294,6 +315,10 @@ pub struct EglSession<'a> {
     /// docs. The reel driver passes &mut self.image_bg_cache
     /// to paint_slide via render_*_in_session.
     image_bg_cache: ImageBgCache,
+    /// r110 stage 3 commit 3.1 (2026-06-11): per-session cache
+    /// of decoded + uploaded VideoSlide poster textures (poster
+    /// frozen-entry strategy). See PosterCache docs.
+    poster_cache: PosterCache,
     /// Task #168 (2026-05-22): per-session async-refresh GL texture
     /// cache for ImageSlide / WebSlide paints. Replaces the per-paint
     /// PNG decode + glTexImage2D + delete cycle that hitched the
@@ -730,6 +755,7 @@ where
         last_over_budget_warn_at: None,
         in_transition: false,
         image_bg_cache: ImageBgCache::with_capacity(IMAGE_BG_CACHE_CAPACITY),
+        poster_cache: PosterCache::with_capacity(POSTER_CACHE_CAPACITY),
         image_slide_tex_cache: crate::image_slide_tex::ImageSlideTextureCache::with_capacity(
             crate::image_slide_tex::IMAGE_SLIDE_TEX_CACHE_CAPACITY,
         ),
@@ -858,6 +884,12 @@ where
             unsafe { gl.delete_texture(tex); }
             // Trace-level diagnostic: cached image freed.
             // Comment-only -- production logs stay quiet.
+            let _ = path;
+        }
+        // r110 stage 3 commit 3.1: drain the poster cache before
+        // the GL context dies. Same shape as image_bg_cache.
+        for (path, (tex, _, _)) in session.poster_cache.drain() {
+            unsafe { gl.delete_texture(tex); }
             let _ = path;
         }
         // Task #168: drain the image-slide texture cache while the GL
@@ -3085,6 +3117,101 @@ fn load_png_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
     // on the Mac dev box (hdmi.rs is Linux-only).
     let rgba = crate::hdmi_logic::flip_rgba_rows_vertically(rgba, w, h);
     Ok((rgba, w, h))
+}
+
+/// r110 stage 3 commit 3.1 (2026-06-11): cache-or-load lookup for
+/// a VideoSlide poster texture (poster frozen-entry strategy).
+///
+/// On cache hit: returns the cached `(NativeTexture, width,
+/// height)` tuple. The cache is touched via `get(&mut)` for LRU
+/// recency ordering.
+///
+/// On cache miss: decodes `<content_root>/<slide_id>/poster.png`
+/// via `load_png_rgba`, uploads it as a GL texture (mirroring
+/// `image_bg` upload conventions: RGBA8, LINEAR filter,
+/// CLAMP_TO_EDGE), inserts into the cache, and returns the new
+/// tuple. LRU-evicted textures are freed; on a key replacement
+/// (rare; only on retry-after-failure), the replaced texture is
+/// also freed.
+///
+/// Returns `Ok(None)` when the poster file doesn't exist on disk
+/// (slide has no poster yet — backend hasn't run the import
+/// recipe, or this is a brand-new slide). Caller should fall
+/// back to live-decode-only path. ENOMEM-fallback semantics
+/// follow naturally: with no poster on disk, the poster frozen-
+/// entry path falls back to whatever B's decoder is doing today.
+///
+/// Returns `Err` on disk-present-but-malformed PNG (wrong bit
+/// depth, decode failure, GL upload failure). Caller should log
+/// + fall back same as Ok(None).
+///
+/// `#[allow(dead_code)]` for stage 3 commit 3.1 — wired into
+/// the transition composite path in commit 3.2.
+#[allow(dead_code)]
+pub unsafe fn ensure_poster_cached(
+    session: &mut EglSession,
+    content_root: &Path,
+    slide_id: uuid::Uuid,
+) -> Result<Option<(glow::NativeTexture, u32, u32)>> {
+    use glow::HasContext;
+    let path = crate::content::video_slide_poster_path(content_root, slide_id);
+    // Cache hit: touch LRU ordering + return.
+    if let Some((tex, w, h)) = session.poster_cache.get(&path) {
+        return Ok(Some((*tex, *w, *h)));
+    }
+    // Backend hasn't run the import recipe yet for this slide
+    // (or it's a brand-new slide). Caller falls back to live-
+    // decode-only path.
+    if !path.exists() {
+        return Ok(None);
+    }
+    // Decode the PNG.
+    let (rgba, w, h) = match load_png_rgba(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(e).with_context(|| format!(
+                "ensure_poster_cached: load_png_rgba for slide {} at {}",
+                slide_id, path.display(),
+            ));
+        }
+    };
+    // Upload to a fresh GL texture.
+    let gl = session.gl;
+    let tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!(
+            "ensure_poster_cached: glGenTextures for slide {}: {}",
+            slide_id, e,
+        ))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA as i32,
+        w as i32,
+        h as i32,
+        0,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        Some(&rgba),
+    );
+    // Insert into cache; free evicted/replaced LRU entries.
+    let outcome = session.poster_cache.insert(path.clone(), (tex, w, h));
+    if let Some((evicted, _, _)) = outcome.evicted_lru {
+        gl.delete_texture(evicted);
+    }
+    if let Some((replaced, _, _)) = outcome.replaced {
+        gl.delete_texture(replaced);
+    }
+    eprintln!(
+        "[perf] poster_cache_loaded slide_id={} dims={}x{} cache_len={}",
+        slide_id, w, h, session.poster_cache.len(),
+    );
+    Ok(Some((tex, w, h)))
 }
 
 /// v1-spec-delta #8 (slice a, 2026-05-08) -- render an ImageSlide
@@ -6835,16 +6962,24 @@ impl<'a> EglSession<'a> {
         use glow::HasContext;
         let freed_bg = self.image_bg_cache.len();
         let freed_slide = self.image_slide_tex_cache.len();
+        // r110 stage 3 commit 3.1: also evict the poster cache
+        // on CMA pressure events. ~12 MB at 4 1080p entries —
+        // worth reclaiming alongside the image caches when the
+        // r46 mitigation fires.
+        let freed_poster = self.poster_cache.len();
         for (_path, (tex, _, _)) in self.image_bg_cache.drain() {
             unsafe { self.gl.delete_texture(tex); }
         }
         for tex in self.image_slide_tex_cache.take_all_textures() {
             unsafe { self.gl.delete_texture(tex); }
         }
-        if freed_bg > 0 || freed_slide > 0 {
+        for (_path, (tex, _, _)) in self.poster_cache.drain() {
+            unsafe { self.gl.delete_texture(tex); }
+        }
+        if freed_bg > 0 || freed_slide > 0 || freed_poster > 0 {
             eprintln!(
-                "ipc: r46 text-over-video CMA mitigation -- evicted {} image_bg + {} image_slide_tex entries",
-                freed_bg, freed_slide
+                "ipc: r46 text-over-video CMA mitigation -- evicted {} image_bg + {} image_slide_tex + {} poster entries",
+                freed_bg, freed_slide, freed_poster
             );
         }
     }
