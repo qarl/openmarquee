@@ -3214,8 +3214,25 @@ impl Decoder {
         }
 
         // FLAG_LAST: kernel-side drain is done. Set the wrapper's
-        // capture_drained mirror per the same convention next_frame
-        // uses at v4l2.rs:1877-1879.
+        // capture_drained mirror.
+        //
+        // r110 stage 3 commit 3 (2026-06-11) contract note: this
+        // path (`drain_capture_step_no_frame`) KEEPS the
+        // FLAG_LAST → capture_drained=true latch, unlike
+        // next_frame and dqbuf_capture_hold which defanged
+        // theirs. Rationale: drain_capture_step_no_frame is only
+        // invoked from drain_after_signal_eos which itself runs
+        // only after
+        // signal_eos_via_cmd_stop succeeded (currently no-op'd per
+        // r92 experiment at line ~2825). In that POST-CMD_STOP
+        // context, FLAG_LAST is the canonical, expected EOS
+        // signal — the kernel is telling us the drain we
+        // requested is complete. Latching is the correct
+        // semantic here. The live-path (next_frame /
+        // dqbuf_capture_hold) defangs because those paths run on
+        // normal mid-stream DQBUFs where bcm2835-codec's
+        // documented FLAG_LAST quirk could spuriously trip the
+        // latch and silently poison the decoder.
         if is_last {
             inner.capture_drained = true;
         }
@@ -3330,19 +3347,41 @@ impl Decoder {
         ];
         let inner_arc = Arc::clone(&self.inner);
         drop(inner_mut);
-        // r110 subagent WARN-1 fix: flip capture_in_flight=true
-        // to mirror next_frame's behavior at lines 3493-3499.
-        // Also r110 subagent WARN-2 fix: set capture_drained on
-        // FLAG_LAST so degenerate single-frame clips don't
-        // dangle the EOS state (defensive parity with
-        // next_frame).
+        // r110 stage 3 commit 1 WARN-1 fix: flip
+        // capture_in_flight=true to mirror next_frame's
+        // behavior at lines 3493-3499.
+        //
+        // r110 stage 3 commit 3.0 contract UPDATE (was c1 WARN-2
+        // fix; SUPERSEDED): the FLAG_LAST → capture_drained=true
+        // latch from c1 has been defanged here per QA expanded
+        // mandate. See contract note immediately below at the
+        // FLAG_LAST conditional. Degenerate single-frame clips
+        // (the c1 WARN-2 motivating case) now leave the latch
+        // unset; the next dqbuf_capture_hold call returns
+        // EAGAIN-error rather than Ok(None) as c1 originally
+        // designed. Stage 3 commit 3.1+ wiring MUST handle
+        // "EAGAIN after FLAG_LAST observed" as the EOS condition
+        // for held-frame callers — there is no auto-latch to
+        // rely on.
         {
             let mut inner_w = self.inner.lock().unwrap();
             if (idx as usize) < inner_w.capture_in_flight.len() {
                 inner_w.capture_in_flight[idx as usize] = true;
             }
+            // r110 stage 3 commit 3 (2026-06-11): DEFANGED same
+            // as next_frame's FLAG_LAST site. See the long
+            // contract note at line ~3568. Mirror the probe
+            // shape (label _no_latch suffix) so a future
+            // unexpected fire on the held-frame path is
+            // identifiable in the journal.
             if is_last {
-                inner_w.capture_drained = true;
+                eprintln!(
+                    "[perf] dqbuf_capture_hold_flag_last_seen_no_latch \
+                     buf_idx={} mapped_capture_len={} \
+                     (r110 contract: capture_drained NOT latched)",
+                    idx,
+                    inner_w.mapped_capture.len(),
+                );
             }
         }
         Ok(Some(HeldCapture {
@@ -3448,11 +3487,21 @@ impl Decoder {
             let last = LAST_EMIT_NS.load(Ordering::Relaxed);
             if now_ns.saturating_sub(last) > 1_000_000_000 {
                 LAST_EMIT_NS.store(now_ns, Ordering::Relaxed);
+                // r110 stage 3 commit 3.0 NIT-1 fix: under the new
+                // contract, only EPIPE (live paths) or
+                // drain_capture_step_no_frame's FLAG_LAST (the
+                // post-CMD_STOP EOS-flush path) latches
+                // capture_drained=true. The pre-defang
+                // attribution to "FLAG_LAST at some prior DQBUF"
+                // is stale.
                 eprintln!(
                     "[perf] next_frame_capture_drained_early_return \
-                     (codec emitted FLAG_LAST at some prior DQBUF; \
-                     all subsequent next_frame calls return Ok(None) \
-                     until resume_after_eos clears the latch)"
+                     (capture_drained latched: EPIPE at some prior \
+                     DQBUF on next_frame/dqbuf_capture_hold OR \
+                     drain_capture_step_no_frame observed FLAG_LAST \
+                     after CMD_STOP; all subsequent next_frame calls \
+                     return Ok(None) until resume_after_eos clears \
+                     the latch)"
                 );
             }
             return Ok(None);
@@ -3566,20 +3615,49 @@ impl Decoder {
                 inner_w.capture_in_flight[idx as usize] = true;
             }
             if is_last {
-                inner_w.capture_drained = true;
-                // r110 stage 3 commit 2 (2026-06-11): unthrottled
-                // probe so QA can pinpoint EXACTLY which DQBUF
-                // triggered the latch. If this fires mid-stream
-                // (not at known end-of-clip), the bcm2835-codec
-                // FLAG_LAST quirk is confirmed as the 141-poll
-                // root cause. Unthrottled because legitimate
-                // FLAG_LAST fires at most once per slide cycle —
-                // log volume is bounded.
+                // r110 stage 3 commit 3 (2026-06-11): DEFANGED
+                // per QA expanded-mandate "defensive don't-
+                // latch-on-mid-stream-FLAG_LAST" insurance fix.
+                //
+                // c2 probe verdict (15-min 720p soak, ~120
+                // transitions): the bcm2835-codec FLAG_LAST-mid-
+                // clip quirk does NOT fire on the baseline path.
+                // c2's hypothesis was wrong; the 141-poll bug
+                // was r109.4 collateral via drain_capture_to_wake
+                // exhausting and tripping a DIFFERENT latch site.
+                //
+                // But: the FLAG_LAST→capture_drained=true latch
+                // is the WRONG contract for bcm2835-codec given
+                // the known driver quirk (project memory:
+                // "deviates from V4L2 m2m spec; CMD_STOP on empty
+                // pipeline triggers FLAG_LAST emission"). If the
+                // quirk EVER fires mid-stream in a future load,
+                // the latch would silently poison the decoder.
+                //
+                // r110 contract: capture_drained latches ONLY on
+                // EPIPE (the canonical V4L2 "stream is over"
+                // signal). FLAG_LAST on a normal DQBUF is
+                // treated as "this buffer's content is good;
+                // deliver it; do NOT latch the global drained
+                // state." Callers who genuinely need to detect
+                // EOS-via-FLAG_LAST should check the
+                // FrameMetadata.is_last bit explicitly (future
+                // work; no caller needs it today — drain
+                // scenarios go through drain_capture_step which
+                // is post-CMD_STOP context and DOES still latch
+                // there because that path's FLAG_LAST is the
+                // expected canonical EOS).
+                //
+                // Probe kept (unconditional): if it ever fires
+                // unexpectedly we want to know. Updated label
+                // reflects the new contract.
                 eprintln!(
-                    "[perf] next_frame_flag_last_seen buf_idx={} \
-                     frames_since_streamon={} \
-                     (sets capture_drained=true; subsequent \
-                     next_frame returns Ok(None) until clear)",
+                    "[perf] next_frame_flag_last_seen_no_latch \
+                     buf_idx={} mapped_capture_len={} \
+                     (FLAG_LAST observed; r110 contract: \
+                     capture_drained NOT latched; caller \
+                     receives buffer; further next_frame calls \
+                     continue trying DQBUF)",
                     idx,
                     inner_w.mapped_capture.len(),
                 );
