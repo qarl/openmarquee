@@ -191,6 +191,168 @@ fi
 after_s10="$(cat "$TMP/s10.txt")"
 check "s10: file untouched on refusal" "$before_s10" "$after_s10"
 
+# ── patch_config_txt_gpu_mem (r110 c3.3.2-followup, 2026-06-11) ─────
+# Bumps GPU memory split to 128M so 1080p ril.video_decode can
+# allocate. Idempotent: replace existing gpu_mem=<N> in place,
+# or append if absent.
+
+# Append when no gpu_mem= line present.
+printf '[all]\nhdmi_force_hotplug=1\n' > "$TMP/g1.txt"
+patch_config_txt_gpu_mem "$TMP/g1.txt" >/dev/null
+check "g1: exactly one gpu_mem=128 line" "1" "$(grep -cE '^gpu_mem=128$' "$TMP/g1.txt")"
+grep -q 'hdmi_force_hotplug=1' "$TMP/g1.txt" && ok "g1: existing line preserved" || bad "g1: existing line lost"
+
+# Idempotent re-run does NOT double-append.
+patch_config_txt_gpu_mem "$TMP/g1.txt" >/dev/null
+check "g1: no double gpu_mem on re-run" "1" "$(grep -cE '^gpu_mem=128' "$TMP/g1.txt")"
+
+# Existing gpu_mem=64 is REPLACED in place (not appended below).
+printf '[all]\ngpu_mem=64\nhdmi_force_hotplug=1\n' > "$TMP/g2.txt"
+patch_config_txt_gpu_mem "$TMP/g2.txt" >/dev/null
+check "g2: gpu_mem=128 present" "1" "$(grep -cE '^gpu_mem=128$' "$TMP/g2.txt")"
+check "g2: old gpu_mem=64 gone" "0" "$(grep -cE '^gpu_mem=64$' "$TMP/g2.txt")"
+grep -q 'hdmi_force_hotplug=1' "$TMP/g2.txt" && ok "g2: post-line preserved" || bad "g2: post-line lost"
+
+# A different existing value (e.g., 256) is also replaced.
+printf 'gpu_mem=256\n' > "$TMP/g3.txt"
+patch_config_txt_gpu_mem "$TMP/g3.txt" >/dev/null
+check "g3: gpu_mem=128 present" "1" "$(grep -cE '^gpu_mem=128$' "$TMP/g3.txt")"
+check "g3: old gpu_mem=256 gone" "0" "$(grep -cE '^gpu_mem=256$' "$TMP/g3.txt")"
+
+# Commented-out gpu_mem MUST NOT match (so it's NOT replaced).
+printf '# gpu_mem=64 (commented out)\n' > "$TMP/g4.txt"
+patch_config_txt_gpu_mem "$TMP/g4.txt" >/dev/null
+grep -q '^# gpu_mem=64' "$TMP/g4.txt" && ok "g4: commented line preserved" || bad "g4: commented line lost"
+check "g4: gpu_mem=128 appended" "1" "$(grep -cE '^gpu_mem=128$' "$TMP/g4.txt")"
+
+# BLOCKER-1 pin (sacred subagent): gpu_mem=64 with trailing
+# `# comment` junk MUST result in an effective gpu_mem=128
+# (the pre-fix lenient-entry / strict-substitution sed would
+# silently no-op and the log lied about success).
+printf 'gpu_mem=64 # default\n' > "$TMP/g5.txt"
+patch_config_txt_gpu_mem "$TMP/g5.txt" >/dev/null
+# The old gpu_mem=64 line (with trailing junk) MUST be gone.
+check "g5: old gpu_mem=64 line gone" "0" "$(grep -cE '^gpu_mem=64' "$TMP/g5.txt")"
+# Exactly one effective gpu_mem= line, and it's 128.
+check "g5: exactly one gpu_mem= line" "1" "$(grep -cE '^[[:space:]]*gpu_mem[[:space:]]*=' "$TMP/g5.txt")"
+check "g5: gpu_mem=128 present" "1" "$(grep -cE '^gpu_mem=128$' "$TMP/g5.txt")"
+
+# BLOCKER-2(a) pin: multiple gpu_mem= lines across [section]
+# selectors. The pre-fix idempotency check would find
+# gpu_mem=128 in [pi4] and short-circuit while the [all]
+# line at 64 keeps the Pi booting at 64M.
+printf '[pi4]\ngpu_mem=128\n[all]\ngpu_mem=64\n' > "$TMP/g6.txt"
+patch_config_txt_gpu_mem "$TMP/g6.txt" >/dev/null
+# Both pre-existing gpu_mem= lines (one 128, one 64) MUST be
+# stripped — the appended [all]/gpu_mem=128 at EOF is the
+# only one left.
+check "g6: exactly one gpu_mem= line" "1" "$(grep -cE '^[[:space:]]*gpu_mem[[:space:]]*=' "$TMP/g6.txt")"
+check "g6: gpu_mem=128 present" "1" "$(grep -cE '^gpu_mem=128$' "$TMP/g6.txt")"
+check "g6: gpu_mem=64 gone" "0" "$(grep -cE '^gpu_mem=64$' "$TMP/g6.txt")"
+# The [pi4] section header from before is preserved (we only
+# strip gpu_mem= lines, not section headers).
+grep -q '^\[pi4\]' "$TMP/g6.txt" && ok "g6: [pi4] header preserved" || bad "g6: [pi4] header lost"
+
+# BLOCKER-2(b) pin: append emits an EXPLICIT [all] header
+# before gpu_mem=128 so scope is pinned regardless of which
+# section header was last opened at EOF. Verify the appended
+# value's IMMEDIATE preceding section context is [all], not
+# any earlier section.
+printf '[pi4]\nsome_pi4_only_setting=1\n' > "$TMP/g7.txt"
+patch_config_txt_gpu_mem "$TMP/g7.txt" >/dev/null
+# The new gpu_mem=128 line must be preceded by an [all] header
+# (not just inherit the [pi4] from above). awk: find the last
+# [section] header BEFORE the gpu_mem=128 line.
+last_section="$(awk '/^\[/{sec=$0} /^gpu_mem=128$/{print sec; exit}' "$TMP/g7.txt")"
+check "g7: [all] scope pinned at gpu_mem=128" "[all]" "$last_section"
+grep -q '^\[pi4\]' "$TMP/g7.txt" && ok "g7: original [pi4] preserved" || bad "g7: original [pi4] lost"
+
+# BLOCKER-1+2(a) idempotency under the new contract: a
+# correctly-already-applied file (single uncommented
+# gpu_mem=128 line, last seen [all] header) is a true no-op.
+printf '[all]\ngpu_mem=128\n' > "$TMP/g8.txt"
+md5_before="$(md5sum < "$TMP/g8.txt" 2>/dev/null || md5 < "$TMP/g8.txt" 2>/dev/null | awk '{print $NF}')"
+patch_config_txt_gpu_mem "$TMP/g8.txt" >/dev/null
+md5_after="$(md5sum < "$TMP/g8.txt" 2>/dev/null || md5 < "$TMP/g8.txt" 2>/dev/null | awk '{print $NF}')"
+check "g8: true no-op (file unchanged byte-for-byte)" "$md5_before" "$md5_after"
+
+# ── patch_cmdline_txt_cma (r110 c3.3.2-followup, 2026-06-11) ────────
+# Sets cma=256M, replacing any prior cma= token, preserving the
+# single-line cmdline.txt invariant. Idempotent.
+
+# Append when no cma= present.
+printf 'console=tty1 root=PARTUUID=abc-02 rootwait\n' > "$TMP/cma1.txt"
+patch_cmdline_txt_cma "$TMP/cma1.txt" >/dev/null
+check "cma1: one line" "1" "$(wc -l < "$TMP/cma1.txt" | tr -d ' ')"
+grep -qw 'cma=256M' "$TMP/cma1.txt" && ok "cma1: cma=256M appended" || bad "cma1: cma=256M missing"
+grep -qw 'root=PARTUUID=abc-02' "$TMP/cma1.txt" && ok "cma1: root= preserved" || bad "cma1: root= lost"
+grep -qw 'rootwait' "$TMP/cma1.txt" && ok "cma1: rootwait preserved" || bad "cma1: rootwait lost"
+
+# Idempotency: re-run is a no-op.
+patch_cmdline_txt_cma "$TMP/cma1.txt" >/dev/null
+check "cma1: re-run no double cma=" "1" "$(grep -ow 'cma=256M' "$TMP/cma1.txt" | wc -l | tr -d ' ')"
+check "cma1: still one line after re-run" "1" "$(wc -l < "$TMP/cma1.txt" | tr -d ' ')"
+
+# Existing cma=384M is REPLACED with cma=256M.
+printf 'console=tty1 cma=384M root=PARTUUID=x rootwait\n' > "$TMP/cma2.txt"
+patch_cmdline_txt_cma "$TMP/cma2.txt" >/dev/null
+check "cma2: one line" "1" "$(wc -l < "$TMP/cma2.txt" | tr -d ' ')"
+check "cma2: cma=256M present" "1" "$(grep -ow 'cma=256M' "$TMP/cma2.txt" | wc -l | tr -d ' ')"
+check "cma2: old cma=384M gone" "0" "$(grep -ow 'cma=384M' "$TMP/cma2.txt" | wc -l | tr -d ' ')"
+grep -qw 'root=PARTUUID=x' "$TMP/cma2.txt" && ok "cma2: root= preserved" || bad "cma2: root= lost"
+
+# Different existing value (cma=512M) also replaced.
+printf 'cma=512M root=PARTUUID=y\n' > "$TMP/cma3.txt"
+patch_cmdline_txt_cma "$TMP/cma3.txt" >/dev/null
+check "cma3: cma=256M present" "1" "$(grep -ow 'cma=256M' "$TMP/cma3.txt" | wc -l | tr -d ' ')"
+check "cma3: old cma=512M gone" "0" "$(grep -ow 'cma=512M' "$TMP/cma3.txt" | wc -l | tr -d ' ')"
+
+# Substring-prefix collision: `cma_zone=foo` MUST NOT be stripped.
+printf 'cma_zone=foo cma=384M root=PARTUUID=z\n' > "$TMP/cma4.txt"
+patch_cmdline_txt_cma "$TMP/cma4.txt" >/dev/null
+grep -qw 'cma_zone=foo' "$TMP/cma4.txt" && ok "cma4: cma_zone=foo preserved" || bad "cma4: cma_zone=foo wrongly stripped"
+check "cma4: cma=256M present" "1" "$(grep -ow 'cma=256M' "$TMP/cma4.txt" | wc -l | tr -d ' ')"
+check "cma4: old cma=384M gone" "0" "$(grep -ow 'cma=384M' "$TMP/cma4.txt" | wc -l | tr -d ' ')"
+
+# Empty cmdline.txt is REFUSED (same safety as patch_cmdline_txt).
+: > "$TMP/cma5.txt"
+if patch_cmdline_txt_cma "$TMP/cma5.txt" >/dev/null 2>&1; then
+    bad "cma5: empty cmdline.txt should be refused"
+else
+    ok "cma5: empty cmdline.txt refused"
+fi
+
+# Single-token file where the only token IS cma=*: stripping would
+# empty → refused.
+printf 'cma=384M\n' > "$TMP/cma6.txt"
+before_cma6="$(cat "$TMP/cma6.txt")"
+if patch_cmdline_txt_cma "$TMP/cma6.txt" >/dev/null 2>&1; then
+    bad "cma6: would-be-empty result should be refused"
+else
+    ok "cma6: would-be-empty result refused"
+fi
+after_cma6="$(cat "$TMP/cma6.txt")"
+check "cma6: file untouched on refusal" "$before_cma6" "$after_cma6"
+
+# Multiple existing cma= tokens (paranoid; cmdline shouldn't have
+# this but the function must be safe) — both stripped, single
+# cma=256M appended.
+printf 'foo cma=128M bar cma=384M baz\n' > "$TMP/cma7.txt"
+patch_cmdline_txt_cma "$TMP/cma7.txt" >/dev/null
+check "cma7: exactly one cma=256M" "1" "$(grep -ow 'cma=256M' "$TMP/cma7.txt" | wc -l | tr -d ' ')"
+check "cma7: cma=128M gone" "0" "$(grep -ow 'cma=128M' "$TMP/cma7.txt" | wc -l | tr -d ' ')"
+check "cma7: cma=384M gone" "0" "$(grep -ow 'cma=384M' "$TMP/cma7.txt" | wc -l | tr -d ' ')"
+grep -qw foo "$TMP/cma7.txt" && ok "cma7: foo preserved" || bad "cma7: foo lost"
+grep -qw bar "$TMP/cma7.txt" && ok "cma7: bar preserved" || bad "cma7: bar lost"
+grep -qw baz "$TMP/cma7.txt" && ok "cma7: baz preserved" || bad "cma7: baz lost"
+
+# CR/LF input collapsed to one line + cma=256M applied.
+printf 'console=tty1\r\nroot=PARTUUID=q\r\n' > "$TMP/cma8.txt"
+patch_cmdline_txt_cma "$TMP/cma8.txt" >/dev/null
+check "cma8: CR/LF input -> one line" "1" "$(wc -l < "$TMP/cma8.txt" | tr -d ' ')"
+grep -qw 'cma=256M' "$TMP/cma8.txt" && ok "cma8: cma=256M present" || bad "cma8: cma=256M missing"
+grep -q 'console=tty1 root=PARTUUID=q' "$TMP/cma8.txt" && ok "cma8: params re-joined" || bad "cma8: params not joined"
+
 if [ "$fail" -eq 0 ]; then
     echo "ALL PASS"
 else

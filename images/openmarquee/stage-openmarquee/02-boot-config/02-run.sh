@@ -41,3 +41,14 @@ patch_cmdline_txt "${boot_dir}/cmdline.txt"
 # kernel PSI/cgroup memory accounting + blocks systemd-OOMD
 # policies. Strip it so we get memory-pressure telemetry.
 strip_cmdline_token "cgroup_disable=memory" "${boot_dir}/cmdline.txt"
+# r110 c3.3.2-followup (2026-06-11): bake the GPU memory split
+# into the image defaults so a fresh Jason-class deploy boots
+# with a reloc heap that can allocate a 1080p ril.video_decode
+# component. gpu_mem=64 (stock Pi Zero 2 W default) cannot —
+# vchiq ETIME on component create, reloc heap starved at
+# ~17M/44M idle. gpu_mem=128 + cma=256M verified clean booting
+# with reloc 107M/108M free, no ARM-side regression (gpu_mem
+# grows 64M, cma shrinks 128M from a hypothetical 384M baseline,
+# net within budget on 512MB Zero 2 W).
+patch_config_txt_gpu_mem  "${boot_dir}/config.txt"
+patch_cmdline_txt_cma     "${boot_dir}/cmdline.txt"

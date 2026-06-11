@@ -116,3 +116,155 @@ strip_cmdline_token() {
     printf '%s\n' "$stripped" > "$file"
     echo "cmdline.txt: stripped '$token'"
 }
+
+# Set `gpu_mem=128` in a Pi config.txt, IN PLACE. Idempotent.
+#
+# r110 c3.3.2-followup (2026-06-11): the stock gpu_mem=64 on the
+# Pi Zero 2 W cannot create a 1080p `ril.video_decode` MMAL
+# component — vchiq returns ETIME with reloc heap starved
+# (~17M/44M free at idle). With gpu_mem=128 + cma=256M (paired
+# patch_cmdline_txt_cma below), the firmware reloc heap shows
+# ~107M/108M free post-boot and 1080p decoder creation
+# succeeds. CMA pool drops from 384M (old) to 256M but ARM
+# headroom net is unchanged (gpu_mem grows 64M, cma shrinks
+# 128M — within budget on a 512MB Zero 2 W).
+#
+# Behavior:
+#   - exactly ONE `gpu_mem=128` line (uncommented) present →
+#     no-op
+#   - any other state (zero gpu_mem= lines, one with trailing
+#     junk, multiple gpu_mem= lines across [section] headers,
+#     etc.) → STRIP all gpu_mem= lines + APPEND a fresh
+#     `[all]` / `gpu_mem=128` block at EOF
+#
+# The strip-and-append shape (rather than in-place sed
+# substitution) handles three failure modes a sed-substitute
+# would silently miss:
+#   (1) sacred subagent BLOCKER-1 — `gpu_mem=64 # comment`
+#       trailing junk: the entry pattern matched
+#       (`gpu_mem[[:space:]]*=`) but the strict substitution
+#       pattern with end-anchor (`[^[:space:]]*$`) did NOT,
+#       so sed no-op'd while the log claimed success.
+#   (2) sacred subagent BLOCKER-2(a) — multiple `gpu_mem=` lines
+#       across `[section]` selectors (e.g. `[pi4]
+#       gpu_mem=128` + `[all] gpu_mem=64`): a plain grep for
+#       `gpu_mem=128` would short-circuit the idempotency
+#       check while the `[all]` line at 64 keeps the Pi Zero
+#       2 W booting at 64M.
+#   (3) sacred subagent BLOCKER-2(b) — appending a bare
+#       `gpu_mem=128` at EOF inherits whatever `[section]`
+#       header was last opened. Explicit `[all]` header
+#       before the value pins scope regardless of EOF
+#       context (and stock pi-gen Trixie ends in `[all]`
+#       today, so this also matches the current empirical
+#       layout).
+#
+# Idempotent: a re-run with exactly one uncommented
+# `gpu_mem=128` line is a no-op.
+patch_config_txt_gpu_mem() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        echo "patch_config_txt_gpu_mem: $file not found" >&2
+        return 1
+    fi
+    # Count uncommented `gpu_mem=` lines. Pattern requires
+    # line-start + optional whitespace + literal `gpu_mem`
+    # + `=` — so `# gpu_mem=64` is correctly excluded.
+    local count
+    count="$(grep -cE '^[[:space:]]*gpu_mem[[:space:]]*=' "$file" || true)"
+    # Strict idempotency: exactly ONE gpu_mem= line AND it
+    # equals gpu_mem=128 with no trailing junk → no-op.
+    if [ "$count" = "1" ] && \
+       grep -qE '^[[:space:]]*gpu_mem[[:space:]]*=[[:space:]]*128[[:space:]]*$' "$file"; then
+        echo "config.txt: gpu_mem=128 already set — no-op"
+        return 0
+    fi
+    # Strip ALL existing gpu_mem= lines (idempotent if none
+    # present). Use same-dir mktemp so the mv is intra-fs
+    # atomic on boot partitions that span filesystems from
+    # /tmp.
+    local tmp
+    tmp="$(mktemp "${file}.gpu_mem.XXXXXX")"
+    sed -E '/^[[:space:]]*gpu_mem[[:space:]]*=/d' "$file" > "$tmp"
+    mv "$tmp" "$file"
+    # Append fresh [all]/gpu_mem=128 block at EOF — explicit
+    # section header pins scope regardless of any prior
+    # section selectors above.
+    printf '\n# openMarquee r110 c3.3.2-followup (2026-06-11): bump GPU\n# memory split so the 1080p ril.video_decode component\n# can allocate (paired with cma=256M in cmdline.txt).\n# Explicit [all] header pins scope across all model variants.\n[all]\ngpu_mem=128\n' \
+        >> "$file"
+    if [ "$count" -gt "0" ]; then
+        echo "config.txt: stripped $count existing gpu_mem= line(s) + appended [all]/gpu_mem=128"
+    else
+        echo "config.txt: appended [all]/gpu_mem=128"
+    fi
+}
+
+# Set `cma=256M` in a Pi cmdline.txt, IN PLACE. Idempotent.
+#
+# r110 c3.3.2-followup (2026-06-11): paired with
+# patch_config_txt_gpu_mem above. cma=256M shrinks the CMA pool
+# from the older 384M default to leave headroom for the
+# gpu_mem=128 reloc heap bump — together the split frees the
+# firmware reloc heap enough for 1080p MMAL component creation.
+#
+# Same DANGER as patch_cmdline_txt — cmdline.txt is a SINGLE
+# line and a stray newline silently drops every param after it,
+# bricking boot. This function therefore:
+#   - reads the whole file and turns every CR/LF into a SPACE,
+#   - drops any existing `cma=*` token via exact-prefix awk
+#     field match (so `cma=512M`, `cma=128M`, etc. all get
+#     replaced — NOT regex substring; a hypothetical token
+#     `cma_zone=foo` would NOT match),
+#   - appends `cma=256M` and exactly ONE trailing newline,
+#   - is idempotent: a re-run finds `cma=256M` and re-runs
+#     the strip+append, which is a no-op (same output).
+patch_cmdline_txt_cma() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        echo "patch_cmdline_txt_cma: $file not found" >&2
+        return 1
+    fi
+    local current
+    current="$(tr '\r\n' '  ' < "$file" | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//')"
+    if [ -z "$current" ]; then
+        echo "patch_cmdline_txt_cma: $file is empty — refusing to patch" >&2
+        return 1
+    fi
+    # awk field match: drop any token whose substring up to '=' is
+    # exactly `cma`. Substring-prefix collisions like `cmaX=Y` are
+    # safe because the split-on-`=` test compares the FULL prefix.
+    # Same-dir mktemp not strictly needed here (we don't atomic-
+    # mv the cmdline.txt via tmp file; we rewrite it directly
+    # with the printf below) — but the awk's stdout buffer is
+    # the staging area + final write is one redirection.
+    local stripped
+    stripped="$(printf '%s\n' "$current" | awk '{
+        out=""
+        for (i=1; i<=NF; i++) {
+            eq=index($i, "=")
+            key=(eq>0) ? substr($i, 1, eq-1) : $i
+            if (key != "cma") {
+                if (out=="") out=$i; else out=out" "$i
+            }
+        }
+        print out
+    }')"
+    if [ -z "$stripped" ]; then
+        echo "patch_cmdline_txt_cma: stripping cma= would empty $file — refusing" >&2
+        return 1
+    fi
+    # Idempotency check: if the BEFORE-strip current already has
+    # cma=256M AND no other cma=*, the stripped+append result is
+    # identical to current → log no-op + skip the write.
+    local target_only_cma
+    target_only_cma="$current"
+    # Detect: exactly one cma= token AND it equals cma=256M.
+    local cma_count
+    cma_count="$(printf '%s\n' "$current" | awk '{ c=0; for (i=1;i<=NF;i++) { eq=index($i,"="); key=(eq>0)?substr($i,1,eq-1):$i; if (key=="cma") c++ } print c }')"
+    if [ "$cma_count" = "1" ] && printf '%s\n' "$current" | grep -qw 'cma=256M'; then
+        echo "cmdline.txt: cma=256M already set (exactly one cma= token) — no-op"
+        return 0
+    fi
+    printf '%s %s\n' "$stripped" "cma=256M" > "$file"
+    echo "cmdline.txt: set cma=256M (stripped any prior cma= + appended)"
+}
