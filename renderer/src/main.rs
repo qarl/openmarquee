@@ -31,6 +31,21 @@ mod hdmi_logic;
 mod ipc_main;
 mod lru;
 mod mem;
+// r110 stage 3 commit 3.x (2026-06-11) — Task 2 of the Karl-
+// priority transitions audit. Pure-logic test modules pinning the
+// FLAG_LAST → capture_drained contract (c3.0) and the PosterCache
+// invariants (c3.1). #[cfg(test)] gated, so they cost nothing in
+// release builds.
+#[cfg(test)]
+mod flag_last_contract_tests;
+// r110 c3.3 (2026-06-11): also gate on target_os = "linux"
+// because the test references `crate::hdmi::POSTER_CACHE_CAPACITY`
+// which only exists when hdmi is compiled (Linux-only). code2
+// authored this test file; this cfg-gate is the minimal touch
+// that keeps macOS `cargo test` green for the Karl-priority
+// cadence checks without modifying the test body code2 owns.
+#[cfg(all(test, target_os = "linux"))]
+mod poster_cache_invariants_tests;
 mod mp4_demux;
 mod playback;
 mod profile;

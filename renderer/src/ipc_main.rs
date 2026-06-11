@@ -2913,9 +2913,72 @@ fn handle_inner_request(
                 Some(ContentItem::Text(s)) => s.background_video_slide_id,
                 _ => None,
             };
-            let mut keep_ids = vec![p.slide_id];
+            // r110 stage 3 commit 3.3 (2026-06-11) simplified per QA
+            // amended spec: at BeginSlide for B, if B's video
+            // decoder is in failed/no-frame state (frames_decoded
+            // == 0, the reloc-starved corpse from the dual-decode
+            // overlap window), TEAR IT DOWN by NOT including it in
+            // keep_ids — the subsequent evict_other_video_state +
+            // cache.load creates a FRESH decoder primed from t=0.
+            //
+            // Single-1080p decode has rated capability + months of
+            // steady-state history once it's the only instance
+            // (per QA c3.3 directive). The poster (already on glass
+            // from c3.2.2's bake_b path during the transition
+            // window) covers the recreate+prime latency. First
+            // decoded frame == frame 0 == the poster → invisible
+            // handoff per c3.1.1 BT.709 limited contract.
+            //
+            // Heuristic: frames_decoded == 0 means decoder never
+            // produced a frame across the entire transition window
+            // (~1.5s × ~30fps = ~45 ticks of opportunity). That's
+            // an unambiguous wedge signal.
+            //
+            // cfg-gated: `cache.video_decoders` is Linux-only (no
+            // V4L2 on macOS); the failed-decoder detection is a
+            // no-op on non-Linux dev builds (those paths don't
+            // run a real decoder anyway).
+            #[cfg(target_os = "linux")]
+            let pure_video_failed = match cache.items.peek(&p.slide_id) {
+                Some(ContentItem::Video(_)) => cache
+                    .video_decoders
+                    .get(&p.slide_id)
+                    .map(|d| d.frames_decoded == 0)
+                    .unwrap_or(false),
+                _ => false,
+            };
+            #[cfg(not(target_os = "linux"))]
+            let pure_video_failed = false;
+            #[cfg(target_os = "linux")]
+            let bg_video_failed = bg_video_id
+                .and_then(|bg_id| cache.video_decoders.get(&bg_id))
+                .map(|d| d.frames_decoded == 0)
+                .unwrap_or(false);
+            #[cfg(not(target_os = "linux"))]
+            let bg_video_failed = false;
+            if pure_video_failed {
+                eprintln!(
+                    "[perf] c3_3_decoder_recreate slide_id={} \
+                     kind=pure_video reason=frames_decoded_zero",
+                    p.slide_id,
+                );
+            }
+            if bg_video_failed {
+                if let Some(bg_id) = bg_video_id {
+                    eprintln!(
+                        "[perf] c3_3_decoder_recreate slide_id={} \
+                         bg_video_id={} kind=text_over_video \
+                         reason=frames_decoded_zero",
+                        p.slide_id, bg_id,
+                    );
+                }
+            }
+            let mut keep_ids: Vec<uuid::Uuid> = Vec::with_capacity(2);
+            if !pure_video_failed {
+                keep_ids.push(p.slide_id);
+            }
             if let Some(bg_id) = bg_video_id {
-                if bg_id != p.slide_id {
+                if bg_id != p.slide_id && !bg_video_failed {
                     keep_ids.push(bg_id);
                 }
             }
