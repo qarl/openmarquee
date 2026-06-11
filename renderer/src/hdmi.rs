@@ -5198,6 +5198,16 @@ pub fn paint_and_present_one_transition_frame(
         // call — Option D cadence per `feedback_motion_through_
         // transitions_required`, video plays through the transition
         // alongside text motion phase and image still-frames.
+        // r110 c3.2.2: pre-compute use_poster_a HERE (shared
+        // borrow on endpoint_a) BEFORE inputs_a takes &mut.
+        // The matches! on a shared borrow doesn't hold across
+        // statements; we then read the bool downstream.
+        let use_poster_a = matches!(
+            &endpoint_a,
+            TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
+        ) && poster_a_texture.is_some();
+        let endpoint_a_is_text_over_video =
+            matches!(&endpoint_a, TransitionEndpoint::TextOverVideo { .. });
         let inputs_a = match &mut endpoint_a {
             TransitionEndpoint::Text(_) => {
                 let (id, bg, layers, states) =
@@ -5283,13 +5293,81 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
-        let Some((fbo_a, tex_a)) =
-            bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, cached_pair_a, inputs_a)?
-        else {
-            crate::hdmi_logic::warn_paint_transition_skip(
-                kind, progress, "endpoint_a_no_frame",
-            );
-            return Ok(false);
+        // r110 stage 3 commit 3.2.2 (2026-06-11): poster fast-path.
+        // When endpoint_a is video-bearing AND we have a poster on
+        // disk AND a cached FBO pair, source from the poster
+        // unconditionally for the entire transition window (this is
+        // the FROZEN ENTRY contract — c3.1.1 BT.709 limited recipe
+        // makes the poster pixel-identical to the live first frame,
+        // so the handoff at c3.3 spin-up is invisible).
+        //
+        // Per QA c3.2 correctness note: tick-1 preference is
+        // poster-if-exists BEFORE the first bake_video attempt at
+        // 1080p, else tick 1 may present garbage/black. The
+        // "unconditional source" pattern here satisfies that — we
+        // never try bake_video when poster is available.
+        //
+        // TextOverVideo: composite text layers live on top of the
+        // poster (text is GL-cheap, MUST NOT be frozen into the
+        // poster — poster represents only what the V4L2 decoder
+        // would have produced).
+        let use_poster_a_now = use_poster_a && cached_pair_a.is_some();
+        let (fbo_a, tex_a) = if use_poster_a_now {
+            let (poster_tex, _, _) = poster_a_texture.expect("guarded above");
+            let (fbo, tex) = cached_pair_a.expect("guarded above");
+            use glow::HasContext;
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
+            session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            session.gl.clear(glow::COLOR_BUFFER_BIT);
+            run_blit_pass(session.gl, poster_tex)?;
+            // TextOverVideo: composite text live on top.
+            if endpoint_a_is_text_over_video {
+                if let Some((slide_id, layers, motion_states)) = text_over_video_a.as_ref() {
+                    let slide_id = *slide_id;
+                    let layers_len = layers.len();
+                    let needs_new = match session.slide_caches.get(&slide_id) {
+                        Some(c) => c.glyph.len() != layers_len,
+                        None => true,
+                    };
+                    if needs_new {
+                        if let Some(old) = session.slide_caches.remove(&slide_id) {
+                            free_slide_render_cache(session.gl, old);
+                        }
+                        session.slide_caches.insert(slide_id, SlideRenderCache::new(layers_len));
+                    }
+                    let runtime_glyph_ctx = Some(crate::glyph_cache::RuntimeGlyphCtx {
+                        cache: &session.dynamic_glyph_cache,
+                        fonts_dir: &session.dynamic_fonts_dir,
+                    });
+                    let cache = session.slide_caches.get_mut(&slide_id)
+                        .expect("inserted above");
+                    let wall_clock_unix = current_unix_seconds();
+                    paint_slide_with_viewport(
+                        session.gl,
+                        mode_w_u32, mode_h_u32, 0, 0, mode_w_u32, mode_h_u32,
+                        None, // bg already filled by poster blit
+                        layers,
+                        Some(motion_states),
+                        wall_clock_unix,
+                        Some(&mut cache.glyph),
+                        Some(&mut session.image_bg_cache),
+                        Some(&mut cache.tex),
+                        runtime_glyph_ctx,
+                    )?;
+                }
+            }
+            eprintln!("[perf] poster_a_sourced progress={:.3}", progress);
+            (fbo, tex)
+        } else {
+            let Some((fa, ta)) = bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, cached_pair_a, inputs_a)?
+            else {
+                crate::hdmi_logic::warn_paint_transition_skip(
+                    kind, progress, "endpoint_a_no_frame",
+                );
+                return Ok(false);
+            };
+            (fa, ta)
         };
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
         //
@@ -5368,8 +5446,65 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
-        let mut bake_b_iterations: u32 = 0;
-        let (fbo_b, tex_b) = loop {
+        // r110 stage 3 commit 3.2.2: poster fast-path for bake_b
+        // (mirrors bake_a's poster fast-path above; same FROZEN
+        // ENTRY contract). When endpoint_b is video-bearing AND
+        // we have a poster on disk AND a cached FBO pair, source
+        // from the poster unconditionally for the entire transition
+        // window. TextOverVideo composes text live on top.
+        let use_poster_b = matches!(
+            &endpoint_b,
+            TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
+        ) && poster_b_texture.is_some()
+          && cached_pair_b.is_some();
+        let (fbo_b, tex_b) = if use_poster_b {
+            let (poster_tex, _, _) = poster_b_texture.expect("guarded above");
+            let (fbo, tex) = cached_pair_b.expect("guarded above");
+            use glow::HasContext;
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
+            session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            session.gl.clear(glow::COLOR_BUFFER_BIT);
+            run_blit_pass(session.gl, poster_tex)?;
+            if matches!(&endpoint_b, TransitionEndpoint::TextOverVideo { .. }) {
+                if let Some((slide_id, layers, motion_states)) = text_over_video_b.as_ref() {
+                    let slide_id = *slide_id;
+                    let layers_len = layers.len();
+                    let needs_new = match session.slide_caches.get(&slide_id) {
+                        Some(c) => c.glyph.len() != layers_len,
+                        None => true,
+                    };
+                    if needs_new {
+                        if let Some(old) = session.slide_caches.remove(&slide_id) {
+                            free_slide_render_cache(session.gl, old);
+                        }
+                        session.slide_caches.insert(slide_id, SlideRenderCache::new(layers_len));
+                    }
+                    let runtime_glyph_ctx = Some(crate::glyph_cache::RuntimeGlyphCtx {
+                        cache: &session.dynamic_glyph_cache,
+                        fonts_dir: &session.dynamic_fonts_dir,
+                    });
+                    let cache = session.slide_caches.get_mut(&slide_id)
+                        .expect("inserted above");
+                    let wall_clock_unix = current_unix_seconds();
+                    paint_slide_with_viewport(
+                        session.gl,
+                        mode_w_u32, mode_h_u32, 0, 0, mode_w_u32, mode_h_u32,
+                        None,
+                        layers,
+                        Some(motion_states),
+                        wall_clock_unix,
+                        Some(&mut cache.glyph),
+                        Some(&mut session.image_bg_cache),
+                        Some(&mut cache.tex),
+                        runtime_glyph_ctx,
+                    )?;
+                }
+            }
+            eprintln!("[perf] poster_b_sourced progress={:.3}", progress);
+            (fbo, tex)
+        } else { let mut bake_b_iterations: u32 = 0;
+        loop {
             bake_b_iterations += 1;
             // Re-build inputs_b on each iteration. The match consumes
             // a fresh `&mut endpoint_b` borrow, which is released
@@ -5508,7 +5643,8 @@ pub fn paint_and_present_one_transition_frame(
                     return Err(e);
                 }
             }
-        };
+        }
+        };  // r110 c3.2.2: closes else-block of `if use_poster_b`
         // r102.2: only delete the FBO+tex handles when the cache
         // is disabled (we allocated fresh this tick). When the
         // cache is enabled, session::cleanup_resources owns the
