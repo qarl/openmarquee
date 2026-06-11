@@ -2929,46 +2929,73 @@ fn handle_inner_request(
             // decoded frame == frame 0 == the poster → invisible
             // handoff per c3.1.1 BT.709 limited contract.
             //
-            // Heuristic: frames_decoded == 0 means decoder never
-            // produced a frame across the entire transition window
-            // (~1.5s × ~30fps = ~45 ticks of opportunity). That's
-            // an unambiguous wedge signal.
+            // r110 stage 3 commit 3.3.1 (2026-06-11): REPLACES
+            // c3.3's frames_decoded==0 heuristic with EXPLICIT
+            // poster-sourced signal. c3.3 (f681f7e) fired on
+            // every preloaded video slide because
+            // video_decode.rs:825 + :1058 reset frames_decoded=0
+            // on healthy preload — decoder_drop/REQBUFS storm
+            // crashed FYS renderer + wedged bcm2835-codec
+            // kernel-side. See feedback memory
+            // "subagent-reset-then-check-inverted-logic".
             //
-            // cfg-gated: `cache.video_decoders` is Linux-only (no
-            // V4L2 on macOS); the failed-decoder detection is a
-            // no-op on non-Linux dev builds (those paths don't
-            // run a real decoder anyway).
+            // c3.3.1 contract: recreate IFF the just-completed
+            // transition actually sourced from poster for this
+            // video_id (signal written by c3.2.2 bake_a/bake_b
+            // poster fast-paths via poster_source_event,
+            // cleared at BeginTransition entry). 720p success
+            // path: live decoder produced, poster fast-path
+            // never entered → no recreate. 1080p wedge: poster
+            // sourced → recreate. Pure helper
+            // `should_recreate_decoder` factored to hdmi.rs
+            // with host-portable unit tests (closes c3.3
+            // subagent WARN-2).
+            let is_pure_video = matches!(
+                cache.items.peek(&p.slide_id),
+                Some(ContentItem::Video(_))
+            );
+            // cfg-gated: hdmi module is Linux-only (no GL/V4L2
+            // on macOS); on non-Linux dev builds the recreate
+            // predicate is a no-op since the poster fast-path
+            // never fires there either.
             #[cfg(target_os = "linux")]
-            let pure_video_failed = match cache.items.peek(&p.slide_id) {
-                Some(ContentItem::Video(_)) => cache
-                    .video_decoders
-                    .get(&p.slide_id)
-                    .map(|d| d.frames_decoded == 0)
-                    .unwrap_or(false),
+            let pure_video_failed = crate::hdmi::should_recreate_decoder(
+                is_pure_video,
+                crate::hdmi::poster_was_sourced_for(p.slide_id),
+            );
+            #[cfg(not(target_os = "linux"))]
+            let pure_video_failed = { let _ = is_pure_video; false };
+            // r110 c3.3.1 subagent WARN-2 fix: mirror the
+            // `bg_id != p.slide_id` self-reference guard from
+            // the keep_ids dedup below. Defends against a Text
+            // slide with background_video_slide_id == its own id
+            // (validator-rejected per upstream contracts but
+            // defended in `ensure_bg_video_for_text_slide`). With
+            // the guard: even if such a slide slipped through,
+            // bg_video_failed stays false → bg path not double-
+            // counted in the recreate logic.
+            #[cfg(target_os = "linux")]
+            let bg_video_failed = match bg_video_id {
+                Some(bg_id) if bg_id != p.slide_id => {
+                    crate::hdmi::should_recreate_decoder(
+                        true,
+                        crate::hdmi::poster_was_sourced_for(bg_id),
+                    )
+                }
                 _ => false,
             };
-            #[cfg(not(target_os = "linux"))]
-            let pure_video_failed = false;
-            #[cfg(target_os = "linux")]
-            let bg_video_failed = bg_video_id
-                .and_then(|bg_id| cache.video_decoders.get(&bg_id))
-                .map(|d| d.frames_decoded == 0)
-                .unwrap_or(false);
             #[cfg(not(target_os = "linux"))]
             let bg_video_failed = false;
             if pure_video_failed {
                 eprintln!(
-                    "[perf] c3_3_decoder_recreate slide_id={} \
-                     kind=pure_video reason=frames_decoded_zero",
+                    "[perf] c3_3_1_decoder_recreate slide_id={} kind=pure_video reason=poster_sourced_this_transition",
                     p.slide_id,
                 );
             }
             if bg_video_failed {
                 if let Some(bg_id) = bg_video_id {
                     eprintln!(
-                        "[perf] c3_3_decoder_recreate slide_id={} \
-                         bg_video_id={} kind=text_over_video \
-                         reason=frames_decoded_zero",
+                        "[perf] c3_3_1_decoder_recreate slide_id={} bg_video_id={} kind=text_over_video reason=poster_sourced_this_transition",
                         p.slide_id, bg_id,
                     );
                 }
@@ -3021,6 +3048,15 @@ fn handle_inner_request(
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
+            // r110 c3.3.1 (2026-06-11): clear the poster-sourced
+            // signal at transition entry so it scopes exactly to
+            // "this transition window." c3.2.2 bake_a/bake_b
+            // poster fast-paths during this transition will set
+            // it for any video_id whose poster sourced; c3.3.1's
+            // BeginSlide predicate reads it after the transition
+            // ends.
+            #[cfg(target_os = "linux")]
+            crate::hdmi::clear_poster_source_record();
             // r102.1: V3D BO probe at BeginTransition entry.
             // Brackets the transition kick-off so QA can sum
             // begin->paint_entry->paint_exit deltas across

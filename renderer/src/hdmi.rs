@@ -39,6 +39,104 @@ use std::time::{Duration, Instant};
 pub static BAKE_VIDEO_OK_NONE_EAGAIN: AtomicU64 = AtomicU64::new(0);
 pub static BAKE_VIDEO_OK_NONE_EOS: AtomicU64 = AtomicU64::new(0);
 
+/// r110 stage 3 commit 3.3.1 (2026-06-11) — explicit poster-
+/// sourced signal for the c3.3 recreate predicate.
+///
+/// Replaces the inferred `frames_decoded == 0` heuristic
+/// shipped in c3.3 (commit f681f7e) which fired on EVERY
+/// preloaded video slide because video_decode.rs:825 + :1058
+/// explicitly reset the counter to 0 on healthy preload
+/// handoff. On FYS the resulting decoder_drop/cache_load/
+/// REQBUFS storm crashed the renderer + wedged bcm2835-codec
+/// kernel-side (rebooted box to recover). See feedback memory
+/// "subagent-reset-then-check-inverted-logic" for the pattern.
+///
+/// The explicit signal: c3.2.2's bake_a/bake_b poster fast-
+/// paths CALL `poster_source_event(video_id)` whenever a
+/// poster was sourced. c3.3.1's predicate at BeginSlide reads
+/// the set; `clear_poster_source_record()` runs at
+/// BeginTransition entry so the set scopes exactly to "the
+/// most recent transition window."
+// Vec (not HashSet) because HashSet::new() isn't const. The
+// per-transition set is at most 2 entries (poster_a_video_id +
+// poster_b_video_id), so linear scan is fine.
+pub static LAST_TRANSITION_POSTER_SOURCED_VIDEO_IDS:
+    std::sync::Mutex<Vec<uuid::Uuid>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn poster_source_event(video_id: uuid::Uuid) {
+    if let Ok(mut set) = LAST_TRANSITION_POSTER_SOURCED_VIDEO_IDS.lock() {
+        if !set.contains(&video_id) {
+            set.push(video_id);
+        }
+    }
+}
+
+pub fn poster_was_sourced_for(video_id: uuid::Uuid) -> bool {
+    LAST_TRANSITION_POSTER_SOURCED_VIDEO_IDS
+        .lock()
+        .map(|set| set.contains(&video_id))
+        .unwrap_or(false)
+}
+
+pub fn clear_poster_source_record() {
+    if let Ok(mut set) = LAST_TRANSITION_POSTER_SOURCED_VIDEO_IDS.lock() {
+        set.clear();
+    }
+}
+
+/// r110 c3.3.1: pure-function recreate predicate, factored for
+/// host-portable unit tests (closes c3.3 subagent WARN-2).
+/// `is_video` = slide is a video endpoint (Pure Video or
+/// Text-with-bg-video). `poster_was_sourced` = the explicit
+/// signal: c3.2.2's poster fast-path fired for this video_id
+/// during the just-completed transition.
+pub fn should_recreate_decoder(is_video: bool, poster_was_sourced: bool) -> bool {
+    is_video && poster_was_sourced
+}
+
+#[cfg(test)]
+mod c331_should_recreate_decoder_tests {
+    use super::should_recreate_decoder;
+
+    #[test]
+    fn non_video_never_recreates() {
+        assert!(!should_recreate_decoder(false, true));
+        assert!(!should_recreate_decoder(false, false));
+    }
+
+    #[test]
+    fn video_without_poster_source_does_not_recreate() {
+        // 720p success path: live decoder produced; poster
+        // never sourced; decoder is healthy.
+        assert!(!should_recreate_decoder(true, false));
+    }
+
+    #[test]
+    fn video_with_poster_source_recreates() {
+        // 1080p wedge path: poster sourced during transition;
+        // decoder is presumed wedged; tear down + re-prime.
+        assert!(should_recreate_decoder(true, true));
+    }
+
+    #[test]
+    fn poster_source_event_dedups_and_clears() {
+        // subagent NIT-5 from c3.3.1: pin the
+        // poster_source_event dedup behavior and the
+        // clear_poster_source_record idempotence.
+        use super::{clear_poster_source_record, poster_source_event,
+                    poster_was_sourced_for};
+        let v = uuid::Uuid::new_v4();
+        clear_poster_source_record();
+        assert!(!poster_was_sourced_for(v));
+        poster_source_event(v);
+        poster_source_event(v); // dedup: no panic, no duplicate
+        assert!(poster_was_sourced_for(v));
+        clear_poster_source_record();
+        assert!(!poster_was_sourced_for(v));
+    }
+}
+
 use anyhow::{anyhow, bail, Context, Result};
 use drm::buffer::{Buffer as DrmBuffer, DrmFourcc, Handle as DrmHandle};
 use drm::Device as DrmBaseDevice;
@@ -5313,7 +5411,7 @@ pub fn paint_and_present_one_transition_frame(
         // would have produced).
         let use_poster_a_now = use_poster_a && cached_pair_a.is_some();
         let (fbo_a, tex_a) = if use_poster_a_now {
-            let (poster_tex, _, _) = poster_a_texture.expect("guarded above");
+            let (poster_tex, poster_w, poster_h) = poster_a_texture.expect("guarded above");
             let (fbo, tex) = cached_pair_a.expect("guarded above");
             use glow::HasContext;
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
@@ -5357,7 +5455,28 @@ pub fn paint_and_present_one_transition_frame(
                     )?;
                 }
             }
-            eprintln!("[perf] poster_a_sourced progress={:.3}", progress);
+            // r110 c3.3.1 (subagent BLOCKER-1 fix): only signal
+            // recreate for 1080p posters. 720p video slides ALSO
+            // have posters on FYS (QA generated for all 21 video
+            // assets across all resolutions), and their live
+            // decoders work fine; recreating them would
+            // reproduce c3.3's storm. The wedge condition is
+            // bcm2835-codec's 1080p30-TOTAL spec — only 1080p
+            // material triggers it.
+            //
+            // Threshold: >= 1080 height OR >= 1920 width.
+            // Catches 1920x1080 + portrait 1080x1920 + any
+            // larger material.
+            if let Some(vid) = poster_a_video_id {
+                if poster_w >= 1920 || poster_h >= 1080 {
+                    poster_source_event(vid);
+                }
+            }
+            eprintln!(
+                "[perf] poster_a_sourced progress={:.3} dims={}x{} signal_set={}",
+                progress, poster_w, poster_h,
+                poster_w >= 1920 || poster_h >= 1080,
+            );
             (fbo, tex)
         } else {
             let Some((fa, ta)) = bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, cached_pair_a, inputs_a)?
@@ -5458,7 +5577,7 @@ pub fn paint_and_present_one_transition_frame(
         ) && poster_b_texture.is_some()
           && cached_pair_b.is_some();
         let (fbo_b, tex_b) = if use_poster_b {
-            let (poster_tex, _, _) = poster_b_texture.expect("guarded above");
+            let (poster_tex, poster_w, poster_h) = poster_b_texture.expect("guarded above");
             let (fbo, tex) = cached_pair_b.expect("guarded above");
             use glow::HasContext;
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
@@ -5501,7 +5620,18 @@ pub fn paint_and_present_one_transition_frame(
                     )?;
                 }
             }
-            eprintln!("[perf] poster_b_sourced progress={:.3}", progress);
+            // r110 c3.3.1 (subagent BLOCKER-1 fix): only signal
+            // recreate for 1080p posters. See bake_a comment.
+            if let Some(vid) = poster_b_video_id {
+                if poster_w >= 1920 || poster_h >= 1080 {
+                    poster_source_event(vid);
+                }
+            }
+            eprintln!(
+                "[perf] poster_b_sourced progress={:.3} dims={}x{} signal_set={}",
+                progress, poster_w, poster_h,
+                poster_w >= 1920 || poster_h >= 1080,
+            );
             (fbo, tex)
         } else { let mut bake_b_iterations: u32 = 0;
         loop {
