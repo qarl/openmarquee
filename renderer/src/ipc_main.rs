@@ -2790,6 +2790,17 @@ fn run_paint_hook(
                 None => unreachable!("to_id presence verified above"),
             };
 
+            // r110 stage 3 commit 3.2.0 (2026-06-11) subagent
+            // WARN-1 fix: poster-video ids are by construction
+            // identical to the V4L2 decoder-lookup ids resolved
+            // at `from_dec_id`/`to_dec_id` above (same Text-bg /
+            // Video / _ dispatch on cache.items). Reuse them
+            // verbatim so a future change to the bg-video
+            // sourcing rule lands in ONE place. Pre-fix this
+            // was a separate closure that duplicated the logic
+            // — drift risk heading into c3.2.1/c3.2.2.
+            let poster_a_video_id = from_dec_id;
+            let poster_b_video_id = to_dec_id;
             if let Err(e) = hdmi::paint_and_present_one_transition_frame(
                 session,
                 card,
@@ -2799,6 +2810,8 @@ fn run_paint_hook(
                 content_root,
                 &kind,
                 progress,
+                poster_a_video_id,
+                poster_b_video_id,
             ) {
                 return err(format!("paint_transition failed: {e:#}"));
             }

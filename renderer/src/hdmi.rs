@@ -3462,6 +3462,11 @@ pub fn render_transition_any_endpoint_in_session(
             Some(content_root),
             kind,
             progress,
+            // r110 stage 3 commit 3.2.0: standalone reel preview
+            // path never uses poster frozen-entry — always live-
+            // decode. Pass None for both poster ids.
+            None,
+            None,
         )?;
         let elapsed = frame_start.elapsed();
         if elapsed < frame_budget {
@@ -4961,7 +4966,28 @@ pub fn paint_and_present_one_transition_frame(
     content_root: Option<&Path>,
     kind: &str,
     progress: f32,
+    // r110 stage 3 commit 3.2.0 (2026-06-11): poster-resolution
+    // video ids for the poster frozen-entry strategy. Caller
+    // (ipc_main.rs:run_paint_hook PaintTransition arm) resolves
+    // these from the cache.items lookup:
+    //   - Text with background_video_slide_id: that bg id (the
+    //     MP4 + poster.png live under the bg video's content id,
+    //     NOT the text slide id)
+    //   - Video: the slide's own id
+    //   - Text without bg, Image: None
+    //
+    // c3.2.0 is plumbing only; the values are accepted but not
+    // read here. c3.2.1 calls `ensure_poster_cached` at function
+    // entry; c3.2.2 wires the sourcing into bake_b.
+    //
+    // The standalone-reel caller at hdmi.rs:3456 passes (None,
+    // None) — the reel preview path doesn't have a poster
+    // strategy at all; it always live-decodes.
+    poster_a_video_id: Option<uuid::Uuid>,
+    poster_b_video_id: Option<uuid::Uuid>,
 ) -> Result<()> {
+    // c3.2.0 plumbing-only acknowledgement; c3.2.1 wires them in.
+    let _ = (poster_a_video_id, poster_b_video_id);
     use glow::HasContext;
     // r102.1.1 (2026-06-09): V3D BO leak probe. Throttle to
     // FIRST and LAST tick of each transition so QA can bracket
