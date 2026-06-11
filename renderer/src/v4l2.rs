@@ -1669,6 +1669,83 @@ impl Drop for Frame {
     }
 }
 
+/// r110 stage 3 (2026-06-11): a DQBUF'd CAPTURE buffer held
+/// indefinitely without auto-re-QBUF. Used by the hold-frame-0
+/// pattern (per QA's first-principles study + adversarial
+/// verify):
+///
+/// 1. Pre-roll B normally via prime_video_decoder.
+/// 2. DQBUF the first decoded frame into a HeldCapture and store
+///    it on the session — NOT re-QBUF'd.
+/// 3. The firmware decodes ~N + ~2-6 internal frames against the
+///    queued OUTPUT, fills CAPTURE, then pauses on spec-normal
+///    backpressure (no work needed; this IS the "frozen-ready"
+///    state).
+/// 4. At BeginTransition: present HeldCapture as bake_b's first-
+///    tick output (presents an IDR; no time-jump; no mid-GOP
+///    artifact), then call `release_held` to re-QBUF the buffer
+///    and begin normal DQBUF/requeue cadence — each requeue
+///    auto-kicks `try_schedule` per the kernel-source-confirmed
+///    mechanism.
+///
+/// Unlike `Frame` (whose Drop re-QBUFs unconditionally),
+/// `HeldCapture` does NOT re-QBUF on Drop. Operators MUST call
+/// `Decoder::release_held` to return the buffer to the kernel,
+/// OR the buffer leaks for the decoder's lifetime (kernel
+/// reclaims on STREAMOFF / decoder teardown, so no kernel-side
+/// leak — just a held-userspace slot from the codec's
+/// perspective until release).
+///
+/// `#[allow(dead_code)]` for stage 3 commit 1 — the types are
+/// architectural commitment; subsequent commits wire them into
+/// the prime path + transition bake_b first-tick.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+pub struct HeldCapture {
+    inner: Arc<Mutex<DecoderInner>>,
+    capture_buffer_index: u32,
+    width: u32,
+    height: u32,
+    plane_lengths: [usize; 2],
+    /// Snapshot of the mmap region pointers + lengths at DQBUF
+    /// time. Caller can read pixel data through these without
+    /// re-locking the inner mutex.
+    y_ptr: *const u8,
+    y_len: usize,
+    uv_ptr: *const u8,
+    uv_len: usize,
+    /// DMA-BUF path: the exported fd for EGLImage import. None
+    /// when capture_buffer_type=Mmap.
+    dmabuf_fd: Option<std::os::fd::RawFd>,
+    bytesperline: u32,
+}
+
+// SAFETY: HeldCapture's raw pointers are into mmap'd CAPTURE
+// regions whose lifetime is tied to the Decoder's inner Arc.
+// We hold an Arc so the regions outlive us. Mirrors `Frame`'s
+// safety story (see line ~1601).
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+unsafe impl Send for HeldCapture {}
+
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+impl HeldCapture {
+    pub fn buffer_index(&self) -> u32 { self.capture_buffer_index }
+    pub fn width(&self) -> u32 { self.width }
+    pub fn height(&self) -> u32 { self.height }
+    // r110 subagent NIT-2 fix: name parity with `Frame::stride()`
+    // at line ~1596 so call sites that switch between Frame and
+    // HeldCapture grep cleanly.
+    pub fn stride(&self) -> u32 { self.bytesperline }
+    pub fn dmabuf_fd(&self) -> Option<std::os::fd::RawFd> { self.dmabuf_fd }
+    pub fn y_ptr(&self) -> *const u8 { self.y_ptr }
+    pub fn y_len(&self) -> usize { self.y_len }
+    pub fn uv_ptr(&self) -> *const u8 { self.uv_ptr }
+    pub fn uv_len(&self) -> usize { self.uv_len }
+    pub fn plane_lengths(&self) -> [usize; 2] { self.plane_lengths }
+}
+
 /// V4L2 M2M H.264 decoder client.
 #[cfg(target_os = "linux")]
 pub struct Decoder {
@@ -3143,6 +3220,198 @@ impl Decoder {
             inner.capture_drained = true;
         }
         Ok(DrainStep::GotFrame { is_last })
+    }
+
+    /// r110 stage 3 (2026-06-11): DQBUF a CAPTURE buffer into a
+    /// `HeldCapture` (NO auto-re-QBUF on Drop). Caller MUST call
+    /// `release_held` to return the buffer.
+    ///
+    /// Used by the hold-frame-0 pattern: prime decoder, DQBUF
+    /// + hold the first decoded frame, let firmware pause on
+    /// backpressure naturally. At transition start, present the
+    /// held frame as bake_b output then release.
+    ///
+    /// Semantically equivalent to `next_frame` except the return
+    /// type carries no Drop side-effect.
+    ///
+    /// `#[allow(dead_code)]` for stage 3 commit 1 — wired in by
+    /// subsequent commits (prime + transition bake_b first-tick).
+    #[allow(dead_code)]
+    pub fn dqbuf_capture_hold(&self) -> Result<Option<HeldCapture>> {
+        self.drain_output_quiet();
+        let inner = self.inner.lock().unwrap();
+        if inner.capture_drained {
+            return Ok(None);
+        }
+        let Some(ref cap_fmt) = inner.capture_format else {
+            return Err(anyhow!("dqbuf_capture_hold: capture not formatted"));
+        };
+        let num_planes = cap_fmt.num_planes as usize;
+        let mut planes = [V4l2Plane::default(); 8];
+        let mut buf = V4l2Buffer {
+            buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            memory: V4L2_MEMORY_MMAP,
+            length: num_planes as u32,
+            m_planes: planes.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        let dq_result = unsafe { vidioc_dqbuf(inner.fd(), &mut buf) };
+        match dq_result {
+            Ok(_) => {}
+            Err(nix::errno::Errno::EAGAIN) => {
+                return Err(anyhow!("dqbuf_capture_hold: would block (EAGAIN)"));
+            }
+            Err(nix::errno::Errno::EPIPE) => {
+                drop(inner);
+                self.inner.lock().unwrap().capture_drained = true;
+                return Ok(None);
+            }
+            Err(e) => return Err(anyhow!("dqbuf_capture_hold: {}", e)),
+        }
+        if buf.flags & V4L2_BUF_FLAG_ERROR != 0 {
+            return Err(anyhow!(
+                "dqbuf_capture_hold buf={}: V4L2_BUF_FLAG_ERROR set", buf.index
+            ));
+        }
+        let is_last = buf.flags & V4L2_BUF_FLAG_LAST != 0;
+        let idx = buf.index;
+        let width = cap_fmt.width;
+        let height = cap_fmt.height;
+        let bytesperline = cap_fmt.plane_fmt.first()
+            .map(|pf| pf.bytesperline)
+            .unwrap_or(0);
+        let capture_buffer_type = inner.capture_buffer_type;
+        drop(inner);
+        let inner_mut = self.inner.lock().unwrap();
+        if (idx as usize) >= inner_mut.mapped_capture.len() {
+            return Err(anyhow!(
+                "dqbuf_capture_hold returned out-of-range buf idx {}", idx
+            ));
+        }
+        let region_planes = &inner_mut.mapped_capture[idx as usize];
+        let (y_ptr, y_len) = {
+            let p = &region_planes[0];
+            (p.ptr as *const u8, planes[0].bytesused as usize)
+        };
+        // r110 subagent BLOCKER-1 fix: mirror next_frame's
+        // num_planes==1 interleaved-NV12 fallback at v4l2.rs:3463+
+        // verbatim. bcm2835-codec production case uses
+        // num_planes=1 with UV interleaved at width*height offset.
+        // Pre-fix this returned NULL → first-tick paint would
+        // null-deref or render chroma-less.
+        let (uv_ptr, uv_len) = if num_planes >= 2 {
+            let p = &region_planes[1];
+            (p.ptr as *const u8, planes[1].bytesused as usize)
+        } else {
+            let p = &region_planes[0];
+            let y_size = (width * height) as usize;
+            let total = planes[0].bytesused as usize;
+            let uv_size = total.saturating_sub(y_size);
+            unsafe { ((p.ptr as *const u8).add(y_size), uv_size) }
+        };
+        let dmabuf_fd = match capture_buffer_type {
+            CaptureBufferType::Mmap => None,
+            CaptureBufferType::DmaBuf => {
+                if (idx as usize) >= inner_mut.capture_dmabuf_fds.len() {
+                    return Err(anyhow!(
+                        "dqbuf_capture_hold DmaBuf: idx {} out of range for fd table (len={})",
+                        idx, inner_mut.capture_dmabuf_fds.len()
+                    ));
+                }
+                Some(inner_mut.capture_dmabuf_fds[idx as usize])
+            }
+        };
+        // r110 subagent NIT-3 fix: mirror next_frame's
+        // plane_lengths shape directly; planes is [Plane;8] so
+        // indexing [1] is safe.
+        let plane_lengths = [
+            planes[0].bytesused as usize,
+            planes[1].bytesused as usize,
+        ];
+        let inner_arc = Arc::clone(&self.inner);
+        drop(inner_mut);
+        // r110 subagent WARN-1 fix: flip capture_in_flight=true
+        // to mirror next_frame's behavior at lines 3493-3499.
+        // Also r110 subagent WARN-2 fix: set capture_drained on
+        // FLAG_LAST so degenerate single-frame clips don't
+        // dangle the EOS state (defensive parity with
+        // next_frame).
+        {
+            let mut inner_w = self.inner.lock().unwrap();
+            if (idx as usize) < inner_w.capture_in_flight.len() {
+                inner_w.capture_in_flight[idx as usize] = true;
+            }
+            if is_last {
+                inner_w.capture_drained = true;
+            }
+        }
+        Ok(Some(HeldCapture {
+            inner: inner_arc,
+            capture_buffer_index: idx,
+            width,
+            height,
+            plane_lengths,
+            y_ptr,
+            y_len,
+            uv_ptr,
+            uv_len,
+            dmabuf_fd,
+            bytesperline,
+        }))
+    }
+
+    /// r110 stage 3 (2026-06-11): re-QBUF a previously held CAPTURE
+    /// buffer back to the kernel. Per the kernel-source-confirmed
+    /// `try_schedule` mechanism, the QBUF auto-kicks codec
+    /// scheduling (v4l2-mem2mem.c:790) — no additional wake-call
+    /// needed.
+    ///
+    /// `#[allow(dead_code)]` for stage 3 commit 1 — wired in by
+    /// subsequent commits.
+    #[allow(dead_code)]
+    pub fn release_held(&self, held: HeldCapture) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        // r110 subagent WARN-1 fix: flip capture_in_flight=false
+        // BEFORE the QBUF, mirroring Frame::drop at v4l2.rs:1619-
+        // 1620. Even on the teardown early-return path, the
+        // userspace-owned status should be cleared so any
+        // post-mortem diagnostic doesn't see a phantom in-flight
+        // count.
+        if (held.capture_buffer_index as usize) < inner.capture_in_flight.len() {
+            inner.capture_in_flight[held.capture_buffer_index as usize] = false;
+        }
+        if !inner.capture_streaming {
+            // Decoder torn down; kernel reclaims via STREAMOFF.
+            // No QBUF needed. r110 subagent NIT-1 fix: dropped
+            // the cosmetic `drop(held)` call — HeldCapture has
+            // no Drop impl so it was a no-op anyway; held drops
+            // at scope end as normal.
+            return Ok(());
+        }
+        let Some(ref cap_fmt) = inner.capture_format else {
+            return Err(anyhow!("release_held: capture not formatted"));
+        };
+        let num_planes = cap_fmt.num_planes as usize;
+        let memory = V4L2_MEMORY_MMAP;
+        let mut planes = [V4l2Plane::default(); 8];
+        for p in 0..num_planes {
+            planes[p].length = cap_fmt.plane_fmt[p].sizeimage;
+            planes[p].bytesused = 0;
+        }
+        let mut buf = V4l2Buffer {
+            index: held.capture_buffer_index,
+            buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+            memory,
+            length: num_planes as u32,
+            m_planes: planes.as_mut_ptr() as u64,
+            ..Default::default()
+        };
+        let qbuf_result = unsafe { vidioc_qbuf(inner.fd(), &mut buf) };
+        qbuf_result.map_err(|e| anyhow!(
+            "release_held: VIDIOC_QBUF failed for buf idx {}: {}",
+            held.capture_buffer_index, e,
+        ))?;
+        Ok(())
     }
 
     /// VIDIOC_DQBUF on CAPTURE -> wrap as `Frame`. Returns
