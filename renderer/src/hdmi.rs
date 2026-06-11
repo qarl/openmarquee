@@ -4986,8 +4986,66 @@ pub fn paint_and_present_one_transition_frame(
     poster_a_video_id: Option<uuid::Uuid>,
     poster_b_video_id: Option<uuid::Uuid>,
 ) -> Result<()> {
-    // c3.2.0 plumbing-only acknowledgement; c3.2.1 wires them in.
-    let _ = (poster_a_video_id, poster_b_video_id);
+    // r110 stage 3 commit 3.2.1 (2026-06-11): cache-or-load
+    // posters for both endpoints at function entry. The
+    // posters drive bake_a/bake_b sourcing in c3.2.2 — if a
+    // poster texture exists for an endpoint AND the endpoint
+    // is video-bearing, the poster is the FROZEN-ENTRY visual
+    // for the transition window (sources unconditionally on
+    // 1080p per QA c3.2 correctness note: tick-1 preference
+    // is poster-if-exists BEFORE the first bake_video attempt,
+    // else 1080p tick 1 may present garbage/black before the
+    // first Ok(None) is observed). For 720p where the live
+    // decoder reliably produces frames, c3.2.2 still tries
+    // bake_video first and only falls back to poster on
+    // Ok(None) — the threshold logic is in c3.2.2.
+    //
+    // Both A and B posters loaded: dual-1080p contention can
+    // cause A to wedge mid-transition (reloc=19M can't fit
+    // dual 1080p DPB per QA plan review), so A needs the
+    // same poster-fallback option as B.
+    //
+    // Loaded into `Option<(NativeTexture, u32, u32)>` locals
+    // that c3.2.2 reads. None = no poster on disk → caller
+    // falls back to live-decode-only. content_root=None
+    // (defensive) → both posters None (the standalone-reel
+    // path passes Some(content_root) so this is realistically
+    // unreachable from the IPC path).
+    let poster_a_texture: Option<(glow::NativeTexture, u32, u32)> =
+        match (content_root, poster_a_video_id) {
+            (Some(root), Some(vid)) => {
+                match unsafe { ensure_poster_cached(session, root, vid) } {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        eprintln!(
+                            "[perf] poster_load_err side=a video_id={} err={:#}",
+                            vid, e,
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+    let poster_b_texture: Option<(glow::NativeTexture, u32, u32)> =
+        match (content_root, poster_b_video_id) {
+            (Some(root), Some(vid)) => {
+                match unsafe { ensure_poster_cached(session, root, vid) } {
+                    Ok(opt) => opt,
+                    Err(e) => {
+                        eprintln!(
+                            "[perf] poster_load_err side=b video_id={} err={:#}",
+                            vid, e,
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+    // c3.2.1: locals defined but not yet read by bake_a/bake_b.
+    // c3.2.2 wires the sourcing logic.
+    let _ = (poster_a_texture, poster_b_texture);
     use glow::HasContext;
     // r102.1.1 (2026-06-09): V3D BO leak probe. Throttle to
     // FIRST and LAST tick of each transition so QA can bracket
