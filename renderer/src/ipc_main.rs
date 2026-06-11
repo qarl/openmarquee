@@ -576,6 +576,26 @@ struct SlideCache {
         uuid::Uuid,
         PreloadHandle,
     >,
+    /// r110 c3.3.2 (2026-06-11): in-flight async recreate workers,
+    /// keyed by the video_id being re-primed. The c3.3.1 BeginSlide
+    /// predicate (poster_was_sourced_for + 1080p dimension gate)
+    /// detects "decoder wedged during transition"; c3.3.2 spawns
+    /// preload_in_worker into this map instead of running cache.load
+    /// synchronously (which costs ~4s at 1080p and trips the backend
+    /// IPC deadline → SIGTERM). The wedged decoder STAYS in
+    /// video_decoders during the spin-up window so the slide-hold
+    /// paint doesn't crash on missing-decoder; it produces Ok(None)
+    /// which the paint path handles as "no new frame this tick" and
+    /// the c3.2.2 poster-painted glass holds. When the worker
+    /// finishes, `try_drain_finished_recreates` (called at the top
+    /// of handle_inner_request) installs the fresh decoder,
+    /// replacing the wedged one. First decoded frame == frame 0 ==
+    /// poster (c3.1.1 BT.709 contract) → invisible handoff.
+    #[cfg(target_os = "linux")]
+    pending_recreates: std::collections::HashMap<
+        uuid::Uuid,
+        PreloadHandle,
+    >,
 }
 
 /// r65 (2026-06-05): handle stored in `SlideCache.pending_preloads`
@@ -620,6 +640,8 @@ impl SlideCache {
             #[cfg(target_os = "linux")]
             video_decoders: std::collections::HashMap::new(),
             pending_preloads: std::collections::HashMap::new(),
+            #[cfg(target_os = "linux")]
+            pending_recreates: std::collections::HashMap::new(),
         }
     }
 
@@ -804,6 +826,41 @@ impl SlideCache {
     /// the existing UnsupportedSlide wire (Python:
     /// `RustRendererUnsupportedSlideError`).
     fn load(&mut self, content_root: &std::path::Path, item_id: uuid::Uuid) -> Result<()> {
+        // r110 c3.3.2 second-pass subagent BLOCKER-3 fix: if an
+        // async recreate worker is in flight for this id, do NOT
+        // synchronously re-prime here. Without this guard,
+        // BeginSlide's spawn block runs the wedged-decoder Drop,
+        // spawns the worker, then THIS function's downstream
+        // video_reprime_needed path would re-open Mp4Demuxer +
+        // call prime_video_decoder synchronously (~4s at 1080p)
+        // — racing the worker, blocking the IPC handler, and
+        // SIGTERMing identically to c3.3.1.
+        //
+        // The PaintSlide gates at the dispatcher handle the
+        // "decoder missing during spin-up" case by holding the
+        // last-presented frame (c3.2.2 poster). The worker
+        // produces fresh artifacts; try_drain_finished_recreates
+        // installs them on a later IPC tick.
+        //
+        // Text-with-bg case (item_id is the text slide, bg is
+        // the failed video): this guard fires when BeginSlide
+        // calls cache.load(text_slide_id) → text slide loading
+        // proceeds; the recursive ensure_bg_video_for_text_slide
+        // → self.load(bg_id) hits THIS guard for the bg_id
+        // because pending_recreates was set for bg_id. Returns
+        // Ok early without sync prime.
+        //
+        // Pure Video case (item_id IS the failed video): guard
+        // returns Ok early; the wedged decoder slot stays empty
+        // until try_drain installs the worker's fresh decoder.
+        #[cfg(target_os = "linux")]
+        if self.pending_recreates.contains_key(&item_id) {
+            eprintln!(
+                "[perf] c3_3_2_load_skip_for_pending_recreate item_id={}",
+                item_id,
+            );
+            return Ok(());
+        }
         // Bug 1 (qarl 2026-05-16): on-disk mtime check defeats the
         // contains_key short-circuit when the operator edits a slide.
         // backend's PUT /api/content/{text-slides,images,videos}/{id}
@@ -1317,6 +1374,80 @@ fn ensure_preload_complete(cache: &mut SlideCache, slide_id: uuid::Uuid) {
         }
     }
 }
+
+/// r110 c3.3.2 (2026-06-11): non-blocking drain of finished
+/// `pending_recreates` workers. Called at the top of
+/// handle_inner_request so any worker that finished since the
+/// last IPC tick gets its fresh decoder installed before the
+/// next handler runs.
+///
+/// Uses `JoinHandle::is_finished()` so workers in progress
+/// stay in the map (we never block waiting for them — that's
+/// the whole point of c3.3.2 vs c3.3.1).
+///
+/// When a worker is finished, joins it (cost ~0 since it's
+/// done), installs the artifacts (replaces the wedged decoder
+/// with the fresh one — Drop on the old runs at install
+/// boundary, not on the IPC critical path), removes from the
+/// map. Errors are logged + the wedged decoder stays for the
+/// next try.
+#[cfg(target_os = "linux")]
+fn try_drain_finished_recreates(cache: &mut SlideCache) {
+    let finished_ids: Vec<uuid::Uuid> = cache
+        .pending_recreates
+        .iter()
+        .filter(|(_, handle)| handle.thread.is_finished())
+        .map(|(id, _)| *id)
+        .collect();
+    for id in finished_ids {
+        let Some(handle) = cache.pending_recreates.remove(&id) else {
+            continue;
+        };
+        let t_install = std::time::Instant::now();
+        let elapsed_since_enqueue = handle.enqueued_at.elapsed().as_micros();
+        let join_result = handle.thread.join();
+        let join_us = t_install.elapsed().as_micros();
+        match join_result {
+            Ok(Ok(artifacts)) => {
+                for (aid, item, mtime) in artifacts.items {
+                    cache.items.insert(aid, item);
+                    if let Some(m) = mtime {
+                        cache.item_mtimes.insert(aid, m);
+                    }
+                }
+                for (aid, dem) in artifacts.demuxers {
+                    cache.video_demuxers.insert(aid, dem);
+                }
+                for (aid, dec) in artifacts.decoders {
+                    cache.video_decoders.insert(aid, dec);
+                }
+                for aid in artifacts.skip_marks {
+                    cache.video_skip.insert(aid);
+                }
+                let install_us = t_install.elapsed().as_micros();
+                eprintln!(
+                    "[perf] c3_3_2_recreate_installed video_id={} time_since_enqueue_us={} join_us={} install_us={}",
+                    id, elapsed_since_enqueue, join_us, install_us,
+                );
+            }
+            Ok(Err(e)) => {
+                eprintln!(
+                    "[perf] c3_3_2_recreate_failed video_id={} time_since_enqueue_us={} err={:#}",
+                    id, elapsed_since_enqueue, e,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[perf] c3_3_2_recreate_panicked video_id={} time_since_enqueue_us={} err={:?}",
+                    id, elapsed_since_enqueue, e,
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_drain_finished_recreates(_cache: &mut SlideCache) {}
 
 /// Emit a response to stdout as a single JSON line + flush.
 /// stdout is line-buffered by default; explicit flush ensures
@@ -2309,6 +2440,29 @@ fn run_paint_hook(
                     };
                     #[cfg(target_os = "linux")]
                     if let Some(bg_id) = bg_video_id {
+                        // r110 c3.3.2 subagent BLOCKER-1 fix: if a
+                        // recreate worker is in flight for this
+                        // bg_video_id, short-circuit the paint
+                        // BEFORE invoking the decoder. The c3.2.2
+                        // poster painted at the last transition
+                        // tick stays on glass (no swap = no
+                        // overwrite). This is the "wedged decoder
+                        // stays in cache; slide-hold paint gets
+                        // Ok(None) → glass holds last frame" path
+                        // promised by the c3.3.2 design, made
+                        // safe by NOT actually invoking the
+                        // wedged decoder (which would Err via
+                        // feed() 100ms timeout → backend slide-
+                        // skip rail → user never sees poster).
+                        if cache.pending_recreates.contains_key(&bg_id) {
+                            eprintln!(
+                                "[perf] c3_3_2_paint_hold_for_recreate kind=text_over_video slide_id={} bg_video_id={} t_in_slide_ms={}",
+                                slide_id, bg_id, t_in_slide_ms,
+                            );
+                            return IpcResponse::Ok {
+                                result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
+                            };
+                        }
                         // Pull bg-video state. If either is missing
                         // (best-effort load failure), warn + fall
                         // through to the standard text paint path so
@@ -2431,6 +2585,23 @@ fn run_paint_hook(
                     }
                 }
                 "video" => {
+                    // r110 c3.3.2 subagent BLOCKER-1 fix (pure
+                    // video mirror of the bg-video gate above):
+                    // if a recreate worker is in flight for this
+                    // slide_id, short-circuit BEFORE invoking the
+                    // (now-removed by BLOCKER-2 sync drop) decoder.
+                    // Glass holds the c3.2.2 poster painted at
+                    // the last transition tick.
+                    #[cfg(target_os = "linux")]
+                    if cache.pending_recreates.contains_key(&slide_id) {
+                        eprintln!(
+                            "[perf] c3_3_2_paint_hold_for_recreate kind=pure_video slide_id={} t_in_slide_ms={}",
+                            slide_id, t_in_slide_ms,
+                        );
+                        return IpcResponse::Ok {
+                            result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
+                        };
+                    }
                     // V4L2 piece 3e: drive one frame of decode +
                     // upload + paint per advance tick. Requires
                     // the demuxer + decoder primed in cache.load.
@@ -2849,6 +3020,14 @@ fn handle_inner_request(
     cache: &mut SlideCache,
     content_root: &std::path::Path,
 ) -> IpcResponse {
+    // r110 c3.3.2 (2026-06-11): non-blocking drain of any
+    // in-flight c3.3.1 recreate workers that finished since
+    // the last IPC tick. Installs fresh decoders, replacing
+    // the wedged ones from the just-completed transition.
+    // Cost: O(pending_recreates) is_finished() calls — bounded
+    // at ~2 typical (one per dual-1080p transition endpoint),
+    // each is_finished() is a non-blocking atomic load.
+    try_drain_finished_recreates(cache);
     match req {
         IpcRequest::Open(_) => {
             err("Open already called; nested Open is not supported")
@@ -2986,26 +3165,133 @@ fn handle_inner_request(
             };
             #[cfg(not(target_os = "linux"))]
             let bg_video_failed = false;
-            if pure_video_failed {
-                eprintln!(
-                    "[perf] c3_3_1_decoder_recreate slide_id={} kind=pure_video reason=poster_sourced_this_transition",
-                    p.slide_id,
-                );
-            }
-            if bg_video_failed {
-                if let Some(bg_id) = bg_video_id {
+            // r110 c3.3.2 (2026-06-11) — ASYNC recreate. c3.3.1
+            // shipped synchronous evict+cache.load which cost
+            // ~4s at 1080p (mp4_open 0.7s + prime 3.1s,
+            // journal-measured on FYS) and tripped the backend
+            // IPC deadline → SIGTERM. c3.3.2 instead SPAWNS
+            // preload_in_worker for the failed video_id +
+            // returns from BeginSlide in ms.
+            //
+            // The wedged decoder STAYS in cache.video_decoders
+            // during the spin-up window (~3-4s). The slide-hold
+            // paint will call into it and get Ok(None) / no new
+            // frames; the existing "no frame this tick" handling
+            // skips the paint, and the glass holds the last
+            // frame painted by c3.2.2 — which IS the poster.
+            // So glass shows the poster for the entire spin-up
+            // window. When the worker finishes, the next
+            // handle_inner_request entry calls
+            // try_drain_finished_recreates which installs the
+            // fresh decoder REPLACING the wedged one. First
+            // decoded frame == frame 0 == poster (c3.1.1 BT.709
+            // contract) → invisible handoff to live video.
+            //
+            // keep_ids is built WITHOUT the failed-decoder
+            // omission (since we're NOT evicting them
+            // synchronously). The standard evict + cache.load
+            // run below short-circuits for the wedged decoder
+            // (still in cache via items+demuxer+decoder all
+            // present) — no synchronous re-prime cost.
+            #[cfg(target_os = "linux")]
+            {
+                let mut recreate_ids: Vec<uuid::Uuid> = Vec::with_capacity(2);
+                if pure_video_failed {
                     eprintln!(
-                        "[perf] c3_3_1_decoder_recreate slide_id={} bg_video_id={} kind=text_over_video reason=poster_sourced_this_transition",
-                        p.slide_id, bg_id,
+                        "[perf] c3_3_2_recreate_spawn slide_id={} video_id={} kind=pure_video reason=poster_sourced_this_transition",
+                        p.slide_id, p.slide_id,
                     );
+                    recreate_ids.push(p.slide_id);
+                }
+                if bg_video_failed {
+                    if let Some(bg_id) = bg_video_id {
+                        eprintln!(
+                            "[perf] c3_3_2_recreate_spawn slide_id={} video_id={} kind=text_over_video reason=poster_sourced_this_transition",
+                            p.slide_id, bg_id,
+                        );
+                        recreate_ids.push(bg_id);
+                    }
+                }
+                for video_id in recreate_ids {
+                    // Don't spawn if there's already an in-flight
+                    // recreate for this id (e.g., a back-to-back
+                    // transition before the prior worker finished).
+                    if cache.pending_recreates.contains_key(&video_id) {
+                        eprintln!(
+                            "[perf] c3_3_2_recreate_skip_already_pending video_id={}",
+                            video_id,
+                        );
+                        continue;
+                    }
+                    // r110 c3.3.2 subagent BLOCKER-2 fix: drop the
+                    // wedged decoder + demuxer SYNCHRONOUSLY here
+                    // BEFORE spawning the worker. Otherwise the
+                    // worker would REQBUFS a fresh decoder while
+                    // the wedged one still holds the
+                    // single-instance bcm2835-codec → likely the
+                    // root cause of QA's REQBUFS-EINVAL pathology
+                    // (Job 2). The Drop cost is what c3.3.1 paid
+                    // synchronously anyway (~hundreds of ms for
+                    // STREAMOFF + destroy_image per r101.x
+                    // history); fits inside the SIGTERM budget
+                    // (~2-3s) and leaves the kernel codec slot
+                    // free for the worker's fresh REQBUFS.
+                    //
+                    // The PaintSlide gate from subagent BLOCKER-1
+                    // fix uses pending_recreates (not decoder
+                    // presence) as the "spin-up in progress"
+                    // signal, so paint sees no-decoder and
+                    // short-circuits to "hold last frame" (which
+                    // is the c3.2.2 poster).
+                    let t_drop = std::time::Instant::now();
+                    cache.video_decoders.remove(&video_id);
+                    cache.video_demuxers.remove(&video_id);
+                    let drop_us = t_drop.elapsed().as_micros();
+                    eprintln!(
+                        "[perf] c3_3_2_wedged_decoder_dropped video_id={} drop_us={}",
+                        video_id, drop_us,
+                    );
+                    let content_root_clone = content_root.to_path_buf();
+                    let video_id_clone = video_id;
+                    let t_enqueue = std::time::Instant::now();
+                    let spawn_result = std::thread::Builder::new()
+                        .name(format!("recreate-{video_id}"))
+                        .spawn(move || -> PreloadResult {
+                            let t_work = std::time::Instant::now();
+                            let r = preload_in_worker(&content_root_clone, video_id_clone);
+                            let work_us = t_work.elapsed().as_micros();
+                            match &r {
+                                Ok(_) => eprintln!(
+                                    "[perf] c3_3_2_recreate_worker_done video_id={} work_us={}",
+                                    video_id_clone, work_us,
+                                ),
+                                Err(e) => eprintln!(
+                                    "[perf] c3_3_2_recreate_worker_failed video_id={} work_us={} err={:#}",
+                                    video_id_clone, work_us, e,
+                                ),
+                            }
+                            r
+                        });
+                    match spawn_result {
+                        Ok(thread) => {
+                            cache.pending_recreates.insert(
+                                video_id,
+                                PreloadHandle { thread, enqueued_at: t_enqueue },
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[perf] c3_3_2_recreate_spawn_failed video_id={} err={:#} (slide will stay on poster until next BeginTransition resets)",
+                                video_id, e,
+                            );
+                        }
+                    }
                 }
             }
             let mut keep_ids: Vec<uuid::Uuid> = Vec::with_capacity(2);
-            if !pure_video_failed {
-                keep_ids.push(p.slide_id);
-            }
+            keep_ids.push(p.slide_id);
             if let Some(bg_id) = bg_video_id {
-                if bg_id != p.slide_id && !bg_video_failed {
+                if bg_id != p.slide_id {
                     keep_ids.push(bg_id);
                 }
             }
