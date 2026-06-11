@@ -17,7 +17,27 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+/// r110 stage 2 (2026-06-11): instrumentation counters for
+/// `bake_video_slide_to_current_fbo` Ok(None) returns.
+///
+/// Distinguishes two cases:
+/// - `BAKE_VIDEO_OK_NONE_EAGAIN`: the 10x3ms inner DQBUF loop
+///   exhausted without a frame. Steady-state lag indicator —
+///   the codec couldn't deliver within ~30ms, the caller skips
+///   swap+commit, the wall holds the prior frame.
+/// - `BAKE_VIDEO_OK_NONE_EOS`: the inner loop got Ok(None) from
+///   next_frame (V4L2_BUF_FLAG_LAST emission). Normal
+///   end-of-clip cycle event; not a lag indicator.
+///
+/// Emitted as delta on each `ipc.soak` 30s summary line so QA
+/// can verify the r106 Ok(None)-steady-state-lag hypothesis
+/// (H4) empirically on FYS. r103.1 baseline should show
+/// `bake_ok_none_eagain` ≈ 0 in steady-state.
+pub static BAKE_VIDEO_OK_NONE_EAGAIN: AtomicU64 = AtomicU64::new(0);
+pub static BAKE_VIDEO_OK_NONE_EOS: AtomicU64 = AtomicU64::new(0);
 
 use anyhow::{anyhow, bail, Context, Result};
 use drm::buffer::{Buffer as DrmBuffer, DrmFourcc, Handle as DrmHandle};
@@ -8117,13 +8137,20 @@ unsafe fn bake_video_slide_to_current_fbo(
     // (decoder pipeline pre-filled, dqbuf wakes on first/second
     // retry).
     let mut frame_opt: Option<crate::v4l2::Frame> = None;
+    // r110 stage 2 (2026-06-11): distinguish EOS (next_frame
+    // Ok(None)) from EAGAIN-exhausted (10x3ms loop ran out) so
+    // the Ok(None) counters below can attribute correctly.
+    let mut eos_seen = false;
     for _ in 0..10 {
         match decoder.next_frame() {
             Ok(Some(f)) => {
                 frame_opt = Some(f);
                 break;
             }
-            Ok(None) => break,
+            Ok(None) => {
+                eos_seen = true;
+                break;
+            }
             Err(e) if e.to_string().contains("EAGAIN") => {
                 std::thread::sleep(std::time::Duration::from_millis(3));
             }
@@ -8134,6 +8161,15 @@ unsafe fn bake_video_slide_to_current_fbo(
         eprintln!("[firstframe] dqbuf={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
     }
     let Some(frame) = frame_opt else {
+        // r110 stage 2: increment the appropriate Ok(None)
+        // counter. `eos_seen` distinguishes "normal end-of-clip"
+        // from "EAGAIN-exhausted, codec didn't deliver in time"
+        // — the latter is QA's H4 steady-state lag indicator.
+        if eos_seen {
+            BAKE_VIDEO_OK_NONE_EOS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            BAKE_VIDEO_OK_NONE_EAGAIN.fetch_add(1, Ordering::Relaxed);
+        }
         // No frame ready this tick. Caller should skip swap+commit.
         // Sample the dqbuf even on no-frame ticks so the EAGAIN wait
         // shows up in the histogram.

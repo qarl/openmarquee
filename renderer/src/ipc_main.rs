@@ -101,6 +101,14 @@ struct IpcPaintMetrics {
     // Session-cumulative stats (never reset).
     session_frames: u64,
     session_transitions: u64,
+    // r110 stage 2 (2026-06-11): snapshot of the
+    // `hdmi::BAKE_VIDEO_OK_NONE_*` counters at the END of the
+    // PRIOR `maybe_emit_summary` call. Used to compute per-30s-
+    // window deltas for the `ipc.soak` line. Establishes the
+    // r103.1 baseline for QA's H4 (r106 Ok(None)-steady-state-
+    // lag) verification.
+    last_bake_ok_none_eagain: u64,
+    last_bake_ok_none_eos: u64,
     // `[perf]` r2: latch so the warn about a failing perf-stats
     // sidecar write (permission denied on a dev box, /var/openmarquee
     // missing, disk full, etc.) fires at most once per session
@@ -305,6 +313,8 @@ impl IpcPaintMetrics {
             paint_us_samples: Vec::with_capacity(PAINT_SAMPLE_CAP),
             session_frames: 0,
             session_transitions: 0,
+            last_bake_ok_none_eagain: 0,
+            last_bake_ok_none_eos: 0,
             perf_json_write_warned: false,
         }
     }
@@ -371,8 +381,36 @@ impl IpcPaintMetrics {
         // but the prior code only inlined `stats.p99_ns` in the
         // eprintln. Bind it explicitly so both consumers share.
         let paint_us_p99 = stats.p99_ns;
+        // r110 stage 2 (2026-06-11): per-30s-window deltas for
+        // `bake_video_slide_to_current_fbo` Ok(None) returns.
+        // `bake_ok_none_eagain` = the 10x3ms inner DQBUF loop
+        // exhausted without a frame (lag indicator); `_eos` =
+        // normal end-of-clip cycle event. On r103.1 baseline,
+        // `_eagain` should be ≈ 0 in steady-state — non-zero
+        // values would empirically validate QA's H4 (r106
+        // Ok(None)-steady-state-lag) and tell us r106's
+        // non-blocking pattern is necessary even at r103.1.
+        // `crate::hdmi` is Linux-cfg-gated (links drm/gbm/EGL);
+        // non-Linux dev builds report 0 for these counters, which
+        // is correct because bake_video doesn't run there either.
+        #[cfg(target_os = "linux")]
+        let bake_ok_none_eagain_total = crate::hdmi::BAKE_VIDEO_OK_NONE_EAGAIN
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_os = "linux")]
+        let bake_ok_none_eos_total = crate::hdmi::BAKE_VIDEO_OK_NONE_EOS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(target_os = "linux"))]
+        let bake_ok_none_eagain_total: u64 = 0;
+        #[cfg(not(target_os = "linux"))]
+        let bake_ok_none_eos_total: u64 = 0;
+        let bake_ok_none_eagain_30s =
+            bake_ok_none_eagain_total.saturating_sub(self.last_bake_ok_none_eagain);
+        let bake_ok_none_eos_30s =
+            bake_ok_none_eos_total.saturating_sub(self.last_bake_ok_none_eos);
+        self.last_bake_ok_none_eagain = bake_ok_none_eagain_total;
+        self.last_bake_ok_none_eos = bake_ok_none_eos_total;
         eprintln!(
-            "ipc.soak window_s={} frames={} transitions={} fps_avg={:.1} paint_us=avg/{}/max/{} paint_us_p99={} session_frames={} session_transitions={} frames_observed_total={} frames_over_budget_total={}",
+            "ipc.soak window_s={} frames={} transitions={} fps_avg={:.1} paint_us=avg/{}/max/{} paint_us_p99={} session_frames={} session_transitions={} frames_observed_total={} frames_over_budget_total={} bake_ok_none_eagain_30s={} bake_ok_none_eos_30s={}",
             elapsed.as_secs(),
             self.frames,
             self.transitions,
@@ -384,6 +422,8 @@ impl IpcPaintMetrics {
             self.session_transitions,
             frames_observed_total,
             frames_over_budget_total,
+            bake_ok_none_eagain_30s,
+            bake_ok_none_eos_30s,
         );
 
         // `[perf]` r2 (2026-05-26): write the same fields to the JSON
