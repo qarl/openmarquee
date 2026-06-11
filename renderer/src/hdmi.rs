@@ -29,8 +29,12 @@ use std::time::{Duration, Instant};
 ///   the codec couldn't deliver within ~30ms, the caller skips
 ///   swap+commit, the wall holds the prior frame.
 /// - `BAKE_VIDEO_OK_NONE_EOS`: the inner loop got Ok(None) from
-///   next_frame (V4L2_BUF_FLAG_LAST emission). Normal
-///   end-of-clip cycle event; not a lag indicator.
+///   next_frame, signalling end-of-stream. Normal end-of-clip
+///   cycle event; not a lag indicator. Live-path Ok(None) is
+///   EPIPE-only post-c3.0 (2026-06-11) — the FLAG_LAST-mid-
+///   stream → Ok(None) emission was defanged because bcm2835-
+///   codec emits FLAG_LAST spuriously on short clips. See
+///   v4l2.rs:3216-3237 for the contract block.
 ///
 /// Emitted as delta on each `ipc.soak` 30s summary line so QA
 /// can verify the r106 Ok(None)-steady-state-lag hypothesis

@@ -2479,8 +2479,12 @@ fn run_paint_hook(
                             // r46.3 (2026-06-02): if the bg video decoder
                             // has reached end-of-stream (next_sample_idx
                             // wrapped past samples.len() during prior
-                            // playback OR a FLAG_LAST mid-stream signal
-                            // set capture_drained=true in V4L2 inner),
+                            // playback OR an EPIPE on CAPTURE DQBUF set
+                            // capture_drained=true in V4L2 inner — pre-
+                            // c3.0 a mid-stream FLAG_LAST could also
+                            // trip this latch, but the live-path
+                            // FLAG_LAST was defanged in c3.0; see
+                            // v4l2.rs:3216-3237 for the contract),
                             // re-prime via the existing canonical
                             // reprime_video_decoder_for_loop path
                             // (STREAMOFF + clear drained + STREAMON +

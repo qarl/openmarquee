@@ -601,8 +601,20 @@ pub fn drain_one_capture_for_preload_with_detail(
     let mut drained = 0usize;
     // r76 subagent BLOCKER: next_frame()'s actual contract per
     // v4l2.rs:1786-1798 is:
-    //   Ok(Some(frame))  -- DQBUF succeeded, frame available
-    //   Ok(None)         -- EPIPE / FLAG_LAST = end-of-stream
+    //   Ok(Some(frame))  -- DQBUF succeeded, frame available.
+    //                       Includes FLAG_LAST-bearing buffers
+    //                       (post-c3.0 defang, 2026-06-11): the
+    //                       live FLAG_LAST observation no longer
+    //                       latches capture_drained=true; the
+    //                       buffer's still-valid content is
+    //                       delivered to the caller.
+    //   Ok(None)         -- EPIPE end-of-stream. Pre-c3.0 this
+    //                       also fired on FLAG_LAST mid-stream,
+    //                       but the live FLAG_LAST path was
+    //                       defanged because bcm2835-codec emits
+    //                       it spuriously on degenerate clips;
+    //                       see v4l2.rs:3216-3237 for the
+    //                       contract block.
     //   Err("would block (EAGAIN)") -- kernel hasn't decoded yet
     //   Err(other ioctl) -- real decode error
     // The pre-fix match swapped Ok(None) and Err(EAGAIN) which
@@ -1173,11 +1185,18 @@ pub fn reprime_video_decoder_for_loop(
     // hold so the decoder never reaches V4L2_BUF_FLAG_LAST.
     // r46.2's keep_ids memoization preserves the decoder across
     // BeginSlide for text-over-video same-slide loops -- and a
-    // long-enough slide will reach EOS, setting
-    // capture_drained=true in DecoderInner, which makes all
-    // subsequent next_frame() return Ok(None) forever. The bare-
-    // IDR feed below would NOT recover from that state because
-    // feeding output buffers doesn't clear the drained flag.
+    // long-enough slide will reach EOS via EPIPE on the CAPTURE
+    // DQBUF, setting capture_drained=true in DecoderInner, which
+    // makes all subsequent next_frame() return Ok(None) forever.
+    // (Pre-c3.0 a mid-stream FLAG_LAST could also latch
+    // capture_drained, but the live-path FLAG_LAST signal was
+    // defanged in c3.0 because bcm2835-codec emits it spuriously
+    // on short clips; only EPIPE or the post-CMD_STOP drain path
+    // latches now per v4l2.rs:3216-3237. The wedge behaviour
+    // this paragraph describes still applies — just via the
+    // EPIPE site, not the FLAG_LAST site.) The bare-IDR feed
+    // below would NOT recover from that state because feeding
+    // output buffers doesn't clear the drained flag.
     //
     // r46.3 shipped reset_for_replay (STREAMOFF + STREAMON +
     // re-QBUF). That cycle is rejected by bcm2835-codec on
