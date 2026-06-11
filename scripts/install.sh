@@ -991,16 +991,52 @@ if [ "$DRY_RUN" -eq 1 ]; then
 elif command -v plymouth >/dev/null 2>&1; then
     say "  plymouth already installed; skip apt"
     PLYMOUTH_PRESENT=1
+    # Clear any deferred marker — plymouth IS present now, splash
+    # will be applied on this run.
+    if [ -z "$ROOT_PREFIX" ] && [ -f /var/openmarquee-splash-deferred ]; then
+        rm -f /var/openmarquee-splash-deferred
+        say "  Cleared /var/openmarquee-splash-deferred from prior offline run."
+    fi
 else
     say "  plymouth not present; attempting apt-get install"
     if apt-get install -y plymouth; then
         PLYMOUTH_PRESENT=1
         say "  plymouth installed"
+        # Clear the deferred marker (if any) — a previous offline
+        # install dropped it; the splash IS being applied now.
+        if [ -z "$ROOT_PREFIX" ] && [ -f /var/openmarquee-splash-deferred ]; then
+            rm -f /var/openmarquee-splash-deferred
+            say "  Cleared /var/openmarquee-splash-deferred from prior offline run."
+        fi
     else
-        say "  WARNING: could not install plymouth (offline / apt failure?)"
-        say "           boot splash skipped — non-critical, device still works."
-        say "           Run 'sudo apt install plymouth' (needs network) then"
-        say "           re-run install.sh to enable the splash."
+        # JasonsSign1 follow-up (2026-06-11): first-boot install via
+        # cloud-init runcmd has NO network on a freshly-flashed Pi OS
+        # Lite — plymouth isn't in the base image and apt fails. The
+        # install otherwise succeeds (factory-fresh promise per
+        # phase-4e), but the openMarquee splash silently doesn't
+        # appear. qarl noticed immediately on JasonsSign1: "this
+        # build doesn't have the openMarquee boot image."
+        #
+        # Drop a marker file + write a clear journal message so the
+        # operator can recover via a one-shot online step:
+        #   sudo apt install plymouth && sudo bash /opt/openmarquee/scripts/install.sh
+        say "  WARNING: could not install plymouth (offline / apt failure)"
+        say "           Boot splash skipped — DEVICE STILL WORKS without it."
+        say ""
+        say "           Limitation: Pi OS Lite arm64 does NOT include plymouth"
+        say "           in the base image, so the stage_sd_card.sh flow can't"
+        say "           install the splash on a first-boot-offline device."
+        say "           Recovery (needs network on the Pi):"
+        say "               sudo apt install plymouth"
+        say "               sudo bash /opt/openmarquee/scripts/install.sh"
+        say "           After this, the openMarquee splash will appear on"
+        say "           the NEXT boot."
+        say ""
+        if [ -z "$ROOT_PREFIX" ]; then
+            run touch /var/openmarquee-splash-deferred
+            say "  Marker dropped at /var/openmarquee-splash-deferred so the"
+            say "  operator (and future install.sh runs) can detect the deferred state."
+        fi
     fi
 fi
 
