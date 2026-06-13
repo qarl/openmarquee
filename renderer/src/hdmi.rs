@@ -3108,6 +3108,66 @@ fn resolve_slide_bg(
     Ok((BgKind::Solid(color), label))
 }
 
+/// 2026-06-13 OFFSCREEN-CAPTURE-ONLY bg substitution for text-over-video.
+///
+/// Background: `resolve_slide_bg` (and therefore `resolve_slide_layers`)
+/// does NOT handle `background_video_slide_id`. For a TextSlide carrying
+/// that field, it falls through to `BgKind::Solid(background_color)` —
+/// which the live IPC paint path bypasses entirely (it routes via
+/// `TransitionEndpoint::TextOverVideo` and V4L2-decodes one bg frame per
+/// tick). The offscreen capture functions (`capture_sb_transition_mid_to
+/// _png`, `capture_legacy_3pass_transition_mid_to_png`, `capture_fullres
+/// _transition_mid_to_png`) have no V4L2 plumbing, so they were painting
+/// solid `background_color` (`#000000` default) behind the text composite.
+/// That is the QA-reported "video background renders solid BLACK on both
+/// endpoints" bug, shipped to fireplacesign on 2026-06-13.
+///
+/// This helper substitutes the bg with the referenced video's `poster.png`
+/// when one exists on disk. It returns `BgKind::Image{asset_path=poster,
+/// solid_fallback=<previous solid color>}` so that:
+///   * paint_slide's existing Image arm loads + blits the PNG as the bg;
+///   * if PNG decode fails at draw time, paint_slide's existing fallback
+///     to solid_fallback keeps the offscreen output deterministic.
+///
+/// When the helper returns the bg unchanged (no bg_video_id, no content
+/// root, or no poster on disk), the capture path keeps its pre-fix
+/// solid-bg behavior — same PNG bytes as before for any slide that
+/// wouldn't have hit the bug anyway. This is critical for not flooding
+/// the existing golden-bless lineage with re-bless requests.
+///
+/// NEVER call this from the live IPC paint path. The live path uses
+/// `TransitionEndpoint::TextOverVideo` (V4L2-decoded LIVE frame per tick);
+/// substituting a frozen poster there would replace motion with a still
+/// frame on FYS.
+// `mod hdmi` is itself Linux-only (main.rs:19 `#[cfg(target_os = "linux")]`),
+// so this fn never compiles on macOS — the cfg_attr below is belt-and-
+// braces against any future build matrix where hdmi.rs is reachable on
+// other targets.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn substitute_video_poster_bg(
+    slide: &TextSlide,
+    bg_kind: BgKind,
+    content_root: Option<&Path>,
+) -> BgKind {
+    let Some(poster_path) =
+        crate::content::capture_video_bg_poster_path(slide, content_root)
+    else {
+        return bg_kind;
+    };
+    // Preserve any pre-existing solid color as the fallback. resolve_
+    // slide_bg never returns a non-solid for a text-over-video slide
+    // today (the bg_video_id falls through pattern/image checks), but
+    // future schema additions could; default to black for safety.
+    let solid_fallback = match &bg_kind {
+        BgKind::Solid(c) => *c,
+        _ => [0.0, 0.0, 0.0, 1.0],
+    };
+    BgKind::Image {
+        asset_path: poster_path,
+        solid_fallback,
+    }
+}
+
 /// Phase 4.2b — render a TextSlide as bg + first text layer in ONE
 /// frame on the shared `render_one_frame_to_hdmi` harness. Pattern
 /// dispatch:
@@ -6258,6 +6318,15 @@ pub fn capture_sb_transition_mid_to_png(
     let t = t.clamp(0.0, 1.0);
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
+    // 2026-06-13 offscreen-capture bg-video fix — see
+    // `crate::content::capture_video_bg_poster_path` for the why.
+    // resolve_slide_bg returns BgKind::Solid for a TextSlide carrying
+    // background_video_slide_id (it has no V4L2 plumbing); the offscreen
+    // capture path inherits that solid bg and renders BLACK behind the
+    // text composite. Substitute the bg with the referenced video's
+    // poster.png when one exists; otherwise keep the solid fallback.
+    let bg_a_kind = substitute_video_poster_bg(slide_a, bg_a_kind, content_root);
+    let bg_b_kind = substitute_video_poster_bg(slide_b, bg_b_kind, content_root);
     if layers_a.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
         || layers_b.len() > SCISSORED_BAKE_MAX_LAYERS_PER_SLIDE
     {
@@ -6568,6 +6637,10 @@ fn capture_legacy_3pass_transition_mid_to_png(
     let t = t.clamp(0.0, 1.0);
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
+    // 2026-06-13 offscreen-capture bg-video fix — see the matching site
+    // in `capture_sb_transition_mid_to_png` above.
+    let bg_a_kind = substitute_video_poster_bg(slide_a, bg_a_kind, content_root);
+    let bg_b_kind = substitute_video_poster_bg(slide_b, bg_b_kind, content_root);
     with_egl_session(card, 0, |session| {
         let mode_w = session.mode_w as u32;
         let mode_h = session.mode_h as u32;
@@ -6796,6 +6869,10 @@ pub fn capture_fullres_transition_mid_to_png(
     let t = t.clamp(0.0, 1.0);
     let (bg_a_kind, _, layers_a) = resolve_slide_layers(slide_a, fonts, content_root)?;
     let (bg_b_kind, _, layers_b) = resolve_slide_layers(slide_b, fonts, content_root)?;
+    // 2026-06-13 offscreen-capture bg-video fix — same substitution as
+    // the SB-portable + legacy-3pass paths.
+    let bg_a_kind = substitute_video_poster_bg(slide_a, bg_a_kind, content_root);
+    let bg_b_kind = substitute_video_poster_bg(slide_b, bg_b_kind, content_root);
     with_egl_session(card, 0, |session| {
         let mode_w = session.mode_w as u32;
         let mode_h = session.mode_h as u32;
