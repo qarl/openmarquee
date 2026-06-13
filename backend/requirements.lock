@@ -34,7 +34,7 @@ cffi==2.0.0
     #   pylibsrtp
 click==8.4.1
     # via uvicorn
-cryptography==48.0.0
+cryptography==49.0.0
     # via
     #   aiortc
     #   pyopenssl
@@ -54,7 +54,7 @@ httptools==0.8.0
     # via uvicorn
 httpx==0.28.1
     # via openmarquee (pyproject.toml)
-idna==3.17
+idna==3.18
     # via
     #   anyio
     #   httpx
@@ -74,13 +74,13 @@ pyee==13.0.1
     # via aiortc
 pylibsrtp==1.0.0
     # via aiortc
-pyopenssl==26.2.0
+pyopenssl==26.3.0
     # via aiortc
 python-dotenv==1.2.2
     # via uvicorn
 pyyaml==6.0.3
     # via uvicorn
-starlette==1.2.0
+starlette==1.3.1
     # via fastapi
 typing-extensions==4.15.0
     # via
@@ -93,7 +93,7 @@ typing-inspection==0.4.2
     # via
     #   fastapi
     #   pydantic
-uvicorn==0.48.0
+uvicorn==0.49.0
     # via openmarquee (pyproject.toml)
 uvloop==0.22.1
     # via uvicorn

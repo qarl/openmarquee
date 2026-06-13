@@ -49,7 +49,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -91,11 +91,13 @@ DEFAULT_HYSTERESIS_SIGNAL = 8
 # ============================================================
 
 
-class SupervisorState(str, Enum):
+class SupervisorState(StrEnum):
     """Product-level state machine per spec §"Onboarding state machine".
 
     Values are stringly-typed so JSON serialisation (for the state
     file + API responses + ring-buffer events) is human-readable.
+    All serialisation paths use ``.value`` explicitly, so the
+    str+Enum → StrEnum migration is wire-compatible.
     """
 
     # No stored creds yet. AP up, portal active. Marquee shows QR.
@@ -112,7 +114,7 @@ class SupervisorState(str, Enum):
     DEGRADED = "DEGRADED"
 
 
-class SupervisorEvent(str, Enum):
+class SupervisorEvent(StrEnum):
     """External events that drive state transitions."""
 
     HAS_STORED_CREDENTIALS = "HAS_STORED_CREDENTIALS"

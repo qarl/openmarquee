@@ -384,4 +384,32 @@ describe("paintLayer text effects (r51 outline + drop_shadow)", () => {
         expect(canvas._strokeCalls).toHaveLength(1);
         expect(canvas._fillCalls[0].shadowOffsetX).toBe(4);
     });
+
+    // Lock the back-compat synthetic-layer field forwarding contract so
+    // a future tightening of layersForDraw (e.g. switching back to an
+    // explicit allowlist) can't silently drop an effect/font field —
+    // the r51 regression that motivated the spread fix.
+    it("back-compat synthetic layer forwards every paintLayer field (regression: r51-style silent drop)", () => {
+        const canvas = makeStubbedCanvasWithEffects();
+        drawCanvas(canvas, {
+            text: "X",
+            font_size_px: 100,
+            outline: true,
+            drop_shadow: true,
+        });
+        // Effect flags reach paintLayer (stroke + shadow visible)
+        expect(canvas._strokeCalls).toHaveLength(1);
+        expect(canvas._strokeCalls[0].lineWidth).toBe(5); // 100 * 0.05
+        expect(canvas._fillCalls[0].shadowOffsetX).toBe(4); // 100 * 0.04
+        // And the camelCase aliases too
+        const canvas2 = makeStubbedCanvasWithEffects();
+        drawCanvas(canvas2, {
+            text: "X",
+            font_size_px: 100,
+            outlineEnabled: true,
+            dropShadow: true,
+        });
+        expect(canvas2._strokeCalls).toHaveLength(1);
+        expect(canvas2._fillCalls[0].shadowOffsetX).toBe(4);
+    });
 });

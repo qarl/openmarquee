@@ -8,7 +8,6 @@ Pins:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -133,9 +132,7 @@ def test_perf_stats_includes_pushed_data(
     assert body["preload_recent"][0]["us"] == 123456
 
 
-def test_perf_stats_serve_is_cheap(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_perf_stats_serve_is_cheap(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """Single serve is sub-50ms even with a full rolling buffer.
 
     The dispatch requires 'single-digit milliseconds' but the
@@ -150,9 +147,7 @@ def test_perf_stats_serve_is_cheap(
     # Fill all buffers to their max.
     for i in range(60):
         fresh.record_preload(f"s-{i}", i * 100)
-        fresh.record_first_frame_paint(
-            f"s-{i}", 1000, 0, 100, 33000, 35000, cache_hit=(i % 2 == 0)
-        )
+        fresh.record_first_frame_paint(f"s-{i}", 1000, 0, 100, 33000, 35000, cache_hit=(i % 2 == 0))
         fresh.record_frame_observation(delta_ms=200, in_transition=False)
     start = _time.perf_counter()
     resp = client.get("/api/perf-stats")

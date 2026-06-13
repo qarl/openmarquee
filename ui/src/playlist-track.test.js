@@ -303,9 +303,15 @@ describe("mountPlaylistTrack", () => {
         // drag — for a pallet → track drop, that's the pallet Sortable
         // (which doesn't configure onEnd). The track's onEnd never fires
         // for a cross-list ADD, so prior behavior left the new block's
-        // .track-remove and .track-block-transition unbound until a
+        // .track-remove and .track-block-transition-wrap unbound until a
         // remount: × no-op'd, transition chip didn't cycle. Now onAdd
         // calls rebindButtons + markDirty itself.
+        //
+        // r52 (2026-06-03): the transition chip became a button-opens-popover;
+        // the data-bound marker moved from the chip element to its
+        // .track-block-transition-wrap parent (which owns the popover +
+        // outside-click handler). Test updated to read the marker from the
+        // wrap instead of the chip itself.
         //
         // Capture the track Sortable's options by spying on Sortable.create
         // (track is the second create call — pallet first per
@@ -347,9 +353,9 @@ describe("mountPlaylistTrack", () => {
         const newBlock = trackEl.querySelector('.track-block[data-id="b"]');
         expect(newBlock).not.toBeNull();
         const removeBtn = newBlock.querySelector(".track-remove");
-        const chip = newBlock.querySelector(".track-block-transition");
+        const transitionWrap = newBlock.querySelector(".track-block-transition-wrap");
         expect(removeBtn?.dataset?.bound).toBe("1");
-        expect(chip?.dataset?.bound).toBe("1");
+        expect(transitionWrap?.dataset?.bound).toBe("1");
 
         // Sanity: clicking × removes the new block. Pre-fix it was a brick.
         removeBtn.click();
