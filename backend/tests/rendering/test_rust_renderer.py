@@ -1358,8 +1358,7 @@ def test_r74_wedged_renderer_raises_timeout_error_within_budget(make_renderer):
             r.advance(t_ms=0)
         elapsed = time.monotonic() - t_start
         assert elapsed < 2.0, (
-            f"timeout took {elapsed:.2f}s; expected ~0.3s "
-            "(pre-r74 was an infinite hang)"
+            f"timeout took {elapsed:.2f}s; expected ~0.3s (pre-r74 was an infinite hang)"
         )
         # Walk the cause chain -- the outer error is the reconnect-
         # exhausted wrapper; the root cause MUST be our timeout.
@@ -1369,8 +1368,7 @@ def test_r74_wedged_renderer_raises_timeout_error_within_budget(make_renderer):
                 break
             cause = cause.__cause__
         assert isinstance(cause, RustRendererTimeoutError), (
-            f"expected RustRendererTimeoutError in the cause chain, "
-            f"got: {excinfo.value!r}"
+            f"expected RustRendererTimeoutError in the cause chain, got: {excinfo.value!r}"
         )
     finally:
         r.close()
@@ -1400,12 +1398,14 @@ def test_r74_lock_is_released_after_timeout(make_renderer):
         # a separate thread to make the assertion meaningful.)
         acquired_in_other_thread = threading.Event()
         timed_out = threading.Event()
+
         def _try_acquire():
             if r._lock.acquire(blocking=True, timeout=2.0):
                 acquired_in_other_thread.set()
                 r._lock.release()
             else:
                 timed_out.set()
+
         t = threading.Thread(target=_try_acquire, daemon=True)
         t.start()
         t.join(timeout=3.0)
@@ -1478,6 +1478,7 @@ def test_r74_terminate_subprocess_abandons_unreapable_pid(make_renderer, caplog)
     re-spawn cleanly.
     """
     import logging
+
     r = make_renderer()
     try:
         r.open()
@@ -1542,10 +1543,9 @@ def test_r74_terminate_subprocess_abandons_unreapable_pid(make_renderer, caplog)
             "after abandon, _proc MUST be None so reconnect can spawn fresh"
         )
         # The CRITICAL log line for the abandoned PID fired.
-        assert any(
-            "did not reap after SIGKILL" in rec.message
-            for rec in caplog.records
-        ), "expected CRITICAL log line naming the abandoned PID"
+        assert any("did not reap after SIGKILL" in rec.message for rec in caplog.records), (
+            "expected CRITICAL log line naming the abandoned PID"
+        )
     finally:
         r.close()
 

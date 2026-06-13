@@ -1001,8 +1001,7 @@ async def test_r58_preload_skipped_when_duration_below_threshold():
     await loop.stop()
 
     assert fake.preload_slide_calls == [], (
-        f"sub-500ms slides should not trigger preload; got "
-        f"{fake.preload_slide_calls}"
+        f"sub-500ms slides should not trigger preload; got {fake.preload_slide_calls}"
     )
 
 
@@ -1070,12 +1069,8 @@ async def test_r58_preload_exception_does_not_kill_playback(caplog):
             self.preload_slide_calls.append(slide_id)
             raise RuntimeError("simulated preload failure (CMA pressure)")
 
-    text_a = _text_slide(
-        name="A", text="A", duration_ms=1500, transition="fade", transition_ms=30
-    )
-    text_b = _text_slide(
-        name="B", text="B", duration_ms=1500, transition="fade", transition_ms=30
-    )
+    text_a = _text_slide(name="A", text="A", duration_ms=1500, transition="fade", transition_ms=30)
+    text_b = _text_slide(name="B", text="B", duration_ms=1500, transition="fade", transition_ms=30)
 
     fake = _PreloadRaisingFake(width=8, height=8)
     loop = PlaybackLoop(
@@ -1098,10 +1093,9 @@ async def test_r58_preload_exception_does_not_kill_playback(caplog):
     assert text_a.id in begin_ids
     # A warning line about the non-fatal preload failure should be
     # in the log.
-    assert any(
-        "preload_slide" in r.message and "non-fatal" in r.message
-        for r in caplog.records
-    ), f"expected non-fatal preload warning; got {[r.message for r in caplog.records]}"
+    assert any("preload_slide" in r.message and "non-fatal" in r.message for r in caplog.records), (
+        f"expected non-fatal preload warning; got {[r.message for r in caplog.records]}"
+    )
 
 
 # ============================================================
@@ -1178,12 +1172,18 @@ async def test_r66_transition_handoff_bumps_transitions_total(tmp_path):
 
     mock = MockRenderer(8, 8, tmp_path / "out.png")
     slide_a = TextSlide(
-        name="A", text_layers=[TextLayer(text="A")],
-        duration_ms=100, transition="fade", transition_ms=200,
+        name="A",
+        text_layers=[TextLayer(text="A")],
+        duration_ms=100,
+        transition="fade",
+        transition_ms=200,
     )
     slide_b = TextSlide(
-        name="B", text_layers=[TextLayer(text="B")],
-        duration_ms=100, transition="fade", transition_ms=200,
+        name="B",
+        text_layers=[TextLayer(text="B")],
+        duration_ms=100,
+        transition="fade",
+        transition_ms=200,
     )
     loop = PlaybackLoop(
         mock,

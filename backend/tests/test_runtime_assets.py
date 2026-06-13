@@ -65,7 +65,9 @@ def test_healthy_font_returns_empty_list(tmp_path: Path) -> None:
     assert issues == []
 
 
-def test_nonexistent_fonts_dir_silently_skips(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_nonexistent_fonts_dir_silently_skips(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """Dev laptop case: /opt/openmarquee/ was never provisioned. The
     check must NOT false-positive on a non-existent dir; instead it
     skips with INFO so the test journal stays clean and the dev

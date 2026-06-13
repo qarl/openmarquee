@@ -41,7 +41,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -68,11 +68,7 @@ _MEMINFO_PATH = Path("/proc/meminfo")
 
 def _utc_now_iso() -> str:
     """ISO-8601 UTC timestamp with millisecond resolution."""
-    return (
-        datetime.now(timezone.utc)
-        .isoformat(timespec="milliseconds")
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 @dataclass
@@ -121,9 +117,7 @@ class PerfStats:
 
     def record_preload(self, slide_id: str, us: int) -> None:
         with self._lock:
-            self.preload_recent.append(
-                {"slide_id": slide_id, "us": int(us), "ts": _utc_now_iso()}
-            )
+            self.preload_recent.append({"slide_id": slide_id, "us": int(us), "ts": _utc_now_iso()})
 
     def record_first_frame_paint(
         self,
@@ -185,9 +179,7 @@ class PerfStats:
                 {"slide_id": slide_id, "load_us": int(load_us), "ts": _utc_now_iso()}
             )
 
-    def record_frame_observation(
-        self, delta_ms: int, in_transition: bool
-    ) -> None:
+    def record_frame_observation(self, delta_ms: int, in_transition: bool) -> None:
         """Called for EVERY frame budget observation. Increments
         the total counter unconditionally; only appends to the
         rolling buffer when delta_ms >= _FRAME_OVER_BUDGET_MIN_MS
@@ -278,9 +270,7 @@ _KV_RE = re.compile(r"(\w+)=(\S+)")
 # drift dropping the colon and the line silently falling into
 # the generic regex (where kind would capture only "frame" and
 # the recognized-but-unrouted line would be lost).
-_FRAME_OVER_BUDGET_RE = re.compile(
-    r"\[perf\]\s+frame over budget:?\s+(.*)$"
-)
+_FRAME_OVER_BUDGET_RE = re.compile(r"\[perf\]\s+frame over budget:?\s+(.*)$")
 
 
 def parse_and_record_perf_line(line: str) -> bool:

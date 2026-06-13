@@ -657,19 +657,41 @@ function layersForDraw(state) {
     if (Array.isArray(state.layers) && state.layers.length > 0) {
         return state.layers;
     }
-    // Back-compat single-layer shape: pull a synthetic layer off the
-    // top-level state fields. This keeps drawCanvas usable from older
-    // unit tests that pass `{text, textColor, …}` directly.
+    // Back-compat single-layer shape: spread the top-level state into a
+    // synthetic layer so drawCanvas stays usable from older unit tests
+    // that pass `{text, textColor, …}` directly. Spread keeps every
+    // field paintLayer reads — font_size_px, outline, drop_shadow,
+    // text_align, text_color, font_family + their camelCase aliases —
+    // in lock-step with paintLayer's lookups, so adding a new layer
+    // field (r51 outline/drop_shadow regressed when only the
+    // layered-shape was extended) can't silently drop here.
+    //
+    // Strip the keys that belong to the OUTER drawCanvas envelope or
+    // to drawCanvas's per-layer wrapper logic before spreading — those
+    // have already been honored by the caller (`layers` itself,
+    // backgroundColor/bgSource/bgImage/bgPattern) or get applied
+    // around the paintLayer call (visible / blend / opacity / motion
+    // sit on individual layers, NOT on the back-compat envelope, so
+    // leaking them in from a flat-shape fixture would silently skip
+    // the draw or apply unintended blending).
+    const {
+        layers: _layers,
+        backgroundColor: _bg,
+        bgSource: _bgSource,
+        bgImage: _bgImage,
+        bgPattern: _bgPattern,
+        visible: _visible,
+        blend: _blend,
+        opacity: _opacity,
+        motion: _motion,
+        motion_intensity: _mi,
+        motion_phase: _mp,
+        ...layerFields
+    } = state;
     return [
         {
+            ...layerFields,
             text: state.text || "",
-            textColor: state.textColor,
-            fontFamily: state.fontFamily,
-            fontSizePct: state.fontSizePct,
-            fontSize: state.fontSize,
-            autoMode: state.autoMode,
-            autoFormat: state.autoFormat,
-            box: state.box,
         },
     ];
 }
