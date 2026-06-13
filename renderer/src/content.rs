@@ -542,6 +542,86 @@ pub fn video_slide_poster_path(content_root: &Path, slide_id: Uuid) -> PathBuf {
     item_dir(content_root, slide_id).join("poster.png")
 }
 
+/// 2026-06-13 offscreen-capture bg-video fix: when a TextSlide carries
+/// `background_video_slide_id` (a "text-over-video" slide), the live IPC
+/// PaintTransition path V4L2-decodes one bg frame per tick via the
+/// `TransitionEndpoint::TextOverVideo` arm. The offscreen capture path
+/// (`--capture-sb-mid` / `--capture-fullres-mid` / the legacy-3pass
+/// variant) has no V4L2 plumbing — it bakes purely through GL. Before
+/// this helper landed the capture path fell through `resolve_slide_bg`'s
+/// solid arm and rendered the bg as `background_color` (defaulted to
+/// `#000000`), so text-over-video transitions captured offscreen showed
+/// pure black behind the text composite. That black PNG is the QA bug
+/// that shipped to fireplacesign on 2026-06-13.
+///
+/// The fix: when capturing offscreen, substitute the bg with the
+/// referenced video's `poster.png` (the BT.709-limited first-frame PNG
+/// the backend already drops at import time per `video_slide_poster_path`).
+/// Returns `Some(poster_path)` only when ALL of:
+///   * `slide.background_video_slide_id` is `Some(bg_id)`,
+///   * `content_root` is `Some(root)`,
+///   * `<root>/<bg_id>/poster.png` exists on disk.
+///
+/// Returns `None` otherwise — the caller keeps its existing solid-bg
+/// behavior (matching pre-fix capture output for any slide that wouldn't
+/// have hit the bug anyway).
+///
+/// LIVE PAINT NEVER CALLS THIS. The IPC sidecar uses live V4L2 decode
+/// via `TransitionEndpoint::TextOverVideo`. This helper is offscreen-
+/// capture-only; mixing it into the live path would replace per-tick
+/// motion with a frozen first-frame.
+pub fn capture_video_bg_poster_path(
+    slide: &TextSlide,
+    content_root: Option<&Path>,
+) -> Option<PathBuf> {
+    let bg_id = slide.background_video_slide_id?;
+    let root = content_root?;
+    let path = video_slide_poster_path(root, bg_id);
+    // is_file (not exists) so a half-extracted archive that left a
+    // directory at the poster path falls through to the solid fallback
+    // -- load_png_rgba would also fail on a dir, but short-circuiting
+    // here keeps the failure cleaner and the warn line tagged at the
+    // capture-substitution layer instead of downstream PNG decode.
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// 2026-06-13 offscreen-capture CLI plumbing: build a synthetic TextSlide
+/// that wraps a VideoSlide so the existing capture functions (which take
+/// `&TextSlide`) can render a video↔video transition offscreen without a
+/// signature change.
+///
+/// The wrapper has:
+///   * `id` = the video's id (so `slide_caches` keyed by id stays natural),
+///   * `background_video_slide_id` = the video's id (so
+///     `capture_video_bg_poster_path` picks up the video's own `poster.png`
+///     as the bake bg),
+///   * empty `text_layers` (a pure video bg with no overlaid text),
+///   * `background_color = "#000000"` (the safety fallback if the poster
+///     PNG is missing from the content dir),
+///   * everything else serde-defaults.
+///
+/// Only the CLI's `--capture-sb-mid` / `--capture-fullres-mid` paths
+/// construct this. Backend storage never contains a synthetic wrapper —
+/// real text-over-video items always carry their own `id` distinct from
+/// `background_video_slide_id`. Don't try to roundtrip a wrapper through
+/// IPC or the reel; it would V4L2-decode the synthetic slide's own dir
+/// (no `asset.mp4` there) and fail.
+pub fn synth_text_wrapper_for_video_capture(video: &VideoSlide) -> TextSlide {
+    serde_json::from_value(serde_json::json!({
+        "id": video.id,
+        "name": video.name,
+        "background_video_slide_id": video.id,
+    }))
+    .expect(
+        "synth wrapper: TextSlide has serde defaults for every field except `id`, \
+         which we set above",
+    )
+}
+
 /// r110 stage 3 commit 3.2.0 (2026-06-11): canonicalised id-
 /// resolution for the poster cache lookup.
 ///
@@ -2284,5 +2364,129 @@ mod tests {
         let id: Uuid = "11111111-2222-4333-8444-555555555555".parse().unwrap();
         let item = ContentItem::Text(_stub_text_slide(id, Some(id)));
         assert_eq!(resolve_poster_dec_id(Some(&item), id), Some(id));
+    }
+
+    // ================================================================
+    // 2026-06-13 offscreen-capture bg-video fix — regression lock for
+    // the QA-reported black-bg bug on text-over-video transitions
+    // captured via --capture-sb-mid / --capture-fullres-mid. Pre-fix
+    // the capture path lacked any bg_video_id handling and rendered the
+    // bg as the slide's solid background_color (defaulted to #000000).
+    // These tests pin the `capture_video_bg_poster_path` helper that
+    // the hdmi.rs capture functions consult AFTER `resolve_slide_layers`
+    // to substitute BgKind::Image{poster.png} when applicable.
+    // ================================================================
+
+    #[test]
+    fn capture_bg_poster_returns_some_when_id_set_and_poster_exists() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bg_id: Uuid = "deadbeef-0000-4000-8000-000000000001".parse().unwrap();
+        let dir = item_dir(tmp.path(), bg_id);
+        std::fs::create_dir_all(&dir).expect("create item dir");
+        let poster = dir.join("poster.png");
+        std::fs::write(&poster, b"fake-png-bytes").expect("write poster");
+
+        let text_id: Uuid = "11111111-0000-4000-8000-000000000001".parse().unwrap();
+        let slide = _stub_text_slide(text_id, Some(bg_id));
+
+        let resolved = capture_video_bg_poster_path(&slide, Some(tmp.path()));
+        assert_eq!(resolved, Some(poster));
+    }
+
+    #[test]
+    fn capture_bg_poster_returns_none_when_bg_video_id_unset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let text_id: Uuid = "11111111-0000-4000-8000-000000000002".parse().unwrap();
+        let slide = _stub_text_slide(text_id, None);
+        assert_eq!(capture_video_bg_poster_path(&slide, Some(tmp.path())), None);
+    }
+
+    #[test]
+    fn capture_bg_poster_returns_none_when_content_root_missing() {
+        let bg_id: Uuid = "deadbeef-0000-4000-8000-000000000003".parse().unwrap();
+        let text_id: Uuid = "11111111-0000-4000-8000-000000000003".parse().unwrap();
+        let slide = _stub_text_slide(text_id, Some(bg_id));
+        // No content_root => substitution cannot resolve a file; helper
+        // returns None so the capture path keeps its solid-bg behavior.
+        assert_eq!(capture_video_bg_poster_path(&slide, None), None);
+    }
+
+    #[test]
+    fn capture_bg_poster_returns_none_when_poster_missing_on_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // bg_id is set but no <root>/<bg_id>/poster.png exists. The
+        // capture path then falls through to the existing solid-bg
+        // path — same as a backend that hasn't run the poster import
+        // recipe for this video yet.
+        let bg_id: Uuid = "deadbeef-0000-4000-8000-000000000004".parse().unwrap();
+        let text_id: Uuid = "11111111-0000-4000-8000-000000000004".parse().unwrap();
+        let slide = _stub_text_slide(text_id, Some(bg_id));
+        assert_eq!(capture_video_bg_poster_path(&slide, Some(tmp.path())), None);
+    }
+
+    #[test]
+    fn capture_bg_poster_resolves_to_bg_id_dir_not_text_slide_id_dir() {
+        // The text-slide's own UUID dir does NOT carry the poster —
+        // the poster lives under the REFERENCED video slide's dir.
+        // Regression-lock: a future "use slide.id" typo would break
+        // this without firing any other test.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let text_id: Uuid = "11111111-0000-4000-8000-000000000005".parse().unwrap();
+        let bg_id: Uuid = "deadbeef-0000-4000-8000-000000000005".parse().unwrap();
+
+        // Drop a poster under TEXT_ID — should NOT be picked up.
+        let text_dir = item_dir(tmp.path(), text_id);
+        std::fs::create_dir_all(&text_dir).unwrap();
+        std::fs::write(text_dir.join("poster.png"), b"WRONG").unwrap();
+
+        let slide = _stub_text_slide(text_id, Some(bg_id));
+        assert_eq!(capture_video_bg_poster_path(&slide, Some(tmp.path())), None);
+
+        // Drop a poster under BG_ID — SHOULD be picked up.
+        let bg_dir = item_dir(tmp.path(), bg_id);
+        std::fs::create_dir_all(&bg_dir).unwrap();
+        let bg_poster = bg_dir.join("poster.png");
+        std::fs::write(&bg_poster, b"RIGHT").unwrap();
+        assert_eq!(
+            capture_video_bg_poster_path(&slide, Some(tmp.path())),
+            Some(bg_poster),
+        );
+    }
+
+    // ---- synth wrapper for CLI ------------------------------------
+
+    #[test]
+    fn synth_text_wrapper_for_video_capture_carries_bg_video_id() {
+        let vid_id: Uuid = "aaaaaaaa-0000-4000-8000-000000000099".parse().unwrap();
+        let video = _stub_video_slide(vid_id);
+        let wrapper = synth_text_wrapper_for_video_capture(&video);
+        assert_eq!(wrapper.id, vid_id);
+        assert_eq!(wrapper.background_video_slide_id, Some(vid_id));
+        assert!(wrapper.text_layers.is_empty());
+        // The fallback solid color must be black so an offscreen
+        // capture without a poster.png still produces a deterministic
+        // (matches pre-fix) PNG instead of an undefined-state crash.
+        assert_eq!(wrapper.background_color, "#000000");
+    }
+
+    #[test]
+    fn synth_wrapper_round_trips_through_capture_bg_helper() {
+        // The wrapper + capture helper must compose: given a VideoSlide
+        // and a content-root containing its poster, the wrapper feeds
+        // the helper to a Some(poster_path). This is the CLI's actual
+        // pipeline for `--capture-sb-mid --fade-from <VIDEO_UUID>`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vid_id: Uuid = "bbbbbbbb-0000-4000-8000-000000000099".parse().unwrap();
+        let dir = item_dir(tmp.path(), vid_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let poster = dir.join("poster.png");
+        std::fs::write(&poster, b"poster").unwrap();
+
+        let video = _stub_video_slide(vid_id);
+        let wrapper = synth_text_wrapper_for_video_capture(&video);
+        assert_eq!(
+            capture_video_bg_poster_path(&wrapper, Some(tmp.path())),
+            Some(poster),
+        );
     }
 }

@@ -1343,6 +1343,33 @@ mod tests {
     }
 }
 
+/// 2026-06-13 offscreen-capture bg-video fix — CLI plumbing helper for
+/// `--fade-from` / `--fade-to`. Pre-fix the only call sites used
+/// `find_text_slide` and bailed for VideoSlide UUIDs, so QA's golden
+/// fixtures (wrapped as `type=video`) couldn't drive `--capture-sb-mid`
+/// at all and the bug reproduction path required hand-authoring a
+/// text-over-video item. Post-fix this tries text first then falls
+/// through to video, synthesizing a TextSlide wrapper for the latter
+/// so the existing capture-function signature is unchanged.
+#[cfg(target_os = "linux")]
+fn resolve_capture_endpoint_slide(
+    content_root: &std::path::Path,
+    id: uuid::Uuid,
+    flag_name: &str,
+) -> Result<content::TextSlide> {
+    if let Some(text) = content::find_text_slide(content_root, id)? {
+        return Ok(text);
+    }
+    if let Some(video) = content::find_video_slide(content_root, id)? {
+        return Ok(content::synth_text_wrapper_for_video_capture(&video));
+    }
+    bail!(
+        "no text_slide or video for {flag_name} {id} under {} \
+         (looked for <root>/<id>/item.json with type=text_slide or type=video)",
+        content_root.display(),
+    );
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -1770,16 +1797,15 @@ fn main() -> Result<()> {
                             args.fallback_font_family,
                         );
                     };
-                    let slide_a = content::find_text_slide(content_root, from_id)?
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "no text_slide for --fade-from {from_id} under {}",
-                            content_root.display()
-                        ))?;
-                    let slide_b = content::find_text_slide(content_root, to_id)?
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "no text_slide for --fade-to {to_id} under {}",
-                            content_root.display()
-                        ))?;
+                    // 2026-06-13: accept Text OR Video UUIDs so QA's
+                    // golden video↔video fixtures drive --capture-sb-mid
+                    // without manual text-over-video item authoring.
+                    let slide_a = resolve_capture_endpoint_slide(
+                        content_root, from_id, "--fade-from",
+                    )?;
+                    let slide_b = resolve_capture_endpoint_slide(
+                        content_root, to_id, "--fade-to",
+                    )?;
                     hdmi::capture_sb_transition_mid_to_png(
                         &card,
                         &slide_a,
@@ -1831,16 +1857,14 @@ fn main() -> Result<()> {
                             args.fallback_font_family,
                         );
                     };
-                    let slide_a = content::find_text_slide(content_root, from_id)?
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "no text_slide for --fade-from {from_id} under {}",
-                            content_root.display()
-                        ))?;
-                    let slide_b = content::find_text_slide(content_root, to_id)?
-                        .ok_or_else(|| anyhow::anyhow!(
-                            "no text_slide for --fade-to {to_id} under {}",
-                            content_root.display()
-                        ))?;
+                    // 2026-06-13: same accept-Text-or-Video plumbing as
+                    // the --capture-sb-mid arm above.
+                    let slide_a = resolve_capture_endpoint_slide(
+                        content_root, from_id, "--fade-from",
+                    )?;
+                    let slide_b = resolve_capture_endpoint_slide(
+                        content_root, to_id, "--fade-to",
+                    )?;
                     hdmi::capture_fullres_transition_mid_to_png(
                         &card,
                         &slide_a,
