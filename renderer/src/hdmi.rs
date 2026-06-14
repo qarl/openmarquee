@@ -4245,6 +4245,10 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             decoder,
             mode_w,
             mode_h,
+            // Steady-state TextOverVideo paints into the WINDOW FB
+            // (or scene FBO for rotation/non-identity); DMABUF zero-
+            // copy works there. False keeps the hot path on DMABUF.
+            false,
         )?
     };
     // r61 Phase B: snapshot bake duration before its record_phase
@@ -4932,6 +4936,10 @@ pub fn paint_and_present_one_video_slide_frame(
             decoder,
             mode_w,
             mode_h,
+            // Steady-state video slide paints into the WINDOW FB
+            // (or scene FBO); DMABUF zero-copy works. False = hot
+            // path on DMABUF unchanged.
+            false,
         )?
     };
     let Some(path_label) = painted else {
@@ -8872,6 +8880,42 @@ unsafe fn bake_video_slide_to_current_fbo(
     decoder: &crate::v4l2::Decoder,
     mode_w: u32,
     mode_h: u32,
+    // 2026-06-14 iter-6 (video→video transition fix):
+    //
+    // When true, skip the zero-copy DMABUF path and use the MMAP path
+    // unconditionally. The DMABUF path samples the V4L2 frame's
+    // dma_buf via an EGLImage + GL_TEXTURE_EXTERNAL_OES sampler and
+    // draws into the currently-bound FRAMEBUFFER. On Mesa+vc4 (Pi
+    // Zero 2 W) this works correctly into the window/default FB
+    // (steady-state PaintSlide) but FAILS SILENTLY into a regular
+    // GL_TEXTURE_2D-backed offscreen FBO (the cached
+    // transition_fbo_a from r102.2). QA's iter-3/iter-5 probe
+    // confirmed transition_tex_a comes up pure BLACK (luma=0) every
+    // tick under the DMABUF path despite the draw call succeeding.
+    //
+    // The MMAP path uploads Y+UV plane bytes via tex_image_2d into
+    // regular GL_TEXTURE_2D and runs FS_NV12_TO_RGB to do YUV→RGB
+    // in-shader. Every step is a vanilla GLES2 op against regular
+    // texture/FBO targets — no external-OES, no EGLImage, no
+    // Mesa+vc4 quirks. ~1-2 ms / frame upload overhead, but for the
+    // ~50-tick transition window that's a tolerable cost in
+    // exchange for actual pixels on the from-side.
+    //
+    // Callers:
+    //   - paint_and_present_one_text_over_video_slide_frame
+    //     (steady-state TextOverVideo) — pass false; DMABUF zero-
+    //     copy is the production hot path.
+    //   - paint_and_present_one_video_slide_frame (steady-state
+    //     pure-video) — pass false.
+    //   - bake_slide_to_fbo SlideBakeInputs::Video branch
+    //     (transition) — pass true.
+    //   - bake_slide_to_fbo SlideBakeInputs::TextOverVideo branch
+    //     (transition) — pass true.
+    //
+    // The kill switch OPENMARQUEE_BAKE_VIDEO_FORCE_MMAP=off lets QA
+    // A/B the choice at deploy time without a rebuild. Default is
+    // honor whatever the caller passed.
+    force_mmap: bool,
 ) -> Result<Option<&'static str>> {
     use glow::HasContext;
     let profile_first = *next_sample_idx == 1
@@ -9017,6 +9061,34 @@ unsafe fn bake_video_slide_to_current_fbo(
     // EGL_EXT_image_dma_buf_import / GL_OES_EGL_image_external
     // (run_nv12_dmabuf_blit_pass returns Ok(false) in that case +
     // we fall through to MMAP).
+    // 2026-06-14 iter-6 — see the force_mmap doc-block on this
+    // function. When the caller declares it's painting into an
+    // offscreen FBO (transition bakes), short-circuit past the
+    // DMABUF path even if a dma_buf fd is available. The MMAP
+    // fallback below produces correct pixels into any FBO target.
+    //
+    // OPENMARQUEE_BAKE_VIDEO_FORCE_MMAP_IN_TRANSITION=off is the
+    // kill switch — when set, the caller's force_mmap flag is
+    // IGNORED and DMABUF is always attempted. Lets QA A/B the
+    // fix at deploy time without a rebuild (e.g. to confirm the
+    // bug still reproduces on the bench against the pre-iter-6
+    // path). Default: iter-6 active (no env or value not in the
+    // off-lexicon).
+    let iter6_kill_switch_active = std::env::var(
+        "OPENMARQUEE_BAKE_VIDEO_FORCE_MMAP_IN_TRANSITION",
+    )
+    .ok()
+    .map(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "off" | "0" | "false" | "no" | "disable" | "disabled")
+    })
+    .unwrap_or(false);
+    let take_dmabuf = if iter6_kill_switch_active {
+        true
+    } else {
+        !force_mmap
+    };
+    if take_dmabuf {
     if let Some(fd) = frame.dma_buf_fd() {
         let stride = frame.stride();
         let t_blit = if profile_first { Some(std::time::Instant::now()) } else { None };
@@ -9189,6 +9261,7 @@ unsafe fn bake_video_slide_to_current_fbo(
         // MMAP for both capture modes so y_plane()/uv_plane() are
         // populated regardless of capture_buffer_type.
     }
+    } // end if take_dmabuf (iter-6 force_mmap gate)
     // MMAP path (piece 3d-e). stride==width is a bcm2835-codec
     // empirical fact; a future codec or alignment regime could
     // surface stride > width, which would require GL_UNPACK_ROW_
@@ -9809,6 +9882,11 @@ unsafe fn bake_slide_to_fbo(
                 decoder,
                 mode_w,
                 mode_h,
+                // 2026-06-14 iter-6 — TRANSITION bake into the cached
+                // offscreen transition_fbo_a (FBO `fbo`/tex `tex`).
+                // DMABUF external-OES → offscreen FBO silently
+                // produces BLACK on Mesa+vc4. Force MMAP.
+                true,
             );
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             match paint_result {
@@ -9915,6 +9993,14 @@ unsafe fn bake_slide_to_fbo(
                 bg_decoder,
                 mode_w,
                 mode_h,
+                // 2026-06-14 iter-6 — TRANSITION TextOverVideo bake
+                // into the cached offscreen transition_fbo_a (FBO
+                // `fbo` / tex `tex`). DMABUF external-OES → offscreen
+                // FBO comes up BLACK on Mesa+vc4 per the iter-3/iter-5
+                // probe. Force MMAP for correctness. See the
+                // force_mmap doc-block on
+                // bake_video_slide_to_current_fbo for the QA trace.
+                true,
             );
             let painted = match video_result {
                 Ok(Some(_path)) => true,
