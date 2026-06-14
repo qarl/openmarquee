@@ -3931,6 +3931,10 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             decoder,
             mode_w,
             mode_h,
+            // Steady-state TextOverVideo paints into the WINDOW FB
+            // (or scene FBO when rotated). eglSwapBuffers is the
+            // implicit barrier; no extra flush needed.
+            false,
         )?
     };
     // r61 Phase B: snapshot bake duration before its record_phase
@@ -4618,6 +4622,9 @@ pub fn paint_and_present_one_video_slide_frame(
             decoder,
             mode_w,
             mode_h,
+            // Steady-state pure-video paints into the WINDOW FB.
+            // eglSwapBuffers is the implicit barrier.
+            false,
         )?
     };
     let Some(path_label) = painted else {
@@ -5481,6 +5488,75 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
+        // 2026-06-14 iter-7 — pre-composite tex probe (carried
+        // forward from iter-3 on the c3.x branch). Reads a 4×4
+        // center patch from each FBO's COLOR_ATTACHMENT0 via
+        // glReadPixels and emits one [perf] transition_tex_probe
+        // line per side per transition. THIS IS THE SIGNAL that
+        // tells us whether iter-7's scoped flush actually landed
+        // pixels in transition_tex_a — without it the bench data
+        // is just "glass looks black" or "glass looks ok" with no
+        // numeric ground truth.
+        //
+        // Throttled via TRANSITION_TEX_PROBE_LAST_PROGRESS to ONE
+        // tick per transition (first tick where progress crosses
+        // 0.4 from below; re-arms when progress drops >0.1
+        // signalling a new transition). Guarantees a reading even
+        // when progress jumps under jank.
+        //
+        // glReadPixels is ~1-2 ms on vc4 720p; once per transition
+        // (≈ once per 5-10 seconds at FYS slide pacing) is
+        // negligible. THIS PROBE IS NOT A LOAD DRIVER; the iter-4
+        // load=17 was the per-tick `gl.flush()`, not the per-
+        // transition probe.
+        let probe_fire = TRANSITION_TEX_PROBE_LAST_PROGRESS.with(|cell| {
+            let last = cell.get();
+            let new_transition = progress < last - 0.1;
+            let fire_now = if new_transition {
+                progress >= 0.4
+            } else {
+                last < 0.4 && progress >= 0.4
+            };
+            cell.set(progress);
+            fire_now
+        });
+        if probe_fire {
+            let mut probe = |label: &str, fbo: glow::NativeFramebuffer, tex: glow::NativeTexture| {
+                let cx = (mode_w_u32 / 2).saturating_sub(2);
+                let cy = (mode_h_u32 / 2).saturating_sub(2);
+                let mut buf = [0u8; 16 * 4]; // 4x4 RGBA
+                session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                session.gl.read_pixels(
+                    cx as i32,
+                    cy as i32,
+                    4,
+                    4,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(&mut buf[..]),
+                );
+                let mut sum_r = 0u32;
+                let mut sum_g = 0u32;
+                let mut sum_b = 0u32;
+                for i in 0..16 {
+                    sum_r += buf[i * 4] as u32;
+                    sum_g += buf[i * 4 + 1] as u32;
+                    sum_b += buf[i * 4 + 2] as u32;
+                }
+                let avg_r = sum_r / 16;
+                let avg_g = sum_g / 16;
+                let avg_b = sum_b / 16;
+                let luma = (0.299 * avg_r as f32 + 0.587 * avg_g as f32 + 0.114 * avg_b as f32)
+                    as u32;
+                eprintln!(
+                    "[perf] transition_tex_probe side={} kind={} progress={:.3} \
+                     fbo_id={:?} tex_id={:?} rgb={},{},{} luma={}",
+                    label, kind, progress, fbo, tex, avg_r, avg_g, avg_b, luma,
+                );
+            };
+            probe("a", fbo_a, tex_a);
+            probe("b", fbo_b, tex_b);
+        }
         // Bind transition target: scene FBO (non-identity) or
         // default fb (identity).
         let transition_target = scene_for_post_pass.map(|(fbo, _)| fbo);
@@ -7132,6 +7208,19 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
     static OVERLAY_BLEND_PROGRAM: std::cell::Cell<Option<CachedOverlayBlendProgram>> =
         const { std::cell::Cell::new(None) };
+    /// 2026-06-14 iter-7: per-transition latch for the transition_
+    /// tex_probe debug emit in paint_and_present_one_transition_
+    /// frame. Stores the LAST progress value passed in; the probe
+    /// fires on the first tick where progress crosses 0.4 from
+    /// below, then re-arms when progress drops by >0.1 (= the
+    /// start of a new transition window). Initial value 2.0 = "out
+    /// of range, no transition yet" so the first transition
+    /// reliably fires the probe. IPC sidecar is single-threaded
+    /// so a thread_local Cell is sufficient. Carried over from
+    /// iter-3 / iter-5 on the c3.x branch — pure instrumentation,
+    /// no behavioral coupling.
+    static TRANSITION_TEX_PROBE_LAST_PROGRESS: std::cell::Cell<f32> =
+        const { std::cell::Cell::new(2.0) };
     /// P2-G (2026-05-10): shared fullscreen-quad VBO for every
     /// post-pass that draws a textured fullscreen quad
     /// (run_bright_gamma_pass + run_blit_pass +
@@ -8103,6 +8192,24 @@ unsafe fn bake_external_nv12_to_current_fbo(
 /// paint function. The `swap_commit=/total=` log stays in the
 /// caller because only the caller does the swap.
 #[cfg(target_os = "linux")]
+/// 2026-06-14 iter-7 kill switch for the offscreen-bake `gl.flush()`
+/// that closes the V4L2 dma_buf re-QBUF / GPU tile-store race
+/// described in `qa/v2v-lean-analysis-2026-06-14.md`. Default ON;
+/// set `OPENMARQUEE_BAKE_OFFSCREEN_FLUSH=off` (off / 0 / false / no /
+/// disable / disabled, case-insensitive, whitespace-trimmed) to skip
+/// the flush even when the caller declares an offscreen bake — used
+/// by QA to verify the bug still reproduces against a known-bad
+/// baseline on the bench.
+fn bake_offscreen_flush_enabled() -> bool {
+    match std::env::var("OPENMARQUEE_BAKE_OFFSCREEN_FLUSH") {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "off" | "0" | "false" | "no" | "disable" | "disabled")
+        }
+        Err(_) => true,
+    }
+}
+
 unsafe fn bake_video_slide_to_current_fbo(
     session: &mut EglSession,
     samples: &[crate::mp4_demux::Sample],
@@ -8111,6 +8218,50 @@ unsafe fn bake_video_slide_to_current_fbo(
     decoder: &crate::v4l2::Decoder,
     mode_w: u32,
     mode_h: u32,
+    // 2026-06-14 iter-7 (video→video transition fix on the lean
+    // r103.1 base).
+    //
+    // ROOT CAUSE (QA analysis qa/v2v-lean-analysis-2026-06-14.md):
+    // vc4/Mesa defers the tiled render of this bake's DMABUF
+    // external-OES draw into the currently-bound FBO. When the bound
+    // FBO is the WINDOW (default fb, steady-state PaintSlide), the
+    // subsequent eglSwapBuffers acts as a hard pipeline barrier that
+    // forces the tile-store before `Frame::drop` re-QBUFs the V4L2
+    // CAPTURE buffer — so the pixels land. When the bound FBO is an
+    // OFFSCREEN target (e.g. session.transition_fbo_a in a
+    // transition), there is NO such barrier; Frame::drop happens
+    // before the tile-store + the codec reclaims the dma_buf slot
+    // before the deferred tile-store executes against it → the FBO
+    // stores BLACK.
+    //
+    // FIX: when this bake is into an offscreen FBO, the caller
+    // declares `is_offscreen_bake=true`; this function emits a
+    // `gl.flush()` BETWEEN the V4L2 frame's read into the FBO and
+    // `drop(frame)`. Forces the tile-store to be issued before the
+    // codec gets the buffer back. Scoped: steady-state callers pass
+    // `false` (default; their swapBuffers is the barrier already) so
+    // the production hot path on FYS pays zero extra GPU sync cost.
+    //
+    // iter-4 (on the c3.x branch) flushed unconditionally and drove
+    // load to 17 + 7.6-minute freeze. The fix needed scoping, not
+    // dropping. iter-7 ships the scoping correctly + on the LEAN
+    // base where the c3.x machinery doesn't compound the cost.
+    //
+    // Callers:
+    //   - paint_and_present_one_text_over_video_slide_frame
+    //     (steady-state TextOverVideo) — pass `false`.
+    //   - paint_and_present_one_video_slide_frame (steady-state
+    //     pure-video) — pass `false`.
+    //   - bake_slide_to_fbo SlideBakeInputs::Video branch
+    //     (transition) — pass `true`.
+    //   - bake_slide_to_fbo SlideBakeInputs::TextOverVideo branch
+    //     (transition) — pass `true`.
+    //
+    // OPENMARQUEE_BAKE_OFFSCREEN_FLUSH=off is a kill switch for the
+    // bench: when set, the flush is skipped even for offscreen bakes
+    // so QA can confirm the bug still reproduces against a known-bad
+    // baseline. Default ON.
+    is_offscreen_bake: bool,
 ) -> Result<Option<&'static str>> {
     use glow::HasContext;
     let profile_first = *next_sample_idx == 1
@@ -8294,6 +8445,18 @@ unsafe fn bake_video_slide_to_current_fbo(
                 "paint_bake_video_shader",
                 t_phase_shader.elapsed().as_nanos() as u64,
             );
+            // 2026-06-14 iter-7 — see the is_offscreen_bake doc-block
+            // on this function. Force the deferred tile-store of the
+            // external-OES draw to be ISSUED before Frame::drop
+            // re-QBUFs the dma_buf slot. Steady-state passes
+            // is_offscreen_bake=false (its eglSwapBuffers is the
+            // implicit barrier); transition passes true and pays
+            // the per-tick flush only inside the transition window.
+            // OPENMARQUEE_BAKE_OFFSCREEN_FLUSH=off skips this for
+            // bench A/B (default ON).
+            if is_offscreen_bake && bake_offscreen_flush_enabled() {
+                session.gl.flush();
+            }
             // Drop the Frame so its Drop re-QBUFs CAPTURE BEFORE the
             // caller's buffer swap; holding the Frame across the next
             // advance would starve the codec of CAPTURE buffers.
@@ -8422,6 +8585,16 @@ unsafe fn bake_video_slide_to_current_fbo(
         "paint_bake_video_shader",
         t_phase_shader.elapsed().as_nanos() as u64,
     );
+    // 2026-06-14 iter-7 — same scoped flush as the DMABUF arm above.
+    // The MMAP path is less likely to hit the tile-store deferral
+    // race (no external-OES + the Y/UV uploads themselves serialize),
+    // but the cost of the flush here is identical to the DMABUF arm
+    // when the path falls through, and we want a single semantic for
+    // "transition bake = barrier before Frame::drop." Defense-in-
+    // depth; cheap when steady-state is_offscreen_bake=false.
+    if is_offscreen_bake && bake_offscreen_flush_enabled() {
+        gl.flush();
+    }
     // Drop the Frame so its Drop re-QBUFs CAPTURE before the
     // caller's swap. Critical: holding the Frame across the next
     // advance starves the codec of CAPTURE buffers.
@@ -8943,6 +9116,12 @@ unsafe fn bake_slide_to_fbo(
                 decoder,
                 mode_w,
                 mode_h,
+                // 2026-06-14 iter-7 — TRANSITION bake into the cached
+                // offscreen transition_fbo_a (fbo here). External-OES
+                // tile-store is deferred past Frame::drop without an
+                // explicit barrier. is_offscreen_bake=true triggers
+                // the scoped gl.flush() before drop(frame).
+                true,
             );
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             match paint_result {
@@ -9049,6 +9228,12 @@ unsafe fn bake_slide_to_fbo(
                 bg_decoder,
                 mode_w,
                 mode_h,
+                // 2026-06-14 iter-7 — TRANSITION TextOverVideo bake
+                // into the cached offscreen transition_fbo_a (fbo
+                // here). Same offscreen tile-store race as the
+                // Video branch above; pass true to trigger the
+                // scoped flush before Frame::drop.
+                true,
             );
             let painted = match video_result {
                 Ok(Some(_path)) => true,
