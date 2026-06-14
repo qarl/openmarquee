@@ -95,6 +95,16 @@ def _resolve_preload_mode(env: dict[str, str] | None = None) -> str:
     Empty / unset / unrecognised → warn (only for non-empty
     unrecognised) + fall back to 'defer'.
 
+    2026-06-13 (FYS regression): when this function returns 'lead'
+    or 'max', emits a log.warning naming the value as an experiment-
+    only knob and pointing at docs/hardware-ceilings.md. A leftover
+    OPENMARQUEE_PRELOAD_MODE=max drop-in on FYS starved the FROM-
+    side bg-video decoder during every transition (outgoing video
+    went black). The visible-in-journal warning makes the
+    experiment-knob's presence loud at process startup — a future
+    operator who SSHes in to inspect won't miss it. Production code
+    NEVER expects 'lead' or 'max'; both are bench-only.
+
     Parameter `env` exists for unit-testability; production callers
     pass None to read from os.environ.
     """
@@ -107,6 +117,17 @@ def _resolve_preload_mode(env: dict[str, str] | None = None) -> str:
     if normalized == "":
         return PRELOAD_MODE_DEFER
     if normalized in _PRELOAD_MODES:
+        if normalized in (PRELOAD_MODE_LEAD, PRELOAD_MODE_MAX):
+            log.warning(
+                "OPENMARQUEE_PRELOAD_MODE=%r is an EXPERIMENT-ONLY knob "
+                "(1080p dual-decode investigation surface). On Pi Zero 2 W "
+                "class hardware running ≤720p production content, leave this "
+                "UNSET (defaults to 'defer'). Setting 'max' or 'lead' "
+                "starves the outgoing video bg decoder during every "
+                "transition — qarl observed BLACK outgoing on FYS 2026-06-13. "
+                "See docs/hardware-ceilings.md for the contract.",
+                normalized,
+            )
         return normalized
     log.warning(
         "OPENMARQUEE_PRELOAD_MODE=%r not a recognised mode "

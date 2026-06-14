@@ -2073,6 +2073,158 @@ class TestResolvePreloadMode:
         # 3 distinct unrecognised values -> 3 warnings.
         assert sum(1 for m in warn_messages if "OPENMARQUEE_PRELOAD_MODE" in m) == 3
 
+    # 2026-06-13 FYS-regression-class tests. The leftover MODE=max
+    # drop-in starved the FROM-side bg decoder during every transition
+    # (outgoing video went black; see docs/hardware-ceilings.md). The
+    # tests below pin the experiment-knob's loud-at-runtime warning AND
+    # ensure no shipped surface in this repo ever sets `max` literally.
+
+    def test_max_emits_experiment_only_warning(self, caplog):
+        # The resolver must emit a WARNING when the operator explicitly
+        # opts into 'max' so the journal makes the experiment-knob's
+        # presence loud at process startup.
+        from openmarquee.playback import _resolve_preload_mode
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "max"}) == "max"
+        warn_messages = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("EXPERIMENT-ONLY" in m and "max" in m.lower() for m in warn_messages), (
+            "expected an EXPERIMENT-ONLY warning naming the value when MODE=max "
+            "is resolved; got: " + repr(warn_messages)
+        )
+        assert any("hardware-ceilings.md" in m for m in warn_messages), (
+            "warning must cite the docs path so operators can find the contract"
+        )
+
+    def test_lead_emits_experiment_only_warning(self, caplog):
+        # Mirror the max case for the 'lead' bench mode.
+        from openmarquee.playback import _resolve_preload_mode
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "lead"}) == "lead"
+        warn_messages = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("EXPERIMENT-ONLY" in m and "lead" in m.lower() for m in warn_messages), (
+            "expected an EXPERIMENT-ONLY warning naming the value when "
+            "MODE=lead is resolved; got: " + repr(warn_messages)
+        )
+
+    def test_defer_does_not_emit_experiment_warning(self, caplog):
+        # The production mode must NOT spam the journal with the
+        # experiment warning. Both the explicit 'defer' and the unset
+        # default path are pinned.
+        from openmarquee.playback import _resolve_preload_mode
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_mode(env={}) == "defer"
+            assert _resolve_preload_mode(env={"OPENMARQUEE_PRELOAD_MODE": "defer"}) == "defer"
+        warn_messages = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert not any("EXPERIMENT-ONLY" in m for m in warn_messages), (
+            "defer mode is production; no EXPERIMENT-ONLY warning expected"
+        )
+
+    def test_repo_setter_lint_is_case_insensitive(self, tmp_path, monkeypatch):
+        # Sacred-review BLOCKER-1: the lint must catch case variants
+        # because BOTH consumers normalise case. A 'Environment=
+        # OPENMARQUEE_PRELOAD_MODE=Max' drop-in in a future deploy
+        # surface would activate the experiment knob identically to
+        # 'max' but slip a case-sensitive regex. Pin the regex inside
+        # the function so it can't drift away from the production
+        # lint above.
+        import re
+
+        banned_re = re.compile(
+            r"OPENMARQUEE_PRELOAD_MODE\s*=\s*[\"']?\s*(max|lead)\b",
+            re.IGNORECASE,
+        )
+        # Must MATCH every case variant of max/lead.
+        for variant in [
+            "max",
+            "MAX",
+            "Max",
+            "mAx",
+            "MaX",
+            "lead",
+            "LEAD",
+            "Lead",
+            "lEaD",
+            "LeAd",
+        ]:
+            assert banned_re.search(f'Environment="OPENMARQUEE_PRELOAD_MODE={variant}"'), (
+                f"lint must catch case variant {variant!r}"
+            )
+        # Must NOT match production value or any other env.
+        for clean in [
+            'Environment="OPENMARQUEE_PRELOAD_MODE=defer"',
+            "Environment=OPENMARQUEE_PRELOAD_MODE=DEFER",
+            'Environment="SOMETHING_ELSE=max"',
+            'Environment="OPENMARQUEE_PRELOAD_LEAD_MS=2000"',
+        ]:
+            assert not banned_re.search(clean), f"lint must NOT match clean line {clean!r}"
+
+    def test_no_repo_setter_ships_preload_mode_max(self):
+        # 2026-06-13 regression-lock: the bug that bit FYS was a
+        # leftover Environment=OPENMARQUEE_PRELOAD_MODE=max drop-in
+        # added during a dual-1080p experiment and never removed.
+        # NOTHING in the repo's deploy surface (systemd units, install
+        # scripts, deploy scripts, stage scripts) is allowed to set
+        # MODE=max. The docs are exempt — they document the contract.
+        import pathlib
+        import re
+
+        repo_root = pathlib.Path(__file__).resolve().parents[2]
+        # Glob the deploy surface explicitly. Don't recurse into
+        # target/, node_modules/, .git/, docs/ (docs DOCUMENT the
+        # value verbatim — see hardware-ceilings.md), qa/ (audit logs
+        # may quote prior incidents), backend/tests/ (this test plus
+        # the others quote the literal string verbatim).
+        # `system/**/*.service.d/**/*.conf` is fully covered by
+        # `system/**/*.conf` (reviewer NIT-1: empirically dedup'd to
+        # the same files). Kept narrow to the realistic deploy
+        # surface — *.service / *.timer / *.conf for systemd,
+        # *.sh / *.py for the install + deploy + stage scripts.
+        deploy_globs = [
+            "system/**/*.service",
+            "system/**/*.conf",
+            "system/**/*.timer",
+            "system/**/*.sh",
+            "scripts/**/*.sh",
+            "scripts/**/*.py",
+            "images/**/*.sh",
+            "images/**/*.service",
+            "images/**/*.conf",
+        ]
+        # The literal pattern we're banning. Tolerant of quoting
+        # variants because systemd accepts both Environment="X=Y" and
+        # Environment=X=Y, and shell scripts vary. Case-insensitive
+        # because BOTH consumers normalise: Python `_resolve_preload_
+        # mode` calls .lower() and Rust `parse_preload_mode` uses
+        # eq_ignore_ascii_case — so a `Max` or `mAx` drop-in would
+        # activate the experiment knob the same as `max` and the
+        # lint must catch it.
+        banned_re = re.compile(
+            r"OPENMARQUEE_PRELOAD_MODE\s*=\s*[\"']?\s*(max|lead)\b",
+            re.IGNORECASE,
+        )
+        offenders: list[str] = []
+        for pattern in deploy_globs:
+            for path in repo_root.glob(pattern):
+                if not path.is_file():
+                    continue
+                try:
+                    text = path.read_text()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                for lineno, line in enumerate(text.splitlines(), start=1):
+                    if banned_re.search(line):
+                        rel = path.relative_to(repo_root)
+                        offenders.append(f"{rel}:{lineno}: {line.strip()}")
+        assert not offenders, (
+            "Production deploy surface ships an experiment-only "
+            "OPENMARQUEE_PRELOAD_MODE value. See docs/hardware-ceilings.md "
+            "for the contract — production must be 'defer' (the code "
+            "default). Offending lines:\n  " + "\n  ".join(offenders)
+        )
+
 
 class TestResolvePreloadLeadSeconds:
     def test_default_when_unset(self):
