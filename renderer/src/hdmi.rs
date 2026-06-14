@@ -688,6 +688,16 @@ pub struct EglSession<'a> {
     /// per-slide context threaded through `commit_fb` (Option A
     /// per QA's r1 decision). Mutated via `set_in_transition`.
     in_transition: bool,
+    /// QA verification unblocker (2026-06-13): flag-gated live
+    /// scanout preview state. When env `OPENMARQUEE_LIVE_PREVIEW_
+    /// PATH` is unset, `config` is None and `maybe_capture` is a
+    /// near-zero early return. When set, every paint_and_present_*
+    /// call site calls `live_preview.maybe_capture` right BEFORE
+    /// `eglSwapBuffers` to glReadPixels the just-composited frame
+    /// from FBO 0 (linear RGBA8, no T-tile) and write a downscaled
+    /// PNG to the configured path so QA can scp + Read it. See
+    /// `live_preview` module docs for the env-var surface + cost.
+    live_preview: crate::live_preview::LivePreviewState,
 }
 
 /// v1-spec-delta #5 (slice a) -- bring up GBM + EGL + GLES2,
@@ -901,6 +911,12 @@ where
             crate::glyph_cache_colr::COLR_CELL_PX,
         ),
         dynamic_fonts_dir: std::path::PathBuf::from("/opt/openmarquee/ui/fonts"),
+        // QA verification unblocker (2026-06-13): read live-preview
+        // env vars once at bring-up. Without the path env set this is
+        // a zero-allocation default; the per-frame `maybe_capture`
+        // sees `config.is_none()` and early-returns before touching
+        // GL.
+        live_preview: crate::live_preview::LivePreviewState::init_from_env(),
     };
 
     // SDF arc slice B.2 -- one-shot atlas upload after the GL
@@ -1515,6 +1531,9 @@ where
     let work: Result<()> = (|| {
         draw(session.gl, session.mode_w as u32, session.mode_h as u32)?;
         gl_error_sweep(session.gl, "user draw closure");
+        // QA live-preview hook (2026-06-13): no-op unless
+        // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
+        session.maybe_live_preview_capture();
         session
             .egl_lib
             .swap_buffers(session.display, session.egl_surface)
@@ -1809,6 +1828,9 @@ fn render_animated_slide_in_session(
             // that used to be here forced an extra tile-store on vc4
             // (cold-scout #2 P6, 2026-05-09).
             crate::profile::record_phase("paint", t_paint.elapsed().as_nanos() as u64);
+            // QA live-preview hook (2026-06-13): no-op unless
+            // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
+            session.maybe_live_preview_capture();
             let t_swap = std::time::Instant::now();
             session
                 .egl_lib
@@ -3834,6 +3856,9 @@ pub fn paint_and_present_one_frame_for_slide(
     // (cold-scout #2 P6, 2026-05-09): eglSwapBuffers implicitly
     // flushes; the explicit gl.flush() that used to be here
     // forced an extra tile-store on vc4.
+    // QA live-preview hook (2026-06-13): no-op unless
+    // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
+    session.maybe_live_preview_capture();
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -4140,6 +4165,9 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         // Step 4: standard scanout swap+commit -- verbatim mirror
         // of the non-cached path's tail.
         let t_scanout = std::time::Instant::now();
+        // QA live-preview hook (2026-06-13): no-op unless
+        // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
+        session.maybe_live_preview_capture();
         session
             .egl_lib
             .swap_buffers(session.display, session.egl_surface)
@@ -4392,6 +4420,9 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // step release contract per qa/r38b-hdmi-cma-deep-read-2026-
     // 06-02.md §2).
     let t_phase = std::time::Instant::now();
+    // QA live-preview hook (2026-06-13): no-op unless
+    // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
+    session.maybe_live_preview_capture();
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -4555,6 +4586,9 @@ pub fn paint_and_present_one_image_slide_frame(
     // Mirror paint_and_present_one_frame_for_slide's scanout
     // rotation: swap, lock front BO, addFB, commit_fb, then
     // shift scanout_current -> scanout_prev and stash the new pair.
+    // QA live-preview hook (2026-06-13): no-op unless
+    // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
+    session.maybe_live_preview_capture();
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -4660,6 +4694,9 @@ pub fn paint_and_present_external_frame(
     }
     // Scanout swap / lock / addFB / commit / pair-rotation — verbatim
     // from paint_and_present_one_image_slide_frame.
+    // QA live-preview hook (2026-06-13): no-op unless
+    // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
+    session.maybe_live_preview_capture();
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -4763,6 +4800,9 @@ pub fn paint_and_present_external_nv12_frame(
     }
     // Scanout swap / lock / addFB / commit / pair-rotation — verbatim
     // from paint_and_present_external_frame.
+    // QA live-preview hook (2026-06-13): no-op unless
+    // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
+    session.maybe_live_preview_capture();
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -4968,6 +5008,9 @@ fn finish_video_slide_swap_and_commit(
     session: &mut EglSession,
     card: &Card,
 ) -> Result<()> {
+    // QA live-preview hook (2026-06-13): no-op unless
+    // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
+    session.maybe_live_preview_capture();
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -6070,6 +6113,11 @@ pub fn paint_and_present_one_transition_frame(
     // (cold-scout #2 P6, 2026-05-09): eglSwapBuffers implicitly
     // flushes; the explicit gl.flush() forced an extra tile-store
     // on vc4.
+    // QA live-preview hook (2026-06-13): the critical one — this is
+    // the per-tick transition present, the exact frame QA cannot
+    // capture today (kmsgrab hangs on the page-flipping scanout
+    // plane). No-op unless OPENMARQUEE_LIVE_PREVIEW_PATH is set.
+    session.maybe_live_preview_capture();
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -7502,6 +7550,20 @@ impl<'a> EglSession<'a> {
     fn phys_mode_size(&self) -> (u32, u32) {
         let (pw, ph) = self.mode.size();
         (pw as u32, ph as u32)
+    }
+
+    /// QA verification unblocker (2026-06-13): one-line site for
+    /// the paint_and_present_* functions to call right BEFORE
+    /// `egl_lib.swap_buffers(...)`. Wraps the disjoint-field-borrow
+    /// dance (live_preview vs gl) so callers don't have to repeat
+    /// it. Near-zero cost when env is unset (early return on
+    /// `config.is_none()`).
+    fn maybe_live_preview_capture(&mut self) {
+        let (phys_w, phys_h) = {
+            let (pw, ph) = self.mode.size();
+            (pw as u32, ph as u32)
+        };
+        self.live_preview.maybe_capture(self.gl, phys_w, phys_h);
     }
 }
 
