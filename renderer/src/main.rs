@@ -25,6 +25,18 @@ mod hdmi;
 /// 100-300ms on every Web-slide refresh transition.
 #[cfg(target_os = "linux")]
 mod image_slide_tex;
+/// QA verification unblocker (2026-06-13) — flag-gated live scanout
+/// preview. OFF unless OPENMARQUEE_LIVE_PREVIEW_PATH is set. Reads
+/// the linear-RGBA8 default framebuffer right BEFORE eglSwapBuffers
+/// so QA can see what's on the glass mid-transition without
+/// fighting the page-flipping VC4 T-tiled scanout BO that kmsgrab
+/// hangs on. See module docs for env vars + cost model.
+///
+/// Not target_os-gated: the GL-touching methods are linux-only
+/// inside the module, but the env parsing + atomic-write surface
+/// is host-portable so the macOS `cargo test` (renderer CI job
+/// runs on macos-latest) can exercise the unit tests.
+mod live_preview;
 mod cea861;
 mod content;
 mod hdmi_logic;
