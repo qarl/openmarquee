@@ -39,6 +39,10 @@
 set -euo pipefail
 
 _SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 2026-06-14: fixtures now live in-repo at code2/qa/fixtures/...
+# (committed in the same PR as this runner so preflight doesn't fail
+# on a missing outer-repo dir). Operators can still override
+# FIXTURES= to point at a curated set.
 FIXTURES="${FIXTURES:-$_SCRIPT_DIR/../../../qa/fixtures/transition-golden}"
 CONTENT_ROOT="${CONTENT_ROOT:-/var/openmarquee/content-vvtest}"
 PLAYLIST_PATH="${PLAYLIST_PATH:-/var/openmarquee/playlist-vvtest.json}"
@@ -202,35 +206,29 @@ cat > "$PYTHON_ANALYZER" <<'PY'
 import os, sys, re
 from PIL import Image
 
-sample_dir, luma_floor_s, transitions_observed_s = sys.argv[1], sys.argv[2], sys.argv[3]
+sample_dir, luma_floor_s = sys.argv[1], sys.argv[2]
 luma_floor = float(luma_floor_s)
-transitions_observed = int(transitions_observed_s)
 journal = sys.stdin.read().splitlines()
 
 errors = []
 
-# --- Assertion 2: endpoint_a_no_frame ≤ small tolerance ----
-# Sacred-review NIT-3: strict > 0 is a flake risk on real hardware
-# (a single kernel pipeline hiccup over a 30s soak with ~10
-# transitions would false-positive). Allow up to 25% of observed
-# transitions to show a single bake_a miss — Option A's contract is
-# "outgoing fires throughout" but a soft tolerance survives the
-# noisy Pi Zero 2 W test environment. If transitions_observed is
-# unknown (no probes fired), fall back to a hard cap of 2.
+# --- Assertion 2: endpoint_a_no_frame ≤ small hard cap ----
+# QA 2026-06-14 bench feedback #2: the iter-1 25%/min-2 tolerance was
+# too generous — an intermittently-broken binary could pass. Hard cap
+# of 3 total across the soak: outgoing fires throughout (Option A's
+# contract), kernel pipeline only hiccups under pathological load,
+# and 3 is enough headroom to absorb a single contended preload
+# window without forgiving real starvation.
 endpoint_a_re = re.compile(r"\bpaint_transition_skip\b.*\bendpoint_a_no_frame\b")
 endpoint_a_hits = sum(1 for line in journal if endpoint_a_re.search(line))
-if transitions_observed > 0:
-    endpoint_a_budget = max(2, int(transitions_observed * 0.25))
-else:
-    endpoint_a_budget = 2
+endpoint_a_budget = 3
 print(f"[journal] endpoint_a_no_frame count = {endpoint_a_hits} (budget {endpoint_a_budget})")
 if endpoint_a_hits > endpoint_a_budget:
     errors.append(
         f"Option A invariant VIOLATED: {endpoint_a_hits} `endpoint_a_no_frame` "
-        f"skips in the journal (budget {endpoint_a_budget} for "
-        f"{transitions_observed} transitions). The OUTGOING live decoder failed "
-        f"to produce a frame during transitions — that's the dual-decoder "
-        f"starvation pattern the fix was supposed to eliminate."
+        f"skips in the journal (budget {endpoint_a_budget}). The OUTGOING live "
+        f"decoder failed to produce a frame during transitions — that's the "
+        f"dual-decoder starvation pattern the fix was supposed to eliminate."
     )
 
 # --- Assertion 3: no multi-second freeze ----
@@ -254,9 +252,21 @@ else:
 
 # --- Assertion 1: mid-transition central-region luma > floor ----
 # We can't perfectly pin which frame was mid-transition without
-# timing it, but the playlist alternates 4s holds with 1.5s
-# transitions; any sample whose center is BLACK during the
-# soak is a strong outgoing-black signal.
+# correlating the sampler's mtime with journalctl wall-clock, but
+# the goldens are deterministic colors that never legitimately dim:
+# golden-red is pure 0xFF0000 (BT.601 luma ≈ 76), golden-blue is
+# pure 0x0000FF (luma ≈ 29). Any sample whose center is BLACK
+# (luma < 20) during the soak is the bug — no legitimate
+# golden-fixture frame can be that dark. Treats the WHOLE soak
+# as the assertion window.
+#
+# QA 2026-06-14 bench feedback #3 (mid-transition isolation):
+# punted. The golden fixtures' dynamic-range floor (29 for blue)
+# is already above the floor threshold (20), so a legitimately-
+# dark frame can't false-positive here. For a future runner
+# exercising operator-uploaded content with darker shots, we'd
+# need to correlate sample timestamps with `transition_paint_
+# entry` / `transition_paint_exit` journal probes.
 samples = sorted(p for p in os.listdir(sample_dir) if p.endswith(".png"))
 luma_min = 999.0
 luma_min_path = None
@@ -300,14 +310,8 @@ else:
     print("OVERALL: PASS — video→video transition kept outgoing live + no freeze.")
 PY
 
-# Count BeginTransition events to size the endpoint_a_no_frame
-# tolerance for the analyzer. This is a rough proxy for the
-# number of transitions in the soak.
-TRANSITIONS_OBSERVED="$(grep -c '\bbegin_transition_load\b' "$JOURNAL_PATH" || echo 0)"
-log "Observed approximately $TRANSITIONS_OBSERVED transitions across the soak."
-
 set +e
-python3 "$PYTHON_ANALYZER" "$SAMPLE_DIR" "$LUMA_FLOOR" "$TRANSITIONS_OBSERVED" < "$JOURNAL_PATH"
+python3 "$PYTHON_ANALYZER" "$SAMPLE_DIR" "$LUMA_FLOOR" < "$JOURNAL_PATH"
 RUN_RC=$?
 set -e
 

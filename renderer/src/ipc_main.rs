@@ -5646,30 +5646,36 @@ mod tests {
     }
 
     #[test]
-    fn paint_transition_use_poster_a_gated_to_1080p_class() {
+    fn paint_transition_use_poster_a_gated_to_1080p_class_video() {
         // Source-grep regression-lock: paint_and_present_one_transition
-        // _frame must gate use_poster_a behind a poster_a_is_1080p_class
-        // check (poster_w >= 1920 || poster_h >= 1080). For 720p
-        // endpoints, a stays on the live decode path so outgoing motion
-        // is preserved across the transition (Option A invariant).
+        // _frame must gate use_poster_a behind a `video_a_is_1080p_class`
+        // check derived from the VIDEO's coded resolution
+        // (`Decoder::capture_dims()`), NOT the poster PNG dimensions.
+        //
+        // Iteration 1 of this fix (commit a9ce2ef) keyed on the poster
+        // image's dimensions and failed bench verification on FYS:
+        // posters are authored at 1920×1080 for ALL videos regardless
+        // of the underlying video's coded resolution, so the gate
+        // fired on every 720p transition and FYS lost outgoing motion.
+        // Iteration 2 reads the bcm2835-codec's NEGOTIATED CAPTURE
+        // format width × height (the actually-decoded frame size) so
+        // the contention check matches the real signal.
         let src = include_str!("hdmi.rs");
-        // The variable name + the dimension thresholds are both pinned
-        // so a future refactor can rename the variable but can't drop
-        // the dimensional gate without tripping the test.
         assert!(
-            src.contains("poster_a_is_1080p_class"),
-            "use_poster_a gate must compute a `poster_a_is_1080p_class` \
-             bool from poster_a_texture dimensions — see Option A spec \
-             at qa/video-to-video-transition-fix-spec-2026-06-14.md",
+            src.contains("video_a_is_1080p_class"),
+            "use_poster_a gate must compute a `video_a_is_1080p_class` \
+             bool from the decoder's `capture_dims()` — see Option A \
+             iteration 2 at qa/video-to-video-transition-fix-spec-\
+             2026-06-14.md + the bench trace 2026-06-14",
         );
         // Both threshold values must appear (1920 width OR 1080 height).
         // Drop either and the gate stops covering some 1080p shape
         // (portrait 1080×1920 vs landscape 1920×1080).
-        let gate_window_start = src.find("poster_a_is_1080p_class");
+        let gate_window_start = src.find("video_a_is_1080p_class");
         match gate_window_start {
             Some(start) => {
                 // Window large enough to span the match arms.
-                let end = (start + 400).min(src.len());
+                let end = (start + 600).min(src.len());
                 let window = &src[start..end];
                 assert!(
                     window.contains("1920"),
@@ -5681,8 +5687,25 @@ mod tests {
                     "1080p-class gate must threshold on >= 1080 height. \
                      Window:\n{window}",
                 );
+                // Pin both decoder accessors so a refactor that drops
+                // either branch (Video / TextOverVideo) silently falls
+                // through to live-only for the other variant.
+                assert!(
+                    window.contains("decoder.capture_dims"),
+                    "TransitionEndpoint::Video arm must read decoder.\
+                     capture_dims() — without it, 1080p Video endpoints \
+                     drop to the live path + risk dual-1080p contention. \
+                     Window:\n{window}",
+                );
+                assert!(
+                    window.contains("bg_decoder.capture_dims"),
+                    "TransitionEndpoint::TextOverVideo arm must read \
+                     bg_decoder.capture_dims() — without it, 1080p text-\
+                     over-video endpoints drop to the live path. \
+                     Window:\n{window}",
+                );
             }
-            None => panic!("poster_a_is_1080p_class not found in hdmi.rs"),
+            None => panic!("video_a_is_1080p_class not found in hdmi.rs"),
         }
     }
 

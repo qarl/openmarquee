@@ -5408,8 +5408,16 @@ pub fn paint_and_present_one_transition_frame(
         // The matches! on a shared borrow doesn't hold across
         // statements; we then read the bool downstream.
         //
-        // 2026-06-14 Option A — video↔video transitions on Pi Zero 2 W
-        // class hardware (single bcm2835-codec H.264 block):
+        // 2026-06-14 Option A iteration 2 — video↔video transitions on
+        // Pi Zero 2 W class hardware (single bcm2835-codec H.264
+        // block). Iteration 1 (commit a9ce2ef) gated on the POSTER
+        // PNG's pixel dimensions and broke on FYS because posters
+        // are authored at 1920×1080 for ALL videos regardless of the
+        // underlying video's coded resolution (bench trace:
+        // poster_b_sourced ... dims=1920x1080 despite videos being
+        // 1280×720). The poster dims are the wrong signal — what
+        // matters for codec contention is the VIDEO's actual decoded
+        // frame size at the V4L2 CAPTURE queue.
         //
         // The c3.2.2 poster fast-path freezes BOTH endpoints to stills
         // during the transition window. That solves the dual-1080p
@@ -5430,26 +5438,51 @@ pub fn paint_and_present_one_transition_frame(
         // decoder for ~3.4s on 720p (the spec'd freeze) or fail
         // outright on 1080p.
         //
-        // The gate below distinguishes "small enough to live-decode
+        // Iteration 2 gate distinguishes "small enough to live-decode
         // both" from "large enough that even one extra live decoder
-        // wedges" via the poster's pixel dimensions. ≥1920w OR ≥1080h
-        // keeps the existing c3.x freeze-both behavior (1080p stays
-        // poster-on-both because the second decoder can't be brought
-        // up reliably). <1080p → a stays live; only b freezes.
+        // wedges" via the VIDEO's negotiated CAPTURE format dims
+        // (`Decoder::capture_dims()` returning the actually-decoded
+        // width × height as the bcm2835-codec settled on at
+        // S_FMT/G_FMT). ≥1920w OR ≥1080h keeps the existing c3.x
+        // freeze-both behavior (1080p+ stays poster-on-both because
+        // the second decoder can't be brought up reliably). <1080p
+        // → a stays live; only b freezes.
+        //
+        // For TextOverVideo endpoints the gate reads the bg-video's
+        // decoder dims (bg_decoder). For pure Video, it's the slide's
+        // own decoder. For Text-only / Image, the matches!() arm
+        // below filters them out before the gate is consulted.
+        //
+        // Decoder::capture_dims() returning None (decoder not yet
+        // negotiated) defaults to NOT-1080p, matching the 720p
+        // Option A live path — the safer choice on unknown dims:
+        // a live decoder always works on the 720p hardware, while
+        // a poster freeze with a half-primed decoder would mute
+        // outgoing motion for no reason. Unreachable in practice
+        // because cache.video_decoders only holds post-prime
+        // entries, but defensive.
         //
         // Invariant during the transition: exactly ONE live V4L2
         // decoder (endpoint a). b's decoder, if it exists in the
         // cache, is NOT drained inside this function on the b-poster
         // path (run_blit_pass blits the poster into transition_fbo_b
         // without touching the V4L2 sample queue).
-        let poster_a_is_1080p_class = match poster_a_texture {
-            Some((_, w, h)) => w >= 1920 || h >= 1080,
-            None => false,
+        let video_a_is_1080p_class = match &endpoint_a {
+            TransitionEndpoint::Video { decoder, .. } => {
+                let dims = decoder.capture_dims();
+                dims.map(|(w, h)| w >= 1920 || h >= 1080).unwrap_or(false)
+            }
+            TransitionEndpoint::TextOverVideo { bg_decoder, .. } => {
+                let dims = bg_decoder.capture_dims();
+                dims.map(|(w, h)| w >= 1920 || h >= 1080).unwrap_or(false)
+            }
+            _ => false,
         };
         let use_poster_a = matches!(
             &endpoint_a,
             TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
-        ) && poster_a_is_1080p_class;
+        ) && poster_a_texture.is_some()
+            && video_a_is_1080p_class;
         let endpoint_a_is_text_over_video =
             matches!(&endpoint_a, TransitionEndpoint::TextOverVideo { .. });
         let inputs_a = match &mut endpoint_a {
