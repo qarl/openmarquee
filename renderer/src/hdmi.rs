@@ -8995,6 +8995,65 @@ unsafe fn bake_video_slide_to_current_fbo(
         let t_phase_shader = std::time::Instant::now();
         let took_dmabuf = {
             let gl = session.gl;
+            // 2026-06-14 iter-4 — QA bench (iter-3 probe) confirmed
+            // transition_tex_a is BLACK (luma=0) every tick across
+            // every transition kind despite bake_a returning Ok(Some)
+            // and endpoint_a_no_frame=0. Probe tex IDs stable, FBO
+            // bound correctly. The remaining gap: this DMABUF draw
+            // is succeeding from the function's perspective but the
+            // pixels aren't landing in the bound FBO's
+            // COLOR_ATTACHMENT0 (transition_tex_a).
+            //
+            // Three GL state hazards that survive across the
+            // PaintSlide → PaintTransition boundary on the IPC
+            // sidecar's persistent EglSession AND that can SILENTLY
+            // suppress fragment output:
+            //
+            //   1. SCISSOR_TEST left enabled with a stale rect from a
+            //      prior pass (atlas SB, render_transition_scissored
+            //      _bake_in_session, or any ticker_clip path). If the
+            //      scissor rect doesn't intersect the FBO, the
+            //      fragment shader still RUNS but every fragment is
+            //      culled — net effect: clear-color (BLACK) survives.
+            //   2. COLOR_MASK left as (false, false, false, false) by
+            //      some pre-pass (rare, but the API permits and a
+            //      future state-saving compositor change could land
+            //      one). Same outcome: fragment runs, write masked.
+            //   3. GL command queue not flushed before Frame::drop
+            //      re-QBUFs the dma_buf. If the codec writes a new
+            //      frame to the same slot before the GPU executes
+            //      the queued draw, the EGLImage's view of the data
+            //      changes mid-flight — the sampler can read
+            //      zeroes if the V4L2 driver clears the slot during
+            //      QBUF (some bcm2835-codec firmware revisions do).
+            //
+            // Steady-state PaintSlide doesn't see this because
+            // eglSwapBuffers between bake and the next tick acts as
+            // an implicit flush + clears scissor + blend state from
+            // the front-buffer swap. Offscreen-FBO transition bakes
+            // get no such barrier.
+            //
+            // Defensive fix: explicitly DISABLE both SCISSOR_TEST and
+            // BLEND before the DMABUF draw (we want every fragment to
+            // write, no source over-ops), and gl.flush() right after
+            // so the GPU pipeline doesn't get to defer the draw past
+            // Frame::drop. Restore prior state after the draw — the
+            // caller may have set them deliberately and we must not
+            // surprise downstream paths (paint_slide_with_viewport
+            // re-enables BLEND on its own; the SCISSOR pre-state is
+            // restored verbatim).
+            let scissor_was_enabled = gl.is_enabled(glow::SCISSOR_TEST);
+            let blend_was_enabled = gl.is_enabled(glow::BLEND);
+            if scissor_was_enabled {
+                gl.disable(glow::SCISSOR_TEST);
+            }
+            if blend_was_enabled {
+                gl.disable(glow::BLEND);
+            }
+            // Also force a known-good COLOR_MASK so a stray (false,
+            // false, false, false) from some prior pass can't silently
+            // suppress the fragment writes.
+            gl.color_mask(true, true, true, true);
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
@@ -9010,7 +9069,7 @@ unsafe fn bake_video_slide_to_current_fbo(
             } else {
                 None
             };
-            run_nv12_dmabuf_blit_pass(
+            let result = run_nv12_dmabuf_blit_pass(
                 gl,
                 cover_vbo,
                 session.egl_lib,
@@ -9021,7 +9080,24 @@ unsafe fn bake_video_slide_to_current_fbo(
                 stride,
                 y_crop_max,
                 cache_slot,
-            )?
+            )?;
+            // Force the GPU to issue the queued draw before
+            // Frame::drop re-QBUFs the dma_buf slot. glFinish would
+            // BLOCK until completion (correct but expensive on vc4
+            // ~1-2 ms); glFlush just kicks the queue (cheaper, and
+            // sufficient if the driver respects EGLImage backing
+            // lifetime across QBUF). Use Flush as the default — if
+            // QA's next probe still shows transition_tex_a=BLACK,
+            // we promote to Finish.
+            gl.flush();
+            // Restore prior state.
+            if scissor_was_enabled {
+                gl.enable(glow::SCISSOR_TEST);
+            }
+            if blend_was_enabled {
+                gl.enable(glow::BLEND);
+            }
+            result
         };
         if let Some(t) = t_blit {
             eprintln!(
