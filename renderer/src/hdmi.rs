@@ -6127,12 +6127,37 @@ pub fn paint_and_present_one_transition_frame(
         //
         // This probe reads a tiny center patch from each FBO RIGHT
         // BEFORE the composite shader runs and logs mean luma. It
-        // throttles to a single tick near mid-transition so the
-        // glReadPixels cost (~1-2ms per call on vc4 720p) doesn't
-        // dominate. Read from COLOR_ATTACHMENT0 by binding the FBO
-        // to READ_FRAMEBUFFER + READ_BUFFER COLOR_ATTACHMENT0 (GLES2
+        // throttles to a single tick PER TRANSITION (latched on the
+        // first tick where progress >= 0.4) so the glReadPixels
+        // cost (~1-2ms per call on vc4 720p) doesn't dominate. Read
+        // from COLOR_ATTACHMENT0 by binding the FBO to READ_
+        // FRAMEBUFFER + READ_BUFFER COLOR_ATTACHMENT0 (GLES2
         // single-attachment FBO so this is the default).
-        if (progress - 0.5).abs() < 0.05 {
+        //
+        // iter-5 widens the trigger over iter-3's
+        // `|progress - 0.5| < 0.05` window — QA bench observed that
+        // under jank (load 17 on iter-4), progress jumps past 0.45
+        // → 0.55 in a single tick and the narrow window fires zero
+        // times. The new latch fires on the first tick where
+        // progress >= 0.4 AND resets when a NEW transition starts
+        // (detected by progress dropping >0.1 from last seen). So
+        // we ALWAYS get a side=a luma reading per transition even
+        // if the paint loop is grinding.
+        let probe_fire = TRANSITION_TEX_PROBE_LAST_PROGRESS.with(|cell| {
+            let last = cell.get();
+            // "New transition" detected by progress dropping (the
+            // monotonic progress 0→1 means a drop crosses a tick
+            // boundary). 0.1 hysteresis tolerates float jitter.
+            let new_transition = progress < last - 0.1;
+            let fire_now = if new_transition {
+                progress >= 0.4
+            } else {
+                last < 0.4 && progress >= 0.4
+            };
+            cell.set(progress);
+            fire_now
+        });
+        if probe_fire {
             let mut probe = |label: &str, fbo: glow::NativeFramebuffer, tex: glow::NativeTexture| {
                 let cx = (mode_w_u32 / 2).saturating_sub(2);
                 let cy = (mode_h_u32 / 2).saturating_sub(2);
@@ -7853,6 +7878,18 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
     static OVERLAY_BLEND_PROGRAM: std::cell::Cell<Option<CachedOverlayBlendProgram>> =
         const { std::cell::Cell::new(None) };
+    /// 2026-06-14 iter-5: per-transition latch for the transition_
+    /// tex_probe debug emit in paint_and_present_one_transition_
+    /// frame. Stores the LAST progress value passed in; the probe
+    /// fires on the first tick where progress crosses 0.4 from
+    /// below, then naturally re-arms when progress drops by >0.1
+    /// (= the start of a new transition window where progress
+    /// resets near 0). Initial value 2.0 = "out of range, no
+    /// transition has run yet" so the first transition reliably
+    /// fires the probe. The IPC sidecar is single-threaded so a
+    /// thread_local Cell is sufficient.
+    static TRANSITION_TEX_PROBE_LAST_PROGRESS: std::cell::Cell<f32> =
+        const { std::cell::Cell::new(2.0) };
     /// P2-G (2026-05-10): shared fullscreen-quad VBO for every
     /// post-pass that draws a textured fullscreen quad
     /// (run_bright_gamma_pass + run_blit_pass +
@@ -9081,15 +9118,28 @@ unsafe fn bake_video_slide_to_current_fbo(
                 y_crop_max,
                 cache_slot,
             )?;
-            // Force the GPU to issue the queued draw before
-            // Frame::drop re-QBUFs the dma_buf slot. glFinish would
-            // BLOCK until completion (correct but expensive on vc4
-            // ~1-2 ms); glFlush just kicks the queue (cheaper, and
-            // sufficient if the driver respects EGLImage backing
-            // lifetime across QBUF). Use Flush as the default — if
-            // QA's next probe still shows transition_tex_a=BLACK,
-            // we promote to Finish.
-            gl.flush();
+            // iter-4 had `gl.flush()` here as a defense against the
+            // GPU deferring the draw past Frame::drop. QA bench
+            // 2026-06-14 caught the cost: per-tick flush on the
+            // Pi Zero 2 W vc4 drove load to 17.42 + max_delta_ms=
+            // 457450 (7.6-minute paint freeze) → watchdog reboot.
+            // The flush was issuing real GPU sync work every tick;
+            // catastrophic on this tier.
+            //
+            // iter-5 drops the flush. GL's spec guarantees that a
+            // read from `tex_a` at composite time implicitly waits
+            // for prior writes to `tex_a`'s FBO to complete — the
+            // sampler in the transition shader is enough of a
+            // dependency edge for the driver to serialize correctly.
+            // The dma_buf-overwrite race we feared (codec
+            // overwriting the buffer between our draw and its
+            // execution) is bounded by the r101 EGLImage cache
+            // keeping the EGLImage alive; if the dma_buf-backed
+            // EGLImage import doesn't honor late-read semantics on
+            // Mesa+vc4, iter-6 would copy the EGLImage into a
+            // regular GL_TEXTURE_2D BEFORE Frame::drop — but that's
+            // the expensive last resort, and we only ship it if
+            // iter-5's bench shows the from-side STILL black.
             // Restore prior state.
             if scissor_was_enabled {
                 gl.enable(glow::SCISSOR_TEST);
