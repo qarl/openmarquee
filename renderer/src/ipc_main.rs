@@ -3672,14 +3672,17 @@ fn handle_inner_request(
             #[cfg(target_os = "linux")]
             {
                 let active_decoder_count = cache.video_decoders.len();
-                let bg_is_video = match cache.items.peek(&preload_id) {
-                    Some(crate::content::ContentItem::Video(_)) => true,
-                    Some(crate::content::ContentItem::Text(s)) => {
-                        s.background_video_slide_id.is_some()
-                    }
-                    Some(crate::content::ContentItem::Image(_)) => false,
-                    None => false,
+                // 2026-06-14 Option A: resolve the bg-video id from
+                // the same peek the bg_is_video predicate uses, so
+                // the still-coverage check below can probe disk for
+                // a poster.png at the correct path without a second
+                // LRU access.
+                let bg_video_id: Option<uuid::Uuid> = match cache.items.peek(&preload_id) {
+                    Some(crate::content::ContentItem::Video(_)) => Some(preload_id),
+                    Some(crate::content::ContentItem::Text(s)) => s.background_video_slide_id,
+                    Some(crate::content::ContentItem::Image(_)) | None => None,
                 };
+                let bg_is_video = bg_video_id.is_some();
                 // r98 (2026-06-09): preload-mode gate. The r97 defer
                 // logic runs only when OPENMARQUEE_PRELOAD_MODE is
                 // 'defer' (default). 'lead' and 'max' modes force
@@ -3696,38 +3699,105 @@ fn handle_inner_request(
                         bg_is_video,
                     )
                 {
-                    let us = t_enqueue.elapsed().as_micros();
-                    // List the active decoder ids so QA can correlate
-                    // which decoder #1 is the contention partner.
-                    let active_decoder_ids: Vec<String> = cache
-                        .video_decoders
-                        .keys()
-                        .map(|id| id.to_string())
-                        .collect();
-                    eprintln!(
-                        "[perf] preload_deferred_for_codec_contention slide_id={} \
-                         active_decoder_count={} active_decoder_ids=[{}] deferral_us={}",
-                        preload_id,
-                        active_decoder_count,
-                        active_decoder_ids.join(","),
-                        us,
-                    );
-                    // Mirror the canonical preload_handoff shape with
-                    // was_deferred=true so log-scanners can
-                    // distinguish frames_drained=0-from-deferral from
-                    // frames_drained=0-from-codec-contention (the
-                    // smoking-gun line that drove this fix).
-                    eprintln!(
-                        "[perf] preload_handoff slide_id={} frames_drained=0 \
-                         prime_only_us=0 drain_us=0 budget_ms=0 was_deferred=true",
-                        preload_id,
-                    );
-                    eprintln!(
-                        "[perf] preload slide_id={} us={} deferred_us={} \
-                         reason=codec_contention",
-                        preload_id, us, us,
-                    );
-                    return ok_empty();
+                    // 2026-06-14 Option A — video→video transitions
+                    // on Pi Zero 2 W (single bcm2835-codec block):
+                    // r97 deferred the worker under contention so a
+                    // second decoder wouldn't compete with the
+                    // current one. Under defer that pushed the
+                    // cold-start prime onto BeginTransition's
+                    // synchronous path — delta_ms up to ~3385 ms
+                    // freeze on the paint loop (qarl's "multi-
+                    // second freeze" symptom). Option A: when a
+                    // poster.png exists for the new slide's bg
+                    // video, the transition window is covered by
+                    // the still (bake_b's poster fast-path inside
+                    // `paint_and_present_one_transition_frame` —
+                    // search for `if use_poster_b {` in hdmi.rs),
+                    // so the visible cost of a contended prime is
+                    // a brief 1-second steady-state-A jitter window
+                    // instead of a paint-loop freeze. Skip the
+                    // defer arm so the worker primes b's decoder
+                    // off-thread; by BeginTransition cache.load is
+                    // a fast no-op.
+                    //
+                    // If no poster exists (backend hasn't run the
+                    // import recipe for a fresh upload), fall back
+                    // to the r97 defer behavior — without a still
+                    // there's nothing to cover the visible cold-
+                    // start gap, and eager prime would be net-
+                    // negative.
+                    //
+                    // is_file (not exists) so a half-extracted
+                    // archive directory at the poster path falls
+                    // through to defer rather than spawning a
+                    // worker against a still that won't load.
+                    let has_poster_cover = bg_video_id
+                        .map(|bg_id| {
+                            crate::content::video_slide_poster_path(content_root, bg_id)
+                                .is_file()
+                        })
+                        .unwrap_or(false);
+                    if has_poster_cover {
+                        // Probe shape parity with `preload_deferred_for_codec_
+                        // contention` above so log-scanners can keep a single
+                        // line-parser across both paths: same slide_id +
+                        // active_decoder_count + active_decoder_ids[] +
+                        // deferral_us=0 (no actual deferral, but the field's
+                        // presence keeps the format stable).
+                        let active_decoder_ids: Vec<String> = cache
+                            .video_decoders
+                            .keys()
+                            .map(|id| id.to_string())
+                            .collect();
+                        eprintln!(
+                            "[perf] preload_defer_skipped_for_still_coverage \
+                             slide_id={} bg_video_id={} \
+                             active_decoder_count={} active_decoder_ids=[{}] \
+                             deferral_us=0",
+                            preload_id,
+                            bg_video_id.expect("guarded by has_poster_cover above"),
+                            active_decoder_count,
+                            active_decoder_ids.join(","),
+                        );
+                        // Intentionally fall through to spawn the
+                        // worker below. The defer-warn / handoff
+                        // probes below do NOT fire on this path.
+                    } else {
+                        let us = t_enqueue.elapsed().as_micros();
+                        // List the active decoder ids so QA can
+                        // correlate which decoder #1 is the
+                        // contention partner.
+                        let active_decoder_ids: Vec<String> = cache
+                            .video_decoders
+                            .keys()
+                            .map(|id| id.to_string())
+                            .collect();
+                        eprintln!(
+                            "[perf] preload_deferred_for_codec_contention slide_id={} \
+                             active_decoder_count={} active_decoder_ids=[{}] deferral_us={}",
+                            preload_id,
+                            active_decoder_count,
+                            active_decoder_ids.join(","),
+                            us,
+                        );
+                        // Mirror the canonical preload_handoff
+                        // shape with was_deferred=true so log-
+                        // scanners can distinguish frames_drained=
+                        // 0-from-deferral from frames_drained=0-
+                        // from-codec-contention (the smoking-gun
+                        // line that drove this fix).
+                        eprintln!(
+                            "[perf] preload_handoff slide_id={} frames_drained=0 \
+                             prime_only_us=0 drain_us=0 budget_ms=0 was_deferred=true",
+                            preload_id,
+                        );
+                        eprintln!(
+                            "[perf] preload slide_id={} us={} deferred_us={} \
+                             reason=codec_contention",
+                            preload_id, us, us,
+                        );
+                        return ok_empty();
+                    }
                 }
             }
             // r65 core: spawn worker. The main thread returns
@@ -5520,5 +5590,135 @@ mod tests {
             }
         }
         Some(lines[start..pos].join("\n"))
+    }
+
+    // ============================================================
+    // 2026-06-14 Option A — video→video transition fix on Pi Zero
+    // 2 W single bcm2835-codec hardware. Two source-grep regression-
+    // locks pinning the new behavior:
+    //   1. PreloadSlide arm checks for a poster.png cover BEFORE
+    //      taking the r97 contention defer arm. Without this, the
+    //      cold-start prime ends up on BeginTransition's synchronous
+    //      path and qarl sees the multi-second freeze again.
+    //   2. paint_and_present_one_transition_frame gates use_poster_a
+    //      to 1080p-class posters only. Without this, 720p endpoints
+    //      freeze on both sides and the outgoing video loses motion.
+    // ============================================================
+
+    #[test]
+    fn preload_slide_arm_has_poster_cover_escape_hatch() {
+        // Pin the still-coverage skip path so a refactor that drops
+        // the disk probe pushes the cold-start prime back onto
+        // BeginTransition (recreating the 3.4s freeze qarl reported
+        // on 2026-06-14).
+        let src = include_str!("ipc_main.rs");
+        assert!(
+            src.contains("preload_defer_skipped_for_still_coverage"),
+            "PreloadSlide arm must emit the still-coverage skip probe so QA \
+             can observe the Option A path firing on FYS",
+        );
+        assert!(
+            src.contains("video_slide_poster_path(content_root,"),
+            "PreloadSlide arm must probe <root>/<bg_id>/poster.png to decide \
+             whether the still can cover the cold-start prime — without the \
+             probe the defer arm falls back to the r97 no-op and the freeze \
+             returns",
+        );
+        // The skip path must run AFTER the r97 defer predicate so it
+        // ONLY rescues the contended case. Without contention we still
+        // want the normal spawn path with no extra disk I/O per
+        // preload.
+        let defer_pred_idx = src.find("should_defer_preload_for_codec_contention(");
+        let escape_idx = src.find("preload_defer_skipped_for_still_coverage");
+        match (defer_pred_idx, escape_idx) {
+            (Some(d), Some(e)) => assert!(
+                d < e,
+                "still-coverage check must appear AFTER the contention \
+                 predicate so the disk probe only runs on the contention \
+                 hot path (d={d} e={e})",
+            ),
+            _ => panic!(
+                "expected both `should_defer_preload_for_codec_contention(` \
+                 and `preload_defer_skipped_for_still_coverage` substrings \
+                 in ipc_main.rs",
+            ),
+        }
+    }
+
+    #[test]
+    fn paint_transition_use_poster_a_gated_to_1080p_class() {
+        // Source-grep regression-lock: paint_and_present_one_transition
+        // _frame must gate use_poster_a behind a poster_a_is_1080p_class
+        // check (poster_w >= 1920 || poster_h >= 1080). For 720p
+        // endpoints, a stays on the live decode path so outgoing motion
+        // is preserved across the transition (Option A invariant).
+        let src = include_str!("hdmi.rs");
+        // The variable name + the dimension thresholds are both pinned
+        // so a future refactor can rename the variable but can't drop
+        // the dimensional gate without tripping the test.
+        assert!(
+            src.contains("poster_a_is_1080p_class"),
+            "use_poster_a gate must compute a `poster_a_is_1080p_class` \
+             bool from poster_a_texture dimensions — see Option A spec \
+             at qa/video-to-video-transition-fix-spec-2026-06-14.md",
+        );
+        // Both threshold values must appear (1920 width OR 1080 height).
+        // Drop either and the gate stops covering some 1080p shape
+        // (portrait 1080×1920 vs landscape 1920×1080).
+        let gate_window_start = src.find("poster_a_is_1080p_class");
+        match gate_window_start {
+            Some(start) => {
+                // Window large enough to span the match arms.
+                let end = (start + 400).min(src.len());
+                let window = &src[start..end];
+                assert!(
+                    window.contains("1920"),
+                    "1080p-class gate must threshold on >= 1920 width. \
+                     Window:\n{window}",
+                );
+                assert!(
+                    window.contains("1080"),
+                    "1080p-class gate must threshold on >= 1080 height. \
+                     Window:\n{window}",
+                );
+            }
+            None => panic!("poster_a_is_1080p_class not found in hdmi.rs"),
+        }
+    }
+
+    #[test]
+    fn paint_transition_use_poster_a_ungated_for_text_image_endpoints() {
+        // Defensive: the use_poster_a gate must STILL filter on
+        // matches!(endpoint_a, Video | TextOverVideo) so Text/Image
+        // endpoints (which carry no video bg) don't accidentally pick
+        // up a poster path. Pin both halves of the `&&` so a future
+        // refactor can't drop the kind-filter.
+        let src = include_str!("hdmi.rs");
+        // The `let use_poster_a = matches!(&endpoint_a, ...)` line
+        // must still mention Video and TextOverVideo.
+        let use_poster_a_line = src
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains("let use_poster_a"))
+            .map(|(i, _)| i)
+            .expect("let use_poster_a = ... line must exist");
+        let window: String = src
+            .lines()
+            .skip(use_poster_a_line)
+            .take(8)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            window.contains("TransitionEndpoint::Video"),
+            "use_poster_a must still kind-filter on TransitionEndpoint::\
+             Video so Text/Image endpoints don't take the poster path. \
+             Window:\n{window}",
+        );
+        assert!(
+            window.contains("TransitionEndpoint::TextOverVideo"),
+            "use_poster_a must still kind-filter on TransitionEndpoint::\
+             TextOverVideo so text-only endpoints don't take the poster \
+             path. Window:\n{window}",
+        );
     }
 }

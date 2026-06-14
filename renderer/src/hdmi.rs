@@ -5407,10 +5407,49 @@ pub fn paint_and_present_one_transition_frame(
         // borrow on endpoint_a) BEFORE inputs_a takes &mut.
         // The matches! on a shared borrow doesn't hold across
         // statements; we then read the bool downstream.
+        //
+        // 2026-06-14 Option A — video↔video transitions on Pi Zero 2 W
+        // class hardware (single bcm2835-codec H.264 block):
+        //
+        // The c3.2.2 poster fast-path freezes BOTH endpoints to stills
+        // during the transition window. That solves the dual-1080p
+        // contention case (firmware can't sustain two 1080p decoders)
+        // but REGRESSES the 720p case — qarl's "video→video transition
+        // should show video on BOTH sides through the whole transition"
+        // ask. Symptom on the wall: transition is two frozen frames
+        // crossfading; outgoing video lost motion. Renderer load also
+        // spiked from r103.1's ~1 to c3.x's ~6 because both endpoints'
+        // text+composite paths still ran on top of the poster blit.
+        //
+        // Option A (see qa/video-to-video-transition-fix-spec-2026-
+        // 06-14.md): keep the OUTGOING (a) endpoint on its WARM live
+        // decoder — it's already running per-tick during steady-state
+        // A and the kernel pipeline is full; no contention cost to
+        // keep draining. Use poster ONLY on the INCOMING (b) endpoint
+        // where the cold-start would otherwise wedge the second
+        // decoder for ~3.4s on 720p (the spec'd freeze) or fail
+        // outright on 1080p.
+        //
+        // The gate below distinguishes "small enough to live-decode
+        // both" from "large enough that even one extra live decoder
+        // wedges" via the poster's pixel dimensions. ≥1920w OR ≥1080h
+        // keeps the existing c3.x freeze-both behavior (1080p stays
+        // poster-on-both because the second decoder can't be brought
+        // up reliably). <1080p → a stays live; only b freezes.
+        //
+        // Invariant during the transition: exactly ONE live V4L2
+        // decoder (endpoint a). b's decoder, if it exists in the
+        // cache, is NOT drained inside this function on the b-poster
+        // path (run_blit_pass blits the poster into transition_fbo_b
+        // without touching the V4L2 sample queue).
+        let poster_a_is_1080p_class = match poster_a_texture {
+            Some((_, w, h)) => w >= 1920 || h >= 1080,
+            None => false,
+        };
         let use_poster_a = matches!(
             &endpoint_a,
             TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
-        ) && poster_a_texture.is_some();
+        ) && poster_a_is_1080p_class;
         let endpoint_a_is_text_over_video =
             matches!(&endpoint_a, TransitionEndpoint::TextOverVideo { .. });
         let inputs_a = match &mut endpoint_a {
