@@ -364,6 +364,25 @@ pub struct EglSession<'a> {
     /// (HDMI hot-plug, rotation flip). `None` while the cache
     /// is empty.
     transition_fbo_dims: Option<(u32, u32)>,
+    /// 2026-06-14 iter-8 (Option A on the lean r103.1 base): per-
+    /// video first-frame still cache. Captured via glCopyTexImage2D
+    /// from the bound fb on the FIRST steady-state paint of each
+    /// video (frames_decoded == 0 && rotation == 0). Used by the
+    /// transition path's INCOMING (b) endpoint so the b side
+    /// blits a pre-decoded 2D still instead of draining a second
+    /// V4L2 decoder concurrent with the outgoing (a) side. Net
+    /// invariant: exactly ONE live decoder during a visible
+    /// video→video transition (the outgoing one). RGBA8 GL_
+    /// TEXTURE_2D — ~3.5 MB at 720p per video id. Per the QA
+    /// analysis at qa/v2v-lean-analysis-2026-06-14.md, this is
+    /// the lean-base equivalent of c3.x's PosterCache (no poster.
+    /// png asset required; uses the proven r62 first_frame_tex
+    /// mechanism but capturing the pure video frame BEFORE any
+    /// text composite and keyed by video-id instead of slide-id).
+    /// Lifetime: held until session teardown (mode change or
+    /// EglSession drop); apply an LRU/cap follow-up if the in-
+    /// playlist video count is high enough to push VRAM.
+    video_first_still: std::collections::HashMap<uuid::Uuid, glow::NativeTexture>,
     /// STREAM/VLC slice-9 follow-up: persistent texture for the
     /// external-frame push-paint path. Allocated once with
     /// glTexImage2D and thereafter updated in place with
@@ -737,6 +756,7 @@ where
         transition_fbo_b: None,
         transition_tex_b: None,
         transition_fbo_dims: None,
+        video_first_still: std::collections::HashMap::new(),
         external_frame_tex: None,
         external_nv12_tex: None,
         current_settings: crate::content::Settings::default(),
@@ -879,6 +899,16 @@ where
         // closes the last divergent path.
         for (_slide_id, entry) in session.slide_caches.drain() {
             free_slide_render_cache(&gl, entry);
+        }
+        // 2026-06-14 iter-8: drain video_first_still HashMap. Each
+        // entry is a session-owned GL_TEXTURE_2D allocated by
+        // try_capture_video_first_still during steady-state pure-
+        // video paints. Matches the image_bg_cache / slide_caches
+        // pattern above: explicit delete_texture while context is
+        // bound keeps driver bookkeeping clean even though EGL
+        // teardown would reclaim the kernel objects anyway.
+        for (_video_id, tex) in session.video_first_still.drain() {
+            unsafe { gl.delete_texture(tex); }
         }
     }
     // qarl-direct perf-profile (2026-05-08): free thread-local
@@ -3225,6 +3255,9 @@ pub fn render_video_slide_in_session(
             &mut state.next_sample_idx,
             &mut state.frames_decoded,
             &state.decoder,
+            // Standalone reel: no transition context; skip the
+            // first-still capture.
+            None,
         )?;
         let elapsed = frame_start.elapsed();
         if elapsed < frame_budget {
@@ -3935,6 +3968,14 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             // (or scene FBO when rotated). eglSwapBuffers is the
             // implicit barrier; no extra flush needed.
             false,
+            // iter-8 still capture: key by the TextSlide's
+            // background_video_slide_id (the underlying video) so
+            // the captured still is the PURE VIDEO frame (before
+            // text composite runs below). This is the correct key
+            // for the transition incoming-still lookup — a future
+            // transition into ANY slide using the same bg video
+            // can reuse it.
+            slide.background_video_slide_id,
         )?
     };
     // r61 Phase B: snapshot bake duration before its record_phase
@@ -4562,6 +4603,12 @@ pub fn paint_and_present_one_video_slide_frame(
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
+    // 2026-06-14 iter-8 (Option A): when Some, capture this paint's
+    // first decoded frame as a `video_first_still` keyed by this id
+    // so the transition path's incoming (b) endpoint can blit it as
+    // a still instead of draining a second live decoder. None: skip
+    // the capture (standalone reel path; no transition context).
+    capture_still_for_video_id: Option<uuid::Uuid>,
 ) -> Result<()> {
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
@@ -4625,6 +4672,11 @@ pub fn paint_and_present_one_video_slide_frame(
             // Steady-state pure-video paints into the WINDOW FB.
             // eglSwapBuffers is the implicit barrier.
             false,
+            // iter-8 still capture: forward the caller-provided
+            // video id so bake_video grabs the pure video frame
+            // for the transition incoming-still cache on the FIRST
+            // frame of each video id.
+            capture_still_for_video_id,
         )?
     };
     let Some(path_label) = painted else {
@@ -4955,6 +5007,7 @@ pub fn paint_and_present_one_transition_frame(
             image_a = Some((slide.id, crate::content::image_slide_asset_path(root, slide.id)));
         }
         TransitionEndpoint::Video { .. } => {}
+        TransitionEndpoint::VideoStill { .. } => {}
         TransitionEndpoint::TextOverVideo { text_slide, .. } => {
             let (bg, _, layers) = resolve_slide_layers(text_slide, fonts, content_root)?;
             // r50 subagent (2026-06-03 NIT): warn if a text-over-
@@ -4991,6 +5044,7 @@ pub fn paint_and_present_one_transition_frame(
             image_b = Some((slide.id, crate::content::image_slide_asset_path(root, slide.id)));
         }
         TransitionEndpoint::Video { .. } => {}
+        TransitionEndpoint::VideoStill { .. } => {}
         TransitionEndpoint::TextOverVideo { text_slide, .. } => {
             let (bg, _, layers) = resolve_slide_layers(text_slide, fonts, content_root)?;
             if !matches!(bg, BgKind::Solid(_)) {
@@ -5047,6 +5101,9 @@ pub fn paint_and_present_one_transition_frame(
                 frames_decoded: &mut **frames_decoded,
                 decoder: *decoder,
             },
+            TransitionEndpoint::VideoStill { tex } => {
+                SlideBakeInputs::VideoStill { tex: *tex }
+            }
             TransitionEndpoint::TextOverVideo {
                 bg_samples,
                 bg_next_sample_idx,
@@ -5223,6 +5280,9 @@ pub fn paint_and_present_one_transition_frame(
                     frames_decoded: &mut **frames_decoded,
                     decoder: *decoder,
                 },
+                TransitionEndpoint::VideoStill { tex } => {
+                    SlideBakeInputs::VideoStill { tex: *tex }
+                }
                 TransitionEndpoint::TextOverVideo {
                     bg_samples,
                     bg_next_sample_idx,
@@ -5736,6 +5796,32 @@ pub enum TransitionEndpoint<'a> {
         bg_next_sample_idx: &'a mut usize,
         bg_frames_decoded: &'a mut usize,
         bg_decoder: &'a crate::v4l2::Decoder,
+    },
+    /// 2026-06-14 iter-8 (Option A): a pre-decoded video first-frame
+    /// still. The IPC PaintTransition handler constructs this for
+    /// the INCOMING (b) endpoint when `session.video_first_still`
+    /// has an entry for the to-side video id AND the to-side is a
+    /// pure VideoSlide, so the transition's b-side bake doesn't
+    /// drain a second V4L2 decoder concurrent with the outgoing (a)
+    /// side. Net: exactly ONE live decoder during a visible
+    /// video→video transition.
+    ///
+    /// `tex` is the cached RGBA8 GL_TEXTURE_2D from
+    /// `session.video_first_still[video_id]`. The bake dispatcher
+    /// blits it via `run_blit_pass` into the offscreen
+    /// transition_fbo_b — the same path the c3.x poster used;
+    /// proven safe on Mesa+vc4 because the source is a regular 2D
+    /// texture (the external-OES → offscreen-FBO bug is specifically
+    /// the dma_buf-backed source, not regular 2D textures).
+    ///
+    /// iter-8 scopes this variant to PURE-VIDEO endpoints only. An
+    /// incoming TextOverVideo endpoint continues to use the live
+    /// `TextOverVideo` variant with iter-7's scoped flush; the live
+    /// text-on-video composite path stays in place for now. A
+    /// follow-up could extend VideoStill to carry text overlay
+    /// state for incoming TextOverVideo too.
+    VideoStill {
+        tex: glow::NativeTexture,
     },
 }
 
@@ -6867,6 +6953,18 @@ impl<'a> EglSession<'a> {
     /// directly (no paint_and_present round-trip).
     pub fn gl(&self) -> &glow::Context {
         self.gl
+    }
+
+    /// 2026-06-14 iter-8 (Option A): the IPC PaintTransition handler
+    /// queries this to decide whether the incoming (b) endpoint can
+    /// be a VideoStill (cached pre-decoded first frame) or must fall
+    /// back to a live `Video` (drains a second decoder concurrent
+    /// with the outgoing side — the contention path). Returns the
+    /// cached texture on hit; None on miss (no prior steady-state
+    /// paint of this video id, or rotation != 0 disabled the
+    /// capture).
+    pub fn video_first_still(&self, video_id: uuid::Uuid) -> Option<glow::NativeTexture> {
+        self.video_first_still.get(&video_id).copied()
     }
 
     /// v1-spec-delta #10 (slice c) -- update cached settings.
@@ -8210,6 +8308,91 @@ fn bake_offscreen_flush_enabled() -> bool {
     }
 }
 
+/// 2026-06-14 iter-8 (Option A) — capture the PURE video frame from
+/// the currently-bound FRAMEBUFFER into session.video_first_still
+/// keyed by video id. Called from `bake_video_slide_to_current_fbo`
+/// immediately after a successful bake (DMABUF or MMAP) and BEFORE
+/// `drop(frame)`. Gates:
+///   * `capture_for_video_id` is Some (caller opted in — steady-state
+///     callers pass Some(slide.id); transition callers pass None).
+///   * `frames_decoded_pre_inc == 0` — this is the FIRST frame for
+///     this video id. The increment happens AFTER us so we observe
+///     the pre-increment value.
+///   * `session.rotation == 0` — the QA-analysis guard. Rotated
+///     panels fall back to live-both transitions (status quo).
+///   * `!session.video_first_still.contains_key(...)` — idempotent
+///     guard; we only do the GPU→GPU copy once per video id, even
+///     if the playlist loops back to the same video after eviction
+///     of frames_decoded (unlikely but defensive).
+///
+/// On all-gates-pass: allocate an RGBA8 GL_TEXTURE_2D sized to the
+/// session's mode dims (the same dims the transition composite
+/// expects) and `glCopyTexImage2D` from the bound fb. Insert into
+/// the map. The texture lives until session teardown — no LRU yet
+/// (analysis flagged a ~50 MB cap concern for many distinct videos,
+/// follow-up if measured).
+///
+/// Failures (texture alloc fail, copy errors) log a warn and
+/// skip the cache entry; the transition path's else-branch (live
+/// fallback) handles the missing key gracefully.
+#[inline]
+unsafe fn try_capture_video_first_still(
+    session: &mut EglSession,
+    mode_w: u32,
+    mode_h: u32,
+    frames_decoded_pre_inc: usize,
+    capture_for_video_id: Option<uuid::Uuid>,
+) {
+    use glow::HasContext;
+    let Some(video_id) = capture_for_video_id else {
+        return;
+    };
+    if frames_decoded_pre_inc != 0 {
+        return;
+    }
+    if session.rotation != 0 {
+        return;
+    }
+    if session.video_first_still.contains_key(&video_id) {
+        return;
+    }
+    let gl = session.gl;
+    let tex = match gl.create_texture() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "warn: video_first_still: glGenTextures failed for video_id={} ({e}); \
+                 transition incoming will fall back to live decoder",
+                video_id,
+            );
+            return;
+        }
+    };
+    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    // glCopyTexImage2D from the bound FRAMEBUFFER's color attachment
+    // into the new TEXTURE_2D. Mode dims so the still is
+    // composite-target-ready without a resize at blit time.
+    gl.copy_tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA,
+        0,
+        0,
+        mode_w as i32,
+        mode_h as i32,
+        0,
+    );
+    session.video_first_still.insert(video_id, tex);
+    eprintln!(
+        "[perf] video_first_still_captured video_id={} dims={}x{}",
+        video_id, mode_w, mode_h,
+    );
+}
+
 unsafe fn bake_video_slide_to_current_fbo(
     session: &mut EglSession,
     samples: &[crate::mp4_demux::Sample],
@@ -8262,6 +8445,22 @@ unsafe fn bake_video_slide_to_current_fbo(
     // so QA can confirm the bug still reproduces against a known-bad
     // baseline. Default ON.
     is_offscreen_bake: bool,
+    // 2026-06-14 iter-8 (Option A): when Some(video_id), capture the
+    // PURE VIDEO FRAME (right after the bake's V4L2 read + GL blit,
+    // BEFORE any text composite the caller may run on top) via
+    // glCopyTexImage2D into session.video_first_still[video_id].
+    // Only fires on the FIRST decoded frame per video id
+    // (frames_decoded transitioning 0→1) and only when rotation == 0
+    // — rotated panels fall back to live-both transitions (status
+    // quo, FYS is rotation == 0). One ~3.5 MB RGBA8 GL_TEXTURE_2D
+    // per unique video id; identical mechanism + cost shape to the
+    // r62 first_frame_tex capture at hdmi.rs:~13128 but keyed by
+    // VIDEO id (not slide id) and capturing the PURE video frame
+    // (not the composited video+text) so the transition incoming
+    // (b) endpoint can blit it as a clean still + re-composite
+    // text on top. None = skip the capture (transition callers, or
+    // any caller that doesn't want the still cached).
+    capture_still_for_video_id: Option<uuid::Uuid>,
 ) -> Result<Option<&'static str>> {
     use glow::HasContext;
     let profile_first = *next_sample_idx == 1
@@ -8457,6 +8656,21 @@ unsafe fn bake_video_slide_to_current_fbo(
             if is_offscreen_bake && bake_offscreen_flush_enabled() {
                 session.gl.flush();
             }
+            // 2026-06-14 iter-8 (Option A) — capture the pure video
+            // frame for the transition incoming-still cache. Runs
+            // BEFORE drop(frame) so the bound FBO still holds the
+            // bake output; after Frame::drop the dma_buf may be
+            // re-QBUF'd. Gate on `*frames_decoded == 0` so the
+            // capture fires exactly once per video id (the
+            // increment is below). Rotation==0 keeps the gate
+            // aligned with the r62 first_frame_tex precedent.
+            try_capture_video_first_still(
+                session,
+                mode_w,
+                mode_h,
+                *frames_decoded,
+                capture_still_for_video_id,
+            );
             // Drop the Frame so its Drop re-QBUFs CAPTURE BEFORE the
             // caller's buffer swap; holding the Frame across the next
             // advance would starve the codec of CAPTURE buffers.
@@ -8595,6 +8809,18 @@ unsafe fn bake_video_slide_to_current_fbo(
     if is_offscreen_bake && bake_offscreen_flush_enabled() {
         gl.flush();
     }
+    // 2026-06-14 iter-8 (Option A) — capture the pure video frame.
+    // Same gate + ordering as the DMABUF arm; runs BEFORE Frame::
+    // drop so the bound FBO still holds the bake output. Y+UV
+    // uploads + the FS_NV12_TO_RGB blit have completed by the time
+    // we get here (blit_result? was unwrapped above).
+    try_capture_video_first_still(
+        session,
+        mode_w,
+        mode_h,
+        *frames_decoded,
+        capture_still_for_video_id,
+    );
     // Drop the Frame so its Drop re-QBUFs CAPTURE before the
     // caller's swap. Critical: holding the Frame across the next
     // advance starves the codec of CAPTURE buffers.
@@ -8858,6 +9084,15 @@ enum SlideBakeInputs<'a> {
         bg_frames_decoded: &'a mut usize,
         bg_decoder: &'a crate::v4l2::Decoder,
     },
+    /// 2026-06-14 iter-8 (Option A): incoming pure-video still
+    /// endpoint. The dispatcher binds the cached transition_fbo_b
+    /// and blits `tex` (the pre-decoded `video_first_still` from a
+    /// prior steady-state) via `run_blit_pass` cover-fit. No text
+    /// composite (this variant is for pure-Video endpoints only in
+    /// iter-8; TextOverVideo incoming endpoints stay on the live
+    /// path).
+    #[cfg(target_os = "linux")]
+    VideoStill { tex: glow::NativeTexture },
 }
 
 /// Phase 8 slice 3 — create an empty (NativeFramebuffer,
@@ -9122,6 +9357,15 @@ unsafe fn bake_slide_to_fbo(
                 // explicit barrier. is_offscreen_bake=true triggers
                 // the scoped gl.flush() before drop(frame).
                 true,
+                // iter-8: don't capture the still from the transition
+                // bake — the bake is going INTO the offscreen
+                // transition_fbo_a (a regular GL_TEXTURE_2D), and
+                // QA analysis confirms glCopyTexImage2D from a 2D-
+                // backed FBO is safe, but the captured pixels would
+                // be from the transition frame mid-blend, not a
+                // clean steady-state first frame. Capture only fires
+                // in steady-state paths above.
+                None,
             );
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             match paint_result {
@@ -9234,6 +9478,10 @@ unsafe fn bake_slide_to_fbo(
                 // Video branch above; pass true to trigger the
                 // scoped flush before Frame::drop.
                 true,
+                // iter-8: don't capture from transitions; only
+                // steady-state pure-video and text-over-video paths
+                // capture stills.
+                None,
             );
             let painted = match video_result {
                 Ok(Some(_path)) => true,
@@ -9307,6 +9555,34 @@ unsafe fn bake_slide_to_fbo(
                 }
                 return Err(e);
             }
+            Ok(Some((fbo, tex)))
+        }
+        // 2026-06-14 iter-8 (Option A): pure-video incoming-still
+        // endpoint. Bind the cached transition_fbo, clear, blit
+        // the pre-decoded video first-frame via run_blit_pass.
+        // Same shape the c3.x poster fast-path used (proven safe
+        // by QA's iter-5 probe: bake_b's poster blit produced
+        // side=b luma~94 into the offscreen FBO). No live V4L2
+        // decoder is touched on this bake, so the dual-decoder
+        // contention iter-7's flush couldn't eliminate goes away
+        // — the incoming side stops draining its decoder during
+        // the transition window.
+        #[cfg(target_os = "linux")]
+        SlideBakeInputs::VideoStill { tex: still_tex } => {
+            let (fbo, tex) = prepare_bake_fbo_pair(session.gl, mode_w, mode_h, existing_fbo_pair)?;
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+            session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            session.gl.clear(glow::COLOR_BUFFER_BIT);
+            if let Err(e) = run_blit_pass(session.gl, still_tex) {
+                session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                if existing_fbo_pair.is_none() {
+                    session.gl.delete_framebuffer(fbo);
+                    session.gl.delete_texture(tex);
+                }
+                return Err(e);
+            }
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             Ok(Some((fbo, tex)))
         }
     }

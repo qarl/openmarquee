@@ -2427,6 +2427,13 @@ fn run_paint_hook(
                         &mut dec_state.next_sample_idx,
                         &mut dec_state.frames_decoded,
                         &dec_state.decoder,
+                        // 2026-06-14 iter-8 (Option A): capture the
+                        // pure video first-frame keyed by this video
+                        // slide's id so a subsequent transition INTO
+                        // this slide can blit it as a still on the
+                        // incoming endpoint, keeping the dual-decoder
+                        // contention off the transition window.
+                        Some(slide_id),
                     ) {
                         return err(format!("paint_slide (video) failed: {e:#}"));
                     }
@@ -2501,10 +2508,33 @@ fn run_paint_hook(
                 Some(ContentItem::Video(_)) => Some(from_id),
                 _ => None,
             };
-            let to_dec_id: Option<uuid::Uuid> = match cache.items.peek(&to_id) {
-                Some(ContentItem::Text(s)) => s.background_video_slide_id,
-                Some(ContentItem::Video(_)) => Some(to_id),
-                _ => None,
+            // 2026-06-14 iter-8 (Option A on lean r103.1 base):
+            // pure video→video transitions on bcm2835-codec contend
+            // on the single hardware decoder when both sides drain
+            // live. Steady-state paint_and_present_one_video_slide_
+            // frame captured a first-frame STILL via glCopyTexImage2D
+            // when the to-side decoder primed up — if that still is
+            // cached, we route the incoming endpoint to VideoStill
+            // (a regular 2D blit; no V4L2 traffic) so only the
+            // OUTGOING decoder runs live during the transition. Net
+            // effect: one live decoder during the visible bake,
+            // matching the iter-7 scoped-flush invariant + lifting
+            // the dual-decoder contention bucket QA logged. Gate is
+            // 'v' kind only — text-over-video bg stays live because
+            // text needs the live bg motion underneath.
+            let to_still_tex: Option<glow::NativeTexture> = if to_kind == 'v' {
+                session.video_first_still(to_id)
+            } else {
+                None
+            };
+            let to_dec_id: Option<uuid::Uuid> = if to_still_tex.is_some() {
+                None
+            } else {
+                match cache.items.peek(&to_id) {
+                    Some(ContentItem::Text(s)) => s.background_video_slide_id,
+                    Some(ContentItem::Video(_)) => Some(to_id),
+                    _ => None,
+                }
             };
 
             // Same-decoder transitions would need two &mut to the
@@ -2732,19 +2762,29 @@ fn run_paint_hook(
                 }
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
                 Some(ContentItem::Video(_)) => {
-                    let demuxer = match cache.video_demuxers.get(&to_id) {
-                        Some(d) => d,
-                        None => return err(format!(
-                            "paint_transition: to video {to_id} demuxer missing",
-                        )),
-                    };
-                    let dec_state =
-                        to_dec_state.take().expect("to_dec_state set above for 'v' kind");
-                    hdmi::TransitionEndpoint::Video {
-                        samples: demuxer.samples.as_slice(),
-                        next_sample_idx: &mut dec_state.next_sample_idx,
-                        frames_decoded: &mut dec_state.frames_decoded,
-                        decoder: &dec_state.decoder,
+                    // 2026-06-14 iter-8: if steady-state captured a
+                    // first-frame still for this video id, blit it as
+                    // a regular 2D texture instead of draining a 2nd
+                    // live decoder concurrent with the from-side.
+                    // to_dec_id was set to None upstream when the
+                    // still is present, so no decoder state to drain.
+                    if let Some(tex) = to_still_tex {
+                        hdmi::TransitionEndpoint::VideoStill { tex }
+                    } else {
+                        let demuxer = match cache.video_demuxers.get(&to_id) {
+                            Some(d) => d,
+                            None => return err(format!(
+                                "paint_transition: to video {to_id} demuxer missing",
+                            )),
+                        };
+                        let dec_state =
+                            to_dec_state.take().expect("to_dec_state set above for 'v' kind");
+                        hdmi::TransitionEndpoint::Video {
+                            samples: demuxer.samples.as_slice(),
+                            next_sample_idx: &mut dec_state.next_sample_idx,
+                            frames_decoded: &mut dec_state.frames_decoded,
+                            decoder: &dec_state.decoder,
+                        }
                     }
                 }
                 None => unreachable!("to_id presence verified above"),
