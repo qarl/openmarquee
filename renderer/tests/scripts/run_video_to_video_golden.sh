@@ -127,6 +127,12 @@ build_video_asset "$VID_RED_ID" "$FIXTURES/golden-red.mp4"
 build_video_asset "$VID_BLUE_ID" "$FIXTURES/golden-blue.mp4"
 
 log "Writing test playlist at $PLAYLIST_PATH..."
+# 2026-06-14 iter-3 — QA bench feedback: iter-2's single-fade playlist
+# would have passed despite the iris/wipe being broken across ALL
+# transition kinds. The playlist now alternates fade, wipe, iris,
+# slide so every code path that branches per-kind (SP shader vs SB
+# vs legacy-3pass) gets exercised. A binary that's broken on one
+# kind but green on another fires per-kind.
 sudo tee "$PLAYLIST_PATH" >/dev/null <<JSON
 {
   "schema_version": 4,
@@ -135,8 +141,10 @@ sudo tee "$PLAYLIST_PATH" >/dev/null <<JSON
       "id": "00000000-0000-4000-8000-000000000001",
       "name": "VideoToVideoTest",
       "items": [
-        {"item_id": "$VID_RED_ID", "transition": "fade", "transition_ms": 1500},
-        {"item_id": "$VID_BLUE_ID", "transition": "fade", "transition_ms": 1500}
+        {"item_id": "$VID_RED_ID",  "transition": "fade",  "transition_ms": 1500},
+        {"item_id": "$VID_BLUE_ID", "transition": "wipe",  "transition_ms": 1500},
+        {"item_id": "$VID_RED_ID",  "transition": "iris",  "transition_ms": 1500},
+        {"item_id": "$VID_BLUE_ID", "transition": "slide", "transition_ms": 1500}
       ]
     }
   ]

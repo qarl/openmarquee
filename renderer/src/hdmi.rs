@@ -6114,6 +6114,69 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
+        // 2026-06-14 iter-3 diagnostic probe: QA bench confirmed that
+        // across ALL transition kinds (iris, wipe, fade, slide, …),
+        // the from-side (endpoint a) glass shows BLACK despite the
+        // journal counters reading poster_a_sourced=0 +
+        // endpoint_a_no_frame=0 (i.e. bake_a took the live path and
+        // returned Ok(Some) every tick). The from-side texture the
+        // transition shaders sample is BLACK/empty. The hypothesis
+        // we don't yet have data on: did bake_a actually paint into
+        // transition_tex_a, OR is the wrong texture being sampled at
+        // composite time?
+        //
+        // This probe reads a tiny center patch from each FBO RIGHT
+        // BEFORE the composite shader runs and logs mean luma. It
+        // throttles to a single tick near mid-transition so the
+        // glReadPixels cost (~1-2ms per call on vc4 720p) doesn't
+        // dominate. Read from COLOR_ATTACHMENT0 by binding the FBO
+        // to READ_FRAMEBUFFER + READ_BUFFER COLOR_ATTACHMENT0 (GLES2
+        // single-attachment FBO so this is the default).
+        if (progress - 0.5).abs() < 0.05 {
+            let mut probe = |label: &str, fbo: glow::NativeFramebuffer, tex: glow::NativeTexture| {
+                let cx = (mode_w_u32 / 2).saturating_sub(2);
+                let cy = (mode_h_u32 / 2).saturating_sub(2);
+                let mut buf = [0u8; 16 * 4]; // 4x4 RGBA
+                session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                session
+                    .gl
+                    .read_pixels(
+                        cx as i32,
+                        cy as i32,
+                        4,
+                        4,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        // This glow version takes &mut [u8] directly,
+                        // NOT Option<&mut [u8]>. The macOS CI never
+                        // compiled this path (hdmi.rs is cfg(target_os
+                        // = "linux")-gated); QA's aarch64 cross-build
+                        // is the real gate for renderer GL changes.
+                        // Mirrors the live_preview.rs:240 site.
+                        glow::PixelPackData::Slice(&mut buf[..]),
+                    );
+                let mut sum_r = 0u32;
+                let mut sum_g = 0u32;
+                let mut sum_b = 0u32;
+                for i in 0..16 {
+                    sum_r += buf[i * 4] as u32;
+                    sum_g += buf[i * 4 + 1] as u32;
+                    sum_b += buf[i * 4 + 2] as u32;
+                }
+                let avg_r = sum_r / 16;
+                let avg_g = sum_g / 16;
+                let avg_b = sum_b / 16;
+                let luma = (0.299 * avg_r as f32 + 0.587 * avg_g as f32 + 0.114 * avg_b as f32)
+                    as u32;
+                eprintln!(
+                    "[perf] transition_tex_probe side={} kind={} progress={:.3} \
+                     fbo_id={:?} tex_id={:?} rgb={},{},{} luma={}",
+                    label, kind, progress, fbo, tex, avg_r, avg_g, avg_b, luma,
+                );
+            };
+            probe("a", fbo_a, tex_a);
+            probe("b", fbo_b, tex_b);
+        }
         // Bind transition target: scene FBO (non-identity) or
         // default fb (identity).
         let transition_target = scene_for_post_pass.map(|(fbo, _)| fbo);
