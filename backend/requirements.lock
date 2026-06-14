@@ -40,7 +40,7 @@ cryptography==49.0.0
     #   pyopenssl
 dnspython==2.8.0
     # via aioice
-fastapi==0.136.3
+fastapi==0.137.0
     # via openmarquee (pyproject.toml)
 google-crc32c==1.8.0
     # via aiortc

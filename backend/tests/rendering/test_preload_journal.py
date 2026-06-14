@@ -60,6 +60,12 @@ SAMPLE_EXPERIMENT_WARN_MAX = _j(
     "WARNING openmarquee.playback: OPENMARQUEE_PRELOAD_MODE='max' is an "
     "EXPERIMENT-ONLY knob (1080p dual-decode investigation surface)..."
 )
+# 2026-06-14 Option A: the still-coverage skip path.
+SAMPLE_DEFER_SKIPPED_STILL = _j(
+    "[perf] preload_defer_skipped_for_still_coverage "
+    "slide_id=55555555-aaaa-4000-8000-000000000001 "
+    "bg_video_id=55555555-bbbb-4000-8000-000000000001 active_decoder_count=1"
+)
 
 
 class TestClassify:
@@ -117,6 +123,18 @@ class TestClassify:
     def test_bake_b_deadline_counted(self):
         s = classify([SAMPLE_BAKE_B_DEADLINE])
         assert s.bake_b_deadline_exhausted == 1
+
+    def test_defer_skipped_for_still_coverage_counted(self):
+        # 2026-06-14 Option A regression-lock: a binary WITH the fix
+        # fires this probe on every video→video transition where a
+        # poster exists. A binary WITHOUT the fix (origin/main pre-
+        # 2026-06-14) never fires it because the r97 defer arm
+        # returns ok_empty unconditionally. The analyzer must
+        # distinguish: defer_skipped > 0 ⇒ Option A active; == 0 +
+        # bg_is_video runs ⇒ pre-Option A binary or no posters on disk.
+        s = classify([SAMPLE_DEFER_SKIPPED_STILL])
+        assert s.defer_skipped_for_still_coverage == 1
+        assert s.deferred_for_codec_contention == 0  # different path
 
     def test_experiment_warn_captured_per_mode(self):
         s = classify([SAMPLE_EXPERIMENT_WARN_MAX])

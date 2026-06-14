@@ -4245,6 +4245,10 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             decoder,
             mode_w,
             mode_h,
+            // Steady-state TextOverVideo paints into the WINDOW FB
+            // (or scene FBO for rotation/non-identity); DMABUF zero-
+            // copy works there. False keeps the hot path on DMABUF.
+            false,
         )?
     };
     // r61 Phase B: snapshot bake duration before its record_phase
@@ -4932,6 +4936,10 @@ pub fn paint_and_present_one_video_slide_frame(
             decoder,
             mode_w,
             mode_h,
+            // Steady-state video slide paints into the WINDOW FB
+            // (or scene FBO); DMABUF zero-copy works. False = hot
+            // path on DMABUF unchanged.
+            false,
         )?
     };
     let Some(path_label) = painted else {
@@ -5407,10 +5415,82 @@ pub fn paint_and_present_one_transition_frame(
         // borrow on endpoint_a) BEFORE inputs_a takes &mut.
         // The matches! on a shared borrow doesn't hold across
         // statements; we then read the bool downstream.
+        //
+        // 2026-06-14 Option A iteration 2 — video↔video transitions on
+        // Pi Zero 2 W class hardware (single bcm2835-codec H.264
+        // block). Iteration 1 (commit a9ce2ef) gated on the POSTER
+        // PNG's pixel dimensions and broke on FYS because posters
+        // are authored at 1920×1080 for ALL videos regardless of the
+        // underlying video's coded resolution (bench trace:
+        // poster_b_sourced ... dims=1920x1080 despite videos being
+        // 1280×720). The poster dims are the wrong signal — what
+        // matters for codec contention is the VIDEO's actual decoded
+        // frame size at the V4L2 CAPTURE queue.
+        //
+        // The c3.2.2 poster fast-path freezes BOTH endpoints to stills
+        // during the transition window. That solves the dual-1080p
+        // contention case (firmware can't sustain two 1080p decoders)
+        // but REGRESSES the 720p case — qarl's "video→video transition
+        // should show video on BOTH sides through the whole transition"
+        // ask. Symptom on the wall: transition is two frozen frames
+        // crossfading; outgoing video lost motion. Renderer load also
+        // spiked from r103.1's ~1 to c3.x's ~6 because both endpoints'
+        // text+composite paths still ran on top of the poster blit.
+        //
+        // Option A (see qa/video-to-video-transition-fix-spec-2026-
+        // 06-14.md): keep the OUTGOING (a) endpoint on its WARM live
+        // decoder — it's already running per-tick during steady-state
+        // A and the kernel pipeline is full; no contention cost to
+        // keep draining. Use poster ONLY on the INCOMING (b) endpoint
+        // where the cold-start would otherwise wedge the second
+        // decoder for ~3.4s on 720p (the spec'd freeze) or fail
+        // outright on 1080p.
+        //
+        // Iteration 2 gate distinguishes "small enough to live-decode
+        // both" from "large enough that even one extra live decoder
+        // wedges" via the VIDEO's negotiated CAPTURE format dims
+        // (`Decoder::capture_dims()` returning the actually-decoded
+        // width × height as the bcm2835-codec settled on at
+        // S_FMT/G_FMT). ≥1920w OR ≥1080h keeps the existing c3.x
+        // freeze-both behavior (1080p+ stays poster-on-both because
+        // the second decoder can't be brought up reliably). <1080p
+        // → a stays live; only b freezes.
+        //
+        // For TextOverVideo endpoints the gate reads the bg-video's
+        // decoder dims (bg_decoder). For pure Video, it's the slide's
+        // own decoder. For Text-only / Image, the matches!() arm
+        // below filters them out before the gate is consulted.
+        //
+        // Decoder::capture_dims() returning None (decoder not yet
+        // negotiated) defaults to NOT-1080p, matching the 720p
+        // Option A live path — the safer choice on unknown dims:
+        // a live decoder always works on the 720p hardware, while
+        // a poster freeze with a half-primed decoder would mute
+        // outgoing motion for no reason. Unreachable in practice
+        // because cache.video_decoders only holds post-prime
+        // entries, but defensive.
+        //
+        // Invariant during the transition: exactly ONE live V4L2
+        // decoder (endpoint a). b's decoder, if it exists in the
+        // cache, is NOT drained inside this function on the b-poster
+        // path (run_blit_pass blits the poster into transition_fbo_b
+        // without touching the V4L2 sample queue).
+        let video_a_is_1080p_class = match &endpoint_a {
+            TransitionEndpoint::Video { decoder, .. } => {
+                let dims = decoder.capture_dims();
+                dims.map(|(w, h)| w >= 1920 || h >= 1080).unwrap_or(false)
+            }
+            TransitionEndpoint::TextOverVideo { bg_decoder, .. } => {
+                let dims = bg_decoder.capture_dims();
+                dims.map(|(w, h)| w >= 1920 || h >= 1080).unwrap_or(false)
+            }
+            _ => false,
+        };
         let use_poster_a = matches!(
             &endpoint_a,
             TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
-        ) && poster_a_texture.is_some();
+        ) && poster_a_texture.is_some()
+            && video_a_is_1080p_class;
         let endpoint_a_is_text_over_video =
             matches!(&endpoint_a, TransitionEndpoint::TextOverVideo { .. });
         let inputs_a = match &mut endpoint_a {
@@ -6042,6 +6122,94 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
+        // 2026-06-14 iter-3 diagnostic probe: QA bench confirmed that
+        // across ALL transition kinds (iris, wipe, fade, slide, …),
+        // the from-side (endpoint a) glass shows BLACK despite the
+        // journal counters reading poster_a_sourced=0 +
+        // endpoint_a_no_frame=0 (i.e. bake_a took the live path and
+        // returned Ok(Some) every tick). The from-side texture the
+        // transition shaders sample is BLACK/empty. The hypothesis
+        // we don't yet have data on: did bake_a actually paint into
+        // transition_tex_a, OR is the wrong texture being sampled at
+        // composite time?
+        //
+        // This probe reads a tiny center patch from each FBO RIGHT
+        // BEFORE the composite shader runs and logs mean luma. It
+        // throttles to a single tick PER TRANSITION (latched on the
+        // first tick where progress >= 0.4) so the glReadPixels
+        // cost (~1-2ms per call on vc4 720p) doesn't dominate. Read
+        // from COLOR_ATTACHMENT0 by binding the FBO to READ_
+        // FRAMEBUFFER + READ_BUFFER COLOR_ATTACHMENT0 (GLES2
+        // single-attachment FBO so this is the default).
+        //
+        // iter-5 widens the trigger over iter-3's
+        // `|progress - 0.5| < 0.05` window — QA bench observed that
+        // under jank (load 17 on iter-4), progress jumps past 0.45
+        // → 0.55 in a single tick and the narrow window fires zero
+        // times. The new latch fires on the first tick where
+        // progress >= 0.4 AND resets when a NEW transition starts
+        // (detected by progress dropping >0.1 from last seen). So
+        // we ALWAYS get a side=a luma reading per transition even
+        // if the paint loop is grinding.
+        let probe_fire = TRANSITION_TEX_PROBE_LAST_PROGRESS.with(|cell| {
+            let last = cell.get();
+            // "New transition" detected by progress dropping (the
+            // monotonic progress 0→1 means a drop crosses a tick
+            // boundary). 0.1 hysteresis tolerates float jitter.
+            let new_transition = progress < last - 0.1;
+            let fire_now = if new_transition {
+                progress >= 0.4
+            } else {
+                last < 0.4 && progress >= 0.4
+            };
+            cell.set(progress);
+            fire_now
+        });
+        if probe_fire {
+            let mut probe = |label: &str, fbo: glow::NativeFramebuffer, tex: glow::NativeTexture| {
+                let cx = (mode_w_u32 / 2).saturating_sub(2);
+                let cy = (mode_h_u32 / 2).saturating_sub(2);
+                let mut buf = [0u8; 16 * 4]; // 4x4 RGBA
+                session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                session
+                    .gl
+                    .read_pixels(
+                        cx as i32,
+                        cy as i32,
+                        4,
+                        4,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        // This glow version takes &mut [u8] directly,
+                        // NOT Option<&mut [u8]>. The macOS CI never
+                        // compiled this path (hdmi.rs is cfg(target_os
+                        // = "linux")-gated); QA's aarch64 cross-build
+                        // is the real gate for renderer GL changes.
+                        // Mirrors the live_preview.rs:240 site.
+                        glow::PixelPackData::Slice(&mut buf[..]),
+                    );
+                let mut sum_r = 0u32;
+                let mut sum_g = 0u32;
+                let mut sum_b = 0u32;
+                for i in 0..16 {
+                    sum_r += buf[i * 4] as u32;
+                    sum_g += buf[i * 4 + 1] as u32;
+                    sum_b += buf[i * 4 + 2] as u32;
+                }
+                let avg_r = sum_r / 16;
+                let avg_g = sum_g / 16;
+                let avg_b = sum_b / 16;
+                let luma = (0.299 * avg_r as f32 + 0.587 * avg_g as f32 + 0.114 * avg_b as f32)
+                    as u32;
+                eprintln!(
+                    "[perf] transition_tex_probe side={} kind={} progress={:.3} \
+                     fbo_id={:?} tex_id={:?} rgb={},{},{} luma={}",
+                    label, kind, progress, fbo, tex, avg_r, avg_g, avg_b, luma,
+                );
+            };
+            probe("a", fbo_a, tex_a);
+            probe("b", fbo_b, tex_b);
+        }
         // Bind transition target: scene FBO (non-identity) or
         // default fb (identity).
         let transition_target = scene_for_post_pass.map(|(fbo, _)| fbo);
@@ -7718,6 +7886,18 @@ std::thread_local! {
         const { std::cell::Cell::new(None) };
     static OVERLAY_BLEND_PROGRAM: std::cell::Cell<Option<CachedOverlayBlendProgram>> =
         const { std::cell::Cell::new(None) };
+    /// 2026-06-14 iter-5: per-transition latch for the transition_
+    /// tex_probe debug emit in paint_and_present_one_transition_
+    /// frame. Stores the LAST progress value passed in; the probe
+    /// fires on the first tick where progress crosses 0.4 from
+    /// below, then naturally re-arms when progress drops by >0.1
+    /// (= the start of a new transition window where progress
+    /// resets near 0). Initial value 2.0 = "out of range, no
+    /// transition has run yet" so the first transition reliably
+    /// fires the probe. The IPC sidecar is single-threaded so a
+    /// thread_local Cell is sufficient.
+    static TRANSITION_TEX_PROBE_LAST_PROGRESS: std::cell::Cell<f32> =
+        const { std::cell::Cell::new(2.0) };
     /// P2-G (2026-05-10): shared fullscreen-quad VBO for every
     /// post-pass that draws a textured fullscreen quad
     /// (run_bright_gamma_pass + run_blit_pass +
@@ -8700,6 +8880,42 @@ unsafe fn bake_video_slide_to_current_fbo(
     decoder: &crate::v4l2::Decoder,
     mode_w: u32,
     mode_h: u32,
+    // 2026-06-14 iter-6 (video→video transition fix):
+    //
+    // When true, skip the zero-copy DMABUF path and use the MMAP path
+    // unconditionally. The DMABUF path samples the V4L2 frame's
+    // dma_buf via an EGLImage + GL_TEXTURE_EXTERNAL_OES sampler and
+    // draws into the currently-bound FRAMEBUFFER. On Mesa+vc4 (Pi
+    // Zero 2 W) this works correctly into the window/default FB
+    // (steady-state PaintSlide) but FAILS SILENTLY into a regular
+    // GL_TEXTURE_2D-backed offscreen FBO (the cached
+    // transition_fbo_a from r102.2). QA's iter-3/iter-5 probe
+    // confirmed transition_tex_a comes up pure BLACK (luma=0) every
+    // tick under the DMABUF path despite the draw call succeeding.
+    //
+    // The MMAP path uploads Y+UV plane bytes via tex_image_2d into
+    // regular GL_TEXTURE_2D and runs FS_NV12_TO_RGB to do YUV→RGB
+    // in-shader. Every step is a vanilla GLES2 op against regular
+    // texture/FBO targets — no external-OES, no EGLImage, no
+    // Mesa+vc4 quirks. ~1-2 ms / frame upload overhead, but for the
+    // ~50-tick transition window that's a tolerable cost in
+    // exchange for actual pixels on the from-side.
+    //
+    // Callers:
+    //   - paint_and_present_one_text_over_video_slide_frame
+    //     (steady-state TextOverVideo) — pass false; DMABUF zero-
+    //     copy is the production hot path.
+    //   - paint_and_present_one_video_slide_frame (steady-state
+    //     pure-video) — pass false.
+    //   - bake_slide_to_fbo SlideBakeInputs::Video branch
+    //     (transition) — pass true.
+    //   - bake_slide_to_fbo SlideBakeInputs::TextOverVideo branch
+    //     (transition) — pass true.
+    //
+    // The kill switch OPENMARQUEE_BAKE_VIDEO_FORCE_MMAP=off lets QA
+    // A/B the choice at deploy time without a rebuild. Default is
+    // honor whatever the caller passed.
+    force_mmap: bool,
 ) -> Result<Option<&'static str>> {
     use glow::HasContext;
     let profile_first = *next_sample_idx == 1
@@ -8845,6 +9061,34 @@ unsafe fn bake_video_slide_to_current_fbo(
     // EGL_EXT_image_dma_buf_import / GL_OES_EGL_image_external
     // (run_nv12_dmabuf_blit_pass returns Ok(false) in that case +
     // we fall through to MMAP).
+    // 2026-06-14 iter-6 — see the force_mmap doc-block on this
+    // function. When the caller declares it's painting into an
+    // offscreen FBO (transition bakes), short-circuit past the
+    // DMABUF path even if a dma_buf fd is available. The MMAP
+    // fallback below produces correct pixels into any FBO target.
+    //
+    // OPENMARQUEE_BAKE_VIDEO_FORCE_MMAP_IN_TRANSITION=off is the
+    // kill switch — when set, the caller's force_mmap flag is
+    // IGNORED and DMABUF is always attempted. Lets QA A/B the
+    // fix at deploy time without a rebuild (e.g. to confirm the
+    // bug still reproduces on the bench against the pre-iter-6
+    // path). Default: iter-6 active (no env or value not in the
+    // off-lexicon).
+    let iter6_kill_switch_active = std::env::var(
+        "OPENMARQUEE_BAKE_VIDEO_FORCE_MMAP_IN_TRANSITION",
+    )
+    .ok()
+    .map(|v| {
+        let v = v.trim().to_ascii_lowercase();
+        matches!(v.as_str(), "off" | "0" | "false" | "no" | "disable" | "disabled")
+    })
+    .unwrap_or(false);
+    let take_dmabuf = if iter6_kill_switch_active {
+        true
+    } else {
+        !force_mmap
+    };
+    if take_dmabuf {
     if let Some(fd) = frame.dma_buf_fd() {
         let stride = frame.stride();
         let t_blit = if profile_first { Some(std::time::Instant::now()) } else { None };
@@ -8860,6 +9104,65 @@ unsafe fn bake_video_slide_to_current_fbo(
         let t_phase_shader = std::time::Instant::now();
         let took_dmabuf = {
             let gl = session.gl;
+            // 2026-06-14 iter-4 — QA bench (iter-3 probe) confirmed
+            // transition_tex_a is BLACK (luma=0) every tick across
+            // every transition kind despite bake_a returning Ok(Some)
+            // and endpoint_a_no_frame=0. Probe tex IDs stable, FBO
+            // bound correctly. The remaining gap: this DMABUF draw
+            // is succeeding from the function's perspective but the
+            // pixels aren't landing in the bound FBO's
+            // COLOR_ATTACHMENT0 (transition_tex_a).
+            //
+            // Three GL state hazards that survive across the
+            // PaintSlide → PaintTransition boundary on the IPC
+            // sidecar's persistent EglSession AND that can SILENTLY
+            // suppress fragment output:
+            //
+            //   1. SCISSOR_TEST left enabled with a stale rect from a
+            //      prior pass (atlas SB, render_transition_scissored
+            //      _bake_in_session, or any ticker_clip path). If the
+            //      scissor rect doesn't intersect the FBO, the
+            //      fragment shader still RUNS but every fragment is
+            //      culled — net effect: clear-color (BLACK) survives.
+            //   2. COLOR_MASK left as (false, false, false, false) by
+            //      some pre-pass (rare, but the API permits and a
+            //      future state-saving compositor change could land
+            //      one). Same outcome: fragment runs, write masked.
+            //   3. GL command queue not flushed before Frame::drop
+            //      re-QBUFs the dma_buf. If the codec writes a new
+            //      frame to the same slot before the GPU executes
+            //      the queued draw, the EGLImage's view of the data
+            //      changes mid-flight — the sampler can read
+            //      zeroes if the V4L2 driver clears the slot during
+            //      QBUF (some bcm2835-codec firmware revisions do).
+            //
+            // Steady-state PaintSlide doesn't see this because
+            // eglSwapBuffers between bake and the next tick acts as
+            // an implicit flush + clears scissor + blend state from
+            // the front-buffer swap. Offscreen-FBO transition bakes
+            // get no such barrier.
+            //
+            // Defensive fix: explicitly DISABLE both SCISSOR_TEST and
+            // BLEND before the DMABUF draw (we want every fragment to
+            // write, no source over-ops), and gl.flush() right after
+            // so the GPU pipeline doesn't get to defer the draw past
+            // Frame::drop. Restore prior state after the draw — the
+            // caller may have set them deliberately and we must not
+            // surprise downstream paths (paint_slide_with_viewport
+            // re-enables BLEND on its own; the SCISSOR pre-state is
+            // restored verbatim).
+            let scissor_was_enabled = gl.is_enabled(glow::SCISSOR_TEST);
+            let blend_was_enabled = gl.is_enabled(glow::BLEND);
+            if scissor_was_enabled {
+                gl.disable(glow::SCISSOR_TEST);
+            }
+            if blend_was_enabled {
+                gl.disable(glow::BLEND);
+            }
+            // Also force a known-good COLOR_MASK so a stray (false,
+            // false, false, false) from some prior pass can't silently
+            // suppress the fragment writes.
+            gl.color_mask(true, true, true, true);
             gl.viewport(0, 0, mode_w as i32, mode_h as i32);
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT);
@@ -8875,7 +9178,7 @@ unsafe fn bake_video_slide_to_current_fbo(
             } else {
                 None
             };
-            run_nv12_dmabuf_blit_pass(
+            let result = run_nv12_dmabuf_blit_pass(
                 gl,
                 cover_vbo,
                 session.egl_lib,
@@ -8886,7 +9189,37 @@ unsafe fn bake_video_slide_to_current_fbo(
                 stride,
                 y_crop_max,
                 cache_slot,
-            )?
+            )?;
+            // iter-4 had `gl.flush()` here as a defense against the
+            // GPU deferring the draw past Frame::drop. QA bench
+            // 2026-06-14 caught the cost: per-tick flush on the
+            // Pi Zero 2 W vc4 drove load to 17.42 + max_delta_ms=
+            // 457450 (7.6-minute paint freeze) → watchdog reboot.
+            // The flush was issuing real GPU sync work every tick;
+            // catastrophic on this tier.
+            //
+            // iter-5 drops the flush. GL's spec guarantees that a
+            // read from `tex_a` at composite time implicitly waits
+            // for prior writes to `tex_a`'s FBO to complete — the
+            // sampler in the transition shader is enough of a
+            // dependency edge for the driver to serialize correctly.
+            // The dma_buf-overwrite race we feared (codec
+            // overwriting the buffer between our draw and its
+            // execution) is bounded by the r101 EGLImage cache
+            // keeping the EGLImage alive; if the dma_buf-backed
+            // EGLImage import doesn't honor late-read semantics on
+            // Mesa+vc4, iter-6 would copy the EGLImage into a
+            // regular GL_TEXTURE_2D BEFORE Frame::drop — but that's
+            // the expensive last resort, and we only ship it if
+            // iter-5's bench shows the from-side STILL black.
+            // Restore prior state.
+            if scissor_was_enabled {
+                gl.enable(glow::SCISSOR_TEST);
+            }
+            if blend_was_enabled {
+                gl.enable(glow::BLEND);
+            }
+            result
         };
         if let Some(t) = t_blit {
             eprintln!(
@@ -8928,6 +9261,7 @@ unsafe fn bake_video_slide_to_current_fbo(
         // MMAP for both capture modes so y_plane()/uv_plane() are
         // populated regardless of capture_buffer_type.
     }
+    } // end if take_dmabuf (iter-6 force_mmap gate)
     // MMAP path (piece 3d-e). stride==width is a bcm2835-codec
     // empirical fact; a future codec or alignment regime could
     // surface stride > width, which would require GL_UNPACK_ROW_
@@ -9548,6 +9882,11 @@ unsafe fn bake_slide_to_fbo(
                 decoder,
                 mode_w,
                 mode_h,
+                // 2026-06-14 iter-6 — TRANSITION bake into the cached
+                // offscreen transition_fbo_a (FBO `fbo`/tex `tex`).
+                // DMABUF external-OES → offscreen FBO silently
+                // produces BLACK on Mesa+vc4. Force MMAP.
+                true,
             );
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             match paint_result {
@@ -9654,6 +9993,14 @@ unsafe fn bake_slide_to_fbo(
                 bg_decoder,
                 mode_w,
                 mode_h,
+                // 2026-06-14 iter-6 — TRANSITION TextOverVideo bake
+                // into the cached offscreen transition_fbo_a (FBO
+                // `fbo` / tex `tex`). DMABUF external-OES → offscreen
+                // FBO comes up BLACK on Mesa+vc4 per the iter-3/iter-5
+                // probe. Force MMAP for correctness. See the
+                // force_mmap doc-block on
+                // bake_video_slide_to_current_fbo for the QA trace.
+                true,
             );
             let painted = match video_result {
                 Ok(Some(_path)) => true,

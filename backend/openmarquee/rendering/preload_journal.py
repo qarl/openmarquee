@@ -50,6 +50,14 @@ against a single journal line):
     ``PRELOAD_MODE=defer`` with an all-text-over-video playlist it
     fires once per transition.
 
+  ``[perf] preload_defer_skipped_for_still_coverage``
+    2026-06-14 Option A: the r97 defer arm noticed that a poster.png
+    exists for the new slide's bg video and chose to LET the worker
+    run anyway because the still can cover the transition window.
+    On FYS 720p video→video this is the production path — fires
+    once per transition. Absence under contention means the runner
+    binary doesn't have the Option A fix.
+
   ``[perf] bake_b_poll_outcome ... result=deadline_exhausted``
     r94 Path B exhausted its consumer-side deadline polling for
     bake_b. Different failure mode than the FROM-side bake_a starvation.
@@ -72,6 +80,7 @@ _PRELOAD_HANDOFF_RE = re.compile(
     r"frames_drained=(?P<drained>\d+).*?was_deferred=(?P<def>true|false)"
 )
 _DEFERRED_FOR_CONTENTION_RE = re.compile(r"\[perf\]\s+preload_deferred_for_codec_contention\b")
+_DEFER_SKIPPED_FOR_STILL_RE = re.compile(r"\[perf\]\s+preload_defer_skipped_for_still_coverage\b")
 _BAKE_B_DEADLINE_RE = re.compile(r"\[perf\]\s+bake_b_poll_outcome\b.*\bresult=deadline_exhausted\b")
 _PRELOAD_MODE_WARN_RE = re.compile(
     r"OPENMARQUEE_PRELOAD_MODE=['\"]?(?P<mode>defer|lead|max)['\"]?"
@@ -90,6 +99,9 @@ class PreloadJournalSummary:
     preload_handoff_deferred: int = 0  # was_deferred=true
     preload_handoff_frames_drained_zero_normal: int = 0  # ⚠ codec stalled
     deferred_for_codec_contention: int = 0
+    # 2026-06-14 Option A: skip-defer-because-poster-covers events.
+    # Non-zero on FYS 720p with the fix; zero on a binary without it.
+    defer_skipped_for_still_coverage: int = 0
     bake_b_deadline_exhausted: int = 0
 
     # Did the Python-side WARN message fire? (set when MODE=lead or max)
@@ -138,6 +150,9 @@ def classify(lines: Iterable[str]) -> PreloadJournalSummary:
             continue
         if _DEFERRED_FOR_CONTENTION_RE.search(line):
             summary.deferred_for_codec_contention += 1
+            continue
+        if _DEFER_SKIPPED_FOR_STILL_RE.search(line):
+            summary.defer_skipped_for_still_coverage += 1
             continue
         if _BAKE_B_DEADLINE_RE.search(line):
             summary.bake_b_deadline_exhausted += 1
@@ -190,6 +205,8 @@ def assert_production_clean(summary: PreloadJournalSummary) -> None:
             f"{summary.bake_b_deadline_exhausted}\n"
             f"  preload_deferred_for_codec_contention     = "
             f"{summary.deferred_for_codec_contention}\n"
+            f"  defer_skipped_for_still_coverage          = "
+            f"{summary.defer_skipped_for_still_coverage}\n"
             f"  experiment_warning_modes seen             = "
             f"{sorted(summary.experiment_warning_modes)}\n"
             "Most likely cause: OPENMARQUEE_PRELOAD_MODE is set to 'max' or "

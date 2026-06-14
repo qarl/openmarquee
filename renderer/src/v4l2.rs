@@ -2060,6 +2060,32 @@ impl Decoder {
         if h == 0 { None } else { Some(h) }
     }
 
+    /// 2026-06-14 Option A iteration 2 — return the negotiated CAPTURE
+    /// format's (width, height). Used by the transition-poster gate in
+    /// `paint_and_present_one_transition_frame` to distinguish 720p
+    /// material (single live decoder, Option A path) from 1080p+
+    /// material (still-on-both, c3.x freeze-both preserved). The
+    /// poster image's PNG dimensions are NOT a reliable proxy —
+    /// posters on FYS are authored at 1920×1080 for every video
+    /// regardless of the underlying video's coded resolution
+    /// (poster_b_sourced ... dims=1920x1080 in the 2026-06-14 bench
+    /// trace despite the videos being 1280×720). The actual decoded
+    /// frame size at the V4L2 CAPTURE queue is the contention signal.
+    ///
+    /// Returns `None` until `set_capture_format` has been called
+    /// (mirrors `capture_display_height`'s pre-negotiation semantic).
+    /// Callers should treat None as "not yet a 1080p-class decoder
+    /// confirmed" — defaulting to the live path is the safer choice
+    /// (matches the 720p Option A invariant for any video whose
+    /// negotiated format hasn't landed yet).
+    pub fn capture_dims(&self) -> Option<(u32, u32)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .capture_format
+            .as_ref()
+            .map(|f| (f.width, f.height))
+    }
+
     /// r83 Phase B (2026-06-08): the y-axis crop fraction for NV12
     /// shader sampling. Computes `capture_display_height() /
     /// capture_format.height` as a `f32` in `(0, 1]`. Returns
