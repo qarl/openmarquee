@@ -194,12 +194,30 @@ pub fn should_defer_preload_for_codec_contention(
 /// `parse_preload_mode` for parsing semantics and
 /// `docs/hardware-ceilings.md` for the dual-1080p design-space
 /// rationale.
+///
+/// **2026-06-13 PRODUCTION CONTRACT (see docs/hardware-ceilings.md
+/// §"`OPENMARQUEE_PRELOAD_MODE=max` is an EXPERIMENT-ONLY knob"):**
+/// On Pi Zero 2 W class hardware running ≤720p production content,
+/// the env var MUST be unset (default `Defer`). Setting `Max` (or
+/// `Lead`) starves the FROM-side bg-video V4L2 decoder during every
+/// transition because both endpoints' decoders run concurrently —
+/// pre-r106 the blocking-feed cadence can't keep both pipelines fed
+/// under contention. Empirically observed on FYS 2026-06-13: the
+/// outgoing video went BLACK at every transition entry under `Max`,
+/// vs zero-starvation under `Defer`. The `Max` and `Lead` variants
+/// stay in-tree as bench A/B knobs for the dual-1080p investigation
+/// (r97/r106 arc), NOT for production. The Python-side helper at
+/// `backend/openmarquee/playback.py:_resolve_preload_mode` emits a
+/// `log.warning` when the resolved mode is `Lead` or `Max` so the
+/// experiment knob's presence is loud in the journal at startup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreloadMode {
     /// r97 behavior (default): skip preload when an active video
     /// decoder is live AND the incoming preload's bg is video. The
     /// Python playback loop fires PreloadSlide at the canonical 1.0s
     /// before slide-end; the Rust IPC arm short-circuits to defer.
+    ///
+    /// **Production mode on all Pi Zero 2 W class signs.**
     Defer,
     /// Force preload through (Rust skips the defer check). Python
     /// reads `OPENMARQUEE_PRELOAD_LEAD_MS` for the time-before-
@@ -207,12 +225,19 @@ pub enum PreloadMode {
     /// sweep "what lead time gives the contended second decoder
     /// enough VPU cycles to have a first frame ready by
     /// BeginTransition?"
+    ///
+    /// **EXPERIMENT-ONLY** — do not ship on production hardware.
     Lead,
     /// Force preload through (Rust skips the defer check). Python
     /// fires PreloadSlide for slide N immediately after slide N-1's
     /// `begin_slide_load` event — the maximum possible lead time
     /// for any playlist structure. `OPENMARQUEE_PRELOAD_LEAD_MS` is
     /// IGNORED in this mode.
+    ///
+    /// **EXPERIMENT-ONLY** — see the FYS 2026-06-13 regression note
+    /// in `docs/hardware-ceilings.md`. Setting this on a 720p
+    /// production sign starves the outgoing bg-video decoder
+    /// during every transition.
     Max,
 }
 
@@ -5424,5 +5449,76 @@ mod tests {
             "expected 5 preload_handoff emit sites carrying was_deferred=false in \
              video_decode.rs; found {count}",
         );
+    }
+
+    // 2026-06-13 FYS-regression doc-comment lock. The bug that bit
+    // FYS was a leftover OPENMARQUEE_PRELOAD_MODE=max drop-in. The
+    // recovery path needs the PreloadMode enum's docs to LOUDLY name
+    // the experiment-only contract — otherwise a future operator
+    // SSHing in and reading the variant docs won't get the warning.
+    // Pin both the variant's "EXPERIMENT-ONLY" tag and the cross-link
+    // to docs/hardware-ceilings.md so a doc-comment cleanup doesn't
+    // silently drop the contract.
+
+    #[test]
+    fn preload_mode_max_variant_documents_experiment_only_contract() {
+        let src = include_str!("ipc_main.rs");
+        // The Max variant's doc-comment must carry the "EXPERIMENT-
+        // ONLY" string AND a cross-link to the docs path. The exact
+        // phrasing can evolve; the two substrings are what an
+        // operator scanning the file should find.
+        let max_doc_window = extract_doc_window(src, "Max,")
+            .expect("Max variant doc-comment must be present");
+        assert!(
+            max_doc_window.contains("EXPERIMENT-ONLY"),
+            "PreloadMode::Max doc-comment must carry the EXPERIMENT-ONLY \
+             tag so the production contract is loud at the call-site. \
+             Window:\n{max_doc_window}",
+        );
+        assert!(
+            max_doc_window.contains("hardware-ceilings.md"),
+            "PreloadMode::Max doc-comment must cross-link to \
+             docs/hardware-ceilings.md so operators can find the \
+             2026-06-13 FYS regression note. Window:\n{max_doc_window}",
+        );
+        assert!(
+            max_doc_window.contains("FYS")
+                || max_doc_window.contains("2026-06-13"),
+            "PreloadMode::Max doc-comment should cite the FYS 2026-06-13 \
+             regression so the WHY survives a future doc cleanup. \
+             Window:\n{max_doc_window}",
+        );
+    }
+
+    #[test]
+    fn preload_mode_lead_variant_documents_experiment_only_contract() {
+        let src = include_str!("ipc_main.rs");
+        let lead_doc_window = extract_doc_window(src, "Lead,")
+            .expect("Lead variant doc-comment must be present");
+        assert!(
+            lead_doc_window.contains("EXPERIMENT-ONLY"),
+            "PreloadMode::Lead doc-comment must carry the EXPERIMENT-\
+             ONLY tag (paired with Max — both bypass the defer guard). \
+             Window:\n{lead_doc_window}",
+        );
+    }
+
+    /// Returns the chunk of source code IMMEDIATELY ABOVE
+    /// `needle` containing the leading `///` doc-comment lines.
+    /// Walks backward line-by-line from the needle's line until a
+    /// non-doc-comment line is hit; returns the joined doc lines.
+    fn extract_doc_window(src: &str, needle: &str) -> Option<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let pos = lines.iter().position(|l| l.trim_start().starts_with(needle))?;
+        let mut start = pos;
+        while start > 0 {
+            let prev = lines[start - 1].trim_start();
+            if prev.starts_with("///") || prev.is_empty() {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        Some(lines[start..pos].join("\n"))
     }
 }
