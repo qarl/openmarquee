@@ -38,7 +38,21 @@ PROFILE_DIR="$PROFILE"
 [ "$PROFILE" = "debug" ] && PROFILE_DIR="debug" || PROFILE_DIR="release"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD_DIR="/tmp/renderer-build"
+# 2026-06-15: per-worktree BUILD_DIR. Pre-fix this was hardcoded to
+# /tmp/renderer-build, which two parallel worktrees (code + code2)
+# would clobber each other's cargo incremental state in. Visible
+# symptom: a build from worktree B would re-cp the LAST binary cargo
+# linked in worktree A even though cargo "succeeded" — because rsync
+# --exclude target preserved A's compiled artifacts and cargo
+# decided nothing in the freshly-rsync'd source needed recompiling
+# against those artifacts. QA caught it via byte-identical md5 of
+# two unrelated commits' binaries.
+#
+# Fix: scope BUILD_DIR to the calling worktree's basename so each
+# worktree has its own cargo state. `${BUILD_DIR:-...}` keeps the
+# var operator-overridable for the rare case someone wants to pin
+# a shared dir on purpose.
+BUILD_DIR="${BUILD_DIR:-/tmp/renderer-build-$(basename "$REPO")}"
 SYSROOT="$HOME/pi-sysroot"
 TARGET="aarch64-unknown-linux-gnu"
 BIN_NAME="openmarquee-render"
@@ -69,9 +83,15 @@ rsync -a --delete --exclude target "$REPO/renderer/" "$BUILD_DIR/"
 
 # SDF arc slice A: build.rs walks ../ui/fonts/*.ttf relative to the
 # renderer crate root. The cross-build BUILD_DIR is /tmp/renderer-
-# build so we also need /tmp/ui/fonts to exist (sibling, same as the
-# repo layout). Without this the atlas bake fails with cryptic
-# include_bytes! errors at link time.
+# build-<worktree> (per-worktree post-2026-06-15) so we also need
+# $(dirname BUILD_DIR)/ui/fonts to exist as a sibling of BUILD_DIR
+# (same layout as the repo). Without this the atlas bake fails
+# with cryptic include_bytes! errors at link time.
+# NOTE: the rsync target $(dirname BUILD_DIR)/ui = /tmp/ui is STILL
+# shared across worktrees. Fonts are identical across worktrees so
+# the only hazard is a race on the rsync if two cross-builds run
+# simultaneously. Acceptable today; revisit if parallel builds
+# become routine.
 echo "==> rsync ui/fonts -> $(dirname "$BUILD_DIR")/ui/fonts"
 mkdir -p "$(dirname "$BUILD_DIR")/ui"
 rsync -a --delete "$REPO/ui/fonts/" "$(dirname "$BUILD_DIR")/ui/fonts/"
