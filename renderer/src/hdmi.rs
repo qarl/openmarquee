@@ -12911,7 +12911,18 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     // that window. When egl_image_cache is None (kill switch),
     // create per-frame + destroy at the end (the leaky path,
     // kept for A/B rollback).
-    let (egl_image, suppress_destroy_at_end) = if let Some((decoder, idx)) = egl_image_cache {
+    // 2026-06-15 tail-fix-v2.1: surface the `created` bool from
+    // get_or_init_egl_image's return tuple so the emitted
+    // tail_diag_blit_subphase line can distinguish cache HIT from
+    // cache MISS-fresh-create on the cache_path=true arm. v2 swallowed
+    // the bool via `let (handle, _created) = ...` — sacred caught this
+    // as the load-bearing ambiguity; code1 nit-tagged the underscore
+    // for rename so the source matches the post-v2.1 contract.
+    //
+    // cache_path=false arm (kill-switch / no cache) always creates a
+    // fresh handle per-frame → emit `created=true` for that arm to
+    // keep the emit shape uniform.
+    let (egl_image, suppress_destroy_at_end, created) = if let Some((decoder, idx)) = egl_image_cache {
         let create_one = || -> Result<crate::v4l2::EglImageHandle> {
             let img = (eps.create_image)(
                 display.as_ptr(),
@@ -12932,8 +12943,8 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
                 destroy_fn: eps.destroy_image,
             })
         };
-        let (handle, _created) = decoder.get_or_init_egl_image(idx, create_one)?;
-        (handle.image, true)
+        let (handle, created) = decoder.get_or_init_egl_image(idx, create_one)?;
+        (handle.image, true, created)
     } else {
         // Pre-r101 path: per-frame create+destroy. Leaks one
         // kernel dmabuf ref per call on Mesa+vc4 -- the bug r101
@@ -12952,7 +12963,8 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
                 fd, width, height, stride
             ));
         }
-        (img, false)
+        // cache disabled → this call always created a fresh handle.
+        (img, false, true)
     };
     // tail-diag-v2 phase boundary: EGLImage acquired (cache hit OR
     // per-frame create). Everything from fn entry up to here is
@@ -13074,21 +13086,33 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
         let sampler_us = t_sampler_end.duration_since(t_import_end).as_micros() as u64;
         let draw_us = t_draw_end.duration_since(t_sampler_end).as_micros() as u64;
         let destroy_us = t_destroy_end.duration_since(t_draw_end).as_micros() as u64;
-        // cache_path=true means the EGLImage cache was ENABLED for
-        // this call (egl_image_cache: Some(_)) — get_or_init may
-        // have HIT or freshly INSERTED. cache_path=false means the
-        // pre-r101 leaky per-frame create+destroy path (kill switch).
-        // Per sacred review nit: this does NOT cleanly disambiguate
-        // cache-miss-fresh-create vs cache-hit on the cache_path=true
-        // arm; a future v3 can thread `_created` through the
-        // get_or_init return to surface that distinction, but for v2's
-        // GL2.1/GL2.2 routing the cache_path bool is enough — large
-        // import_us with cache_path=false is the kill-switch leak; large
-        // import_us with cache_path=true is Mutex contention or a
-        // bcm2835/EGL slow first-insert.
+        // 2026-06-15 tail-fix-v2.1: cache_path + created bools together
+        // give QA the full root-cause attribution for import_us spikes:
+        //   cache_path=true  + created=false → cache HIT; large import_us
+        //                                       = uncontested-lock kernel/
+        //                                       futex anomaly = NO renderer
+        //                                       fix (surface to admin as
+        //                                       out-of-scope kernel-side).
+        //   cache_path=true  + created=true  → cache MISS-fresh-create;
+        //                                       large import_us = eglCreate
+        //                                       ImageKHR is the slow op =
+        //                                       my-lane Option B (render-
+        //                                       thread pre-warm at
+        //                                       transition setup so the
+        //                                       8-buffer cold fill happens
+        //                                       outside the bake critical
+        //                                       path).
+        //   cache_path=false + created=true  → kill-switch leak path;
+        //                                       eglCreateImageKHR every
+        //                                       call; OPENMARQUEE_EGL_
+        //                                       IMAGE_CACHE=on should be
+        //                                       re-enabled in prod.
+        // The created=<bool> tag closes the bug-shadow sacred caught in
+        // v2 (the `let (handle, _created) = ...` underscore on the
+        // get_or_init return tuple).
         eprintln!(
-            "[perf] tail_diag_blit_subphase import_us={} sampler_us={} draw_us={} destroy_us={} total_us={} cache_path={}",
-            import_us, sampler_us, draw_us, destroy_us, total_us, suppress_destroy_at_end,
+            "[perf] tail_diag_blit_subphase import_us={} sampler_us={} draw_us={} destroy_us={} total_us={} cache_path={} created={}",
+            import_us, sampler_us, draw_us, destroy_us, total_us, suppress_destroy_at_end, created,
         );
     }
 
