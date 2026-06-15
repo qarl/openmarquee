@@ -210,6 +210,29 @@ mod tests {
     }
 
     #[test]
+    fn min_buffers_for_capture_activated_fingerprint_pinned_in_video_decode_source() {
+        // perf-decode spike-hunt Phase A (2026-06-15): the literal
+        // `min_buffers_for_capture_activated` is QA's bench-parser
+        // marker for the activation site in
+        // `prime_video_decoder_with_warmup` (video_decode.rs).
+        // Emits min=N requested=M per decoder open; FYS journal
+        // grep on this literal tells us what bcm2835-codec
+        // reports for `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE` AND what
+        // count we actually requested. Phase B (lockstep
+        // PRIME_WARMUP_DEFAULT reduction + K=3) is gated on this
+        // measurement showing N ≤ 2. A rename here would silently
+        // break both the strings-fingerprint gate AND the
+        // measurement-driven ship/skip decision.
+        let v = include_str!("video_decode.rs");
+        assert!(
+            v.contains("min_buffers_for_capture_activated"),
+            "spike-hunt Phase A: `min_buffers_for_capture_activated` substring missing \
+             from video_decode.rs — QA's bench parser can't measure the queried min, \
+             which gates Phase B ship/skip decision",
+        );
+    }
+
+    #[test]
     fn min_buffers_for_capture_negotiated_fingerprint_pinned_in_v4l2_source() {
         // Per admin's QA strings-verification gate (2026-06-15):
         // the literal `min_buffers_for_capture_negotiated` is QA's

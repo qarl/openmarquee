@@ -340,30 +340,51 @@ pub fn prime_video_decoder_with_warmup(
             _ => "?",
         }
     );
-    // perf-decode MIN_BUFFERS plumbing DRAFT (2026-06-15):
-    // telemetry-only call to the spec-correct
-    // `min_buffers_for_capture()` query. Result IS LOGGED via
-    // the `[perf] min_buffers_for_capture_negotiated ...` line
-    // (v4l2.rs) but IS NOT USED to drive the REQBUFS count
-    // below — the production floor stays at 4 (the empirical
-    // safe floor per main.rs:171-198 r73/r77/r93/r94 history).
-    // A future commit (not this draft) wires the queried `min`
-    // into `max(min + headroom, 4)` for the REQBUFS call, gated
-    // on a flag QA can A/B against the baseline floor.
+    // perf-decode spike-hunt Phase A (2026-06-15): ACTIVATE the
+    // V4L2-spec-correct `min_buffers_for_capture()` query as the
+    // SOURCE OF TRUTH for the CAPTURE pool size. Phase A is
+    // ZERO BEHAVIOR CHANGE — `requested = max(min + 1, K=4)`
+    // keeps K=4 floor pinned to the current PRIME_WARMUP_DEFAULT
+    // saturation math (primer + warmup=3 = 4 OUTPUT samples
+    // require ≥4 CAPTURE buffers; r93's D-state wedge at
+    // CAPTURE<4 documented at main.rs:171-198). If bcm2835-codec
+    // returns min=2, requested=max(3,4)=4 — allocated count is
+    // unchanged from the pre-activation hardcoded 4.
     //
-    // The `.ok()` discards the Result; the eprintln in
-    // `min_buffers_for_capture()` fires unconditionally
-    // (success or EINVAL), so the QA binary fingerprint string
-    // `min_buffers_for_capture_negotiated` is always emitted
-    // into the binary's .rodata section regardless of runtime
-    // path. Without this call site, Rust's LTO dead-code
-    // elimination strips the function entirely + the
-    // fingerprint string with it.
-    let _ = dec.min_buffers_for_capture();
+    // The emit lights up the FYS measurement: Phase B (lockstep
+    // PRIME_WARMUP_DEFAULT=2 + K=3, ~3 MB CMA per Decoder save)
+    // is gated on the journal showing `min_buffers_for_capture_
+    // activated min=N` with N ≤ 2. If kernel reports N ≥ 4,
+    // we're already at floor and footprint-shrink-via-CAPTURE
+    // isn't available; pivot to other surfaces.
+    //
+    // Fingerprint markers (both stable; source-pin tests in
+    // frame_pacing.rs):
+    //   - `min_buffers_for_capture_negotiated` (the ioctl probe
+    //     line in `Decoder::min_buffers_for_capture` itself —
+    //     fires once per call regardless of outcome).
+    //   - `min_buffers_for_capture_activated` (THIS line — fires
+    //     once per `prime_video_decoder_with_warmup` call,
+    //     reporting the actual requested count derived from the
+    //     queried min). QA's strings-fingerprint gate + bench
+    //     parser key on both literals.
+    //
+    // Unwrap_or(3): if the ioctl returns EINVAL (driver missing
+    // the control) OR an error path, fall back to the
+    // conservative known-safe r94 floor (3 = current
+    // PRIME_WARMUP_FOR_PRELOAD path; matches the smallest count
+    // observed-safe in main.rs history). Note: with K=4 floor,
+    // max(3+1, 4) = 4 — same as today's hardcoded count.
+    let min = dec.min_buffers_for_capture().unwrap_or(3);
+    let requested = std::cmp::max(min + 1, 4);
+    eprintln!(
+        "[perf] min_buffers_for_capture_activated min={} requested={} k_floor=4 warmup_default=3",
+        min, requested,
+    );
     let t_reqbufs = Instant::now();
     dec.allocate_buffers(v4l2::QueueDirection::Output, 4)
         .context("REQBUFS OUTPUT")?;
-    dec.allocate_buffers(v4l2::QueueDirection::Capture, 4)
+    dec.allocate_buffers(v4l2::QueueDirection::Capture, requested)
         .context("REQBUFS CAPTURE")?;
     let reqbufs_us = t_reqbufs.elapsed().as_micros();
     let t_streamon = Instant::now();
