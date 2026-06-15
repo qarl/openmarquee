@@ -3963,7 +3963,7 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             // Steady-state TextOverVideo paints into the WINDOW FB
             // (or scene FBO when rotated). eglSwapBuffers is the
             // implicit barrier; no extra flush needed.
-            false,
+            /* is_offscreen_bake (Path A Stage 2 scope tag) */ false,
         )?
     };
     // r61 Phase B: snapshot bake duration before its record_phase
@@ -4653,7 +4653,7 @@ pub fn paint_and_present_one_video_slide_frame(
             mode_h,
             // Steady-state pure-video paints into the WINDOW FB.
             // eglSwapBuffers is the implicit barrier.
-            false,
+            /* is_offscreen_bake (Path A Stage 2 scope tag) */ false,
         )?
     };
     let Some(path_label) = painted else {
@@ -9355,7 +9355,7 @@ unsafe fn bake_slide_to_fbo(
                 // tile-store is deferred past Frame::drop without an
                 // explicit barrier. is_offscreen_bake=true triggers
                 // the scoped gl.flush() before drop(frame).
-                true,
+                /* is_offscreen_bake (Path A Stage 2 scope tag) */ true,
             );
             session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             match paint_result {
@@ -9467,7 +9467,7 @@ unsafe fn bake_slide_to_fbo(
                 // here). Same offscreen tile-store race as the
                 // Video branch above; pass true to trigger the
                 // scoped flush before Frame::drop.
-                true,
+                /* is_offscreen_bake (Path A Stage 2 scope tag) */ true,
             );
             let painted = match video_result {
                 Ok(Some(_path)) => true,
@@ -16152,5 +16152,6 @@ mod r102_2_tests {
             );
         }
     }
+
 }
 

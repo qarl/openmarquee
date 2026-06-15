@@ -11264,3 +11264,193 @@ mod tests {
         assert!(glyph_prewarm_drain_complete(0, 0, 0));
     }
 }
+
+/// Path A Stage 2 source-pin regression-lock tests (2026-06-14).
+///
+/// These guard the Stage 2 scoping invariant from the 684d386 r110
+/// revert: non-blocking decoupled feed runs ONLY on the transition
+/// bake path (is_offscreen_bake=true); steady-state video paint
+/// (is_offscreen_bake=false) keeps the pre-r106 blocking pattern.
+/// They live in hdmi_logic.rs (host-portable) rather than hdmi.rs
+/// (linux-cfg-gated) so the renderer's macOS `cargo test` CI job
+/// exercises them. The full live-on-glass behavior is verified by
+/// the hardware runner at `qa/scripts/run_video_to_video_golden.sh`.
+///
+/// Source-pin style: each test uses `include_str!("hdmi.rs")` to
+/// read the actual source at compile time and asserts that the
+/// structurally-important substrings + counts hold. include_str!
+/// resolves a path-relative file so the path is `hdmi.rs` from
+/// hdmi_logic.rs's directory.
+#[cfg(test)]
+mod path_a_stage2_tests {
+    #[test]
+    fn path_a_decouple_gate_pins_stage2_scope() {
+        // The decouple gate inside bake_video_slide_to_current_fbo
+        // MUST be `is_offscreen_bake && is_feed_drain_decouple_
+        // enabled()`. Pre-Stage-2 r106 used `is_feed_drain_
+        // decouple_enabled()` alone, which is what triggered the
+        // 720p steady-state regression that motivated the 684d386
+        // revert. A future refactor that drops the
+        // `is_offscreen_bake` conjunct (e.g. "simplify the gate")
+        // re-opens that regression.
+        let src = include_str!("hdmi.rs");
+        assert!(
+            src.contains(
+                "let decouple = is_offscreen_bake && crate::v4l2::is_feed_drain_decouple_enabled();"
+            ),
+            "Path A Stage 2 scope gate missing or restructured -- the AND with \
+             `is_offscreen_bake` is what isolates the decoupled feed to transition paths only",
+        );
+    }
+
+    #[test]
+    fn path_a_steady_state_callers_pass_is_offscreen_bake_false() {
+        // Steady-state video paint paths
+        // (paint_and_present_one_video_slide_frame +
+        // paint_and_present_one_text_over_video_slide_frame) MUST
+        // pass `is_offscreen_bake=false` to bake_video_slide_to_
+        // current_fbo so they take the pre-r106 blocking branch.
+        // If either caller passes `true`, the 720p regression
+        // returns.
+        //
+        // Sacred BLOCKER-3 carry-forward fix: pin on the canonical
+        // tag marker (`is_offscreen_bake (Path A Stage 2 scope tag)`)
+        // that each call site MUST carry inline immediately before
+        // the literal bool. Earlier draft used a formatting-sensitive
+        // regex that matched zero call sites + 3 incidental comment
+        // hits, so the assertion passed via comments alone — a
+        // future regression flipping a `true` to `false` at a call
+        // site went undetected. The tag is colocated with the
+        // literal so any reword of the literal must also touch (or
+        // visibly remove) the tag.
+        let src = include_str!("hdmi.rs");
+        let tag = "is_offscreen_bake (Path A Stage 2 scope tag) */";
+        let n_false = src.matches(&format!("{tag} false,")).count();
+        let n_true = src.matches(&format!("{tag} true,")).count();
+        let n_total_tags = src.matches(tag).count();
+        assert_eq!(
+            n_total_tags,
+            n_false + n_true,
+            "Path A Stage 2: every tagged call site MUST be immediately followed by \
+             `false,` or `true,`. Found {n_total_tags} tags but only {} false + {} true \
+             literals matched — a tag is dangling without a bool literal (refactor in progress?).",
+            n_false, n_true,
+        );
+        assert!(
+            n_false >= 2,
+            "Path A Stage 2: expected >= 2 tagged call sites passing \
+             `is_offscreen_bake=false` (steady-state video + text-over-video paint paths); \
+             found {n_false}. A regression here re-opens the 720p steady-state freeze \
+             the original r106 caused.",
+        );
+        assert!(
+            n_true >= 2,
+            "Path A Stage 2: expected >= 2 tagged call sites passing \
+             `is_offscreen_bake=true` (transition bake_video + bake_text_over_video branches \
+             in bake_slide_to_fbo); found {n_true}. Without these, decoupled feed never \
+             activates and the dual-1080p input-starvation freeze returns.",
+        );
+    }
+
+    #[test]
+    fn path_a_painted_flag_reset_sites_present() {
+        // Per r106 sacred subagent WARN-4 (carried forward into
+        // Path A): every place that frees a cached
+        // transition_fbo_a/b is also a place that MUST reset the
+        // matching `transition_fbo_a/b_painted` flag, else the
+        // reuse-cached path can serve undefined GL contents.
+        let src = include_str!("hdmi.rs");
+        let n_reset_a = src.matches("transition_fbo_a_painted = false").count();
+        let n_reset_b = src.matches("transition_fbo_b_painted = false").count();
+        // Expect >= 2 reset sites per side: dim-change branch +
+        // fresh per-side allocation branch.
+        assert!(
+            n_reset_a >= 2,
+            "Path A Stage 2: transition_fbo_a_painted reset-false sites missing \
+             (expected >= 2; got {n_reset_a}). At least the dim-change branch + \
+             the fresh-allocation per-side branch should each reset.",
+        );
+        assert!(
+            n_reset_b >= 2,
+            "Path A Stage 2: transition_fbo_b_painted reset-false sites missing \
+             (expected >= 2; got {n_reset_b}). Same invariant as side A.",
+        );
+        assert!(
+            src.contains("transition_fbo_a_painted = true"),
+            "Path A Stage 2: transition_fbo_a_painted set-true site missing -- \
+             the reuse-cached path will never fire on side A",
+        );
+        assert!(
+            src.contains("transition_fbo_b_painted = true"),
+            "Path A Stage 2: transition_fbo_b_painted set-true site missing -- \
+             the reuse-cached path will never fire on side B",
+        );
+    }
+
+    #[test]
+    fn path_a_reuse_cached_probe_lines_present() {
+        // The `[perf] paint_transition_reuse_cached_{a,b}` probe
+        // lines are how QA's bench distinguishes "Path A reuse-
+        // cached fired" from "skip-tick fired" during a transition
+        // window with contention. Both probes must survive any
+        // future log-format refactor.
+        let src = include_str!("hdmi.rs");
+        assert!(
+            src.contains("paint_transition_reuse_cached_a"),
+            "Path A Stage 2: side-A reuse-cached probe line missing",
+        );
+        assert!(
+            src.contains("paint_transition_reuse_cached_b"),
+            "Path A Stage 2: side-B reuse-cached probe line missing",
+        );
+    }
+
+    #[test]
+    fn path_a_iter2_async_prime_helper_and_pending_skip_present() {
+        // Path A iter-2 (2026-06-14) added the off-thread to-side
+        // prime so the 1.5-2.6s render-thread freeze QA flagged
+        // after iter-1's image win disappears. Pin both halves:
+        // the spawn helper at BeginTransition and the dispatcher's
+        // skip-tick when the prime is still in flight.
+        let ipc = include_str!("ipc_main.rs");
+        assert!(
+            ipc.contains("fn spawn_async_to_prime_for_begin_transition("),
+            "Path A iter-2: spawn_async_to_prime_for_begin_transition helper missing -- \
+             BeginTransition will fall back to synchronous cache.load and the multi-second \
+             render-thread freeze returns",
+        );
+        assert!(
+            ipc.contains("spawn_async_to_prime_for_begin_transition("),
+            "Path A iter-2: spawn helper is defined but not called from BeginTransition",
+        );
+        assert!(
+            ipc.contains("paint_transition_skip_pending_prime"),
+            "Path A iter-2: dispatcher skip-tick fallback for pending-prime case missing -- \
+             paint_transition will hard-error when an async prime is still in flight",
+        );
+        assert!(
+            ipc.contains("cache.pending_preloads.contains_key("),
+            "Path A iter-2: the skip-tick fallback's pending_preloads probe is missing -- \
+             we can't distinguish 'in-flight async prime' from 'genuinely missing decoder'",
+        );
+    }
+
+    #[test]
+    fn path_a_kill_switch_env_var_documented() {
+        // OPENMARQUEE_FEED_DRAIN_DECOUPLE is the operator-facing
+        // kill switch that QA uses to A/B Path A against the pre-
+        // r106 blocking pattern. The env var name MUST stay stable
+        // because QA's bench scripts and operator runbooks
+        // reference it literally.
+        let v = include_str!("v4l2.rs");
+        assert!(
+            v.contains("OPENMARQUEE_FEED_DRAIN_DECOUPLE"),
+            "Path A: OPENMARQUEE_FEED_DRAIN_DECOUPLE kill-switch env var name missing or renamed \
+             -- QA's A/B harness will silently use the default (decouple ON)",
+        );
+        assert!(
+            v.contains("fn is_feed_drain_decouple_enabled"),
+            "Path A: is_feed_drain_decouple_enabled helper missing or renamed",
+        );
+    }
+}

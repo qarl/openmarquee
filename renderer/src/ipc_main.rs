@@ -1229,6 +1229,104 @@ fn drain_stale_preloads(
 /// worker already produced.
 ///
 /// Emits `[perf] begin_slide_wait slide_id=X wait_us=N` so QA
+/// 2026-06-14 Path A iter-2: spawn a preload worker for `slide_id`
+/// from the BeginTransition path, OFF the render thread. Mirrors
+/// PreloadSlide's spawn arm but bypasses the r97
+/// `preload_deferred_for_codec_contention` defer — the whole
+/// point of routing BeginTransition through async-prime is to do
+/// the prime DURING the transition window while the from-side
+/// decoder is still streaming. Path A's per-side
+/// `transition_fbo_a/b_painted` cached-FBO reuse handles the
+/// "B decoder not ready yet" visual window — when the bake_b
+/// returns Ok(None) because the worker hasn't finished, the
+/// transition paint path either reuses prior cached B content
+/// (subsequent transitions) or skip-ticks (first-ever transition
+/// into a fresh slide; rare in steady-state playlist cycling).
+///
+/// Idempotent: short-circuits at the same already-loaded /
+/// already-in-flight checks as PreloadSlide. If pending_preloads
+/// is at capacity (MAX_CONCURRENT_PRELOADS=2), falls back to
+/// synchronous cache.load so the to-side decoder is guaranteed
+/// primed by the time BeginSlide(to_id) handoff runs.
+///
+/// ensure_preload_complete at the post-transition BeginSlide(to_id)
+/// joins the worker + installs artifacts. If the worker is still
+/// in flight at BeginSlide, BeginSlide blocks the residual time
+/// (which we expect to be < transition_window because the prime
+/// started at BeginTransition entry).
+fn spawn_async_to_prime_for_begin_transition(
+    cache: &mut SlideCache,
+    content_root: &std::path::Path,
+    slide_id: uuid::Uuid,
+) -> Result<()> {
+    let already_loaded = cache.items.peek(&slide_id).is_some()
+        && cache.video_demuxers.contains_key(&slide_id)
+        && {
+            #[cfg(target_os = "linux")]
+            { cache.has_video_decoder(slide_id) }
+            #[cfg(not(target_os = "linux"))]
+            { true }
+        };
+    if already_loaded {
+        return Ok(());
+    }
+    if cache.pending_preloads.contains_key(&slide_id) {
+        return Ok(());
+    }
+    const MAX_CONCURRENT_PRELOADS: usize = 2;
+    if cache.pending_preloads.len() >= MAX_CONCURRENT_PRELOADS {
+        eprintln!(
+            "[perf] begin_transition_async_prime slide_id={} dropped reason=capacity \
+             pending={} -- falling back to synchronous cache.load",
+            slide_id,
+            cache.pending_preloads.len(),
+        );
+        return cache.load(content_root, slide_id);
+    }
+    let t_enqueue = std::time::Instant::now();
+    let content_root_clone = content_root.to_path_buf();
+    let slide_id_clone = slide_id;
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("v2v-pathA-prime-{slide_id}"))
+        .spawn(move || -> PreloadResult {
+            let t_work = std::time::Instant::now();
+            let r = preload_in_worker(&content_root_clone, slide_id_clone);
+            let work_us = t_work.elapsed().as_micros();
+            match &r {
+                Ok(_) => eprintln!(
+                    "[perf] begin_transition_async_prime slide_id={} work_us={}",
+                    slide_id_clone, work_us,
+                ),
+                Err(e) => eprintln!(
+                    "[perf] begin_transition_async_prime slide_id={} failed_us={} err={:#}",
+                    slide_id_clone, work_us, e,
+                ),
+            }
+            r
+        });
+    match spawn_result {
+        Ok(thread) => {
+            cache.pending_preloads.insert(
+                slide_id,
+                PreloadHandle { thread, enqueued_at: t_enqueue },
+            );
+            eprintln!(
+                "[perf] begin_transition_async_prime slide_id={} queued_us={}",
+                slide_id, t_enqueue.elapsed().as_micros(),
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "ipc: begin_transition async-prime spawn failed for {}: {:#}; \
+                 falling back to synchronous cache.load",
+                slide_id, e,
+            );
+            cache.load(content_root, slide_id)
+        }
+    }
+}
+
 /// can see when BeginSlide had to block on an unfinished
 /// preload. Steady state: wait_us ~= 0 µs (worker done long
 /// before BeginSlide fires for the same id).
@@ -2474,6 +2572,31 @@ fn run_paint_hook(
             // composites text on top, identical to the steady-
             // state paint_and_present_one_text_over_video_slide_
             // frame path.
+            // Path A iter-2 (2026-06-14, sacred BLOCKER-1+2 fix):
+            // the async to-side prime spawned at BeginTransition
+            // doesn't populate cache.items synchronously — its
+            // worker calls preload_in_worker which inserts items +
+            // demuxer + decoder only after V4L2 prime completes.
+            // The pre-iter-2 dispatcher's `None => return err(...)`
+            // arm would fire BEFORE the skip-tick check at the
+            // later (from_dec_id, to_dec_id) match, making the
+            // skip-tick unreachable in the cold-prime case. Route
+            // items.peek None for to_id through the skip-tick path
+            // when pending_preloads has to_id: render thread
+            // doesn't paint this tick, doesn't block — worker
+            // completes within the transition window and the next
+            // tick takes the normal path. Genuinely-missing
+            // to_id (no prime in flight) still errors as before.
+            if cache.items.peek(&to_id).is_none()
+                && cache.pending_preloads.contains_key(&to_id)
+            {
+                eprintln!(
+                    "[perf] paint_transition_skip_pending_prime to_slide_id={} progress={:.3} \
+                     reason=items_peek_none",
+                    to_id, progress,
+                );
+                return ok_empty();
+            }
             let from_kind = match cache.items.peek(&from_id) {
                 Some(ContentItem::Text(s)) => {
                     if s.background_video_slide_id.is_some() { 'b' } else { 't' }
@@ -2521,6 +2644,36 @@ fn run_paint_hook(
                         "paint_transition: same decoder id on both sides ({fid}) not supported \
                          (e.g. two text-over-video slides sharing one bg video)",
                     ));
+                }
+            }
+
+            // Path A iter-2 (2026-06-14): skip-tick when the to-side
+            // video decoder is missing but an async prime is
+            // in-flight (BeginTransition's
+            // spawn_async_to_prime_for_begin_transition queued a
+            // worker; PaintTransition fired before the worker
+            // finished priming). Pre-iter-2 the dispatcher would
+            // hard-error and the render thread would block on
+            // ensure_preload_complete at the next BeginSlide; iter-2
+            // returns Ok-empty to the backend so the render loop
+            // keeps cycling. delta_ms still spikes during the
+            // prime window (we're not painting), but no multi-
+            // second render-thread block, and the next tick after
+            // the worker finishes will install the primed decoder
+            // and resume normal Path A live-video transitioning.
+            //
+            // Genuine "decoder missing without pending prime" is
+            // still an error — fall through to the existing match
+            // below.
+            if let Some(tid) = to_dec_id {
+                if !cache.video_decoders.contains_key(&tid)
+                    && cache.pending_preloads.contains_key(&tid)
+                {
+                    eprintln!(
+                        "[perf] paint_transition_skip_pending_prime to_slide_id={} progress={:.3}",
+                        tid, progress,
+                    );
+                    return ok_empty();
                 }
             }
 
@@ -2929,17 +3082,40 @@ fn handle_inner_request(
             // produced. Identical semantics to the BeginSlide
             // path above; emits the same [perf]
             // begin_slide_wait line.
+            // Path A iter-2 (2026-06-14): replace synchronous
+            // cache.load(to_id) with off-thread prime via the
+            // preload worker pool. The synchronous prime was the
+            // ~1.5-2.6s render-thread freeze QA flagged after the
+            // Path A iter-1 image win. Off-threading lets the
+            // render loop keep painting from-side live during the
+            // worker's V4L2 prime (REQBUFS + STREAMON + primer +
+            // warmup + first-CAPTURE drain). The
+            // ensure_preload_complete call at the post-transition
+            // BeginSlide handoff joins the worker and installs
+            // artifacts; the render-thread paint path tolerates
+            // a still-priming to-decoder via the dispatcher's
+            // skip-tick fallback (paint_and_present_one_transition_
+            // frame is bypassed when to-side decoder is missing
+            // for a video kind — see paint_transition arm).
+            //
+            // ensure_preload_complete above already joined any
+            // in-flight worker (e.g. a PreloadSlide that hit the
+            // same id). If the join short-circuits because no
+            // worker exists, the spawn helper below queues a
+            // fresh one.
             ensure_preload_complete(cache, p.to_slide_id);
-            // r58 (2026-06-04): time the to-slide cache.load so QA
-            // can see PreloadSlide wins on the transition path too.
-            // Same heuristic as begin_slide_load above.
+            // Path A iter-2: async to-side prime entry point.
             let t_load = std::time::Instant::now();
-            if let Err(e) = cache.load(content_root, p.to_slide_id) {
-                return err(format!("begin_transition load failed: {e:#}"));
+            if let Err(e) = spawn_async_to_prime_for_begin_transition(
+                cache,
+                content_root,
+                p.to_slide_id,
+            ) {
+                return err(format!("begin_transition async-prime failed: {e:#}"));
             }
             let load_us = t_load.elapsed().as_micros();
             eprintln!(
-                "[perf] begin_transition_load slide_id={} load_us={}",
+                "[perf] begin_transition_load slide_id={} load_us={} async_prime=true",
                 p.to_slide_id, load_us,
             );
             // Hardening C3 / M1 (2026-05-21): also re-prime the
