@@ -173,6 +173,25 @@ mod tests {
     }
 
     #[test]
+    fn prewarm_egl_image_cache_accessor_pinned_in_v4l2_source() {
+        // perf-decode tail-fix close-out (2026-06-15): the
+        // `prewarm_egl_image_cache` accessor is the cross-lane
+        // unblocker for code2's Option B render-thread pre-warm.
+        // The name MUST stay stable because (a) code2's hdmi.rs
+        // call site keys on the literal, (b) QA's strings-
+        // fingerprint integrity gate keys on the literal, and
+        // (c) future readers tracking the r101 invariant +
+        // pre-warm pattern grep for it.
+        let v = include_str!("v4l2.rs");
+        assert!(
+            v.contains("prewarm_egl_image_cache"),
+            "tail-fix close-out: `prewarm_egl_image_cache` substring missing from v4l2.rs — \
+             code2's Option B hdmi.rs caller will no longer link AND the strings-fingerprint \
+             integrity gate will fail",
+        );
+    }
+
+    #[test]
     fn tail_diag_bake_breakdown_field_name_pinned_in_hdmi_source() {
         // tail-fix dispatch (2026-06-15): QA's bench parser greps
         // `tail_diag_bake_breakdown` literally to identify per-tick

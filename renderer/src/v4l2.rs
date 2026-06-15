@@ -2255,6 +2255,135 @@ impl Decoder {
         );
     }
 
+    /// perf-decode tail-fix close-out (2026-06-15): pre-warm the
+    /// per-CAPTURE-buffer EGLImage cache for the to-side decoder
+    /// BEFORE the first transition tick so the create cost
+    /// (eglCreateImageKHR ~tens-of-ms per fd under the FYS swap-
+    /// pressure regime where pswpin runs ~34 MB/min CONSTANT)
+    /// doesn't land on the per-tick blit path. Without this,
+    /// every CAPTURE buffer's first observation by the render
+    /// thread mid-transition triggers a lazy `get_or_init_egl_
+    /// image` create that may stall (the "import_us up to 3.9 s
+    /// cache_path=true created=true" v2.1 finding).
+    ///
+    /// Usage (code2's Option B in hdmi.rs, at first paint of the
+    /// to-side decoder):
+    /// ```ignore
+    /// decoder.prewarm_egl_image_cache(|idx, fd| {
+    ///     let img = (eps.create_image)(
+    ///         display.as_ptr(),
+    ///         std::ptr::null_mut(),
+    ///         EGL_LINUX_DMA_BUF_EXT,
+    ///         std::ptr::null_mut(),
+    ///         build_attribs(fd, w, h, stride).as_ptr(),
+    ///     );
+    ///     if img.is_null() {
+    ///         return Err(anyhow!("eglCreateImageKHR(idx={}) -> EGL_NO_IMAGE", idx));
+    ///     }
+    ///     Ok(EglImageHandle {
+    ///         image: img,
+    ///         display: display.as_ptr(),
+    ///         destroy_fn: eps.destroy_image,
+    ///     })
+    /// })?;
+    /// ```
+    ///
+    /// **Closure runs INSIDE the Decoder Mutex locked scope.**
+    /// This means:
+    ///   * `fd` is guaranteed valid for the closure's lifetime
+    ///     (Decoder owns the fd; nothing can drop the Decoder while
+    ///     we hold the lock).
+    ///   * Closure MUST NOT call any Decoder method that would
+    ///     re-acquire `self.inner.lock()` — `std::sync::Mutex` is
+    ///     non-reentrant; that would deadlock. Practical
+    ///     consequence: the closure should ONLY call EGL (Mesa
+    ///     entry points) + wrap the result. Don't call any
+    ///     `Decoder::*` API from inside.
+    ///   * Closure SHOULD NOT close(fd) — the fd is owned by
+    ///     `DecoderInner.capture_dmabuf_fds` and is closed in
+    ///     `DecoderInner::Drop` per the r101 lifecycle invariant
+    ///     (destroy_image BEFORE close(fd)).
+    ///
+    /// **Idempotent / safe for repeated calls.** Only slots that
+    /// are currently `None` get build_handle called + inserted.
+    /// Already-populated slots (from a prior pre-warm or a paint-
+    /// path lazy fill via `get_or_init_egl_image`) are skipped.
+    ///
+    /// **MMAP-only mode (no DMA-BUF export).** Returns Ok(()) with
+    /// nothing iterated — `capture_dmabuf_fds` stays empty when
+    /// `capture_buffer_type != DmaBuf` so no pre-warm work is
+    /// possible. Caller's optional pre-warm step naturally becomes
+    /// a no-op on the MMAP fall-through path.
+    ///
+    /// **r101 invariant preservation** (the sacred-review adversarial
+    /// frame): inserted handles end up in `capture_egl_images` via
+    /// the SAME slot mechanism that `get_or_init_egl_image` uses on
+    /// cache-miss (line 2149 `*slot = Some(handle)`). They are
+    /// destroyed at `DecoderInner::Drop` via the carried
+    /// `destroy_fn` + `display`, BEFORE `close(fd)` on the matching
+    /// `capture_dmabuf_fds` entry — identical to the lazy-fill
+    /// path's lifecycle. Pre-warm shifts the create cost to a
+    /// caller-chosen moment but does not change the destroy /
+    /// fd-close ordering.
+    ///
+    /// **Partial-error handling.** If `build_handle` returns Err
+    /// at idx=K, the iteration aborts with that error after
+    /// inserting all successful handles for indices < K. The
+    /// remaining indices > K stay `None` and lazy-fill normally
+    /// on the paint path. No leak (inserted handles stay in
+    /// `capture_egl_images` and destroy at Drop).
+    ///
+    /// **Length invariant.** `capture_egl_images.len() ==
+    /// capture_dmabuf_fds.len()` per the allocate_buffers contract
+    /// (line ~2499 `inner.capture_dmabuf_fds = fds;` followed by
+    /// the parallel `capture_egl_images` resize). The method's
+    /// internal check returns an explicit Err if that invariant
+    /// is ever violated (defensive; shouldn't happen in production
+    /// but the API stays safe under future refactors).
+    pub fn prewarm_egl_image_cache<F>(&self, mut build_handle: F) -> Result<()>
+    where
+        F: FnMut(u32, std::os::fd::RawFd) -> Result<EglImageHandle>,
+    {
+        let mut inner = self.inner.lock().unwrap();
+        let len = inner.capture_dmabuf_fds.len();
+        if len == 0 {
+            // MMAP-only mode (no DMA-BUF export) — nothing to warm.
+            // Caller's pre-warm step becomes a no-op on this path.
+            eprintln!(
+                "[perf] prewarm_egl_image_cache total=0 warmed=0 skipped=0 mode=mmap_or_pre_allocate"
+            );
+            return Ok(());
+        }
+        if inner.capture_egl_images.len() != len {
+            return Err(anyhow!(
+                "prewarm_egl_image_cache: capture_egl_images.len()={} != capture_dmabuf_fds.len()={} — \
+                 allocate_buffers invariant violated",
+                inner.capture_egl_images.len(),
+                len,
+            ));
+        }
+        let mut warmed = 0u32;
+        let mut skipped = 0u32;
+        for idx in 0..len {
+            if inner.capture_egl_images[idx].is_some() {
+                // Already populated (prior pre-warm OR lazy-fill via
+                // get_or_init_egl_image on a previous paint tick).
+                // Idempotent skip — don't re-create + don't leak.
+                skipped += 1;
+                continue;
+            }
+            let fd = inner.capture_dmabuf_fds[idx];
+            let handle = build_handle(idx as u32, fd)?;
+            inner.capture_egl_images[idx] = Some(handle);
+            warmed += 1;
+        }
+        eprintln!(
+            "[perf] prewarm_egl_image_cache total={} warmed={} skipped={}",
+            len, warmed, skipped,
+        );
+        Ok(())
+    }
+
     /// VIDIOC_REQBUFS + VIDIOC_QUERYBUF + mmap for `count`
     /// buffers on the given queue. Call AFTER set_*_format.
     pub fn allocate_buffers(
