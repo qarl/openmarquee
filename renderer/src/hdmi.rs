@@ -8430,6 +8430,16 @@ fn boundary_trace_enabled_cached() -> bool {
         }
         let v = std::env::var_os("OPENMARQUEE_BOUNDARY_TRACE").is_some();
         c.set(Some(v));
+        // 2026-06-15 perf-gl W-2 fingerprint: one-time emit on first
+        // resolution per worker thread. Lets QA's strings|grep gate
+        // confirm the cached helper is compiled in (the function
+        // symbol is stripped; only literal-string emits survive).
+        // Cost: one eprintln per process. The "[perf] w2_env_cache_
+        // resolved" marker is the QA-side fingerprint.
+        eprintln!(
+            "[perf] w2_env_cache_resolved name=OPENMARQUEE_BOUNDARY_TRACE value={}",
+            v,
+        );
         v
     })
 }
@@ -8458,6 +8468,13 @@ fn firstframe_profile_enabled_cached() -> bool {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         c.set(Some(v));
+        // 2026-06-15 perf-gl W-2 fingerprint: same one-time emit as
+        // boundary_trace_enabled_cached. The "[perf] w2_env_cache_
+        // resolved" line literal is the QA-side fingerprint string.
+        eprintln!(
+            "[perf] w2_env_cache_resolved name=OPENMARQUEE_FIRSTFRAME_PROFILE value={}",
+            v,
+        );
         v
     })
 }
