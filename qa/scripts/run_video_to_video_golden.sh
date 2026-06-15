@@ -32,9 +32,15 @@
 #   sudo bash qa/scripts/run_video_to_video_golden.sh
 #
 # Exit codes:
-#   0   OVERALL: PASS
+#   0   OVERALL: PASS (every represented kind side=a/b luma>floor + delta_ms within ceiling)
 #   1   OVERALL: FAIL (one or more transitions black OR delta_ms>ceiling)
-#   2   missing fixtures or invariant pre-check failure
+#   2   INFRA error (missing fixtures, systemctl unavailable, OR the
+#       backend rejected the staged playlist — these are test-staging
+#       failures, NOT transition regressions)
+#   3   PASS with SUSPICIOUS (every kind that ran was clean, but at
+#       least one expected kind produced zero probe samples — possible
+#       benign config drift OR a stutter-regression silenced the probe.
+#       Human reviews the per-kind N/A rows before accepting.)
 #
 # A trap on EXIT/INT/TERM restores the prior playlist + settings +
 # bounces the backend so a mid-run abort doesn't leave the sign
@@ -112,14 +118,27 @@ sudo mkdir -p "/var/openmarquee/content/$RED_ID" "/var/openmarquee/content/$BLUE
 sudo cp "$FIXTURE_DIR/golden-red.mp4"  "/var/openmarquee/content/$RED_ID/asset.mp4"
 sudo cp "$FIXTURE_DIR/golden-blue.mp4" "/var/openmarquee/content/$BLUE_ID/asset.mp4"
 
+NOW_ISO="$(date -u +'%Y-%m-%dT%H:%M:%S.000000+00:00')"
+# 2026-06-14 v2 fix per QA: item.json MUST carry the full envelope the
+# backend's storage/playback loader expects, not a bare `{"item": ...}`.
+# The envelope shape is `{schema_version: 3, updated_at: <iso>, item: {...VideoSlide...}}`
+# per backend/openmarquee/content/storage.py. Without
+# `schema_version`, fetch_items() throws ValueError + the playback loop
+# never starts any slides → zero transitions → the runner falsely
+# reports "no samples" as a transition regression.
 for id in "$RED_ID" "$BLUE_ID"; do
     cat > /tmp/item.json <<EOF
 {
+  "schema_version": 3,
+  "updated_at": "$NOW_ISO",
   "item": {
+    "type": "video",
     "id": "$id",
     "name": "v2v-golden-$id",
-    "type": "video",
-    "duration_ms": 3000
+    "duration_ms": 3000,
+    "transition": "cut",
+    "transition_ms": 500,
+    "created_at": "$NOW_ISO"
   }
 }
 EOF
@@ -173,13 +192,74 @@ echo "==> capturing journal since restart"
 sudo journalctl -u "$BACKEND_UNIT" --since "$JOURNAL_SINCE_REF" --no-pager > "$JOURNAL"
 echo "   $(wc -l < "$JOURNAL") lines"
 
+# 2026-06-14 v2 fix per QA: distinguish "test infrastructure broken"
+# from "real regression." Pre-v2 the runner would falsely report
+# every kind as FAIL when the playlist staging was rejected (zero
+# transitions ran → zero probe samples → "no samples = FAIL"). A
+# broken test masquerading as a broken fix is dangerous — operator
+# reverts the fix on a phantom regression.
+#
+# Two pre-flight checks before per-kind analysis:
+#   1. Look for backend startup errors that indicate the test
+#      playlist itself failed to load (schema mismatch, JSON parse
+#      error, etc.). If present → exit 2 INFRA.
+#   2. Count TOTAL transition_tex_probe lines in the journal. If
+#      0 across all kinds → no transitions ran → exit 2 INFRA.
+# Only after both pass does the per-kind black-side / delta-ms
+# analysis fire (which determines OVERALL PASS/FAIL).
+echo
+echo "==> pre-flight: confirming test playlist was accepted by backend"
+# Sacred-review #1 fix: scope the INFRA grep to lines that reference
+# OUR test slide UUIDs ($RED_ID/$BLUE_ID). The substring 'migration
+# needed' appears verbatim in _storage_recovery.quarantine_corrupt_
+# file's warning log when ANY item.json on disk has the wrong
+# schema_version (e.g. a quarantined sibling from a PRIOR test run,
+# OR an unrelated corrupt envelope). Without the UUID filter we'd
+# trip INFRA on unrelated quarantines and mask the real per-kind
+# signal.
+INFRA_RE="playlist prune failed|fetch_items failed|envelope corrupted"
+INFRA_LINES=$(grep -E "$INFRA_RE" "$JOURNAL" 2>/dev/null \
+              | grep -E "$RED_ID|$BLUE_ID" || true)
+# 'migration needed' is treated specially because that's the exact
+# error the v1 runner produced; scope it tightly to OUR UUIDs.
+MIGRATION_LINES=$(grep "migration needed" "$JOURNAL" 2>/dev/null \
+                  | grep -E "$RED_ID|$BLUE_ID" || true)
+INFRA_TOTAL=0
+[ -n "$INFRA_LINES" ] && INFRA_TOTAL=$((INFRA_TOTAL + $(printf '%s\n' "$INFRA_LINES" | wc -l)))
+[ -n "$MIGRATION_LINES" ] && INFRA_TOTAL=$((INFRA_TOTAL + $(printf '%s\n' "$MIGRATION_LINES" | wc -l)))
+if [ "$INFRA_TOTAL" -gt 0 ]; then
+    echo "   INFRA: backend rejected our test items ($INFRA_TOTAL error lines reference $RED_ID/$BLUE_ID):"
+    printf '%s\n' "$INFRA_LINES" "$MIGRATION_LINES" | head -3 | sed 's/^/      /'
+    echo
+    echo "==========================================="
+    echo "INFRA: test-staging error (NOT a transition regression)"
+    echo "==========================================="
+    echo "Inspect: $JOURNAL (copied to /tmp/v2v-golden-journal.log on exit)"
+    exit 2
+fi
+TOTAL_PROBE_SAMPLES=$(grep -c "transition_tex_probe side=" "$JOURNAL" || true)
+echo "   $TOTAL_PROBE_SAMPLES transition_tex_probe samples in window"
+if [ "$TOTAL_PROBE_SAMPLES" -eq 0 ]; then
+    echo
+    echo "==========================================="
+    echo "INFRA: no transitions ran (zero probe samples) — check playlist items accepted"
+    echo "==========================================="
+    echo "Hint: are the staged item.json envelopes the right schema_version?"
+    echo "Inspect: $JOURNAL (copied to /tmp/v2v-golden-journal.log on exit)"
+    exit 2
+fi
+echo "   pre-flight OK — proceeding to per-kind analysis"
+
 # transition_tex_probe line shape (from iter-3 instrumentation):
 #   [perf] transition_tex_probe side=<a|b> kind=<k> progress=<p> fbo_id=<n> tex_id=<n> luma=<L>
 # Per side per transition kind, we expect ≥1 sample (latched once
-# per transition at progress >= 0.4). If 0 samples → FAIL (the
-# probe didn't fire OR no transition of that kind ran).
+# per transition at progress >= 0.4). If 0 samples for a SPECIFIC
+# kind (with TOTAL_PROBE_SAMPLES > 0) → that kind didn't run
+# (unknown transition name in our list, or the kind was dropped
+# from the playlist) → flag as N/A, not FAIL.
 
 FAIL=0
+SUSPICIOUS=0
 echo
 echo "==> per-transition-kind luma analysis (floor=$LUMA_FLOOR)"
 printf "%-12s %8s %8s %8s %8s %s\n" "KIND" "A_SAMPLES" "A_MIN" "B_SAMPLES" "B_MIN" "VERDICT"
@@ -203,8 +283,20 @@ for k in "${TRANSITIONS[@]}"; do
     if [ "$k" = "cut" ]; then
         verdict="N/A (cut is zero-duration)"
     elif [ "$a_n" = "0" ] || [ "$b_n" = "0" ]; then
-        verdict="FAIL (no samples — probe didn't fire OR transition didn't run)"
-        FAIL=1
+        # Pre-flight already confirmed TOTAL > 0, so per-kind 0
+        # means this specific kind didn't appear in the playlist
+        # (e.g. unknown transition name dropped by the loader)
+        # OR — and this is the subagent #2 concern — the kind
+        # ran but the renderer's probe didn't latch because the
+        # framerate stuttered so badly the transition never
+        # crossed progress >= 0.4 (the latch threshold). The
+        # first cause is benign config drift; the second is a
+        # real regression silenced. Bias toward visibility:
+        # flag as SUSPICIOUS so a human reviews even if all
+        # other kinds PASS. Exit code 3 distinguishes from a
+        # clean PASS (0) and a real black-side FAIL (1).
+        verdict="N/A (kind missing OR stutter-regression — REVIEW)"
+        SUSPICIOUS=1
     elif [ "$a_min" -le "$LUMA_FLOOR" ] || [ "$b_min" -le "$LUMA_FLOOR" ]; then
         verdict="FAIL (a_min=$a_min b_min=$b_min ≤ floor=$LUMA_FLOOR — side went BLACK)"
         FAIL=1
@@ -239,13 +331,20 @@ fi
 
 echo
 echo "==========================================="
-if [ "$FAIL" = "0" ]; then
-    echo "OVERALL: PASS"
-else
+if [ "$FAIL" -gt 0 ]; then
     echo "OVERALL: FAIL"
+    OVERALL_EXIT=1
+elif [ "$SUSPICIOUS" -gt 0 ]; then
+    echo "OVERALL: PASS (with SUSPICIOUS — review N/A rows; possible kind"
+    echo "         missing from playlist OR stutter-regression that silenced"
+    echo "         the probe by never crossing progress >= 0.4)"
+    OVERALL_EXIT=3
+else
+    echo "OVERALL: PASS"
+    OVERALL_EXIT=0
 fi
 echo "==========================================="
 echo "journal will be available at /tmp/v2v-golden-journal.log (the trap"
 echo "copies it OUT of $RESTORE_TMP before wiping)"
 
-exit "$FAIL"
+exit "$OVERALL_EXIT"
