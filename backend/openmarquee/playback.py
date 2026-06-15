@@ -1202,26 +1202,53 @@ class PlaybackLoop:
         # pending").
         preloaded_next_id: UUID | None = None
         # Threshold seconds-before-slide-end for the preload trigger.
-        # r58 shipped at 0.5 s, r61 widened to 1.0 s. r62 (2026-06-05)
-        # widens again to 2.0 s after FYS data with the REAL r61
-        # binary showed preload_us p50 ~550 ms, p90 ~1100 ms, max
-        # 1322 ms (21-sample window). ~30% of preloads still exceeded
-        # the 1.0 s window so the slow tail landed in the transition
-        # critical path. 2.0 s comfortably covers the 1322 ms
-        # worst case + ~678 ms headroom.
+        # History: r58 shipped at 0.5 s, r61 widened to 1.0 s, r62
+        # (2026-06-05) bumped to 2.0 s because FYS data with the
+        # r61 binary showed preload_us p50 ~550 ms, p90 ~1100 ms,
+        # max 1322 ms (21-sample window) — ~30% of preloads
+        # exceeded the 1.0 s window so the slow tail landed in
+        # the transition critical path. The r62 2.0 s bump was
+        # REVERTED before r97 (the modes-design-space dispatch)
+        # and the default returned to 1.0 s — see
+        # `_DEFAULT_PRELOAD_LEAD_MS` at module scope.
+        #
+        # Why 1.0 s remains the right default post-F-1 (perf-decode
+        # 2026-06-15, ipc_main.rs spawn_async_to_prime_for_begin_slide):
+        # BeginSlide now off-threads the V4L2 prime via the preload-
+        # worker pool. An in-flight worker at BeginSlide entry is
+        # joined by `ensure_preload_complete` (not blocked-on); a
+        # not-yet-spawned worker is queued by the BeginSlide handler
+        # itself. So the r62 slow-tail concern (preload didn't
+        # complete in time → transition critical path absorbed the
+        # residual) no longer applies — the residual now hides
+        # behind paint_slide's skip-tick gates, not the render
+        # thread. The 1.0 s lead still gives steady-state preloads
+        # a comfortable window to complete; the r62 1322 ms
+        # worst case now overflows by ~322 ms into the
+        # off-thread spawn path (free).
         #
         # CMA: r58 measured 251.8 MB peak under the 254 MB watchdog
-        # in a ~1.5 s 2-pool window; r61 widened to ~2.5 s, r62 to
-        # ~3.5 s. The 2-pool concurrent shape already exists during
-        # transitions today -- pre-warm only widens its TIME window,
-        # not the peak. r59 raised the watchdog ceiling 220 -> 254
-        # MB which gives the wider window more headroom.
+        # in a ~1.5 s 2-pool window; r61's 1.0 s lead = ~2.5 s
+        # 2-pool window (transition overlap + preload lead). r59
+        # raised the watchdog ceiling 220 -> 254 MB. The 2-pool
+        # concurrent shape already exists during transitions today
+        # — pre-warm only widens its TIME window, not the peak.
         #
-        # Trade-off: slides with duration_ms < 2000 ms skip pre-warm
-        # entirely. Default duration in api.py is 5000-10000 ms;
-        # operators CAN set 100-2000 ms via the API. For sub-2-s
-        # slides the transition pays the cold prime cost as before
-        # -- no worse than r57.
+        # Trade-off: slides with duration_ms < 1000 ms skip
+        # pre-warm entirely (the trigger condition
+        # `elapsed >= duration/1000 - lead` requires elapsed < 0
+        # which never happens). Default duration in api.py is
+        # 5000 ms (per the BeginSlideParams + content schema
+        # defaults at api.py:296/566/594/641/697); operators CAN
+        # set 100-86400000 ms via the API (validated at api.py:
+        # 1149). For sub-1-s slides the transition pays the
+        # cold prime cost — but per perf-decode F-1, that cost
+        # is now off-threaded at BeginSlide, so the display
+        # freezes on the previous frame during prime rather
+        # than blocking the render thread. Followup: short-
+        # duration playlists may benefit from 'max' mode (fires
+        # preload IMMEDIATELY after begin_slide(N)) — see
+        # qa/perf-decode-followups-2026-06-15.md Angle 2.
         # r98 (2026-06-09): preload scheduling mode + lead time.
         # OPENMARQUEE_PRELOAD_MODE selects how to schedule the
         # next-slide preload:
