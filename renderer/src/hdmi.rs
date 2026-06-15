@@ -7123,12 +7123,20 @@ impl<'a> EglSession<'a> {
                     .map(|t| now.saturating_duration_since(t).as_secs() >= 1)
                     .unwrap_or(true);
                 if should_log {
+                    // peak-triage (2026-06-15): `since_restart_ms`
+                    // disambiguates qa-bench-cycle restart artifacts
+                    // (small value, typically < 5000 ms) from
+                    // steady-state cold-prime freezes (large value).
+                    // Read via crate::frame_pacing's process-startup
+                    // OnceLock marked at main.rs entry. Pure
+                    // instrumentation; no behavior change.
                     eprintln!(
-                        "[perf] frame over budget: delta_ms={} in_transition={} over_budget_total={} observed_total={}",
+                        "[perf] frame over budget: delta_ms={} in_transition={} over_budget_total={} observed_total={} since_restart_ms={}",
                         delta_ms,
                         self.in_transition,
                         self.frames_over_budget_total,
                         self.frames_observed_total,
+                        crate::frame_pacing::since_renderer_startup_ms(),
                     );
                     self.last_over_budget_warn_at = Some(now);
                 }

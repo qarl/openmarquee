@@ -1343,6 +1343,15 @@ mod tests {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    // peak-triage (2026-06-15): mark process startup time as the
+    // canonical anchor for QA's `since_restart_ms=N` tag on the
+    // `[perf] frame over budget` line (hdmi.rs:7127). FIRST call
+    // wins; subsequent calls are no-ops (OnceLock). Placed before
+    // env-banner emission so the startup-env logs themselves carry
+    // a meaningful since_restart_ms in any future use (currently
+    // the field is read only by the over-budget emitter).
+    crate::frame_pacing::mark_renderer_startup();
+
     // r87 (2026-06-09) startup env-var banner per QA r87 dispatch
     // ask. r86 telemetry showed EOS_FLUSH=1 systemd drop-in
     // caused REQBUFS EINVAL on the very first decoder open --
