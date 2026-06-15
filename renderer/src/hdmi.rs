@@ -8479,14 +8479,42 @@ fn firstframe_profile_enabled_cached() -> bool {
     })
 }
 
+/// 2026-06-15 perf-gl W-2 follow-on: thread_local-cached read of
+/// `OPENMARQUEE_BAKE_OFFSCREEN_FLUSH`. Same pattern as
+/// boundary_trace_enabled_cached / firstframe_profile_enabled_cached.
+/// Called from 2 sites inside bake_video_slide_to_current_fbo, both
+/// gated on `is_offscreen_bake=true`, which runs ~30 ticks per
+/// transition (60 reads/transition; ~30-60 reads/sec during the
+/// transition window). Each pre-fix call did `std::env::var(...)`
+/// which heap-allocates a String for the matched value. Caching
+/// drops the per-call cost to a Cell::get() (~1 ns); first call
+/// emits a one-time fingerprint marker.
 fn bake_offscreen_flush_enabled() -> bool {
-    match std::env::var("OPENMARQUEE_BAKE_OFFSCREEN_FLUSH") {
-        Ok(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !matches!(v.as_str(), "off" | "0" | "false" | "no" | "disable" | "disabled")
-        }
-        Err(_) => true,
+    use std::cell::Cell;
+    thread_local! {
+        static CACHED: Cell<Option<bool>> = const { Cell::new(None) };
     }
+    CACHED.with(|c| {
+        if let Some(v) = c.get() {
+            return v;
+        }
+        let v = match std::env::var("OPENMARQUEE_BAKE_OFFSCREEN_FLUSH") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !matches!(v.as_str(), "off" | "0" | "false" | "no" | "disable" | "disabled")
+            }
+            Err(_) => true,
+        };
+        c.set(Some(v));
+        // Fingerprint marker — distinctive literal "bake_flush_cache_
+        // resolved" lets QA strings|grep verify this commit is in the
+        // binary. Singular emit (expected count=1).
+        eprintln!(
+            "[perf] bake_flush_cache_resolved name=OPENMARQUEE_BAKE_OFFSCREEN_FLUSH value={}",
+            v,
+        );
+        v
+    })
 }
 
 unsafe fn bake_video_slide_to_current_fbo(
