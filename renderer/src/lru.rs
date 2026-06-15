@@ -99,6 +99,41 @@ where
         self.map.get(key)
     }
 
+    /// Lookup with LRU touch returning a MUTABLE reference. Mirrors
+    /// `get`'s behavior for callers that need to mutate the cached
+    /// value in place (e.g. SlideRenderCache field updates). Same
+    /// O(capacity) cost as `get`.
+    ///
+    /// Added 2026-06-15 (perf-gl M-1) so the slide_caches conversion
+    /// from HashMap to LruMap doesn't require restructuring the many
+    /// `slide_caches.get_mut(&id).expect(...)` callers in hdmi.rs.
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if !self.map.contains_key(key) {
+            return None;
+        }
+        if let Some(pos) = self.order.iter().position(|k| k.borrow() == key) {
+            if let Some(k) = self.order.remove(pos) {
+                self.order.push_back(k);
+            }
+        }
+        self.map.get_mut(key)
+    }
+
+    /// Read-only key-membership check. Does NOT touch the LRU order.
+    /// O(1). Added 2026-06-15 (perf-gl M-1) to match the existing
+    /// HashMap-based slide_caches.contains_key call sites.
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.contains_key(key)
+    }
+
     /// Lookup WITHOUT touching the LRU order. Takes `&self` so
     /// multiple peeks (or a peek under a `&SlideCache` borrow) can
     /// coexist. The trade-off vs `get`: an entry only ever surfaced
@@ -343,6 +378,43 @@ mod tests {
         c.insert("a", 1);
         assert_eq!(c.remove(&"missing"), None);
         assert_eq!(c.len(), 1);
+    }
+
+    #[test]
+    fn get_mut_touches_to_most_recent() {
+        // perf-gl M-1 (2026-06-15): get_mut must mirror get's LRU-
+        // touch semantic so callers that READ-MODIFY (e.g.
+        // SlideRenderCache field updates) keep the entry hot.
+        let mut c: LruMap<&'static str, u32> = LruMap::with_capacity(3);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        c.insert("c", 3);
+        // get_mut("a") promotes a to back; next insert evicts b.
+        if let Some(v) = c.get_mut(&"a") {
+            *v = 11;
+        }
+        let o = c.insert("d", 4);
+        assert_eq!(o.evicted_lru, Some(2)); // b evicted, not a.
+        assert_eq!(c.peek(&"a"), Some(&11)); // mutation applied + retained.
+        assert!(c.peek(&"b").is_none());
+    }
+
+    #[test]
+    fn contains_key_does_not_touch_lru_order() {
+        // perf-gl M-1 (2026-06-15): contains_key is a probe; must
+        // NOT touch the LRU order or callers using it as a first-
+        // paint detector would accidentally promote cold entries.
+        let mut c: LruMap<&'static str, u32> = LruMap::with_capacity(2);
+        c.insert("a", 1);
+        c.insert("b", 2);
+        // contains_key on a (the LRU) — should NOT promote a.
+        assert!(c.contains_key(&"a"));
+        let o = c.insert("c", 3);
+        // a evicted (contains_key didn't promote it); b retained.
+        assert_eq!(o.evicted_lru, Some(1));
+        assert!(!c.contains_key(&"a"));
+        assert!(c.contains_key(&"b"));
+        assert!(c.contains_key(&"c"));
     }
 
     #[test]

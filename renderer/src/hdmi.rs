@@ -424,14 +424,22 @@ pub struct EglSession<'a> {
     /// reel pass touching every slide, the second pass + onward
     /// hit cache for ALL bake operations.
     ///
-    /// Keyed by slide_id (Uuid). HashMap (no LRU) — FYS reel is
-    /// 19 slides × ~1 MB cached state per slide (small text
-    /// bitmaps); 19 MB total fits trivially in CMA budget. If
-    /// future workloads need eviction, swap to LruMap.
+    /// Keyed by slide_id (Uuid). 2026-06-15 perf-gl M-1: converted
+    /// HashMap → LruMap so growth is BOUNDED. Per-entry holds glyph
+    /// alpha bitmaps (CPU heap) + tex/bg_tex/first_frame_tex handles
+    /// (GPU/CMA); cap prevents unbounded vm_data accumulation under
+    /// long-lived sessions or playlist swaps. SLIDE_CACHE_CAP_DEFAULT
+    /// = 24 (covers the FYS 19-slide reel + 5 headroom for a swap-in
+    /// of a partial new playlist before LRU eviction begins). The
+    /// cap is operator-tunable via `OPENMARQUEE_SLIDE_CACHE_CAP` for
+    /// bench experiments without a recompile.
     ///
     /// Cleanup at with_egl_session teardown drains all entries
-    /// + delete_textures while gl context is still bound.
-    slide_caches: std::collections::HashMap<uuid::Uuid, SlideRenderCache>,
+    /// + delete_textures while gl context is still bound. Per-insert
+    /// LRU eviction (when at cap + new key) routes the evicted
+    /// SlideRenderCache through `free_slide_render_cache` for the
+    /// same texture-handle cleanup contract.
+    slide_caches: crate::lru::LruMap<uuid::Uuid, SlideRenderCache>,
     /// QA-direct (2026-05-08, post-clock_nanosleep): session-cached
     /// fullscreen-quad VBO for the SP transition path. The same
     /// 4-vert TRIANGLE_STRIP geometry is used by every transition
@@ -769,7 +777,7 @@ where
         external_frame_tex: None,
         external_nv12_tex: None,
         current_settings: crate::content::Settings::default(),
-        slide_caches: std::collections::HashMap::new(),
+        slide_caches: crate::lru::LruMap::with_capacity(slide_cache_capacity()),
         transition_sp_quad_vbo: None,
         scissored_bake_atlas: None,
         msdf_atlases: Vec::new(),
@@ -1616,7 +1624,12 @@ fn render_animated_slide_in_session(
             if let Some(old) = session.slide_caches.remove(&slide_id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session.slide_caches.insert(slide_id, SlideRenderCache::new(text_layers.len()));
+            insert_slide_render_cache(
+                &mut session.slide_caches,
+                session.gl,
+                slide_id,
+                SlideRenderCache::new(text_layers.len()),
+            );
         }
     }
 
@@ -1656,9 +1669,12 @@ fn render_animated_slide_in_session(
                 if let Some(old) = session.slide_caches.remove(&slide_id) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session
-                    .slide_caches
-                    .insert(slide_id, SlideRenderCache::new(text_layers.len()));
+                insert_slide_render_cache(
+                    &mut session.slide_caches,
+                    session.gl,
+                    slide_id,
+                    SlideRenderCache::new(text_layers.len()),
+                );
             }
             // Bug 1 fix (2026-05-09): tick_seconds is session-
             // global, NOT call-local. Motion phase stays continuous
@@ -3502,9 +3518,12 @@ pub fn paint_and_present_one_frame_for_slide(
             if let Some(old) = session.slide_caches.remove(&slide.id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session
-                .slide_caches
-                .insert(slide.id, SlideRenderCache::new(text_layers.len()));
+            insert_slide_render_cache(
+                &mut session.slide_caches,
+                session.gl,
+                slide.id,
+                SlideRenderCache::new(text_layers.len()),
+            );
         }
     }
     let cache = session
@@ -3778,9 +3797,12 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             if let Some(old) = session.slide_caches.remove(&slide.id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session
-                .slide_caches
-                .insert(slide.id, SlideRenderCache::new(text_layers.len()));
+            insert_slide_render_cache(
+                &mut session.slide_caches,
+                session.gl,
+                slide.id,
+                SlideRenderCache::new(text_layers.len()),
+            );
         }
     }
     crate::profile::record_phase(
@@ -6035,7 +6057,12 @@ pub fn capture_sb_transition_mid_to_png(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                insert_slide_render_cache(
+                    &mut session.slide_caches,
+                    session.gl,
+                    sid,
+                    SlideRenderCache::new(n),
+                );
             }
         }
 
@@ -8356,6 +8383,29 @@ unsafe fn bake_external_nv12_to_current_fbo(
 /// the flush even when the caller declares an offscreen bake — used
 /// by QA to verify the bug still reproduces against a known-bad
 /// baseline on the bench.
+/// 2026-06-15 perf-gl M-1: cap for the slide_caches LruMap. Default
+/// 24 covers the FYS 19-slide reel + 5-slide headroom for a partial
+/// playlist swap-in before eviction begins. Tunable via
+/// `OPENMARQUEE_SLIDE_CACHE_CAP` for bench experiments (admin's
+/// optimization mission, not for production hot-swaps). Clamped to
+/// [4, 256] to stop pathological values from either blowing memory
+/// or churning every slide change.
+const SLIDE_CACHE_CAP_DEFAULT: usize = 24;
+const SLIDE_CACHE_CAP_MIN: usize = 4;
+const SLIDE_CACHE_CAP_MAX: usize = 256;
+
+fn slide_cache_capacity() -> usize {
+    match std::env::var("OPENMARQUEE_SLIDE_CACHE_CAP") {
+        Ok(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .map(|n| n.clamp(SLIDE_CACHE_CAP_MIN, SLIDE_CACHE_CAP_MAX))
+            .unwrap_or(SLIDE_CACHE_CAP_DEFAULT),
+        Err(_) => SLIDE_CACHE_CAP_DEFAULT,
+    }
+}
+
 fn bake_offscreen_flush_enabled() -> bool {
     match std::env::var("OPENMARQUEE_BAKE_OFFSCREEN_FLUSH") {
         Ok(v) => {
@@ -9332,9 +9382,12 @@ unsafe fn bake_slide_to_fbo(
                 if let Some(old) = session.slide_caches.remove(&slide_id) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session
-                    .slide_caches
-                    .insert(slide_id, SlideRenderCache::new(layers_len));
+                insert_slide_render_cache(
+                    &mut session.slide_caches,
+                    session.gl,
+                    slide_id,
+                    SlideRenderCache::new(layers_len),
+                );
             }
             // Bug 3 Slice 2D-fp4 (2026-05-19): construct the runtime
             // glyph cache context BEFORE the mutable borrow of
@@ -9519,9 +9572,12 @@ unsafe fn bake_slide_to_fbo(
                 if let Some(old) = session.slide_caches.remove(&slide_id) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session
-                    .slide_caches
-                    .insert(slide_id, SlideRenderCache::new(layers_len));
+                insert_slide_render_cache(
+                    &mut session.slide_caches,
+                    session.gl,
+                    slide_id,
+                    SlideRenderCache::new(layers_len),
+                );
             }
             // r102.2: reuse cached transition FBO+tex pair when
             // the caller threaded one through.
@@ -10155,7 +10211,12 @@ fn render_transition_animated_in_session(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                insert_slide_render_cache(
+                    &mut session.slide_caches,
+                    session.gl,
+                    sid,
+                    SlideRenderCache::new(n),
+                );
             }
         }
         let start = Instant::now();
@@ -10595,7 +10656,12 @@ fn render_transition_single_pass_in_session(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                insert_slide_render_cache(
+                    &mut session.slide_caches,
+                    session.gl,
+                    sid,
+                    SlideRenderCache::new(n),
+                );
             }
         }
     }
@@ -10966,7 +11032,12 @@ fn render_transition_scissored_bake_in_session(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                insert_slide_render_cache(
+                    &mut session.slide_caches,
+                    session.gl,
+                    sid,
+                    SlideRenderCache::new(n),
+                );
             }
         }
     }
@@ -13670,6 +13741,36 @@ fn free_slide_render_cache(gl: &glow::Context, mut cache: SlideRenderCache) {
     }
 }
 
+/// 2026-06-15 perf-gl M-1: route every slide_caches.insert through
+/// here so the LruMap's InsertOutcome (evicted_lru / replaced) is
+/// always cleaned up via free_slide_render_cache — the same texture-
+/// handle cleanup contract the explicit remove+free sites use.
+///
+/// The borrow split (slide_caches vs gl) is the standard field-
+/// disjoint pattern used elsewhere in this file (image_bg_cache +
+/// gl, image_slide_tex_cache + gl); passing both as separate refs
+/// keeps the helper callable from sites that already hold &mut
+/// session for other field access.
+fn insert_slide_render_cache(
+    slide_caches: &mut crate::lru::LruMap<uuid::Uuid, SlideRenderCache>,
+    gl: &glow::Context,
+    slide_id: uuid::Uuid,
+    cache: SlideRenderCache,
+) {
+    let outcome = slide_caches.insert(slide_id, cache);
+    if let Some(evicted) = outcome.evicted_lru {
+        free_slide_render_cache(gl, evicted);
+    }
+    if let Some(replaced) = outcome.replaced {
+        // Defensive: callers explicitly remove+free before insert
+        // (see the `if let Some(old) = ... .remove(...)` idiom), so
+        // the replaced slot should be None on the production paths.
+        // Free anyway if it ever fires — better than leaking texture
+        // handles.
+        free_slide_render_cache(gl, replaced);
+    }
+}
+
 /// v1-spec-delta perf-profile (qarl-direct 2026-05-08): per-layer
 /// GL texture cache parallel to glyph_cache. Same indexing (Vec
 /// position = layer index). When a layer's bitmap is re-rasterized
@@ -14770,9 +14871,12 @@ fn prewarm_sp_session(
             if let Some(old) = session.slide_caches.remove(&slide_id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session
-                .slide_caches
-                .insert(slide_id, SlideRenderCache::new(n));
+            insert_slide_render_cache(
+                &mut session.slide_caches,
+                session.gl,
+                slide_id,
+                SlideRenderCache::new(n),
+            );
         }
 
         // B.3 cleanup follow-up: prepare_layers_for_single_pass is
