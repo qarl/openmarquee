@@ -382,13 +382,16 @@ def test_dry_run_chmod_plus_x_on_system_sh_helpers(dry_output: str) -> None:
         )
 
 
-def test_dry_run_unmasks_hostapd_and_dnsmasq(dry_output: str) -> None:
-    """Task #99 Fix 1 (2026-05-14): Pi OS Lite trixie ships hostapd.service
-    masked (prevents accidental AP-on-boot on unrelated images). Without
-    `systemctl unmask hostapd`, openmarquee-ap0.service's `Before=
-    hostapd.service` ordering pulls in a masked unit that refuses to
-    start -- no AP, no captive portal."""
-    assert "systemctl unmask hostapd.service dnsmasq.service" in dry_output
+def test_dry_run_masks_ap_side_units_per_r60(dry_output: str) -> None:
+    """r60 (2026-06-04): AP off by default. Per qarl spec, brcmfmac
+    dual-mode (AP on ap0 + STA on wlan0) crashes under load; the
+    AP-side units (openmarquee-ap0, hostapd, dnsmasq) must be MASKED
+    on install so they cannot fire on boot or via postinst nudges.
+    Field-provisioning brings the AP back via `systemctl unmask
+    openmarquee-ap0.service hostapd.service dnsmasq.service && start`
+    (per install.sh:1188-1207 comment + qa/r60-ap-off-by-default-
+    design.md §A). Supersedes Task #99 Fix 1's unmask assertion."""
+    assert "systemctl mask openmarquee-ap0.service hostapd.service dnsmasq.service" in dry_output
 
 
 def test_dry_run_enables_hostapd_and_dnsmasq(dry_output: str) -> None:
@@ -408,15 +411,22 @@ def test_dry_run_enables_hostapd_and_dnsmasq(dry_output: str) -> None:
         )
 
 
-def test_dry_run_unmask_precedes_enable_for_hostapd(dry_output: str) -> None:
-    """Order: unmask -> enable. If enable runs first against a masked
-    unit, systemctl returns 1 and -- under `set -e` -- aborts install.sh
-    before the rest of the enable line."""
-    unmask_idx = dry_output.find("systemctl unmask hostapd.service")
+def test_dry_run_ap_mask_precedes_backend_enable(dry_output: str) -> None:
+    """r60 ordering: the AP-side mask (openmarquee-ap0 + hostapd +
+    dnsmasq) must land BEFORE the backend.service enable. The
+    `systemctl enable` runs under `set -e`; pinning the relative
+    order keeps a future edit (e.g. someone re-inserting an enable
+    for hostapd between these two calls) from silently swapping the
+    safety order. The mask is on the AP-side units; the enable here
+    is on the unrelated backend.service — the two operate on
+    DIFFERENT units, this is a pure relative-order assertion."""
     enable_idx = dry_output.find("systemctl enable openmarquee-backend.service")
-    assert unmask_idx != -1, "unmask marker missing"
+    mask_idx = dry_output.find(
+        "systemctl mask openmarquee-ap0.service hostapd.service dnsmasq.service"
+    )
     assert enable_idx != -1, "enable marker missing"
-    assert unmask_idx < enable_idx, f"unmask must precede enable: {unmask_idx=} {enable_idx=}"
+    assert mask_idx != -1, "AP-side mask marker missing"
+    assert mask_idx < enable_idx, f"AP mask must precede backend enable: {mask_idx=} {enable_idx=}"
 
 
 def test_ap0_service_orders_before_networkmanager() -> None:
