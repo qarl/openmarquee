@@ -173,6 +173,24 @@ mod tests {
     }
 
     #[test]
+    fn tail_diag_bake_breakdown_field_name_pinned_in_hdmi_source() {
+        // tail-fix dispatch (2026-06-15): QA's bench parser greps
+        // `tail_diag_bake_breakdown` literally to identify per-tick
+        // bake breakdowns for slow transition ticks (>100ms). The
+        // emit is gated to slow ticks ONLY so steady-state journal
+        // volume is unchanged; QA's load-discipline pattern depends
+        // on the gate working. A rename would silently break the
+        // parser AND let the gate disappear unnoticed.
+        let h = include_str!("hdmi.rs");
+        assert!(
+            h.contains("tail_diag_bake_breakdown"),
+            "tail-fix: `tail_diag_bake_breakdown` substring missing from hdmi.rs — \
+             QA's bench parser will no longer be able to identify per-tick bake \
+             breakdowns for slow transition ticks",
+        );
+    }
+
+    #[test]
     fn begin_transition_from_drain_wait_field_name_pinned_in_ipc_main_source() {
         // QA's bench parser greps `begin_transition_from_drain_wait`
         // literally to identify the F-1 belt-and-suspenders sync-

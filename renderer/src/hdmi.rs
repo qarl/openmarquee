@@ -8426,6 +8426,40 @@ unsafe fn bake_video_slide_to_current_fbo(
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+    // tail-diag instrumentation v1 (2026-06-15, per admin's tail-fix
+    // dispatch): per-tick `feed_us` / `dqbuf_us` / `blit_us` /
+    // `total_us` breakdown, emitted ONLY when total_us > 100ms (well
+    // over the 33ms 30fps budget; well below the multi-second
+    // freezes we're hunting). Probe cost on the fast tick = 5
+    // CLOCK_MONOTONIC reads (4 Instant::now + 1 .elapsed() inside the
+    // gate eval) + 1 comparison = sub-µs; stderr is UNTOUCHED on fast
+    // ticks. On the slow tick = +1 format/eprintln (~5-50µs) —
+    // negligible vs the multi-second stall we're measuring. Sacred
+    // review G.2 confirmed: gated emit can't amplify journal load
+    // since the rate caps at tens of emits per transition (~1/tick
+    // worst-case on the 14% tail rate).
+    //
+    // Sacred review S-1 ack: the `samples.is_empty()` early-return
+    // below at line ~8475 fires WITHOUT emitting tail-diag (defensive
+    // branch; prime_video_decoder bails on zero-sample MP4 so this
+    // shouldn't fire in production). If it ever does fire in journal
+    // diagnosis, the absence of `tail_diag_bake_breakdown` is the
+    // signal that the bake never reached the feed/dqbuf phases.
+    //
+    // Sacred review S-2 ack: error-path returns (e.g. feed Err,
+    // next_frame Err, blit_pass Err) DO NOT emit tail-diag. F-1
+    // live-fire shows the 6.9s freeze is in_transition=true sustained
+    // (not an aborted transition), so this scope is correct for the
+    // bench's stated purpose — the slow tick we're hunting completes
+    // successfully through one of the 3 instrumented paths.
+    //
+    // Fingerprint marker: `tail_diag_bake_breakdown` (source-pinned
+    // in frame_pacing.rs).
+    let t_bake_total = std::time::Instant::now();
+    let t_bake_feed = std::time::Instant::now();
+    let mut t_diag_feed_us: u64 = 0;
+    let mut t_diag_dqbuf_us: u64 = 0;
+    let mut t_diag_blit_us: u64 = 0;
     let t_feed_start = if profile_first { Some(std::time::Instant::now()) } else { None };
     // perf-night r3 (2026-05-26): sub-sub-phase wraps inside the
     // bake_video bottleneck. r2 showed paint_bake_video p99=29.8ms
@@ -8540,6 +8574,9 @@ unsafe fn bake_video_slide_to_current_fbo(
             eprintln!("[firstframe] feed={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
         }
     }
+    // tail-diag v1: end of feed phase, start of dqbuf phase.
+    t_diag_feed_us = t_bake_feed.elapsed().as_micros() as u64;
+    let t_bake_dqbuf = std::time::Instant::now();
     let t_dqbuf_start = if profile_first { Some(std::time::Instant::now()) } else { None };
     // perf-night r5 (2026-05-26): boost EAGAIN budget from 5*2ms=10ms
     // to 10*3ms=30ms. r3 baseline showed cold-start ticks exhaust the
@@ -8588,6 +8625,9 @@ unsafe fn bake_video_slide_to_current_fbo(
     if let Some(t) = t_dqbuf_start {
         eprintln!("[firstframe] dqbuf={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
     }
+    // tail-diag v1: end of dqbuf phase (whether we got a frame or not).
+    t_diag_dqbuf_us = t_bake_dqbuf.elapsed().as_micros() as u64;
+    let t_bake_blit = std::time::Instant::now();
     let Some(frame) = frame_opt else {
         // No frame ready this tick. Caller should skip swap+commit.
         // Sample the dqbuf even on no-frame ticks so the EAGAIN wait
@@ -8596,6 +8636,14 @@ unsafe fn bake_video_slide_to_current_fbo(
             "paint_bake_video_dqbuf",
             t_phase.elapsed().as_nanos() as u64,
         );
+        // tail-diag v1: blit_us = 0 on no-frame return; emit gated.
+        let total_us = t_bake_total.elapsed().as_micros() as u64;
+        if total_us > 100_000 {
+            eprintln!(
+                "[perf] tail_diag_bake_breakdown feed_us={} dqbuf_us={} blit_us={} total_us={} path=no_frame",
+                t_diag_feed_us, t_diag_dqbuf_us, t_diag_blit_us, total_us,
+            );
+        }
         return Ok(None);
     };
     crate::profile::record_phase(
@@ -8718,6 +8766,15 @@ unsafe fn bake_video_slide_to_current_fbo(
                     "steady_state_video_paint_after_N"
                 };
                 crate::v4l2::log_v3d_bos_at_phase_with_path(phase, None, "DMABUF");
+            }
+            // tail-diag v1: DMABUF success path. Emit gated.
+            t_diag_blit_us = t_bake_blit.elapsed().as_micros() as u64;
+            let total_us = t_bake_total.elapsed().as_micros() as u64;
+            if total_us > 100_000 {
+                eprintln!(
+                    "[perf] tail_diag_bake_breakdown feed_us={} dqbuf_us={} blit_us={} total_us={} path=dmabuf",
+                    t_diag_feed_us, t_diag_dqbuf_us, t_diag_blit_us, total_us,
+                );
             }
             return Ok(Some("DMABUF"));
         }
@@ -8854,6 +8911,15 @@ unsafe fn bake_video_slide_to_current_fbo(
             "steady_state_video_paint_after_N"
         };
         crate::v4l2::log_v3d_bos_at_phase_with_path(phase, None, "MMAP");
+    }
+    // tail-diag v1: MMAP success path. Emit gated.
+    t_diag_blit_us = t_bake_blit.elapsed().as_micros() as u64;
+    let total_us = t_bake_total.elapsed().as_micros() as u64;
+    if total_us > 100_000 {
+        eprintln!(
+            "[perf] tail_diag_bake_breakdown feed_us={} dqbuf_us={} blit_us={} total_us={} path=mmap",
+            t_diag_feed_us, t_diag_dqbuf_us, t_diag_blit_us, total_us,
+        );
     }
     Ok(Some("MMAP"))
 }
