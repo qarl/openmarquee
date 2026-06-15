@@ -11405,36 +11405,16 @@ mod path_a_stage2_tests {
         );
     }
 
-    #[test]
-    fn path_a_iter2_async_prime_helper_and_pending_skip_present() {
-        // Path A iter-2 (2026-06-14) added the off-thread to-side
-        // prime so the 1.5-2.6s render-thread freeze QA flagged
-        // after iter-1's image win disappears. Pin both halves:
-        // the spawn helper at BeginTransition and the dispatcher's
-        // skip-tick when the prime is still in flight.
-        let ipc = include_str!("ipc_main.rs");
-        assert!(
-            ipc.contains("fn spawn_async_to_prime_for_begin_transition("),
-            "Path A iter-2: spawn_async_to_prime_for_begin_transition helper missing -- \
-             BeginTransition will fall back to synchronous cache.load and the multi-second \
-             render-thread freeze returns",
-        );
-        assert!(
-            ipc.contains("spawn_async_to_prime_for_begin_transition("),
-            "Path A iter-2: spawn helper is defined but not called from BeginTransition",
-        );
-        assert!(
-            ipc.contains("paint_transition_skip_pending_prime"),
-            "Path A iter-2: dispatcher skip-tick fallback for pending-prime case missing -- \
-             paint_transition will hard-error when an async prime is still in flight",
-        );
-        assert!(
-            ipc.contains("cache.pending_preloads.contains_key("),
-            "Path A iter-2: the skip-tick fallback's pending_preloads probe is missing -- \
-             we can't distinguish 'in-flight async prime' from 'genuinely missing decoder'",
-        );
-    }
-
+    // Path A iter-2's source-pin test
+    // (path_a_iter2_async_prime_helper_and_pending_skip_present)
+    // was REMOVED 2026-06-14 (admin + QA dispatch). iter-2 was
+    // rejected at QA bench (6601ms = 6x worse than iter-1 1043ms
+    // baseline) and reverted from this branch; the test's
+    // assertions on spawn_async_to_prime_for_begin_transition
+    // and paint_transition_skip_pending_prime would fail by
+    // design on the iter-1-only state. The other 5
+    // path_a_stage2_tests still pin iter-1 (r106 decouple +
+    // scoped flush + painted-flag reuse) and remain green.
     #[test]
     fn path_a_kill_switch_env_var_documented() {
         // OPENMARQUEE_FEED_DRAIN_DECOUPLE is the operator-facing
