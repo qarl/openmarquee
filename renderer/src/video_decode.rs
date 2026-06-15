@@ -340,6 +340,26 @@ pub fn prime_video_decoder_with_warmup(
             _ => "?",
         }
     );
+    // perf-decode MIN_BUFFERS plumbing DRAFT (2026-06-15):
+    // telemetry-only call to the spec-correct
+    // `min_buffers_for_capture()` query. Result IS LOGGED via
+    // the `[perf] min_buffers_for_capture_negotiated ...` line
+    // (v4l2.rs) but IS NOT USED to drive the REQBUFS count
+    // below — the production floor stays at 4 (the empirical
+    // safe floor per main.rs:171-198 r73/r77/r93/r94 history).
+    // A future commit (not this draft) wires the queried `min`
+    // into `max(min + headroom, 4)` for the REQBUFS call, gated
+    // on a flag QA can A/B against the baseline floor.
+    //
+    // The `.ok()` discards the Result; the eprintln in
+    // `min_buffers_for_capture()` fires unconditionally
+    // (success or EINVAL), so the QA binary fingerprint string
+    // `min_buffers_for_capture_negotiated` is always emitted
+    // into the binary's .rodata section regardless of runtime
+    // path. Without this call site, Rust's LTO dead-code
+    // elimination strips the function entirely + the
+    // fingerprint string with it.
+    let _ = dec.min_buffers_for_capture();
     let t_reqbufs = Instant::now();
     dec.allocate_buffers(v4l2::QueueDirection::Output, 4)
         .context("REQBUFS OUTPUT")?;

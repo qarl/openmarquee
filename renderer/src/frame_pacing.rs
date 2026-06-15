@@ -173,6 +173,26 @@ mod tests {
     }
 
     #[test]
+    fn min_buffers_for_capture_negotiated_fingerprint_pinned_in_v4l2_source() {
+        // Per admin's QA strings-verification gate (2026-06-15):
+        // the literal `min_buffers_for_capture_negotiated` is QA's
+        // fingerprint marker for the MIN_BUFFERS_FOR_CAPTURE
+        // draft binary. The marker name MUST stay stable so QA's
+        // one-liner integrity check (strings ./openmarquee-render
+        // | grep) can distinguish this draft binary from the F-1
+        // chain (which has 0 matches; this draft will have 1).
+        // A rename here would silently break the binary
+        // integrity gate.
+        let v = include_str!("v4l2.rs");
+        assert!(
+            v.contains("min_buffers_for_capture_negotiated"),
+            "MIN_BUFFERS draft: `min_buffers_for_capture_negotiated` fingerprint marker \
+             missing from v4l2.rs — QA's strings-fingerprint integrity gate will no \
+             longer be able to distinguish this draft binary from the F-1 chain",
+        );
+    }
+
+    #[test]
     fn begin_transition_from_drain_wait_field_name_pinned_in_ipc_main_source() {
         // QA's bench parser greps `begin_transition_from_drain_wait`
         // literally to identify the F-1 belt-and-suspenders sync-
