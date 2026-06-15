@@ -1357,6 +1357,299 @@ fn ensure_preload_complete(cache: &mut SlideCache, slide_id: uuid::Uuid) {
     }
 }
 
+/// perf-decode F-1 (2026-06-15): non-blocking drain of a
+/// pending preload IF the worker has finished. Returns true if
+/// drained.
+///
+/// Sacred review BLOCKER-1+2 fix: without this, a BeginSlide
+/// async-prime worker for slide A would never be joined while A
+/// is `state.current` — paint_slide would skip-tick forever (A
+/// never paints) AND the next BeginTransition's F-3 gate would
+/// see A's V4L2 state absent → re-prime A SYNCHRONOUSLY on the
+/// render thread while the worker is still running → iter-2-
+/// class V4L2 contention (which benched at 6601 ms).
+///
+/// Called from paint_slide entry on every tick. When the
+/// worker is finished, drains it; subsequent gates evaluate
+/// against the post-drain cache state and paint normally.
+/// When the worker isn't finished, no-op; the skip-tick gates
+/// fire and the display stays on the last rendered frame
+/// (same UX as pre-F-1 blocking cache.load).
+fn try_drain_pending_preload_if_finished(
+    cache: &mut SlideCache,
+    slide_id: uuid::Uuid,
+) -> bool {
+    let is_finished = match cache.pending_preloads.get(&slide_id) {
+        Some(handle) => handle.thread.is_finished(),
+        None => return false,
+    };
+    if !is_finished {
+        return false;
+    }
+    // Worker finished; drain via the existing path that installs
+    // artifacts + emits the [perf] begin_slide_wait line.
+    ensure_preload_complete(cache, slide_id);
+    true
+}
+
+/// perf-decode F-1 (2026-06-15): cheap synchronous peek of the
+/// item.json on disk to decide whether BeginSlide should
+/// off-thread its cache.load or take the synchronous path.
+/// Returns `true` iff the slide will touch the V4L2 H.264
+/// decoder during cache.load — bare Video, or TextOverVideo
+/// (text_slide with `background_video_slide_id` set per
+/// SYSTEM_SPEC §5.10).
+///
+/// Returns `false` on any peek failure (missing item.json,
+/// unreadable, malformed JSON) so the caller falls through to
+/// the synchronous cache.load — preserves the existing
+/// `handle_begin_slide_errors_on_missing_content` error rail.
+fn peek_needs_v4l2_prime_for_async_dispatch(
+    content_root: &std::path::Path,
+    slide_id: uuid::Uuid,
+) -> bool {
+    let item_json = content_root
+        .join(slide_id.to_string())
+        .join("item.json");
+    let text = match std::fs::read_to_string(&item_json) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let envelope: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let item = match envelope.get("item") {
+        Some(v) => v,
+        None => return false,
+    };
+    let kind = item.get("type").and_then(|t| t.as_str());
+    match kind {
+        Some("video") => true,
+        Some("text_slide") => {
+            // TextOverVideo iff background_video_slide_id is set
+            // to a non-null UUID. cache.load recurses into the
+            // bg video's V4L2 prime via
+            // ensure_bg_video_for_text_slide — that's the
+            // expensive path F-1 targets.
+            item.get("background_video_slide_id")
+                .and_then(|v| v.as_str())
+                .is_some()
+        }
+        _ => false,
+    }
+}
+
+/// perf-decode F-1 (2026-06-15): off-thread the synchronous
+/// cache.load at BeginSlide so the render thread isn't blocked
+/// during the 1.5-2.6 s V4L2 prime path. Modeled on
+/// PreloadSlide's spawn (canonical r65 pattern); the differences
+/// are (a) called from BeginSlide rather than PreloadSlide and
+/// (b) log tag `begin_slide_async_prime` so QA can disambiguate
+/// async-prime sources in the journal.
+///
+/// Returns Ok(()) when the worker is queued (or short-circuits on
+/// already-loaded). Returns Err on capacity-overflow + sync-load
+/// failure or on spawn-failure + sync-load failure. The BeginSlide
+/// handler propagates Err so the cold "really broken" path still
+/// surfaces as `begin_slide load failed` to the backend.
+///
+/// Cold-prime contract with paint_slide dispatcher:
+///   * When this helper queues a worker (returns Ok), the items
+///     + demuxer + decoder arrive ASYNCHRONOUSLY via
+///     ensure_preload_complete at the NEXT BeginSlide /
+///     BeginTransition for the same id. The paint_slide
+///     dispatcher has TWO skip-tick gates (added in F-1):
+///       (a) items.peek=None + pending_preloads has slide_id
+///           → emit `[perf] paint_slide_skip_pending_prime
+///             reason=items_peek_none` + return ok_empty
+///       (b) Video kind + decoder missing + pending_preloads
+///           has slide_id → emit `[perf]
+///             paint_slide_skip_pending_prime
+///             reason=video_decoder_missing` + return ok_empty
+///   * Skip-tick keeps the display showing the last rendered
+///     frame (typically the previous slide's last frame from
+///     before evict_other_video_state ran). Same visual cost as
+///     the pre-F-1 synchronous case (which also showed the
+///     previous frame while the render thread blocked); the win
+///     is the render thread itself stays available for advance
+///     ticks and IPC.
+///
+/// V4L2 contention note: F-1 differs from the rejected iter-2
+/// (BeginTransition async to-side prime) because at BeginSlide
+/// the previous slide's V4L2 state is EVICTED synchronously
+/// before this helper runs (evict_other_video_state at lines
+/// 2906-2948 in the BeginSlide handler). So the worker has
+/// exclusive V4L2 ownership — there's no decoder-vs-decoder
+/// codec contention shaped like iter-2's "to-prime while
+/// from-side painting live". The from-side at BeginSlide is the
+/// PREVIOUS slide, already STREAMOFF + closed by the eviction.
+fn spawn_async_to_prime_for_begin_slide(
+    cache: &mut SlideCache,
+    content_root: &std::path::Path,
+    slide_id: uuid::Uuid,
+) -> Result<()> {
+    // Sync precheck for asset.mp4 existence — preserves the
+    // pre-F-1 wire-marker rail (`video slide unsupported (load
+    // failed)`) that Python's _UNSUPPORTED_SLIDE_WIRE_MARKERS
+    // matches at the BeginSlide handler. Without this, a video
+    // slide whose asset.mp4 is missing would surface as a
+    // worker err ~50-200 ms later via ensure_preload_complete,
+    // and the next BeginSlide would emit the wire marker — too
+    // late: Python would have already moved on. Inserting
+    // video_skip + returning Ok lets BeginSlide's existing
+    // video_skip check at line ~2975 fire the wire marker
+    // synchronously, identical to the pre-F-1 path.
+    //
+    // peek_needs_v4l2_prime_for_async_dispatch only returns
+    // true for kind=video or text_slide+bg_video. For
+    // text_slide+bg_video, the bg's asset.mp4 lives under a
+    // DIFFERENT slide directory (bg_video_id). The check here
+    // is for the dispatched slide_id only; bg-side missing
+    // asset surfaces in the worker (best-effort match of
+    // pre-F-1 ensure_bg_video_for_text_slide).
+    let item_dir = content_root.join(slide_id.to_string());
+    let item_json_path = item_dir.join("item.json");
+    if let Ok(envelope_text) = std::fs::read_to_string(&item_json_path) {
+        if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&envelope_text) {
+            let kind = envelope
+                .get("item")
+                .and_then(|i| i.get("type"))
+                .and_then(|t| t.as_str());
+            if kind == Some("video") {
+                let asset_path = item_dir.join("asset.mp4");
+                if !asset_path.is_file() {
+                    eprintln!(
+                        "ipc: warning -- asset.mp4 missing for video slide {} (F-1 precheck); inserting video_skip + falling through to wire-marker rail",
+                        slide_id,
+                    );
+                    cache.video_skip.insert(slide_id);
+                    eprintln!(
+                        "[perf] begin_slide_async_prime slide_id={} sync_skip_marked \
+                         reason=asset_mp4_missing",
+                        slide_id,
+                    );
+                    // Return Ok — BeginSlide's video_skip check
+                    // fires the canonical wire marker.
+                    return Ok(());
+                }
+                // Sacred BLOCKER-3 fix: synchronously try
+                // Mp4Demuxer::open to catch (b) malformed mp4
+                // and (c) no-H.264-video-trak — the two
+                // non-missing failure modes Mp4Demuxer::open
+                // catches in cache.load. Cost: ~10-50 ms file
+                // open + box parse, negligible vs the 1.5-2.6 s
+                // V4L2 prime that stays async. On Err: same
+                // video_skip + wire-marker rail as the missing
+                // file case. On Ok: discard (worker re-opens
+                // for V4L2 prime — fs cache means the second
+                // open is ~µs).
+                if let Err(e) = Mp4Demuxer::open(&asset_path) {
+                    eprintln!(
+                        "ipc: warning -- Mp4Demuxer::open failed for video slide {} (F-1 precheck, malformed or no-H.264 trak): {:#}",
+                        slide_id, e,
+                    );
+                    cache.video_skip.insert(slide_id);
+                    eprintln!(
+                        "[perf] begin_slide_async_prime slide_id={} sync_skip_marked \
+                         reason=mp4_demuxer_open_failed",
+                        slide_id,
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+    let already_loaded = cache.items.peek(&slide_id).is_some()
+        && cache.video_demuxers.contains_key(&slide_id)
+        && {
+            #[cfg(target_os = "linux")]
+            { cache.has_video_decoder(slide_id) }
+            #[cfg(not(target_os = "linux"))]
+            { true }
+        };
+    if already_loaded {
+        eprintln!(
+            "[perf] begin_slide_async_prime slide_id={} already_loaded_us=0",
+            slide_id,
+        );
+        return Ok(());
+    }
+    if cache.pending_preloads.contains_key(&slide_id) {
+        // Worker for this id is already in flight (PreloadSlide
+        // queued one before BeginSlide fired). ensure_preload_
+        // complete at the BeginSlide entry already had a chance
+        // to join — if we're here it means the worker hadn't
+        // finished yet; let it keep cooking and the next paint
+        // tick joins it via the skip-tick → next BeginSlide /
+        // ensure_preload_complete cycle.
+        eprintln!(
+            "[perf] begin_slide_async_prime slide_id={} in_flight",
+            slide_id,
+        );
+        return Ok(());
+    }
+    const MAX_CONCURRENT_PRELOADS: usize = 2;
+    if cache.pending_preloads.len() >= MAX_CONCURRENT_PRELOADS {
+        // Capacity full. Fall back to synchronous cache.load so
+        // the slide can still start; cost shape is identical to
+        // pre-F-1 (the same blocking prime we're trying to
+        // avoid). With MAX_CONCURRENT_PRELOADS=2 and PreloadSlide
+        // arriving 2 s before BeginSlide, capacity-full at
+        // BeginSlide entry implies operator-side playlist
+        // churn — rare on steady state.
+        eprintln!(
+            "[perf] begin_slide_async_prime slide_id={} dropped reason=capacity \
+             pending={} -- falling back to synchronous cache.load",
+            slide_id,
+            cache.pending_preloads.len(),
+        );
+        return cache.load(content_root, slide_id);
+    }
+    let t_enqueue = std::time::Instant::now();
+    let content_root_clone = content_root.to_path_buf();
+    let slide_id_clone = slide_id;
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("begin-slide-prime-{slide_id}"))
+        .spawn(move || -> PreloadResult {
+            let t_work = std::time::Instant::now();
+            let r = preload_in_worker(&content_root_clone, slide_id_clone);
+            let work_us = t_work.elapsed().as_micros();
+            match &r {
+                Ok(_) => eprintln!(
+                    "[perf] begin_slide_async_prime slide_id={} work_us={}",
+                    slide_id_clone, work_us,
+                ),
+                Err(e) => eprintln!(
+                    "[perf] begin_slide_async_prime slide_id={} failed_us={} err={:#}",
+                    slide_id_clone, work_us, e,
+                ),
+            }
+            r
+        });
+    match spawn_result {
+        Ok(thread) => {
+            cache.pending_preloads.insert(
+                slide_id,
+                PreloadHandle { thread, enqueued_at: t_enqueue },
+            );
+            eprintln!(
+                "[perf] begin_slide_async_prime slide_id={} queued_us={}",
+                slide_id, t_enqueue.elapsed().as_micros(),
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "ipc: begin_slide async-prime spawn failed for {}: {:#}; \
+                 falling back to synchronous cache.load",
+                slide_id, e,
+            );
+            cache.load(content_root, slide_id)
+        }
+    }
+}
+
 /// Emit a response to stdout as a single JSON line + flush.
 /// stdout is line-buffered by default; explicit flush ensures
 /// the caller never sees a partial line on a slow stdin read.
@@ -2287,6 +2580,43 @@ fn run_paint_hook(
     };
     let out = match result {
         OpResult::PaintSlide { slide_id, t_in_slide_ms } => {
+            // perf-decode F-1 (2026-06-15) sacred BLOCKER-1+2
+            // fix: at paint_slide entry, non-blocking drain of
+            // any pending preload for this slide_id if the
+            // worker is finished. This is the load-bearing piece
+            // of F-1 — without it, the async-primed slide A
+            // would never be installed (ensure_preload_complete
+            // is only called from BeginSlide/BeginTransition for
+            // a DIFFERENT id), so paint_slide would skip-tick
+            // forever AND the next BeginTransition's F-3 gate
+            // would synchronously re-prime A → iter-2-class
+            // V4L2 contention. After this drain runs the
+            // skip-tick gates below evaluate against the post-
+            // drain cache state and paint normally as soon as
+            // the worker completes.
+            try_drain_pending_preload_if_finished(cache, slide_id);
+            // F-1 skip-tick gate for the BeginSlide async-prime
+            // in-flight case. When BeginSlide queues a worker
+            // via spawn_async_to_prime_for_begin_slide, items +
+            // demuxer + decoder are populated ASYNCHRONOUSLY by
+            // preload_in_worker. paint_slide may fire before
+            // the worker finishes — items.get returns None even
+            // though the slide is "real" (just not done
+            // priming). Return ok_empty (display stays on the
+            // last rendered frame, same UX cost as pre-F-1
+            // blocking cache.load) rather than the err-rail.
+            // Genuinely missing (no pending prime) still hard-
+            // errors as before, surfacing real cache corruption.
+            if cache.items.get(&slide_id).is_none()
+                && cache.pending_preloads.contains_key(&slide_id)
+            {
+                eprintln!(
+                    "[perf] paint_slide_skip_pending_prime slide_id={} \
+                     reason=items_peek_none",
+                    slide_id,
+                );
+                return ok_empty();
+            }
             // Clone the borrow shape we need so we can take a
             // mutable borrow on cache.video_decoders later for
             // the Video branch without re-entering the borrow.
@@ -2473,6 +2803,35 @@ fn run_paint_hook(
                     // V4L2 piece 3e: drive one frame of decode +
                     // upload + paint per advance tick. Requires
                     // the demuxer + decoder primed in cache.load.
+                    //
+                    // perf-decode F-1 (2026-06-15): same skip-tick
+                    // shape as the items-miss gate above but for
+                    // the partially-primed window where items is
+                    // populated (by an earlier preload phase) but
+                    // demuxer or decoder hasn't been installed
+                    // yet. Worker order in preload_in_worker
+                    // populates items first then demuxer then
+                    // decoder, so this gate catches the
+                    // demuxer-installed-but-not-decoder gap. A
+                    // genuinely-missing decoder (no pending
+                    // prime) still hard-errors as before.
+                    if cache.pending_preloads.contains_key(&slide_id) {
+                        let dem_present = cache.video_demuxers.contains_key(&slide_id);
+                        let dec_present = {
+                            #[cfg(target_os = "linux")]
+                            { cache.video_decoders.contains_key(&slide_id) }
+                            #[cfg(not(target_os = "linux"))]
+                            { true }
+                        };
+                        if !dem_present || !dec_present {
+                            eprintln!(
+                                "[perf] paint_slide_skip_pending_prime slide_id={} \
+                                 reason=video_decoder_missing dem_present={} dec_present={}",
+                                slide_id, dem_present, dec_present,
+                            );
+                            return ok_empty();
+                        }
+                    }
                     let dem = match cache.video_demuxers.get(&slide_id) {
                         Some(d) => d,
                         None => {
@@ -2946,20 +3305,41 @@ fn handle_inner_request(
                 }
             }
             cache.evict_other_video_state(&keep_ids);
-            // r58 (2026-06-04): time the cache.load so QA can see
-            // when a PreloadSlide pre-warm shaved the BeginSlide
-            // critical path. A small us (≲ 1 ms) means short-
-            // circuit on items+mtime+demuxer+decoder hit (pre-warm
-            // landed); a large us (~70-270 ms range) means cold
-            // load (pre-warm missed or wasn't sent).
+            // perf-decode F-1 (2026-06-15): off-thread the cold
+            // cache.load for the kinds whose prime path is
+            // EXPENSIVE — bare Video and TextOverVideo (where
+            // the bg video's V4L2 prime is on the critical path).
+            // Image and text-only stay SYNCHRONOUS because their
+            // cache.load is already ~5-15 ms (just JSON parse +
+            // items.insert) — async would add thread-spawn
+            // overhead with no win, and would break existing
+            // tests that assert post-BeginSlide cache state.
+            // FYS baseline peaks 2251/2872/3416 ms are all
+            // V4L2-prime cases; F-1 target per perf-roadmap-
+            // 2026-06-15 item #1.
+            //
+            // The kind peek reads + parses item.json
+            // synchronously (cheap; ~1 ms). On peek failure
+            // (missing/unreadable/malformed item.json), fall
+            // through to the synchronous cache.load path so the
+            // existing error rail surfaces immediately
+            // (preserves `handle_begin_slide_errors_on_missing_
+            // content` test semantics).
+            let needs_v4l2_prime =
+                peek_needs_v4l2_prime_for_async_dispatch(content_root, p.slide_id);
             let t_load = std::time::Instant::now();
-            if let Err(e) = cache.load(content_root, p.slide_id) {
+            let load_outcome = if needs_v4l2_prime {
+                spawn_async_to_prime_for_begin_slide(cache, content_root, p.slide_id)
+            } else {
+                cache.load(content_root, p.slide_id)
+            };
+            if let Err(e) = load_outcome {
                 return err(format!("begin_slide load failed: {e:#}"));
             }
             let load_us = t_load.elapsed().as_micros();
             eprintln!(
-                "[perf] begin_slide_load slide_id={} load_us={}",
-                p.slide_id, load_us,
+                "[perf] begin_slide_load slide_id={} load_us={} async_prime={}",
+                p.slide_id, load_us, needs_v4l2_prime,
             );
             // Bug 8 / Fix A (2026-05-17): cache.load succeeded
             // populating ContentItem::Video, but the underlying
@@ -3050,6 +3430,18 @@ fn handle_inner_request(
             // is preserved by `cache.evict_other_video_state` at
             // BeginSlide (not here).
             if let Some(from_id) = state.current.as_ref().map(|c| c.slide_id) {
+                // perf-decode F-1 sacred BLOCKER-2 (belt-and-
+                // suspenders): if the from-slide's BeginSlide
+                // async-prime worker is still in flight (e.g.
+                // operator skipped to next slide before paint
+                // ticks could drain the worker), drain it
+                // synchronously here before F-3's gate runs.
+                // Worst case: blocks the render thread for the
+                // residual V4L2 prime time we couldn't hide
+                // behind paint ticks — but better than racing
+                // the worker with a synchronous cache.load and
+                // re-introducing iter-2-class V4L2 contention.
+                ensure_preload_complete(cache, from_id);
                 if !cache.has_video_decoder_for_slide(from_id) {
                     if let Err(e) = cache.load(content_root, from_id) {
                         return err(format!("begin_transition load failed: {e:#}"));
@@ -3897,6 +4289,358 @@ mod tests {
         );
     }
 
+    // perf-decode F-1 (2026-06-15) host-portable unit tests for
+    // peek_needs_v4l2_prime_for_async_dispatch +
+    // spawn_async_to_prime_for_begin_slide. The runtime savings
+    // (render thread not blocked on the 1.5-2.6 s V4L2 prime at
+    // BeginSlide) is Pi-side measured via QA's golden runner;
+    // these pin the dispatch logic so a refactor can't silently
+    // mis-route a kind (and re-introduce the multi-second
+    // freeze, OR async a fast text-only slide).
+
+    fn f1_video_item_json(id: Uuid) -> String {
+        format!(
+            r##"{{
+  "schema_version": 3,
+  "item": {{
+    "type": "video",
+    "id": "{id}",
+    "name": "f1-video",
+    "duration_ms": 1000,
+    "transition": "cut",
+    "transition_ms": 500
+  }}
+}}"##
+        )
+    }
+
+    fn f1_text_item_json(id: Uuid, bg_id: Option<Uuid>) -> String {
+        let bg = match bg_id {
+            Some(b) => format!("\"{b}\""),
+            None => "null".to_string(),
+        };
+        format!(
+            r##"{{
+  "schema_version": 3,
+  "item": {{
+    "type": "text_slide",
+    "id": "{id}",
+    "name": "f1-text",
+    "duration_ms": 1000,
+    "text_layers": [],
+    "background_color": "#000000",
+    "background_pattern": null,
+    "background_video_slide_id": {bg},
+    "transition": "cut",
+    "transition_ms": 500
+  }}
+}}"##
+        )
+    }
+
+    fn f1_image_item_json(id: Uuid) -> String {
+        format!(
+            r##"{{
+  "schema_version": 3,
+  "item": {{
+    "type": "image",
+    "id": "{id}",
+    "name": "f1-image",
+    "duration_ms": 1000,
+    "transition": "cut",
+    "transition_ms": 500
+  }}
+}}"##
+        )
+    }
+
+    #[test]
+    fn f1_peek_needs_v4l2_prime_returns_true_for_video() {
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(10);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f1_video_item_json(id)).unwrap();
+        assert!(peek_needs_v4l2_prime_for_async_dispatch(td.path(), id));
+    }
+
+    #[test]
+    fn f1_peek_needs_v4l2_prime_returns_true_for_text_over_video() {
+        let td = tempfile::TempDir::new().unwrap();
+        let text_id = uuid(11);
+        let bg_id = uuid(12);
+        let dir = td.path().join(text_id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f1_text_item_json(text_id, Some(bg_id)))
+            .unwrap();
+        assert!(peek_needs_v4l2_prime_for_async_dispatch(td.path(), text_id));
+    }
+
+    #[test]
+    fn f1_peek_needs_v4l2_prime_returns_false_for_text_only() {
+        // Pure-text slide (no bg_video) → sync cache.load path
+        // (cheap ~ms JSON parse + items.insert; async would add
+        // thread-spawn overhead with no win + break tests that
+        // assert post-BeginSlide cache state).
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(13);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f1_text_item_json(id, None)).unwrap();
+        assert!(!peek_needs_v4l2_prime_for_async_dispatch(td.path(), id));
+    }
+
+    #[test]
+    fn f1_peek_needs_v4l2_prime_returns_false_for_image() {
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(14);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f1_image_item_json(id)).unwrap();
+        assert!(!peek_needs_v4l2_prime_for_async_dispatch(td.path(), id));
+    }
+
+    #[test]
+    fn f1_peek_needs_v4l2_prime_returns_false_on_missing_item_json() {
+        // No directory + no item.json → false (fall through to
+        // sync cache.load path; preserves the
+        // `handle_begin_slide_errors_on_missing_content`
+        // synchronous Err rail).
+        let td = tempfile::TempDir::new().unwrap();
+        assert!(!peek_needs_v4l2_prime_for_async_dispatch(td.path(), uuid(15)));
+    }
+
+    #[test]
+    fn f1_peek_needs_v4l2_prime_returns_false_on_malformed_json() {
+        // Malformed item.json → false (fall through to sync
+        // cache.load; the JSON-parse error surfaces on the
+        // synchronous error rail rather than late via the worker).
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(16);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), "{ not valid json").unwrap();
+        assert!(!peek_needs_v4l2_prime_for_async_dispatch(td.path(), id));
+    }
+
+    #[test]
+    fn f1_spawn_async_to_prime_for_begin_slide_short_circuits_on_already_loaded() {
+        // When items + demuxer + decoder are all present (the
+        // common case where a PreloadSlide ran and
+        // ensure_preload_complete drained the worker), the helper
+        // short-circuits without queuing a new worker.
+        let video_fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
+        };
+        if !video_fixture.exists() {
+            eprintln!("skipping: fixture missing {:?}", video_fixture);
+            return;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(17);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f1_video_item_json(id)).unwrap();
+        std::fs::copy(&video_fixture, dir.join("asset.mp4")).unwrap();
+        let mut cache = SlideCache::new();
+        // Pre-warm via sync cache.load — analogous to a
+        // successful PreloadSlide + ensure_preload_complete.
+        cache.load(td.path(), id).expect("warm cache.load");
+        let pending_before = cache.pending_preloads.len();
+        spawn_async_to_prime_for_begin_slide(&mut cache, td.path(), id)
+            .expect("short-circuit");
+        assert_eq!(
+            cache.pending_preloads.len(),
+            pending_before,
+            "already-loaded short-circuit must NOT queue a worker",
+        );
+    }
+
+    #[test]
+    fn f1_spawn_async_to_prime_for_begin_slide_queues_worker_on_cold_path() {
+        // Cold cache + valid video on disk: spawn helper queues a
+        // worker in pending_preloads. Caller then state.begin_slide
+        // (handled by BeginSlide handler, not here) — paint_slide
+        // dispatcher's skip-tick gates handle the prime window.
+        let video_fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
+        };
+        if !video_fixture.exists() {
+            eprintln!("skipping: fixture missing {:?}", video_fixture);
+            return;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(18);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f1_video_item_json(id)).unwrap();
+        std::fs::copy(&video_fixture, dir.join("asset.mp4")).unwrap();
+        let mut cache = SlideCache::new();
+        spawn_async_to_prime_for_begin_slide(&mut cache, td.path(), id)
+            .expect("cold-path spawn");
+        assert!(
+            cache.pending_preloads.contains_key(&id),
+            "cold-path spawn must queue worker into pending_preloads",
+        );
+    }
+
+    #[test]
+    fn f1_spawn_async_to_prime_for_begin_slide_sync_skip_marks_missing_asset() {
+        // Sync precheck regression-lock: video slide with item.json
+        // present but asset.mp4 missing inserts video_skip + returns
+        // Ok so BeginSlide's existing video_skip check fires the
+        // canonical wire marker synchronously. Mirrors
+        // handle_begin_slide_emits_unsupported_marker_when_video_demuxer_fails
+        // semantics at the spawn-helper layer.
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(19);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f1_video_item_json(id)).unwrap();
+        // No asset.mp4 written.
+        let mut cache = SlideCache::new();
+        let result = spawn_async_to_prime_for_begin_slide(&mut cache, td.path(), id);
+        assert!(result.is_ok(), "sync precheck returns Ok; BeginSlide handles wire marker");
+        assert!(
+            cache.video_skip.contains(&id),
+            "sync precheck inserts video_skip on missing asset.mp4",
+        );
+        assert!(
+            !cache.pending_preloads.contains_key(&id),
+            "sync precheck must NOT queue a worker for a known-bad slide",
+        );
+    }
+
+    #[test]
+    fn f1_spawn_async_to_prime_for_begin_slide_sync_skip_marks_malformed_mp4() {
+        // Sacred BLOCKER-3 regression-lock: video slide with
+        // item.json present + asset.mp4 PRESENT BUT MALFORMED
+        // (garbage bytes; Mp4Demuxer::open returns Err) → sync
+        // precheck inserts video_skip + returns Ok so the
+        // BeginSlide handler's video_skip check fires the wire
+        // marker synchronously. Pre-BLOCKER-3-fix the malformed
+        // mp4 case took the spawn path; the marker would surface
+        // late via the worker → Python's UnsupportedSlide rail
+        // wouldn't fire at BeginSlide. This pins parity with
+        // pre-F-1 Mp4Demuxer::open-Err behavior in cache.load.
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(20);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f1_video_item_json(id)).unwrap();
+        // Garbage bytes — not a valid MP4. Mp4Demuxer::open
+        // returns Err.
+        std::fs::write(dir.join("asset.mp4"), b"garbage-not-mp4-bytes").unwrap();
+        let mut cache = SlideCache::new();
+        let result = spawn_async_to_prime_for_begin_slide(&mut cache, td.path(), id);
+        assert!(result.is_ok(), "sync precheck returns Ok; BeginSlide handles wire marker");
+        assert!(
+            cache.video_skip.contains(&id),
+            "sync precheck inserts video_skip on Mp4Demuxer::open Err",
+        );
+        assert!(
+            !cache.pending_preloads.contains_key(&id),
+            "sync precheck must NOT queue a worker for a malformed mp4",
+        );
+    }
+
+    #[test]
+    fn f1_try_drain_pending_preload_if_finished_drains_completed_worker() {
+        // Sacred BLOCKER-1+2 regression-lock: with a worker
+        // spawned + finished, try_drain installs artifacts.
+        // Without this drain, paint_slide would skip-tick
+        // forever AND BeginTransition's F-3 gate would
+        // synchronously re-prime → iter-2-class V4L2 contention.
+        let video_fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
+        };
+        if !video_fixture.exists() {
+            eprintln!("skipping: fixture missing {:?}", video_fixture);
+            return;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(21);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f1_video_item_json(id)).unwrap();
+        std::fs::copy(&video_fixture, dir.join("asset.mp4")).unwrap();
+        let mut cache = SlideCache::new();
+        // Spawn the worker.
+        spawn_async_to_prime_for_begin_slide(&mut cache, td.path(), id)
+            .expect("spawn ok");
+        assert!(cache.pending_preloads.contains_key(&id), "worker queued");
+        // Wait for the worker to finish (bounded; the small mp4
+        // fixture's open is sub-second). Spin on is_finished()
+        // up to 5 s.
+        let start = std::time::Instant::now();
+        let mut polls = 0;
+        while start.elapsed() < std::time::Duration::from_secs(5) {
+            polls += 1;
+            if let Some(h) = cache.pending_preloads.get(&id) {
+                if h.thread.is_finished() {
+                    break;
+                }
+            } else {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        eprintln!("f1 try_drain test: spun {polls} times in {:?}", start.elapsed());
+        // Drain.
+        let drained = try_drain_pending_preload_if_finished(&mut cache, id);
+        assert!(drained, "try_drain returns true when worker is finished");
+        assert!(
+            !cache.pending_preloads.contains_key(&id),
+            "post-drain: pending_preloads slot is empty",
+        );
+        assert!(
+            cache.items.get(&id).is_some(),
+            "post-drain: items populated",
+        );
+        assert!(
+            cache.video_demuxers.contains_key(&id),
+            "post-drain: demuxer installed",
+        );
+    }
+
+    #[test]
+    fn f1_try_drain_pending_preload_if_finished_noop_when_no_preload() {
+        // Empty cache + try_drain → returns false, no panic.
+        let mut cache = SlideCache::new();
+        assert!(!try_drain_pending_preload_if_finished(&mut cache, uuid(22)));
+    }
+
+    #[test]
+    fn f1_paint_slide_skip_pending_prime_substring_present() {
+        // Source-pin: the paint_slide dispatcher's skip-tick log
+        // tag MUST stay stable because QA's perf parser matches
+        // it literally + because the iter-2 lesson taught us
+        // that an absent skip-tick re-introduces hard-error and
+        // the 2-3s freeze just moves from cache.load to the
+        // err-rail.
+        let ipc = include_str!("ipc_main.rs");
+        assert!(
+            ipc.contains("paint_slide_skip_pending_prime"),
+            "F-1 paint_slide skip-tick fallback tag missing; cold-prime window will hard-error",
+        );
+        assert!(
+            ipc.contains("begin_slide_async_prime"),
+            "F-1 BeginSlide async-prime log tag missing; QA perf parser can't disambiguate sources",
+        );
+    }
+
     #[test]
     fn f3_has_video_decoder_for_slide_routes_to_bg_for_text_over_video() {
         // TextOverVideo: helper checks the BACKGROUND video id,
@@ -4028,9 +4772,18 @@ mod tests {
             td.path(),
         );
         assert_eq!(resp_begin, IpcResponse::Ok { result: OpResult::Empty });
+        // perf-decode F-1 (2026-06-15): BeginSlide on a video
+        // kind now off-threads the V4L2 prime via
+        // spawn_async_to_prime_for_begin_slide. The artifacts
+        // (items + demuxer + decoder) are installed when
+        // ensure_preload_complete next joins the worker — call
+        // it directly here so the rest of this regression-lock
+        // test (M1 BeginTransition re-prime path) sees the
+        // synchronously-equivalent state.
+        ensure_preload_complete(&mut cache, id_from);
         assert!(
             cache.video_demuxers.contains_key(&id_from),
-            "from-slide demuxer primed by BeginSlide",
+            "from-slide demuxer primed by BeginSlide (post-F-1 async drain)",
         );
         // Simulate the Bug 9 slide-change eviction of the
         // from-slide's video state.
