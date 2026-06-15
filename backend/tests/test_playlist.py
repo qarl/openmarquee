@@ -815,6 +815,8 @@ def test_concurrent_appends_dont_lose_items(tmp_path: Path):
         f"load-mutate-save race. Sample missing: "
         f"{list(missing)[:5]}"
     )
+
+
 # --- r52: cut-clamps-to-0 model validator -----------------------------------
 
 

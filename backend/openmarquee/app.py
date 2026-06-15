@@ -20,11 +20,11 @@ from openmarquee.api_auth import router as auth_router
 from openmarquee.api_backgrounds import router as backgrounds_router
 from openmarquee.api_flock import router as flock_router
 from openmarquee.api_live import router as live_router
+from openmarquee.api_perf import router as perf_router
 from openmarquee.api_playback import router as playback_router
 from openmarquee.api_playlist import router as playlist_router
 from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
-from openmarquee.api_perf import router as perf_router
 from openmarquee.api_system import router as system_router
 from openmarquee.auth_middleware import AuthMiddleware
 from openmarquee.content.migrations import migrate_050608_bg_to_000000
@@ -106,6 +106,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 check_runtime_assets,
                 log_runtime_asset_issues,
             )
+
             log_runtime_asset_issues(check_runtime_assets())
         except Exception:
             log.exception("startup runtime asset check failed")
@@ -213,13 +214,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # a per-request syscall. Cheap: ~sub-ms /proc read + dict update.
     # Disabled in test fixtures alongside DISABLE_AUTOSTART since they
     # don't run the full lifespan worker set.
-    cma_sampler_handle: "asyncio.Task[None] | None" = None
+    cma_sampler_handle: asyncio.Task[None] | None = None
     if os.environ.get("OPENMARQUEE_DISABLE_AUTOSTART") != "1":
         try:
             from openmarquee.perf_stats import cma_sampler_task
-            cma_sampler_handle = asyncio.create_task(
-                cma_sampler_task(), name="cma-sampler"
-            )
+
+            cma_sampler_handle = asyncio.create_task(cma_sampler_task(), name="cma-sampler")
         except Exception:
             log.exception("startup CMA sampler autostart failed")
     yield

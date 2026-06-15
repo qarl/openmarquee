@@ -523,7 +523,8 @@ class RustRenderer:
                     log.warning(
                         "ignoring invalid OPENMARQUEE_RENDERER_RESPONSE_TIMEOUT_S=%r; "
                         "using default %.1fs",
-                        env_val, self.DEFAULT_RESPONSE_TIMEOUT_S,
+                        env_val,
+                        self.DEFAULT_RESPONSE_TIMEOUT_S,
                     )
                     self._response_timeout_s = self.DEFAULT_RESPONSE_TIMEOUT_S
             else:
@@ -1100,7 +1101,8 @@ class RustRenderer:
         try:
             assert self._proc.stdout is not None
             response_line = self._readline_with_timeout(
-                op, self._response_timeout_s,
+                op,
+                self._response_timeout_s,
             )
         except (BrokenPipeError, OSError) as e:
             raise RustRendererSubprocessError(f"Failed to read response to op {op!r}: {e}") from e
@@ -1157,7 +1159,7 @@ class RustRenderer:
         assert self._proc.stdout is not None
         fd = self._proc.stdout.fileno()
 
-        def _raise_timeout() -> "RustRendererTimeoutError":
+        def _raise_timeout() -> RustRendererTimeoutError:
             # r74 subagent NIT-7: single source of truth for the
             # timeout-error message. A future op-specific hint
             # (e.g. "for op begin_slide try increasing budget to N
@@ -1296,7 +1298,8 @@ class RustRenderer:
                         "within %.1fs (likely V4L2 D-state); abandoning the handle. "
                         "The orphan PID will linger until kernel ioctl returns "
                         "(may be never -- needs Pi reboot or systemd restart).",
-                        proc.pid, self.ABANDON_TIMEOUT_S,
+                        proc.pid,
+                        self.ABANDON_TIMEOUT_S,
                     )
         if self._stderr_thread is not None and self._stderr_thread.is_alive():
             self._stderr_thread.join(timeout=1.0)
