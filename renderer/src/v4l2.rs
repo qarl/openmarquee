@@ -441,6 +441,43 @@ pub fn read_v3d_bo_snapshot() -> V3dBoSnapshot {
     snap
 }
 
+/// r106 + Path A Stage 2 (2026-06-14): runtime kill-switch for
+/// the feed/drain decoupling fix. Default ENABLED.
+///
+/// When enabled (default), `bake_video_slide_to_current_fbo`
+/// — when called from the transition path (`is_offscreen_bake=
+/// true`) — replaces the pre-r106 blocking `feed()` + 10x3ms
+/// EAGAIN loop with: (1) a bounded `try_feed_nonblocking()`
+/// top-up of the OUTPUT pool until the kernel-owned slots are
+/// full or the per-tick cap (16, matching ffmpeg's queue
+/// depth) is hit, then (2) a single non-blocking `next_frame
+/// ()` attempt. Returns `Ok(None)` when no frame is ready.
+/// The caller in `paint_and_present_one_transition_frame`
+/// reuses the cached `transition_fbo_a/b` content via the
+/// per-side `transition_fbo_a/b_painted` flag.
+///
+/// Steady-state paint paths (`is_offscreen_bake=false`) keep
+/// the pre-r106 blocking pattern even when this flag is on
+/// — Stage 2 scoping per the 684d386 r110 revert body, which
+/// identified r106's whole-function decouple as the cause of
+/// the 720p steady-state regression (perceptual freeze when
+/// the codec doesn't deliver every tick).
+///
+/// When DISABLED via `OPENMARQUEE_FEED_DRAIN_DECOUPLE=off`
+/// (or `0`/`false`/`no`/`disable`/`disabled`, case-insens,
+/// trimmed), the pre-r106 blocking feed + 10x3ms EAGAIN inner
+/// loop + Path B polling behavior is restored on the
+/// transition path too. Lets QA A/B the fix at deploy time.
+pub fn is_feed_drain_decouple_enabled() -> bool {
+    match std::env::var("OPENMARQUEE_FEED_DRAIN_DECOUPLE") {
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "off" | "false" | "no" | "disable" | "disabled")
+        }
+        Err(_) => true,
+    }
+}
+
 /// r103.1 (2026-06-09): throttle helper for the steady-state
 /// video-paint probe. Emits on the FIRST paint of a decoder's
 /// lifetime (count==1) and every 30 paints after (1 sec at
@@ -2932,6 +2969,106 @@ impl Decoder {
         inner.free_output_slots.iter().copied().collect()
     }
 
+    /// r106 + Path A Stage 2 (2026-06-14): non-blocking feed
+    /// primitive. Returns `Ok(true)` if the sample was QBUF'd
+    /// into an OUTPUT slot; `Ok(false)` if all OUTPUT slots are
+    /// kernel-owned right now (no sleep, no retry); `Err` only
+    /// for real V4L2 failures.
+    ///
+    /// Used by the r106 decoupled feed-drain path so each
+    /// transition tick can top up the active decoder's input
+    /// pool without blocking when the OUTPUT pool is full. The
+    /// existing `feed()` method retains its bounded blocking
+    /// behavior for callers that need it (pre-r106 paint path
+    /// under the kill-switch=off branch AND the steady-state
+    /// paint path that Stage 2 scoping deliberately leaves on
+    /// blocking).
+    ///
+    /// Drains completed OUTPUT slots back into the free list
+    /// before checking, so a finished buffer is immediately
+    /// available rather than waiting for the next caller.
+    pub fn try_feed_nonblocking(&self, h264_nal: &[u8]) -> Result<bool> {
+        self.drain_output_quiet();
+        let mut inner = self.inner.lock().unwrap();
+        if inner.output_eof_sent && !h264_nal.is_empty() {
+            return Err(anyhow!("try_feed_nonblocking: called after EOF"));
+        }
+        if inner.mapped_output.is_empty() {
+            return Err(anyhow!(
+                "try_feed_nonblocking: no OUTPUT buffers allocated",
+            ));
+        }
+        if inner.free_output_slots.is_empty() {
+            return Ok(false);
+        }
+        let (num_planes, plane_max, plane_sizeimages) = {
+            let Some(ref out_fmt) = inner.output_format else {
+                return Err(anyhow!("try_feed_nonblocking: output not formatted"));
+            };
+            let num_planes = out_fmt.num_planes as usize;
+            let plane_max = out_fmt.plane_fmt[0].sizeimage as usize;
+            let mut sizeimages = [0u32; 8];
+            for p in 0..num_planes {
+                sizeimages[p] = out_fmt.plane_fmt[p].sizeimage;
+            }
+            (num_planes, plane_max, sizeimages)
+        };
+        let buf_idx = inner
+            .free_output_slots
+            .pop_front()
+            .expect("checked non-empty above");
+        if h264_nal.len() > plane_max {
+            // Restore slot before erroring so a future caller can
+            // try a smaller sample.
+            inner.free_output_slots.push_front(buf_idx);
+            return Err(anyhow!(
+                "try_feed_nonblocking: NAL chunk ({} bytes) larger than OUTPUT buffer ({})",
+                h264_nal.len(),
+                plane_max,
+            ));
+        }
+        // Copy bytes into plane 0 (same shape as the blocking
+        // `feed` above).
+        let region = &mut inner.mapped_output[buf_idx as usize][0];
+        let dst = region.as_mut_slice();
+        dst[..h264_nal.len()].copy_from_slice(h264_nal);
+        let mut planes = [V4l2Plane::default(); 8];
+        for p in 0..num_planes {
+            planes[p].length = plane_sizeimages[p];
+        }
+        planes[0].bytesused = h264_nal.len() as u32;
+        let mut buf = V4l2Buffer {
+            index: buf_idx,
+            buf_type: V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+            memory: V4L2_MEMORY_MMAP,
+            length: num_planes as u32,
+            m_planes: planes.as_mut_ptr() as u64,
+            bytesused: h264_nal.len() as u32,
+            flags: if h264_nal.is_empty() {
+                V4L2_BUF_FLAG_LAST
+            } else {
+                0
+            },
+            ..Default::default()
+        };
+        let qbuf_r = unsafe { vidioc_qbuf(inner.fd(), &mut buf) };
+        if let Err(e) = qbuf_r {
+            // r106 subagent WARN-2: rotate the failed slot to
+            // the BACK of the pool (matches the existing
+            // `feed()`'s documented semantic). push_front would
+            // re-pop the same persistently-bad slot on the next
+            // try_feed call and wedge the decoder; push_back
+            // lets the kernel try its peers first.
+            inner.free_output_slots.push_back(buf_idx);
+            return Err(anyhow::Error::from(e)
+                .context("try_feed_nonblocking: VIDIOC_QBUF(OUTPUT)"));
+        }
+        if h264_nal.is_empty() {
+            inner.output_eof_sent = true;
+        }
+        Ok(true)
+    }
+
     /// Best-effort: drain completed OUTPUT buffers so they're
     /// available for the next feed. EAGAIN -> nothing ready ->
     /// silently return.
@@ -3649,6 +3786,59 @@ mod tests {
         );
         log_v3d_bos_at_phase("", None); // empty label
         log_v3d_bos_at_phase("phase with spaces", None);
+    }
+
+    #[test]
+    fn r106_is_feed_drain_decouple_enabled_defaults_to_on() {
+        // r106 + Path A Stage 2 (2026-06-14): the kill switch
+        // defaults ON so a fresh deploy gets the decoupled feed
+        // path automatically. Operators flip OFF only for A/B
+        // when comparing against the pre-r106 blocking path on
+        // the same binary.
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("OPENMARQUEE_FEED_DRAIN_DECOUPLE").ok();
+        std::env::remove_var("OPENMARQUEE_FEED_DRAIN_DECOUPLE");
+        assert!(
+            is_feed_drain_decouple_enabled(),
+            "r106: default (env unset) must ENABLE feed-drain decouple",
+        );
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_FEED_DRAIN_DECOUPLE", v);
+        }
+    }
+
+    #[test]
+    fn r106_is_feed_drain_decouple_off_values_disable() {
+        // r106 + Path A Stage 2 (2026-06-14): the off-lexicon
+        // matches the renderer's other env-knob conventions
+        // (case-insens, whitespace-trimmed). Anything not in
+        // the off list keeps decouple ENABLED so a typo can't
+        // silently regress the production path.
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("OPENMARQUEE_FEED_DRAIN_DECOUPLE").ok();
+        for off in ["0", "off", "false", "no", "disable", "disabled", "OFF"] {
+            std::env::set_var("OPENMARQUEE_FEED_DRAIN_DECOUPLE", off);
+            assert!(
+                !is_feed_drain_decouple_enabled(),
+                "value {off:?} must disable r106 decouple",
+            );
+        }
+        for on in ["1", "on", "yes", "enable", "enabled", "", "garbage"] {
+            std::env::set_var("OPENMARQUEE_FEED_DRAIN_DECOUPLE", on);
+            assert!(
+                is_feed_drain_decouple_enabled(),
+                "value {on:?} must keep r106 decouple enabled (default-on policy)",
+            );
+        }
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_FEED_DRAIN_DECOUPLE", v);
+        } else {
+            std::env::remove_var("OPENMARQUEE_FEED_DRAIN_DECOUPLE");
+        }
     }
 
     #[test]
