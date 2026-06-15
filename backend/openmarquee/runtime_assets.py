@@ -109,8 +109,7 @@ def check_runtime_assets(fonts_dir: Path | None = None) -> list[AssetIssue]:
                 path=emoji_font,
                 reason="file missing",
                 remedy=(
-                    "run scripts/download-emoji-font-colrv1.sh on the dev host, "
-                    "then re-deploy"
+                    "run scripts/download-emoji-font-colrv1.sh on the dev host, then re-deploy"
                 ),
             )
         )
@@ -124,8 +123,7 @@ def check_runtime_assets(fonts_dir: Path | None = None) -> list[AssetIssue]:
                     reason=f"file only {size} bytes (< {_MIN_FONT_BYTES} minimum); "
                     "likely a 0-byte stub or truncated download",
                     remedy=(
-                        "run scripts/download-emoji-font-colrv1.sh on the dev host, "
-                        "then re-deploy"
+                        "run scripts/download-emoji-font-colrv1.sh on the dev host, then re-deploy"
                     ),
                 )
             )
