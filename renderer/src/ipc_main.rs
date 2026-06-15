@@ -602,6 +602,85 @@ impl SlideCache {
         true
     }
 
+    /// perf-decode F-3 (2026-06-15): cheap O(1) check — "is the
+    /// full video state needed for `slide_id`'s paint path
+    /// already in cache (demuxer + decoder both present)?" Drives
+    /// the conditional from-slide re-prime skip at the
+    /// BeginTransition handler — pre-F-3 that site called
+    /// `cache.load(from_id)` UNCONDITIONALLY every transition;
+    /// `cache.load` short-circuits on a full
+    /// items+mtime+demuxer+decoder hit but only after a filesystem
+    /// `stat(item.json)` + an LRU touch + multiple HashMap lookups
+    /// + a nested `ensure_bg_video_for_text_slide` recursion. On
+    /// the common-case path (the from-slide's demuxer + decoder
+    /// are alive because we're transitioning AWAY from it), this
+    /// helper answers in microseconds vs the ~20-40 ms reported by
+    /// the perf-roadmap for the cache.load short-circuit on Pi I/O.
+    ///
+    /// Per-kind logic:
+    ///   * `ContentItem::Video(_)` — slide_id is the V4L2 key;
+    ///     require BOTH `video_demuxers.contains_key(slide_id)`
+    ///     AND `has_video_decoder(slide_id)`.
+    ///   * `ContentItem::Text(s)` — TextOverVideo iff
+    ///     `s.background_video_slide_id == Some(bg_id)`; require
+    ///     BOTH `video_demuxers.contains_key(bg_id)` AND
+    ///     `has_video_decoder(bg_id)`. Text-only returns true
+    ///     (no decoder needed).
+    ///   * `ContentItem::Image(_)` — Stream + Web slides also
+    ///     render through the Image-variant path; no V4L2 decoder
+    ///     needed → true.
+    ///   * `items` miss (slide isn't even cached) — return false
+    ///     so the caller takes the full cache.load path.
+    ///
+    /// Sacred subagent BLOCKER fix: the decoder-only check would
+    /// miss a partial state where the demuxer is missing but the
+    /// decoder is present. That's an unreachable in steady state
+    /// (evict_other_video_state drops both atomically), but a
+    /// future refactor or panic-unwind partial path could surface
+    /// it; `video_reprime_needed` already checks both demuxer +
+    /// decoder, and this helper mirrors that contract.
+    ///
+    /// Caller MUST still treat `false` as "needs re-prime, call
+    /// cache.load" — this helper only short-circuits when we can
+    /// PROVE both demuxer and decoder are already live. On `true`
+    /// the caller skips cache.load entirely.
+    ///
+    /// Tradeoff (mtime-drift detection): pre-F-3, the
+    /// unconditional cache.load detected mid-transition mtime
+    /// drift on from_id (operator edited item.json while it was
+    /// on screen) and would invalidate+reprime. F-3 skips that
+    /// detection on the cached-state path. Net: we lose
+    /// "operator edits frozen between BeginSlide and
+    /// BeginTransition take effect at the transition moment" —
+    /// gained: continuity (no mid-transition decoder reset to
+    /// frame 0). BeginSlide for from_id already caught any prior
+    /// edit, so the only loss is the ~10-second-window edit
+    /// during a single slide's dwell. Acceptable per perf-roadmap
+    /// (F-3 is item #8, ~20-40ms savings on transition entry).
+    fn has_video_decoder_for_slide(&self, slide_id: uuid::Uuid) -> bool {
+        let item = match self.items.peek(&slide_id) {
+            Some(it) => it,
+            None => return false,
+        };
+        match item {
+            ContentItem::Video(_) => {
+                self.video_demuxers.contains_key(&slide_id)
+                    && self.has_video_decoder(slide_id)
+            }
+            ContentItem::Text(s) => match s.background_video_slide_id {
+                Some(bg_id) => {
+                    self.video_demuxers.contains_key(&bg_id)
+                        && self.has_video_decoder(bg_id)
+                }
+                None => true,
+            },
+            // Image (Stream + Web also render through Image
+            // variant — they screenshot to PNG and load via the
+            // Image path); no V4L2 decoder path.
+            ContentItem::Image(_) => true,
+        }
+    }
+
     /// FYS bug A follow-up (finding H1, 2026-05-21): decide whether a
     /// video slide whose lightweight `items`/`item_mtimes` entry is
     /// still cached nonetheless needs a full re-prime in `load`.
@@ -2954,9 +3033,27 @@ fn handle_inner_request(
             // The from-slide id comes from PlaybackState.current
             // (begin_transition itself derives it the same way and
             // errors below if there's no current slide).
+            //
+            // perf-decode F-3 (2026-06-15): even the cache.load
+            // short-circuit does a filesystem stat(item.json) + LRU
+            // touch + multiple HashMap lookups + a nested
+            // `ensure_bg_video_for_text_slide` recursion (~20-40 ms
+            // on Pi I/O per perf-roadmap). On the COMMON-case path
+            // we're transitioning AWAY from from_id whose decoder
+            // is still alive — gate the cache.load on
+            // `has_video_decoder_for_slide` which answers in
+            // microseconds via a single HashMap contains_key.
+            // Defensive: if the helper returns false (decoder
+            // missing or items miss) we fall through to the
+            // existing unconditional cache.load — same error rail,
+            // same behavior. The eviction-after-re-prime hazard
+            // is preserved by `cache.evict_other_video_state` at
+            // BeginSlide (not here).
             if let Some(from_id) = state.current.as_ref().map(|c| c.slide_id) {
-                if let Err(e) = cache.load(content_root, from_id) {
-                    return err(format!("begin_transition load failed: {e:#}"));
+                if !cache.has_video_decoder_for_slide(from_id) {
+                    if let Err(e) = cache.load(content_root, from_id) {
+                        return err(format!("begin_transition load failed: {e:#}"));
+                    }
                 }
             }
             // Bug 8 / Fix A: same skip-marker check as BeginSlide,
@@ -3625,6 +3722,216 @@ mod tests {
             }
             other => panic!("expected PaintSlide, got {other:?}"),
         }
+    }
+
+    // perf-decode F-3 (2026-06-15) host-portable unit tests for the
+    // has_video_decoder_for_slide helper. The runtime savings (skip
+    // cache.load on the common from-slide path at BeginTransition)
+    // is Pi-side measured via the perf-decode bench; these tests
+    // pin the pure decision logic so a refactor can't silently
+    // misroute a kind.
+
+    fn f3_text_slide_json(id: Uuid, bg_video_id: Option<Uuid>) -> String {
+        let bg = match bg_video_id {
+            Some(b) => format!("\"{}\"", b),
+            None => "null".to_string(),
+        };
+        format!(
+            r##"{{
+  "schema_version": 3,
+  "item": {{
+    "type": "text_slide",
+    "id": "{id}",
+    "name": "f3-text",
+    "duration_ms": 1000,
+    "text_layers": [],
+    "background_color": "#000000",
+    "background_pattern": null,
+    "background_video_slide_id": {bg},
+    "transition": "cut",
+    "transition_ms": 500
+  }}
+}}"##
+        )
+    }
+
+    fn f3_image_slide_json(id: Uuid) -> String {
+        format!(
+            r##"{{
+  "schema_version": 3,
+  "item": {{
+    "type": "image",
+    "id": "{id}",
+    "name": "f3-image",
+    "duration_ms": 1000,
+    "transition": "cut",
+    "transition_ms": 500
+  }}
+}}"##
+        )
+    }
+
+    #[test]
+    fn f3_has_video_decoder_for_slide_returns_false_on_items_miss() {
+        // No item in cache.items → can't prove decoder is alive
+        // → caller MUST take the full cache.load path.
+        let cache = SlideCache::new();
+        assert!(
+            !cache.has_video_decoder_for_slide(uuid(7)),
+            "items-miss must return false so caller falls back to cache.load",
+        );
+    }
+
+    #[test]
+    fn f3_has_video_decoder_for_slide_returns_true_for_image() {
+        // Image slides have no V4L2 decoder path → trivially true.
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(2);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f3_image_slide_json(id)).unwrap();
+        // Image cache.load also needs asset.png (empty bytes ok for
+        // this test — we never paint).
+        std::fs::write(dir.join("asset.png"), b"").unwrap();
+        let mut cache = SlideCache::new();
+        cache.load(td.path(), id).expect("cache.load image fixture");
+        assert!(
+            cache.has_video_decoder_for_slide(id),
+            "Image slide has no decoder path; helper returns true so caller skips re-prime",
+        );
+    }
+
+    #[test]
+    fn f3_has_video_decoder_for_slide_returns_true_for_text_only() {
+        // Pure-text slide (no background_video_slide_id) has no
+        // decoder path → trivially true.
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(3);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("item.json"), f3_text_slide_json(id, None)).unwrap();
+        let mut cache = SlideCache::new();
+        cache.load(td.path(), id).expect("cache.load text-only fixture");
+        assert!(
+            cache.has_video_decoder_for_slide(id),
+            "text-only slide has no decoder path; helper returns true",
+        );
+    }
+
+    #[test]
+    fn f3_has_video_decoder_for_slide_video_positive_path() {
+        // Pure Video slide loaded via the real cache.load path:
+        // items has Video + demuxer present + (on Linux) decoder
+        // present → helper short-circuits to true. This is the
+        // common-case path the helper exists for: the from-slide
+        // whose decoder is alive because we're transitioning AWAY
+        // from it.
+        //
+        // macOS note: video_decoders is a cfg-gated stub that
+        // returns true unconditionally, so on host this test
+        // exercises demuxer presence + items routing. The Linux
+        // negative test below pins the demuxer-missing branch.
+        let video_fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
+        };
+        if !video_fixture.exists() {
+            eprintln!("skipping: fixture missing {:?}", video_fixture);
+            return;
+        }
+        let td = tempfile::TempDir::new().unwrap();
+        let id = uuid(8);
+        let dir = td.path().join(id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("item.json"),
+            format!(
+                r##"{{
+  "schema_version": 3,
+  "item": {{
+    "type": "video",
+    "id": "{id}",
+    "name": "f3-video",
+    "duration_ms": 1000,
+    "transition": "cut",
+    "transition_ms": 500
+  }}
+}}"##
+            ),
+        )
+        .unwrap();
+        std::fs::copy(&video_fixture, dir.join("asset.mp4")).unwrap();
+        let mut cache = SlideCache::new();
+        cache.load(td.path(), id).expect("video cache.load");
+        assert!(
+            cache.has_video_decoder_for_slide(id),
+            "pure Video positive: items + demuxer + decoder all present → helper short-circuits to true",
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn f3_has_video_decoder_for_slide_video_negative_demuxer_missing() {
+        // Linux-only: items has Video but video_demuxers is empty
+        // (partial state — possible after a failed mid-cycle
+        // eviction or panic-unwind path). Helper must return false
+        // so caller falls through to cache.load and re-primes.
+        // Mirrors the video_reprime_needed contract.
+        let mut cache = SlideCache::new();
+        let id = uuid(9);
+        let video = crate::content::VideoSlide {
+            id,
+            name: "f3-video-neg".to_string(),
+            duration_ms: 1000,
+            transition: "cut".to_string(),
+            transition_ms: 500,
+        };
+        cache.items.insert(id, crate::content::ContentItem::Video(video));
+        // Deliberately do NOT populate video_demuxers / video_decoders.
+        assert!(
+            !cache.has_video_decoder_for_slide(id),
+            "Video with missing demuxer must return false (mirrors video_reprime_needed)",
+        );
+    }
+
+    #[test]
+    fn f3_has_video_decoder_for_slide_routes_to_bg_for_text_over_video() {
+        // TextOverVideo: helper checks the BACKGROUND video id,
+        // not the text slide id. If items has the text slide but
+        // the bg's decoder is missing → false (caller re-primes
+        // via cache.load).
+        let td = tempfile::TempDir::new().unwrap();
+        let text_id = uuid(4);
+        let bg_id = uuid(5);
+        let dir = td.path().join(text_id.to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("item.json"),
+            f3_text_slide_json(text_id, Some(bg_id)),
+        )
+        .unwrap();
+        let mut cache = SlideCache::new();
+        // Don't call cache.load (which would recursively try to
+        // load bg_id and fail because its dir doesn't exist).
+        // Instead, parse + insert ONLY the text item directly so
+        // we control which sides of cache are populated.
+        let env: serde_json::Value =
+            serde_json::from_str(&f3_text_slide_json(text_id, Some(bg_id))).unwrap();
+        let item: crate::content::TextSlide =
+            serde_json::from_value(env["item"].clone()).unwrap();
+        cache.items.insert(text_id, crate::content::ContentItem::Text(item));
+        // Host-portable: even though has_video_decoder is a
+        // cfg-gated stub returning true on non-Linux, the F-3
+        // helper short-circuits on the demuxer check (which is
+        // unconditional). video_demuxers is empty here, so the
+        // helper returns false uniformly on both platforms.
+        assert!(
+            !cache.has_video_decoder_for_slide(text_id),
+            "TextOverVideo with missing bg demuxer must return false (routes to bg_id; gated on demuxer check)",
+        );
     }
 
     #[test]
