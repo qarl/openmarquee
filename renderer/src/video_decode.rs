@@ -96,7 +96,10 @@ impl VideoDecoderState {
 // the macOS dev host where the rest of this Linux-only module
 // doesn't compile in. Re-exported here as `pub use` so existing
 // `crate::video_decode::PRIME_WARMUP_*` call sites keep working.
-pub use crate::{PRIME_WARMUP_DEFAULT, PRIME_WARMUP_FOR_PRELOAD};
+pub use crate::{
+    PRIME_K_FLOOR_DEFAULT, PRIME_K_FLOOR_FOR_PRELOAD, PRIME_WARMUP_DEFAULT,
+    PRIME_WARMUP_FOR_PRELOAD,
+};
 
 // ====================================================================
 // r78 Phase A (2026-06-08): MP4 sample classification probe.
@@ -184,7 +187,8 @@ fn log_first_samples_nal_types(label: &str, slide_id: &str, samples: &[Vec<u8>],
 pub fn prime_video_decoder(dem: &Mp4Demuxer, caller: &'static str) -> Result<VideoDecoderState> {
     // r91 (2026-06-08) probe: per QA r91 dispatch, explicit
     // caller tag so QA can distinguish cold_start from reel
-    // (both use warmup_count=3). The synchronous BeginSlide path
+    // (both use PRIME_WARMUP_DEFAULT — currently 2 after
+    // Phase B 2026-06-15). The synchronous BeginSlide path
     // passes "cold_start"; the standalone reel passes "reel";
     // tests pass "test".
     eprintln!(
@@ -197,7 +201,7 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer, caller: &'static str) -> Result<Vid
     // (hdmi.rs:3123) and tests; firing the probe here would flood
     // unrelated journals + cargo test stderr, masking the actual
     // BeginSlide signal QA wants.
-    prime_video_decoder_with_warmup(dem, PRIME_WARMUP_DEFAULT)
+    prime_video_decoder_with_warmup(dem, PRIME_WARMUP_DEFAULT, PRIME_K_FLOOR_DEFAULT)
 }
 
 /// r78 Phase A: callable probe for the synchronous BeginSlide path's
@@ -255,9 +259,36 @@ pub fn log_preload_decoder_config(slide_id: uuid::Uuid, dem: &Mp4Demuxer, label:
     );
 }
 
+/// Prime + warmup a V4L2 H.264 decoder against a given Mp4Demuxer.
+///
+/// Two safety parameters:
+/// - `warmup_count_requested`: how many warmup samples are QBUF'd
+///   after the SPS+PPS+IDR primer. Total OUTPUT samples queued
+///   at prime exit = `1 primer + warmup_count_requested`.
+/// - `k_floor`: minimum CAPTURE pool size (REQBUFS count). The
+///   ACTUAL allocated count is `max(min_buffers_for_capture()+1,
+///   k_floor)`, where `min_buffers_for_capture()` is the V4L2-
+///   spec ioctl probe. K_FLOOR'S LOAD-BEARING SEMANTIC IS THE
+///   r93 SATURATION SAFETY MARGIN — callers MUST choose a value
+///   consistent with their consumer-arrival latency:
+///   * `PRIME_K_FLOOR_DEFAULT` (= warmup+1 = 3 at Phase B):
+///     cold-start path; consumer at-pace (33ms tick); Frame::drop
+///     re-QBUF prevents persistent saturation.
+///   * `PRIME_K_FLOOR_FOR_PRELOAD` (= warmup+2 = 4 at Phase B):
+///     preload path; consumer DELAYED ~1s; preserves r77's hard
+///     guarantee that pool has ≥1 free slot whether or not the
+///     post-prime drain succeeds.
+///
+/// Picking a k_floor BELOW these values for the wrong path
+/// re-introduces the r93 D-state wedge geometry (main.rs:171-198
+/// history). Picking ABOVE is strictly safer but costs CMA.
+///
+/// The OUTPUT pool is also sized to k_floor, matching the
+/// CAPTURE math at the saturation boundary.
 pub fn prime_video_decoder_with_warmup(
     dem: &Mp4Demuxer,
     warmup_count_requested: usize,
+    k_floor: usize,
 ) -> Result<VideoDecoderState> {
     use std::path::Path;
     use std::time::Instant;
@@ -340,49 +371,62 @@ pub fn prime_video_decoder_with_warmup(
             _ => "?",
         }
     );
-    // perf-decode spike-hunt Phase A (2026-06-15): ACTIVATE the
-    // V4L2-spec-correct `min_buffers_for_capture()` query as the
-    // SOURCE OF TRUTH for the CAPTURE pool size. Phase A is
-    // ZERO BEHAVIOR CHANGE — `requested = max(min + 1, K=4)`
-    // keeps K=4 floor pinned to the current PRIME_WARMUP_DEFAULT
-    // saturation math (primer + warmup=3 = 4 OUTPUT samples
-    // require ≥4 CAPTURE buffers; r93's D-state wedge at
-    // CAPTURE<4 documented at main.rs:171-198). If bcm2835-codec
-    // returns min=2, requested=max(3,4)=4 — allocated count is
-    // unchanged from the pre-activation hardcoded 4.
+    // perf-decode spike-hunt Phase B (2026-06-15): split-path
+    // k_floor via the parameter. Cold-start path passes
+    // PRIME_K_FLOOR_DEFAULT (=3) for the equality-boundary
+    // safety; preload path passes PRIME_K_FLOOR_FOR_PRELOAD (=4)
+    // for the r77 hard guarantee. See main.rs PRIME_K_FLOOR_*
+    // docstrings for the saturation-math derivation.
     //
-    // The emit lights up the FYS measurement: Phase B (lockstep
-    // PRIME_WARMUP_DEFAULT=2 + K=3, ~3 MB CMA per Decoder save)
-    // is gated on the journal showing `min_buffers_for_capture_
-    // activated min=N` with N ≤ 2. If kernel reports N ≥ 4,
-    // we're already at floor and footprint-shrink-via-CAPTURE
-    // isn't available; pivot to other surfaces.
+    //   CAPTURE pool = max(min_buffers_for_capture() + 1, k_floor)
+    //   OUTPUT pool  = k_floor (matches CAPTURE for symmetric
+    //                           saturation math at the boundary)
+    //
+    // For typical bcm2835-codec min=1:
+    //   Cold-start: max(2, 3) = 3 CAPTURE; OUTPUT 3.
+    //               (~3 MB CMA / Decoder × 2 transition = ~6 MB
+    //               peak reduction vs pre-Phase-B floor of 4)
+    //   Preload:    max(2, 4) = 4 CAPTURE; OUTPUT 4.
+    //               (unchanged from pre-Phase-B; r77 hard guarantee
+    //               preserved)
+    //
+    // Targets (iii) memory-pressure spike avoidance per the
+    // 512 MB ceiling diagnosis
+    // (qa/ceiling-finding-512mb-2026-06-15.md). Cold-start path
+    // only; preload path keeps its r77 margin.
+    //
+    // CONTENT-PROFILE FENCE: see PRIME_WARMUP_DEFAULT docstring
+    // at main.rs. Cold-start SAFE for FYS Main/no-B/untagged
+    // H.264; regression risk for B-frame H.264 with reorder >4.
+    // Preload path inherits the same fence symmetrically (same
+    // content profile, larger safety margin).
     //
     // Fingerprint markers (both stable; source-pin tests in
     // frame_pacing.rs):
-    //   - `min_buffers_for_capture_negotiated` (the ioctl probe
-    //     line in `Decoder::min_buffers_for_capture` itself —
-    //     fires once per call regardless of outcome).
+    //   - `min_buffers_for_capture_negotiated` (v4l2.rs ioctl
+    //     probe line — fires once per call regardless of outcome).
     //   - `min_buffers_for_capture_activated` (THIS line — fires
     //     once per `prime_video_decoder_with_warmup` call,
-    //     reporting the actual requested count derived from the
-    //     queried min). QA's strings-fingerprint gate + bench
-    //     parser key on both literals.
+    //     reporting min, requested, AND k_floor for the call).
+    //     QA's bench parser keys on this literal; the dynamic
+    //     k_floor field distinguishes cold-start (=3) from
+    //     preload (=4) at the journal level.
     //
-    // Unwrap_or(3): if the ioctl returns EINVAL (driver missing
-    // the control) OR an error path, fall back to the
-    // conservative known-safe r94 floor (3 = current
-    // PRIME_WARMUP_FOR_PRELOAD path; matches the smallest count
-    // observed-safe in main.rs history). Note: with K=4 floor,
-    // max(3+1, 4) = 4 — same as today's hardcoded count.
-    let min = dec.min_buffers_for_capture().unwrap_or(3);
-    let requested = std::cmp::max(min + 1, 4);
+    // Unwrap_or(k_floor): if the ioctl returns EINVAL (driver
+    // missing the control) OR an error path, fall back to the
+    // caller's k_floor as the conservative floor. The +1 in
+    // max(min+1, k_floor) becomes max(k_floor+1, k_floor) =
+    // k_floor+1 — strictly above the caller's intended floor,
+    // which is the safety direction.
+    let k_floor_u32 = k_floor as u32;
+    let min = dec.min_buffers_for_capture().unwrap_or(k_floor_u32);
+    let requested = std::cmp::max(min + 1, k_floor_u32);
     eprintln!(
-        "[perf] min_buffers_for_capture_activated min={} requested={} k_floor=4 warmup_default=3",
-        min, requested,
+        "[perf] min_buffers_for_capture_activated min={} requested={} k_floor={} warmup={}",
+        min, requested, k_floor, warmup_count_requested,
     );
     let t_reqbufs = Instant::now();
-    dec.allocate_buffers(v4l2::QueueDirection::Output, 4)
+    dec.allocate_buffers(v4l2::QueueDirection::Output, k_floor_u32)
         .context("REQBUFS OUTPUT")?;
     dec.allocate_buffers(v4l2::QueueDirection::Capture, requested)
         .context("REQBUFS CAPTURE")?;
@@ -430,23 +474,37 @@ pub fn prime_video_decoder_with_warmup(
     // before the next feed collided.
     //
     // r48 (2026-06-03) replaced the single-buffer hardcode with a
-    // free-list rotation across all 4 OUTPUT buffers (`free_output_
-    // slots: VecDeque` in DecoderInner; see v4l2.rs:618-634). Each
-    // feed() now pop_front()s a different slot index, so back-to-
-    // back feeds queue to different kernel-side slots and never
-    // collide.
+    // free-list rotation across the OUTPUT pool (`free_output_slots:
+    // VecDeque` in DecoderInner; see v4l2.rs:618-634). Each feed()
+    // now pop_front()s a different slot index, so back-to-back feeds
+    // queue to different kernel-side slots and never collide. Pool
+    // size was 4 at r48; perf-decode spike-hunt Phase B (2026-06-15)
+    // made it path-dependent via the k_floor parameter: cold-start
+    // uses 3, preload keeps 4. See `k_floor` doc on the fn signature.
     //
     // r57 subagent (2026-06-04): warmup_count narrowed from 4 to 3
-    // so the total feed sequence (1 primer + 3 warmup = 4) fits the
-    // 4-slot OUTPUT pool with strict zero-wait math. Pre-fix the 5th
-    // feed (4th warmup sample) depended on feed()'s 5×2 ms drain-
-    // retry budget to find a slot, which is tight under CMA-pressured
-    // worst-case kernel-side decode timing (~7-8 ms/sample). With
-    // warmup_count=3 the worst case is strictly non-blocking. H.264
-    // B-frame reorder distance is typically 3-4 frames, so 3 warmup
-    // samples still fills the kernel's lookahead window — perf delta
-    // vs warmup_count=4 is negligible in the steady-state advance
-    // loop, which feeds one sample per tick from sample idx 4 onward.
+    // so the total feed sequence (1 primer + 3 warmup = 4) fit the
+    // then-4-slot OUTPUT pool with strict zero-wait math. Pre-fix
+    // the 5th feed (4th warmup sample) depended on feed()'s 5×2 ms
+    // drain-retry budget to find a slot, which was tight under
+    // CMA-pressured worst-case kernel-side decode timing (~7-8
+    // ms/sample). With warmup_count=3 the worst case was strictly
+    // non-blocking. H.264 B-frame reorder distance is typically 3-4
+    // frames, so 3 warmup samples filled the kernel's lookahead
+    // window — perf delta vs warmup_count=4 was negligible in the
+    // steady-state advance loop, which feeds one sample per tick
+    // from sample idx 4 onward.
+    //
+    // Phase B (2026-06-15): warmup_count further narrowed from 3 to
+    // 2 for cold-start (PRIME_WARMUP_DEFAULT); preload kept at 2.
+    // Cold-start sequence now 1 primer + 2 warmup = 3 OUTPUT samples
+    // ≤ 3-slot pool (k_floor=PRIME_K_FLOOR_DEFAULT). Preload
+    // sequence 1 primer + 2 warmup = 3 OUTPUT samples ≤ 4-slot pool
+    // (k_floor=PRIME_K_FLOOR_FOR_PRELOAD, preserving r77 margin).
+    // CONTENT-PROFILE FENCE: cold-start SAFE for Main/no-B/untagged
+    // H.264 (reorder depth 0-1). Deeper reorder structures may
+    // regress cold-start; see PRIME_WARMUP_DEFAULT docstring for
+    // the documented retest trigger.
     //
     // Pixel-perfect parity contract preserved: the samples fed and
     // their order are unchanged; only the timing of when sample N+1
@@ -701,9 +759,12 @@ pub fn drain_one_capture_for_preload_with_detail(
 }
 
 /// Preload-path prime: primes the decoder via
-/// `prime_video_decoder_with_warmup(PRIME_WARMUP_FOR_PRELOAD)` then
-/// drains the first CAPTURE frame to unblock the kernel-side
-/// pipeline. Emits `[perf] preload_handoff slide_id=... frames_drained=... drain_us=... budget_ms=...`
+/// `prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD,
+/// PRIME_K_FLOOR_FOR_PRELOAD)` then drains the first CAPTURE frame
+/// to unblock the kernel-side pipeline. The k_floor=4 preserves
+/// r77's hard guarantee (CAPTURE pool ≥1 free slot whether or not
+/// drain succeeds) — load-bearing for the delayed-consumer
+/// timing inherent to preload. Emits `[perf] preload_handoff slide_id=... frames_drained=... drain_us=... budget_ms=...`
 /// so QA can see whether the drain succeeded (frames_drained=1) or
 /// timed out (frames_drained=0 -- decoder produced nothing in the
 /// budget, points at a downstream root cause).
@@ -754,7 +815,7 @@ pub fn prime_video_decoder_for_preload(
     if !eos_flush_enabled {
         // r84-baseline (default): prime + one-shot drain + emit.
         let t_prime_only = Instant::now();
-        let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
+        let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD, PRIME_K_FLOOR_FOR_PRELOAD)?;
         let prime_only_us = t_prime_only.elapsed().as_micros();
         let budget_ms = preload_capture_drain_budget_ms();
         let t_drain = Instant::now();
@@ -788,7 +849,7 @@ pub fn prime_video_decoder_for_preload(
     );
 
     let t_prime_only = Instant::now();
-    let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
+    let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD, PRIME_K_FLOOR_FOR_PRELOAD)?;
     let prime_only_us = t_prime_only.elapsed().as_micros();
 
     let budget_ms = preload_capture_drain_budget_ms();
@@ -947,7 +1008,7 @@ fn prime_video_decoder_for_preload_r82_disabled(
     // so we'd see that immediately.
 
     let t_prime_only = Instant::now();
-    let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
+    let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD, PRIME_K_FLOOR_FOR_PRELOAD)?;
     let prime_only_us = t_prime_only.elapsed().as_micros();
 
     let budget_ms = preload_capture_drain_budget_ms();
@@ -1262,7 +1323,8 @@ mod tests {
     // r73 (2026-06-06): warmup constants + preload-wiring regression
     // tests live at the binary crate root (main.rs) so they run on
     // all platforms, not just Linux where THIS test module compiles
-    // in. See main.rs near the PRIME_WARMUP_* constants.
+    // in. See main.rs near the PRIME_WARMUP_* + PRIME_K_FLOOR_*
+    // constants.
 
     // ============================================================
     // r76 Phase B (2026-06-07): preload CAPTURE drain budget.

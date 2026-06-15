@@ -122,12 +122,49 @@ mod video_decode;
 // userspace. See PRIME_WARMUP_FOR_PRELOAD for the r73 root-cause
 // chain.
 
-/// Cold-start (immediate-playback) warmup count. r57 chose 3 so
-/// the total feed sequence (1 primer + 3 warmup = 4) fully fills
-/// the 4-slot OUTPUT pool, maximizing the kernel's parallel
-/// decode depth for the bake loop that consumes one CAPTURE
-/// frame per tick within ~33ms.
-pub const PRIME_WARMUP_DEFAULT: usize = 3;
+/// Cold-start (immediate-playback) warmup count.
+///
+/// r57 (perf-night) chose 3 so the total feed sequence
+/// (1 primer + 3 warmup = 4) fully filled the then-hardcoded
+/// 4-slot OUTPUT pool, maximizing the kernel's parallel decode
+/// depth for the bake loop that consumes one CAPTURE frame per
+/// tick within ~33ms.
+///
+/// perf-decode spike-hunt Phase B (2026-06-15) reduces this to
+/// 2, aligning with PRIME_WARMUP_FOR_PRELOAD. The cold-start path
+/// passes `PRIME_K_FLOOR_DEFAULT` (= warmup+1 = 3) as the
+/// `prime_video_decoder_with_warmup` k_floor — the equality case
+/// of the saturation invariant `1 primer + warmup_count ≤ CAPTURE
+/// pool` (1 + 2 = 3 OUTPUT samples queued ≤ 3 CAPTURE buffers).
+/// The preload path keeps `PRIME_K_FLOOR_FOR_PRELOAD` (= 4) to
+/// preserve r77's hard guarantee under its delayed-consumer
+/// timing; only the cold-start path realizes Phase B's ~6 MB
+/// peak transition CMA savings.
+///
+/// Cold-start safety at the boundary: Frame::drop re-QBUFs each
+/// consumed CAPTURE buffer back to the kernel pool
+/// (v4l2.rs:1619-1620). The bake loop consumes at 33ms ticks
+/// (paint_and_present_one_transition_frame), outpacing the
+/// kernel's per-sample decode rate at steady state. Saturation
+/// cannot persist for more than one tick after the consumer
+/// arrives — distinct from the r93 PRELOAD-path wedge where the
+/// consumer was delayed ~1s.
+///
+/// CONTENT-PROFILE FENCE (load-bearing): SAFE for the FYS-tier
+/// Main/no-B/untagged H.264 profile (see
+/// reference_hw_decoder_needs_main_no_b in fleet memory; reorder
+/// depth 0-1). B-frame H.264 with reorder >4 MAY regress
+/// cold-start black-frame latency by 100-500ms because the
+/// cold-start path has NO r94 Path B equivalent (consumer-side
+/// deadline-poll only exists in
+/// paint_and_present_one_transition_frame, NOT in the cold-start
+/// handoff from prime → first bake tick). If the content profile
+/// expands, revisit with one of:
+/// - revert PRIME_WARMUP_DEFAULT to 3 (lose Phase B's ~6 MB savings)
+/// - add cold-start equivalent of r94 Path B (consumer-side
+///   deadline-poll in the first-bake-tick handoff)
+/// - gate warmup count on detected content profile
+pub const PRIME_WARMUP_DEFAULT: usize = 2;
 
 /// Preload-path warmup count. Used by the r65 async PreloadSlide
 /// worker, whose decoder sits idle for ~1s between prime exit and
@@ -195,7 +232,56 @@ pub const PRIME_WARMUP_DEFAULT: usize = 3;
 /// - r94 (2026-06-08) restored to 2 and shipped Path B (consumer-
 ///   side deadline-poll) as the actual fix for "transitions
 ///   look like cuts."
+/// - Phase B (2026-06-15) preserved the r77 hard guarantee for
+///   PRELOAD by holding K floor at warmup+2 = 4 (see
+///   PRIME_K_FLOOR_FOR_PRELOAD below). Cold-start path got the
+///   tighter K floor warmup+1 = 3. Code-split via the k_floor
+///   parameter of `prime_video_decoder_with_warmup` —
+///   `prime_video_decoder_for_preload` keeps the r77 margin
+///   intact AND drains; `prime_video_decoder` (cold-start) ships
+///   at the equality boundary with Frame::drop re-QBUF at-pace
+///   consumer as the structural safety net.
 pub const PRIME_WARMUP_FOR_PRELOAD: usize = 2;
+
+/// Cold-start CAPTURE pool floor. Equality-boundary safety: the
+/// bake-loop consumes CAPTURE at 33ms ticks (`paint_and_present_
+/// one_transition_frame`) and Frame::drop re-QBUFs each consumed
+/// buffer back to the kernel pool, so the cold-start producer
+/// (kernel decoding at ~7-8ms/sample) cannot saturate for more
+/// than one tick. r93's wedge was the PRELOAD-path delayed-
+/// consumer case, NOT cold-start.
+///
+/// Math: PRIME_WARMUP_DEFAULT (=2) + 1 primer = 3 OUTPUT samples
+/// queued; CAPTURE pool ≥ 3 satisfies r93's strict-inequality
+/// invariant at equality.
+///
+/// CONTENT-PROFILE FENCE: SAFE for FYS Main/no-B/untagged H.264
+/// (reference_hw_decoder_needs_main_no_b). B-frame H.264 with
+/// reorder >4 may regress cold-start latency. See
+/// PRIME_WARMUP_DEFAULT docstring for the retest trigger options.
+pub const PRIME_K_FLOOR_DEFAULT: usize = PRIME_WARMUP_DEFAULT + 1;
+
+/// Preload-path CAPTURE pool floor. PRESERVES r77's HARD
+/// GUARANTEE (main.rs: PRIME_WARMUP_FOR_PRELOAD docstring) that
+/// the CAPTURE pool has at least 1 free slot WHETHER OR NOT the
+/// post-prime drain succeeds. With 1 primer + warmup=2 = 3
+/// OUTPUT samples queued and pool=4, the kernel can produce at
+/// most 3 CAPTURE frames → at least 1 free slot remains. This
+/// matters because the preload path's consumer is DELAYED ~1s
+/// (between prime exit and transition start); during that idle
+/// window, kernel-side CAPTURE saturation pins OUTPUT and
+/// re-introduces the r93 D-state wedge.
+///
+/// Math: PRIME_WARMUP_FOR_PRELOAD (=2) + 1 margin slot for
+/// drain-failure case + 1 primer slot = 4. The margin is
+/// load-bearing: r94's Path B consumer-side deadline-poll is a
+/// transition-window-only safety net (paint_and_present), not a
+/// preload-idle-window safety net.
+///
+/// Phase B's cold-start CAPTURE savings (~6 MB peak during
+/// 2-decoder transitions) is COLD-START PATH ONLY. Preload path
+/// keeps its r77 margin.
+pub const PRIME_K_FLOOR_FOR_PRELOAD: usize = PRIME_WARMUP_FOR_PRELOAD + 2;
 
 use std::path::PathBuf;
 
@@ -1163,14 +1249,22 @@ mod tests {
     // ============================================================
 
     #[test]
-    fn prime_warmup_default_is_three() {
-        // Cold-start callers (synchronous BeginSlide, standalone
-        // reel) MUST keep warmup=3 -- the playback loop consumes
-        // CAPTURE at 30fps so CAPTURE never saturates, and the
-        // B-frame lookahead (typical H.264 reorder distance 3-4)
-        // makes the difference between instant first-paint and a
-        // ~100ms cold-start hiccup.
-        assert_eq!(super::PRIME_WARMUP_DEFAULT, 3);
+    fn prime_warmup_default_is_two() {
+        // perf-decode spike-hunt Phase B (2026-06-15): cold-start
+        // warmup count reduced 3 → 2, aligning with
+        // PRIME_WARMUP_FOR_PRELOAD. Lockstep with the K floor drop
+        // 4 → 3 in `prime_video_decoder_with_warmup`. Saturation
+        // invariant holds at the EQUALITY case (1 primer + 2
+        // warmup = 3 OUTPUT samples ≤ 3 CAPTURE buffers); cold-
+        // start consumer is at-pace (33ms tick), so equality is
+        // safe via Frame::drop re-QBUF re-pool.
+        //
+        // SAFETY FENCE: Main/no-B/untagged H.264 (FYS HW decoder
+        // constraint per reference_hw_decoder_needs_main_no_b).
+        // B-frame H.264 with reorder >4 may regress cold-start
+        // latency; commit body documents retest triggers. This
+        // pin makes a silent revert to 3 a TEST FAILURE.
+        assert_eq!(super::PRIME_WARMUP_DEFAULT, 2);
     }
 
     #[test]
@@ -1215,23 +1309,34 @@ mod tests {
              transition_endpoint_b_unconsumed regression -- see r76 commit \
              message."
         );
-        // The wrapper itself MUST call
-        // `prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)`.
+        // The wrapper itself MUST call `prime_video_decoder_with_warmup`
+        // with BOTH the PRIME_WARMUP_FOR_PRELOAD constant AND the
+        // PRIME_K_FLOOR_FOR_PRELOAD constant (Phase B 2026-06-15
+        // split-path k_floor).
+        //
         // r76 subagent WARN-2: a bare `contains("PRIME_WARMUP_FOR_PRELOAD")`
         // is too weak -- the substring appears in the `pub use` re-export
         // and in docstrings, so a refactor that calls
-        // `prime_video_decoder_with_warmup(dem, 0)` (or `with_warmup(dem, 3)`)
-        // would still pass. Pin the full call expression with the constant
-        // in argument position.
+        // `prime_video_decoder_with_warmup(dem, 0, ...)` (or
+        // `with_warmup(dem, 3, ...)`) would still pass.
+        //
+        // Phase B (2026-06-15) extension: a refactor that inlines a
+        // wrong k_floor (e.g., `PRIME_K_FLOOR_DEFAULT` for the preload
+        // path) would silently regress r77's hard guarantee. Pin BOTH
+        // arguments by name in the call expression.
         let wrapper_src = include_str!("video_decode.rs");
         assert!(
-            wrapper_src.contains("prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)"),
+            wrapper_src.contains(
+                "prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD, PRIME_K_FLOOR_FOR_PRELOAD)"
+            ),
             "prime_video_decoder_for_preload in video_decode.rs MUST contain the \
              exact call expression \
-             `prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)`. \
+             `prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD, PRIME_K_FLOOR_FOR_PRELOAD)`. \
              If you've inlined a different warmup count (e.g. \
-             `with_warmup(dem, 0)`), you've bypassed the r73 CAPTURE-saturation \
-             guard."
+             `with_warmup(dem, 0, ...)`) OR a wrong k_floor (e.g., \
+             `PRIME_K_FLOOR_DEFAULT` for the preload path), you've bypassed \
+             the r73 CAPTURE-saturation guard or r77's hard free-slot \
+             guarantee — see main.rs:PRIME_K_FLOOR_FOR_PRELOAD docstring."
         );
     }
 

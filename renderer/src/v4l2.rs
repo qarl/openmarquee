@@ -1097,11 +1097,18 @@ nix::ioctl_readwrite!(vidioc_g_ctrl, b'V', 27, V4l2Control);
 /// least this count via REQBUFS, plus a headroom slot for the
 /// consumer (caller decides the headroom). bcm2835-codec on
 /// the Pi Zero 2 W typically reports `min = 1` (single
-/// decoder), but the safe production floor remains 4 because
-/// the perf-night r57 cold-start path uses warmup_count=3 = 4
-/// OUTPUT samples QBUF'd = 4 CAPTURE frames potentially
-/// produced concurrently. See main.rs:171-198 r73/r77/r93/r94
-/// history.
+/// decoder); the safe production floor is now SPLIT BY PATH
+/// after perf-decode spike-hunt Phase B (2026-06-15):
+/// * cold-start path: `PRIME_K_FLOOR_DEFAULT` = 3
+///   (equality-boundary safe via at-pace Frame::drop re-QBUF)
+/// * preload path: `PRIME_K_FLOOR_FOR_PRELOAD` = 4
+///   (preserves r77's hard guarantee of ≥1 free slot whether
+///   or not post-prime drain succeeds; required because preload
+///   consumer is DELAYED ~1s)
+///
+/// Pre-Phase-B both paths used floor=4. See main.rs
+/// PRIME_K_FLOOR_* docstrings for the saturation-math
+/// derivation + content-profile fence + r73/r77/r93/r94 history.
 ///
 /// Sacred review caught this constant as 0x009A0921 in the
 /// first draft (codec-class misattribution). Fixed pre-commit;

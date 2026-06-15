@@ -1174,8 +1174,10 @@ fn preload_in_worker(
                     // in wait-for-userspace during the idle window
                     // between preload finish and transition start.
                     // Cold-start callers (synchronous BeginSlide,
-                    // standalone reel) still use the default
-                    // warmup_count=3 for B-frame lookahead.
+                    // standalone reel) use PRIME_WARMUP_DEFAULT
+                    // (currently 2 after Phase B 2026-06-15;
+                    // previously 3 for B-frame lookahead — see
+                    // main.rs:130 content-profile fence).
                     // r75 subagent BLOCKER-2: snapshot before prime
                     // so the failure log can emit before+after.
                     //
