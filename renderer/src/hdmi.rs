@@ -8832,6 +8832,43 @@ unsafe fn bake_video_slide_to_current_fbo(
     // we fall through to MMAP).
     if let Some(fd) = frame.dma_buf_fd() {
         let stride = frame.stride();
+        // 2026-06-15 Option B (perf-gl, tail-fix close-out): on the
+        // first transition bake where the EGLImage cache is detected
+        // cold, pre-warm ALL CAPTURE buffer indices in one batched
+        // Mutex acquire. Subsequent transition ticks hit the cache
+        // HIT path → import_us drops from ~83-148 ms to ~1 ms per
+        // tick. Targets the (ii) component of QA's tail decomposition
+        // (cache-MISS create cost ~150 ms per slow tick); does NOT
+        // touch (i) inherent V3D draw cost or (iii) memory-pressure
+        // swap stalls (those are documented separately).
+        //
+        // Gate:
+        //   - is_offscreen_bake=true → transition path only. Steady-
+        //     state PaintSlide doesn't need this (one decoder, lazy-
+        //     fill catches up on the first 8 paints with no contention
+        //     pressure surfacing as slow ticks).
+        //   - decoder.cached_egl_image(0).is_none() → O(1) Mutex-
+        //     acquired slot probe. When the cache is warm (a prior
+        //     transition primed it), the probe returns Some and the
+        //     prewarm is skipped entirely — zero work on the hot path.
+        //     code1's accessor is also idempotent under repeated calls
+        //     (skipped++ on already-populated slots), so this gate is
+        //     belt-and-suspenders cheap.
+        if is_offscreen_bake && decoder.cached_egl_image(0).is_none() {
+            // Fire-and-log; a prewarm error is non-fatal (the lazy-
+            // fill path in run_nv12_dmabuf_blit_pass will retry per
+            // index on each subsequent tick — same behavior as the
+            // pre-Option-B baseline). The warn surfaces in journal so
+            // QA's bench can spot the rare failure case.
+            if let Err(e) = prewarm_egl_image_cache_for_decoder(
+                decoder, session.egl_lib, session.display, session.gl,
+                f_w, f_h, stride,
+            ) {
+                eprintln!(
+                    "warn: eglimage_prewarm_transition failed (non-fatal, lazy-fill resumes): {e:#}"
+                );
+            }
+        }
         let t_blit = if profile_first { Some(std::time::Instant::now()) } else { None };
         // DMABUF path: zero CPU upload — EGLImage is imported inside
         // run_nv12_dmabuf_blit_pass + sampled via OES_external. Record
@@ -12816,6 +12853,105 @@ fn cached_nv12_dmabuf_program(gl: &glow::Context) -> Result<CachedNv12DmaBufProg
 ///   - `Err(_)` -- eglCreateImageKHR returned EGL_NO_IMAGE or
 ///     GL pass errored. State may be partially mutated; caller
 ///     should treat this as a transient frame failure.
+/// 2026-06-15 Option B: render-thread EGLImage cache pre-warm helper.
+///
+/// QA's tail-diag-v2.1 sample isolated the milder transition slow ticks
+/// (525-542 ms total) to cache MISS-fresh-create eglCreateImageKHR
+/// calls on the cache_path=true arm of run_nv12_dmabuf_blit_pass. The
+/// cache is lazily populated one-buffer-at-a-time on the bake hot
+/// path; under 2-video transition load the first 8 transition ticks
+/// each pay the eglCreateImageKHR cost for a new buffer index, surfacing
+/// as a per-tick stall the user perceives as motion judder.
+///
+/// This helper batches the cold-fill: on the first transition bake
+/// where the cache is detected cold (cached_egl_image(0).is_none()),
+/// we invoke code1's new Decoder.prewarm_egl_image_cache method to
+/// iterate ALL CAPTURE buffer fds + create their EGLImages in one
+/// Mutex-acquired batch. Subsequent transition paints all hit the
+/// cache HIT path; import_us drops from ~83-148 ms (per slow tick)
+/// to ~1 ms.
+///
+/// HARD INVARIANTS preserved by construction (sacred lead concerns):
+///   - r101 dmabuf-ref-leak: handles inserted via prewarm ride the
+///     same DecoderInner::Drop teardown as lazy-fill (code1's accessor
+///     contract).
+///   - get_or_init_egl_image idempotency: the closure passed to
+///     prewarm_egl_image_cache mirrors the create_one shape from
+///     run_nv12_dmabuf_blit_pass exactly (same attribs layout, same
+///     EglImageHandle build).
+///   - No GL state mutation outside the EGLImage create (no texture
+///     binds, no shader use); the caller still owns all GL state.
+///   - The closure runs INSIDE the Decoder's Mutex-acquired scope; it
+///     MUST NOT call any other Decoder method (would deadlock per
+///     std::sync::Mutex non-reentrance). The closure here only does
+///     eglCreateImageKHR + EglImageHandle::new — no Decoder access.
+///
+/// Emits `[perf] eglimage_prewarm_transition entry w=N h=N stride=N`
+/// as the QA-side fingerprint. Code1's accessor follows with its own
+/// `[perf] prewarm_egl_image_cache total=N warmed=N skipped=N` line
+/// summarizing how many slots were cold-filled vs already populated.
+///
+/// Safety: matches run_nv12_dmabuf_blit_pass — extern "C" EGL fn ptrs
+/// loaded via eglGetProcAddress, called per spec; signatures pinned
+/// by the EGL + GL_OES_EGL_image_external specs.
+#[cfg(target_os = "linux")]
+unsafe fn prewarm_egl_image_cache_for_decoder(
+    decoder: &crate::v4l2::Decoder,
+    egl_lib: &egl::DynamicInstance<egl::EGL1_5>,
+    display: egl::Display,
+    gl: &glow::Context,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Result<()> {
+    let Some(eps) = dma_buf_egl_entry_points(egl_lib, display, gl) else {
+        return Ok(());
+    };
+    eprintln!(
+        "[perf] eglimage_prewarm_transition entry w={} h={} stride={}",
+        width, height, stride,
+    );
+    decoder.prewarm_egl_image_cache(|idx, fd| {
+        let y_size: i32 = (stride as i32) * (height as i32);
+        let attribs: [i32; 20] = [
+            // EGL_WIDTH + EGL_HEIGHT spec-numbered 0x3057 + 0x3056 —
+            // matches the attribs layout in run_nv12_dmabuf_blit_pass
+            // exactly. Any drift between these two attrib arrays would
+            // be a sacred-review BLOCKER.
+            0x3057, width as i32,
+            0x3056, height as i32,
+            EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_NV12,
+            EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+            EGL_DMA_BUF_PLANE0_PITCH_EXT, stride as i32,
+            EGL_DMA_BUF_PLANE1_FD_EXT, fd,
+            EGL_DMA_BUF_PLANE1_OFFSET_EXT, y_size,
+            EGL_DMA_BUF_PLANE1_PITCH_EXT, stride as i32,
+            EGL_NONE_ATTR,
+            // Trailing 0 — unused; EGL parser stops at EGL_NONE.
+            0,
+        ];
+        let img = (eps.create_image)(
+            display.as_ptr(),
+            std::ptr::null_mut(),  // EGL_NO_CONTEXT
+            EGL_LINUX_DMA_BUF_EXT,
+            std::ptr::null_mut(),  // buffer = NULL for dma_buf
+            attribs.as_ptr(),
+        );
+        if img.is_null() {
+            return Err(anyhow!(
+                "eglCreateImageKHR(prewarm, idx={}, fd={}, w={}, h={}, stride={}) -> EGL_NO_IMAGE",
+                idx, fd, width, height, stride,
+            ));
+        }
+        Ok(crate::v4l2::EglImageHandle {
+            image: img,
+            display: display.as_ptr(),
+            destroy_fn: eps.destroy_image,
+        })
+    })
+}
+
 #[cfg(target_os = "linux")]
 pub unsafe fn run_nv12_dmabuf_blit_pass(
     gl: &glow::Context,

@@ -467,4 +467,27 @@ mod tests {
              QA's bench parser can no longer locate iter-7 flush emits",
         );
     }
+
+    #[test]
+    fn eglimage_prewarm_transition_field_name_pinned_in_hdmi_source() {
+        // 2026-06-15 Option B (perf-gl tail-fix close-out): the
+        // `eglimage_prewarm_transition` line literal is QA's grep
+        // fingerprint for the pre-warm call at the start of a cold
+        // transition bake. A silent rename would drop the marker
+        // from journal samples + break QA's paired-gate verification
+        // that this binary contains the Option B fix. The helper
+        // name `prewarm_egl_image_cache_for_decoder` is pinned too
+        // so the call site can't drift via renaming.
+        let hdmi = include_str!("hdmi.rs");
+        assert!(
+            hdmi.contains("eglimage_prewarm_transition"),
+            "Option B: `eglimage_prewarm_transition` substring missing from hdmi.rs — \
+             QA's bench parser can no longer locate the pre-warm fingerprint",
+        );
+        assert!(
+            hdmi.contains("prewarm_egl_image_cache_for_decoder"),
+            "Option B: `prewarm_egl_image_cache_for_decoder` helper name missing from \
+             hdmi.rs — refactored without updating this pin",
+        );
+    }
 }
