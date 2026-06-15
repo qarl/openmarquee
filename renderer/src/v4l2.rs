@@ -833,6 +833,37 @@ pub struct V4l2Selection {
     pub reserved: [u32; 9],
 }
 
+/// perf-decode MIN_BUFFERS plumbing draft (2026-06-15):
+/// `struct v4l2_control` for VIDIOC_G_CTRL.
+///
+/// Size: 8 bytes (id u32 + value i32). Matches the kernel
+/// definition exactly per <linux/videodev2.h>:
+///   struct v4l2_control {
+///       __u32 id;
+///       __s32 value;
+///   };
+///
+/// Used to query V4L2_CID_MIN_BUFFERS_FOR_CAPTURE — the V4L2-
+/// spec-correct way to determine the minimum CAPTURE pool size
+/// the driver requires for reorder buffers + EGL hold. C-1
+/// (2026-06-15, aborted) tried to shortcut this by requesting
+/// count=2 directly; sacred caught the r93 wedge risk because
+/// bcm2835-codec doesn't reliably up-negotiate REQBUFS count
+/// to satisfy MIN_BUFFERS_FOR_CAPTURE (the control is a
+/// userspace contract — driver expects userspace to query it
+/// and request that many).
+///
+/// References:
+///   - <linux/videodev2.h> struct v4l2_control
+///   - <https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/vidioc-g-ctrl.html>
+///   - <https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/control.html>
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct V4l2Control {
+    pub id: u32,
+    pub value: i32,
+}
+
 /// Single plane's metadata inside a multiplanar v4l2_buffer.
 /// Size: 64 bytes.
 #[repr(C)]
@@ -1036,6 +1067,48 @@ nix::ioctl_readwrite!(vidioc_try_decoder_cmd, b'V', 97, V4l2DecoderCmd);
 // `_IOWR('V', 60, v4l2_selection)`.
 #[cfg(target_os = "linux")]
 nix::ioctl_readwrite!(vidioc_g_selection, b'V', 60, V4l2Selection);
+
+// perf-decode MIN_BUFFERS plumbing draft (2026-06-15):
+// VIDIOC_G_CTRL = _IOWR('V', 27, v4l2_control) per
+// <linux/videodev2.h>. Used to query V4L2_CID_MIN_BUFFERS_
+// FOR_CAPTURE (CID 0x009A0921) — the V4L2 stateful-decoder
+// spec's userspace contract for "minimum number of CAPTURE
+// buffers the driver requires to avoid reorder starvation."
+// See `Decoder::min_buffers_for_capture` for the wrapper.
+#[cfg(target_os = "linux")]
+nix::ioctl_readwrite!(vidioc_g_ctrl, b'V', 27, V4l2Control);
+
+/// V4L2_CID_MIN_BUFFERS_FOR_CAPTURE per
+/// <linux/v4l2-controls.h> line 106:
+///   #define V4L2_CID_MIN_BUFFERS_FOR_CAPTURE (V4L2_CID_BASE+39)
+///
+/// V4L2_CID_BASE = (V4L2_CTRL_CLASS_USER | 0x900)
+///               = 0x00980000 | 0x900
+///               = 0x00980900
+/// + 39 (0x27) = 0x00980927.
+///
+/// Lives in the USER control class (NOT codec — codec-class is
+/// 0x00990000 / 0x00A40000 stateless; MIN_BUFFERS_FOR_CAPTURE
+/// has always been in user-class for stateful decoders).
+///
+/// Read via VIDIOC_G_CTRL after S_FMT on the CAPTURE queue.
+/// The driver reports the minimum number of buffers it needs
+/// for H.264 reorder + EGL hold. Userspace MUST request at
+/// least this count via REQBUFS, plus a headroom slot for the
+/// consumer (caller decides the headroom). bcm2835-codec on
+/// the Pi Zero 2 W typically reports `min = 1` (single
+/// decoder), but the safe production floor remains 4 because
+/// the perf-night r57 cold-start path uses warmup_count=3 = 4
+/// OUTPUT samples QBUF'd = 4 CAPTURE frames potentially
+/// produced concurrently. See main.rs:171-198 r73/r77/r93/r94
+/// history.
+///
+/// Sacred review caught this constant as 0x009A0921 in the
+/// first draft (codec-class misattribution). Fixed pre-commit;
+/// 0x009A0921 would have EINVAL'd on every ioctl and silently
+/// neutered the spec-correct path on a future ship attempt.
+#[cfg(target_os = "linux")]
+pub const V4L2_CID_MIN_BUFFERS_FOR_CAPTURE: u32 = 0x0098_0927;
 
 // ============================================================
 // Higher-level types.
@@ -1876,6 +1949,78 @@ impl Decoder {
             anyhow!("assert_capture_quantization_compatible called before set_capture_format")
         })?;
         check_quantization_for_lim_range_shader(cap.quantization)
+    }
+
+    /// perf-decode MIN_BUFFERS plumbing draft (2026-06-15):
+    /// query V4L2_CID_MIN_BUFFERS_FOR_CAPTURE via VIDIOC_G_CTRL.
+    /// Returns the kernel-reported minimum CAPTURE buffer count
+    /// the driver requires for H.264 reorder + EGL hold.
+    ///
+    /// **Spec contract**: the V4L2 stateful-decoder spec
+    /// (<https://www.kernel.org/doc/html/latest/userspace-api/media/v4l/dev-decoder.html>)
+    /// states userspace MUST query this control AFTER S_FMT on
+    /// the CAPTURE queue and BEFORE REQBUFS, and MUST request
+    /// AT LEAST this count. Userspace adds its own headroom for
+    /// the consumer (the GLES texture binding, in our case).
+    ///
+    /// **Behavior on failure**: bcm2835-codec is known to
+    /// support this control (verified via lsv4l2-controls on
+    /// Pi Zero 2 W 2026-06-09). On a driver that doesn't expose
+    /// it, VIDIOC_G_CTRL returns EINVAL — the caller should
+    /// treat that as "no spec-correct floor available; fall
+    /// back to the empirical hardcoded floor."
+    ///
+    /// **Why this is a DRAFT plumbing**: this method is added
+    /// but NOT YET called from prime_video_decoder_with_warmup.
+    /// The wiring to actually USE it (request max(min+headroom,
+    /// safety_floor)) is gated behind the post-F-1+C-3+W-2
+    /// bench results — see perf-decode-min-buffers-draft commit
+    /// body for the queue/risk analysis.
+    pub fn min_buffers_for_capture(&self) -> Result<u32> {
+        let inner = self.inner.lock().unwrap();
+        if inner.capture_format.is_none() {
+            return Err(anyhow!(
+                "min_buffers_for_capture: set_capture_format must be called first (V4L2 \
+                 spec: query VIDIOC_G_CTRL(V4L2_CID_MIN_BUFFERS_FOR_CAPTURE) AFTER S_FMT)"
+            ));
+        }
+        let mut ctrl = V4l2Control {
+            id: V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
+            value: 0,
+        };
+        // SAFETY: ioctl_readwrite! generated wrapper takes
+        // &mut V4l2Control; the kernel writes the value field
+        // back; we read it on success. fd is a raw file
+        // descriptor that lives at least as long as `inner`.
+        let result = unsafe { vidioc_g_ctrl(inner.fd(), &mut ctrl) };
+        // Distinct fingerprint marker (per admin's QA strings-
+        // verification gate 2026-06-15): the tag name
+        // `min_buffers_for_capture_negotiated` is QA's
+        // grep-key for the F-1 chain integrity check + is
+        // unique to this draft commit. Emits even on EINVAL
+        // (driver doesn't support the control) so the binary
+        // always carries the fingerprint string regardless of
+        // runtime behavior. r84 ioctl trace shape preserved
+        // in the result= field.
+        eprintln!(
+            "[perf] min_buffers_for_capture_negotiated source=g_ctrl_probe result={}",
+            match &result {
+                Ok(_) => format!("ok_value_{}", ctrl.value),
+                Err(e) => format!("errno_{:?}", e),
+            },
+        );
+        result.with_context(|| {
+            "VIDIOC_G_CTRL(V4L2_CID_MIN_BUFFERS_FOR_CAPTURE) failed -- driver may not \
+             support the control (EINVAL); fall back to empirical hardcoded floor"
+                .to_string()
+        })?;
+        if ctrl.value < 0 {
+            return Err(anyhow!(
+                "min_buffers_for_capture: kernel reported negative count {} (unexpected)",
+                ctrl.value,
+            ));
+        }
+        Ok(ctrl.value as u32)
     }
 
     /// VIDIOC_S_FMT on the OUTPUT (compressed-in) queue.
