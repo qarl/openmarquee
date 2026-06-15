@@ -173,6 +173,23 @@ mod tests {
     }
 
     #[test]
+    fn begin_transition_from_drain_wait_field_name_pinned_in_ipc_main_source() {
+        // QA's bench parser greps `begin_transition_from_drain_wait`
+        // literally to identify the F-1 belt-and-suspenders sync-
+        // wait at BeginTransition.from_id (8-12 s freeze pattern
+        // in the v2v bench when paint ticks couldn't drain the
+        // worker before the next transition fired). A rename
+        // would silently break that bench's classification.
+        let ipc = include_str!("ipc_main.rs");
+        assert!(
+            ipc.contains("begin_transition_from_drain_wait"),
+            "perf-decode F-1 follow-up: `begin_transition_from_drain_wait` substring \
+             missing from ipc_main.rs — QA's bench parser will no longer be able to \
+             identify the BeginTransition.from_id sync-wait freezes",
+        );
+    }
+
+    #[test]
     fn peak_triage_since_restart_ms_field_name_pinned_in_hdmi_source() {
         // QA's bench parser greps `since_restart_ms=` literally
         // (per the peak-triage dispatch field-name contract). A

@@ -3441,7 +3441,29 @@ fn handle_inner_request(
                 // behind paint ticks — but better than racing
                 // the worker with a synchronous cache.load and
                 // re-introducing iter-2-class V4L2 contention.
+                //
+                // QA's distinct-tag request (2026-06-15): the
+                // ensure_preload_complete emits a generic
+                // `[perf] begin_slide_wait` line that QA's bench
+                // grep can't distinguish from the BeginSlide
+                // to-side join at line 3391. Snapshot pending
+                // state before the call so we can emit a tagged
+                // `[perf] begin_transition_from_drain_wait` line
+                // ONLY when there was actually a worker to drain
+                // — steady-state stays quiet (no noise) but a
+                // multi-second sync-wait fires the distinct tag
+                // QA's parser keys on to identify the 8-12 s
+                // freeze pattern in her v2v bench.
+                let was_pending_from = cache.pending_preloads.contains_key(&from_id);
+                let t_from_drain = std::time::Instant::now();
                 ensure_preload_complete(cache, from_id);
+                if was_pending_from {
+                    eprintln!(
+                        "[perf] begin_transition_from_drain_wait slide_id={} wait_us={}",
+                        from_id,
+                        t_from_drain.elapsed().as_micros(),
+                    );
+                }
                 if !cache.has_video_decoder_for_slide(from_id) {
                     if let Err(e) = cache.load(content_root, from_id) {
                         return err(format!("begin_transition load failed: {e:#}"));
