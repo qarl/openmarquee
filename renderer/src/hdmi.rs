@@ -8894,7 +8894,25 @@ unsafe fn bake_video_slide_to_current_fbo(
             // OPENMARQUEE_BAKE_OFFSCREEN_FLUSH=off skips this for
             // bench A/B (default ON).
             if is_offscreen_bake && bake_offscreen_flush_enabled() {
+                // tail-diag-v2 flush probe: time the iter-7 gl.flush()
+                // independently. Admin's GL2.2 hypothesis is that
+                // this flush serializes against the V3D backlog
+                // during 2-video transitions → multi-second wait
+                // for the GPU to drain. Steady-state passes
+                // is_offscreen_bake=false so this entire block is
+                // skipped → zero probe cost on the steady-state
+                // hot path. Gated emit on flush_us > 500_000 (500 ms,
+                // same threshold as tail_diag_blit_subphase). Pure
+                // additive — flush behavior unchanged.
+                let t_flush_start = std::time::Instant::now();
                 session.gl.flush();
+                let flush_us = t_flush_start.elapsed().as_micros() as u64;
+                if flush_us > 500_000 {
+                    eprintln!(
+                        "[perf] tail_diag_blit_flush flush_us={} is_offscreen_bake=true",
+                        flush_us,
+                    );
+                }
             }
             // Drop the Frame so its Drop re-QBUFs CAPTURE BEFORE the
             // caller's buffer swap; holding the Frame across the next
@@ -12819,6 +12837,37 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     egl_image_cache: Option<(&crate::v4l2::Decoder, u32)>,
 ) -> Result<bool> {
     use glow::HasContext;
+    // tail-diag instrumentation v2 (2026-06-15, follows code1's
+    // tail-diag-v1 per QA + admin routing). v1 isolated blit_us as
+    // the dominant phase during transition stalls (up to 8.8s on
+    // ~14% of transitions, all in_transition=true, all path=
+    // dmabuf). v2 sub-phases what HAPPENS inside the blit so QA
+    // can narrow GL2.1 (2-dmabuf overload) vs GL2.2 (sync/fence
+    // stall) per admin's hypothesis tree:
+    //   import_us large   -> EGLImage acquire stall (Mutex
+    //                        contention OR per-frame eglCreate
+    //                        ImageKHR slow path)
+    //   sampler_us large  -> create_texture / bind / tex_params
+    //                        (V3D BO alloc + driver state churn)
+    //   draw_us large     -> GL/GPU stall on shader+draw (vc4
+    //                        V3D overload during dual-video bake)
+    //   destroy_us large  -> texture delete / EGLImage destroy
+    //                        (V3D BO free under memory pressure)
+    // The iter-7 gl.flush() is OUTSIDE this function (in
+    // bake_video_slide_to_current_fbo); a sibling tail-diag-v2-
+    // flush probe at that site captures it as flush_us. QA
+    // correlates the two by sequence + timestamp.
+    //
+    // Gate: emit only when this function's total_us > 500_000
+    // (500 ms) — well above any fast tick, well below the
+    // multi-second freezes. Steady-state never trips the gate.
+    // Probe overhead bound: 5 CLOCK_MONOTONIC reads + 1 compare
+    // ~= 1 µs per fast tick; emit cost ~5-50 µs per slow tick.
+    // Pure field-add per the cross-lane instrumentation rule —
+    // NO signature change, NO control-flow change, NO new
+    // return shape. tail_diag_blit_subphase string-pin is the
+    // QA-side fingerprint marker.
+    let t_total_start = std::time::Instant::now();
     // Lazy-resolve EGL+GLES extension entry points. None -> caller
     // falls back to MMAP path.
     let Some(eps) = dma_buf_egl_entry_points(egl_lib, display, gl) else {
@@ -12905,6 +12954,12 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
         }
         (img, false)
     };
+    // tail-diag-v2 phase boundary: EGLImage acquired (cache hit OR
+    // per-frame create). Everything from fn entry up to here is
+    // "import" — the EGL_LINUX_DMA_BUF_EXT import + the Mutex
+    // acquisition for the cached path. Suspect surface for GL2.1
+    // (concurrent dmabuf import overload).
+    let t_import_end = std::time::Instant::now();
     // Create + bind the external-OES texture. Set min/mag filter
     // to LINEAR; CLAMP_TO_EDGE both axes (the spec lists wrap as
     // one of the supported parameters on TEXTURE_EXTERNAL_OES;
@@ -12946,6 +13001,12 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     // From this point the texture samples the dma_buf bytes
     // directly -- zero CPU copy.
     (eps.image_target_texture_2d)(GL_TEXTURE_EXTERNAL_OES, egl_image);
+    // tail-diag-v2 phase boundary: texture object created + bound
+    // + sampler state set + EGLImage→texture associated. Everything
+    // between t_import_end and here is "sampler" — V3D BO alloc
+    // for the texture handle + 4 tex_parameter_i32 driver calls +
+    // image_target_texture_2d (the actual EGLImage→texture bind).
+    let t_sampler_end = std::time::Instant::now();
 
     // Run the blit pass. cached_nv12_dmabuf_program lazy-links
     // FS_NV12_DMABUF_TO_RGB on first call.
@@ -12970,6 +13031,12 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
         gl.disable_vertex_attrib_array(cnp.a_uv);
         Ok(())
     })();
+    // tail-diag-v2 phase boundary: shader bound + uniforms set +
+    // draw issued + state-cleanup done. Everything between
+    // t_sampler_end and here is "draw" — the actual GPU work
+    // submission. Suspect surface for GL2.2 (vc4 V3D pipeline
+    // stall on shader+draw under 2-video concurrent load).
+    let t_draw_end = std::time::Instant::now();
 
     // Teardown ordering: unbind texture, delete texture, THEN
     // destroy the EGLImage. The driver keeps the dma_buf reference
@@ -12993,6 +13060,36 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
             // re-import will catch any persistent leak.
             eprintln!("warn: eglDestroyImageKHR returned EGL_FALSE for fd={}", fd);
         }
+    }
+
+    // tail-diag-v2 phase boundary + gated emit. Everything between
+    // t_draw_end and here is "destroy" — texture delete + (if
+    // no-cache path) EGLImage destroy. Suspect surface for V3D BO
+    // free under memory pressure (rare unless the allocator is
+    // saturated).
+    let t_destroy_end = std::time::Instant::now();
+    let total_us = t_destroy_end.duration_since(t_total_start).as_micros() as u64;
+    if total_us > 500_000 {
+        let import_us = t_import_end.duration_since(t_total_start).as_micros() as u64;
+        let sampler_us = t_sampler_end.duration_since(t_import_end).as_micros() as u64;
+        let draw_us = t_draw_end.duration_since(t_sampler_end).as_micros() as u64;
+        let destroy_us = t_destroy_end.duration_since(t_draw_end).as_micros() as u64;
+        // cache_path=true means the EGLImage cache was ENABLED for
+        // this call (egl_image_cache: Some(_)) — get_or_init may
+        // have HIT or freshly INSERTED. cache_path=false means the
+        // pre-r101 leaky per-frame create+destroy path (kill switch).
+        // Per sacred review nit: this does NOT cleanly disambiguate
+        // cache-miss-fresh-create vs cache-hit on the cache_path=true
+        // arm; a future v3 can thread `_created` through the
+        // get_or_init return to surface that distinction, but for v2's
+        // GL2.1/GL2.2 routing the cache_path bool is enough — large
+        // import_us with cache_path=false is the kill-switch leak; large
+        // import_us with cache_path=true is Mutex contention or a
+        // bcm2835/EGL slow first-insert.
+        eprintln!(
+            "[perf] tail_diag_blit_subphase import_us={} sampler_us={} draw_us={} destroy_us={} total_us={} cache_path={}",
+            import_us, sampler_us, draw_us, destroy_us, total_us, suppress_destroy_at_end,
+        );
     }
 
     blit_result?;

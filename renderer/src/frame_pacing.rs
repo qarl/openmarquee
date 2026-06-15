@@ -442,4 +442,29 @@ mod tests {
         assert_eq!(over_budget_ms(t0, t_short, 10), None);
         assert_eq!(over_budget_ms(t0, t_long, 10), Some(20));
     }
+
+    #[test]
+    fn tail_diag_blit_subphase_field_name_pinned_in_hdmi_source() {
+        // 2026-06-15 tail-diag-v2 (perf-gl): the
+        // `tail_diag_blit_subphase` and `tail_diag_blit_flush`
+        // literals are QA's grep fingerprint for the sub-phase
+        // blit instrumentation in run_nv12_dmabuf_blit_pass + the
+        // iter-7 flush probe in bake_video_slide_to_current_fbo.
+        // Same regression-lock shape as peak-triage's
+        // since_restart_ms pin above. A silent rename would break
+        // QA's bench parser, lose the GL2.1-vs-GL2.2
+        // disambiguation signal, and force a re-deploy of a
+        // re-instrumented binary to recover.
+        let hdmi = include_str!("hdmi.rs");
+        assert!(
+            hdmi.contains("tail_diag_blit_subphase"),
+            "tail-diag-v2: `tail_diag_blit_subphase` substring missing from hdmi.rs — \
+             QA's bench parser can no longer locate sub-phase blit emits",
+        );
+        assert!(
+            hdmi.contains("tail_diag_blit_flush"),
+            "tail-diag-v2: `tail_diag_blit_flush` substring missing from hdmi.rs — \
+             QA's bench parser can no longer locate iter-7 flush emits",
+        );
+    }
 }
