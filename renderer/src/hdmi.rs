@@ -3424,10 +3424,10 @@ pub fn paint_and_present_one_frame_for_slide(
     // QA-direct (2026-05-14 slide-boundary characterization slice):
     // OPENMARQUEE_BOUNDARY_TRACE=1 emits one JSON line per painted
     // frame to stderr with per-phase Instant deltas in microseconds.
-    // Zero overhead when off (one env::var lookup per frame; the
-    // Instant captures are skipped entirely). Drained by the
-    // sidecar smoke driver's stderr thread for offline analysis.
-    let trace = std::env::var_os("OPENMARQUEE_BOUNDARY_TRACE").is_some();
+    // 2026-06-15 perf-gl W-2: was a per-frame std::env::var_os call;
+    // now reads a thread_local-cached bool (resolved once per
+    // worker). The Instant captures are skipped entirely when off.
+    let trace = boundary_trace_enabled_cached();
     let t_start = if trace { Some(std::time::Instant::now()) } else { None };
     // perf-night r2 (2026-05-26): record bake/compose/present sub-
     // phases for the runtime profile histogram (orthogonal to the
@@ -4625,12 +4625,13 @@ pub fn paint_and_present_one_video_slide_frame(
     // log emitted below the swap (DMABUF path only; the MMAP path
     // was always silent for the total log and Phase 8 slice 2
     // preserves that asymmetry).
+    // 2026-06-15 perf-gl W-2: was a per-frame std::env::var call;
+    // now reads a thread_local-cached bool (resolved once per
+    // worker). Saves ~0.5-1 µs/frame (env::var allocates the
+    // String on every call; the cached path is a Cell::get()).
     let profile_first = *next_sample_idx == 1
         && *frames_decoded == 0
-        && std::env::var("OPENMARQUEE_FIRSTFRAME_PROFILE")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        && firstframe_profile_enabled_cached();
     let t_enter = if profile_first { Some(std::time::Instant::now()) } else { None };
     // perf-night r2 (2026-05-26): bake/compose/present sub-phases for
     // the runtime profile. Video bake = V4L2 sample drain + NV12
@@ -8406,6 +8407,61 @@ fn slide_cache_capacity() -> usize {
     }
 }
 
+/// 2026-06-15 perf-gl W-2: thread_local-cached read of
+/// `OPENMARQUEE_BOUNDARY_TRACE`. Pre-W-2 every paint hook called
+/// `std::env::var_os("OPENMARQUEE_BOUNDARY_TRACE").is_some()` per
+/// frame — a libc getenv → linear environ-block scan that costs
+/// ~0.5 µs and is wasted work since the env var never changes
+/// mid-process. The thread_local Cell holds the resolved Option
+/// per worker thread: first call resolves + caches; subsequent
+/// calls are a single Cell::get() (~1 ns). Saves ~0.5 µs/frame at
+/// the 2 hot-path call sites (paint_and_present_one_frame_for_
+/// slide + paint_slide_with_viewport). The paint_slide_with_
+/// viewport site has no EglSession in scope (it takes raw &gl), so
+/// thread_local is the canonical place for this cache.
+fn boundary_trace_enabled_cached() -> bool {
+    use std::cell::Cell;
+    thread_local! {
+        static CACHED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    CACHED.with(|c| {
+        if let Some(v) = c.get() {
+            return v;
+        }
+        let v = std::env::var_os("OPENMARQUEE_BOUNDARY_TRACE").is_some();
+        c.set(Some(v));
+        v
+    })
+}
+
+/// 2026-06-15 perf-gl W-2: thread_local-cached read of
+/// `OPENMARQUEE_FIRSTFRAME_PROFILE`. Same rationale + shape as
+/// boundary_trace_enabled_cached. The 2 hot-path call sites are
+/// paint_and_present_one_video_slide_frame +
+/// bake_video_slide_to_current_fbo; pre-W-2 each called
+/// `std::env::var("OPENMARQUEE_FIRSTFRAME_PROFILE").ok().map(|v|
+/// v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)`
+/// which is even more expensive than var_os (heap-allocates a
+/// String for the matched value). Cached path skips both the
+/// getenv syscall and the alloc.
+fn firstframe_profile_enabled_cached() -> bool {
+    use std::cell::Cell;
+    thread_local! {
+        static CACHED: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    CACHED.with(|c| {
+        if let Some(v) = c.get() {
+            return v;
+        }
+        let v = std::env::var("OPENMARQUEE_FIRSTFRAME_PROFILE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        c.set(Some(v));
+        v
+    })
+}
+
 fn bake_offscreen_flush_enabled() -> bool {
     match std::env::var("OPENMARQUEE_BAKE_OFFSCREEN_FLUSH") {
         Ok(v) => {
@@ -8470,12 +8526,10 @@ unsafe fn bake_video_slide_to_current_fbo(
     is_offscreen_bake: bool,
 ) -> Result<Option<&'static str>> {
     use glow::HasContext;
+    // 2026-06-15 perf-gl W-2: thread_local-cached env-var read.
     let profile_first = *next_sample_idx == 1
         && *frames_decoded == 0
-        && std::env::var("OPENMARQUEE_FIRSTFRAME_PROFILE")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        && firstframe_profile_enabled_cached();
     // tail-diag instrumentation v1 (2026-06-15, per admin's tail-fix
     // dispatch): per-tick `feed_us` / `dqbuf_us` / `blit_us` /
     // `total_us` breakdown, emitted ONLY when total_us > 100ms (well
@@ -13835,9 +13889,9 @@ fn paint_slide_with_viewport(
     // JSON line per paint_slide invocation with bg / raster /
     // draw_loop sub-phase deltas in microseconds. The line is
     // emitted RIGHT BEFORE the outer "boundary" trace line so the
-    // analysis script can pair them by stream order. Zero overhead
-    // when off (single env::var_os check at entry).
-    let trace_sub = std::env::var_os("OPENMARQUEE_BOUNDARY_TRACE").is_some();
+    // analysis script can pair them by stream order.
+    // 2026-06-15 perf-gl W-2: thread_local-cached env-var read.
+    let trace_sub = boundary_trace_enabled_cached();
     let t_sub_start = if trace_sub { Some(std::time::Instant::now()) } else { None };
     let mut t_after_bg: Option<std::time::Instant> = None;
     let mut t_after_raster: Option<std::time::Instant> = None;
