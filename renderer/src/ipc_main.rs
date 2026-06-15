@@ -1278,6 +1278,102 @@ fn ensure_preload_complete(cache: &mut SlideCache, slide_id: uuid::Uuid) {
     }
 }
 
+/// 2026-06-14 iter-9 (Option A round 2): spawn a preload worker
+/// for `slide_id` from the BeginTransition path, OFF the render
+/// thread. Mirrors PreloadSlide's spawn arm but bypasses the r97
+/// `preload_deferred_for_codec_contention` defer — iter-9's whole
+/// point is to prime the to-side decoder DURING the transition
+/// window while the from-side decoder is still streaming. The
+/// iter-8 still-routing means PaintTransition does NOT drain the
+/// to-side decoder, so the worker's prime contends only with the
+/// from-side's live drain (single-decoder render path; one prime
+/// alloc against one live drain — the r97 finding was 2 prime
+/// allocs simultaneously).
+///
+/// Idempotent: short-circuits at the same already-loaded / already-
+/// in-flight checks as PreloadSlide. If pending_preloads is at
+/// capacity (MAX_CONCURRENT_PRELOADS), falls back to synchronous
+/// cache.load so the to-side decoder is guaranteed primed by the
+/// time BeginSlide(to_id) handoff runs.
+///
+/// ensure_preload_complete at the post-transition BeginSlide(to_id)
+/// joins the worker + installs artifacts. If the worker is still
+/// in flight at BeginSlide, BeginSlide blocks the residual time
+/// (which we expect to be <transition_window because the prime
+/// started at BeginTransition entry).
+fn spawn_async_to_prime_for_begin_transition(
+    cache: &mut SlideCache,
+    content_root: &std::path::Path,
+    slide_id: uuid::Uuid,
+) -> Result<()> {
+    let already_loaded = cache.items.peek(&slide_id).is_some()
+        && cache.video_demuxers.contains_key(&slide_id)
+        && {
+            #[cfg(target_os = "linux")]
+            { cache.has_video_decoder(slide_id) }
+            #[cfg(not(target_os = "linux"))]
+            { true }
+        };
+    if already_loaded {
+        return Ok(());
+    }
+    if cache.pending_preloads.contains_key(&slide_id) {
+        return Ok(());
+    }
+    const MAX_CONCURRENT_PRELOADS: usize = 2;
+    if cache.pending_preloads.len() >= MAX_CONCURRENT_PRELOADS {
+        eprintln!(
+            "[perf] begin_transition_async_prime slide_id={} dropped reason=capacity \
+             pending={} -- falling back to synchronous cache.load",
+            slide_id,
+            cache.pending_preloads.len(),
+        );
+        return cache.load(content_root, slide_id);
+    }
+    let t_enqueue = std::time::Instant::now();
+    let content_root_clone = content_root.to_path_buf();
+    let slide_id_clone = slide_id;
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("v2v-it9-prime-{slide_id}"))
+        .spawn(move || -> PreloadResult {
+            let t_work = std::time::Instant::now();
+            let r = preload_in_worker(&content_root_clone, slide_id_clone);
+            let work_us = t_work.elapsed().as_micros();
+            match &r {
+                Ok(_) => eprintln!(
+                    "[perf] begin_transition_async_prime slide_id={} work_us={}",
+                    slide_id_clone, work_us,
+                ),
+                Err(e) => eprintln!(
+                    "[perf] begin_transition_async_prime slide_id={} failed_us={} err={:#}",
+                    slide_id_clone, work_us, e,
+                ),
+            }
+            r
+        });
+    match spawn_result {
+        Ok(thread) => {
+            cache.pending_preloads.insert(
+                slide_id,
+                PreloadHandle { thread, enqueued_at: t_enqueue },
+            );
+            eprintln!(
+                "[perf] begin_transition_async_prime slide_id={} queued_us={}",
+                slide_id, t_enqueue.elapsed().as_micros(),
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "ipc: begin_transition async-prime spawn failed for {}: {:#}; \
+                 falling back to synchronous cache.load",
+                slide_id, e,
+            );
+            cache.load(content_root, slide_id)
+        }
+    }
+}
+
 /// Emit a response to stdout as a single JSON line + flush.
 /// stdout is line-buffered by default; explicit flush ensures
 /// the caller never sees a partial line on a slow stdin read.
@@ -1526,7 +1622,7 @@ where
             }
         };
         let is_close = matches!(req, IpcRequest::Close);
-        let resp = handle_inner_request(req, &mut state, &mut cache, content_root);
+        let resp = handle_inner_request(req, &mut state, &mut cache, content_root, None);
         emit_response(stdout, &resp)?;
         if is_close {
             break;
@@ -1920,7 +2016,13 @@ where
                 continue;
             }
 
-            let resp = handle_inner_request(req, &mut state, &mut cache, content_root);
+            // 2026-06-14 iter-9: thread the EglSession through so
+            // BeginTransition can read session.video_first_still and
+            // decide async-prime (still cached) vs sync cache.load
+            // (no still — first encounter).
+            let resp = handle_inner_request(
+                req, &mut state, &mut cache, content_root, Some(&*session),
+            );
 
             // Phase 9 Step 9a: tag the paint kind (if any) BEFORE
             // run_paint_hook so we can wrap the call in wall-clock
@@ -2835,6 +2937,18 @@ fn handle_inner_request(
     state: &mut PlaybackState,
     cache: &mut SlideCache,
     content_root: &std::path::Path,
+    // 2026-06-14 iter-9: read-only handle to the EGL session, used
+    // by the BeginTransition arm to query session.video_first_still
+    // and decide whether the to-side decoder prime can go async
+    // (still bridges the visible window) or must stay synchronous
+    // (no still → first encounter). None at callers that have no
+    // session (test fixtures, the non-paint open loop) → falls back
+    // to the synchronous cache.load path. Linux-only because the
+    // EglSession type itself is Linux-only (cfg-gated mod hdmi); on
+    // macOS the parameter is a unit-typed marker to keep handle_
+    // inner_request's signature uniform across platforms.
+    #[cfg(target_os = "linux")] session: Option<&crate::hdmi::EglSession>,
+    #[cfg(not(target_os = "linux"))] session: Option<&()>,
 ) -> IpcResponse {
     match req {
         IpcRequest::Open(_) => {
@@ -2970,17 +3084,71 @@ fn handle_inner_request(
             // path above; emits the same [perf]
             // begin_slide_wait line.
             ensure_preload_complete(cache, p.to_slide_id);
-            // r58 (2026-06-04): time the to-slide cache.load so QA
-            // can see PreloadSlide wins on the transition path too.
-            // Same heuristic as begin_slide_load above.
+            // 2026-06-14 iter-9 (Option A round 2): replace the
+            // synchronous cache.load for the to-slide with an
+            // ASYNC spawn when iter-8 has a cached still for the
+            // to-slide. Rationale:
+            //
+            // - The synchronous cache.load primes the V4L2 decoder
+            //   (prime_video_decoder_for_preload + Mp4Demuxer::open
+            //   + warmup samples) on the render thread; the prime
+            //   takes 500ms–25s on Pi Zero 2 W class hardware when
+            //   contending with an active outgoing decoder (the
+            //   r97 finding). This is the framerate catastrophe
+            //   QA logged on the iter-8 bench (delta_ms 5–25s,
+            //   load=7).
+            //
+            // - iter-8 captures a steady-state first-frame STILL
+            //   for every pure-video slide. When that still exists,
+            //   the PaintTransition handler routes endpoint_b to
+            //   VideoStill (a regular 2D blit; no V4L2 traffic).
+            //   The to-side decoder is NOT needed during the
+            //   transition window. So we can spawn the prime on a
+            //   background thread and let it finish while the
+            //   render thread keeps the from-side live + blits
+            //   the still for the to-side.
+            //
+            // - Post-transition: BeginSlide(to_id) calls
+            //   ensure_preload_complete which joins the worker.
+            //   If the worker finished during the transition
+            //   window (the goal), the join is ~0 µs. If it
+            //   didn't finish (e.g. heavy contention), BeginSlide
+            //   blocks the residual time — still better than
+            //   blocking the FULL prime at BeginTransition.
+            //
+            // - No-still fallback: first encounter of a video as
+            //   a transition to-slide has no cached still. Fall
+            //   back to the synchronous cache.load (the original
+            //   r103.1 behavior) — accept the freeze on first
+            //   appearance; subsequent transitions into the same
+            //   video benefit from the still + async prime path.
             let t_load = std::time::Instant::now();
-            if let Err(e) = cache.load(content_root, p.to_slide_id) {
+            #[cfg(target_os = "linux")]
+            let to_still_cached = session
+                .and_then(|s| s.video_first_still(p.to_slide_id))
+                .is_some();
+            #[cfg(not(target_os = "linux"))]
+            let to_still_cached = {
+                let _ = session;
+                false
+            };
+            if to_still_cached {
+                if let Err(e) = spawn_async_to_prime_for_begin_transition(
+                    cache,
+                    content_root,
+                    p.to_slide_id,
+                ) {
+                    return err(format!(
+                        "begin_transition async prime spawn failed: {e:#}",
+                    ));
+                }
+            } else if let Err(e) = cache.load(content_root, p.to_slide_id) {
                 return err(format!("begin_transition load failed: {e:#}"));
             }
             let load_us = t_load.elapsed().as_micros();
             eprintln!(
-                "[perf] begin_transition_load slide_id={} load_us={}",
-                p.to_slide_id, load_us,
+                "[perf] begin_transition_load slide_id={} load_us={} still_cached={}",
+                p.to_slide_id, load_us, to_still_cached,
             );
             // Hardening C3 / M1 (2026-05-21): also re-prime the
             // FROM-slide. The transition paint path fetches the
@@ -3511,7 +3679,7 @@ mod tests {
         let dir = td.path().join(id.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("item.json"), SAMPLE_TEXT_ITEM_FOR_UUID_1).unwrap();
-        handle_inner_request(req, state, cache, td.path())
+        handle_inner_request(req, state, cache, td.path(), None)
     }
 
     const SAMPLE_TEXT_ITEM_FOR_UUID_1: &str = r##"{
@@ -3542,7 +3710,7 @@ mod tests {
             content_root: Some(td.path().to_str().unwrap().to_string()),
             rotation: 0,
         });
-        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path(), None);
         match resp {
             IpcResponse::Err { error } => {
                 assert!(error.contains("already called"), "got: {error}");
@@ -3606,7 +3774,7 @@ mod tests {
             t0_ms: 0,
             duration_ms: 5000,
         });
-        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path(), None);
         match resp {
             IpcResponse::Err { error } => {
                 assert!(
@@ -3632,7 +3800,7 @@ mod tests {
             t0_ms: 0,
             duration_ms: 5000,
         });
-        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path(), None);
         match resp {
             IpcResponse::Err { error } => {
                 assert!(error.contains("begin_slide load failed"), "got: {error}");
@@ -3655,7 +3823,7 @@ mod tests {
         // Then advance.
         let req_adv = IpcRequest::Advance(AdvanceParams { t_ms: 500 });
         let td = tempfile::TempDir::new().unwrap();
-        let resp = handle_inner_request(req_adv, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(req_adv, &mut state, &mut cache, td.path(), None);
         match resp {
             IpcResponse::Ok {
                 result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
@@ -3697,7 +3865,7 @@ mod tests {
             transition_ms: 800,
             t0_ms: 1000,
         });
-        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path(), None);
         assert_eq!(resp, IpcResponse::Ok { result: OpResult::Empty });
         assert!(state.pending.is_some());
         assert_eq!(state.pending.as_ref().unwrap().to_slide.slide_id, id_b);
@@ -3759,6 +3927,7 @@ mod tests {
             &mut state,
             &mut cache,
             td.path(),
+            None,
         );
         assert_eq!(resp_begin, IpcResponse::Ok { result: OpResult::Empty });
         assert!(
@@ -3789,6 +3958,7 @@ mod tests {
             &mut state,
             &mut cache,
             td.path(),
+            None,
         );
         assert_eq!(resp, IpcResponse::Ok { result: OpResult::Empty });
         assert!(
@@ -3806,7 +3976,7 @@ mod tests {
         let req = IpcRequest::Capture(crate::playback::CaptureParams {
             path: "/tmp/x.png".to_string(),
         });
-        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path(), None);
         match resp {
             IpcResponse::Err { error } => {
                 assert!(error.contains("Capture not yet implemented"));
@@ -3829,7 +3999,7 @@ mod tests {
             brightness: None,
             gamma: None,
         });
-        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path(), None);
         match resp {
             IpcResponse::Err { error } => {
                 assert!(
@@ -3859,7 +4029,7 @@ mod tests {
             brightness: Some(0.5),
             gamma: None,
         });
-        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path(), None);
         match resp {
             IpcResponse::Err { error } => {
                 assert!(
@@ -3885,7 +4055,7 @@ mod tests {
         let req = IpcRequest::ProfileStart(
             crate::playback::ProfileStartParams { frames: 0 },
         );
-        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path(), None);
         match resp {
             IpcResponse::Err { error } => {
                 assert!(
@@ -3912,11 +4082,11 @@ mod tests {
         let start_req = IpcRequest::ProfileStart(
             crate::playback::ProfileStartParams { frames: 42 },
         );
-        let start_resp = handle_inner_request(start_req, &mut state, &mut cache, td.path());
+        let start_resp = handle_inner_request(start_req, &mut state, &mut cache, td.path(), None);
         assert_eq!(start_resp, IpcResponse::Ok { result: OpResult::Empty });
 
         let dump_req = IpcRequest::ProfileDump;
-        let dump_resp = handle_inner_request(dump_req, &mut state, &mut cache, td.path());
+        let dump_resp = handle_inner_request(dump_req, &mut state, &mut cache, td.path(), None);
         match dump_resp {
             IpcResponse::Ok { result: OpResult::ProfileDumpOk { text } } => {
                 // No frames have been completed yet -- enable but no
@@ -3946,7 +4116,7 @@ mod tests {
             brightness: None,
             gamma: None,
         });
-        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(req, &mut state, &mut cache, td.path(), None);
         match resp {
             IpcResponse::Ok { result } => {
                 assert_eq!(result, OpResult::Empty);
@@ -4547,7 +4717,7 @@ mod tests {
         assert!(state.current.is_some());
         // Close.
         let td = tempfile::TempDir::new().unwrap();
-        let resp = handle_inner_request(IpcRequest::Close, &mut state, &mut cache, td.path());
+        let resp = handle_inner_request(IpcRequest::Close, &mut state, &mut cache, td.path(), None);
         assert_eq!(resp, IpcResponse::Ok { result: OpResult::Empty });
         assert!(state.current.is_none());
         // Cache survives close (caller could re-open without
