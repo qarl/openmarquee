@@ -448,6 +448,23 @@ pub struct EglSession<'a> {
     /// (~1 ms per transition * 18 reel transitions). Lazy-init on
     /// first SP transition; freed at with_egl_session teardown.
     transition_sp_quad_vbo: Option<glow::NativeBuffer>,
+    /// 2026-06-15 spike-kill (Karl-live-QA-observed stutter; Jimmy-
+    /// prime dispatch post Option B): session-cached GL_TEXTURE_
+    /// EXTERNAL_OES texture object for the DMABUF NV12 blit path.
+    /// Pre-fix every call to run_nv12_dmabuf_blit_pass did
+    /// gl.create_texture + 4× gl.tex_parameter_i32 + image_target_
+    /// texture_2d + (after blit) gl.delete_texture — V3D BO alloc/
+    /// free PER FRAME even on r101's cache_path=true. QA's tail-
+    /// diag-v2.1 measured sampler_us 200-400 ms on slow ticks; that
+    /// budget is dominated by the per-frame create_texture under
+    /// memory pressure on the 512 MB Pi Zero 2 W. Cache the texture
+    /// once; each frame just calls image_target_texture_2d to re-
+    /// associate it with the new EGLImage (the EXT_image_external
+    /// spec permits re-association without re-creating the texture).
+    /// Sampler state (MIN_FILTER / MAG_FILTER / WRAP_S / WRAP_T) is
+    /// set once at init + sticks per GLES2 spec. Freed at with_egl_
+    /// session teardown while the GL context is still bound.
+    dmabuf_blit_texture: Option<glow::NativeTexture>,
     /// Single 2048x2048 atlas FBO for the scissored-bake path
     /// (2026-05-09 redirect). Replaces the prior fbo_a / fbo_b
     /// pair: with vc4 V3D 2.1 tiled-deferred sequencing, every
@@ -779,6 +796,7 @@ where
         current_settings: crate::content::Settings::default(),
         slide_caches: crate::lru::LruMap::with_capacity(slide_cache_capacity()),
         transition_sp_quad_vbo: None,
+        dmabuf_blit_texture: None,
         scissored_bake_atlas: None,
         msdf_atlases: Vec::new(),
         // Bug 3 Slice 1 part B (2026-05-19): construct the dynamic
@@ -1035,6 +1053,14 @@ where
         }
         if let Some(vbo) = session.transition_sp_quad_vbo.take() {
             gl.delete_buffer(vbo);
+        }
+        // 2026-06-15 spike-kill: drain session-cached GL_TEXTURE_
+        // EXTERNAL_OES texture object. Allocated lazily on the first
+        // DMABUF blit; surviving GL handle freed here while context
+        // is still bound. Matches the existing image_bg_cache /
+        // slide_caches teardown pattern.
+        if let Some(tex) = session.dmabuf_blit_texture.take() {
+            gl.delete_texture(tex);
         }
         if let Some((fbo, tex)) = session.scissored_bake_atlas.take() {
             gl.delete_framebuffer(fbo);
@@ -8897,6 +8923,30 @@ unsafe fn bake_video_slide_to_current_fbo(
             } else {
                 None
             };
+            // 2026-06-15 spike-kill: lazy-init the session-cached
+            // GL_TEXTURE_EXTERNAL_OES on FIRST use. The texture object
+            // survives the entire session lifetime; each subsequent
+            // blit reuses it via image_target_texture_2d (spec-
+            // permitted EGLImage re-association). Cuts the per-frame
+            // V3D BO alloc/free + 4× sampler-state ioctls that QA's
+            // v2.1 sample measured at 200-400 ms sampler_us under
+            // memory pressure.
+            if session.dmabuf_blit_texture.is_none() {
+                match gl.create_texture() {
+                    Ok(t) => {
+                        session.dmabuf_blit_texture = Some(t);
+                        eprintln!("[perf] dmabuf_blit_texture_cached init");
+                    }
+                    Err(e) => {
+                        // Soft-fail: fall through to per-frame
+                        // create+delete path inside the blit fn.
+                        eprintln!(
+                            "warn: spike-kill cached texture init failed: {e} — \
+                             falling back to per-frame create+delete (zero regression)",
+                        );
+                    }
+                }
+            }
             run_nv12_dmabuf_blit_pass(
                 gl,
                 cover_vbo,
@@ -8907,6 +8957,7 @@ unsafe fn bake_video_slide_to_current_fbo(
                 f_h,
                 stride,
                 y_crop_max,
+                session.dmabuf_blit_texture,
                 cache_slot,
             )?
         };
@@ -12963,6 +13014,15 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     height: u32,
     stride: u32,
     y_crop_max: f32,
+    // 2026-06-15 spike-kill (Karl-live-QA stutter, post Option B):
+    // session-cached GL_TEXTURE_EXTERNAL_OES texture object. When
+    // Some(t), this function REUSES `t` (just rebinds + image_target
+    // _texture_2d to associate with the new EGLImage; sampler state
+    // is sticky per GLES2 + was set once at lazy-init time in the
+    // caller). When None, falls back to the historical per-frame
+    // create+destroy path (the V3D BO alloc the v2.1 sample measured
+    // at 200-400 ms sampler_us under memory pressure).
+    cached_texture: Option<glow::NativeTexture>,
     // r101 (2026-06-09): EGLImage cache slot. `Some((decoder, idx))`
     // -> look up Decoder::cached_egl_image(idx); if None, lazy-create
     // + insert. DO NOT destroy at function end (cleanup happens in
@@ -13120,31 +13180,47 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     // until renderer exit. Frame::Drop's re-QBUF only re-queues the
     // V4L2 buffer slot; it doesn't release the EGLImage's dma_buf
     // ref. See qa/r40-non-fys-allocator-fixes-2026-06-02.md.
-    let tex = match gl.create_texture() {
-        Ok(t) => t,
-        Err(e) => {
-            // r101: only destroy if we created locally (no-cache
-            // path). Cache hit/miss with the cache enabled means
-            // the EGLImage is owned by Decoder; let
-            // DecoderInner::Drop handle teardown.
-            if !suppress_destroy_at_end {
-                let destroyed = (eps.destroy_image)(display.as_ptr(), egl_image);
-                if destroyed == 0 {
-                    eprintln!(
-                        "warn: eglDestroyImageKHR returned EGL_FALSE for fd={} during create_texture-fail cleanup",
-                        fd
-                    );
+    //
+    // spike-kill (2026-06-15): when caller passed a session-cached
+    // texture, REUSE IT — skip create + skip 4× tex_parameter_i32
+    // (sampler state is sticky per GLES2 + was set once at lazy-init
+    // time by the caller). Cuts V3D BO alloc + 4 driver state-set
+    // calls per frame on the production hot path.
+    let (tex, tex_was_cached) = match cached_texture {
+        Some(t) => (t, true),
+        None => {
+            let t = match gl.create_texture() {
+                Ok(t) => t,
+                Err(e) => {
+                    // r101: only destroy if we created locally (no-cache
+                    // path). Cache hit/miss with the cache enabled means
+                    // the EGLImage is owned by Decoder; let
+                    // DecoderInner::Drop handle teardown.
+                    if !suppress_destroy_at_end {
+                        let destroyed = (eps.destroy_image)(display.as_ptr(), egl_image);
+                        if destroyed == 0 {
+                            eprintln!(
+                                "warn: eglDestroyImageKHR returned EGL_FALSE for fd={} during create_texture-fail cleanup",
+                                fd
+                            );
+                        }
+                    }
+                    return Err(anyhow!("glGenTextures(external-OES): {e}"));
                 }
-            }
-            return Err(anyhow!("glGenTextures(external-OES): {e}"));
+            };
+            (t, false)
         }
     };
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, Some(tex));
-    gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
-    gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
-    gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-    gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    if !tex_was_cached {
+        // First-use sampler state. Sticks per GLES2 spec so cached-
+        // path frames skip these 4 driver calls entirely.
+        gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    }
     // Associate the EGLImage with the bound external-OES texture.
     // From this point the texture samples the dma_buf bytes
     // directly -- zero CPU copy.
@@ -13193,7 +13269,12 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
     // EGLImage ref-count is dropped here so the kernel can release
     // the dma_buf at the right moment.
     gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, None);
-    gl.delete_texture(tex);
+    // spike-kill: only delete when we created locally. The session-
+    // cached texture survives across frames + is freed in
+    // cleanup_resources at session teardown.
+    if !tex_was_cached {
+        gl.delete_texture(tex);
+    }
     // r101: only destroy at the end when the cache is disabled
     // (no-cache pre-r101 path). When the cache is enabled the
     // EGLImage is owned by Decoder.capture_egl_images and will be

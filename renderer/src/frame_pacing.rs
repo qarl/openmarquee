@@ -469,6 +469,28 @@ mod tests {
     }
 
     #[test]
+    fn dmabuf_blit_texture_cached_field_name_pinned_in_hdmi_source() {
+        // 2026-06-15 spike-kill (Karl-live-QA): the
+        // `dmabuf_blit_texture_cached` literal is QA's grep
+        // fingerprint for the session-cached GL_TEXTURE_EXTERNAL_OES
+        // texture object in run_nv12_dmabuf_blit_pass. Pinning the
+        // string protects the bench parser from a silent rename. The
+        // helper field name `dmabuf_blit_texture` is pinned too so
+        // EglSession's cache slot can't drift via refactor.
+        let hdmi = include_str!("hdmi.rs");
+        assert!(
+            hdmi.contains("dmabuf_blit_texture_cached"),
+            "spike-kill: `dmabuf_blit_texture_cached` substring missing from hdmi.rs — \
+             QA's bench parser can no longer locate the texture-cache init emit",
+        );
+        assert!(
+            hdmi.contains("dmabuf_blit_texture"),
+            "spike-kill: `dmabuf_blit_texture` EglSession field name missing from \
+             hdmi.rs — refactored without updating this pin",
+        );
+    }
+
+    #[test]
     fn eglimage_prewarm_transition_field_name_pinned_in_hdmi_source() {
         // 2026-06-15 Option B (perf-gl tail-fix close-out): the
         // `eglimage_prewarm_transition` line literal is QA's grep
