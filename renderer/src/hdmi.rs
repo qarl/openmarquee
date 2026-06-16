@@ -802,12 +802,34 @@ where
         msdf_atlases: Vec::new(),
         // Bug 3 Slice 1 part B (2026-05-19): construct the dynamic
         // glyph cache + its backing atlas page upfront. GlyphCache
-        // spawns 4 std::thread workers via crossbeam-channel mpsc;
-        // for Slice 1 those workers are stubs that drain + discard
-        // MissRequest. AtlasPage::allocate_texture is called below
-        // (after GL context is current) to set up the GPU-resident
+        // spawns N std::thread workers via crossbeam-channel mpsc.
+        // AtlasPage::allocate_texture is called below (after GL
+        // context is current) to set up the GPU-resident
         // 2048×2048 RGBA8 backing texture.
-        dynamic_glyph_cache: crate::glyph_cache::GlyphCache::new(4),
+        //
+        // G-1 (2026-06-16): worker cap reduced 4 → 2 on Pi Zero 2 W
+        // (4 ARM cores). Per QA's trace pin: 4 workers running msdfgen
+        // FFI in parallel saturated all 4 cores at sidecar startup;
+        // the render thread (running prewarm_glyph_rasterization's
+        // poll_completions loop) was starved in nanosleep; the IPC
+        // sidecar loop never started; /dev/video10 never opened; the
+        // bcm2835-codec hit flush-timeout downstream → sign blank on
+        // any cold-start of a reel with enough text slides to expose
+        // the saturation. Capping at 2 leaves 2 cores for the main
+        // render thread + IPC + presentation, bounding the prewarm
+        // CPU storm to half of the SoC.
+        //
+        // Paired with G-1 Fix 2 (async prewarm, see
+        // run_in_egl_session below): the worker cap reduces the
+        // per-tick CPU contention; the async prewarm removes the
+        // blocking gate. Both ship together.
+        dynamic_glyph_cache: {
+            let workers = 2usize;
+            eprintln!(
+                "[perf] glyph_cache_workers count={workers} reason=msdfgen_storm_cap"
+            );
+            crate::glyph_cache::GlyphCache::new(workers)
+        },
         dynamic_atlas_page_msdf: crate::atlas_page::AtlasPage::new(
             crate::glyph_cache::CELL_PX,
         ),
@@ -13306,15 +13328,39 @@ fn prewarm_glyph_rasterization(session: &mut EglSession) {
     ];
     const PRINTABLE_ASCII_START: u32 = 0x20;
     const PRINTABLE_ASCII_END: u32 = 0x7E;
-    const PREWARM_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
+
+    // G-1 Fix 2 (2026-06-16): ASYNC PREWARM. The pre-G-1 shape
+    // enqueued ~855 MissRequests (9 fonts × 95 codepoints) then
+    // BLOCKED in a poll_completions loop until every glyph was
+    // drained — typical 16 s baseline; 48 s under cold-start memory
+    // pressure (Pi Zero 2 W cma=320 leaves ~96 MB non-CMA so
+    // msdfgen swap-thrashes on full reels). During that drain the
+    // IPC sidecar inner loop hadn't yet started, so /dev/video10
+    // never opened, the bcm2835 codec hit its flush-timeout, and
+    // the sign went blank on every cold-start of a non-trivial reel.
+    //
+    // The fix: enqueue the same 855 MissRequests then RETURN
+    // IMMEDIATELY. The sidecar's inner loop reaches the IPC reader
+    // in milliseconds, the codec opens on the first BeginSlide
+    // with a video bg, and the glyph workers continue baking in
+    // the background. Render-thread paints naturally call
+    // `poll_completions` from `paint_and_present_one_*_for_slide`
+    // sites, so completed glyphs get uploaded to the atlas the
+    // same tick they finish. Glyphs that aren't yet ready render
+    // as fallback (tofu / Bug-3 Slice-2D DejaVu chain) for the
+    // first few paints until the worker pool catches up.
+    //
+    // The blocking drain + 120 s watchdog + completion-count
+    // baseline tracking are GONE — they existed to escape a
+    // stuck drain that no longer occurs (the function no longer
+    // drains).
+    //
+    // Paired with G-1 Fix 1 (worker cap 4→2 at construction
+    // site): together, the worker storm is bounded to 2 cores
+    // and the main thread + presentation get the other 2,
+    // preventing the saturation that triggered the wedge.
 
     let t0 = std::time::Instant::now();
-    // Capture pre-prewarm completion count so we can measure
-    // "completions due to MY enqueues only" -- defensive in case
-    // some other code path bumps completion_count before this
-    // function runs (it doesn't today, but the diff-against-
-    // baseline shape is sound either way).
-    let baseline_completions = session.dynamic_glyph_cache.completion_count();
     let mut requested: u64 = 0;
     let mut skipped_fonts: u32 = 0;
 
@@ -13341,46 +13387,10 @@ fn prewarm_glyph_rasterization(session: &mut EglSession) {
         }
     }
 
+    let enqueue_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let fonts = DEMO_REEL_STEMS.len() - skipped_fonts as usize;
     eprintln!(
-        "glyph-prewarm: enqueued {requested} glyphs across {} fonts ({skipped_fonts} skipped); draining to zero...",
-        DEMO_REEL_STEMS.len() - skipped_fonts as usize,
-    );
-
-    let watchdog_deadline = t0 + PREWARM_WATCHDOG;
-    loop {
-        let drained_this_call = session.dynamic_glyph_cache.poll_completions(
-            session.gl,
-            &mut session.dynamic_atlas_page_msdf,
-            &mut session.dynamic_atlas_page_colr,
-            128,
-        );
-        let completions_since_baseline =
-            session.dynamic_glyph_cache.completion_count() - baseline_completions;
-        if crate::hdmi_logic::glyph_prewarm_drain_complete(
-            requested,
-            completions_since_baseline,
-            drained_this_call,
-        ) {
-            break;
-        }
-        if std::time::Instant::now() > watchdog_deadline {
-            eprintln!(
-                "glyph-prewarm: WATCHDOG tripped after {:.1}s -- enqueued {requested}, drained {completions_since_baseline}. \
-                 Continuing to boot; uncached glyphs populate lazily (slide_caches-drain cost bounded to residual queue).",
-                t0.elapsed().as_secs_f64()
-            );
-            break;
-        }
-        if drained_this_call == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let completions_since_baseline =
-        session.dynamic_glyph_cache.completion_count() - baseline_completions;
-    eprintln!(
-        "glyph-prewarm: drained {completions_since_baseline}/{requested} glyphs in {ms:.1}ms (sidecar boot gate cleared)"
+        "[perf] prewarm_glyph_rasterization async=true requested={requested} fonts={fonts} skipped_fonts={skipped_fonts} enqueue_ms={enqueue_ms:.1} (sidecar IPC unblocked; atlas populates via paint-time poll_completions)"
     );
 }
 

@@ -514,6 +514,52 @@ mod tests {
     }
 
     #[test]
+    fn g1_glyph_cache_workers_marker_pinned_in_hdmi_source() {
+        // 2026-06-16 G-1 Fix 1: the `glyph_cache_workers` literal +
+        // the `msdfgen_storm_cap` reason field are QA's grep
+        // fingerprint that the worker-pool cap shipped (4 → 2 on
+        // Pi Zero 2 W). Pin protects the bench parser from a silent
+        // rename + locks the reduction: re-introducing 4 workers
+        // would need to update this pin (the eprintln format uses
+        // a let-binding for workers, so the count field is
+        // emit-time not source-pinned; pin the marker + reason).
+        let hdmi = include_str!("hdmi.rs");
+        assert!(
+            hdmi.contains("glyph_cache_workers"),
+            "G-1 Fix 1: `glyph_cache_workers` substring missing from hdmi.rs — \
+             QA's bench parser can no longer locate the worker-cap fingerprint",
+        );
+        assert!(
+            hdmi.contains("msdfgen_storm_cap"),
+            "G-1 Fix 1: `msdfgen_storm_cap` reason field missing from hdmi.rs — \
+             refactored the cap reason without updating this pin",
+        );
+    }
+
+    #[test]
+    fn g1_prewarm_glyph_async_marker_pinned_in_hdmi_source() {
+        // 2026-06-16 G-1 Fix 2: the `prewarm_glyph_rasterization` +
+        // `async=true` literals are QA's grep fingerprint that the
+        // BLOCKING drain loop was removed from prewarm. Pin protects
+        // the bench parser + locks the structural fix: re-introducing
+        // a synchronous drain would need to flip the marker, which
+        // would break this pin.
+        let hdmi = include_str!("hdmi.rs");
+        assert!(
+            hdmi.contains("prewarm_glyph_rasterization async=true"),
+            "G-1 Fix 2: `prewarm_glyph_rasterization async=true` substring missing \
+             from hdmi.rs — QA's bench parser can no longer confirm the async \
+             prewarm shipped (synchronous drain would re-introduce the codec-jam wedge)",
+        );
+        // Negative pin: the old blocking-drain text must not return.
+        assert!(
+            !hdmi.contains("draining to zero"),
+            "G-1 Fix 2: `draining to zero` substring REAPPEARED in hdmi.rs — \
+             the blocking drain loop was restored; the async-prewarm fix was undone",
+        );
+    }
+
+    #[test]
     fn r62_first_frame_tex_removed_marker_pinned_in_hdmi_source() {
         // 2026-06-15 R-1 footprint cut: the `r62_first_frame_tex_removed`
         // literal is QA's grep fingerprint that the SlideRenderCache
