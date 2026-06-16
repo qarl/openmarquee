@@ -537,25 +537,40 @@ mod tests {
     }
 
     #[test]
-    fn g1_prewarm_glyph_async_marker_pinned_in_hdmi_source() {
-        // 2026-06-16 G-1 Fix 2: the `prewarm_glyph_rasterization` +
-        // `async=true` literals are QA's grep fingerprint that the
-        // BLOCKING drain loop was removed from prewarm. Pin protects
-        // the bench parser + locks the structural fix: re-introducing
-        // a synchronous drain would need to flip the marker, which
-        // would break this pin.
+    fn g2_glyph_prewarm_skipped_marker_pinned_in_hdmi_source() {
+        // 2026-06-16 G-2: the `glyph_prewarm_skipped` literal +
+        // `on_demand_bake` reason field are QA's grep fingerprint
+        // that startup MissRequest enqueue is SKIPPED entirely
+        // (pure on-demand bake at paint time). Pin protects the
+        // bench parser + locks the structural fix: re-introducing
+        // any startup enqueue loop would need to either flip this
+        // marker (breaking the positive pin) or restore the deleted
+        // prewarm function (breaking the negative pin).
         let hdmi = include_str!("hdmi.rs");
         assert!(
-            hdmi.contains("prewarm_glyph_rasterization async=true"),
-            "G-1 Fix 2: `prewarm_glyph_rasterization async=true` substring missing \
-             from hdmi.rs — QA's bench parser can no longer confirm the async \
-             prewarm shipped (synchronous drain would re-introduce the codec-jam wedge)",
+            hdmi.contains("glyph_prewarm_skipped"),
+            "G-2: `glyph_prewarm_skipped` substring missing from hdmi.rs — \
+             QA's bench parser can no longer confirm the on-demand bake fix shipped",
         );
-        // Negative pin: the old blocking-drain text must not return.
+        assert!(
+            hdmi.contains("on_demand_bake"),
+            "G-2: `on_demand_bake` reason field missing from hdmi.rs — \
+             refactored the skip reason without updating this pin",
+        );
+        // Negative pin 1: the old blocking-drain text must not return.
         assert!(
             !hdmi.contains("draining to zero"),
-            "G-1 Fix 2: `draining to zero` substring REAPPEARED in hdmi.rs — \
-             the blocking drain loop was restored; the async-prewarm fix was undone",
+            "G-1 → G-2 regression-lock: `draining to zero` substring REAPPEARED \
+             in hdmi.rs — the blocking drain loop was restored, undoing both G-1 + G-2",
+        );
+        // Negative pin 2: the prewarm function signature must not return.
+        // (Comments referencing it for history are fine; the function
+        // declaration is what would re-introduce the enqueue.)
+        assert!(
+            !hdmi.contains("fn prewarm_glyph_rasterization"),
+            "G-2: `fn prewarm_glyph_rasterization` REAPPEARED in hdmi.rs — \
+             the deleted prewarm function was restored, undoing G-2 (855 startup \
+             MissRequests would thrash the 96 MB non-CMA ceiling again)",
         );
     }
 

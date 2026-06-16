@@ -5732,18 +5732,43 @@ pub fn run_in_egl_session<F, R>(card: &Card, rotation: i32, work: F) -> Result<R
 where
     F: FnOnce(&mut EglSession) -> Result<R>,
 {
-    // r25 (2026-05-31): glyph rasterization prewarm lives at the
-    // long-lived-sidecar entrypoint, NOT inside with_egl_session
-    // itself. The 16s drain-to-zero cost is only worth paying when
-    // the session outlives the prewarm by many minutes-to-hours
-    // (the IPC sidecar). All other with_egl_session callers
-    // (--play-slide, --capture-*, --solid-color, --fade-*, the
-    // standalone reel driver, the QA visual-verdict snapshot
-    // paths) construct + tear down a session for one or a few
-    // paints; the 16s prewarm tax would dominate their wall-clock
-    // and force-cache glyphs they never render.
+    // r25 (2026-05-31) glyph prewarm historical context:
+    //
+    // Originally a synchronous drain ("glyph-prewarm: drained N/M
+    // glyphs in Xms (sidecar boot gate cleared)") that blocked
+    // sidecar startup ~16-48 s while 4 worker threads ran msdfgen
+    // FFI on 855 glyphs (9 fonts × 95 ASCII codepoints). G-1
+    // (2026-06-16 a.m.) made it async so the IPC loop could
+    // accept commands while bake continued in 2 workers.
+    //
+    // G-2 (2026-06-16 evening): even the ASYNC prewarm enqueue is
+    // skipped on Pi Zero 2 W. With cma=320 leaving ~96 MB non-CMA
+    // RAM, the working set of 855 in-flight msdfgen bakes
+    // (intermediate shape/distance buffers + atlas uploads in the
+    // completion channel) thrashes the memory ceiling. Per QA's
+    // gate-harness on f4d58c1: G-1 dropped CPU storm 300% → 170%,
+    // unblocked sidecar IPC in 16 ms — but /dev/video10 STILL
+    // never opened on the 21-slide cold-start reel because the
+    // memory pressure starved the V4L2 prime path.
+    //
+    // Fix: skip the prewarm enqueue entirely. Glyphs bake
+    // ON-DEMAND when paint_slide_with's layout_text_to_quads
+    // first encounters a codepoint missing from the static MSDF
+    // atlas. The 2-worker cap (G-1 Fix 1) bounds the on-demand
+    // bake CPU; the on-demand pattern bounds the memory working
+    // set to the codepoints the ACTIVE reel actually references
+    // (Karl's reel: ~1 font × ~40-60 unique glyphs = ~50 cells,
+    // vs the 855 cells of the 9-font printable-ASCII prewarm).
+    //
+    // Trade: first paint of each text slide may show fallback
+    // (tofu / Bug-3 Slice-2D DejaVu chain) for ~1-3 frames while
+    // workers catch up. Same lazy-fill mechanism the prewarm
+    // existed to mask, just routed differently — and with no
+    // wedge risk under memory pressure.
     with_egl_session(card, rotation, |session| {
-        prewarm_glyph_rasterization(session);
+        eprintln!(
+            "[perf] glyph_prewarm_skipped reason=on_demand_bake (G-2: 0 startup MissRequests; cold-start memory pressure removed; paint-time layout_text_to_quads triggers per-codepoint bake via get_or_request)"
+        );
         work(session)
     })
 }
@@ -13306,93 +13331,12 @@ fn prewarm_shader_programs(session: &EglSession) {
 /// slot 2048×2048 page vs 855-glyph budget). The watchdog floor
 /// is the failsafe; bumping completion_count in those branches
 /// is a glyph_cache.rs follow-up, out of r25 scope.
-#[cfg(target_os = "linux")]
-fn prewarm_glyph_rasterization(session: &mut EglSession) {
-    use crate::glyph_cache::{font_family_id_from_stem, GlyphKey, RenderMode};
-
-    // Demo-reel font set per backend/openmarquee/seed.py _DEMO_REEL
-    // + FALLBACK_FONT_STEMS. Stems match
-    // hdmi_logic::font_family_to_filename's basename-minus-extension.
-    // Keep in sync with seed.py _DEMO_REEL's font_family= set +
-    // FALLBACK_FONT_STEMS if either changes.
-    const DEMO_REEL_STEMS: &[&str] = &[
-        "anton",
-        "alfa-slab-one",
-        "bowlby-one-sc",
-        "playfair-display",
-        "vt323",
-        "permanent-marker",
-        "caveat-brush",
-        "jetbrains-mono",
-        "dejavu-sans",
-    ];
-    const PRINTABLE_ASCII_START: u32 = 0x20;
-    const PRINTABLE_ASCII_END: u32 = 0x7E;
-
-    // G-1 Fix 2 (2026-06-16): ASYNC PREWARM. The pre-G-1 shape
-    // enqueued ~855 MissRequests (9 fonts × 95 codepoints) then
-    // BLOCKED in a poll_completions loop until every glyph was
-    // drained — typical 16 s baseline; 48 s under cold-start memory
-    // pressure (Pi Zero 2 W cma=320 leaves ~96 MB non-CMA so
-    // msdfgen swap-thrashes on full reels). During that drain the
-    // IPC sidecar inner loop hadn't yet started, so /dev/video10
-    // never opened, the bcm2835 codec hit its flush-timeout, and
-    // the sign went blank on every cold-start of a non-trivial reel.
-    //
-    // The fix: enqueue the same 855 MissRequests then RETURN
-    // IMMEDIATELY. The sidecar's inner loop reaches the IPC reader
-    // in milliseconds, the codec opens on the first BeginSlide
-    // with a video bg, and the glyph workers continue baking in
-    // the background. Render-thread paints naturally call
-    // `poll_completions` from `paint_and_present_one_*_for_slide`
-    // sites, so completed glyphs get uploaded to the atlas the
-    // same tick they finish. Glyphs that aren't yet ready render
-    // as fallback (tofu / Bug-3 Slice-2D DejaVu chain) for the
-    // first few paints until the worker pool catches up.
-    //
-    // The blocking drain + 120 s watchdog + completion-count
-    // baseline tracking are GONE — they existed to escape a
-    // stuck drain that no longer occurs (the function no longer
-    // drains).
-    //
-    // Paired with G-1 Fix 1 (worker cap 4→2 at construction
-    // site): together, the worker storm is bounded to 2 cores
-    // and the main thread + presentation get the other 2,
-    // preventing the saturation that triggered the wedge.
-
-    let t0 = std::time::Instant::now();
-    let mut requested: u64 = 0;
-    let mut skipped_fonts: u32 = 0;
-
-    for stem in DEMO_REEL_STEMS {
-        let fid = font_family_id_from_stem(stem);
-        let font_path = session.dynamic_fonts_dir.join(format!("{stem}.ttf"));
-        if !font_path.exists() {
-            eprintln!(
-                "glyph-prewarm: skip {stem} -- font file not found at {font_path:?}"
-            );
-            skipped_fonts += 1;
-            continue;
-        }
-        for cp in PRINTABLE_ASCII_START..=PRINTABLE_ASCII_END {
-            let key = GlyphKey {
-                font_family_id: fid,
-                codepoint: cp,
-                render_mode: RenderMode::Msdf,
-            };
-            let _ = session
-                .dynamic_glyph_cache
-                .get_or_request(key, || font_path.clone());
-            requested += 1;
-        }
-    }
-
-    let enqueue_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let fonts = DEMO_REEL_STEMS.len() - skipped_fonts as usize;
-    eprintln!(
-        "[perf] prewarm_glyph_rasterization async=true requested={requested} fonts={fonts} skipped_fonts={skipped_fonts} enqueue_ms={enqueue_ms:.1} (sidecar IPC unblocked; atlas populates via paint-time poll_completions)"
-    );
-}
+// `prewarm_glyph_rasterization` removed in G-2 (2026-06-16):
+// shifted to pure on-demand bake via paint-time `get_or_request`
+// in layout_text_to_quads. See the docstring above
+// `run_in_egl_session` for the rationale + the memory-cliff
+// trade-off that made G-1's async-prewarm shape inadequate on
+// the Pi Zero 2 W 96 MB non-CMA RAM ceiling.
 
 /// Populate `slide_caches[slide_id].bg_tex` for non-solid bgs
 /// at atlas region size (2048x1024). Idempotent: returns early
