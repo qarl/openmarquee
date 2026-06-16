@@ -285,6 +285,54 @@ pub fn log_preload_decoder_config(slide_id: uuid::Uuid, dem: &Mp4Demuxer, label:
 ///
 /// The OUTPUT pool is also sized to k_floor, matching the
 /// CAPTURE math at the saturation boundary.
+/// codec-jam fix (2026-06-16): bcm2835-codec firmware has an
+/// undocumented concurrency limit on simultaneous H.264 prime
+/// sequences. Empirically (QA repro 2026-06-16 on FYS, full
+/// 21-video reel cold-start): N concurrent prime workers race
+/// → firmware wedges → 0 frames → sign dark; wedge survives
+/// process restart (only Pi reboot clears).
+///
+/// Mechanism: r97 deferred-preload logic (ipc_main.rs:177)
+/// trims same-slide-class contention but only when
+/// `active_decoder_count >= 1` — at COLD-START of a fresh
+/// playlist, active_decoder_count = 0 + items LRU is cold
+/// (peek returns None → bg_is_video=false → defer=false), so
+/// all PreloadSlide spawns fire freely. With
+/// MAX_CONCURRENT_PRELOADS=2 caps spawned workers, the
+/// over-cap preloads fall back to synchronous cache.load on
+/// render thread → 2 workers + 1 sync thread race the firmware.
+///
+/// Fix: strict serialization (cap=1) of the prime sequence via
+/// this static mutex. Held for the duration of
+/// prime_video_decoder_with_warmup: Decoder::open + S_FMT +
+/// REQBUFS + STREAMON + feed primer + warmup loop. Drops on
+/// function return (Rust Drop guarantees release on Ok / Err /
+/// panic-unwind paths).
+///
+/// Wall-clock cost at cold-start: (N-1) × ~70-270 ms per
+/// queued prime. For typical N=2-3 cold-start workers, ~140-810
+/// ms cumulative serialization vs ~4+ s codec wedge per QA repro.
+///
+/// Why not cap=2 (matching the steady-state dual-1080p ceiling):
+/// QA repro suggests "many" decoders priming jams, and the prime
+/// sequence touches firmware more aggressively than steady-state
+/// decode (REQBUFS allocates kernel buffers, STREAMON arms the
+/// codec). Conservative cap=1 strictly avoids the wedge surface;
+/// can be relaxed to 2 later if bench shows serialization
+/// dominates.
+///
+/// Composes with:
+/// - r97 defer (trims preload workers BEFORE spawn; semaphore
+///   only catches the cold-start gap r97 misses).
+/// - Phase B split-path k_floor (preserves r77 margin; semaphore
+///   touches none of the saturation math).
+/// - eviction-timing fix (Advance handler; eviction state-machine
+///   side; no overlap with prime semaphore on the codec side).
+/// - F-1 typical-case win: F-1 is the BeginSlide RETURN time
+///   (54ms p50). Semaphore lives inside prime, called by the
+///   worker AFTER F-1 returns. F-1 p50 unchanged.
+static PRIMING_SEMAPHORE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn prime_video_decoder_with_warmup(
     dem: &Mp4Demuxer,
     warmup_count_requested: usize,
@@ -292,6 +340,28 @@ pub fn prime_video_decoder_with_warmup(
 ) -> Result<VideoDecoderState> {
     use std::path::Path;
     use std::time::Instant;
+    // codec-jam fix (2026-06-16): serialize the prime sequence
+    // through PRIMING_SEMAPHORE. Acquired here AT FUNCTION ENTRY;
+    // held for the entire prime body (Decoder::open through
+    // warmup loop); released on function return via Drop. Emits
+    // wait_us so QA can see how much serialization the codec-jam
+    // protection added per prime call.
+    //
+    // .lock() is poisoned-safe (a panicking holder would poison
+    // the mutex). Use unwrap_or_else(|e| e.into_inner()) so a
+    // prior panic doesn't make ALL subsequent primes fail —
+    // poisoning indicates corrupted state on the codec side,
+    // but the new prime opens a fresh decoder + fresh kernel
+    // resources; the firmware-side state is per-fd, not poisoned.
+    let t_lock_wait = Instant::now();
+    let _prime_lock_guard = PRIMING_SEMAPHORE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock_wait_us = t_lock_wait.elapsed().as_micros();
+    eprintln!(
+        "[perf] codec_prime_serialize_wait wait_us={} k_floor={} warmup={}",
+        lock_wait_us, k_floor, warmup_count_requested,
+    );
     // r90 (2026-06-08) probe: per QA r90 dispatch's instrumentation-
     // only ask. Fires UNCONDITIONALLY (not gated by EOS_FLUSH),
     // so QA can compare OFF vs ON trace patterns directly. The

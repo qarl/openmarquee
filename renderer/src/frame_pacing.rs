@@ -269,6 +269,25 @@ mod tests {
     }
 
     #[test]
+    fn codec_prime_serialize_wait_fingerprint_pinned_in_video_decode_source() {
+        // codec-jam fix (2026-06-16): QA's bench parser greps
+        // `codec_prime_serialize_wait` literally to identify the
+        // PRIMING_SEMAPHORE wait time per prime call. wait_us=0
+        // in the uncontended common case; >0 when a prior prime
+        // is in flight (cold-start of multi-video playlist).
+        // Distinguishes "serialized wait" from "actual prime
+        // work" in QA's bench attribution. A rename would
+        // silently break the contention-vs-work split.
+        let v = include_str!("video_decode.rs");
+        assert!(
+            v.contains("codec_prime_serialize_wait"),
+            "codec-jam fix: `codec_prime_serialize_wait` substring missing \
+             from video_decode.rs — QA's bench parser will no longer be \
+             able to attribute prime-time to serialization vs codec-work",
+        );
+    }
+
+    #[test]
     fn evict_at_transition_end_field_name_pinned_in_ipc_main_source() {
         // perf-decode eviction-timing fix (2026-06-15): QA's bench
         // parser greps `evict_at_transition_end` literally to
