@@ -512,4 +512,30 @@ mod tests {
              hdmi.rs — refactored without updating this pin",
         );
     }
+
+    #[test]
+    fn r62_first_frame_tex_removed_marker_pinned_in_hdmi_source() {
+        // 2026-06-15 R-1 footprint cut: the `r62_first_frame_tex_removed`
+        // literal is QA's grep fingerprint that the SlideRenderCache
+        // r62 cache removal shipped on FYS. Drops ~mode_w*mode_h*4
+        // bytes per slide × N reel slides of CMA. Pin protects the
+        // bench parser from a silent rename + locks the removal
+        // invariant: re-introducing the field MUST update this pin
+        // (or remove it if the removal is reverted entirely).
+        let hdmi = include_str!("hdmi.rs");
+        assert!(
+            hdmi.contains("r62_first_frame_tex_removed"),
+            "R-1: `r62_first_frame_tex_removed` substring missing from hdmi.rs — \
+             QA's bench parser can no longer confirm the footprint cut shipped",
+        );
+        // Negative pin: the field name `first_frame_tex` must not
+        // reappear as an `Option<glow::NativeTexture>` struct member
+        // (comments referencing it for history are fine). If a future
+        // edit re-adds the field, this test fires loudly.
+        assert!(
+            !hdmi.contains("pub first_frame_tex:"),
+            "R-1: `pub first_frame_tex:` struct field REAPPEARED in hdmi.rs — \
+             the footprint cut was undone; either restore the cut or remove this pin",
+        );
+    }
 }
