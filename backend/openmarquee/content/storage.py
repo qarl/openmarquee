@@ -25,6 +25,8 @@ edit bumps it.
 """
 
 import json
+import logging
+import os
 import shutil
 import threading
 from datetime import UTC, datetime
@@ -45,6 +47,8 @@ from openmarquee.content import (
     VideoSlide,
     WebSlide,
 )
+
+log = logging.getLogger(__name__)
 
 # Bump when the on-disk envelope format changes in a non-backward-compatible
 # way. load() will refuse to read older versions until a migration is written.
@@ -271,6 +275,33 @@ class ContentStorage:
         # loaded items returns no mutation sites; document this here
         # so a future contributor adding one gets caught in review.)
         self._cache: dict[UUID, tuple[int, ContentItem]] = {}
+        # codec-jam followup (2026-06-16): memoize list_all() output
+        # keyed on the content root's directory mtime. Cache hit ⇒
+        # `dict.copy()` returns the previously-loaded items without
+        # re-walking the filesystem.
+        #
+        # Invalidation surfaces:
+        # 1. Root dir mtime change — covers add/delete (most FS bump
+        #    dir mtime when entries change).
+        # 2. Explicit invalidation on save/delete (this class's mutators)
+        #    sets self._list_all_cache = None directly. Defense in depth
+        #    for filesystems that don't bump dir mtime AND for the
+        #    short window during a save where dir mtime + envelope
+        #    mtime drift briefly.
+        #
+        # The trade-off: file-content edits via an external tool (an
+        # operator manually editing item.json on disk WITHOUT going
+        # through save()) won't bump the root dir's mtime and won't
+        # invalidate. That's accepted; the per-item self._cache
+        # entry is mtime-keyed at envelope level and catches the
+        # individual item; the list_all view stays stale until the
+        # next API-driven mutation. Operationally we never document
+        # manual envelope edits as a supported path.
+        #
+        # QA's py-spy (2026-06-16) showed list_all called PER playback
+        # _loop iteration via scheduled_fetch_items; cache hit-rate
+        # ~100% post-fix is the structural target.
+        self._list_all_cache: tuple[int, list[ContentItem]] | None = None
         # Round-29 concurrency: serialize mutator methods (save /
         # save_video / delete). FastAPI sync handlers run on the
         # threadpool; two concurrent PUT /api/content/text-slides/
@@ -349,6 +380,12 @@ class ContentStorage:
             # holding pre-save state that diverges from disk on retry.
             # Next load() repopulates with the canonical re-decoded shape.
             self._cache.pop(item.id, None)
+            # codec-jam followup (2026-06-16): invalidate list_all
+            # memoization on any save. Mutator path is the only place
+            # outside list_all itself that creates / overwrites
+            # envelopes — any save changes the result of the next
+            # list_all walk.
+            self._list_all_cache = None
             self._atomic_write_text(item_dir / _ENVELOPE_FILENAME, json.dumps(envelope, indent=2))
             self._atomic_write_bytes(item_dir / _ASSET_FILENAME, png)
 
@@ -481,20 +518,39 @@ class ContentStorage:
         to FileNotFoundError after the bad file is quarantined aside, so
         list_all's existing missing-envelope skip path handles both
         shapes uniformly).
+
+        codec-jam followup (2026-06-16): builds the envelope path via
+        `os.path.join` on plain strs (single str-build) instead of two
+        `Path /` constructions, and combines existence + mtime stat
+        into a single `os.stat` (catching FileNotFoundError) rather
+        than `Path.exists()` then `Path.stat()` (two syscalls). QA's
+        py-spy backend trace pinned `pathlib._parse_path` /
+        `__fspath__` / `stat` as the dominant cold-start hot frames in
+        the per-_loop-iteration fetch_items → list_all → load chain.
         """
         type(self)._stats["load_calls"] += 1
-        envelope_path = self.root / str(item_id) / _ENVELOPE_FILENAME
-        if not envelope_path.exists():
-            raise FileNotFoundError(f"no content item at {envelope_path}")
+        envelope_str = os.path.join(str(self.root), str(item_id), _ENVELOPE_FILENAME)
 
         # Batch 7.1: mtime-keyed cache. A `stat()` is ~microseconds
         # vs json.loads + discriminated-union validate at ~milliseconds
         # on a populated device. List-then-show-on-UI flows hit this
         # path 60-200x per playback session per the baseline data.
-        mtime_ns = envelope_path.stat().st_mtime_ns
+        #
+        # codec-jam followup: existence check + mtime read in ONE
+        # syscall via os.stat + FileNotFoundError. Pre-fix:
+        # Path.exists() + Path.stat() = two stat syscalls per call.
+        try:
+            stat_result = os.stat(envelope_str)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"no content item at {envelope_str}") from exc
+        mtime_ns = stat_result.st_mtime_ns
         cached = self._cache.get(item_id)
         if cached is not None and cached[0] == mtime_ns:
             return cached[1]
+        # The quarantine-corrupt-file helper (Round-30 recovery
+        # branch below) expects a Path; build it ONLY on the
+        # cache-miss path so the happy path stays pathlib-free.
+        envelope_path = Path(envelope_str)
 
         # Round-30 corruption recovery: ContentStorage was the lone
         # storage class missing this guard. PlaylistStorage,
@@ -517,7 +573,8 @@ class ContentStorage:
         # (e.g. just `{"schema_version": 3}` if the write was cut
         # mid-stream after the version was written).
         try:
-            data = json.loads(envelope_path.read_text())
+            with open(envelope_str, encoding="utf-8") as fp:
+                data = json.loads(fp.read())
             version = data.get("schema_version")
             if version != SCHEMA_VERSION:
                 raise ValueError(
@@ -539,6 +596,11 @@ class ContentStorage:
             # Drop the cache entry too -- a hand-restore of the bad
             # envelope from the quarantine sibling shouldn't load stale.
             self._cache.pop(item_id, None)
+            # codec-jam followup (2026-06-16): also invalidate the
+            # list_all memo. quarantine_corrupt_file renames the
+            # envelope to a sibling, which changes the on-disk set
+            # of envelopes the next list_all walk would see.
+            self._list_all_cache = None
             raise FileNotFoundError(
                 f"item {item_id} envelope corrupted; quarantined sibling at "
                 f"{envelope_path.name}.corrupt-<UTC>: {exc!r}"
@@ -605,6 +667,10 @@ class ContentStorage:
         except (json.JSONDecodeError, ValidationError, KeyError, TypeError) as exc:
             quarantine_corrupt_file(envelope_path, exc)
             self._cache.pop(item_id, None)
+            # codec-jam followup (2026-06-16): invalidate list_all
+            # memo on quarantine — same reasoning as the load()
+            # corruption branch.
+            self._list_all_cache = None
             raise FileNotFoundError(
                 f"item {item_id} envelope corrupted; quarantined: {exc!r}"
             ) from exc
@@ -620,19 +686,104 @@ class ContentStorage:
 
         Resilient to the root being deleted at runtime (e.g. SD card swap,
         manual cleanup) — returns an empty list rather than raising.
+
+        codec-jam followup (2026-06-16): two changes.
+
+        (a) walks with `os.scandir` instead of `pathlib.Path.iterdir`,
+        and checks envelope existence with `os.path.isfile` instead of
+        `Path.exists`. QA's py-spy backend trace of the FYS 21-slide
+        cold-start (~42 s "backend busy" before the renderer received
+        any IPC) pinned the hot frames in `pathlib._local._parse_path`
+        / `is_dir` / `exists` — each `Path` op constructs + re-parses
+        path strings, so a single list_all over 21 dirs ran into the
+        thousands of intermediate Path objects. `os.scandir` returns
+        `DirEntry`s whose `is_dir` consults stat data cached at
+        scandir time (one syscall per child instead of three), and
+        `os.path.isfile` on a plain str skips the Path constructor
+        entirely.
+
+        (b) memoizes the result keyed on the content root directory's
+        mtime. The playback _loop calls fetch_items per outer-while
+        iteration → scheduled_fetch_items → list_for_playback →
+        _playlist_ordered_prefix → list_all; in the FYS cold-start
+        reproducer this fired list_all repeatedly with no underlying
+        change. Cache hit rebuilds nothing; cache miss falls back to
+        the os.scandir walk above. Invalidation surfaces:
+        - root dir mtime (covers add/delete on most FS)
+        - save() / delete() explicit invalidation (defense in depth)
+        - load()'s Round-30 quarantine path explicit invalidation
+
+        Same observable behavior (sorted by id string, missing/
+        quarantined items skipped); only the dirwalk implementation
+        and the memoization wrapper change.
+
+        Emits `[backend] content_storage_list_all cache=hit|miss
+        elapsed_us=N entries=N` per call for QA bench attribution.
         """
         type(self)._stats["list_all_calls"] += 1
-        if not self.root.exists():
+        import time
+
+        t_call_start = time.perf_counter_ns()
+        # Read the root mtime so we can decide cache-hit vs miss.
+        # FileNotFoundError mirrors the pre-existing `if not
+        # root.exists()` short-circuit so callers see an empty list,
+        # not an exception.
+        try:
+            root_mtime_ns = os.stat(self.root).st_mtime_ns
+        except FileNotFoundError:
+            elapsed_us = (time.perf_counter_ns() - t_call_start) // 1000
+            log.info(
+                "[backend] content_storage_list_all cache=miss elapsed_us=%d entries=0",
+                elapsed_us,
+            )
             return []
+        cached = self._list_all_cache
+        if cached is not None and cached[0] == root_mtime_ns:
+            elapsed_us = (time.perf_counter_ns() - t_call_start) // 1000
+            log.info(
+                "[backend] content_storage_list_all cache=hit elapsed_us=%d entries=%d",
+                elapsed_us,
+                len(cached[1]),
+            )
+            # Defensive copy: callers iterate the result; sharing the
+            # same list object would let a future mutation hook
+            # accidentally mutate the cache.
+            return list(cached[1])
+        # Cache miss. Walk the dir.
+        try:
+            scandir_iter = os.scandir(self.root)
+        except FileNotFoundError:
+            elapsed_us = (time.perf_counter_ns() - t_call_start) // 1000
+            log.info(
+                "[backend] content_storage_list_all cache=miss elapsed_us=%d entries=0",
+                elapsed_us,
+            )
+            return []
+        # DirEntry.name is the bare component string (no string-parse
+        # of a full path); sort by it directly. Materialise to a
+        # list so we close the scandir handle promptly (the per-
+        # iteration `load()` calls can take ms each and we don't
+        # want a long-lived DirEntry handle).
+        with scandir_iter as it:
+            entries = sorted(it, key=lambda entry: entry.name)
         items: list[ContentItem] = []
-        for child in sorted(self.root.iterdir()):
-            if not child.is_dir():
+        for entry in entries:
+            # `is_dir(follow_symlinks=False)` uses scandir's cached
+            # stat data on Linux; no extra syscall. On the platforms
+            # where scandir can't cache (e.g. some network FSes) it
+            # falls back to a stat, identical to the prior code.
+            if not entry.is_dir(follow_symlinks=False):
                 continue
             try:
-                item_id = UUID(child.name)
+                item_id = UUID(entry.name)
             except ValueError:
                 continue  # skip non-UUID dirs (could be editor scratch, etc.)
-            if not (child / _ENVELOPE_FILENAME).exists():
+            # `os.path.isfile` on a str path is a single stat syscall
+            # without any Path-object construction. Constructing the
+            # str via `os.path.join` is a cheap str.join under the
+            # hood.
+            envelope_str = os.path.join(entry.path, _ENVELOPE_FILENAME)
+            if not os.path.isfile(envelope_str):
                 continue
             # Round-30: load() converts corruption to FileNotFoundError
             # after quarantining the bad envelope. Skip silently --
@@ -650,7 +801,16 @@ class ContentStorage:
                 # now-missing item; the next prune_dangling_refs sweep
                 # cleans the ref.
                 continue
-        return items
+        self._list_all_cache = (root_mtime_ns, items)
+        elapsed_us = (time.perf_counter_ns() - t_call_start) // 1000
+        log.info(
+            "[backend] content_storage_list_all cache=miss elapsed_us=%d entries=%d",
+            elapsed_us,
+            len(items),
+        )
+        # Defensive copy per the cache-hit path: callers shouldn't be
+        # able to mutate the cached list via the returned reference.
+        return list(items)
 
     def delete(self, item_id: UUID) -> None:
         """Delete a content item and everything in its directory.
@@ -669,6 +829,10 @@ class ContentStorage:
                 raise FileNotFoundError(f"no content item at {item_dir}")
             shutil.rmtree(item_dir)
             self._cache.pop(item_id, None)
+            # codec-jam followup (2026-06-16): invalidate list_all
+            # memoization. delete is one of two paths (with save)
+            # that mutates the on-disk set of envelopes.
+            self._list_all_cache = None
 
     # --- internals ---
 

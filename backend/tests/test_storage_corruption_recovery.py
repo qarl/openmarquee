@@ -135,3 +135,95 @@ def test_storage_load_unchanged_when_file_valid(tmp_path: Path):
     reloaded = storage.load()
     assert isinstance(reloaded, Flock)
     assert _list_corrupt_quarantine(tmp_path, "flock.json") == []
+
+
+# codec-jam followup (2026-06-16): list_all memoization + os.scandir
+# tests.
+
+
+def test_content_storage_list_all_marker_pinned_in_source():
+    """codec-jam followup (2026-06-16): QA's bench parser greps the
+    `[backend] content_storage_list_all` literal to verify cache hit
+    vs miss rates at FYS cold-start. A rename here would silently
+    break the bench's cache-hit-rate attribution."""
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "openmarquee" / "content" / "storage.py"
+    text = src.read_text()
+    assert "[backend] content_storage_list_all" in text, (
+        "codec-jam followup: `[backend] content_storage_list_all` substring "
+        "missing from content/storage.py — QA's bench parser will no longer "
+        "be able to attribute cache hit-rate at cold-start"
+    )
+
+
+def test_content_storage_list_all_uses_os_scandir():
+    """codec-jam followup (2026-06-16): pin the os.scandir + os.path
+    substitution for pathlib in the list_all hot path. py-spy trace
+    of the FYS cold-start identified pathlib._parse_path as the
+    dominant CPU; this test guards against a future refactor that
+    accidentally regresses to Path.iterdir.
+    """
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "openmarquee" / "content" / "storage.py"
+    text = src.read_text()
+    assert "os.scandir(self.root)" in text, (
+        "codec-jam followup: list_all should use os.scandir(self.root) "
+        "in the cache-miss path — pathlib.Path.iterdir reintroduces "
+        "the per-child Path-parse overhead that py-spy pinned as the "
+        "42 s cold-start hot frame"
+    )
+
+
+def test_list_all_caches_result_and_invalidates_on_save(
+    tmp_path,
+):
+    """codec-jam followup (2026-06-16): cache invalidation behavior
+    on the happy path. Same instance: list_all twice with no
+    intervening mutation should return identical lists; after a
+    save(), the cache should be invalidated."""
+    from openmarquee.content import TextSlide
+    from openmarquee.content.storage import ContentStorage
+
+    storage = ContentStorage(tmp_path / "content")
+
+    # Cold cache.
+    first = storage.list_all()
+    assert first == []
+    # Cache hit (root mtime unchanged).
+    second = storage.list_all()
+    assert second == []
+    assert storage._list_all_cache is not None
+
+    # Save a slide → invalidates.
+    slide = TextSlide(name="x")
+    storage.save(slide, png=b"\x89PNG\r\n\x1a\n")
+    # Cache should be cleared by save().
+    assert storage._list_all_cache is None
+    # list_all repopulates with new content.
+    third = storage.list_all()
+    assert len(third) == 1
+    assert third[0].id == slide.id
+
+
+def test_list_all_returns_defensive_copy(tmp_path):
+    """codec-jam followup (2026-06-16): callers should not be able to
+    mutate the cached list. Return a fresh list each time, even from
+    a cache hit."""
+    from openmarquee.content import TextSlide
+    from openmarquee.content.storage import ContentStorage
+
+    storage = ContentStorage(tmp_path / "content")
+    slide = TextSlide(name="x")
+    storage.save(slide, png=b"\x89PNG\r\n\x1a\n")
+
+    first = storage.list_all()
+    second = storage.list_all()
+    assert first == second
+    # But not the same object.
+    assert first is not second
+    # Mutate first; second should NOT change.
+    first.clear()
+    third = storage.list_all()
+    assert len(third) == 1
