@@ -634,6 +634,82 @@ mod tests {
     }
 
     #[test]
+    fn r106_live_motion_reuse_cached_paths_removed_pinned_in_hdmi_source() {
+        // 2026-06-16 R-106-LIVE-MOTION: side A + side B
+        // reuse-cached-on-Ok(None) branches REMOVED from
+        // paint_and_present_one_transition_frame. QA pinpoint
+        // (transition_tex_probe rgb/luma frozen on Balloon rise
+        // across every transition kind) traced the freeze to
+        // these branches surfacing the prior baked frame as a
+        // still during transitions, VIOLATING qarl's NON-
+        // NEGOTIABLE "motion through transitions" requirement.
+        // Post-fix: Ok(None) always skip-ticks (after the sleep+
+        // retry budget exhausts) instead of reusing cached.
+        let hdmi = include_str!("hdmi.rs");
+        // NEGATIVE pin 1: the reuse-cached_a emit string must not
+        // appear.
+        assert!(
+            !hdmi.contains("paint_transition_reuse_cached_a"),
+            "R-106-LIVE-MOTION: `paint_transition_reuse_cached_a` REAPPEARED \
+             in hdmi.rs — the side-A reuse-cached path was restored; side A \
+             would re-freeze on Ok(None) instead of skip-ticking live",
+        );
+        // NEGATIVE pin 2: the reuse-cached_b emit string must not
+        // appear.
+        assert!(
+            !hdmi.contains("paint_transition_reuse_cached_b"),
+            "R-106-LIVE-MOTION: `paint_transition_reuse_cached_b` REAPPEARED \
+             in hdmi.rs — the side-B reuse-cached path was restored; the \
+             Balloon-freeze bug returns (side B locks to first-good-frame)",
+        );
+        // POSITIVE pin: the new skip-tick emit must be present so
+        // QA's bench parser can count skip ticks per transition.
+        assert!(
+            hdmi.contains("transition_skip_tick_live_only"),
+            "R-106-LIVE-MOTION: `transition_skip_tick_live_only` emit substring \
+             missing from hdmi.rs — QA can no longer count skip-ticks per \
+             transition to validate dual-live cost on glass",
+        );
+    }
+
+    #[test]
+    fn r106_freeze_fix_painted_reset_pinned_in_sources() {
+        // 2026-06-16 R-106-FREEZE-FIX: QA pinpointed via
+        // `transition_tex_probe` that side-B's transition FBO/texture
+        // (NativeFramebuffer(3)/NativeTexture(7)) was frozen on the
+        // FIRST incoming slide's baked content (rgb=143,36,46 luma=69
+        // — Balloon rise from reel idx 1) and reused across every
+        // subsequent transition regardless of incoming slide id.
+        // Root cause: `transition_fbo_b_painted` was only reset on
+        // dims-change / fresh allocation; the `Ok(None) → reuse_
+        // cached_b` branch at hdmi.rs ~line 5303 surfaced the stale
+        // content. Fix: thread_local TRANSITION_PAINTED_FLAGS_NEED_
+        // RESET set at BeginTransition, consumed at the head of
+        // paint_and_present_one_transition_frame to clear both
+        // painted flags. Pin both literals + the reset emit so a
+        // silent refactor can't drop the reset.
+        let hdmi = include_str!("hdmi.rs");
+        let hdmi_logic = include_str!("hdmi_logic.rs");
+        assert!(
+            hdmi.contains("transition_fbo_painted_reset"),
+            "R-106-FREEZE-FIX: `transition_fbo_painted_reset` emit substring missing \
+             from hdmi.rs — QA's bench parser can no longer confirm the per-transition \
+             reset is firing",
+        );
+        assert!(
+            hdmi.contains("take_transition_painted_flags_need_reset"),
+            "R-106-FREEZE-FIX: `take_transition_painted_flags_need_reset` call missing \
+             from hdmi.rs — the reset consume hook was removed; side-B would re-freeze",
+        );
+        assert!(
+            hdmi_logic.contains("TRANSITION_PAINTED_FLAGS_NEED_RESET"),
+            "R-106-FREEZE-FIX: `TRANSITION_PAINTED_FLAGS_NEED_RESET` thread_local \
+             missing from hdmi_logic.rs — the arm-on-BeginTransition hook was \
+             removed; reset consume would always read false; side-B re-freezes",
+        );
+    }
+
+    #[test]
     fn load_next_off_thread_marker_pinned_in_ipc_main_source() {
         // 2026-06-16 LOAD-NEXT (code's pre-staged off-thread fix,
         // picked up by code2 due to weekly-cap freeze): the

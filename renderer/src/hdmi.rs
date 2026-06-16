@@ -4779,6 +4779,38 @@ pub fn paint_and_present_one_transition_frame(
     progress: f32,
 ) -> Result<()> {
     use glow::HasContext;
+    // R-106-FREEZE-FIX (2026-06-16): clear the cached-pair
+    // "painted" flags on the FIRST tick of a new transition so the
+    // `Ok(None) → reuse_cached_b` branch downstream (~line 5303)
+    // can't surface the PRIOR transition's baked side-B content.
+    // The flag is armed at BeginTransition (in hdmi_logic.rs's
+    // `record_transition_begin_for_endpoint_b_metric` which also
+    // sets `TRANSITION_PAINTED_FLAGS_NEED_RESET`), so the consume
+    // here fires exactly once per transition — first paint tick
+    // resets, subsequent ticks within the same transition keep
+    // the within-transition reuse benefit (codec hiccup mid-
+    // transition still gets the last good baked frame instead of
+    // stalling).
+    //
+    // QA bug 2026-06-16: side-B `transition_tex_probe` rgb=143,36,46
+    // luma=69 IDENTICAL across every transition kind (halftone /
+    // pixelate / fade / dissolve), regardless of incoming slide
+    // id. Smoking gun: balloons (reel idx 1) is the FIRST
+    // incoming slide; once baked, `transition_fbo_b_painted`=true
+    // never cleared, so every later transition's first bake_b
+    // iteration that hit `Ok(None)` (codec ramping) reused the
+    // balloons content. Fix: reset both painted flags at
+    // transition start. Side A is symmetric — even though A
+    // typically bakes Ok(Some) first iteration and doesn't hit
+    // the reuse path in practice, reset both for defense-in-depth.
+    if crate::hdmi_logic::take_transition_painted_flags_need_reset() {
+        session.transition_fbo_a_painted = false;
+        session.transition_fbo_b_painted = false;
+        eprintln!(
+            "[perf] transition_fbo_painted_reset side=both kind={} progress={:.3} reason=new_transition",
+            kind, progress,
+        );
+    }
     // r102.1.1 (2026-06-09): V3D BO leak probe. Throttle to
     // FIRST and LAST tick of each transition so QA can bracket
     // the transition's BO delta without log-volume blowup.
@@ -5033,35 +5065,35 @@ pub fn paint_and_present_one_transition_frame(
                 pair
             }
             None => {
-                // r106 + Path A Stage 2 (2026-06-14): decoupled
-                // bake returned Ok(None) (codec didn't deliver
-                // this tick). If we've previously baked into
-                // the cached pair this transition window AND
-                // the decouple is enabled, reuse — gives the
-                // codec time to catch up while keeping the
-                // FROM-side video frozen on its last good
-                // frame instead of skipping the tick entirely.
-                let decouple = crate::v4l2::is_feed_drain_decouple_enabled();
-                if decouple && session.transition_fbo_a_painted {
-                    if let Some((fbo, tex)) = cached_pair_a {
-                        eprintln!(
-                            "[perf] paint_transition_reuse_cached_a kind={} progress={:.3}",
-                            kind, progress,
-                        );
-                        (fbo, tex)
-                    } else {
-                        // FBO cache off; fall back to skip-tick.
-                        crate::hdmi_logic::warn_paint_transition_skip(
-                            kind, progress, "endpoint_a_no_frame",
-                        );
-                        return Ok(false);
-                    }
-                } else {
-                    crate::hdmi_logic::warn_paint_transition_skip(
-                        kind, progress, "endpoint_a_no_frame",
-                    );
-                    return Ok(false);
-                }
+                // R-106-LIVE-MOTION (2026-06-16, QA #1-priority
+                // v2v transition correctness): the r106 + Path A
+                // Stage 2 reuse-cached-on-Ok(None) path REMOVED.
+                // It would surface the LAST GOOD baked frame of
+                // the FROM-side as a still while the codec
+                // catches up — locally smooth but VIOLATES
+                // qarl's NON-NEGOTIABLE "motion through
+                // transitions" requirement. The reuse-cached
+                // pre-fix produced visible stills for the rest
+                // of a transition once the codec ever bubbled
+                // mid-transition. Post 2ead796's eviction-timing
+                // fix (combined-stack eeb84ec, live + verified)
+                // the codec headroom is restored; dual-live v2v
+                // transitions fit the per-tick budget on the Pi
+                // Zero 2 W, so the skip-tick fallback (= pre-
+                // r106 behavior) is correct again. QA gates this
+                // on-glass per frame-time DISTRIBUTION + visible-
+                // smoothness — if a measurable hitch class
+                // emerges, the right fix is poll harder / extend
+                // budget at the v4l2 layer, NOT re-introduce the
+                // freeze.
+                crate::hdmi_logic::warn_paint_transition_skip(
+                    kind, progress, "endpoint_a_no_frame",
+                );
+                eprintln!(
+                    "[perf] transition_skip_tick_live_only side=a kind={} progress={:.3} reason=endpoint_a_no_frame",
+                    kind, progress,
+                );
+                return Ok(false);
             }
         };
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
@@ -5268,7 +5300,17 @@ pub fn paint_and_present_one_transition_frame(
                         }
                         _ => true, // Text/Image never returns None
                     };
-                    if !decouple && deadline_ok && iter_ok && samples_remaining_ok {
+                    // R-106-LIVE-MOTION (2026-06-16): the retry was
+                    // previously gated on `!decouple` because with
+                    // decouple=ON the reuse-cached fallback handled
+                    // Ok(None) by surfacing the prior frame as a
+                    // still — that fallback is REMOVED for the
+                    // motion-through-transitions requirement, so the
+                    // sleep-poll-retry is now the ONLY way to recover
+                    // a transient codec hiccup mid-transition. Drop
+                    // the `!decouple` gate; retry within deadline /
+                    // iter / samples caps unconditionally.
+                    if deadline_ok && iter_ok && samples_remaining_ok {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                         continue;
                     }
@@ -5291,26 +5333,35 @@ pub fn paint_and_present_one_transition_frame(
                          deadline_ms={}",
                         kind, progress, bake_b_iterations, elapsed_us, reason, bake_b_deadline_ms,
                     );
-                    // r106 + Path A Stage 2 (2026-06-14): if we've
-                    // baked into the cached pair earlier this
-                    // transition window AND decouple is on AND the
-                    // cache is enabled, reuse the cached content
-                    // instead of skipping the tick. Keeps the TO-
-                    // side video frozen on its last good frame
-                    // while the codec catches up, avoiding the
-                    // "endpoint_b_no_frame skip = the whole
-                    // transition stalls" pre-r106 failure mode.
-                    if decouple && session.transition_fbo_b_painted {
-                        if let Some((fbo, tex)) = cached_pair_b {
-                            eprintln!(
-                                "[perf] paint_transition_reuse_cached_b kind={} progress={:.3}",
-                                kind, progress,
-                            );
-                            break (fbo, tex);
-                        }
-                    }
+                    // R-106-LIVE-MOTION (2026-06-16, QA #1-priority
+                    // v2v transition correctness): the r106 + Path A
+                    // Stage 2 reuse-cached-on-Ok(None) path REMOVED
+                    // for side B. The pre-fix behavior surfaced the
+                    // first-good-baked-frame of the TO-side as a
+                    // still while the codec ramped — visible result:
+                    // every transition's incoming video frozen
+                    // (worst case: ALL transitions frozen on the
+                    // first incoming slide's first baked frame
+                    // because `transition_fbo_b_painted` only reset
+                    // on dims-change, per the same arc's
+                    // R-106-FREEZE-FIX). VIOLATES qarl's NON-
+                    // NEGOTIABLE "motion through transitions"
+                    // requirement (live render u_to + u_from every
+                    // frame; NO snapshot-and-crossfade). The skip-
+                    // tick fallback (= pre-r106) returns; post
+                    // 2ead796 the codec headroom is restored so the
+                    // pre-r106 stall failure-mode shouldn't recur
+                    // — QA gates on-glass frame-time DISTRIBUTION +
+                    // visible smoothness to confirm. If a measurable
+                    // hitch class emerges, the fix is poll harder /
+                    // extend budget at the v4l2 layer, NOT re-
+                    // introduce the freeze.
                     crate::hdmi_logic::warn_paint_transition_skip(
                         kind, progress, "endpoint_b_no_frame",
+                    );
+                    eprintln!(
+                        "[perf] transition_skip_tick_live_only side=b kind={} progress={:.3} reason=endpoint_b_no_frame",
+                        kind, progress,
                     );
                     // r106 BLOCKER-1 carry-forward fix: only delete
                     // fbo_a/tex_a when the FBO cache is OFF (we

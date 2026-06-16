@@ -2880,6 +2880,26 @@ std::thread_local! {
     static TRANSITION_ENDPOINT_B_METRIC: std::cell::RefCell<
         Option<(Option<uuid::Uuid>, uuid::Uuid, std::time::Instant)>
     > = const { std::cell::RefCell::new(None) };
+
+    // R-106-FREEZE-FIX (2026-06-16): set TRUE at BeginTransition,
+    // consumed once at the head of `paint_and_present_one_
+    // transition_frame` to reset both `transition_fbo_a_painted`
+    // and `transition_fbo_b_painted` on the EglSession. Before this
+    // fix the painted flags only reset on dims-change / fresh
+    // allocation, so once side-B was baked on the FIRST transition
+    // the flag stayed TRUE forever, and every subsequent
+    // transition's `Ok(None)` (codec not yet warm) hit the
+    // `decouple && transition_fbo_b_painted` reuse-cached branch
+    // and BROKE B-side to the PRIOR transition's baked content
+    // (QA bug 2026-06-16: side-B frozen on "Balloon rise" texture
+    // across all subsequent transitions; rgb=143,36,46 luma=69
+    // identical via transition_tex_probe across halftone /
+    // pixelate / fade / dissolve). Side A is symmetric — even
+    // though A typically bakes Ok(Some) on first iteration and
+    // doesn't hit the reuse path in practice, reset both flags
+    // for defense-in-depth.
+    static TRANSITION_PAINTED_FLAGS_NEED_RESET: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Called from ipc_main.rs at the BeginTransition handler. Sets the
@@ -2915,6 +2935,26 @@ pub fn record_transition_begin_for_endpoint_b_metric(
             );
         }
     });
+    // R-106-FREEZE-FIX: simultaneously arm the painted-flag reset.
+    // BeginTransition is the canonical "new transition starting"
+    // boundary; mirror the marker-set timing so the next paint_and_
+    // present_one_transition_frame call resets both `transition_
+    // fbo_*_painted` flags before any bake_a/bake_b iteration
+    // consults them. See TRANSITION_PAINTED_FLAGS_NEED_RESET
+    // docstring above for the bug rationale.
+    TRANSITION_PAINTED_FLAGS_NEED_RESET.with(|c| c.set(true));
+}
+
+/// R-106-FREEZE-FIX (2026-06-16): consumed at the head of
+/// `paint_and_present_one_transition_frame` on every tick.
+/// Returns TRUE iff a new transition was recorded via
+/// `record_transition_begin_for_endpoint_b_metric` since the last
+/// call — i.e. the painted flags need clearing so a stale
+/// `Ok(None) → reuse_cached_b` branch can't surface the previous
+/// transition's baked content. Idempotent across same-transition
+/// ticks (only fires once per transition).
+pub fn take_transition_painted_flags_need_reset() -> bool {
+    TRANSITION_PAINTED_FLAGS_NEED_RESET.with(|c| c.replace(false))
 }
 
 /// Called from hdmi.rs at the endpoint_b bake-success branch in
@@ -11387,23 +11427,26 @@ mod path_a_stage2_tests {
         );
     }
 
-    #[test]
-    fn path_a_reuse_cached_probe_lines_present() {
-        // The `[perf] paint_transition_reuse_cached_{a,b}` probe
-        // lines are how QA's bench distinguishes "Path A reuse-
-        // cached fired" from "skip-tick fired" during a transition
-        // window with contention. Both probes must survive any
-        // future log-format refactor.
-        let src = include_str!("hdmi.rs");
-        assert!(
-            src.contains("paint_transition_reuse_cached_a"),
-            "Path A Stage 2: side-A reuse-cached probe line missing",
-        );
-        assert!(
-            src.contains("paint_transition_reuse_cached_b"),
-            "Path A Stage 2: side-B reuse-cached probe line missing",
-        );
-    }
+    // 2026-06-16 R-106-LIVE-MOTION: the
+    // `path_a_reuse_cached_probe_lines_present` test was DELETED
+    // here. It pinned the `[perf] paint_transition_reuse_cached_a`
+    // and `..._b` probe-line emits as required-present in hdmi.rs.
+    // Those emits were the regression-lock for r106's Path A Stage
+    // 2 reuse-cached-on-Ok(None) behavior — a behavior that QA
+    // identified as VIOLATING qarl's NON-NEGOTIABLE "motion
+    // through transitions" requirement (side-B locked to first-
+    // good-baked-frame, surfacing the "Balloon rise" still across
+    // every subsequent transition). R-106-LIVE-MOTION REMOVES
+    // both reuse-cached branches; the probe-line emits go with
+    // them. The new regression-lock — POSITIVE pin on
+    // `transition_skip_tick_live_only` + NEGATIVE pins on the
+    // removed reuse-cached emit substrings — lives in
+    // `r106_live_motion_reuse_cached_paths_removed_pinned_in_hdmi_
+    // source` in frame_pacing.rs. If a future refactor reintroduces
+    // a "freeze incoming side on bake fail" optimization (e.g. for
+    // the still-unresolved Pi Zero 2 W under-budget case), the
+    // negative pins fire loudly + the new behavior gets its own
+    // QA-visible literal that bench parsers can grep distinctly.
 
     // path_a_iter2_async_prime_helper_and_pending_skip_present —
     // REMOVED 2026-06-15 perf-gl base-hygiene.
