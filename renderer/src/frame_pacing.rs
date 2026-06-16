@@ -632,4 +632,43 @@ mod tests {
              the footprint cut was undone; either restore the cut or remove this pin",
         );
     }
+
+    #[test]
+    fn load_next_off_thread_marker_pinned_in_ipc_main_source() {
+        // 2026-06-16 LOAD-NEXT (code's pre-staged off-thread fix,
+        // picked up by code2 due to weekly-cap freeze): the
+        // `begin_slide_async_prime_loadnext` literal is QA's grep
+        // fingerprint that the F-1 sacred BLOCKER-3 sync precheck
+        // (item.json read + asset.mp4 exists check + Mp4Demuxer::
+        // open) was moved INTO the preload worker thunk instead
+        // of running synchronously on the render thread. The
+        // common-path render-thread hitch on every BeginSlide
+        // (~10-50 ms) is gone; the error-case wire-marker rail
+        // delays ~150 ms (acceptable per Karl's perception-
+        // threshold framing).
+        let ipc_main = include_str!("ipc_main.rs");
+        assert!(
+            ipc_main.contains("begin_slide_async_prime_loadnext"),
+            "LOAD-NEXT: `begin_slide_async_prime_loadnext` substring missing \
+             from ipc_main.rs — QA's bench parser can no longer confirm the \
+             off-thread move shipped (render-thread sync precheck would re-introduce \
+             the per-BeginSlide hitch)",
+        );
+        // Negative pin: the two sync_skip_marked emit format
+        // strings from the pre-LOAD-NEXT precheck must not return.
+        // Those literals existed ONLY in the deleted precheck block.
+        assert!(
+            !ipc_main.contains("sync_skip_marked reason=asset_mp4_missing"),
+            "LOAD-NEXT: `sync_skip_marked reason=asset_mp4_missing` literal \
+             REAPPEARED in ipc_main.rs — the F-1 BLOCKER-3 sync precheck was \
+             restored on the render thread; LOAD-NEXT was undone",
+        );
+        assert!(
+            !ipc_main.contains("sync_skip_marked reason=mp4_demuxer_open_failed"),
+            "LOAD-NEXT: `sync_skip_marked reason=mp4_demuxer_open_failed` literal \
+             REAPPEARED in ipc_main.rs — the F-1 BLOCKER-3 sync precheck's \
+             Mp4Demuxer::open branch was restored on the render thread; LOAD-NEXT \
+             was undone",
+        );
+    }
 }

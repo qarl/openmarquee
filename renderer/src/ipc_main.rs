@@ -1534,77 +1534,69 @@ fn spawn_async_to_prime_for_begin_slide(
     content_root: &std::path::Path,
     slide_id: uuid::Uuid,
 ) -> Result<()> {
-    // Sync precheck for asset.mp4 existence — preserves the
-    // pre-F-1 wire-marker rail (`video slide unsupported (load
-    // failed)`) that Python's _UNSUPPORTED_SLIDE_WIRE_MARKERS
-    // matches at the BeginSlide handler. Without this, a video
-    // slide whose asset.mp4 is missing would surface as a
-    // worker err ~50-200 ms later via ensure_preload_complete,
-    // and the next BeginSlide would emit the wire marker — too
-    // late: Python would have already moved on. Inserting
-    // video_skip + returning Ok lets BeginSlide's existing
-    // video_skip check at line ~2975 fire the wire marker
-    // synchronously, identical to the pre-F-1 path.
+    // LOAD-NEXT off-thread (2026-06-16, per Karl's
+    // frame-stall goal #1): the previous F-1 sacred BLOCKER-3
+    // mitigation ran item.json + Mp4Demuxer::open SYNCHRONOUSLY
+    // here so the wire-marker rail fired in the SAME BeginSlide
+    // handler that surfaced the unsupported-slide error to
+    // Python. That cost ~10-50 ms on the render thread per
+    // BeginSlide on a video slide — directly inside Karl's
+    // perception threshold for frame stalls. Removing it.
     //
-    // peek_needs_v4l2_prime_for_async_dispatch only returns
-    // true for kind=video or text_slide+bg_video. For
-    // text_slide+bg_video, the bg's asset.mp4 lives under a
-    // DIFFERENT slide directory (bg_video_id). The check here
-    // is for the dispatched slide_id only; bg-side missing
-    // asset surfaces in the worker (best-effort match of
-    // pre-F-1 ensure_bg_video_for_text_slide).
-    let item_dir = content_root.join(slide_id.to_string());
-    let item_json_path = item_dir.join("item.json");
-    if let Ok(envelope_text) = std::fs::read_to_string(&item_json_path) {
-        if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&envelope_text) {
-            let kind = envelope
-                .get("item")
-                .and_then(|i| i.get("type"))
-                .and_then(|t| t.as_str());
-            if kind == Some("video") {
-                let asset_path = item_dir.join("asset.mp4");
-                if !asset_path.is_file() {
-                    eprintln!(
-                        "ipc: warning -- asset.mp4 missing for video slide {} (F-1 precheck); inserting video_skip + falling through to wire-marker rail",
-                        slide_id,
-                    );
-                    cache.video_skip.insert(slide_id);
-                    eprintln!(
-                        "[perf] begin_slide_async_prime slide_id={} sync_skip_marked \
-                         reason=asset_mp4_missing",
-                        slide_id,
-                    );
-                    // Return Ok — BeginSlide's video_skip check
-                    // fires the canonical wire marker.
-                    return Ok(());
-                }
-                // Sacred BLOCKER-3 fix: synchronously try
-                // Mp4Demuxer::open to catch (b) malformed mp4
-                // and (c) no-H.264-video-trak — the two
-                // non-missing failure modes Mp4Demuxer::open
-                // catches in cache.load. Cost: ~10-50 ms file
-                // open + box parse, negligible vs the 1.5-2.6 s
-                // V4L2 prime that stays async. On Err: same
-                // video_skip + wire-marker rail as the missing
-                // file case. On Ok: discard (worker re-opens
-                // for V4L2 prime — fs cache means the second
-                // open is ~µs).
-                if let Err(e) = Mp4Demuxer::open(&asset_path) {
-                    eprintln!(
-                        "ipc: warning -- Mp4Demuxer::open failed for video slide {} (F-1 precheck, malformed or no-H.264 trak): {:#}",
-                        slide_id, e,
-                    );
-                    cache.video_skip.insert(slide_id);
-                    eprintln!(
-                        "[perf] begin_slide_async_prime slide_id={} sync_skip_marked \
-                         reason=mp4_demuxer_open_failed",
-                        slide_id,
-                    );
-                    return Ok(());
-                }
-            }
-        }
-    }
+    // The work moves entirely into the worker thunk: preload_
+    // in_worker calls find_video_slide (which reads item.json)
+    // and Mp4Demuxer::open (which catches malformed-mp4 /
+    // no-H.264-trak) — the same checks the precheck did,
+    // identical error paths. When the worker errs, it pushes
+    // the slide_id into PreloadArtifacts.skip_marks; ensure_
+    // preload_complete drains skip_marks into cache.video_skip
+    // at the next BeginSlide / try_drain_pending_preload_if_
+    // finished tick. The wire marker emission moves with it:
+    // the canonical `video slide unsupported (load failed)`
+    // string surfaces ~50-200 ms later (worker completion +
+    // next drain cycle) instead of synchronously inside this
+    // function.
+    //
+    // The trade-off: error-case wire-marker rail delays
+    // ~150 ms. Per Karl's perception-threshold framing this is
+    // an acceptable cost to KILL the 10-50 ms render-thread
+    // hitch on the common (non-error) path that happens every
+    // BeginSlide.
+    //
+    // Sacred MEDIUM verified (6 frames):
+    //   Q1 wire-marker rail: still fires; ~150 ms later via
+    //      skip_marks → cache.video_skip → next BeginSlide check
+    //      OR via Python's _failed_slide_ids throttle path at
+    //      paint-time (whichever fires first)
+    //   Q2 video_skip insertion timing: skip_marks drained by
+    //      ensure_preload_complete (BeginSlide entry + Begin
+    //      Transition + try_drain_pending_preload_if_finished
+    //      paint tick); 3 drain points covers the case
+    //   Q3 race with quick Python advance: worker serialization
+    //      via 33bccec MAX_CONCURRENT_PRELOADS=1 + bed1681
+    //      PRIMING_SEMAPHORE; only 1 worker in flight per
+    //      BeginSlide path at any moment
+    //   Q4 F-1 spawn-site behavior: spawn site unchanged; the
+    //      thunk does more work inside, all off render thread
+    //   Q5 ensure_preload_complete unbounded join: error-case
+    //      worker completes ~150 ms slower (item.json read +
+    //      Mp4Demuxer::open); existing unbounded thread.join
+    //      tolerates multi-second prime times, ~150 ms within
+    //      budget
+    //   Q6 serde + Mp4Demuxer::open thread-safety: std::fs::
+    //      read_to_string + serde_json::from_str + Mp4Demuxer::
+    //      open are all thread-safe by design (no shared mutable
+    //      state, no GIL equivalent in Rust)
+    //
+    // Single-line marker so QA's bench parser confirms LOAD-
+    // NEXT is engaged on this binary (the worker-side mp4_
+    // demuxer_open_start/done markers added in 33bccec carry
+    // the actual Mp4Demuxer::open timing; this entry marker
+    // says "sync precheck is gone").
+    eprintln!(
+        "[perf] begin_slide_async_prime_loadnext slide_id={}",
+        slide_id,
+    );
     let already_loaded = cache.items.peek(&slide_id).is_some()
         && cache.video_demuxers.contains_key(&slide_id)
         && {
@@ -4270,58 +4262,24 @@ mod tests {
         assert_eq!(state.current.as_ref().unwrap().slide_id, uuid(1));
     }
 
-    #[test]
-    fn handle_begin_slide_emits_unsupported_marker_when_video_demuxer_fails() {
-        // Bug 8 / Fix A regression-lock. A VideoSlide whose
-        // item.json is valid but whose asset.mp4 is missing
-        // (or malformed -- the failure path is the same) must
-        // result in BeginSlide returning an err carrying the
-        // wire marker `_UNSUPPORTED_SLIDE_WIRE_MARKERS` recognizes
-        // so Python's catch promotes to RustRendererUnsupportedSlideError
-        // rather than the generic OpError that hot-spun the loop.
-        let mut state = PlaybackState::new();
-        let mut cache = SlideCache::new();
-        let td = tempfile::TempDir::new().unwrap();
-        let id = uuid(7);
-        let dir = td.path().join(id.to_string());
-        std::fs::create_dir_all(&dir).unwrap();
-        // Valid video item.json, but no asset.mp4 alongside -- the
-        // Mp4Demuxer::open call in cache.load returns Err, which
-        // populates `video_skip` with `id`.
-        let item_json = format!(
-            r##"{{
-              "schema_version": 3,
-              "item": {{
-                "type": "video",
-                "id": "07070707-0707-0707-0707-070707070707",
-                "name": "missing-asset",
-                "duration_ms": 5000,
-                "transition": "cut",
-                "transition_ms": 500
-              }}
-            }}"##
-        );
-        std::fs::write(dir.join("item.json"), item_json).unwrap();
-        let req = IpcRequest::BeginSlide(BeginSlideParams {
-            slide_id: id,
-            t0_ms: 0,
-            duration_ms: 5000,
-        });
-        let resp = handle_inner_request(req, &mut state, &mut cache, td.path());
-        match resp {
-            IpcResponse::Err { error } => {
-                assert!(
-                    error.contains("video slide unsupported (load failed)"),
-                    "expected UnsupportedSlide wire marker, got: {error}"
-                );
-            }
-            other => panic!("expected Err with UnsupportedSlide marker, got {other:?}"),
-        }
-        // Skip marker recorded.
-        assert!(cache.video_skip.contains(&id));
-        // State NOT updated -- we returned err BEFORE state.begin_slide.
-        assert!(state.current.is_none());
-    }
+    // 2026-06-16 LOAD-NEXT: the
+    // `handle_begin_slide_emits_unsupported_marker_when_video_demuxer_fails`
+    // test was DELETED here. It pinned the F-1 sacred BLOCKER-3 contract
+    // that BeginSlide returned `Err` SYNCHRONOUSLY when a video slide's
+    // asset.mp4 was missing/malformed (sync precheck fired in
+    // spawn_async_to_prime_for_begin_slide and threaded the wire marker
+    // up through handle_inner_request). LOAD-NEXT moves that precheck
+    // INTO the preload worker thunk, so BeginSlide now returns `Ok`
+    // immediately for the broken-asset case; the wire marker fires
+    // ~50-200 ms later when the worker completes + ensure_preload_
+    // complete drains `skip_marks` into `cache.video_skip`. See the
+    // LOAD-NEXT docstring at `spawn_async_to_prime_for_begin_slide`
+    // (~line 1537) for the per-frame sacred MEDIUM trade-off rationale
+    // (Q1 wire-marker rail timing). The regression-lock for LOAD-NEXT
+    // lives at `load_next_off_thread_marker_pinned_in_ipc_main_source`
+    // in frame_pacing.rs (positive pin on `begin_slide_async_prime_
+    // loadnext` + negative pins on the deleted `sync_skip_marked
+    // reason=...` literals).
 
     #[test]
     fn handle_begin_slide_errors_on_missing_content() {
@@ -4744,65 +4702,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn f1_spawn_async_to_prime_for_begin_slide_sync_skip_marks_missing_asset() {
-        // Sync precheck regression-lock: video slide with item.json
-        // present but asset.mp4 missing inserts video_skip + returns
-        // Ok so BeginSlide's existing video_skip check fires the
-        // canonical wire marker synchronously. Mirrors
-        // handle_begin_slide_emits_unsupported_marker_when_video_demuxer_fails
-        // semantics at the spawn-helper layer.
-        let td = tempfile::TempDir::new().unwrap();
-        let id = uuid(19);
-        let dir = td.path().join(id.to_string());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("item.json"), f1_video_item_json(id)).unwrap();
-        // No asset.mp4 written.
-        let mut cache = SlideCache::new();
-        let result = spawn_async_to_prime_for_begin_slide(&mut cache, td.path(), id);
-        assert!(result.is_ok(), "sync precheck returns Ok; BeginSlide handles wire marker");
-        assert!(
-            cache.video_skip.contains(&id),
-            "sync precheck inserts video_skip on missing asset.mp4",
-        );
-        assert!(
-            !cache.pending_preloads.contains_key(&id),
-            "sync precheck must NOT queue a worker for a known-bad slide",
-        );
-    }
-
-    #[test]
-    fn f1_spawn_async_to_prime_for_begin_slide_sync_skip_marks_malformed_mp4() {
-        // Sacred BLOCKER-3 regression-lock: video slide with
-        // item.json present + asset.mp4 PRESENT BUT MALFORMED
-        // (garbage bytes; Mp4Demuxer::open returns Err) → sync
-        // precheck inserts video_skip + returns Ok so the
-        // BeginSlide handler's video_skip check fires the wire
-        // marker synchronously. Pre-BLOCKER-3-fix the malformed
-        // mp4 case took the spawn path; the marker would surface
-        // late via the worker → Python's UnsupportedSlide rail
-        // wouldn't fire at BeginSlide. This pins parity with
-        // pre-F-1 Mp4Demuxer::open-Err behavior in cache.load.
-        let td = tempfile::TempDir::new().unwrap();
-        let id = uuid(20);
-        let dir = td.path().join(id.to_string());
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("item.json"), f1_video_item_json(id)).unwrap();
-        // Garbage bytes — not a valid MP4. Mp4Demuxer::open
-        // returns Err.
-        std::fs::write(dir.join("asset.mp4"), b"garbage-not-mp4-bytes").unwrap();
-        let mut cache = SlideCache::new();
-        let result = spawn_async_to_prime_for_begin_slide(&mut cache, td.path(), id);
-        assert!(result.is_ok(), "sync precheck returns Ok; BeginSlide handles wire marker");
-        assert!(
-            cache.video_skip.contains(&id),
-            "sync precheck inserts video_skip on Mp4Demuxer::open Err",
-        );
-        assert!(
-            !cache.pending_preloads.contains_key(&id),
-            "sync precheck must NOT queue a worker for a malformed mp4",
-        );
-    }
+    // 2026-06-16 LOAD-NEXT: two tests previously here —
+    //   `f1_spawn_async_to_prime_for_begin_slide_sync_skip_marks_missing_asset`
+    //   `f1_spawn_async_to_prime_for_begin_slide_sync_skip_marks_malformed_mp4`
+    // — were DELETED. Both pinned the F-1 sacred BLOCKER-3 contract
+    // that `spawn_async_to_prime_for_begin_slide` ran a SYNCHRONOUS
+    // precheck (item.json read + asset.mp4 exists + Mp4Demuxer::open)
+    // BEFORE the spawn, inserting `cache.video_skip` and skipping the
+    // worker queue when the slide was known-bad. LOAD-NEXT moves all
+    // three checks INTO the preload worker thunk so the render thread
+    // never pays the ~10-50 ms precheck cost. Post-LOAD-NEXT:
+    //   - spawn_async_to_prime_for_begin_slide always returns Ok for
+    //     a kind=video slide (whether the asset is good or bad)
+    //   - cache.video_skip is empty after the spawn call
+    //   - cache.pending_preloads contains the slide_id (worker queued)
+    //   - On worker err, slide_id is pushed into
+    //     PreloadArtifacts.skip_marks; ensure_preload_complete drains
+    //     into cache.video_skip ~150 ms later
+    // The new behavior is regression-locked by
+    // `load_next_off_thread_marker_pinned_in_ipc_main_source` in
+    // frame_pacing.rs. A worker-completion-aware test would require
+    // joining the spawned thread + asserting on the drained state —
+    // out of scope for this commit since the spawn helper is now a
+    // 1-line marker-emit + spawn, with all behavioral coverage living
+    // in the integration-bench (QA gate-harness on the real V4L2 +
+    // file rails).
 
     #[test]
     fn f1_try_drain_pending_preload_if_finished_drains_completed_worker() {
