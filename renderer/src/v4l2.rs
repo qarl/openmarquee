@@ -1796,12 +1796,29 @@ pub struct Decoder {
 impl Decoder {
     /// Open + sanity-check the V4L2 device.
     pub fn open(path: &Path) -> Result<Self> {
+        // codec-jam diag 2026-06-16 (post-bed1681 RED): if the
+        // bcm2835 firmware wedges at the V4L2 fd open itself
+        // (admin's candidate #3), this attempt marker fires
+        // but the success marker doesn't. Pair v4l2_decoder_
+        // open_attempt with v4l2_decoder_open_success to bracket
+        // the syscall.
+        eprintln!(
+            "[perf] v4l2_decoder_open_attempt path={}",
+            path.display(),
+        );
+        let t_open = std::time::Instant::now();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
             .open(path)
             .with_context(|| format!("open {}", path.display()))?;
+        let open_us = t_open.elapsed().as_micros();
+        eprintln!(
+            "[perf] v4l2_decoder_open_success path={} open_us={}",
+            path.display(),
+            open_us,
+        );
         let decoder_seq_for_inner = next_decoder_open_seq();
         let inner = DecoderInner {
             decoder_seq: decoder_seq_for_inner,

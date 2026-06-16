@@ -269,6 +269,78 @@ mod tests {
     }
 
     #[test]
+    fn preload_spawn_entered_fingerprint_pinned_in_ipc_main_source() {
+        // codec-jam diag 2026-06-16: QA's bench parser greps
+        // `preload_spawn_entered` to count actual preload worker
+        // spawns at cold-start of 21-slide reel. Identifies
+        // whether wedge is before, after, or at the spawn site.
+        // A rename would silently break the spawn-count
+        // attribution at the next cold-start wedge.
+        let ipc = include_str!("ipc_main.rs");
+        assert!(
+            ipc.contains("preload_spawn_entered"),
+            "codec-jam diag: `preload_spawn_entered` substring missing \
+             from ipc_main.rs — QA's bench parser can't count cold-start \
+             preload worker spawns",
+        );
+    }
+
+    #[test]
+    fn mp4_demuxer_open_start_fingerprint_pinned_in_ipc_main_source() {
+        // codec-jam diag 2026-06-16: brackets Mp4Demuxer::open
+        // calls in preload_in_worker. dur_us reveals whether
+        // multi-MB MP4 parsing at 21 concurrent workers is the
+        // CPU storm surface. Paired with mp4_demuxer_open_done.
+        let ipc = include_str!("ipc_main.rs");
+        assert!(
+            ipc.contains("mp4_demuxer_open_start"),
+            "codec-jam diag: `mp4_demuxer_open_start` substring missing \
+             from ipc_main.rs — can't bracket MP4 parsing time at cold-start",
+        );
+        assert!(
+            ipc.contains("mp4_demuxer_open_done"),
+            "codec-jam diag: `mp4_demuxer_open_done` substring missing \
+             from ipc_main.rs — can't bracket MP4 parsing time at cold-start",
+        );
+    }
+
+    #[test]
+    fn v4l2_decoder_open_attempt_fingerprint_pinned_in_v4l2_source() {
+        // codec-jam diag 2026-06-16: brackets the V4L2 fd open
+        // syscall (admin's candidate #3 — firmware may wedge
+        // at open itself, before any prime ioctls). If attempt
+        // fires but success doesn't, the open syscall is where
+        // execution wedges.
+        let v = include_str!("v4l2.rs");
+        assert!(
+            v.contains("v4l2_decoder_open_attempt"),
+            "codec-jam diag: `v4l2_decoder_open_attempt` substring missing \
+             from v4l2.rs — can't bracket V4L2 fd open syscall",
+        );
+        assert!(
+            v.contains("v4l2_decoder_open_success"),
+            "codec-jam diag: `v4l2_decoder_open_success` substring missing \
+             from v4l2.rs — can't bracket V4L2 fd open syscall",
+        );
+    }
+
+    #[test]
+    fn prime_video_decoder_entered_fingerprint_pinned_in_ipc_main_source() {
+        // codec-jam diag 2026-06-16: explicit entered marker
+        // BEFORE the prime_video_decoder_for_preload call in
+        // the worker. Distinguishes "post-mp4-open, pre-prime"
+        // surface from in-prime surface (which has the existing
+        // prime_entry marker inside the function).
+        let ipc = include_str!("ipc_main.rs");
+        assert!(
+            ipc.contains("prime_video_decoder_entered"),
+            "codec-jam diag: `prime_video_decoder_entered` substring missing \
+             from ipc_main.rs — can't bracket the post-mp4-open, pre-prime \
+             window for cold-start wedge attribution",
+        );
+    }
+
+    #[test]
     fn codec_prime_serialize_wait_fingerprint_pinned_in_video_decode_source() {
         // codec-jam fix (2026-06-16): QA's bench parser greps
         // `codec_prime_serialize_wait` literally to identify the

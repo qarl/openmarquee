@@ -1102,6 +1102,15 @@ fn preload_in_worker(
     content_root: &std::path::Path,
     item_id: uuid::Uuid,
 ) -> PreloadResult {
+    // codec-jam diag 2026-06-16 (post-bed1681 RED): QA's wedge
+    // signature was "0 prime markers fire for 48s; CPU storm
+    // 297%". This marker fires at the FIRST line of every
+    // preload worker so we can see how many actually spawn at
+    // cold-start of a 21-slide reel (and whether spawn itself
+    // wedges). Paired with mp4_demuxer_open_start /
+    // mp4_demuxer_open_done / v4l2_decoder_open_attempt below
+    // to identify which upstream phase storms.
+    eprintln!("[perf] preload_spawn_entered slide_id={}", item_id);
     let mut artifacts = PreloadArtifacts {
         items: Vec::new(),
         demuxers: Vec::new(),
@@ -1159,11 +1168,39 @@ fn preload_in_worker(
     if let Some(s) = find_video_slide(content_root, item_id)? {
         artifacts.items.push((item_id, ContentItem::Video(s), mtime));
         let asset_path = video_slide_asset_path(content_root, item_id);
+        // codec-jam diag 2026-06-16: bracket Mp4Demuxer::open
+        // with start/done markers. dur_us identifies whether
+        // upstream cold-start storm is in MP4 parsing (file I/O
+        // + sample-table walk + Annex-B conversion) — at 21
+        // concurrent workers each reading multi-MB files this
+        // is a candidate storm surface.
+        eprintln!(
+            "[perf] mp4_demuxer_open_start slide_id={} path={}",
+            item_id, asset_path.display(),
+        );
+        let t_mp4_open = std::time::Instant::now();
         match Mp4Demuxer::open(&asset_path) {
             Ok(dem) => {
+                eprintln!(
+                    "[perf] mp4_demuxer_open_done slide_id={} dur_us={} samples={}",
+                    item_id,
+                    t_mp4_open.elapsed().as_micros(),
+                    dem.samples.len(),
+                );
                 #[cfg(target_os = "linux")]
                 {
                     let t_prime = std::time::Instant::now();
+                    // codec-jam diag 2026-06-16: explicit entered
+                    // marker BEFORE the prime call. If wedge is
+                    // between mp4_demuxer_open_done and this line,
+                    // it's spurious bookkeeping (counter probe).
+                    // If wedge fires before this but AFTER
+                    // mp4_demuxer_open_done, prime call is
+                    // unreachable for this slide.
+                    eprintln!(
+                        "[perf] prime_video_decoder_entered slide_id={} caller=preload_worker",
+                        item_id,
+                    );
                     // r73 (2026-06-06) / r77 (2026-06-07): preload
                     // worker uses warmup_count=PRIME_WARMUP_FOR_PRELOAD
                     // (currently 2; see main.rs:PRIME_WARMUP_FOR_PRELOAD
@@ -1238,6 +1275,12 @@ fn preload_in_worker(
                 artifacts.demuxers.push((item_id, dem));
             }
             Err(e) => {
+                eprintln!(
+                    "[perf] mp4_demuxer_open_done slide_id={} dur_us={} err={:#}",
+                    item_id,
+                    t_mp4_open.elapsed().as_micros(),
+                    e,
+                );
                 eprintln!(
                     "ipc: preload_worker -- failed to open MP4 {} for video slide {}: {:#}",
                     asset_path.display(), item_id, e
@@ -1591,7 +1634,19 @@ fn spawn_async_to_prime_for_begin_slide(
         );
         return Ok(());
     }
-    const MAX_CONCURRENT_PRELOADS: usize = 2;
+    // codec-jam diag 2026-06-16 (post-bed1681 RED): reduced
+    // from 2 to 1. QA's wedge had 0 prime markers + CPU storm
+    // → execution never reached prime → my PRIMING_SEMAPHORE
+    // didn't help. Hypothesis: 2 concurrent preload SPAWNS
+    // upstream of prime (Mp4Demuxer::open + V4L2 fd open in
+    // parallel) overwhelms the firmware OR the IPC loop. Cap=1
+    // serializes the SPAWN side too. Net safety: strictly
+    // serial preload + sync fallback on cap-hit. The new
+    // diagnostic markers (preload_spawn_entered, mp4_demuxer_
+    // open_start/done, v4l2_decoder_open_attempt/success,
+    // prime_video_decoder_entered) will reveal where execution
+    // actually wedges if cap=1 is insufficient.
+    const MAX_CONCURRENT_PRELOADS: usize = 1;
     if cache.pending_preloads.len() >= MAX_CONCURRENT_PRELOADS {
         // Capacity full. Fall back to synchronous cache.load so
         // the slide can still start; cost shape is identical to
@@ -3826,7 +3881,11 @@ fn handle_inner_request(
             // drop the new preload + let BeginSlide hit the
             // synchronous cache.load path (same cost shape as
             // pre-r65).
-            const MAX_CONCURRENT_PRELOADS: usize = 2;
+            // codec-jam diag 2026-06-16 (post-bed1681 RED):
+            // reduced from 2 to 1 in lockstep with the
+            // spawn_async_to_prime_for_begin_slide cap. See the
+            // longer comment there for the wedge hypothesis.
+            const MAX_CONCURRENT_PRELOADS: usize = 1;
             if cache.pending_preloads.len() >= MAX_CONCURRENT_PRELOADS
                 && !cache.pending_preloads.contains_key(&preload_id)
             {
