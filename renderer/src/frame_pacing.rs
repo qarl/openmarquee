@@ -269,6 +269,25 @@ mod tests {
     }
 
     #[test]
+    fn begin_slide_evict_field_name_pinned_in_ipc_main_source() {
+        // perf-decode investigation 2026-06-15 (post-Phase-B):
+        // QA's bench parser greps `begin_slide_evict` literally to
+        // identify FREE-OLD render-thread cost at the BeginSlide
+        // eviction site (the uninstrumented gap before this commit).
+        // Used to validate Karl's "still SEES the stall" hypothesis
+        // — is it LOAD-NEXT (begin_slide_wait / begin_slide_load)
+        // or FREE-OLD (begin_slide_evict) that dominates? A rename
+        // would silently break the FREE-OLD classification.
+        let ipc = include_str!("ipc_main.rs");
+        assert!(
+            ipc.contains("begin_slide_evict"),
+            "perf-decode investigation: `begin_slide_evict` substring \
+             missing from ipc_main.rs — QA's bench parser will no longer \
+             be able to identify FREE-OLD render-thread cost at BeginSlide",
+        );
+    }
+
+    #[test]
     fn peak_triage_since_restart_ms_field_name_pinned_in_hdmi_source() {
         // QA's bench parser greps `since_restart_ms=` literally
         // (per the peak-triage dispatch field-name contract). A

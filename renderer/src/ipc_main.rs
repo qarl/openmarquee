@@ -3306,7 +3306,57 @@ fn handle_inner_request(
                     keep_ids.push(bg_id);
                 }
             }
+            // perf-decode investigation 2026-06-15 (post-Phase-B):
+            // measure aggregate render-thread time spent in
+            // evict_other_video_state, the FREE-OLD candidate for
+            // Karl's "still SEES the stall" report. Existing
+            // telemetry (per-Decoder egl_image_destroy_loop_summary
+            // + decoder_drop seq=N) captures per-drop cost; this
+            // line aggregates at the call site so QA can sum the
+            // render-thread cost across the retain() pass and any
+            // attendant Mp4Demuxer drops (demuxers held no V4L2
+            // state; their drop is ~µs, but the count tells us
+            // whether the eviction did anything).
+            //
+            // Why the call site rather than inside the helper: this
+            // captures the actual render-thread wall-clock that
+            // BeginSlide pays. The helper is shared infrastructure;
+            // any future caller (currently this is the only one)
+            // gets its own timing if needed without entangling.
+            //
+            // Steady-state shape (typical slide-change):
+            // decoders_dropped=1 (the outgoing video), demuxers_
+            // dropped=1, evict_us in the single-digit ms range
+            // (per-Decoder Drop is bounded by the existing r101.1
+            // destroy-loop summary). Same-slide repeat: dropped=0,
+            // evict_us=0.
+            //
+            // Unconditional emit (one per BeginSlide is low cadence)
+            // — no gating needed.
+            let decoders_before = {
+                #[cfg(target_os = "linux")]
+                { cache.video_decoders.len() }
+                #[cfg(not(target_os = "linux"))]
+                { 0_usize }
+            };
+            let demuxers_before = cache.video_demuxers.len();
+            let t_evict = std::time::Instant::now();
             cache.evict_other_video_state(&keep_ids);
+            let evict_us = t_evict.elapsed().as_micros();
+            let decoders_after = {
+                #[cfg(target_os = "linux")]
+                { cache.video_decoders.len() }
+                #[cfg(not(target_os = "linux"))]
+                { 0_usize }
+            };
+            let demuxers_after = cache.video_demuxers.len();
+            eprintln!(
+                "[perf] begin_slide_evict slide_id={} evict_us={} decoders_dropped={} demuxers_dropped={}",
+                p.slide_id,
+                evict_us,
+                decoders_before.saturating_sub(decoders_after),
+                demuxers_before.saturating_sub(demuxers_after),
+            );
             // perf-decode F-1 (2026-06-15): off-thread the cold
             // cache.load for the kinds whose prime path is
             // EXPENSIVE — bare Video and TextOverVideo (where
