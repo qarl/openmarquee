@@ -269,6 +269,31 @@ mod tests {
     }
 
     #[test]
+    fn evict_at_transition_end_field_name_pinned_in_ipc_main_source() {
+        // perf-decode eviction-timing fix (2026-06-15): QA's bench
+        // parser greps `evict_at_transition_end` literally to
+        // identify the end-of-transition early-eviction emit added
+        // by the IPC Advance handler. Distinct from
+        // `begin_slide_evict` (which still fires at BeginSlide as
+        // belt-and-suspenders). The pair lets QA distinguish:
+        // - common path (transition resolved → advance evicts →
+        //   next BeginSlide.evict shows decoders_dropped=0)
+        // - jump-to-slide path (no prior transition → advance
+        //   doesn't emit → BeginSlide.evict shows decoders_dropped
+        //   in the usual range)
+        // A rename here would silently break the bench's split-
+        // attribution of FREE-OLD timing across the two paths.
+        let ipc = include_str!("ipc_main.rs");
+        assert!(
+            ipc.contains("evict_at_transition_end"),
+            "perf-decode eviction-timing fix: `evict_at_transition_end` substring \
+             missing from ipc_main.rs — QA's bench parser will no longer be able \
+             to distinguish end-of-transition early-eviction from the belt-and-\
+             suspenders BeginSlide.evict path",
+        );
+    }
+
+    #[test]
     fn begin_slide_evict_field_name_pinned_in_ipc_main_source() {
         // perf-decode investigation 2026-06-15 (post-Phase-B):
         // QA's bench parser greps `begin_slide_evict` literally to

@@ -221,6 +221,28 @@ impl PlaybackState {
         self.current = None;
         self.pending = None;
     }
+
+    /// perf-decode eviction-timing fix (2026-06-15): expose the
+    /// from-slide id of an in-flight transition so the IPC
+    /// Advance handler can detect transition completion across
+    /// an advance() call (snapshot before/after) and evict the
+    /// from-side state at end-of-transition instead of deferring
+    /// to the next BeginSlide.
+    ///
+    /// Returns `Some(from_slide_id)` iff a transition is in
+    /// flight (self.pending = Some). Returns `None` otherwise.
+    /// Pure read; does not mutate.
+    pub fn pending_from_slide_id(&self) -> Option<Uuid> {
+        self.pending.as_ref().map(|t| t.from_slide_id)
+    }
+
+    /// perf-decode eviction-timing fix (2026-06-15): expose
+    /// `self.current.slide_id` so the IPC Advance handler can
+    /// reference the to-side (which becomes current at transition
+    /// completion) when computing keep_ids for the eviction call.
+    pub fn current_slide_id(&self) -> Option<Uuid> {
+        self.current.as_ref().map(|c| c.slide_id)
+    }
 }
 
 // ============================================================

@@ -3548,7 +3548,126 @@ fn handle_inner_request(
             // OpResult without painting. Slice (d) wires the
             // actual paint_slide / paint_transition calls that
             // turn the OpResult into pixels-on-screen.
+            //
+            // perf-decode eviction-timing fix (2026-06-15):
+            // detect transition completion across this advance()
+            // call (snapshot pending_from_slide_id before/after)
+            // and evict the from-side V4L2 decoder + Mp4Demuxer
+            // immediately. Pre-fix, eviction was deferred to the
+            // next BeginSlide handler — the from-side artifacts
+            // (Decoder ~12 MB CAPTURE-pool kernel CMA + Mp4Demuxer
+            // multi-MB samples Vec) stayed alive for the entire
+            // to-side hold (typically 5-15s), driving (iii)
+            // memory-pressure spikes per the 512 MB ceiling
+            // diagnosis.
+            //
+            // The fix attacks INTEGRATED time-under-2-decoder-load
+            // (orthogonal to Phase B which reduced PEAK). For a
+            // typical 60-cycle 10-min loop:
+            //   pre-fix:  660s × 18 MB = ~12,000 MB-seconds
+            //   post-fix: 60s  × 18 MB = ~1,080 MB-seconds
+            // ~92% integrated pressure reduction. See
+            // qa/target-2-memory-reduction-addendum-2026-06-15.md.
+            //
+            // Detection: state.pending_from_slide_id() returns the
+            // from-side id iff state.pending is Some (transition
+            // in flight). state.advance() may consume pending via
+            // .take() if the transition_ms threshold is crossed,
+            // promoting to_slide to current. A before→after Some→
+            // None edge means the transition just resolved on
+            // THIS call — fire the evict exactly once.
+            //
+            // Sacred adversarial frames:
+            // - use-after-evict in paint_b: SAFE because state.
+            //   advance returns PaintSlide (not PaintTransition)
+            //   when this branch fires; the subsequent paint_hook
+            //   reads from-side artifacts only on PaintTransition.
+            //   By the time PaintSlide is dispatched, the from-
+            //   side is already evicted (consistent ordering).
+            // - F-3 re-prime ordering: F-3 lives in the
+            //   BeginTransition handler (gates from-side
+            //   cache.load on has_video_decoder_for_slide). At
+            //   end-of-transition, the NEXT BeginTransition is
+            //   ≥1 hold-duration away; the from-side at THAT
+            //   BeginTransition is a DIFFERENT slide than the
+            //   one evicted here. F-3 sees the fresh from-side
+            //   (the to-side here, which we KEEP). No interaction.
+            // - TextOverVideo bg_video_id: keep_ids logic mirrors
+            //   the BeginSlide path — if to_id is a TextSlide
+            //   with background_video_slide_id, we preserve that
+            //   bg id alongside to_id.
+            // - r102.1 V3D BO probe: emitted at the same point as
+            //   the existing evict_other_video_state_exit probe
+            //   (inside the helper); QA's bench correlation still
+            //   ties the probe to evict timing, just at a NEW
+            //   moment in the IPC dispatch (advance, not begin_
+            //   slide). Begin_slide's probe still fires too (on
+            //   the next BeginSlide), giving QA both anchors.
+            // - F-1 async-prime worker: BeginSlide spawns the
+            //   NEXT slide's preload. End-of-transition runs
+            //   BEFORE that BeginSlide. The F-1 worker hasn't
+            //   spawned yet when this evict fires, so there's no
+            //   in-flight worker for the to-side (which is what
+            //   we KEEP). No interaction.
+            // - r106 cached transition FBO pair: lives in the
+            //   EglSession (per-session, not per-Decoder). evict_
+            //   other_video_state retains only video_demuxers +
+            //   video_decoders HashMaps; FBO cache untouched.
+            // - timing fence: this branch fires on the advance()
+            //   call that PROMOTES the transition; subsequent
+            //   advance() calls see pending=None and from_id_
+            //   before=None, so the evict can't double-fire.
+            // - BeginSlide.evict belt-and-suspenders: kept as-is
+            //   (line 3309 unchanged). On the common path
+            //   (transition → next slide), this advance-side
+            //   evict fires first, and BeginSlide's evict
+            //   becomes a no-op (decoders_dropped=0 telemetry
+            //   confirms). On the jump-to-slide path (no prior
+            //   BeginTransition), the advance-side evict doesn't
+            //   fire and BeginSlide's evict is the only one. Both
+            //   paths covered.
+            let from_id_before = state.pending_from_slide_id();
             let cmd = state.advance(p.t_ms);
+            if from_id_before.is_some() && state.pending_from_slide_id().is_none() {
+                // Transition just resolved on THIS call — evict
+                // from-side now.
+                if let Some(to_id) = state.current_slide_id() {
+                    let bg_video_id = match cache.items.peek(&to_id) {
+                        Some(ContentItem::Text(s)) => s.background_video_slide_id,
+                        _ => None,
+                    };
+                    let mut keep_ids = vec![to_id];
+                    if let Some(bg_id) = bg_video_id {
+                        if bg_id != to_id {
+                            keep_ids.push(bg_id);
+                        }
+                    }
+                    let decoders_before = {
+                        #[cfg(target_os = "linux")]
+                        { cache.video_decoders.len() }
+                        #[cfg(not(target_os = "linux"))]
+                        { 0_usize }
+                    };
+                    let demuxers_before = cache.video_demuxers.len();
+                    let t_evict = std::time::Instant::now();
+                    cache.evict_other_video_state(&keep_ids);
+                    let evict_us = t_evict.elapsed().as_micros();
+                    let decoders_after = {
+                        #[cfg(target_os = "linux")]
+                        { cache.video_decoders.len() }
+                        #[cfg(not(target_os = "linux"))]
+                        { 0_usize }
+                    };
+                    let demuxers_after = cache.video_demuxers.len();
+                    eprintln!(
+                        "[perf] evict_at_transition_end to_slide_id={} evict_us={} decoders_dropped={} demuxers_dropped={}",
+                        to_id,
+                        evict_us,
+                        decoders_before.saturating_sub(decoders_after),
+                        demuxers_before.saturating_sub(demuxers_after),
+                    );
+                }
+            }
             IpcResponse::Ok {
                 result: advance_command_to_op_result(cmd),
             }
