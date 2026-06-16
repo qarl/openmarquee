@@ -150,6 +150,71 @@ pub fn delete_all(gl: &glow::Context, atlases: &mut Vec<MsdfAtlasGl>) {
     }
 }
 
+/// G-3 (2026-06-16): upload a SINGLE atlas on demand. Factored
+/// from `upload_all`'s per-atlas body so the runtime lookup
+/// (`msdf_atlas_for_family`) can lazy-upload the requested font
+/// on first miss instead of paying the full 29 MB upfront at
+/// session bring-up. Same RGB888 + LINEAR + CLAMP_TO_EDGE
+/// semantics as `upload_all`; same UNPACK_ALIGNMENT temporarily
+/// set to 1 + restored to 4 around the upload. Returns the
+/// NativeTexture handle on success; the caller is responsible
+/// for storing it in the session's atlas table for teardown.
+pub fn upload_one(
+    gl: &glow::Context,
+    atlas: &MsdfAtlas,
+) -> Result<glow::NativeTexture> {
+    use glow::HasContext;
+    unsafe {
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        let tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("glGenTextures(msdf {}): {e}", atlas.manifest.font))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGB as i32,
+            atlas.manifest.atlas_w as i32,
+            atlas.manifest.atlas_h as i32,
+            0,
+            glow::RGB,
+            glow::UNSIGNED_BYTE,
+            Some(atlas.atlas_rgb),
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        let err = gl.get_error();
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        if err != 0 {
+            gl.delete_texture(tex);
+            return Err(anyhow!(
+                "msdf atlas {} upload failed: GL error 0x{err:x}",
+                atlas.manifest.font
+            ));
+        }
+        Ok(tex)
+    }
+}
+
 /// Find an uploaded atlas by font stem (matches
 /// `font_family_to_filename`'s output without the `.ttf` suffix).
 /// Returns `None` if the font isn't in the baked set (e.g.

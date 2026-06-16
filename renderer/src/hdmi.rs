@@ -853,16 +853,46 @@ where
     // context is current. 23 atlases x ~1.3 MB each = ~30 MB GPU
     // memory, all RGB8. The Vec is freed at session teardown.
     //
-    // Failure semantics: if atlas loading fails, the session
-    // CAN'T render MSDF text (which is now the only text path).
-    // Bubble up the error -- the operator will see the failure
-    // immediately rather than getting silently-broken text on
-    // every slide.
+    // G-3 (2026-06-16): static MSDF atlas LAZY UPLOAD. Pre-G-3
+    // the eager `upload_all` path staged all 23 atlases (~29 MB
+    // GPU memory; up to ~30 MB RSS attribution depending on
+    // mesa's accounting) at session bring-up. With Pi Zero 2 W
+    // cma=320 leaving only ~96 MB non-CMA RAM, that ~29 MB was a
+    // sizeable contributor to the wedge ceiling — and it's
+    // most-of-the-time WASTE: Karl's reel uses Bebas Neue (NOT in
+    // the static atlas set) so 0 of the 23 atlases are actually
+    // consulted on his content; other reels touch a subset.
+    //
+    // Post-G-3: CPU-side parse + the OnceLock<Vec<MsdfAtlas>>
+    // initialization happen at session bring-up (cheap, ~80 KB
+    // for the parsed manifests + the static atlas_rgb bytes ride
+    // in .rodata via include_bytes!). The GPU texture upload is
+    // deferred to `msdf_atlas_for_family`'s first-miss path —
+    // each family's atlas (1.3 MB) is uploaded synchronously on
+    // first lookup, cached in MSDF_ATLAS_LOOKUP, and reused
+    // thereafter. Per-family upload cost ~30-100 ms paid once.
+    //
+    // Failure semantics: CPU-side parse failure still bubbles up
+    // (operator sees broken text rendering immediately). GPU
+    // upload failure (transient, e.g. resource exhaustion) logs
+    // a warn + returns None from msdf_atlas_for_family — layout
+    // then falls back to the dynamic glyph_cache path or tofu.
     {
-        let parsed = crate::sdf_atlas::load_all_atlases()
-            .map_err(|e| anyhow!("msdf atlas load failed: {e}"))?;
-        session.msdf_atlases = crate::sdf_atlas_gl::upload_all(&gl, &parsed)?;
-        populate_msdf_lookup(&session.msdf_atlases);
+        let _ = MSDF_ATLASES_CPU.get_or_init(|| {
+            crate::sdf_atlas::load_all_atlases().unwrap_or_default()
+        });
+        if MSDF_ATLASES_CPU.get().map(|v| v.is_empty()).unwrap_or(true) {
+            bail!("msdf atlas CPU-side parse produced 0 atlases");
+        }
+        // session.msdf_atlases stays empty (Vec::new). delete_all
+        // at teardown becomes a no-op on it; lazy-uploaded
+        // textures live in MSDF_ATLAS_LOOKUP and are released by
+        // clear_msdf_lookup at teardown (see the G-3 update to
+        // that helper below for the leak-fix).
+        let n = MSDF_ATLASES_CPU.get().map(|v| v.len()).unwrap_or(0);
+        eprintln!(
+            "[perf] msdf_static_atlas_lazy=true atlases_parsed={n} bytes_uploaded=0 (G-3: ~29 MB GPU deferred to first per-family text paint via msdf_atlas_for_family)"
+        );
     }
 
     // Bug 3 Slice 1 part B (2026-05-19): allocate the dynamic atlas
@@ -972,8 +1002,12 @@ where
     clear_msdf_text_vbo_cache(&gl);
     // SDF arc slice B.2: free msdf atlas textures while context
     // is still bound. Clear the lookup table first so a paint after
-    // teardown can't dereference dead texture handles.
-    clear_msdf_lookup();
+    // teardown can't dereference dead texture handles. G-3:
+    // clear_msdf_lookup now takes &gl + deletes lazy-uploaded
+    // textures owned by MSDF_ATLAS_LOOKUP (session.msdf_atlases
+    // stays empty under G-3 lazy upload; delete_all on it is a
+    // no-op kept for forward-compat with non-lazy code paths).
+    clear_msdf_lookup(&gl);
     crate::sdf_atlas_gl::delete_all(&gl, &mut session.msdf_atlases);
     // Slice 3D (2026-05-19): the CBDT-side `clear_emoji_lookup()` +
     // `delete_all` of session.emoji_atlases are gone alongside the
@@ -11903,8 +11937,25 @@ fn populate_msdf_lookup(atlases: &[crate::sdf_atlas_gl::MsdfAtlasGl]) {
     });
 }
 
-fn clear_msdf_lookup() {
-    MSDF_ATLAS_LOOKUP.with(|c| c.borrow_mut().clear());
+fn clear_msdf_lookup(gl: &glow::Context) {
+    use glow::HasContext;
+    // G-3 (2026-06-16): with lazy upload, MSDF_ATLAS_LOOKUP owns
+    // the NativeTexture handles for atlases that were uploaded
+    // on-demand via `msdf_atlas_for_family`. Pre-G-3 those handles
+    // were tracked in session.msdf_atlases and freed by
+    // sdf_atlas_gl::delete_all. Post-G-3 session.msdf_atlases is
+    // empty (upload_all skipped at session bring-up), so the
+    // GL textures must be deleted here at teardown to avoid a
+    // per-session leak on short-lived session callers (--play-
+    // slide, --capture-*, etc.). The sidecar session is process-
+    // lifetime so a leak there would be reclaimed by process exit
+    // anyway, but the short-lived callers run many sessions.
+    MSDF_ATLAS_LOOKUP.with(|c| {
+        let mut v = c.borrow_mut();
+        for (_stem, tex) in v.drain(..) {
+            unsafe { gl.delete_texture(tex); }
+        }
+    });
     // MSDF_ATLASES_CPU is process-lifetime + only references 'static
     // bytes; intentionally not cleared.
 }
@@ -11969,17 +12020,46 @@ fn font_family_to_atlas_stem(family: &str) -> Option<&'static str> {
 /// fall back to the catalog's default family ("Inter") when the
 /// requested family is missing.
 fn msdf_atlas_for_family(
+    gl: &glow::Context,
     family: &str,
 ) -> Option<(glow::NativeTexture, &'static crate::sdf_atlas::MsdfAtlas)> {
     let stem = font_family_to_atlas_stem(family)?;
     let cpu = MSDF_ATLASES_CPU.get()?;
     let atlas = crate::sdf_atlas::atlas_for_stem(cpu, stem)?;
-    let tex = MSDF_ATLAS_LOOKUP.with(|c| {
+    // G-3 (2026-06-16): static atlas LAZY-UPLOAD on first lookup
+    // miss. Pre-G-3 the upload_all path eagerly uploaded all 23
+    // atlases (~29 MB GPU) at session bring-up. Post-G-3
+    // upload_all is skipped; this lookup path uploads the requested
+    // atlas on demand and caches the handle in MSDF_ATLAS_LOOKUP
+    // for subsequent calls. Reels that never reference a particular
+    // family pay zero MB for it. Karl's reel (Bebas Neue, NOT in
+    // the static atlas set) never reaches this code path at all —
+    // it routes through the dynamic glyph_cache instead.
+    let existing = MSDF_ATLAS_LOOKUP.with(|c| {
         c.borrow()
             .iter()
             .find(|(s, _)| s == stem)
             .map(|(_, t)| *t)
-    })?;
+    });
+    if let Some(tex) = existing {
+        return Some((tex, atlas));
+    }
+    // Cold path: upload this single atlas, cache the handle.
+    let tex = match crate::sdf_atlas_gl::upload_one(gl, atlas) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("warn: msdf_atlas_lazy_upload {stem}: {e}");
+            return None;
+        }
+    };
+    let stem_owned = stem.to_string();
+    MSDF_ATLAS_LOOKUP.with(|c| {
+        c.borrow_mut().push((stem_owned, tex));
+    });
+    eprintln!(
+        "[perf] msdf_atlas_lazy_upload stem={stem} bytes_uploaded={size}",
+        size = atlas.manifest.atlas_w * atlas.manifest.atlas_h * 3,
+    );
     Some((tex, atlas))
 }
 
@@ -14142,8 +14222,8 @@ fn paint_slide_with_viewport(
                 let wrapped =
                     wrap_text_to_width(font.as_ref(), resolved_text, size_px, max_width_px);
                 let family = layer.font_family.as_deref().unwrap_or("Inter");
-                let group = msdf_atlas_for_family(family)
-                    .or_else(|| msdf_atlas_for_family("Inter"))
+                let group = msdf_atlas_for_family(gl, family)
+                    .or_else(|| msdf_atlas_for_family(gl, "Inter"))
                     .and_then(|(_atlas_tex, atlas)| {
                         // Bug 4 (2026-05-19): per-line X-squish gate.
                         // `max_width_px` is the same boxW used for
@@ -14287,8 +14367,8 @@ fn paint_slide_with_viewport(
                     continue;
                 };
                 let family = layer.font_family.as_deref().unwrap_or("Inter");
-                let (atlas_tex, _) = msdf_atlas_for_family(family)
-                    .or_else(|| msdf_atlas_for_family("Inter"))
+                let (atlas_tex, _) = msdf_atlas_for_family(gl, family)
+                    .or_else(|| msdf_atlas_for_family(gl, "Inter"))
                     .ok_or_else(|| {
                         anyhow!(
                             "MSDF atlas missing at draw time for family {family:?}"
@@ -14434,8 +14514,8 @@ fn paint_layers_via_overlay_route(
                 continue;
             };
             let family = layer.font_family.as_deref().unwrap_or("Inter");
-            let (atlas_tex, _) = msdf_atlas_for_family(family)
-                .or_else(|| msdf_atlas_for_family("Inter"))
+            let (atlas_tex, _) = msdf_atlas_for_family(gl, family)
+                .or_else(|| msdf_atlas_for_family(gl, "Inter"))
                 .ok_or_else(|| {
                     anyhow!(
                         "MSDF atlas missing at overlay-route draw for family {family:?}"

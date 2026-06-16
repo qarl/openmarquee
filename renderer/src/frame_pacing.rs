@@ -537,6 +537,39 @@ mod tests {
     }
 
     #[test]
+    fn g3_msdf_static_atlas_lazy_marker_pinned_in_hdmi_source() {
+        // 2026-06-16 G-3: the `msdf_static_atlas_lazy=true` literal +
+        // the `msdf_atlas_lazy_upload` per-family upload emit are QA's
+        // grep fingerprint that the eager 29 MB static atlas upload
+        // at session bring-up is GONE and replaced with lazy per-
+        // family upload on first paint. Positive pin on both emits;
+        // negative pin on `upload_all(` being called from hdmi.rs's
+        // session bring-up (the function itself stays available in
+        // sdf_atlas_gl for forward-compat with non-lazy callers).
+        let hdmi = include_str!("hdmi.rs");
+        assert!(
+            hdmi.contains("msdf_static_atlas_lazy=true"),
+            "G-3: `msdf_static_atlas_lazy=true` substring missing from hdmi.rs — \
+             QA's bench parser can no longer confirm the static atlas defer shipped",
+        );
+        assert!(
+            hdmi.contains("msdf_atlas_lazy_upload"),
+            "G-3: `msdf_atlas_lazy_upload` substring missing from hdmi.rs — \
+             refactored the per-family upload emit without updating this pin",
+        );
+        // Negative pin: the session bring-up must not re-call
+        // upload_all. The function `sdf_atlas_gl::upload_all` still
+        // exists in the crate (tests use it; standalone paths may),
+        // but hdmi.rs's session bring-up must not be the caller.
+        assert!(
+            !hdmi.contains("sdf_atlas_gl::upload_all"),
+            "G-3: hdmi.rs is calling `sdf_atlas_gl::upload_all` again — \
+             the eager 29 MB atlas upload was restored, undoing G-3 \
+             (renderer RSS at session=open would jump back to pre-G-3 baseline)",
+        );
+    }
+
+    #[test]
     fn g2_glyph_prewarm_skipped_marker_pinned_in_hdmi_source() {
         // 2026-06-16 G-2: the `glyph_prewarm_skipped` literal +
         // `on_demand_bake` reason field are QA's grep fingerprint
