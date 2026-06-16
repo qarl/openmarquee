@@ -86,6 +86,63 @@ PRELOAD_MODE_LEAD = "lead"
 PRELOAD_MODE_MAX = "max"
 _PRELOAD_MODES = frozenset({PRELOAD_MODE_DEFER, PRELOAD_MODE_LEAD, PRELOAD_MODE_MAX})
 
+# codec-jam followup (2026-06-16): preload window size. At slot
+# K, ensure slides K+1..K+N are preloaded (dedupe via
+# self._preloaded_slide_ids). Cold-start of slot 0: N
+# PreloadSlide commands burst (one per window item). Steady
+# state: one new PreloadSlide per slot (the new window edge),
+# composing with the existing per-slot tail-trigger as
+# belt-and-suspenders.
+#
+# Default 2 = current + 2 ahead. Empirically: 1 slide of
+# warmup is enough for steady-state preload (r58 ship), but
+# extending to 2 gives the renderer's cap=1 PRIMING_SEMAPHORE
+# (bed1681) more time to drain the cold-start prime queue
+# before any slide is needed for paint. Per-slide priming is
+# ~70-270ms; window=2 with 5s+ slot durations leaves ample
+# headroom.
+#
+# Env override: OPENMARQUEE_PRELOAD_WINDOW_SIZE (clamped to
+# [1, 5]).
+_DEFAULT_PRELOAD_WINDOW_SIZE = 2
+_PRELOAD_WINDOW_MIN = 1
+_PRELOAD_WINDOW_MAX = 5
+
+
+def _resolve_preload_window_size(env: dict[str, str] | None = None) -> int:
+    """codec-jam followup (2026-06-16): read
+    OPENMARQUEE_PRELOAD_WINDOW_SIZE env var with validation.
+
+    Returns the preload window size as int. Default 2
+    (current + 2 ahead). Clamps to [1, 5]; invalid inputs
+    (non-integer, negative) log a warning and fall back to
+    default. Parameter `env` exists for unit-testability.
+    """
+    import os
+
+    raw = (env if env is not None else os.environ).get("OPENMARQUEE_PRELOAD_WINDOW_SIZE")
+    if raw is None or raw == "":
+        return _DEFAULT_PRELOAD_WINDOW_SIZE
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning(
+            "OPENMARQUEE_PRELOAD_WINDOW_SIZE=%r is not an integer; using default %d",
+            raw,
+            _DEFAULT_PRELOAD_WINDOW_SIZE,
+        )
+        return _DEFAULT_PRELOAD_WINDOW_SIZE
+    if value < _PRELOAD_WINDOW_MIN or value > _PRELOAD_WINDOW_MAX:
+        log.warning(
+            "OPENMARQUEE_PRELOAD_WINDOW_SIZE=%d outside [%d, %d]; using default %d",
+            value,
+            _PRELOAD_WINDOW_MIN,
+            _PRELOAD_WINDOW_MAX,
+            _DEFAULT_PRELOAD_WINDOW_SIZE,
+        )
+        return _DEFAULT_PRELOAD_WINDOW_SIZE
+    return value
+
 
 def _resolve_preload_mode(env: dict[str, str] | None = None) -> str:
     """r98: read OPENMARQUEE_PRELOAD_MODE env var with validation.
@@ -311,6 +368,14 @@ class PlaybackLoop:
         # fixes the bad slide and switches playlists gets a fresh
         # ERROR if the fix didn't take.
         self._failed_slide_ids: set[UUID] = set()
+        # codec-jam followup (2026-06-16): track which slide ids
+        # we've already sent PreloadSlide for in the current
+        # playlist cycle. Backend-side dedup avoids redundant
+        # IPC roundtrips for slides already in the renderer's
+        # cache. Reset on playlist change via _stamp_playlist_id
+        # below (an operator switching playlists invalidates the
+        # window — fresh playlist re-builds the window from idx 0).
+        self._preloaded_slide_ids: set[UUID] = set()
         # Bug 8 gap (2026-05-20): per-slide throttle for the
         # unsupported-KIND skip log. Fix B's _failed_slide_ids only
         # throttles the IPC-FAILURE path; the unsupported-kind
@@ -748,6 +813,37 @@ class PlaybackLoop:
                     if played:
                         any_played = True
                     continue
+
+                # codec-jam followup (2026-06-16): ensure the
+                # preload window covers slides
+                # current_idx+1..current_idx+window_size BEFORE
+                # we begin painting current. At cold-start
+                # (slot 0): this fires window_size PreloadSlide
+                # commands in a burst (current+1..current+N).
+                # Steady-state (slot K>0): only the new window
+                # edge slide is enqueued (others already in
+                # self._preloaded_slide_ids from prior slots).
+                #
+                # Composes with the existing per-slot tail-
+                # trigger at slot end; renderer-side cap=1
+                # PRIMING_SEMAPHORE (bed1681) + cap=1
+                # MAX_CONCURRENT_PRELOADS (33bccec) serialize
+                # the actual prime work.
+                #
+                # r58 invariant preserved: skip window-preload
+                # entirely when current slide's duration is below
+                # the preload-lead threshold (sub-second slides
+                # have no time for preload to help; firing it is
+                # wasted work). The tail-trigger has the same
+                # gate; keep them aligned.
+                _window_preload_lead_seconds = _resolve_preload_lead_seconds()
+                _window_preload_min_duration_ms = int(_window_preload_lead_seconds * 1000)
+                if int(item.duration_ms) >= _window_preload_min_duration_ms:
+                    await self._ensure_preload_window(
+                        items,
+                        i,
+                        _resolve_preload_window_size(),
+                    )
 
                 # IPC route. After the DELETE-PIL purge (slices 1-12)
                 # there is no PIL fallback: every renderer the loop is
@@ -1795,6 +1891,92 @@ class PlaybackLoop:
         """
         return self._current_playlist_id
 
+    async def _ensure_preload_window(
+        self,
+        items: list[ContentItem],
+        current_idx: int,
+        window_size: int,
+    ) -> None:
+        """codec-jam followup (2026-06-16): ensure slides at
+        current_idx+1..current_idx+window_size are preloaded
+        on the renderer side.
+
+        Backend dedupe via self._preloaded_slide_ids — slides
+        already issued in this playlist cycle are skipped (the
+        renderer's PreloadSlide IPC arm has its own dedup via
+        cache.video_demuxers + has_video_decoder, but
+        backend-side skip saves the IPC roundtrip).
+
+        Emits `[backend] preload_schedule_emit current_index=X
+        target_index=Y window_size=N slide_id=Z` per issued
+        PreloadSlide. QA's bench parser keys on this literal to
+        verify the window scheduling fires correctly (not all
+        21 at cold-start, not 0 ever; exactly window_size at
+        cold-start + 1 new per advance steady-state).
+
+        Composes with:
+        - existing per-slot tail-trigger at slot end (lead-time
+          fires PreloadSlide for next_item once; renderer dedupes
+          the second emit when the window already covered it)
+        - 'max' mode begin_slide preload (same dedup applies)
+        - renderer-side MAX_CONCURRENT_PRELOADS=1 cap (33bccec) +
+          PRIMING_SEMAPHORE cap=1 (bed1681): over-cap drops are
+          fine; backend will retry on next slot via this method
+          since the slide isn't in _preloaded_slide_ids yet
+          ONLY when the drop is actionable... wait, renderer
+          drops are silent (return ok_empty), so backend sees
+          success and adds to _preloaded_slide_ids. Trade-off:
+          if a renderer drop is "lost", backend won't re-fire.
+          But next BeginSlide hits sync cache.load fallback,
+          which still primes. So worst case = slight latency,
+          not failure.
+
+        Non-fatal: any single preload_slide IPC failure logs a
+        warning + adds the slide to _preloaded_slide_ids
+        (preventing retry storm). The slide will hit the same
+        failure on its actual BeginSlide where the UnsupportedSlide
+        rail picks it up.
+
+        For single-item playlists, no-op (no "next" to preload).
+        """
+        n_items = len(items)
+        if n_items <= 1:
+            return
+        # Iterate the window. With wrap-around (% n_items) for
+        # cyclic playlists; for n_items > window_size, the wrap
+        # is a no-op for the normal range.
+        for offset in range(1, min(window_size + 1, n_items)):
+            target_idx = (current_idx + offset) % n_items
+            target = items[target_idx]
+            target_id = target.id
+            if target_id in self._preloaded_slide_ids:
+                continue
+            try:
+                await asyncio.to_thread(
+                    self._renderer.preload_slide,
+                    target_id,
+                )
+            except Exception as e:
+                # Non-fatal per docstring above. Add to set
+                # regardless so we don't retry every slot.
+                log.warning(
+                    "playback: preload_window emit current_idx=%d target_idx=%d "
+                    "slide_id=%s failed (non-fatal): %s",
+                    current_idx,
+                    target_idx,
+                    target_id,
+                    e,
+                )
+            self._preloaded_slide_ids.add(target_id)
+            log.info(
+                "[backend] preload_schedule_emit current_index=%d target_index=%d "
+                "window_size=%d slide_id=%s",
+                current_idx,
+                target_idx,
+                window_size,
+                target_id,
+            )
+
     def _stamp_playlist_id(self, playlist_id: UUID | None) -> None:
         """Hook for the scheduled fetch fn to publish which playlist is
         currently active. Test-only setter is just self._current_playlist_id.
@@ -1822,6 +2004,10 @@ class PlaybackLoop:
             )
             self._failed_slide_ids.clear()
             self._skipped_slide_ids.clear()
+            # codec-jam followup (2026-06-16): playlist switch
+            # invalidates the preload window — the new playlist
+            # rebuilds its window from idx 0 on the first slot.
+            self._preloaded_slide_ids.clear()
         self._current_playlist_id = playlist_id
 
     # --- /api/playback/current-frame capture (added 2026-05-06) ----------

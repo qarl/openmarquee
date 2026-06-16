@@ -2124,3 +2124,70 @@ class TestResolvePreloadLeadSeconds:
             assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "abc"}) == 1.0
             assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "µs"}) == 1.0
         assert sum(1 for r in caplog.records if "OPENMARQUEE_PRELOAD_LEAD_MS" in r.message) == 3
+
+
+class TestResolvePreloadWindowSize:
+    """codec-jam followup (2026-06-16): OPENMARQUEE_PRELOAD_WINDOW_SIZE
+    env var validation. Default 2 (current + 2 ahead)."""
+
+    def test_default_when_unset(self):
+        from openmarquee.playback import _resolve_preload_window_size
+
+        assert _resolve_preload_window_size(env={}) == 2
+
+    def test_recognises_canonical_values(self):
+        from openmarquee.playback import _resolve_preload_window_size
+
+        for n in (1, 2, 3, 4, 5):
+            assert (
+                _resolve_preload_window_size(env={"OPENMARQUEE_PRELOAD_WINDOW_SIZE": str(n)}) == n
+            )
+
+    def test_empty_string_silently_defaults(self, caplog):
+        from openmarquee.playback import _resolve_preload_window_size
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_window_size(env={"OPENMARQUEE_PRELOAD_WINDOW_SIZE": ""}) == 2
+        assert not any("OPENMARQUEE_PRELOAD_WINDOW_SIZE" in r.message for r in caplog.records)
+
+    def test_below_min_falls_back_with_warn(self, caplog):
+        from openmarquee.playback import _resolve_preload_window_size
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_window_size(env={"OPENMARQUEE_PRELOAD_WINDOW_SIZE": "0"}) == 2
+            assert _resolve_preload_window_size(env={"OPENMARQUEE_PRELOAD_WINDOW_SIZE": "-1"}) == 2
+        assert sum(1 for r in caplog.records if "OPENMARQUEE_PRELOAD_WINDOW_SIZE" in r.message) == 2
+
+    def test_above_max_falls_back_with_warn(self, caplog):
+        from openmarquee.playback import _resolve_preload_window_size
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_window_size(env={"OPENMARQUEE_PRELOAD_WINDOW_SIZE": "6"}) == 2
+            assert _resolve_preload_window_size(env={"OPENMARQUEE_PRELOAD_WINDOW_SIZE": "99"}) == 2
+        assert sum(1 for r in caplog.records if "OPENMARQUEE_PRELOAD_WINDOW_SIZE" in r.message) == 2
+
+    def test_non_integer_falls_back_with_warn(self, caplog):
+        from openmarquee.playback import _resolve_preload_window_size
+
+        with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
+            assert _resolve_preload_window_size(env={"OPENMARQUEE_PRELOAD_WINDOW_SIZE": "2.0"}) == 2
+            assert _resolve_preload_window_size(env={"OPENMARQUEE_PRELOAD_WINDOW_SIZE": "abc"}) == 2
+        assert sum(1 for r in caplog.records if "OPENMARQUEE_PRELOAD_WINDOW_SIZE" in r.message) == 2
+
+
+def test_preload_schedule_emit_marker_pinned_in_playback_source():
+    """codec-jam followup (2026-06-16): QA's bench parser greps
+    `[backend] preload_schedule_emit` literally to verify the
+    window scheduling fires correctly at cold-start (window_size
+    emits) and during steady-state (one new emit per advance).
+    A rename here would silently break the bench's split-
+    attribution of window vs tail-trigger preload paths."""
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "openmarquee" / "playback.py"
+    text = src.read_text()
+    assert "[backend] preload_schedule_emit" in text, (
+        "codec-jam followup: `[backend] preload_schedule_emit` substring missing "
+        "from playback.py — QA's bench parser will no longer be able to verify the "
+        "preload window scheduling at cold-start"
+    )
