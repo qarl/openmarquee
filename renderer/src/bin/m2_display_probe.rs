@@ -378,7 +378,18 @@ void main() {
         height: u32,
         stride: u32,
         y_crop_max: f32,
+        site: &str,
     ) -> Result<()> {
+        // Helper to check + report glGetError immediately after a
+        // suspected source. Returns the error code so caller can
+        // log + decide.
+        let check_gl_err = |label: &str| -> u32 {
+            let err = gl.get_error();
+            if err != 0 {
+                eprintln!("[m2] WARN gl_err=0x{err:x} at {site}/{label}");
+            }
+            err
+        };
         let y_size: i32 = (stride as i32) * (height as i32);
         // EGL attribute list — verbatim from hdmi.rs:13186.
         let attribs: [i32; 20] = [
@@ -420,6 +431,7 @@ void main() {
         gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
         gl.tex_parameter_i32(GL_TEXTURE_EXTERNAL_OES, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
         (eps.image_target_texture_2d)(GL_TEXTURE_EXTERNAL_OES, egl_image);
+        check_gl_err("after_image_target_texture_2d");
         // Shader + draw.
         gl.use_program(Some(program.program));
         gl.uniform_1_i32(Some(&program.u_tex_external), 0);
@@ -430,6 +442,20 @@ void main() {
         gl.enable_vertex_attrib_array(program.a_uv);
         gl.vertex_attrib_pointer_f32(program.a_uv, 2, glow::FLOAT, false, 16, 8);
         gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        check_gl_err("after_draw_arrays");
+        // M2 wiring-fix (2026-06-17 post first-bench DIVERGENT-all-black
+        // diagnosis): force the GPU to actually CONSUME the draw before
+        // we tear down the texture + EGLImage. Prod's hot path keeps
+        // both cached across frames (c06340b spike-kill + r101 cache),
+        // so the per-frame create/destroy path historically deferred
+        // texture+image cleanup via cache eviction. M2 lacks the cache,
+        // so the draw can be queued while the texture+image get deleted
+        // BEFORE the GPU touches them — vc4 then renders BLACK because
+        // its draw-side reference is gone. gl.finish() blocks until the
+        // GPU completes the queued draws, making the per-frame
+        // create/destroy safe (slower per blit by ~5-15 ms but
+        // correctness > throughput for a probe).
+        gl.finish();
         gl.disable_vertex_attrib_array(program.a_pos);
         gl.disable_vertex_attrib_array(program.a_uv);
         // Teardown — order matters (texture → EGLImage).
@@ -836,6 +862,7 @@ void main() {
                             &gl, &egl_lib, display, dma_eps,
                             &blit_program, vbo, fd,
                             f.width(), f.height(), f.stride(), 1.0,
+                            "a_blit",
                         ) {
                             Ok(()) => {}
                             Err(e) => eprintln!("[m2] A blit err: {e:#}"),
@@ -850,6 +877,7 @@ void main() {
                             &gl, &egl_lib, display, dma_eps,
                             &blit_program, vbo, fd,
                             f.width(), f.height(), f.stride(), 1.0,
+                            "b_blit",
                         ) {
                             Ok(()) => {
                                 if b_first_resume_to_screen_us == 0 {
