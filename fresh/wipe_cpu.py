@@ -70,6 +70,16 @@ Why this gets the frame flow right:
     loop and exits the script. A future iteration could NULL the
     affected decode pipeline and keep the compositor running on its
     timeout-fallback frames.)
+  - SHARED CLOCK + SHARED BASE-TIME across all three pipelines (forced
+    after PAUSED, before any PLAYING). Each Gst.Pipeline normally
+    auto-selects its own clock at PLAYING -- with three pipelines and
+    an intervideo bridge that carries PTS, the consumer pipeline reads
+    those PTS in a different timebase, kmssink sync=true throttles to
+    match the mismatch, and the whole system runs at ~8% real-time.
+    use_clock(SystemClock) + identical set_base_time gives all three a
+    single shared running-time origin; do-timestamp=false on each
+    intervideosrc preserves the producer's PTS instead of re-stamping
+    against the throttled cadence.
 
 WIPE (unchanged): GLib timer animates comp.sink_1 xpos/width 0->DW
 over WIPE_S; after the wipe roles swap. Both inputs are genuinely
@@ -201,11 +211,11 @@ def build_compositor_pipeline():
         f"! videoconvert "
         f"! {NV12_DISP} "
         f"! kmssink name=sink sync=true "
-        f"intervideosrc channel=chA timeout=200000000 do-timestamp=true "
+        f"intervideosrc channel=chA timeout=200000000 do-timestamp=false "
         f"  ! videorate skip-to-first=true ! {RATE_30} "
         f"  ! queue max-size-buffers=2 leaky=downstream "
         f"  ! comp.sink_0 "
-        f"intervideosrc channel=chB timeout=200000000 do-timestamp=true "
+        f"intervideosrc channel=chB timeout=200000000 do-timestamp=false "
         f"  ! videorate skip-to-first=true ! {RATE_30} "
         f"  ! queue max-size-buffers=2 leaky=downstream "
         f"  ! comp.sink_1"
@@ -513,6 +523,40 @@ if shutdown_requested:
 for label, demux in [("demuxA", demuxA), ("demuxB", demuxB)]:
     if not segment_seek(demux):
         die(f"initial SEGMENT seek failed on {label}")
+
+# Force one shared clock + one shared base-time on all three pipelines
+# BEFORE any of them goes PLAYING. Each Gst.Pipeline normally
+# auto-selects its own clock at PLAYING and stamps buffers in its own
+# timebase; the intervideo bridge then carries PTS that are only valid
+# in the producer pipeline -- pipe_c interprets them against ITS clock,
+# kmssink sync=true throttles to match the timebase mismatch, the
+# blocking intervideo handoff back-pressures all the way to the
+# decoders, and the whole system runs at ~8% real-time (the prior
+# slow-motion bug). use_clock pins the clock so the PLAYING transition
+# will not re-select; set_base_time after PAUSED with the same value
+# everywhere gives all three pipelines a single shared running-time
+# origin. do-timestamp=false on intervideosrc (above) preserves the
+# producer's PTS instead of re-stamping against the throttled cadence.
+shared_clock = Gst.SystemClock.obtain()
+shared_base_time = shared_clock.get_time()
+for label, p in [("compositor", pipe_c),
+                 ("decodeA", pipe_a),
+                 ("decodeB", pipe_b)]:
+    p.use_clock(shared_clock)
+    p.set_base_time(shared_base_time)
+
+# Inline verification log so QA can grep the journal for clock/base-time
+# match without needing to add their own probe.
+clock_name = shared_clock.get_name() or "?"
+print(f"[wipe_cpu] shared clock: {clock_name} "
+      f"base_time={shared_base_time} ns")
+for label, p in [("compositor", pipe_c),
+                 ("decodeA", pipe_a),
+                 ("decodeB", pipe_b)]:
+    c = p.get_clock()
+    bt = p.get_base_time()
+    cn = c.get_name() if c is not None else "NONE"
+    print(f"[wipe_cpu]   {label}: clock={cn} base_time={bt} ns")
 
 for label, p in [("compositor", pipe_c),
                  ("decodeA", pipe_a),
