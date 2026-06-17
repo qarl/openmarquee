@@ -1635,18 +1635,35 @@ fn spawn_async_to_prime_for_begin_slide(
         return Ok(());
     }
     // codec-jam diag 2026-06-16 (post-bed1681 RED): reduced
-    // from 2 to 1. QA's wedge had 0 prime markers + CPU storm
-    // → execution never reached prime → my PRIMING_SEMAPHORE
-    // didn't help. Hypothesis: 2 concurrent preload SPAWNS
-    // upstream of prime (Mp4Demuxer::open + V4L2 fd open in
-    // parallel) overwhelms the firmware OR the IPC loop. Cap=1
-    // serializes the SPAWN side too. Net safety: strictly
-    // serial preload + sync fallback on cap-hit. The new
-    // diagnostic markers (preload_spawn_entered, mp4_demuxer_
-    // open_start/done, v4l2_decoder_open_attempt/success,
-    // prime_video_decoder_entered) will reveal where execution
-    // actually wedges if cap=1 is insufficient.
-    const MAX_CONCURRENT_PRELOADS: usize = 1;
+    // from 2 to 1 against a wrong codec-jam-at-spawn hypothesis.
+    // The TRUE cold-start wedge surface turned out to be the glyph
+    // prewarm storm (G-2/G-3) + the backend content_storage pathlib
+    // walk (50197ff). Cap=1 was a wrong-direction fix that ALSO
+    // dropped every look-ahead preload (QA forensic 2026-06-16
+    // over 15 cycles: 15/15 look-ahead drops + 15/15 sync cold-loads
+    // = ~0 ms lead on half of all transitions vs Karl's ≥2 s
+    // directive). Raising back to 2 (original r65 design) so:
+    //   - the canonical transition envelope (current + next-preload)
+    //     fits without dropping the next preload
+    //   - PreloadSlide(K+1) issued at slot K start (44b7e10 backend
+    //     window) can run while a residual prior-cycle worker
+    //     completes
+    //
+    // Constraints still hold:
+    //   - 2ead796 eviction-timing freed the from-side decoder at
+    //     end-of-transition (not next BeginSlide), so the 2-decoder
+    //     concurrent window is BOUNDED to the actual transition +
+    //     lead time, not (lead + hold).
+    //   - bed1681 PRIMING_SEMAPHORE cap=1 still serializes the
+    //     codec-firmware-touching ioctls (REQBUFS/STREAMON/feed).
+    //     Two spawned workers contend on the semaphore; the
+    //     winner primes, loser waits. Spawn parallelism without
+    //     codec-firmware parallelism.
+    //   - r75 MMAL slot leak (vchiq_mmal_component_init -62)
+    //     accelerates with longer 2-decoder overlap. eviction-
+    //     timing keeps the overlap bounded; per-slide budget
+    //     still fits 4-slot MMAL ceiling at 720p.
+    const MAX_CONCURRENT_PRELOADS: usize = 2;
     if cache.pending_preloads.len() >= MAX_CONCURRENT_PRELOADS {
         // Capacity full. Fall back to synchronous cache.load so
         // the slide can still start; cost shape is identical to
@@ -3883,9 +3900,16 @@ fn handle_inner_request(
             // pre-r65).
             // codec-jam diag 2026-06-16 (post-bed1681 RED):
             // reduced from 2 to 1 in lockstep with the
-            // spawn_async_to_prime_for_begin_slide cap. See the
-            // longer comment there for the wedge hypothesis.
-            const MAX_CONCURRENT_PRELOADS: usize = 1;
+            // spawn_async_to_prime_for_begin_slide cap based on
+            // a wrong codec-jam-at-spawn hypothesis. Raised back
+            // to 2 (original r65 design) — the true wedge surface
+            // was glyph prewarm + content_storage pathlib walk,
+            // both fixed. See the longer comment in
+            // spawn_async_to_prime_for_begin_slide for the full
+            // rationale. r75 MMAL slot-leak risk is bounded by
+            // 2ead796 eviction-timing; codec-firmware ioctl
+            // serialization remains in bed1681 PRIMING_SEMAPHORE.
+            const MAX_CONCURRENT_PRELOADS: usize = 2;
             if cache.pending_preloads.len() >= MAX_CONCURRENT_PRELOADS
                 && !cache.pending_preloads.contains_key(&preload_id)
             {

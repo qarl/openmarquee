@@ -2075,15 +2075,19 @@ class TestResolvePreloadMode:
 
 
 class TestResolvePreloadLeadSeconds:
+    # 2026-06-16 Karl directive + QA forensic: default lead bumped
+    # 1.0 → 2.0 s. Karl's explicit requirement: the incoming
+    # decoder must be primed + producing frames ≥ 2 s before the
+    # transition, every transition. Pinned defaults updated.
     def test_default_when_unset(self):
         from openmarquee.playback import _resolve_preload_lead_seconds
 
-        assert _resolve_preload_lead_seconds(env={}) == 1.0
+        assert _resolve_preload_lead_seconds(env={}) == 2.0
 
     def test_default_when_empty_string(self):
         from openmarquee.playback import _resolve_preload_lead_seconds
 
-        assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": ""}) == 1.0
+        assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": ""}) == 2.0
 
     def test_valid_in_range(self):
         from openmarquee.playback import _resolve_preload_lead_seconds
@@ -2099,9 +2103,9 @@ class TestResolvePreloadLeadSeconds:
         from openmarquee.playback import _resolve_preload_lead_seconds
 
         with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
-            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "50"}) == 1.0
-            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "0"}) == 1.0
-            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "-1"}) == 1.0
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "50"}) == 2.0
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "0"}) == 2.0
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "-1"}) == 2.0
         assert sum(1 for r in caplog.records if "OPENMARQUEE_PRELOAD_LEAD_MS" in r.message) == 3
 
     def test_above_max_falls_back_with_warn(self, caplog):
@@ -2109,10 +2113,10 @@ class TestResolvePreloadLeadSeconds:
 
         with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
             assert (
-                _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "10001"}) == 1.0
+                _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "10001"}) == 2.0
             )
             assert (
-                _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "99999"}) == 1.0
+                _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "99999"}) == 2.0
             )
         assert sum(1 for r in caplog.records if "OPENMARQUEE_PRELOAD_LEAD_MS" in r.message) == 2
 
@@ -2120,9 +2124,9 @@ class TestResolvePreloadLeadSeconds:
         from openmarquee.playback import _resolve_preload_lead_seconds
 
         with caplog.at_level(logging.WARNING, logger="openmarquee.playback"):
-            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "3.14"}) == 1.0
-            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "abc"}) == 1.0
-            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "µs"}) == 1.0
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "3.14"}) == 2.0
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "abc"}) == 2.0
+            assert _resolve_preload_lead_seconds(env={"OPENMARQUEE_PRELOAD_LEAD_MS": "µs"}) == 2.0
         assert sum(1 for r in caplog.records if "OPENMARQUEE_PRELOAD_LEAD_MS" in r.message) == 3
 
 

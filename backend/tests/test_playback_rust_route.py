@@ -918,21 +918,22 @@ async def test_r58_preload_fires_for_next_slide_during_current_tail():
     next slide so its V4L2 decoder bring-up happens off the
     transition critical path.
 
-    Uses a 3000 ms duration (well over the 2000 ms threshold) so
-    the trigger fires reliably. The 1.5 s sleep covers the trigger
-    boundary (3000/1000 − 2.0 = 1.0 s) — slide A does NOT finish in
-    the window; we assert only that B was preloaded (not begun)."""
+    Uses a 3000 ms duration (well over the 2000 ms threshold from
+    2026-06-16 Karl directive) so the trigger fires reliably. The
+    1.0 s sleep covers the trigger boundary (3000/1000 − 2.0 =
+    1.0 s) — slide A does NOT finish in the window; we assert only
+    that B was preloaded (not begun)."""
     text_a = _text_slide(
         name="A",
         text="A",
-        duration_ms=1500,
+        duration_ms=3000,
         transition="fade",
         transition_ms=30,
     )
     text_b = _text_slide(
         name="B",
         text="B",
-        duration_ms=1500,
+        duration_ms=3000,
         transition="fade",
         transition_ms=30,
     )
@@ -1023,14 +1024,14 @@ async def test_r58_preload_forwards_through_autofallback_wrapper():
     text_a = _text_slide(
         name="A",
         text="A",
-        duration_ms=1500,
+        duration_ms=3000,
         transition="fade",
         transition_ms=30,
     )
     text_b = _text_slide(
         name="B",
         text="B",
-        duration_ms=1500,
+        duration_ms=3000,
         transition="fade",
         transition_ms=30,
     )
@@ -1069,8 +1070,8 @@ async def test_r58_preload_exception_does_not_kill_playback(caplog):
             self.preload_slide_calls.append(slide_id)
             raise RuntimeError("simulated preload failure (CMA pressure)")
 
-    text_a = _text_slide(name="A", text="A", duration_ms=1500, transition="fade", transition_ms=30)
-    text_b = _text_slide(name="B", text="B", duration_ms=1500, transition="fade", transition_ms=30)
+    text_a = _text_slide(name="A", text="A", duration_ms=3000, transition="fade", transition_ms=30)
+    text_b = _text_slide(name="B", text="B", duration_ms=3000, transition="fade", transition_ms=30)
 
     fake = _PreloadRaisingFake(width=8, height=8)
     loop = PlaybackLoop(

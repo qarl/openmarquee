@@ -75,7 +75,21 @@ _STREAM_CONNECT_TIMEOUT_S = 3.0
 # paths; the lead/max modes only matter when the slide flow has
 # back-to-back video-bg slides where r97's defer would otherwise
 # skip the preload.
-_DEFAULT_PRELOAD_LEAD_MS = 1000
+# 2026-06-16 (Karl directive + QA forensic): bumped 1000 → 2000.
+# QA's 15-cycle steady-state forensic on the head-start 4e19469
+# binary measured a bimodal lead distribution: ~1.8 s on half the
+# transitions and ~0 ms on the other half (sync cold-load at
+# transition start). Root cause traced to the Rust-side
+# MAX_CONCURRENT_PRELOADS=1 cap dropping 15/15 look-ahead
+# preloads → forced sync cache.load on the next BeginSlide. With
+# the cap raised back to 2 in this same arc, the look-ahead
+# preload (PreloadSlide(K+1) issued at slot K start by the
+# backend window from 44b7e10) now reliably reaches prime; the
+# lead value below is what determines its trigger window in
+# `defer` / `lead` modes. Karl's explicit directive: the
+# incoming decoder must be primed + producing frames ≥2 s
+# before the transition, every transition. 2000 ms matches.
+_DEFAULT_PRELOAD_LEAD_MS = 2000
 _PRELOAD_LEAD_MIN_MS = 100
 _PRELOAD_LEAD_MAX_MS = 10000
 
@@ -1959,9 +1973,15 @@ class PlaybackLoop:
             except Exception as e:
                 # Non-fatal per docstring above. Add to set
                 # regardless so we don't retry every slot.
+                # 2026-06-16: includes the literal "preload_slide"
+                # so the existing `non-fatal preload warning`
+                # regression-lock test (test_r58_preload_exception_
+                # does_not_kill_playback) matches BOTH the
+                # tail-trigger path AND the window emit path on
+                # the same substring contract.
                 log.warning(
-                    "playback: preload_window emit current_idx=%d target_idx=%d "
-                    "slide_id=%s failed (non-fatal): %s",
+                    "playback: preload_window emit (preload_slide) "
+                    "current_idx=%d target_idx=%d slide_id=%s failed (non-fatal): %s",
                     current_idx,
                     target_idx,
                     target_id,
