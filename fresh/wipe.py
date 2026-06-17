@@ -1,8 +1,29 @@
 #!/usr/bin/env python3
 """fresh/wipe.py — A <-> B wipe with TWO live HW H264 decoders, GL blend, seek-loop.
 
-Step 2b (fix iteration) of fresh-stack rebuild (2026-06-17). v2 changes
-on top of f993751:
+Step 2b (service-robust iteration) of fresh-stack rebuild (2026-06-17).
+
+v3 changes on top of 8099590 (service launch hardening):
+
+  - XDG_RUNTIME_DIR fallback. systemd-run --scope launches inherit
+    NO XDG_RUNTIME_DIR (no logind = no /run/user/<uid>). Mesa's vc4
+    EGL/GBM init uses XDG_RUNTIME_DIR for dri-socket path AND for
+    shader-cache discovery; without it, first GL context creation
+    cold-compiles every shader and the PAUSED preroll runs past 10s.
+    `_ensure_xdg_runtime_dir()` populates the env BEFORE Gst.init,
+    falling back from inherited -> /run/user/<uid> -> /tmp/runtime-<uid>
+    (created 0700 if missing).
+  - 30s preroll budget with progress polling. The old 5s timeout died
+    immediately on the FIRST systemd cold-start (no cache, slower init);
+    the new loop polls get_state at 1s ticks up to 30s, logs each
+    ASYNC tick so a slow-but-progressing preroll is NOT mistaken for
+    hang, and only dies on FAILURE or budget exhausted.
+  - SIGTERM during preroll exits cleanly. The shutdown handler sets a
+    shared `shutdown_requested` flag; the preroll polling loop checks
+    it each iteration and exits without waiting for the systemd
+    SIGTERM->SIGKILL timer.
+
+v2 changes (kept from 8099590):
 
   1. GPU blend: glupload -> glvideomixer -> gldownload -> kmssink
      (was: videoconvert -> compositor [CPU sysmem] -> kmssink, which
@@ -58,6 +79,37 @@ import sys
 os.environ.setdefault("GST_GL_PLATFORM", "egl")
 os.environ.setdefault("GST_GL_WINDOW", "gbm")
 os.environ.setdefault("GST_GL_API", "gles2")
+
+
+def _ensure_xdg_runtime_dir():
+    """systemd transient services launched without logind (e.g.
+    `systemd-run --scope`) inherit NO XDG_RUNTIME_DIR. EGL/GBM on Mesa
+    uses XDG_RUNTIME_DIR for the dri socket path AND for the shader
+    cache (XDG_CACHE_HOME falls back via XDG_RUNTIME_DIR derivations).
+    Without it the first GL context creation on V3D triggers a full
+    cold shader compile and various probe fallbacks — empirically
+    pushing PAUSED preroll past 10s on Pi Zero 2 W.
+
+    Fallback chain: existing env -> /run/user/<uid> (logind path) ->
+    /tmp/runtime-<uid> (mode 0700, created if missing).
+    """
+    if os.environ.get("XDG_RUNTIME_DIR"):
+        return
+    uid = os.getuid()
+    for candidate in (f"/run/user/{uid}", f"/tmp/runtime-{uid}"):
+        try:
+            os.makedirs(candidate, mode=0o700, exist_ok=True)
+            os.chmod(candidate, 0o700)
+            os.environ["XDG_RUNTIME_DIR"] = candidate
+            print(f"[wipe] XDG_RUNTIME_DIR fallback: {candidate}")
+            return
+        except OSError:
+            continue
+    print("[wipe] WARN: no writable XDG_RUNTIME_DIR; GL cold-start may be slow",
+          file=sys.stderr)
+
+
+_ensure_xdg_runtime_dir()
 
 import gi  # noqa: E402
 
@@ -303,7 +355,15 @@ bus.add_signal_watch()
 bus.connect("message", on_bus)
 
 
+shutdown_requested = False
+
+
 def shutdown(*_):
+    global shutdown_requested
+    shutdown_requested = True
+    # The GLib main loop may not be running yet (still in preroll); the
+    # preroll polling loop also checks shutdown_requested so SIGTERM
+    # during cold-start exits cleanly without waiting on systemd SIGKILL.
     GLib.idle_add(loop.quit)
 
 
@@ -320,9 +380,32 @@ print(f"[wipe] starting; HOLD={HOLD_S}s WIPE={WIPE_S}s; ctrl-c to stop")
 # non-flushing loop mode for each source.
 if pipeline.set_state(Gst.State.PAUSED) == Gst.StateChangeReturn.FAILURE:
     die("pipeline failed to enter PAUSED")
-ret, _, _ = pipeline.get_state(5 * Gst.SECOND)
-if ret != Gst.StateChangeReturn.SUCCESS:
-    die(f"pipeline did not reach PAUSED within 5s (got {ret.value_nick})")
+
+# GL cold-start as a systemd service (no logind session) legitimately
+# needs 10-20s on a Zero 2 W even with the XDG_RUNTIME_DIR fallback
+# above. Poll get_state with a 1s tick up to a 30s budget; log
+# progress so a slow-but-progressing preroll isn't mistaken for hang.
+PREROLL_BUDGET_S = 30
+POLL_S = 1
+prerolled = False
+for elapsed in range(POLL_S, PREROLL_BUDGET_S + POLL_S, POLL_S):
+    if shutdown_requested:
+        pipeline.set_state(Gst.State.NULL)
+        sys.exit(0)
+    ret, cur, pending = pipeline.get_state(POLL_S * Gst.SECOND)
+    if ret == Gst.StateChangeReturn.SUCCESS:
+        print(f"[wipe] preroll done after ~{elapsed}s "
+              f"(state={cur.value_nick})")
+        prerolled = True
+        break
+    if ret == Gst.StateChangeReturn.FAILURE:
+        die("pipeline preroll FAILURE")
+    # ASYNC — still progressing; log + keep polling.
+    print(f"[wipe] preroll... state={cur.value_nick} "
+          f"pending={pending.value_nick} ({elapsed}/{PREROLL_BUDGET_S}s)")
+
+if not prerolled:
+    die(f"pipeline preroll exceeded {PREROLL_BUDGET_S}s budget")
 
 for name, demux in demuxes.items():
     if not segment_seek(demux):
