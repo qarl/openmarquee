@@ -443,9 +443,24 @@ signal.signal(signal.SIGTERM, shutdown)
 
 def preroll_to_paused(p, label):
     """Set p to PAUSED and poll get_state up to PREROLL_BUDGET_S
-    seconds. Logs each ASYNC tick. Honors shutdown_requested."""
-    if p.set_state(Gst.State.PAUSED) == Gst.StateChangeReturn.FAILURE:
+    seconds. Logs each ASYNC tick. Honors shutdown_requested.
+
+    Live pipelines (compositor pipe_c contains intervideosrc x2) reach
+    PAUSED but return NO_PREROLL rather than SUCCESS -- live sources
+    only produce buffers in PLAYING. NO_PREROLL is a "yes, in PAUSED,
+    will produce on PLAYING" answer, NOT a failure; accept it as
+    success-equivalent so the live compositor pipeline does not
+    30-second-budget-out waiting for a SUCCESS that will never arrive.
+    File-backed decode pipelines still return SUCCESS via the ASYNC
+    path (their non-live sources DO preroll a buffer in PAUSED, which
+    is what the initial SEGMENT seek then arms)."""
+    ret = p.set_state(Gst.State.PAUSED)
+    if ret == Gst.StateChangeReturn.FAILURE:
         die(f"{label}: pipeline failed to enter PAUSED")
+    if ret == Gst.StateChangeReturn.NO_PREROLL:
+        print(f"[wipe_cpu] {label} reached PAUSED (NO_PREROLL "
+              "-- live source, will produce in PLAYING)")
+        return True
     for elapsed in range(1, PREROLL_BUDGET_S + 1):
         if shutdown_requested:
             return False
@@ -453,6 +468,10 @@ def preroll_to_paused(p, label):
         if ret == Gst.StateChangeReturn.SUCCESS:
             print(f"[wipe_cpu] {label} preroll done after ~{elapsed}s "
                   f"(state={cur.value_nick})")
+            return True
+        if ret == Gst.StateChangeReturn.NO_PREROLL:
+            print(f"[wipe_cpu] {label} reached PAUSED after ~{elapsed}s "
+                  "(NO_PREROLL -- live source)")
             return True
         if ret == Gst.StateChangeReturn.FAILURE:
             die(f"{label} preroll FAILURE")
