@@ -51,15 +51,25 @@ Why this gets the frame flow right:
     during a SEGMENT_DONE -> re-seek transient). Both compositor pads
     are always fed, so the aggregator never deadline-waits.
   - LOOPING is contained in each single-source / single-sink decode
-    bin. Per-decode bus catches SEGMENT_DONE from THAT bin's demuxer
-    and re-issues a non-flushing SEGMENT seek to time 0. This IS the
-    canonical SEGMENT-seek case that gst supports; the prior failure
-    was the aggregator behind it, which is now gone.
-  - NO FLUSH event ever reaches v4l2h264dec at the loop boundary
-    (SEGMENT seeks are non-flushing). gstreamer's v4l2videodec flush
-    handler does NOT call VIDIOC_STREAMOFF/STREAMON on the
-    bcm2835-codec CAPTURE queue. The REQBUFS/EINVAL wedge surface
-    stays dormant.
+    bin. Two pieces:
+      (a) SEGMENT seek with stop=duration (NOT NONE). The previous
+          version used Gst.SeekType.NONE for stop; segment completion
+          is defined as "streaming reached the segment STOP time", so
+          stop=NONE meant SEGMENT_DONE never fired and SEGMENT mode
+          also suppresses EOS -> position froze at duration forever.
+          Now: query_duration on each demuxer after PAUSED, pass it
+          as stop_ns (with hardcoded fallback for asset A=4.75s /
+          B=9.08s if the query fails).
+      (b) Downstream EVENT pad probe on each qtdemux video src pad
+          (install_loop_probe). Catches SEGMENT_DONE OR EOS, DROPs the
+          event so it never propagates to v4l2h264dec (no flush -> no
+          STREAMOFF -> no bcm2835-codec REQBUFS/EINVAL wedge by
+          construction), and schedules the re-seek via GLib.idle_add
+          (the seek() call must run on the main thread -- calling it
+          inside the streaming-thread probe callback would re-enter
+          the streaming chain and deadlock). Bus SEGMENT_DONE messages
+          are NOT used for re-arm (would double-fire alongside the
+          probe).
   - intervideo bridge isolates each decode pipeline's EOS / flush /
     segment events from the compositor pipeline at the BUFFER level:
     no event propagates across the bridge, so the compositor cannot
@@ -266,15 +276,85 @@ if pads[0] is None or pads[1] is None:
     die(f"could not locate compositor pads sink_0/sink_1: {pads}")
 
 # --- Looping (per decode bin) -------------------------------------------
+#
+# Two pieces:
+#  - segment_seek(elem, stop_ns): non-flushing SEGMENT|ACCURATE seek
+#    from 0 to stop_ns (NOT NONE). stop=NONE was the prior bug -- segment
+#    completion is defined as "streaming reached the segment STOP time",
+#    so stop=NONE meant SEGMENT_DONE never fired and SEGMENT-mode also
+#    suppresses EOS -> position froze at duration with no re-arm signal.
+#  - install_loop_probe(demuxer, channel, dur_ns): downstream EVENT pad
+#    probe on the demuxer video src pad. Catches SEGMENT_DONE OR EOS;
+#    DROPs the event so it never propagates to v4l2h264dec (no flush,
+#    no STREAMOFF, no codec wedge -- BY CONSTRUCTION); schedules the
+#    re-seek via GLib.idle_add (the seek() call itself must run on the
+#    main GLib thread, NOT inside the streaming-thread probe callback,
+#    or we get re-entry into the streaming chain).
+#
+# Why the probe rather than the bus SEGMENT_DONE message: bus messages
+# arrive on the main thread but go through async queueing; the probe
+# fires the moment the event reaches the qtdemux src pad, so the re-
+# seek lands with one-frame-or-better boundary latency. Sink-independent
+# and topology-proof.
 
 
-def segment_seek(elem):
+def segment_seek(elem, stop_ns):
     return elem.seek(
         1.0, Gst.Format.TIME,
-        Gst.SeekFlags.SEGMENT | Gst.SeekFlags.KEY_UNIT,
+        Gst.SeekFlags.SEGMENT | Gst.SeekFlags.ACCURATE,
         Gst.SeekType.SET, 0,
-        Gst.SeekType.NONE, 0,
+        Gst.SeekType.SET, stop_ns,
     )
+
+
+def find_video_src_pad(demuxer):
+    it = demuxer.iterate_src_pads()
+    while True:
+        res, pad = it.next()
+        if res != Gst.IteratorResult.OK:
+            return None
+        name = pad.get_name()
+        caps = pad.get_current_caps()
+        if name.startswith("video") or (
+            caps and "video/" in caps.to_string()
+        ):
+            return pad
+
+
+def query_dur_ns(pipeline_or_elem, label, fallback_ns):
+    ok, dur = pipeline_or_elem.query_duration(Gst.Format.TIME)
+    if ok and dur > 0:
+        print(f"[wipe_cpu] {label} duration = {dur} ns "
+              f"({dur / 1e9:.3f}s)")
+        return dur
+    print(f"[wipe_cpu] {label} duration query failed; "
+          f"using fallback {fallback_ns} ns "
+          f"({fallback_ns / 1e9:.3f}s)", file=sys.stderr)
+    return fallback_ns
+
+
+def install_loop_probe(demuxer, channel, dur_ns):
+    pad = find_video_src_pad(demuxer)
+    if pad is None:
+        die(f"[{channel}] no video src pad found on demuxer")
+
+    def _re_seek():
+        if not segment_seek(demuxer, dur_ns):
+            print(f"[{channel}] idle re-seek FAILED", file=sys.stderr)
+        return False  # one-shot via idle_add
+
+    def _on_event(_pad, info):
+        event = info.get_event()
+        if event is None:
+            return Gst.PadProbeReturn.OK
+        if event.type in (Gst.EventType.SEGMENT_DONE, Gst.EventType.EOS):
+            print(f"[{channel}] {event.type.value_nick} -> idle re-seek")
+            GLib.idle_add(_re_seek)
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.OK
+
+    pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, _on_event)
+    print(f"[{channel}] loop probe attached on {pad.get_name()}")
 
 
 # --- Frame-flow instrument ---------------------------------------------
@@ -404,15 +484,14 @@ phase_start_ns = now_ns()
 loop = GLib.MainLoop()
 
 
-def _make_decode_bus_handler(channel, demux_obj):
+def _make_decode_bus_handler(channel):
+    """Decode-pipeline bus: ERROR + EOS reporting only. The loop re-arm
+    is owned by the EVENT pad probe (install_loop_probe), NOT the bus
+    -- bus SEGMENT_DONE messages would double-fire alongside the probe.
+    EOS on the bus is unexpected (the probe DROPs EOS at the demuxer
+    src) and indicates the probe missed an event; we log + quit so the
+    failure is visible rather than silent."""
     def _on_bus(_bus, msg):
-        if msg.type == Gst.MessageType.SEGMENT_DONE:
-            src = msg.src
-            if src is demux_obj:
-                if not segment_seek(src):
-                    print(f"[{channel}] SEGMENT_DONE re-seek FAILED",
-                          file=sys.stderr)
-            return
         if msg.type == Gst.MessageType.ERROR:
             err, dbg = msg.parse_error()
             src = msg.src.get_name() if msg.src else "?"
@@ -424,7 +503,7 @@ def _make_decode_bus_handler(channel, demux_obj):
             return
         if msg.type == Gst.MessageType.EOS:
             print(f"[{channel}] pipeline EOS reached bus "
-                  "(segment mode dropped?)", file=sys.stderr)
+                  "(probe should have DROPped this!)", file=sys.stderr)
             loop.quit()
     return _on_bus
 
@@ -445,8 +524,8 @@ def on_comp_bus(_bus, msg):
 
 
 for p, h in [
-    (pipe_a, _make_decode_bus_handler("A", demuxA)),
-    (pipe_b, _make_decode_bus_handler("B", demuxB)),
+    (pipe_a, _make_decode_bus_handler("A")),
+    (pipe_b, _make_decode_bus_handler("B")),
     (pipe_c, on_comp_bus),
 ]:
     bus = p.get_bus()
@@ -523,10 +602,22 @@ if shutdown_requested:
         p.set_state(Gst.State.NULL)
     sys.exit(0)
 
+# Query each demuxer for its file duration (qtdemux has parsed the
+# moov box by PAUSED). Fall back to known asset durations if the
+# query fails. These durations become the SEGMENT seek stop= boundary.
+DUR_A = query_dur_ns(pipe_a, "decodeA", int(4.75 * Gst.SECOND))
+DUR_B = query_dur_ns(pipe_b, "decodeB", int(9.08 * Gst.SECOND))
+
+# Install the EVENT pad probe BEFORE the initial seek so the very
+# first segment boundary is caught even if it lands surprisingly early.
+install_loop_probe(demuxA, "A", DUR_A)
+install_loop_probe(demuxB, "B", DUR_B)
+
 # Arm SEGMENT-seek mode on each demuxer BEFORE PLAYING so the very
-# first segment runs in segment mode (SEGMENT_DONE rather than EOS).
-for label, demux in [("demuxA", demuxA), ("demuxB", demuxB)]:
-    if not segment_seek(demux):
+# first segment runs in segment mode (stop=dur triggers SEGMENT_DONE
+# at the end; without stop=dur the previous version froze at end).
+for label, demux, dur in [("demuxA", demuxA, DUR_A), ("demuxB", demuxB, DUR_B)]:
+    if not segment_seek(demux, dur):
         die(f"initial SEGMENT seek failed on {label}")
 
 # Force one shared clock + one shared base-time on all three pipelines
