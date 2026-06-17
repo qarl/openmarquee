@@ -145,6 +145,14 @@ if [ -x "$M3_SRC_BIN" ]; then
     cp "$M3_SRC_BIN" "$M3_DST_BIN"
     ls -la "$M3_DST_BIN"
 fi
+# 2026-06-17 QA M4 dispatch: same copy pattern for the m4-pageevict-
+# probe bin. Conditional so old trees pre-M4 still build.
+M4_SRC_BIN="$BUILD_DIR/target/$TARGET/$PROFILE_DIR/m4-pageevict-probe"
+M4_DST_BIN="$REPO/renderer/target/$TARGET/$PROFILE_DIR/m4-pageevict-probe"
+if [ -x "$M4_SRC_BIN" ]; then
+    cp "$M4_SRC_BIN" "$M4_DST_BIN"
+    ls -la "$M4_DST_BIN"
+fi
 
 echo
 echo "PASS: cross-build green. Binary at:"

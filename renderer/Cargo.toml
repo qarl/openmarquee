@@ -212,6 +212,17 @@ path = "src/bin/m2_display_probe.rs"
 name = "m3-transition-probe"
 path = "src/bin/m3_transition_probe.rs"
 
+# 2026-06-17 QA M4 dispatch — page-evict vs pure-GPU disambiguator:
+# M3 cornered r76 to a multi-second PAINT STALL (correct frame frozen
+# in time, NOT black/stale). M4 = M3 + getrusage(RUSAGE_SELF).ru_majflt
+# delta per transition tick + VmRSS/VmSwap sample at entry to
+# disambiguate which fix arc applies (HIGH majflt = footprint
+# reduction; ~0 majflt + multi-second flush_us = GPU drain / barrier
+# fix).
+[[bin]]
+name = "m4-pageevict-probe"
+path = "src/bin/m4_pageevict_probe.rs"
+
 [profile.release]
 opt-level = 3
 strip = "symbols"
