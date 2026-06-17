@@ -181,6 +181,15 @@ path = "src/bin/m0_park_resume_probe.rs"
 name = "m1-two-decoder-probe"
 path = "src/bin/m1_two_decoder_probe.rs"
 
+# 2026-06-17 QA M2 dispatch — display-path probe: drive A+B through
+# real EGL+GL+swap (lifted from hdmi.rs::with_egl_session +
+# run_nv12_dmabuf_blit_pass) and run the pixel oracle on
+# glReadPixels of the back buffer (NOT the decoder Y-plane). Catches
+# the r76 fingerprint: decoder OK + screen BLACK/STUCK divergence.
+[[bin]]
+name = "m2-display-probe"
+path = "src/bin/m2_display_probe.rs"
+
 [profile.release]
 opt-level = 3
 strip = "symbols"
