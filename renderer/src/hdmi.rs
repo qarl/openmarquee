@@ -5742,6 +5742,20 @@ pub fn paint_and_present_one_transition_frame(
         // swap+commit too — the DRM scanout holds the previous frame
         // and the next advance retries. Mirrors the single-video
         // paint_and_present_one_video_slide_frame Ok(None) path.
+        //
+        // 2026-06-17 M3 probe — emit SKIPPED tag (env-gated).
+        // Default OFF (env unset → no read, no log, no set, behavior-
+        // neutral). When OPENMARQUEE_TRANSITION_SCREEN_ORACLE=on,
+        // emit the skip line + record the outcome so M3 doesn't
+        // count this tick as a real-paint frame (= MAJOR #2 fix
+        // from the sacred review on 2026-06-17 a477eb7).
+        if std::env::var("OPENMARQUEE_TRANSITION_SCREEN_ORACLE").as_deref() == Ok("on") {
+            eprintln!(
+                "[perf] transition_screen_oracle kind={} progress={:.3} tag=SKIPPED",
+                kind, progress,
+            );
+            M3_LAST_TRANSITION_PAINT_OUTCOME.with(|c| c.set(Some("SKIPPED")));
+        }
         return Ok(());
     }
 
@@ -5755,6 +5769,59 @@ pub fn paint_and_present_one_transition_frame(
     // capture today (kmsgrab hangs on the page-flipping scanout
     // plane). No-op unless OPENMARQUEE_LIVE_PREVIEW_PATH is set.
     session.maybe_live_preview_capture();
+    // 2026-06-17 M3 probe — env-gated pre-swap screen oracle.
+    // Default OFF (env unset → no glReadPixels, no log, no set,
+    // behavior-neutral). When OPENMARQUEE_TRANSITION_SCREEN_ORACLE=on,
+    // read a 4×4 center patch from the BACK buffer NOW (before
+    // swap_buffers below moves it to FRONT) so M3's blend-pass-
+    // black detector has a real composite-output readback. ~1ms
+    // cost on vc4 per transition tick when active; not active on
+    // prod IPC sidecar (env unset by default). Same prior-art
+    // pattern as `maybe_live_preview_capture` above. Closes
+    // failure signature #3 (BLEND-PASS BLACK) in M3 (QA M3 dispatch
+    // 2026-06-17 + critical-screen-oracle reply).
+    if std::env::var("OPENMARQUEE_TRANSITION_SCREEN_ORACLE").as_deref() == Ok("on") {
+        let cx = (mode_w_u32 / 2).saturating_sub(2);
+        let cy = (mode_h_u32 / 2).saturating_sub(2);
+        let mut buf = [0u8; 16 * 4];
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.read_pixels(
+                cx as i32,
+                cy as i32,
+                4,
+                4,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(&mut buf[..]),
+            );
+        }
+        let first = buf[0];
+        let mut all_constant = true;
+        let mut sum_r = 0u32;
+        let mut sum_g = 0u32;
+        let mut sum_b = 0u32;
+        for i in 0..16 {
+            if buf[i * 4] != first {
+                all_constant = false;
+            }
+            sum_r += buf[i * 4] as u32;
+            sum_g += buf[i * 4 + 1] as u32;
+            sum_b += buf[i * 4 + 2] as u32;
+        }
+        let avg_r = sum_r / 16;
+        let avg_g = sum_g / 16;
+        let avg_b = sum_b / 16;
+        let luma = (0.299 * avg_r as f32
+            + 0.587 * avg_g as f32
+            + 0.114 * avg_b as f32) as u32;
+        eprintln!(
+            "[perf] transition_screen_oracle kind={} progress={:.3} tag=PAINTED \
+             avg_r={} avg_g={} avg_b={} luma={} all_constant={}",
+            kind, progress, avg_r, avg_g, avg_b, luma, all_constant,
+        );
+        M3_LAST_TRANSITION_PAINT_OUTCOME.with(|c| c.set(Some("PAINTED")));
+    }
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -5859,6 +5926,26 @@ pub enum TransitionEndpoint<'a> {
         bg_frames_decoded: &'a mut usize,
         bg_decoder: &'a crate::v4l2::Decoder,
     },
+}
+
+/// 2026-06-17 M3 probe — accessor for the env-gated
+/// `OPENMARQUEE_TRANSITION_SCREEN_ORACLE` paint-outcome tag stored
+/// by `paint_and_present_one_transition_frame`. M3's tick loop
+/// calls this AFTER each transition call to distinguish:
+///   - `Some("PAINTED")` — env on AND the function ran the real
+///     pre-swap readback path (= a fresh composite was presented).
+///   - `Some("SKIPPED")` — env on AND the function returned
+///     `Ok(())` via the FYS-bug-C no-frame-ready early-return.
+///   - `None` — env unset OR no transition call has run yet
+///     (M3 falls back to raw Ok(()) counting in this case).
+/// Takes-and-clears semantics so each call reads the LATEST tag
+/// without confusion across ticks.
+///
+/// IPC sidecar (prod) doesn't call this — the thread_local stays
+/// `None` because the env-gated block that writes it never runs
+/// (env unset by default). Behavior-neutral on prod.
+pub fn take_last_transition_paint_outcome() -> Option<&'static str> {
+    M3_LAST_TRANSITION_PAINT_OUTCOME.with(|c| c.replace(None))
 }
 
 /// Public adapter: open a fresh EglSession and run the
@@ -7468,6 +7555,18 @@ std::thread_local! {
     /// no behavioral coupling.
     static TRANSITION_TEX_PROBE_LAST_PROGRESS: std::cell::Cell<f32> =
         const { std::cell::Cell::new(2.0) };
+    /// 2026-06-17 M3 probe — last paint outcome from
+    /// `paint_and_present_one_transition_frame`. Set ONLY by the
+    /// env-gated `OPENMARQUEE_TRANSITION_SCREEN_ORACLE=on` block:
+    /// `Some("PAINTED")` when the real-paint path ran the pre-swap
+    /// readback; `Some("SKIPPED")` when the FYS-bug-C no-frame-ready
+    /// path returned `Ok(())` without swapping. `None` when the env
+    /// is unset (M3 probe inactive). M3 reads via the pub accessor
+    /// `take_last_transition_paint_outcome()` below to distinguish
+    /// real-paint Ok(()) from skip-tick Ok(()) (the b_transition_
+    /// frames inflation bug the sacred review caught).
+    static M3_LAST_TRANSITION_PAINT_OUTCOME: std::cell::Cell<Option<&'static str>> =
+        const { std::cell::Cell::new(None) };
     /// P2-G (2026-05-10): shared fullscreen-quad VBO for every
     /// post-pass that draws a textured fullscreen quad
     /// (run_bright_gamma_pass + run_blit_pass +

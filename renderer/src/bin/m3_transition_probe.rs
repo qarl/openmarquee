@@ -157,6 +157,18 @@ mod linux_main {
     }
 
     pub fn run() -> Result<()> {
+        // 2026-06-17 — auto-enable the env-gated pre-swap screen
+        // oracle in paint_and_present_one_transition_frame so the
+        // M3 binary captures BLEND-PASS BLACK (signature #3) by
+        // default. QA can still disable via
+        // OPENMARQUEE_TRANSITION_SCREEN_ORACLE=off if needed for
+        // an A/B run. SetEnv is process-local (M3 is the only thing
+        // running this binary), so the IPC sidecar in another
+        // process is unaffected.
+        if std::env::var("OPENMARQUEE_TRANSITION_SCREEN_ORACLE").is_err() {
+            std::env::set_var("OPENMARQUEE_TRANSITION_SCREEN_ORACLE", "on");
+        }
+
         // ---------- env ------------------------------------------------
         let park_ms: u64 = std::env::var("M0_PARK_MS").ok()
             .and_then(|s| s.parse().ok()).unwrap_or(200);
@@ -257,16 +269,29 @@ mod linux_main {
         let mut transition_tick_idx: u32 = 0;
 
         // Oracles + counters.
-        // M3's PRIMARY screen oracle: the window-fb readback at the
-        // end of each transition tick (B's contribution as composited
-        // by FS_FADE). Per dispatch: this catches BLEND-PASS BLACK if
-        // both tex_a + tex_b are non-zero but the final composite is
-        // black.
-        let mut final_screen_oracle = probe_oracle::PixelOracle::new();
+        //
+        // M3's screen oracle for BLEND-PASS BLACK (failure signature
+        // #3) is the env-gated `transition_screen_oracle` prod probe
+        // that hdmi.rs:paint_and_present_one_transition_frame emits
+        // PRE-SWAP (the readback before the swap moves the composite
+        // to FRONT). M3 sets OPENMARQUEE_TRANSITION_SCREEN_ORACLE=on
+        // at startup so the prod probe fires every transition tick.
+        // The probe's stderr line carries luma + all_constant + tag
+        // (PAINTED / SKIPPED) which QA greps from the journal.
+        //
+        // For M3's IN-PROCESS summary, we use the pub accessor
+        // `hdmi::take_last_transition_paint_outcome()` to know
+        // whether each tick was PAINTED (real composite presented),
+        // SKIPPED (FYS-bug-C no-frame-ready early-return), or
+        // unknown (accessor returned None, shouldn't happen since
+        // we auto-enable the env).
         let mut a_solo_screen_oracle = probe_oracle::PixelOracle::new();
 
         let mut a_pretransition: u32 = 0;
-        let mut b_transition_frames: u32 = 0;
+        let mut b_transition_frames: u32 = 0;   // count of Ok(()) returns (legacy, may incl. skips)
+        let mut b_transition_painted: u32 = 0;  // count of PAINTED via accessor (real paint only)
+        let mut b_transition_skipped: u32 = 0;  // FYS-bug-C skips
+        let mut b_transition_unknown: u32 = 0;  // accessor None (env-disable scenario)
         let mut transitions_run: u32 = 0;
         let mut b_warm_us: u128 = 0;
         let mut b_resume_us: u128 = 0;
@@ -458,15 +483,40 @@ mod linux_main {
                         max_paint_stall_us = call_us;
                     }
 
+                    // 2026-06-17 — MAJOR #2 fix. Read the env-gated
+                    // outcome tag emitted by paint_and_present_one_
+                    // transition_frame's pre-swap probe. PAINTED =
+                    // real composite presented; SKIPPED = FYS-bug-C
+                    // no-frame-ready early-return (no swap, scanout
+                    // holds prior frame); None = env unset (we auto-
+                    // enable at startup so shouldn't fire unless QA
+                    // explicitly sets =off).
+                    let outcome = hdmi::take_last_transition_paint_outcome();
                     match res {
                         Ok(()) => {
                             b_transition_frames += 1;
-                            if b_first_frame_us == 0 {
-                                if let Some(t) = transition_start {
-                                    b_first_frame_us = t.elapsed().as_micros();
+                            match outcome {
+                                Some("PAINTED") => {
+                                    b_transition_painted += 1;
+                                    // Only count first FRESH paint —
+                                    // PAINTED guarantees the swap
+                                    // ran AND the readback wasn't
+                                    // intercepted by stale-reuse
+                                    // (paint_transition_reuse_cached_b
+                                    // still SWAPS; QA disambiguates
+                                    // via stderr grep on that line).
+                                    if b_first_frame_us == 0 {
+                                        if let Some(t) = transition_start {
+                                            b_first_frame_us = t.elapsed().as_micros();
+                                            b_resume_us = b_first_frame_us;
+                                        }
+                                    }
                                 }
-                                if let Some(t) = transition_start {
-                                    b_resume_us = t.elapsed().as_micros();
+                                Some("SKIPPED") => {
+                                    b_transition_skipped += 1;
+                                }
+                                Some(_) | None => {
+                                    b_transition_unknown += 1;
                                 }
                             }
                         }
@@ -483,24 +533,27 @@ mod linux_main {
                         }
                     }
 
-                    // Window screen oracle on the just-presented frame.
-                    // The transition fn's commit_fb already swapped +
-                    // page-flipped, but the BACK buffer holds what was
-                    // just composited (post-swap, the "back" is the
-                    // formerly-presented bo). Read center patch + a
-                    // patch on B's half for asymmetric coverage.
-                    {
-                        let probe_w: u32 = 64u32.min(mode_w / 4);
-                        let probe_h: u32 = 64u32.min(mode_h / 4);
-                        let cx = (mode_w / 2).saturating_sub(probe_w / 2);
-                        let cy = (mode_h / 2).saturating_sub(probe_h / 2);
-                        let buf = read_back_buffer_rgba(session.gl(), cx, cy, probe_w, probe_h);
-                        let v = final_screen_oracle.check(&buf);
-                        eprintln!(
-                            "[m3] transition tick={} progress={:.3} call_us={} screen_distinct={} screen_black={}",
-                            transition_tick_idx, progress, call_us, v.distinct, v.all_constant,
-                        );
-                    }
+                    // 2026-06-17 — CRITICAL #1 fix from sacred
+                    // review. The previous version did a glReadPixels
+                    // on BACK AFTER paint_and_present_one_transition_
+                    // frame returned, but that fn's internal
+                    // eglSwapBuffers (hdmi.rs:5760) moves the just-
+                    // composited content to FRONT and gives us a
+                    // fresh undefined BO as BACK → readback was
+                    // garbage → false DIVERGENT verdicts on healthy
+                    // systems. The fix lives in the prod fn itself
+                    // (env-gated PRE-swap probe at hdmi.rs:5757,
+                    // emitting `[perf] transition_screen_oracle ...
+                    // tag=PAINTED luma=N all_constant=Y`) which QA
+                    // greps from the journal. The accessor read
+                    // above already classified PAINTED vs SKIPPED
+                    // for M3's summary counters.
+                    eprintln!(
+                        "[m3] transition tick={} progress={:.3} call_us={} \
+                         outcome={:?}",
+                        transition_tick_idx, progress, call_us,
+                        outcome.unwrap_or("UNSET"),
+                    );
 
                     transition_tick_idx += 1;
                 }
@@ -524,32 +577,35 @@ mod linux_main {
         }
 
         // ---------- VERDICT --------------------------------------------
-        let final_screen_total = final_screen_oracle.total;
-        let final_screen_pixel_ok = final_screen_oracle.pixel_ok;
-
+        //
+        // M3's in-process verdict uses the PAINTED/SKIPPED/unknown
+        // counters from the env-gated accessor. Failure signatures
+        // #1 (offscreen FBO black) and #3 (BLEND-PASS BLACK) live in
+        // the journal's `[perf] transition_tex_probe` and `[perf]
+        // transition_screen_oracle` lines — QA's grep job, not M3's
+        // VERDICT to assess. M3's job here is to confirm "the
+        // transition ran end-to-end + the painted-vs-skipped ratio
+        // looks sensible" so QA knows whether to look at the journal
+        // for r76 signatures vs to chase a wedge.
         let verdict = if !b_open_errno.is_empty() {
             "WEDGED"
         } else if transitions_run == 0 {
             "WEDGED"
         } else if transition_errs > 0 {
             "WEDGED"
-        } else if final_screen_oracle.stuck >= final_screen_total.saturating_sub(2)
-            && final_screen_total >= 5
-        {
-            // Stale-buffer / blend-frozen reproduction.
-            "DIVERGENT"
-        } else if final_screen_oracle.black >= final_screen_total.saturating_sub(2)
-            && final_screen_total >= 5
-        {
-            // BLEND-PASS BLACK or r76-proper offscreen FBO black
-            // propagating to the composite.
-            "DIVERGENT"
-        } else if b_transition_frames >= transition_ticks.saturating_sub(2)
-            && final_screen_pixel_ok >= final_screen_total.saturating_sub(2)
+        } else if b_transition_painted == 0 && b_transition_skipped >= 5 {
+            // All ticks hit FYS-bug-C skip → decoder didn't produce
+            // for any tick → wedge.
+            "WEDGED"
+        } else if b_transition_painted >= transition_ticks.saturating_sub(3)
             && a_paint_errs == 0
         {
+            // Most ticks painted (real composite presented). DIVERGENT
+            // vs HEALTHY then depends on the journal's transition_
+            // screen_oracle + transition_tex_probe + paint_transition_
+            // reuse_cached_b lines, which QA assesses.
             "HEALTHY"
-        } else if b_transition_frames >= 10 && final_screen_pixel_ok >= 5 {
+        } else if b_transition_painted >= 10 {
             "DEGRADED"
         } else {
             "WEDGED"
@@ -563,9 +619,10 @@ mod linux_main {
              b_first_frame_us={b_first_frame_us} \
              transitions_run={transitions_run} \
              b_transition_frames={b_transition_frames}/{target} \
+             b_transition_painted={b_transition_painted} \
+             b_transition_skipped={b_transition_skipped} \
+             b_transition_unknown={b_transition_unknown} \
              transition_errs={transition_errs} \
-             {final_report} \
-             final_screen_pixel_ok={final_screen_pixel_ok}/{final_screen_total} \
              transition_kind=\"{transition_kind}\" \
              offscreen_flush={offscreen_flush_env} \
              bake_b_poll_deadline_ms={bake_b_poll_deadline_ms} \
@@ -585,10 +642,10 @@ mod linux_main {
             transitions_run = transitions_run,
             b_transition_frames = b_transition_frames,
             target = transition_ticks,
+            b_transition_painted = b_transition_painted,
+            b_transition_skipped = b_transition_skipped,
+            b_transition_unknown = b_transition_unknown,
             transition_errs = transition_errs,
-            final_report = final_screen_oracle.report("final_screen"),
-            final_screen_pixel_ok = final_screen_pixel_ok,
-            final_screen_total = final_screen_total,
             transition_kind = transition_kind,
             offscreen_flush_env = offscreen_flush_env,
             bake_b_poll_deadline_ms = bake_b_poll_deadline_ms,
@@ -604,7 +661,11 @@ mod linux_main {
     /// Mirror of M2's read_back_buffer_rgba — reads a tile from the
     /// default fb's BACK buffer as RGBA bytes. PixelOracle hashes the
     /// byte slice (FNV-1a) + all-constant detector, so RGBA tiles work
-    /// the same way Y-plane bytes did.
+    /// the same way Y-plane bytes did. Kept for the solo-A phases
+    /// (PreOpen/BOpening/BParked/Drain) where M2's read-BEFORE-swap
+    /// pattern is correct and the read isn't intercepted by an
+    /// internal swap.
+    #[allow(dead_code)]
     fn read_back_buffer_rgba(
         gl: &glow::Context,
         x: u32,
