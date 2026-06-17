@@ -21,7 +21,9 @@ compositing via the intervideo bridge:
   DECODE PIPELINE A (its own Gst.Pipeline; single source, single sink)
     filesrc -> qtdemux -> h264parse -> v4l2h264dec
     -> videorate -> video/x-raw,framerate=30/1
-    -> queue -> intervideosink channel=chA sync=false
+    -> queue (non-leaky) -> intervideosink channel=chA sync=true
+       (sync=true + non-leaky queue paces the decoder to 30 fps via
+        back-pressure on the shared clock; was sync=false + leaky)
 
   DECODE PIPELINE B
     identical, channel=chB, file B
@@ -197,13 +199,26 @@ def build_decode_pipeline(video_path, channel):
     pads are sized to match (DW x DH) so they do NOT scale either.
     kmssink HW-scales the final NV12 1280x720 to the connector mode
     (1360x768) via the vc4 DRM plane -- zero CPU pixel work."""
+    # intervideosink sync=true so the decode pipeline is paced to real-
+    # time via the shared clock (post-videorate PTS = 30 fps spacing =>
+    # 30 fps wall-clock). Was sync=false, which let the decoder free-run
+    # at ~67 fps and race through each clip in <2s wall-clock.
+    #
+    # Queue is NON-LEAKY (default) so back-pressure actually propagates:
+    # intervideosink blocks (clock wait) -> queue fills -> queue blocks
+    # upstream -> v4l2h264dec slows to 30 fps. With leaky=downstream the
+    # queue would drop the oldest unfetched buffer when full, decoder
+    # would keep racing, and sink would emit at 30 fps but sampled from
+    # a constantly-rolling window -> erratic position advance, jittery
+    # playback. max-size-buffers=4 keeps the buffer small for tight
+    # back-pressure response.
     desc = (
         f'filesrc location="{video_path}" name=src '
         f"! qtdemux name=demux ! h264parse "
         f"! v4l2h264dec name=dec "
         f"! videorate ! {RATE_30} "
-        f"! queue max-size-buffers=4 leaky=downstream "
-        f"! intervideosink channel={channel} sync=false"
+        f"! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 "
+        f"! intervideosink channel={channel} sync=true"
     )
     try:
         return Gst.parse_launch(desc)
