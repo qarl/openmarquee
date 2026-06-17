@@ -201,6 +201,17 @@ path = "src/bin/m1_two_decoder_probe.rs"
 name = "m2-display-probe"
 path = "src/bin/m2_display_probe.rs"
 
+# 2026-06-17 QA M3 dispatch — transition-path probe: drive the REAL
+# `paint_and_present_one_transition_frame` (kind=fade, progress 0→1)
+# with TransitionEndpoint::Video for both A (playing) + B (just-resumed
+# from warm-park) so the offscreen FBO bake (is_offscreen_bake=true) +
+# cross-fade blend shader + Path-B poll deadline are all in the test
+# path. M2 cleared the window-fb path; M3 corners the r76 freeze in
+# the transition compositor.
+[[bin]]
+name = "m3-transition-probe"
+path = "src/bin/m3_transition_probe.rs"
+
 [profile.release]
 opt-level = 3
 strip = "symbols"
