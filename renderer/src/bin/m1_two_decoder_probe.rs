@@ -230,6 +230,22 @@ fn main() -> Result<()> {
         let tick_start = Instant::now();
 
         // ---- A: always feed + DQBUF one frame per tick. ------------------
+        // 2026-06-16 M1 hygiene fix per QA's M2 dispatch note: short
+        // reel clips (~3-4 s) were exhausting A's samples before B's
+        // park-resume completed at park_ms=5000/10000, producing
+        // false-DEGRADED verdicts. Loop A via the existing
+        // `reprime_video_decoder_for_loop` API (same path the
+        // standalone reel uses to loop within a hold) so A keeps
+        // producing through the entire test window regardless of
+        // clip length. Note: reprime feeds sample[0] inline + leaves
+        // next_sample_idx=1, so the gating feed below picks up at
+        // sample[1] the same tick — cadence resumes without a hole.
+        if state_a.next_sample_idx >= dem_a.samples.len() {
+            if let Err(e) = video_decode::reprime_video_decoder_for_loop(&mut state_a, &dem_a) {
+                eprintln!("[m1] A reprime_for_loop failed: {:#}", e);
+                a_other_errs += 1;
+            }
+        }
         if state_a.next_sample_idx < dem_a.samples.len() {
             match state_a.decoder.feed(&dem_a.samples[state_a.next_sample_idx]) {
                 Ok(()) => {
