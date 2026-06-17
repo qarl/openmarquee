@@ -4,6 +4,12 @@
 Step 2b pivot (2026-06-17). Sibling to fresh/wipe.py; that file stays
 as the GL reference. THIS file is the service-runnable version.
 
+Iteration on top of 674ae5a: add-only frame-flow instrument (BUFFER
+probes on decA src, decB src, kmssink sink; once-per-second [fps] log
+line with counters + per-source stream position + state). No pipeline,
+loop, or wipe logic touched — instrument-only diagnostic to localize
+a frozen-frame-with-no-errors symptom QA cannot see on the glass.
+
 Why pivot from GL: the GL version (wipe.py @ e493068) renders smooth on
 glass but will not preroll as a headless systemd service. GST_GL_WINDOW=
 gbm hangs at READY->PAUSED forever (GL context init blocks waiting for a
@@ -72,6 +78,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 
 import gi
 
@@ -143,12 +150,12 @@ pipe_desc = (
     f"  sink_0::width={DW} sink_0::height={DH} sink_0::zorder=0 "
     f"  sink_1::xpos=0 sink_1::ypos=0 "
     f"  sink_1::width=0 sink_1::height={DH} sink_1::zorder=1 "
-    f"! videoconvert ! {OUTPUT_NV12} ! kmssink sync=true "
+    f"! videoconvert ! {OUTPUT_NV12} ! kmssink name=sink sync=true "
     f'filesrc location="{VIDEOS[0]}" name=srcA '
-    f"  ! qtdemux name=demuxA ! h264parse ! v4l2h264dec "
+    f"  ! qtdemux name=demuxA ! h264parse ! v4l2h264dec name=decA "
     f"  ! videoscale method=1 ! {INPUT_SIZE} ! comp.sink_0 "
     f'filesrc location="{VIDEOS[1]}" name=srcB '
-    f"  ! qtdemux name=demuxB ! h264parse ! v4l2h264dec "
+    f"  ! qtdemux name=demuxB ! h264parse ! v4l2h264dec name=decB "
     f"  ! videoscale method=1 ! {INPUT_SIZE} ! comp.sink_1"
 )
 
@@ -202,6 +209,95 @@ def segment_seek(elem):
         Gst.SeekType.SET, 0,             # start
         Gst.SeekType.NONE, 0,            # stop (NONE = duration)
     )
+
+
+# --- Frame-flow instrument (per-second [fps] line) ----------------------
+#
+# Add-only diagnostic per QA dispatch 2026-06-17. The state machine
+# log "wipe/hold" prints regardless of whether frames are flowing;
+# decoder-open != frame-delivering; the pipeline emits no error when
+# a decoder silently stops producing. Pad probes here give a true
+# frame-flow signal at three points:
+#
+#   - decA src pad -> frames OUT of HW decoder A
+#   - decB src pad -> frames OUT of HW decoder B
+#   - kmssink sink pad -> frames actually reaching the screen
+#
+# Once per second a single line prints uptime, all three counters
+# (reset after each tick), each demuxer's stream position, and the
+# current state. Reading the line:
+#   decA/decB drop to 0 -> THAT decoder stalled
+#   decA/decB > 0 but screen = 0 -> stall is downstream of decoders
+#   posA/posB frozen with fps > 0 -> seek/segment confusion
+#   line stops appearing -> process or main loop hung
+
+counters = {"decA": 0, "decB": 0, "screen": 0}
+
+try:
+    fps_log_file = open("/tmp/wipe_fps.log", "a", buffering=1)
+    print(f"[wipe_cpu] tee fps to /tmp/wipe_fps.log")
+except OSError as _exc:
+    fps_log_file = None
+    print(f"[wipe_cpu] /tmp/wipe_fps.log unavailable ({_exc}); stderr only")
+
+
+def _make_counter_probe(key):
+    def _probe(_pad, _info):
+        counters[key] += 1
+        return Gst.PadProbeReturn.OK
+    return _probe
+
+
+def attach_flow_probes():
+    for name in ("decA", "decB"):
+        el = pipeline.get_by_name(name)
+        if el is None:
+            die(f"{name} element not found for flow probe")
+        pad = el.get_static_pad("src")
+        if pad is None:
+            die(f"{name} has no src pad")
+        pad.add_probe(Gst.PadProbeType.BUFFER, _make_counter_probe(name))
+    sink_el = pipeline.get_by_name("sink")
+    if sink_el is None:
+        die("kmssink element not found for flow probe")
+    sink_pad = sink_el.get_static_pad("sink")
+    if sink_pad is None:
+        die("kmssink has no sink pad")
+    sink_pad.add_probe(
+        Gst.PadProbeType.BUFFER, _make_counter_probe("screen")
+    )
+
+
+def _query_pos_s(elem):
+    ok, pos_ns = elem.query_position(Gst.Format.TIME)
+    if not ok or pos_ns < 0:
+        return "?"
+    return f"{pos_ns / 1e9:.2f}"
+
+
+_t_start = time.monotonic()
+
+
+def fps_tick():
+    uptime = int(time.monotonic() - _t_start)
+    posA = _query_pos_s(demuxes["demuxA"])
+    posB = _query_pos_s(demuxes["demuxB"])
+    line = (
+        f"[fps] t={uptime} "
+        f"decA={counters['decA']} decB={counters['decB']} "
+        f"screen={counters['screen']} "
+        f"posA={posA} posB={posB} state={state}"
+    )
+    print(line, file=sys.stderr, flush=True)
+    if fps_log_file is not None:
+        try:
+            fps_log_file.write(line + "\n")
+        except OSError:
+            pass
+    counters["decA"] = 0
+    counters["decB"] = 0
+    counters["screen"] = 0
+    return True  # keep firing
 
 
 # --- Sanity: exactly two HW decoders ------------------------------------
@@ -362,8 +458,16 @@ for name, demux in demuxes.items():
 if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
     die("pipeline failed to enter PLAYING")
 
+attach_flow_probes()
+
 GLib.timeout_add(TICK_MS, tick)
+GLib.timeout_add(1000, fps_tick)
 try:
     loop.run()
 finally:
     pipeline.set_state(Gst.State.NULL)
+    if fps_log_file is not None:
+        try:
+            fps_log_file.close()
+        except OSError:
+            pass
