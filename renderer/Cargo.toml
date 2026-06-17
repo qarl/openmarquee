@@ -172,6 +172,15 @@ path = "src/main.rs"
 name = "m0-park-resume-probe"
 path = "src/bin/m0_park_resume_probe.rs"
 
+# 2026-06-17 QA M1 dispatch — headless TWO-decoder contention probe
+# + shared pixel oracle (probe_oracle.rs). M1 reproduces the real
+# transition moment (A draining + B opens/primes/parks/resumes
+# under shared-codec contention) with per-frame Y-plane oracle
+# checks on BOTH sides so "valid buffer, BLACK pixels" can't pass.
+[[bin]]
+name = "m1-two-decoder-probe"
+path = "src/bin/m1_two_decoder_probe.rs"
+
 [profile.release]
 opt-level = 3
 strip = "symbols"

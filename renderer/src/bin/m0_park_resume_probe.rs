@@ -86,6 +86,15 @@ mod video_decode;
 #[cfg(target_os = "linux")]
 #[path = "../frame_pacing.rs"]
 mod frame_pacing;
+// 2026-06-17 QA M1 dispatch retrofit: pixel oracle shared with the
+// M1 two-decoder probe. M0's pre-oracle `fresh=30/30` only proved
+// DQBUF returned kernel-valid buffers, NOT that pixels were
+// non-black + distinct frame-to-frame. With this retrofit, M0 is
+// re-runnable with the same pixel check M1 uses → closes the M0
+// blind spot.
+#[cfg(target_os = "linux")]
+#[path = "../probe_oracle.rs"]
+mod probe_oracle;
 
 #[cfg(target_os = "linux")]
 use anyhow::{anyhow, Result};
@@ -173,6 +182,9 @@ fn main() -> Result<()> {
     let mut other_errs: u32 = 0;
     let mut samples_fed: usize = 0;
     let mut eos_seen = false;
+    // 2026-06-17 QA M1 retrofit: oracle checks every drained CAPTURE
+    // frame's Y-plane is non-black + distinct from the previous frame.
+    let mut oracle = probe_oracle::PixelOracle::new();
 
     while fresh_count < TARGET_FRAMES && Instant::now() < resume_deadline {
         // Feed the next sample if we have one. The decoder's
@@ -209,12 +221,15 @@ fn main() -> Result<()> {
         // Try to drain a CAPTURE frame. next_frame() is the same
         // entrypoint the production paint loop uses.
         match state.decoder.next_frame() {
-            Ok(Some(_frame)) => {
+            Ok(Some(frame)) => {
                 if first_fresh_us.is_none() {
                     first_fresh_us = Some(t_resume.elapsed().as_micros());
                 }
                 fresh_count += 1;
                 state.frames_decoded += 1;
+                // 2026-06-17 QA M1 retrofit: oracle on Y-plane.
+                // catches BLACK / stuck / single-constant fill.
+                oracle.check(frame.y_plane());
                 // Frame drops at end of this scope → re-QBUFs
                 // automatically, keeping the pool drained.
             }
@@ -247,9 +262,21 @@ fn main() -> Result<()> {
     let total_resume_us = t_resume.elapsed().as_micros();
 
     // ---- Phase 4: VERDICT ------------------------------------------------
-    let verdict = if fresh_count >= TARGET_FRAMES && einval_errs == 0 && epipe_errs == 0 && other_errs == 0 {
+    // 2026-06-17 QA M1 retrofit: VERDICT now folds the pixel oracle.
+    // HEALTHY requires (a) target buffer count drained AND (b) zero
+    // non-EAGAIN errors AND (c) oracle pixel_ok matches fresh_count
+    // (i.e. every drained buffer carried real, distinct, non-black
+    // pixels). The "valid buffers, BLACK frames" false-positive
+    // M0's first ship couldn't catch is closed here.
+    let oracle_clean = oracle.pixel_ok == fresh_count && oracle.black == 0;
+    let verdict = if fresh_count >= TARGET_FRAMES
+        && einval_errs == 0
+        && epipe_errs == 0
+        && other_errs == 0
+        && oracle_clean
+    {
         "HEALTHY"
-    } else if fresh_count >= 15 {
+    } else if fresh_count >= 15 && oracle.pixel_ok >= 15 {
         "DEGRADED"
     } else {
         "WEDGED"
@@ -258,7 +285,7 @@ fn main() -> Result<()> {
     println!(
         "[m0] PARK_MS={} warm_us={} resume_us={} total_resume_us={} \
          fresh={}/{} eagain={} einval={} epipe={} errors={} \
-         samples_fed={} eos_seen={} VERDICT={}",
+         samples_fed={} eos_seen={} {} VERDICT={}",
         park_ms,
         warm_setup_us,
         resume_us,
@@ -271,6 +298,7 @@ fn main() -> Result<()> {
         other_errs,
         samples_fed,
         eos_seen,
+        oracle.report("y"),
         verdict,
     );
 

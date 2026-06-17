@@ -121,6 +121,14 @@ if [ -x "$M0_SRC_BIN" ]; then
     cp "$M0_SRC_BIN" "$M0_DST_BIN"
     ls -la "$M0_DST_BIN"
 fi
+# 2026-06-17 QA M1 dispatch: same copy pattern for the m1-two-
+# decoder-probe bin. Conditional so old trees pre-M1 still build.
+M1_SRC_BIN="$BUILD_DIR/target/$TARGET/$PROFILE_DIR/m1-two-decoder-probe"
+M1_DST_BIN="$REPO/renderer/target/$TARGET/$PROFILE_DIR/m1-two-decoder-probe"
+if [ -x "$M1_SRC_BIN" ]; then
+    cp "$M1_SRC_BIN" "$M1_DST_BIN"
+    ls -la "$M1_DST_BIN"
+fi
 
 echo
 echo "PASS: cross-build green. Binary at:"
