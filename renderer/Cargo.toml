@@ -157,6 +157,17 @@ png = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+[lib]
+# 2026-06-17 QA M2 dispatch — pivot to Option A (lib.rs restructure).
+# See src/lib.rs docstring for the why. Production main binary is
+# UNAFFECTED: it keeps its own `mod X;` declarations + builds with
+# byte-equivalent emitted code. The lib path exists so the M2 probe
+# can call the REAL `run_in_egl_session` + `bake_video_slide_to_current_fbo`
+# instead of a hand-wired copy that has failed twice in DIVERGENT
+# state.
+name = "openmarquee_render"
+path = "src/lib.rs"
+
 [[bin]]
 name = "openmarquee-render"
 path = "src/main.rs"
