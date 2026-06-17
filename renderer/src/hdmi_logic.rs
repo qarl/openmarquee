@@ -2880,6 +2880,33 @@ std::thread_local! {
     static TRANSITION_ENDPOINT_B_METRIC: std::cell::RefCell<
         Option<(Option<uuid::Uuid>, uuid::Uuid, std::time::Instant)>
     > = const { std::cell::RefCell::new(None) };
+
+    // 2026-06-16 QA sideb buffer-trace instrumentation (LOGGING ONLY,
+    // no behavior change). Identifies which transition side ("a" or
+    // "b") is being baked, so the emit inside
+    // `bake_video_slide_to_current_fbo` can tag itself + so the
+    // record_sideb_dqbuf hook filters out side-A frames.
+    //   0 = none/idle (steady-state video paint; not in a transition)
+    //   1 = side A bake
+    //   2 = side B bake
+    static TRANSITION_BAKE_SIDE: std::cell::Cell<u8> =
+        const { std::cell::Cell::new(0) };
+
+    // 2026-06-16 QA sideb buffer-trace: snapshot of the LAST
+    // successfully-dequeued CAPTURE buffer on side B's transition
+    // bake. Used by the `paint_transition_reuse_cached_b` emit so we
+    // can answer "what V4L2 buffer index/dmabuf-fd is the cached
+    // FBO showing right now?" — exactly the gap QA's forensic
+    // finding identified (existing logs can't distinguish fresh
+    // buffer vs reused buffer).
+    //
+    // Tuple: (buf_idx, dmabuf_fd, stride). Set on every successful
+    // side-B Ok(Some) bake; preserved across transitions (so the
+    // emit can show "still showing buffer N from 30 transitions
+    // ago" — the exact frozen pattern QA captured across 30+
+    // consecutive transitions).
+    static LAST_SIDEB_DQBUF_INFO: std::cell::Cell<Option<(u32, i32, u32)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Called from ipc_main.rs at the BeginTransition handler. Sets the
@@ -2947,6 +2974,53 @@ pub fn reset_transition_endpoint_b_metric_for_tests() {
     TRANSITION_ENDPOINT_B_METRIC.with(|cell| {
         *cell.borrow_mut() = None;
     });
+}
+
+// ====================================================================
+// 2026-06-16 QA sideb buffer-trace instrumentation accessors
+// (LOGGING ONLY — no behavior change)
+// ====================================================================
+
+/// Set the current transition bake side from the dispatcher in
+/// `paint_and_present_one_transition_frame`. Reset to "none" after
+/// each bake call so steady-state video paint never tags itself as
+/// a transition side.
+pub fn set_transition_bake_side(side: &'static str) {
+    let code: u8 = match side {
+        "a" => 1,
+        "b" => 2,
+        _ => 0,
+    };
+    TRANSITION_BAKE_SIDE.with(|c| c.set(code));
+}
+
+/// Read the current transition bake side. Returns "a", "b", or
+/// "none".
+pub fn current_transition_bake_side() -> &'static str {
+    TRANSITION_BAKE_SIDE.with(|c| match c.get() {
+        1 => "a",
+        2 => "b",
+        _ => "none",
+    })
+}
+
+/// Record the successfully-dequeued CAPTURE buffer info from a
+/// side-B transition bake. Called from
+/// `bake_video_slide_to_current_fbo` on every Ok(Some(frame))
+/// when the current bake side is "b" — so the reuse-cached emit
+/// can answer "what V4L2 buffer is the cached FBO content
+/// representing?" QA's forensic finding: existing logs can't
+/// distinguish a fresh DQBUF from a reused buffer. This thread_
+/// local closes that gap.
+pub fn record_sideb_dqbuf_info(buf_idx: u32, dmabuf_fd: i32, stride: u32) {
+    LAST_SIDEB_DQBUF_INFO.with(|c| c.set(Some((buf_idx, dmabuf_fd, stride))));
+}
+
+/// Read the last-recorded side-B DQBUF info. Returns None when no
+/// side-B frame has been dequeued yet in this process lifetime
+/// (e.g. before the first transition).
+pub fn last_sideb_dqbuf_info() -> Option<(u32, i32, u32)> {
+    LAST_SIDEB_DQBUF_INFO.with(|c| c.get())
 }
 
 /// Test-only: read the marker (to_id only) without consuming so

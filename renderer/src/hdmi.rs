@@ -5015,13 +5015,20 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
-        let (fbo_a, tex_a) = match bake_slide_to_fbo(
+        // 2026-06-16 QA sideb buffer-trace: tag the upcoming bake
+        // call so the emit inside bake_video_slide_to_current_fbo
+        // can identify it as side A. Cleared to "none" after the
+        // bake returns. LOGGING-ONLY; no behavior change.
+        crate::hdmi_logic::set_transition_bake_side("a");
+        let bake_a_result = bake_slide_to_fbo(
             session,
             mode_w_u32,
             mode_h_u32,
             cached_pair_a,
             inputs_a,
-        )? {
+        );
+        crate::hdmi_logic::set_transition_bake_side("none");
+        let (fbo_a, tex_a) = match bake_a_result? {
             Some(pair) => {
                 // r106 + Path A Stage 2 (2026-06-14): bake
                 // landed real content into the cached pair —
@@ -5198,7 +5205,15 @@ pub fn paint_and_present_one_transition_frame(
                     }
                 }
             };
-            match bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, cached_pair_b, inputs_b) {
+            // 2026-06-16 QA sideb buffer-trace: tag the side-B bake
+            // call so the emit inside bake_video_slide_to_current_fbo
+            // identifies the side + so record_sideb_dqbuf_info gates
+            // its store on side B only. LOGGING-ONLY; no behavior
+            // change.
+            crate::hdmi_logic::set_transition_bake_side("b");
+            let bake_b_result = bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, cached_pair_b, inputs_b);
+            crate::hdmi_logic::set_transition_bake_side("none");
+            match bake_b_result {
                 Ok(Some(p)) => {
                     // r76 Phase A: emit begin_transition -> endpoint_b
                     // first-frame gap. r94: also surface poll outcome
@@ -5302,12 +5317,41 @@ pub fn paint_and_present_one_transition_frame(
                     // transition stalls" pre-r106 failure mode.
                     if decouple && session.transition_fbo_b_painted {
                         if let Some((fbo, tex)) = cached_pair_b {
+                            // 2026-06-16 QA sideb buffer-trace: append
+                            // the last-recorded side-B DQBUF info so
+                            // QA can see WHICH V4L2 buffer the cached
+                            // FBO content was rendered from. Closes
+                            // the gap that "existing emits look
+                            // identical whether cache is fresh or
+                            // stuck" — the buf_idx will be FROZEN at
+                            // the first transition's value across all
+                            // 30+ subsequent transitions in a stuck
+                            // run. LOGGING-ONLY.
+                            let (last_idx, last_fd, last_stride) =
+                                crate::hdmi_logic::last_sideb_dqbuf_info()
+                                    .map(|(i, f, s)| (i as i32, f, s as i32))
+                                    .unwrap_or((-1, -1, -1));
                             eprintln!(
-                                "[perf] paint_transition_reuse_cached_b kind={} progress={:.3}",
-                                kind, progress,
+                                "[perf] paint_transition_reuse_cached_b kind={} progress={:.3} last_sideb_buf_idx={} last_sideb_dmabuf_fd={} last_sideb_stride={}",
+                                kind, progress, last_idx, last_fd, last_stride,
                             );
                             break (fbo, tex);
                         }
+                    }
+                    // 2026-06-16 QA sideb buffer-trace: emit on the
+                    // skip-tick path too so QA sees a CONTINUOUS
+                    // record of what side-B's last DQBUF was, even
+                    // on ticks where neither bake-fresh nor reuse-
+                    // cached fired.
+                    {
+                        let (last_idx, last_fd, last_stride) =
+                            crate::hdmi_logic::last_sideb_dqbuf_info()
+                                .map(|(i, f, s)| (i as i32, f, s as i32))
+                                .unwrap_or((-1, -1, -1));
+                        eprintln!(
+                            "[perf] transition_sideb_skip_tick kind={} progress={:.3} last_sideb_buf_idx={} last_sideb_dmabuf_fd={} last_sideb_stride={}",
+                            kind, progress, last_idx, last_fd, last_stride,
+                        );
                     }
                     crate::hdmi_logic::warn_paint_transition_skip(
                         kind, progress, "endpoint_b_no_frame",
@@ -8688,6 +8732,34 @@ unsafe fn bake_video_slide_to_current_fbo(
     let t_phase = std::time::Instant::now();
     let f_w = frame.width();
     let f_h = frame.height();
+    // 2026-06-16 QA sideb buffer-trace (LOGGING-ONLY): emit the
+    // CAPTURE buffer index + dmabuf fd + stride for every
+    // successful transition-side bake. Pairs with the new emits at
+    // paint_transition_reuse_cached_b + skip-tick paths to make
+    // visible whether side-B is dequeuing fresh buffers per
+    // transition or repeatedly reusing the same buffer index.
+    // QA forensic finding: side-B (NativeTexture(6)) locks to first
+    // transition's content for entire run; existing emits can't
+    // distinguish a fresh-DQBUF success from a stuck-on-same-buffer
+    // success. The buffer-index trace closes that gap. The emit is
+    // gated on is_offscreen_bake (transition path only) to keep
+    // steady-state video paint quiet.
+    if is_offscreen_bake {
+        let cap_idx = frame.capture_buffer_index();
+        let dma_fd = frame.dma_buf_fd().unwrap_or(-1);
+        let stride = frame.stride();
+        let side = crate::hdmi_logic::current_transition_bake_side();
+        eprintln!(
+            "[perf] transition_dqbuf side={} buf_idx={} dmabuf_fd={} stride={} w={} h={}",
+            side, cap_idx, dma_fd, stride, f_w, f_h,
+        );
+        // Stash for the reuse-cached emit. Filter to side="b" so
+        // we don't shadow side-B's last-good info with a side-A
+        // bake that interleaved between transition ticks.
+        if side == "b" {
+            crate::hdmi_logic::record_sideb_dqbuf_info(cap_idx, dma_fd, stride);
+        }
+    }
     // FYS bug B (2026-05-21): a regular uploaded MP4 video must be
     // shown aspect-preserving, not stretched to fill the panel.
     // cover_quad_vbo gives a quad whose positions overflow +/-1 NDC
