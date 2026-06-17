@@ -161,6 +161,17 @@ serde_json = "1.0"
 name = "openmarquee-render"
 path = "src/main.rs"
 
+# 2026-06-17 QA M0 dispatch — headless V4L2 park-and-resume probe.
+# Standalone binary that imports v4l2 / mp4_demux / video_decode
+# via #[path] inside its own root, so reuse is read-only without
+# requiring the openmarquee-render binary crate to expose a lib.
+# Linux-only: V4L2 ioctls aren't available on macOS so the binary
+# is a no-op stub there (`cargo build` succeeds on dev; only the
+# aarch64 cross-build produces a runnable probe).
+[[bin]]
+name = "m0-park-resume-probe"
+path = "src/bin/m0_park_resume_probe.rs"
+
 [profile.release]
 opt-level = 3
 strip = "symbols"

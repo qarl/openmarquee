@@ -112,6 +112,16 @@ mkdir -p "$(dirname "$DST_BIN")"
 cp "$SRC_BIN" "$DST_BIN"
 ls -la "$DST_BIN"
 
+# 2026-06-17 QA M0 dispatch: copy the optional m0-park-resume-probe
+# binary out alongside openmarquee-render. Conditional so older
+# trees without the M0 bin still cross-build cleanly.
+M0_SRC_BIN="$BUILD_DIR/target/$TARGET/$PROFILE_DIR/m0-park-resume-probe"
+M0_DST_BIN="$REPO/renderer/target/$TARGET/$PROFILE_DIR/m0-park-resume-probe"
+if [ -x "$M0_SRC_BIN" ]; then
+    cp "$M0_SRC_BIN" "$M0_DST_BIN"
+    ls -la "$M0_DST_BIN"
+fi
+
 echo
 echo "PASS: cross-build green. Binary at:"
 echo "  $DST_BIN"
