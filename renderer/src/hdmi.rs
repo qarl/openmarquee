@@ -1217,7 +1217,7 @@ fn poll_drm_fd_for_events(card: &Card, timeout_ms: i32) -> Result<()> {
 /// cleanup; this fn does NOT call destroy_framebuffer/drop on
 /// error so the existing per-call cleanup pattern stays
 /// consistent across both SetCrtc and page_flip dispatch.
-fn commit_fb(
+pub fn commit_fb(
     session: &mut EglSession,
     card: &Card,
     fb: framebuffer::Handle,
@@ -4630,7 +4630,7 @@ pub fn paint_and_present_one_video_slide_frame(
 /// scanout_prev. Caller must have ALREADY dropped the Frame +
 /// incremented frames_decoded.
 #[cfg(target_os = "linux")]
-fn finish_video_slide_swap_and_commit(
+pub fn finish_video_slide_swap_and_commit(
     session: &mut EglSession,
     card: &Card,
 ) -> Result<()> {
@@ -7021,6 +7021,15 @@ impl<'a> EglSession<'a> {
         self.gl
     }
 
+    /// 2026-06-17 M2 Option A pivot β: panel mode dims accessors.
+    /// The M2 display probe drives `bake_video_slide_to_current_fbo`
+    /// directly (rather than via paint_and_present_one_video_slide_frame)
+    /// and needs the mode dims to pass through. The bake fn signature
+    /// already takes mode_w/mode_h u32 explicitly — these accessors
+    /// just expose the value the session already holds. Read-only.
+    pub fn mode_w(&self) -> u16 { self.mode_w }
+    pub fn mode_h(&self) -> u16 { self.mode_h }
+
     /// v1-spec-delta #10 (slice c) -- update cached settings.
     /// paint_and_present_one_frame_for_slide consults
     /// current_settings.is_color_identity() to decide whether
@@ -8571,7 +8580,7 @@ fn bake_offscreen_flush_enabled() -> bool {
     })
 }
 
-unsafe fn bake_video_slide_to_current_fbo(
+pub unsafe fn bake_video_slide_to_current_fbo(
     session: &mut EglSession,
     samples: &[crate::mp4_demux::Sample],
     next_sample_idx: &mut usize,

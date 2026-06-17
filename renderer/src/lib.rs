@@ -82,6 +82,11 @@ pub mod glyph_cache_colr;
 pub mod v4l2;
 #[cfg(target_os = "linux")]
 pub mod video_decode;
+// M0/M1/M2 probe pixel oracle. Linux-only because the consumers are
+// the V4L2-backed probes; the module itself is pure-Rust but is
+// gated to match its dependents.
+#[cfg(target_os = "linux")]
+pub mod probe_oracle;
 
 // =====================================================================
 // Crate-root pub items referenced by modules via `crate::X` paths.
