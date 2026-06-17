@@ -1,77 +1,89 @@
 #!/usr/bin/env python3
-"""fresh/wipe_cpu.py — A <-> B wipe, CPU compositor at native display res.
+"""fresh/wipe_cpu.py — A <-> B wipe via 3-pipeline intervideo architecture.
 
-Step 2b pivot (2026-06-17). Sibling to fresh/wipe.py; that file stays
-as the GL reference. THIS file is the service-runnable version.
+Step 2b root-fix (2026-06-17). Built on the per-second [fps] instrument
+introduced in fb49201, which localized two structural failures in the
+prior single-pipeline approach:
 
-Iteration on top of 674ae5a: add-only frame-flow instrument (BUFFER
-probes on decA src, decB src, kmssink sink; once-per-second [fps] log
-line with counters + per-source stream position + state). No pipeline,
-loop, or wipe logic touched — instrument-only diagnostic to localize
-a frozen-frame-with-no-errors symptom QA cannot see on the glass.
+  (P1) Compositor rate-collapse to ~1 fps. compositor's src had no fixed
+       framerate; the aggregator ran in deadline-alignment mode against
+       two inputs whose running-times diverged (A loops every 4.75s, B
+       every 9.08s) under kmssink sync=true backpressure, so it emitted
+       roughly one buffer per second to the screen.
+  (P2) SEGMENT-seek loop did not re-arm behind the aggregator. Per-source
+       SEGMENT_DONE on a multi-pad aggregator is not actionable the same
+       way it is for a single-source/single-sink chain; rearmed buffers
+       landed behind the compositor's shared running-time and were dropped.
 
-Why pivot from GL: the GL version (wipe.py @ e493068) renders smooth on
-glass but will not preroll as a headless systemd service. GST_GL_WINDOW=
-gbm hangs at READY->PAUSED forever (GL context init blocks waiting for a
-session that does not exist); EGL surfaceless fails fast with "Failed to
-create EGLDisplay from native display." The only remaining GL fix is a
-hand-built GstGLDisplay on the render node /dev/dri/renderD128 — code we
-can't iterate on locally and that wins nothing when the panel runs at
-1360x768 anyway (~2x wasted blend work at 1080p). qarl's call: prefer
-the simple robust path.
+Both are topology problems, not tuning. The fix decouples looping from
+compositing via the intervideo bridge:
 
-Pipeline (CPU, sized to native, one explicit videoconvert at output):
+  DECODE PIPELINE A (its own Gst.Pipeline; single source, single sink)
+    filesrc -> qtdemux -> h264parse -> v4l2h264dec
+    -> videorate -> video/x-raw,framerate=30/1
+    -> videoscale method=1
+    -> video/x-raw,format=NV12,width=1360,height=768
+    -> queue -> intervideosink channel=chA sync=false
 
-  filesrc -> qtdemux -> h264parse -> v4l2h264dec (HW)
-          -> videoscale method=1 (bilinear)
-          -> video/x-raw,width=1360,height=768  (size only; format
-                                                 left to negotiation)
-          -> comp.sink_0 / comp.sink_1
+  DECODE PIPELINE B
+    identical, channel=chB, file B
 
-  compositor name=comp  (CPU blend in whatever format it prefers,
-                         typically AYUV / ARGB internally)
-          -> videoconvert
-          -> video/x-raw,format=NV12,width=1360,height=768
-          -> kmssink sync=true                  (native modeset, NV12)
+  COMPOSITOR PIPELINE (its own Gst.Pipeline; runs forever, never sees
+                       any decode-side EOS / flush / segment event)
+    intervideosrc channel=chA timeout=200ms
+    -> videorate skip-to-first=true
+    -> video/x-raw,framerate=30/1
+    -> queue -> comp.sink_0
+    (same for chB -> comp.sink_1)
+    compositor name=comp background=black
+    -> video/x-raw,format=NV12-or-AYUV,width=1360,height=768,framerate=30/1
+    -> queue -> videoconvert
+    -> video/x-raw,format=NV12,width=1360,height=768
+    -> kmssink name=sink sync=true
 
-Perf reasoning + honesty:
-- Subagent caught the v3 docstring claim of "zero videoconvert" as
-  wrong: mainline compositor does NOT blend NV12 natively, it
-  negotiates to AYUV/ARGB internally and gstreamer would silently
-  inject a videoconvert per stream upstream. Letting upstream caps
-  negotiate (no format=NV12 on input) means at MOST one input
-  format conversion per stream, picked by compositor itself — which
-  is the minimum achievable without GL.
-- One explicit videoconvert sits between compositor and kmssink so
-  the output reaches NV12 for kmssink (vc4 KMS plane native format),
-  no implicit per-frame conversion path inside kmssink.
-- videoscale downscales 1920x1080 -> 1360x768 (~0.50x area) BEFORE
-  the blend so compositor blends ~1 MP per stream not ~2 MP. This
-  is the leverage QA called out for moving CPU off the cliff.
-- kmssink takes the NV12 1360x768 output and KMS-atomic-commits at
-  the panel's native mode — no output scale.
+Why this gets the frame flow right:
 
-Kept from e493068 (verified on glass already):
-- non-flushing SEGMENT-seek loop: SEGMENT_DONE on the bus -> re-arm
-  with seek(rate=1.0, TIME, SEGMENT|KEY_UNIT, SET 0, NONE 0). No FLUSH
-  event reaches v4l2h264dec — no STREAMOFF/STREAMON, no REQBUFS/EINVAL
-  surface.
-- wipe animation: sink_1 xpos=0 width animated 0->DW over WIPE_S; after
-  wipe, roles swap.
-- 30s preroll polling loop with progress logging — overkill for the CPU
-  path (no GL, preroll should be <1s) but harmless and protects against
-  future slow-init sources.
-- SIGTERM-clean shutdown: shutdown_requested flag checked in preroll;
-  GLib.idle_add(loop.quit) post-PLAYING.
-- Two-HW-decoder enumeration sanity, peer-process double-start guard.
+  - FIXED framerate=30/1 on the compositor pipeline (src cap + per-pad
+    videorate) means the aggregator emits at a steady 30 fps regardless
+    of input alignment. The 4.75s vs 9.08s loop-duration mismatch
+    becomes invisible to the compositor.
+  - videorate after each intervideosrc REPEATS the last buffer to
+    maintain 30 fps when its decode pipeline briefly stalls (e.g.
+    during a SEGMENT_DONE -> re-seek transient). Both compositor pads
+    are always fed, so the aggregator never deadline-waits.
+  - LOOPING is contained in each single-source / single-sink decode
+    bin. Per-decode bus catches SEGMENT_DONE from THAT bin's demuxer
+    and re-issues a non-flushing SEGMENT seek to time 0. This IS the
+    canonical SEGMENT-seek case that gst supports; the prior failure
+    was the aggregator behind it, which is now gone.
+  - NO FLUSH event ever reaches v4l2h264dec at the loop boundary
+    (SEGMENT seeks are non-flushing). gstreamer's v4l2videodec flush
+    handler does NOT call VIDIOC_STREAMOFF/STREAMON on the
+    bcm2835-codec CAPTURE queue. The REQBUFS/EINVAL wedge surface
+    stays dormant.
+  - intervideo bridge isolates each decode pipeline's EOS / flush /
+    segment events from the compositor pipeline at the BUFFER level:
+    no event propagates across the bridge, so the compositor cannot
+    be tipped into EOS or be flushed by a decoder-side restart.
+    (Note: operational error-recovery is NOT in this step -- any
+    GStreamer ERROR message on any bus still quits the GLib main
+    loop and exits the script. A future iteration could NULL the
+    affected decode pipeline and keep the compositor running on its
+    timeout-fallback frames.)
 
-Dropped from e493068 (no longer needed without GL):
-- GST_GL_PLATFORM / GST_GL_WINDOW / GST_GL_API env defaults.
-- _ensure_xdg_runtime_dir() helper.
-- glupload / glcolorconvert / glvideomixer / gldownload from the
-  required-element list.
+WIPE (unchanged): GLib timer animates comp.sink_1 xpos/width 0->DW
+over WIPE_S; after the wipe roles swap. Both inputs are genuinely
+live every frame now (videorate-fed), so motion-through-the-transition
+is preserved without any decoder-warm trickery.
 
-TODO(warm) decoder-warmup mitigation site is still NOT this step.
+INSTRUMENT (preserved + adapted to new topology): per-second [fps]
+line continues to print to stderr + /tmp/wipe_fps.log. Probes attach
+in the new locations: decA.src in pipe_a, decB.src in pipe_b,
+kmssink.sink in pipe_c. Position queries hit pipe_a.demux and
+pipe_b.demux. A WORKING result must show screen ~= 30 sustained and
+positions cycling 0->dur->0 forever.
+
+NOT in this step (still): the TODO(warm) decoder-warm-up site.
 """
 
 import os
@@ -90,10 +102,12 @@ VIDEOS = [
     "/var/openmarquee/content/029c4d68-744c-4d30-9adc-0f37c55514f1/asset.mp4",
     "/var/openmarquee/content/3f54a4d2-a120-4c0c-aa80-5b99aaf7c9ff/asset.mp4",
 ]
-DW, DH = 1360, 768  # native display res; matches kmssink mode + blend res
+DW, DH = 1360, 768
+FPS = 30
 HOLD_S = 4.0
 WIPE_S = 1.0
 TICK_MS = 33
+PREROLL_BUDGET_S = 30
 
 
 def die(msg, code=1):
@@ -109,70 +123,104 @@ for v in VIDEOS:
 
 Gst.init(None)
 
-for el in (
+REQUIRED_ELEMENTS = (
     "filesrc", "qtdemux", "h264parse", "v4l2h264dec",
-    "videoscale", "compositor", "videoconvert", "kmssink",
-):
+    "videorate", "videoscale", "videoconvert",
+    "intervideosink", "intervideosrc",
+    "compositor", "queue", "kmssink",
+)
+for el in REQUIRED_ELEMENTS:
     if not Gst.ElementFactory.find(el):
         die(f"missing gstreamer element: {el} "
             "(try sudo apt install gstreamer1.0-plugins-{good,bad})")
 
-# Single HW decoder context — refuse double-start. Exclude both this
-# process AND its parent (the shell / systemd-run scope wrapper);
-# those carry the script's argv in their cmdline and would otherwise
-# false-positive.
 self_pid = os.getpid()
 parent_pid = os.getppid()
-own = (str(self_pid), str(parent_pid))
+own_pids = (str(self_pid), str(parent_pid))
 ps = subprocess.run(
     ["pgrep", "-af", "v4l2h264dec|openmarquee-render|mini-play|wipe.py|wipe_cpu"],
     capture_output=True, text=True,
 )
 peers = [
     line for line in ps.stdout.splitlines()
-    if line.split() and line.split()[0] not in own
+    if line.split() and line.split()[0] not in own_pids
 ]
 if peers:
     die("another HW-decode process is already running:\n  "
         + "\n  ".join(peers))
 
-# --- Pipeline -----------------------------------------------------------
+# --- Pipelines ----------------------------------------------------------
 
-# Input caps: size only (let compositor pick blend format).
-# Output caps: NV12 at native for kmssink, with an explicit videoconvert
-# so the AYUV/ARGB compositor output is converted ONCE at the seam.
-INPUT_SIZE = f"video/x-raw,width={DW},height={DH}"
-OUTPUT_NV12 = f"video/x-raw,format=NV12,width={DW},height={DH}"
+NV12_DISP = f"video/x-raw,format=NV12,width={DW},height={DH}"
+RATE_30 = f"video/x-raw,framerate={FPS}/1"
 
-pipe_desc = (
-    f"compositor name=comp background=black "
-    f"  sink_0::xpos=0 sink_0::ypos=0 "
-    f"  sink_0::width={DW} sink_0::height={DH} sink_0::zorder=0 "
-    f"  sink_1::xpos=0 sink_1::ypos=0 "
-    f"  sink_1::width=0 sink_1::height={DH} sink_1::zorder=1 "
-    f"! videoconvert ! {OUTPUT_NV12} ! kmssink name=sink sync=true "
-    f'filesrc location="{VIDEOS[0]}" name=srcA '
-    f"  ! qtdemux name=demuxA ! h264parse ! v4l2h264dec name=decA "
-    f"  ! videoscale method=1 ! {INPUT_SIZE} ! comp.sink_0 "
-    f'filesrc location="{VIDEOS[1]}" name=srcB '
-    f"  ! qtdemux name=demuxB ! h264parse ! v4l2h264dec name=decB "
-    f"  ! videoscale method=1 ! {INPUT_SIZE} ! comp.sink_1"
-)
 
-try:
-    pipeline = Gst.parse_launch(pipe_desc)
-except GLib.Error as exc:
-    die(f"pipeline parse failed: {exc.message}")
+def build_decode_pipeline(video_path, channel):
+    """One source, one sink. SEGMENT-seek loop lives inside this bin
+    where it is canonically supported."""
+    desc = (
+        f'filesrc location="{video_path}" name=src '
+        f"! qtdemux name=demux ! h264parse "
+        f"! v4l2h264dec name=dec "
+        f"! videorate ! {RATE_30} "
+        f"! videoscale method=1 ! {NV12_DISP} "
+        f"! queue max-size-buffers=4 leaky=downstream "
+        f"! intervideosink channel={channel} sync=false"
+    )
+    try:
+        return Gst.parse_launch(desc)
+    except GLib.Error as exc:
+        die(f"decode pipeline ({channel}) parse failed: {exc.message}")
 
-comp = pipeline.get_by_name("comp")
-if comp is None:
-    die("compositor not found in parsed pipeline")
+
+def build_compositor_pipeline():
+    """Runs forever. NEVER sees an EOS or flush from the decoders.
+    Per-pad videorate keeps the compositor fed at 30 fps even when an
+    upstream intervideosrc momentarily has no buffer."""
+    desc = (
+        f"compositor name=comp background=black "
+        f"  sink_0::xpos=0 sink_0::ypos=0 "
+        f"  sink_0::width={DW} sink_0::height={DH} sink_0::zorder=0 "
+        f"  sink_1::xpos=0 sink_1::ypos=0 "
+        f"  sink_1::width=0 sink_1::height={DH} sink_1::zorder=1 "
+        f"! video/x-raw,width={DW},height={DH},framerate={FPS}/1 "
+        f"! queue max-size-buffers=2 leaky=downstream "
+        f"! videoconvert "
+        f"! {NV12_DISP} "
+        f"! kmssink name=sink sync=true "
+        f"intervideosrc channel=chA timeout=200000000 do-timestamp=true "
+        f"  ! videorate skip-to-first=true ! {RATE_30} "
+        f"  ! queue max-size-buffers=2 leaky=downstream "
+        f"  ! comp.sink_0 "
+        f"intervideosrc channel=chB timeout=200000000 do-timestamp=true "
+        f"  ! videorate skip-to-first=true ! {RATE_30} "
+        f"  ! queue max-size-buffers=2 leaky=downstream "
+        f"  ! comp.sink_1"
+    )
+    try:
+        return Gst.parse_launch(desc)
+    except GLib.Error as exc:
+        die(f"compositor pipeline parse failed: {exc.message}")
+
+
+pipe_a = build_decode_pipeline(VIDEOS[0], "chA")
+pipe_b = build_decode_pipeline(VIDEOS[1], "chB")
+pipe_c = build_compositor_pipeline()
+
+decA = pipe_a.get_by_name("dec")
+decB = pipe_b.get_by_name("dec")
+demuxA = pipe_a.get_by_name("demux")
+demuxB = pipe_b.get_by_name("demux")
+comp = pipe_c.get_by_name("comp")
+sink = pipe_c.get_by_name("sink")
+for label, el in [("decA", decA), ("decB", decB),
+                  ("demuxA", demuxA), ("demuxB", demuxB),
+                  ("comp", comp), ("sink", sink)]:
+    if el is None:
+        die(f"required element {label} not found after parse_launch")
 
 
 def find_sink_pad(element, name):
-    """compositor pads are request pads; get_static_pad behavior on
-    request pads is version-dependent. Iterate sink pads to find by
-    name reliably."""
     pad = element.get_static_pad(name)
     if pad is not None:
         return pad
@@ -189,53 +237,25 @@ pads = [find_sink_pad(comp, "sink_0"), find_sink_pad(comp, "sink_1")]
 if pads[0] is None or pads[1] is None:
     die(f"could not locate compositor pads sink_0/sink_1: {pads}")
 
-# --- Per-source SEGMENT-seek loop ---------------------------------------
-
-DEMUX_NAMES = ("demuxA", "demuxB")
-demuxes = {}
-for name in DEMUX_NAMES:
-    demux = pipeline.get_by_name(name)
-    if demux is None:
-        die(f"{name} not found in parsed pipeline")
-    demuxes[name] = demux
+# --- Looping (per decode bin) -------------------------------------------
 
 
 def segment_seek(elem):
-    """Non-flushing segment seek from 0 to end (NONE)."""
     return elem.seek(
-        1.0,                              # rate
-        Gst.Format.TIME,
+        1.0, Gst.Format.TIME,
         Gst.SeekFlags.SEGMENT | Gst.SeekFlags.KEY_UNIT,
-        Gst.SeekType.SET, 0,             # start
-        Gst.SeekType.NONE, 0,            # stop (NONE = duration)
+        Gst.SeekType.SET, 0,
+        Gst.SeekType.NONE, 0,
     )
 
 
-# --- Frame-flow instrument (per-second [fps] line) ----------------------
-#
-# Add-only diagnostic per QA dispatch 2026-06-17. The state machine
-# log "wipe/hold" prints regardless of whether frames are flowing;
-# decoder-open != frame-delivering; the pipeline emits no error when
-# a decoder silently stops producing. Pad probes here give a true
-# frame-flow signal at three points:
-#
-#   - decA src pad -> frames OUT of HW decoder A
-#   - decB src pad -> frames OUT of HW decoder B
-#   - kmssink sink pad -> frames actually reaching the screen
-#
-# Once per second a single line prints uptime, all three counters
-# (reset after each tick), each demuxer's stream position, and the
-# current state. Reading the line:
-#   decA/decB drop to 0 -> THAT decoder stalled
-#   decA/decB > 0 but screen = 0 -> stall is downstream of decoders
-#   posA/posB frozen with fps > 0 -> seek/segment confusion
-#   line stops appearing -> process or main loop hung
+# --- Frame-flow instrument ---------------------------------------------
 
 counters = {"decA": 0, "decB": 0, "screen": 0}
 
 try:
     fps_log_file = open("/tmp/wipe_fps.log", "a", buffering=1)
-    print(f"[wipe_cpu] tee fps to /tmp/wipe_fps.log")
+    print("[wipe_cpu] tee fps to /tmp/wipe_fps.log")
 except OSError as _exc:
     fps_log_file = None
     print(f"[wipe_cpu] /tmp/wipe_fps.log unavailable ({_exc}); stderr only")
@@ -249,23 +269,15 @@ def _make_counter_probe(key):
 
 
 def attach_flow_probes():
-    for name in ("decA", "decB"):
-        el = pipeline.get_by_name(name)
-        if el is None:
-            die(f"{name} element not found for flow probe")
-        pad = el.get_static_pad("src")
+    for label, element, padname in [
+        ("decA", decA, "src"),
+        ("decB", decB, "src"),
+        ("screen", sink, "sink"),
+    ]:
+        pad = element.get_static_pad(padname)
         if pad is None:
-            die(f"{name} has no src pad")
-        pad.add_probe(Gst.PadProbeType.BUFFER, _make_counter_probe(name))
-    sink_el = pipeline.get_by_name("sink")
-    if sink_el is None:
-        die("kmssink element not found for flow probe")
-    sink_pad = sink_el.get_static_pad("sink")
-    if sink_pad is None:
-        die("kmssink has no sink pad")
-    sink_pad.add_probe(
-        Gst.PadProbeType.BUFFER, _make_counter_probe("screen")
-    )
+            die(f"{label}: element has no {padname} pad")
+        pad.add_probe(Gst.PadProbeType.BUFFER, _make_counter_probe(label))
 
 
 def _query_pos_s(elem):
@@ -280,8 +292,8 @@ _t_start = time.monotonic()
 
 def fps_tick():
     uptime = int(time.monotonic() - _t_start)
-    posA = _query_pos_s(demuxes["demuxA"])
-    posB = _query_pos_s(demuxes["demuxB"])
+    posA = _query_pos_s(demuxA)
+    posB = _query_pos_s(demuxB)
     line = (
         f"[fps] t={uptime} "
         f"decA={counters['decA']} decB={counters['decB']} "
@@ -297,23 +309,8 @@ def fps_tick():
     counters["decA"] = 0
     counters["decB"] = 0
     counters["screen"] = 0
-    return True  # keep firing
+    return True
 
-
-# --- Sanity: exactly two HW decoders ------------------------------------
-
-hw_decs = []
-it = pipeline.iterate_elements()
-while True:
-    res, el = it.next()
-    if res != Gst.IteratorResult.OK:
-        break
-    fac = el.get_factory()
-    if fac and fac.get_name() == "v4l2h264dec":
-        hw_decs.append(el.get_name())
-print(f"[wipe_cpu] HW decoders in pipeline: {len(hw_decs)} -> {hw_decs}")
-if len(hw_decs) != 2:
-    die("expected exactly 2 v4l2h264dec instances")
 
 # --- State machine ------------------------------------------------------
 
@@ -324,7 +321,7 @@ phase_start_ns = 0
 
 
 def now_ns():
-    return GLib.get_monotonic_time() * 1000  # us -> ns
+    return GLib.get_monotonic_time() * 1000
 
 
 def set_geom(pad, x, w):
@@ -334,14 +331,11 @@ def set_geom(pad, x, w):
 
 def start_wipe():
     global state, phase_start_ns
-    # TODO(warm): pre-emit a frame from the incoming pad ~150-300ms BEFORE
-    # geometry animation begins, so the v4l2h264dec context is past first
-    # CAPTURE-buffer allocation when the wipe edge starts moving. With the
-    # SEGMENT-seek loop both decoders stay in PLAYING continuously, so
-    # warming should already be implicit -- but if the wipe seam stutters
-    # on glass, the knob site is: temporarily zorder=1 + width=1 on the
-    # incoming pad for ~200ms before animation start (single-pixel reveal
-    # warm-up). Still NOT this step.
+    # TODO(warm): with intervideosrc + videorate the incoming pad is
+    # already being driven at 30 fps from its decoder, so warming should
+    # be implicit. If glass shows a stutter at the leading edge of the
+    # reveal, this is the site: temporarily zorder=1 + width=1 on the
+    # incoming pad for ~150-300ms before animation start.
     pads[incoming].set_property("zorder", 1)
     pads[outgoing].set_property("zorder", 0)
     state = "WIPE"
@@ -370,7 +364,7 @@ def tick():
             finish_wipe()
         else:
             set_geom(pads[incoming], 0, (elapsed_s / WIPE_S) * DW)
-    return True  # keep firing
+    return True
 
 
 set_geom(pads[0], 0, DW)
@@ -382,32 +376,54 @@ phase_start_ns = now_ns()
 loop = GLib.MainLoop()
 
 
-def on_bus(_bus, msg):
-    if msg.type == Gst.MessageType.SEGMENT_DONE:
-        src = msg.src
-        name = src.get_name() if src else "?"
-        if name in DEMUX_NAMES:
-            if not segment_seek(src):
-                print(f"[wipe_cpu] {name} segment re-seek FAILED",
-                      file=sys.stderr)
-        return
+def _make_decode_bus_handler(channel, demux_obj):
+    def _on_bus(_bus, msg):
+        if msg.type == Gst.MessageType.SEGMENT_DONE:
+            src = msg.src
+            if src is demux_obj:
+                if not segment_seek(src):
+                    print(f"[{channel}] SEGMENT_DONE re-seek FAILED",
+                          file=sys.stderr)
+            return
+        if msg.type == Gst.MessageType.ERROR:
+            err, dbg = msg.parse_error()
+            src = msg.src.get_name() if msg.src else "?"
+            print(f"[{channel}] ERROR {src}: {err.message}",
+                  file=sys.stderr)
+            if dbg:
+                print(f"[{channel}]  debug: {dbg}", file=sys.stderr)
+            loop.quit()
+            return
+        if msg.type == Gst.MessageType.EOS:
+            print(f"[{channel}] pipeline EOS reached bus "
+                  "(segment mode dropped?)", file=sys.stderr)
+            loop.quit()
+    return _on_bus
+
+
+def on_comp_bus(_bus, msg):
     if msg.type == Gst.MessageType.ERROR:
         err, dbg = msg.parse_error()
         src = msg.src.get_name() if msg.src else "?"
-        print(f"[wipe_cpu] ERROR {src}: {err.message}", file=sys.stderr)
+        print(f"[comp] ERROR {src}: {err.message}", file=sys.stderr)
         if dbg:
-            print(f"[wipe_cpu]  debug: {dbg}", file=sys.stderr)
+            print(f"[comp]  debug: {dbg}", file=sys.stderr)
         loop.quit()
         return
     if msg.type == Gst.MessageType.EOS:
-        print("[wipe_cpu] pipeline EOS reached bus (segment mode dropped?)",
-              file=sys.stderr)
+        print("[comp] pipeline EOS (decoder-isolated bridge should "
+              "have prevented this)", file=sys.stderr)
         loop.quit()
 
 
-bus = pipeline.get_bus()
-bus.add_signal_watch()
-bus.connect("message", on_bus)
+for p, h in [
+    (pipe_a, _make_decode_bus_handler("A", demuxA)),
+    (pipe_b, _make_decode_bus_handler("B", demuxB)),
+    (pipe_c, on_comp_bus),
+]:
+    bus = p.get_bus()
+    bus.add_signal_watch()
+    bus.connect("message", h)
 
 
 shutdown_requested = False
@@ -424,48 +440,62 @@ signal.signal(signal.SIGTERM, shutdown)
 
 # --- Run ----------------------------------------------------------------
 
+
+def preroll_to_paused(p, label):
+    """Set p to PAUSED and poll get_state up to PREROLL_BUDGET_S
+    seconds. Logs each ASYNC tick. Honors shutdown_requested."""
+    if p.set_state(Gst.State.PAUSED) == Gst.StateChangeReturn.FAILURE:
+        die(f"{label}: pipeline failed to enter PAUSED")
+    for elapsed in range(1, PREROLL_BUDGET_S + 1):
+        if shutdown_requested:
+            return False
+        ret, cur, pending = p.get_state(1 * Gst.SECOND)
+        if ret == Gst.StateChangeReturn.SUCCESS:
+            print(f"[wipe_cpu] {label} preroll done after ~{elapsed}s "
+                  f"(state={cur.value_nick})")
+            return True
+        if ret == Gst.StateChangeReturn.FAILURE:
+            die(f"{label} preroll FAILURE")
+        print(f"[wipe_cpu] {label} preroll... state={cur.value_nick} "
+              f"pending={pending.value_nick} "
+              f"({elapsed}/{PREROLL_BUDGET_S}s)")
+    die(f"{label} preroll exceeded {PREROLL_BUDGET_S}s budget")
+
+
 print(f"[wipe_cpu] starting; HOLD={HOLD_S}s WIPE={WIPE_S}s "
-      f"display={DW}x{DH} NV12; ctrl-c to stop")
+      f"display={DW}x{DH}@{FPS} intervideo-bridged; ctrl-c to stop")
 
-if pipeline.set_state(Gst.State.PAUSED) == Gst.StateChangeReturn.FAILURE:
-    die("pipeline failed to enter PAUSED")
+# Start the compositor pipeline first so the intervideosrc endpoints on
+# chA / chB exist before the decode pipelines start emitting buffers.
+preroll_to_paused(pipe_c, "compositor")
+preroll_to_paused(pipe_a, "decodeA")
+preroll_to_paused(pipe_b, "decodeB")
 
-PREROLL_BUDGET_S = 30
-POLL_S = 1
-prerolled = False
-for elapsed in range(POLL_S, PREROLL_BUDGET_S + POLL_S, POLL_S):
-    if shutdown_requested:
-        pipeline.set_state(Gst.State.NULL)
-        sys.exit(0)
-    ret, cur, pending = pipeline.get_state(POLL_S * Gst.SECOND)
-    if ret == Gst.StateChangeReturn.SUCCESS:
-        print(f"[wipe_cpu] preroll done after ~{elapsed}s "
-              f"(state={cur.value_nick})")
-        prerolled = True
-        break
-    if ret == Gst.StateChangeReturn.FAILURE:
-        die("pipeline preroll FAILURE")
-    print(f"[wipe_cpu] preroll... state={cur.value_nick} "
-          f"pending={pending.value_nick} ({elapsed}/{PREROLL_BUDGET_S}s)")
+if shutdown_requested:
+    for p in (pipe_a, pipe_b, pipe_c):
+        p.set_state(Gst.State.NULL)
+    sys.exit(0)
 
-if not prerolled:
-    die(f"pipeline preroll exceeded {PREROLL_BUDGET_S}s budget")
-
-for name, demux in demuxes.items():
+# Arm SEGMENT-seek mode on each demuxer BEFORE PLAYING so the very
+# first segment runs in segment mode (SEGMENT_DONE rather than EOS).
+for label, demux in [("demuxA", demuxA), ("demuxB", demuxB)]:
     if not segment_seek(demux):
-        die(f"initial SEGMENT seek failed on {name}")
+        die(f"initial SEGMENT seek failed on {label}")
 
-if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-    die("pipeline failed to enter PLAYING")
+for label, p in [("compositor", pipe_c),
+                 ("decodeA", pipe_a),
+                 ("decodeB", pipe_b)]:
+    if p.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+        die(f"{label}: pipeline failed to enter PLAYING")
 
 attach_flow_probes()
-
 GLib.timeout_add(TICK_MS, tick)
 GLib.timeout_add(1000, fps_tick)
 try:
     loop.run()
 finally:
-    pipeline.set_state(Gst.State.NULL)
+    for p in (pipe_a, pipe_b, pipe_c):
+        p.set_state(Gst.State.NULL)
     if fps_log_file is not None:
         try:
             fps_log_file.close()
