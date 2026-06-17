@@ -1,7 +1,12 @@
 #!/bin/bash
-# Smallest fresh renderer: H264 HW-decode -> portrait rotate -> KMS, looped.
-# Stack: gstreamer (v4l2h264dec + videoflip + kmssink). Zero shared code with
+# Smallest fresh renderer: H264 HW-decode -> KMS, looped.
+# Stack: gstreamer (v4l2h264dec + kmssink). Zero shared code with
 # openmarquee-render. Step 1 of fresh-stack rebuild (2026-06-17).
+#
+# No rotation: CPU videoflip crushed 1080p to 2-4fps on Pi Zero 2 W.
+# Native/landscape only for now. Portrait will return as a proper
+# feature: HW-plane rotation via kmssink DRM plane property, honoring
+# settings.json display_rotation. Not in this step.
 #
 # Usage:
 #   sudo systemctl stop openmarquee-render   # free the HW decoder + DRM master
@@ -32,7 +37,6 @@ while true; do
     filesrc location="$VIDEO" ! \
     qtdemux name=d d. ! queue ! \
     h264parse ! v4l2h264dec ! \
-    videoflip method=clockwise ! \
     kmssink sync=true \
     || { echo "[fresh] pipeline exited non-zero; sleeping 1s + retrying"; sleep 1; }
 done
