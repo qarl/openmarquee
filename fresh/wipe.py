@@ -1,36 +1,51 @@
 #!/usr/bin/env python3
-"""fresh/wipe.py — A <-> B wipe with TWO live HW H264 decoders.
+"""fresh/wipe.py — A <-> B wipe with TWO live HW H264 decoders, GL blend, seek-loop.
 
-Step 2b of fresh-stack rebuild (2026-06-17). Same gstreamer stack as
-step 2a, two of them: v4l2h264dec (bcm2835 HW H264) per source, into a
-gst `compositor`, out via kmssink. Sibling to play.sh; play.sh stays
-single-pipeline + sequential, wipe.py is the dual-decode/compositor.
+Step 2b (fix iteration) of fresh-stack rebuild (2026-06-17). v2 changes
+on top of f993751:
+
+  1. GPU blend: glupload -> glvideomixer -> gldownload -> kmssink
+     (was: videoconvert -> compositor [CPU sysmem] -> kmssink, which
+     QA measured as frame-dropping with CPU climbing 43%->95% backlog).
+     glupload imports the v4l2h264dec dmabuf as an EGL image (zero-copy
+     on V3D/Mesa); glvideomixer blends two GL textures via shader;
+     gldownload pulls the composited RGB into sysmem once per frame for
+     kmssink. Sysmem cost is now one 1080p readback per output frame
+     instead of two 1080p YUV downloads + a CPU blend per frame.
+
+  2. Continuous loop without decoder teardown: named filesrc + qtdemux
+     per source. On entry to PAUSED we issue a non-flushing SEGMENT seek
+     on each demuxer (start=0, stop=NONE = play to end). The demuxer
+     emits a SEGMENT_DONE bus message at end-of-stream instead of EOS;
+     the bus handler issues another SEGMENT seek back to time 0. NO
+     FLUSH event reaches v4l2h264dec at the loop boundary, so the
+     gstreamer v4l2videodec flush handler does NOT call
+     VIDIOC_STREAMOFF/STREAMON on the CAPTURE queue — the bcm2835-codec
+     REQBUFS/EINVAL wedge surface is NOT exercised by the loop.
+     (A prior version using `multifilesrc loop=true` EOS-quit at ~14s
+     because qtdemux forwards EOS rather than looping; a flushing-seek
+     version was rejected because flush would trigger STREAMOFF.)
+
+Sibling to play.sh; play.sh stays single-pipeline sequential.
 
 EFFECT: left-to-right wipe of the incoming video over the outgoing one.
-Compositor sink_1 pad geometry (xpos=0, width animated 0→1920 over
+glvideomixer sink_1 pad geometry (xpos=0, width animated 0->1920 over
 WIPE_S) reveals the incoming on top of the outgoing (z-order 1 > 0).
-After the wipe completes, roles swap; both pads continue decoding their
-sources via `multifilesrc loop=true` so neither decoder dies between
-wipes (motion-through-transition requirement).
+Roles swap after each wipe; both decoders run continuously.
 
 CORE STUDY (per QA dispatch 2026-06-17): two simultaneous HW decoders
 on bcm2835 is the freeze surface. This script proves the wipe +
 dual-decode lifecycle works; the "warm the incoming decoder early"
-knob is the NEXT step. Marked TODO(warm) below.
+knob is still the NEXT step. Marked TODO(warm) below.
 
-HW-decode verification: this script enumerates v4l2h264dec elements
-at startup. To confirm both are actually on HW (not silent fallback to
-avdec_h264), on the Pi run:
-    v4l2-ctl --list-devices         # bcm2835-codec-decode -> /dev/video10
-    GST_DEBUG=v4l2:5 ./wipe.py 2>&1 | grep -i 'open.*video1[01]'
+HW-decode + GL-path verification on the Pi:
+    v4l2-ctl --list-devices                          # /dev/video10
+    fuser -v /dev/video10                            # two opens (one per decoder)
+    GST_DEBUG=v4l2:5,glupload:4 ./wipe.py 2>&1 \
+        | grep -iE 'open.*video1[01]|dmabuf|EGL'
 
-LIMITATIONS at this step (acceptable per spec):
-- `compositor` is CPU (sysmem path); during the wipe both 1080p streams
-  download from dmabuf -> RGB blend. May tank fps during the wipe
-  window. Measurement on glass decides whether to move to glvideomixer.
-- multifilesrc loop=true on a single .mp4: known to work for raw streams
-  but qtdemux re-parsing on each loop may stutter at the loop seam.
-  Acceptable for this study (seam smoothing is the NEXT step's job).
+GL platform: defaults to EGL on GBM with GLES2 (right path for V3D on
+headless Pi). Override via the standard GST_GL_* env vars if needed.
 """
 
 import os
@@ -38,7 +53,13 @@ import signal
 import subprocess
 import sys
 
-import gi
+# Headless GL on V3D + KMS/GBM. Set BEFORE Gst.init so gstreamer-gl picks
+# the GBM window backend (EGL on dri/card0) instead of trying X11/Wayland.
+os.environ.setdefault("GST_GL_PLATFORM", "egl")
+os.environ.setdefault("GST_GL_WINDOW", "gbm")
+os.environ.setdefault("GST_GL_API", "gles2")
+
+import gi  # noqa: E402
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
@@ -69,11 +90,13 @@ Gst.init(None)
 
 for el in (
     "filesrc", "qtdemux", "h264parse", "v4l2h264dec",
-    "compositor", "videoconvert", "multifilesrc", "kmssink",
+    "glupload", "glcolorconvert", "glvideomixer", "gldownload",
+    "videoconvert", "kmssink",
 ):
     if not Gst.ElementFactory.find(el):
         die(f"missing gstreamer element: {el} "
-            "(try sudo apt install gstreamer1.0-plugins-{good,bad})")
+            "(try sudo apt install gstreamer1.0-plugins-{good,bad} "
+            "gstreamer1.0-gl)")
 
 # Single HW decoder context — refuse double-start.
 self_pid = os.getpid()
@@ -90,18 +113,24 @@ if peers:
         + "\n  ".join(peers))
 
 # --- Pipeline -----------------------------------------------------------
+#
+# Two decode branches into glvideomixer; output via gldownload + kmssink.
+# Named filesrc + qtdemux per branch so we can attach an EOS-loop probe
+# on each demuxer's dynamic video pad.
 
 pipe_desc = (
-    f"compositor name=comp background=black "
+    f"glvideomixer name=mix background=black "
     f"  sink_0::xpos=0 sink_0::ypos=0 "
     f"  sink_0::width={W} sink_0::height={H} sink_0::zorder=0 "
     f"  sink_1::xpos=0 sink_1::ypos=0 "
     f"  sink_1::width=0 sink_1::height={H} sink_1::zorder=1 "
-    f"! videoconvert ! kmssink sync=true "
-    f'multifilesrc location="{VIDEOS[0]}" loop=true ! qtdemux ! h264parse '
-    f"  ! v4l2h264dec ! videoconvert ! comp.sink_0 "
-    f'multifilesrc location="{VIDEOS[1]}" loop=true ! qtdemux ! h264parse '
-    f"  ! v4l2h264dec ! videoconvert ! comp.sink_1"
+    f"! gldownload ! videoconvert ! kmssink sync=true "
+    f'filesrc location="{VIDEOS[0]}" name=srcA '
+    f"  ! qtdemux name=demuxA ! h264parse ! v4l2h264dec "
+    f"  ! glupload ! glcolorconvert ! mix.sink_0 "
+    f'filesrc location="{VIDEOS[1]}" name=srcB '
+    f"  ! qtdemux name=demuxB ! h264parse ! v4l2h264dec "
+    f"  ! glupload ! glcolorconvert ! mix.sink_1"
 )
 
 try:
@@ -109,14 +138,15 @@ try:
 except GLib.Error as exc:
     die(f"pipeline parse failed: {exc.message}")
 
-comp = pipeline.get_by_name("comp")
-if comp is None:
-    die("compositor not found in parsed pipeline")
+mix = pipeline.get_by_name("mix")
+if mix is None:
+    die("glvideomixer not found in parsed pipeline")
 
 
 def find_sink_pad(element, name):
-    """compositor pads are request pads; get_static_pad behavior on them
-    is version-dependent. Iterate sink pads to find by name reliably."""
+    """glvideomixer pads are request pads; get_static_pad behavior on
+    request pads is version-dependent. Iterate sink pads to find by
+    name reliably."""
     pad = element.get_static_pad(name)
     if pad is not None:
         return pad
@@ -129,11 +159,39 @@ def find_sink_pad(element, name):
             return p
 
 
-pads = [find_sink_pad(comp, "sink_0"), find_sink_pad(comp, "sink_1")]
+pads = [find_sink_pad(mix, "sink_0"), find_sink_pad(mix, "sink_1")]
 if pads[0] is None or pads[1] is None:
-    die(f"could not locate compositor pads sink_0/sink_1: {pads}")
+    die(f"could not locate glvideomixer pads sink_0/sink_1: {pads}")
 
-# Enumerate HW-decode elements so the operator can confirm two of them.
+# --- Per-source SEGMENT-seek loop ---------------------------------------
+#
+# After PAUSED, we issue a non-flushing SEGMENT seek on each demuxer.
+# When the segment completes, the demuxer posts a SEGMENT_DONE message
+# (not EOS) on the bus; the bus handler issues another SEGMENT seek to
+# time 0. No FLUSH event ever propagates to v4l2h264dec, so no
+# STREAMOFF/STREAMON cycle on the bcm2835-codec CAPTURE queue.
+
+DEMUX_NAMES = ("demuxA", "demuxB")
+demuxes = {}
+for name in DEMUX_NAMES:
+    demux = pipeline.get_by_name(name)
+    if demux is None:
+        die(f"{name} not found in parsed pipeline")
+    demuxes[name] = demux
+
+
+def segment_seek(elem):
+    """Non-flushing segment seek from 0 to end (NONE)."""
+    return elem.seek(
+        1.0,                              # rate
+        Gst.Format.TIME,
+        Gst.SeekFlags.SEGMENT | Gst.SeekFlags.KEY_UNIT,
+        Gst.SeekType.SET, 0,             # start
+        Gst.SeekType.NONE, 0,            # stop (NONE = duration)
+    )
+
+# --- Sanity: exactly two HW decoders ------------------------------------
+
 hw_decs = []
 it = pipeline.iterate_elements()
 while True:
@@ -168,11 +226,11 @@ def start_wipe():
     global state, phase_start_ns
     # TODO(warm): pre-emit a frame from the incoming pad ~150-300ms BEFORE
     # geometry animation begins, so the v4l2h264dec context is past first
-    # CAPTURE-buffer allocation when the wipe edge starts moving. With
-    # multifilesrc loop=true both decoders run continuously throughout, so
-    # warming should already be implicit -- but if the wipe seam stutters
-    # on glass, this is the knob: temporarily zorder=1 on the incoming pad
-    # for ~200ms with width=1 (single-pixel reveal) before animation start.
+    # CAPTURE-buffer allocation when the wipe edge starts moving. With the
+    # EOS-seek loop both decoders stay in PLAYING continuously, so warming
+    # should already be implicit -- but if the wipe seam stutters on glass,
+    # the knob site is: temporarily zorder=1 + width=1 on the incoming pad
+    # for ~200ms before animation start (single-pixel reveal warm-up).
     pads[incoming].set_property("zorder", 1)
     pads[outgoing].set_property("zorder", 0)
     state = "WIPE"
@@ -214,6 +272,16 @@ loop = GLib.MainLoop()
 
 
 def on_bus(_bus, msg):
+    if msg.type == Gst.MessageType.SEGMENT_DONE:
+        # End of a SEGMENT seek — re-arm to time 0 to keep this source
+        # looping. No flush -> no STREAMOFF on bcm2835 v4l2h264dec.
+        src = msg.src
+        name = src.get_name() if src else "?"
+        if name in DEMUX_NAMES:
+            if not segment_seek(src):
+                print(f"[wipe] {name} segment re-seek FAILED",
+                      file=sys.stderr)
+        return
     if msg.type == Gst.MessageType.ERROR:
         err, dbg = msg.parse_error()
         src = msg.src.get_name() if msg.src else "?"
@@ -221,8 +289,11 @@ def on_bus(_bus, msg):
         if dbg:
             print(f"[wipe]  debug: {dbg}", file=sys.stderr)
         loop.quit()
-    elif msg.type == Gst.MessageType.EOS:
-        print("[wipe] pipeline EOS (unexpected with multifilesrc loop=true)",
+        return
+    if msg.type == Gst.MessageType.EOS:
+        # SEGMENT seeks should produce SEGMENT_DONE not EOS — if EOS
+        # reaches the bus, something fell out of segment mode.
+        print("[wipe] pipeline EOS reached bus (segment mode dropped?)",
               file=sys.stderr)
         loop.quit()
 
@@ -233,9 +304,6 @@ bus.connect("message", on_bus)
 
 
 def shutdown(*_):
-    # Signal context — defer pipeline teardown to the GLib main loop to
-    # avoid GStreamer-from-signal-handler races. loop.quit() exits run(),
-    # the finally clause does the NULL transition.
     GLib.idle_add(loop.quit)
 
 
@@ -245,6 +313,21 @@ signal.signal(signal.SIGTERM, shutdown)
 # --- Run ----------------------------------------------------------------
 
 print(f"[wipe] starting; HOLD={HOLD_S}s WIPE={WIPE_S}s; ctrl-c to stop")
+
+# PAUSED first so each demuxer parses its mp4 moov, exposes its video
+# pad, and the downstream link to glupload/glcolorconvert/glvideomixer
+# negotiates. Only then can we issue the SEGMENT seek that arms the
+# non-flushing loop mode for each source.
+if pipeline.set_state(Gst.State.PAUSED) == Gst.StateChangeReturn.FAILURE:
+    die("pipeline failed to enter PAUSED")
+ret, _, _ = pipeline.get_state(5 * Gst.SECOND)
+if ret != Gst.StateChangeReturn.SUCCESS:
+    die(f"pipeline did not reach PAUSED within 5s (got {ret.value_nick})")
+
+for name, demux in demuxes.items():
+    if not segment_seek(demux):
+        die(f"initial SEGMENT seek failed on {name}")
+
 if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
     die("pipeline failed to enter PLAYING")
 
