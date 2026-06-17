@@ -152,18 +152,31 @@ if peers:
 # --- Pipelines ----------------------------------------------------------
 
 NV12_DISP = f"video/x-raw,format=NV12,width={DW},height={DH}"
+SIZE_ONLY = f"video/x-raw,width={DW},height={DH}"
 RATE_30 = f"video/x-raw,framerate={FPS}/1"
 
 
 def build_decode_pipeline(video_path, channel):
     """One source, one sink. SEGMENT-seek loop lives inside this bin
-    where it is canonically supported."""
+    where it is canonically supported.
+
+    Caps deliberately size-only on the post-scaler capsfilter: this
+    chain has NO videoconvert, and v4l2h264dec emits whatever pixel
+    format the source asset uses (I420 for the project's 4:2:0
+    landscape clips; could be NV12 elsewhere). videorate + videoscale
+    are passthrough on pixel format, so a format=NV12 capsfilter here
+    would fail negotiation with an I420 source ('not-negotiated -4')
+    and the pipeline would FAILURE-out of preroll. Compositor accepts
+    I420 natively; the single videoconvert in pipe_c (before kmssink)
+    handles the final conversion to NV12 for the vc4 plane. Total
+    convert count per frame is unchanged (or lower) vs forcing NV12
+    here -- matches the proven 674ae5a single-pipeline pattern."""
     desc = (
         f'filesrc location="{video_path}" name=src '
         f"! qtdemux name=demux ! h264parse "
         f"! v4l2h264dec name=dec "
         f"! videorate ! {RATE_30} "
-        f"! videoscale method=1 ! {NV12_DISP} "
+        f"! videoscale method=1 ! {SIZE_ONLY} "
         f"! queue max-size-buffers=4 leaky=downstream "
         f"! intervideosink channel={channel} sync=false"
     )
