@@ -21,8 +21,6 @@ compositing via the intervideo bridge:
   DECODE PIPELINE A (its own Gst.Pipeline; single source, single sink)
     filesrc -> qtdemux -> h264parse -> v4l2h264dec
     -> videorate -> video/x-raw,framerate=30/1
-    -> videoscale method=1
-    -> video/x-raw,format=NV12,width=1360,height=768
     -> queue -> intervideosink channel=chA sync=false
 
   DECODE PIPELINE B
@@ -30,16 +28,17 @@ compositing via the intervideo bridge:
 
   COMPOSITOR PIPELINE (its own Gst.Pipeline; runs forever, never sees
                        any decode-side EOS / flush / segment event)
-    intervideosrc channel=chA timeout=200ms
+    intervideosrc channel=chA timeout=200ms do-timestamp=false
     -> videorate skip-to-first=true
     -> video/x-raw,framerate=30/1
     -> queue -> comp.sink_0
     (same for chB -> comp.sink_1)
     compositor name=comp background=black
-    -> video/x-raw,format=NV12-or-AYUV,width=1360,height=768,framerate=30/1
+    -> video/x-raw,width=1280,height=720,framerate=30/1
     -> queue -> videoconvert
-    -> video/x-raw,format=NV12,width=1360,height=768
-    -> kmssink name=sink sync=true
+    -> video/x-raw,format=NV12,width=1280,height=720
+    -> kmssink name=sink sync=true       (HW-scales 1280x720 -> 1360x768
+                                          via the vc4 DRM plane)
 
 Why this gets the frame flow right:
 
@@ -71,15 +70,23 @@ Why this gets the frame flow right:
     affected decode pipeline and keep the compositor running on its
     timeout-fallback frames.)
   - SHARED CLOCK + SHARED BASE-TIME across all three pipelines (forced
-    after PAUSED, before any PLAYING). Each Gst.Pipeline normally
-    auto-selects its own clock at PLAYING -- with three pipelines and
-    an intervideo bridge that carries PTS, the consumer pipeline reads
-    those PTS in a different timebase, kmssink sync=true throttles to
-    match the mismatch, and the whole system runs at ~8% real-time.
-    use_clock(SystemClock) + identical set_base_time gives all three a
-    single shared running-time origin; do-timestamp=false on each
-    intervideosrc preserves the producer's PTS instead of re-stamping
-    against the throttled cadence.
+    after PAUSED, before any PLAYING). use_clock(SystemClock) + an
+    identical set_base_time gives all three a single shared running-
+    time origin. do-timestamp=false on each intervideosrc preserves
+    the producer PTS instead of re-stamping. (Kept after QA confirmed
+    clock alignment alone did NOT change the slow-motion symptom; the
+    real bottleneck was CPU videoscale, fixed below. Shared clock
+    remains the architecturally-correct setup for three Gst.Pipeline
+    objects bridged by intervideo and is harmless to keep.)
+  - NO CPU VIDEOSCALE. Source assets are native 1280x720 = the
+    composite size; the decode pipelines emit native-size frames
+    straight into intervideosink, the compositor pads are sized to
+    match, and kmssink HW-scales 1280x720 -> 1360x768 via the vc4
+    DRM plane (zero CPU pixel work). QA bisection on glass showed
+    `videoscale 1280x720 -> 1360x768` cost ~140ms/frame on a single
+    A53 core, pegging the cores and throttling the whole system to
+    ~7% real-time. Was present since 674ae5a; was masked by the
+    launch/freeze failures.
 
 WIPE (unchanged): GLib timer animates comp.sink_1 xpos/width 0->DW
 over WIPE_S; after the wipe roles swap. Both inputs are genuinely
@@ -112,7 +119,7 @@ VIDEOS = [
     "/var/openmarquee/content/029c4d68-744c-4d30-9adc-0f37c55514f1/asset.mp4",
     "/var/openmarquee/content/3f54a4d2-a120-4c0c-aa80-5b99aaf7c9ff/asset.mp4",
 ]
-DW, DH = 1360, 768
+DW, DH = 1280, 720
 FPS = 30
 HOLD_S = 4.0
 WIPE_S = 1.0
@@ -135,7 +142,7 @@ Gst.init(None)
 
 REQUIRED_ELEMENTS = (
     "filesrc", "qtdemux", "h264parse", "v4l2h264dec",
-    "videorate", "videoscale", "videoconvert",
+    "videorate", "videoconvert",
     "intervideosink", "intervideosrc",
     "compositor", "queue", "kmssink",
 )
@@ -162,7 +169,6 @@ if peers:
 # --- Pipelines ----------------------------------------------------------
 
 NV12_DISP = f"video/x-raw,format=NV12,width={DW},height={DH}"
-SIZE_ONLY = f"video/x-raw,width={DW},height={DH}"
 RATE_30 = f"video/x-raw,framerate={FPS}/1"
 
 
@@ -170,23 +176,22 @@ def build_decode_pipeline(video_path, channel):
     """One source, one sink. SEGMENT-seek loop lives inside this bin
     where it is canonically supported.
 
-    Caps deliberately size-only on the post-scaler capsfilter: this
-    chain has NO videoconvert, and v4l2h264dec emits whatever pixel
-    format the source asset uses (I420 for the project's 4:2:0
-    landscape clips; could be NV12 elsewhere). videorate + videoscale
-    are passthrough on pixel format, so a format=NV12 capsfilter here
-    would fail negotiation with an I420 source ('not-negotiated -4')
-    and the pipeline would FAILURE-out of preroll. Compositor accepts
-    I420 natively; the single videoconvert in pipe_c (before kmssink)
-    handles the final conversion to NV12 for the vc4 plane. Total
-    convert count per frame is unchanged (or lower) vs forcing NV12
-    here -- matches the proven 674ae5a single-pipeline pattern."""
+    NO videoscale and NO size capsfilter. Source assets are native
+    1280x720 = the chosen composite size (DW x DH); CPU videoscale
+    from 1280x720 to a different size cost ~140ms/frame on the Pi
+    Zero 2 W ISP-less A53 cores (QA bisection on glass), pegging one
+    core per branch and throttling the whole system to ~7% real-time.
+    Decoder emits at native 1280x720 in whatever pixel format the
+    asset is (I420 for these clips); videorate normalizes the rate to
+    30 fps; that goes straight into intervideosink. The compositor
+    pads are sized to match (DW x DH) so they do NOT scale either.
+    kmssink HW-scales the final NV12 1280x720 to the connector mode
+    (1360x768) via the vc4 DRM plane -- zero CPU pixel work."""
     desc = (
         f'filesrc location="{video_path}" name=src '
         f"! qtdemux name=demux ! h264parse "
         f"! v4l2h264dec name=dec "
         f"! videorate ! {RATE_30} "
-        f"! videoscale method=1 ! {SIZE_ONLY} "
         f"! queue max-size-buffers=4 leaky=downstream "
         f"! intervideosink channel={channel} sync=false"
     )
