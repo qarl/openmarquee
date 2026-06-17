@@ -5283,7 +5283,50 @@ pub fn paint_and_present_one_transition_frame(
                         }
                         _ => true, // Text/Image never returns None
                     };
-                    if !decouple && deadline_ok && iter_ok && samples_remaining_ok {
+                    // 2026-06-16 side-B HEAD-START GATE: when the
+                    // transition is still waiting for side-B's first
+                    // CAPTURE frame, override decouple's Path B
+                    // short-circuit + bypass PATH_B_MAX_ITERS=4 so
+                    // the loop runs to its existing 100 ms deadline.
+                    // The 4-iter cap was designed for IPC-thread
+                    // block budgeting on mid-transition codec
+                    // hiccups; the FIRST-tick race against
+                    // preload-worker prime needs more headroom
+                    // (codec produces a 720p frame in ~30 ms after
+                    // first OUTPUT samples land, so a 4-iter × 2 ms
+                    // = 8 ms budget can't cover it). Per QA forensic
+                    // on a64cbbb sideb-buffer-trace: when decouple
+                    // skips Path B during this race window, bake_b
+                    // returns Ok(None) → reuse-cached fires → side-B
+                    // locks to the PRIOR slide's stale buffer for
+                    // the entire transition. The head-start gate
+                    // closes the race without removing the graceful
+                    // fallback on subsequent ticks (after first frame
+                    // baked, the metric clears and normal decouple
+                    // skip resumes).
+                    let first_frame_pending =
+                        crate::hdmi_logic::is_transition_endpoint_b_first_frame_pending();
+                    const HEAD_START_ITERS_CAP: u32 = 60; // ~120ms@2ms; deadline still binds at 100ms
+                    let head_start_iter_ok =
+                        first_frame_pending && bake_b_iterations < HEAD_START_ITERS_CAP;
+                    let any_iter_ok = if first_frame_pending {
+                        head_start_iter_ok
+                    } else {
+                        iter_ok
+                    };
+                    let head_start_override_decouple = first_frame_pending;
+                    if (!decouple || head_start_override_decouple)
+                        && deadline_ok
+                        && any_iter_ok
+                        && samples_remaining_ok
+                    {
+                        if first_frame_pending && bake_b_iterations == 1 {
+                            eprintln!(
+                                "[perf] head_start_gate_engaged kind={} progress={:.3} \
+                                 deadline_ms={} head_start_iters_cap={}",
+                                kind, progress, bake_b_deadline_ms, HEAD_START_ITERS_CAP,
+                            );
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(2));
                         continue;
                     }

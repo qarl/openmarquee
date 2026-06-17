@@ -3023,6 +3023,34 @@ pub fn last_sideb_dqbuf_info() -> Option<(u32, i32, u32)> {
     LAST_SIDEB_DQBUF_INFO.with(|c| c.get())
 }
 
+/// 2026-06-16 side-B HEAD-START GATE: peek (non-consuming) whether
+/// the TRANSITION_ENDPOINT_B_METRIC is still set, indicating that
+/// the current transition's first side-B CAPTURE frame has NOT yet
+/// been baked. The metric is set at BeginTransition (via
+/// `record_transition_begin_for_endpoint_b_metric`) and CLEARED at
+/// the first successful bake_b (via
+/// `consume_transition_endpoint_b_first_frame_marker`). So this
+/// returns:
+///   - true  = transition is active AND side-B has not yet produced
+///             a fresh CAPTURE frame for it
+///   - false = either no transition is active, OR side-B has already
+///             produced its first frame for the current transition
+///
+/// The side-B bake_b retry loop uses this to OVERRIDE the
+/// `!decouple` short-circuit during the head-start window. Per QA
+/// forensic (2026-06-16, sub-agent on the a64cbbb sideb-buffer-
+/// trace binary): when the preload-worker prime races the first
+/// transition tick and the codec hasn't produced a CAPTURE frame
+/// yet, decouple=ON skips Path B's retry and falls through to
+/// reuse-cached → side-B locks to the prior slide's stale buffer
+/// for the entire transition. The head-start gate lets the retry
+/// run within its existing 100 ms deadline regardless of decouple,
+/// closing the race window without removing the graceful fallback
+/// on ticks AFTER the first frame baked.
+pub fn is_transition_endpoint_b_first_frame_pending() -> bool {
+    TRANSITION_ENDPOINT_B_METRIC.with(|cell| cell.borrow().is_some())
+}
+
 /// Test-only: read the marker (to_id only) without consuming so
 /// unit tests can assert "begin_transition set it" vs "endpoint_b
 /// consumed it."
