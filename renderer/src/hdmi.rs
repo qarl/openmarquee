@@ -591,6 +591,15 @@ pub struct EglSession<'a> {
     /// per-slide context threaded through `commit_fb` (Option A
     /// per QA's r1 decision). Mutated via `set_in_transition`.
     in_transition: bool,
+    /// 2026-06-16 QA Task 2: sample counter for the per-frame
+    /// `[perf] frame_phase_us` emitter. ALWAYS emits during a
+    /// transition (so the per-frame paint/swap breakdown is
+    /// captured across the transition window). Outside a
+    /// transition, emits every `FRAME_PHASE_EMIT_EVERY_N`-th
+    /// frame to keep steady-state journal cadence at ~3 lines/sec
+    /// rather than ~30 lines/sec. Counter is monotonic across the
+    /// session; the modulo decides emission.
+    frame_phase_emit_counter: u64,
     /// QA verification unblocker (2026-06-13): flag-gated live
     /// scanout preview state. When env `OPENMARQUEE_LIVE_PREVIEW_
     /// PATH` is unset, `config` is None and `maybe_capture` is a
@@ -769,6 +778,7 @@ where
         frames_over_budget_total: 0,
         last_over_budget_warn_at: None,
         in_transition: false,
+        frame_phase_emit_counter: 0,
         image_bg_cache: ImageBgCache::with_capacity(IMAGE_BG_CACHE_CAPACITY),
         image_slide_tex_cache: crate::image_slide_tex::ImageSlideTextureCache::with_capacity(
             crate::image_slide_tex::IMAGE_SLIDE_TEX_CACHE_CAPACITY,
@@ -1802,7 +1812,8 @@ fn render_animated_slide_in_session(
             // eglSwapBuffers implicitly flushes; the explicit gl.flush()
             // that used to be here forced an extra tile-store on vc4
             // (cold-scout #2 P6, 2026-05-09).
-            crate::profile::record_phase("paint", t_paint.elapsed().as_nanos() as u64);
+            let paint_dur = t_paint.elapsed();
+            crate::profile::record_phase("paint", paint_dur.as_nanos() as u64);
             // QA live-preview hook (2026-06-13): no-op unless
             // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
             session.maybe_live_preview_capture();
@@ -1811,7 +1822,12 @@ fn render_animated_slide_in_session(
                 .egl_lib
                 .swap_buffers(session.display, session.egl_surface)
                 .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
-            crate::profile::record_phase("swap", t_swap.elapsed().as_nanos() as u64);
+            let swap_dur = t_swap.elapsed();
+            crate::profile::record_phase("swap", swap_dur.as_nanos() as u64);
+            // 2026-06-16 QA Task 2: per-frame paint/swap breakdown
+            // (steady-state slide-hold paint site). Rate-limited
+            // by emit_frame_phase_us; logging only.
+            session.emit_frame_phase_us(paint_dur.as_micros(), swap_dur.as_micros());
             let t_lockfb = std::time::Instant::now();
             let bo = unsafe {
                 session
@@ -7111,6 +7127,56 @@ impl<'a> EglSession<'a> {
     /// device missing every frame doesn't spam the journal — the
     /// counter still increments every frame, so the IPC summary
     /// emitter sees the true rate.
+    /// 2026-06-16 QA Task 2: emit `[perf] frame_phase_us paint_us=N
+    /// swap_us=N in_transition={bool} delta_ms=N` per frame.
+    /// Logging only — no behavior change.
+    ///
+    /// `paint_us` = elapsed micros of the GPU draw phase
+    /// (paint_slide / composite / sp_draw). `swap_us` = elapsed
+    /// micros of the eglSwapBuffers call. `delta_ms` is computed
+    /// from `self.last_present_at` (0 if not yet seeded). The
+    /// `in_transition` flag is read from `self`.
+    ///
+    /// Rate-limit: ALWAYS emits during a transition (so each frame
+    /// inside the transition window has paint/swap recorded; ~30
+    /// frames per ~1 s transition is a bounded burst). Outside a
+    /// transition, emits every `FRAME_PHASE_EMIT_EVERY_N`-th frame
+    /// (default 10 = ~3 lines/sec at 30 fps steady-state). The
+    /// counter is incremented unconditionally so transition
+    /// boundaries don't reset cadence.
+    ///
+    /// Called from the 3 paint loops in this file after their
+    /// `record_phase("swap", ...)` so the local `t_paint` /
+    /// `t_swap` brackets are still in scope (caller passes their
+    /// elapsed micros).
+    fn emit_frame_phase_us(&mut self, paint_us: u128, swap_us: u128) {
+        /// QA's `[perf] frame_phase_us` is rate-limited via this
+        /// counter sampling rate. 10 = emit every 10th frame
+        /// (~3 lines/sec at 30 fps steady-state). Transition
+        /// windows always emit (so per-frame paint/swap timing
+        /// is captured for the spiky 55-75 ms range QA flagged).
+        const FRAME_PHASE_EMIT_EVERY_N: u64 = 10;
+        self.frame_phase_emit_counter =
+            self.frame_phase_emit_counter.saturating_add(1);
+        let should_emit = self.in_transition
+            || self.frame_phase_emit_counter % FRAME_PHASE_EMIT_EVERY_N == 0;
+        if !should_emit {
+            return;
+        }
+        let delta_ms = self
+            .last_present_at
+            .map(|prev| {
+                std::time::Instant::now()
+                    .saturating_duration_since(prev)
+                    .as_millis()
+            })
+            .unwrap_or(0);
+        eprintln!(
+            "[perf] frame_phase_us paint_us={} swap_us={} in_transition={} delta_ms={}",
+            paint_us, swap_us, self.in_transition, delta_ms,
+        );
+    }
+
     fn record_present(&mut self, now: std::time::Instant) {
         if let Some(prev) = self.last_present_at {
             self.frames_observed_total = self.frames_observed_total.saturating_add(1);
@@ -10417,6 +10483,10 @@ fn render_transition_animated_in_session(
             // transition entry / exit (qarl-flagged on glass).
             let tick_seconds = session.motion_tick_seconds();
             let wall_clock_unix = current_unix_seconds();
+            // 2026-06-16 QA Task 2: hoist composite paint elapsed out of
+            // the unsafe block so the emit_frame_phase_us call below
+            // (after the swap record_phase) can see it.
+            let mut composite_paint_us_outer: u128 = 0;
             unsafe {
                 let t_bake_a = std::time::Instant::now();
                 if any_animated_a || any_auto_a {
@@ -10520,6 +10590,13 @@ fn render_transition_animated_in_session(
                 // gl.flush() forced an extra tile-store on vc4
                 // (cold-scout #2 P6, 2026-05-09).
                 crate::profile::record_phase("composite", t_composite.elapsed().as_nanos() as u64);
+                // 2026-06-16 QA Task 2: capture composite-phase duration
+                // BEFORE the unsafe block closes (t_composite is
+                // scoped here). This is the transition's "paint" phase
+                // — the bake_a/bake_b draws into FBOs above + the
+                // composite blend pass into the default framebuffer
+                // just now.
+                composite_paint_us_outer = t_composite.elapsed().as_micros();
             }
 
             // -- Push to scanout.
@@ -10528,7 +10605,12 @@ fn render_transition_animated_in_session(
                 .egl_lib
                 .swap_buffers(session.display, session.egl_surface)
                 .map_err(|e| anyhow!("eglSwapBuffers (frame {frame}) failed: {e:?}"))?;
-            crate::profile::record_phase("swap", t_swap_t.elapsed().as_nanos() as u64);
+            let swap_dur_t = t_swap_t.elapsed();
+            crate::profile::record_phase("swap", swap_dur_t.as_nanos() as u64);
+            // 2026-06-16 QA Task 2: per-frame paint/swap breakdown
+            // (transition composite path). Rate-limited by
+            // emit_frame_phase_us; logging only.
+            session.emit_frame_phase_us(composite_paint_us_outer, swap_dur_t.as_micros());
             let t_lockfb_t = std::time::Instant::now();
             let bo = unsafe {
                 session
@@ -11008,9 +11090,10 @@ fn render_transition_single_pass_in_session(
                     // gl.flush() forced an extra tile-store on vc4
                     // (cold-scout #2 P6, 2026-05-09).
                 }
+                let sp_draw_dur = t_draw.elapsed();
                 crate::profile::record_phase(
                     "sp_draw",
-                    t_draw.elapsed().as_nanos() as u64,
+                    sp_draw_dur.as_nanos() as u64,
                 );
 
                 let t_swap_t = Instant::now();
@@ -11018,7 +11101,12 @@ fn render_transition_single_pass_in_session(
                     .egl_lib
                     .swap_buffers(session.display, session.egl_surface)
                     .map_err(|e| anyhow!("eglSwapBuffers (frame {frame}) failed: {e:?}"))?;
-                crate::profile::record_phase("swap", t_swap_t.elapsed().as_nanos() as u64);
+                let swap_dur_t = t_swap_t.elapsed();
+                crate::profile::record_phase("swap", swap_dur_t.as_nanos() as u64);
+                // 2026-06-16 QA Task 2: per-frame paint/swap breakdown
+                // (single-pass shader transition path). Rate-limited
+                // by emit_frame_phase_us; logging only.
+                session.emit_frame_phase_us(sp_draw_dur.as_micros(), swap_dur_t.as_micros());
                 let t_lockfb_t = Instant::now();
                 let bo = unsafe {
                     session
@@ -11559,7 +11647,8 @@ fn render_transition_scissored_bake_in_session(
                     );
                     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
                 }
-                crate::profile::record_phase("sb_composite", t_comp.elapsed().as_nanos() as u64);
+                let sb_comp_dur = t_comp.elapsed();
+                crate::profile::record_phase("sb_composite", sb_comp_dur.as_nanos() as u64);
 
                 // Swap + commit + N-2 BO/FB rotation (mirrors SP path).
                 // eglSwapBuffers implicitly flushes; the explicit gl.flush()
@@ -11570,7 +11659,12 @@ fn render_transition_scissored_bake_in_session(
                     .egl_lib
                     .swap_buffers(session.display, session.egl_surface)
                     .map_err(|e| anyhow!("eglSwapBuffers (frame {frame}) failed: {e:?}"))?;
-                crate::profile::record_phase("swap", t_swap.elapsed().as_nanos() as u64);
+                let swap_dur = t_swap.elapsed();
+                crate::profile::record_phase("swap", swap_dur.as_nanos() as u64);
+                // 2026-06-16 QA Task 2: per-frame paint/swap breakdown
+                // (per-tick sb_composite transition path). Rate-limited
+                // by emit_frame_phase_us; logging only.
+                session.emit_frame_phase_us(sb_comp_dur.as_micros(), swap_dur.as_micros());
                 let t_lockfb = Instant::now();
                 let bo = unsafe {
                     session

@@ -173,6 +173,25 @@ mod tests {
     }
 
     #[test]
+    fn frame_phase_us_marker_pinned_in_hdmi_source() {
+        // 2026-06-16 QA Task 2: the literal `frame_phase_us` is QA's
+        // bench parser fingerprint for the per-frame paint vs swap
+        // breakdown. Emitted by EglSession::emit_frame_phase_us at
+        // each of 4 paint loop sites (steady-state slide hold,
+        // transition composite, single-pass shader transition, and
+        // per-tick sb_composite transition). A rename would silently
+        // break QA's localization of whether the chronic ~50ms frame
+        // budget miss is GPU draw (paint) or display handoff (swap).
+        let hdmi = include_str!("hdmi.rs");
+        assert!(
+            hdmi.contains("frame_phase_us"),
+            "QA Task 2: `frame_phase_us` substring missing from hdmi.rs — \
+             QA's bench parser can no longer attribute the chronic over-budget \
+             frame cost to paint vs swap",
+        );
+    }
+
+    #[test]
     fn prewarm_egl_image_cache_accessor_pinned_in_v4l2_source() {
         // perf-decode tail-fix close-out (2026-06-15): the
         // `prewarm_egl_image_cache` accessor is the cross-lane
