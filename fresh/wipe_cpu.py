@@ -20,10 +20,17 @@ compositing via the intervideo bridge:
 
   DECODE PIPELINE A (its own Gst.Pipeline; single source, single sink)
     filesrc -> qtdemux -> h264parse -> v4l2h264dec
+    -> queue name=res (time=1.2s, non-leaky)  -- RESERVOIR; absorbs
+                                                 the decoder pause at
+                                                 each re-seek boundary
     -> videorate -> video/x-raw,framerate=30/1
-    -> queue (non-leaky) -> intervideosink channel=chA sync=true
-       (sync=true + non-leaky queue paces the decoder to 30 fps via
-        back-pressure on the shared clock; was sync=false + leaky)
+    -> queue (4 buf, non-leaky)
+    -> intervideosink channel=chA sync=false async=false
+       (decode pipeline decoupled from real-time; pacing authority
+        is kmssink sync=true in pipe_c on the shared clock, which
+        back-pressures the whole compositor pipeline so average
+        decode consumption is real-time. Decoder runs ahead, fills
+        the reservoir, then back-pressures.)
 
   DECODE PIPELINE B
     identical, channel=chB, file B
@@ -53,25 +60,29 @@ Why this gets the frame flow right:
     during a SEGMENT_DONE -> re-seek transient). Both compositor pads
     are always fed, so the aggregator never deadline-waits.
   - LOOPING is contained in each single-source / single-sink decode
-    bin. Two pieces:
-      (a) SEGMENT seek with stop=duration (NOT NONE). The previous
-          version used Gst.SeekType.NONE for stop; segment completion
-          is defined as "streaming reached the segment STOP time", so
-          stop=NONE meant SEGMENT_DONE never fired and SEGMENT mode
-          also suppresses EOS -> position froze at duration forever.
-          Now: query_duration on each demuxer after PAUSED, pass it
-          as stop_ns (with hardcoded fallback for asset A=4.75s /
-          B=9.08s if the query fails).
-      (b) Downstream EVENT pad probe on each qtdemux video src pad
-          (install_loop_probe). Catches SEGMENT_DONE OR EOS, DROPs the
-          event so it never propagates to v4l2h264dec (no flush -> no
-          STREAMOFF -> no bcm2835-codec REQBUFS/EINVAL wedge by
-          construction), and schedules the re-seek via GLib.idle_add
-          (the seek() call must run on the main thread -- calling it
-          inside the streaming-thread probe callback would re-enter
-          the streaming chain and deadlock). Bus SEGMENT_DONE messages
-          are NOT used for re-arm (would double-fire alongside the
-          probe).
+    bin. Three pieces, two probes + a reservoir:
+      (a) SEGMENT seek with stop=duration (NOT NONE) -- segment
+          completion is defined as "streaming reached the segment STOP
+          time"; stop=NONE meant SEGMENT_DONE never fired. Duration
+          comes from query_duration after PAUSED (asset fallbacks A
+          =4.75s / B=9.08s).
+      (b) BUFFER pad probe on each qtdemux video src pad fires the
+          SEGMENT re-seek EARLY -- as soon as a buffer with PTS >=
+          duration - LEAD_NS (1.2s) passes through. The decoder begins
+          refilling from frame 0 WHILE the reservoir is still being
+          drained from the tail of the OLD segment. The ~1s refill
+          latency of v4l2h264dec on bcm2835 is hidden under reservoir
+          frames; the consumer sees no gap. Re-arms when PTS resets to
+          near 0 after the seek lands. Re-seek is dispatched via
+          GLib.idle_add (the seek call must run on the main thread to
+          avoid streaming-thread re-entry/deadlock).
+      (c) EVENT pad probe on the same pad is DROP-ONLY: when the
+          actual SEGMENT_DONE or EOS finally arrives, the probe drops
+          it so it never propagates to v4l2h264dec (no flush, no
+          STREAMOFF, no bcm2835-codec REQBUFS/EINVAL wedge BY
+          CONSTRUCTION). Re-seek is NOT initiated here -- the BUFFER
+          probe has already fired one and the EVENT probe must not
+          double-seek.
   - intervideo bridge isolates each decode pipeline's EOS / flush /
     segment events from the compositor pipeline at the BUFFER level:
     no event propagates across the bridge, so the compositor cannot
@@ -138,6 +149,31 @@ WIPE_S = 1.0
 TICK_MS = 33
 PREROLL_BUDGET_S = 30
 
+# Decode-bin reservoir: queue between v4l2h264dec and videorate that
+# decouples decoder rate from real-time. Decoder fills it (then back-
+# pressures); videorate drains it at the source rate. At a loop re-
+# seek the decoder briefly stalls (~1s for v4l2h264dec on bcm2835 to
+# refill its CAPTURE queue); the reservoir covers the consumer side
+# during that window. Hardcoded ns (1.2s) -- do NOT use Gst.SECOND
+# at module-import time (it is gi-typelib-loaded but the PyGObject
+# contract is "after Gst.init"; on some versions accessing it pre-
+# init raises). Bounds CMA cost (~42MB at 720p NV12 @ 1.2s per decode
+# branch).
+RESERVOIR_NS = 1_200_000_000  # 1.2 seconds in nanoseconds
+
+# Early re-seek lead time: fire the SEGMENT re-seek when the current
+# buffer's PTS reaches (duration - LEAD_NS), so the decoder refills
+# from frame 0 WHILE the reservoir is still being drained from the
+# old segment. LEAD_NS = RESERVOIR_NS so the in-flight old-segment
+# frames cover the v4l2h264dec refill latency.
+LEAD_NS = RESERVOIR_NS
+
+# Re-arm threshold: any backward PTS jump larger than this on the
+# qtdemux video src pad is treated as "a SEGMENT seek landed" (B-frame
+# reorder backward jumps are << 500ms; a non-flushing SEGMENT seek
+# back to time 0 produces a near-full-duration backward jump).
+SEEK_DROP_NS = 500_000_000  # 500ms in nanoseconds
+
 
 def die(msg, code=1):
     print(f"[wipe_cpu] {msg}", file=sys.stderr)
@@ -199,26 +235,32 @@ def build_decode_pipeline(video_path, channel):
     pads are sized to match (DW x DH) so they do NOT scale either.
     kmssink HW-scales the final NV12 1280x720 to the connector mode
     (1360x768) via the vc4 DRM plane -- zero CPU pixel work."""
-    # intervideosink sync=true so the decode pipeline is paced to real-
-    # time via the shared clock (post-videorate PTS = 30 fps spacing =>
-    # 30 fps wall-clock). Was sync=false, which let the decoder free-run
-    # at ~67 fps and race through each clip in <2s wall-clock.
+    # Pacing moves to a single authority: kmssink sync=true in pipe_c
+    # on the shared clock back-pressures the whole compositor pipeline,
+    # so average decode consumption stays at 30 fps wall-clock. The
+    # decode pipeline is decoupled from real-time so it can run AHEAD
+    # and fill the RESERVOIR queue between v4l2h264dec and videorate.
     #
-    # Queue is NON-LEAKY (default) so back-pressure actually propagates:
-    # intervideosink blocks (clock wait) -> queue fills -> queue blocks
-    # upstream -> v4l2h264dec slows to 30 fps. With leaky=downstream the
-    # queue would drop the oldest unfetched buffer when full, decoder
-    # would keep racing, and sink would emit at 30 fps but sampled from
-    # a constantly-rolling window -> erratic position advance, jittery
-    # playback. max-size-buffers=4 keeps the buffer small for tight
-    # back-pressure response.
+    #   intervideosink sync=false async=false -- not the throttle.
+    #     async=false avoids the async preroll wait on this non-display
+    #     sink in the decoupled-from-real-time setup.
+    #   reservoir queue (name=res, time=1.2s, non-leaky) -- decoder
+    #     fills it then back-pressures (bounded CMA ~42MB per branch at
+    #     720p NV12). When the boundary re-seek pauses the decoder for
+    #     ~1s, videorate keeps draining the reservoir at the source
+    #     rate (~24 fps), so the downstream consumer never starves.
+    #   second small queue between videorate and intervideosink keeps
+    #     the bridge-handoff smooth.
     desc = (
         f'filesrc location="{video_path}" name=src '
         f"! qtdemux name=demux ! h264parse "
         f"! v4l2h264dec name=dec "
+        f"! queue name=res "
+        f"  max-size-buffers=0 max-size-bytes=0 "
+        f"  max-size-time={RESERVOIR_NS} "
         f"! videorate ! {RATE_30} "
         f"! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 "
-        f"! intervideosink channel={channel} sync=true"
+        f"! intervideosink channel={channel} sync=false async=false"
     )
     try:
         return Gst.parse_launch(desc)
@@ -348,33 +390,124 @@ def query_dur_ns(pipeline_or_elem, label, fallback_ns):
     return fallback_ns
 
 
-def install_loop_probe(demuxer, channel, dur_ns):
+def install_loop_probe(demuxer, channel):
+    """DROP SEGMENT_DONE / EOS at the demuxer src pad so neither ever
+    propagates to v4l2h264dec (no flush -> no STREAMOFF/STREAMON ->
+    no bcm2835-codec REQBUFS/EINVAL wedge BY CONSTRUCTION).
+
+    Re-seek is OWNED BY install_early_reseek_probe (a BUFFER probe on
+    the same pad that fires re-seek when PTS approaches the duration
+    boundary, BEFORE SEGMENT_DONE arrives). By the time SEGMENT_DONE
+    or EOS hits here, the decoder is already mid-refill from a prior
+    early-seek -- this probe just makes sure the boundary event does
+    not also reach the decoder."""
     pad = find_video_src_pad(demuxer)
     if pad is None:
         die(f"[{channel}] no video src pad found on demuxer")
-
-    def _re_seek():
-        if not segment_seek(demuxer, dur_ns):
-            print(f"[{channel}] idle re-seek FAILED", file=sys.stderr)
-        return False  # one-shot via idle_add
 
     def _on_event(_pad, info):
         event = info.get_event()
         if event is None:
             return Gst.PadProbeReturn.OK
         if event.type in (Gst.EventType.SEGMENT_DONE, Gst.EventType.EOS):
-            print(f"[{channel}] {event.type.value_nick} -> idle re-seek")
-            GLib.idle_add(_re_seek)
+            print(f"[{channel}] {event.type.value_nick} DROPped at demux src "
+                  "(early-reseek already armed)")
             return Gst.PadProbeReturn.DROP
         return Gst.PadProbeReturn.OK
 
     pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, _on_event)
-    print(f"[{channel}] loop probe attached on {pad.get_name()}")
+    print(f"[{channel}] DROP-only event probe attached on {pad.get_name()}")
+
+
+def install_early_reseek_probe(demuxer, channel, dur_ns, lead_ns):
+    """BUFFER pad probe on the qtdemux video src pad. Schedules the
+    non-flushing SEGMENT re-seek as soon as a buffer with
+    PTS >= duration - lead_ns passes through, so the decoder begins
+    refilling from frame 0 WHILE the reservoir is still being drained
+    from the tail of the OLD segment. The refill latency
+    (~1s for v4l2h264dec on bcm2835 to refill its CAPTURE queue) is
+    hidden under reservoir frames; the consumer sees no gap.
+
+    Idle_add hands the seek to the main GLib thread; calling seek()
+    inside the streaming-thread probe would re-enter the streaming
+    chain and deadlock.
+
+    Re-arm guard: 'armed' goes False after a fire, then back True on
+    the first buffer with PTS < dur/4 in the NEW segment (PTS resets
+    to 0 after the SEGMENT seek). Without the guard the probe would
+    re-fire every frame above the threshold."""
+    pad = find_video_src_pad(demuxer)
+    if pad is None:
+        die(f"[{channel}] no video src pad found for early-reseek")
+
+    # State: armed governs whether the next fire-threshold crossing
+    # triggers a re-seek (one fire per cycle). max_pts tracks the
+    # highest PTS seen since last re-arm; a sudden backward jump of
+    # > SEEK_DROP_NS detects a SEGMENT seek landing (tolerates
+    # B-frame reorder which is << 500ms).
+    state = {"armed": True, "max_pts": 0}
+    fire_threshold = dur_ns - lead_ns
+
+    def _re_seek():
+        if not segment_seek(demuxer, dur_ns):
+            print(f"[{channel}] early re-seek FAILED", file=sys.stderr)
+        return False
+
+    def _on_buffer(_pad, info):
+        buf = info.get_buffer()
+        if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+            return Gst.PadProbeReturn.OK
+        pts = buf.pts
+
+        # Re-arm on a large backward PTS jump (= a SEGMENT seek landed).
+        # Small backward jumps (B-frame reorder) tolerated by the
+        # SEEK_DROP_NS threshold.
+        if state["max_pts"] - pts > SEEK_DROP_NS:
+            state["armed"] = True
+            state["max_pts"] = pts
+        elif pts > state["max_pts"]:
+            state["max_pts"] = pts
+
+        # Watchdog: PTS shouldn't ever exceed duration. If it does AND
+        # we're still armed, the early re-seek slot was missed -- fire
+        # a recovery seek (loud log). If armed=False the early re-seek
+        # is already in-flight; just wait for the large-drop re-arm.
+        if pts > dur_ns:
+            if state["armed"]:
+                state["armed"] = False
+                print(f"[{channel}] WATCHDOG pts={pts / 1e9:.2f}s "
+                      f"> dur={dur_ns / 1e9:.2f}s and armed -- "
+                      "early-reseek missed; firing recovery",
+                      file=sys.stderr)
+                GLib.idle_add(_re_seek)
+            return Gst.PadProbeReturn.OK
+
+        if state["armed"] and pts >= fire_threshold:
+            state["armed"] = False
+            print(f"[{channel}] early re-seek at pts={pts / 1e9:.2f}s "
+                  f"(fire>={fire_threshold / 1e9:.2f}s, "
+                  f"dur={dur_ns / 1e9:.2f}s)")
+            GLib.idle_add(_re_seek)
+        return Gst.PadProbeReturn.OK
+
+    pad.add_probe(Gst.PadProbeType.BUFFER, _on_buffer)
+    print(f"[{channel}] early-reseek probe attached "
+          f"(fire>={fire_threshold / 1e9:.2f}s, "
+          f"rearm if backward jump>{SEEK_DROP_NS / 1e9:.1f}s)")
 
 
 # --- Frame-flow instrument ---------------------------------------------
 
 counters = {"decA": 0, "decB": 0, "screen": 0}
+# Per-pad max inter-buffer gap (ms) seen in the past second. A frame
+# stall shows up here as a high gap value even if the per-second count
+# is unchanged (e.g. burst-then-stall vs steady delivery). Reset after
+# each fps_tick.
+gap_state = {
+    "decA": {"last_ns": 0, "max_gap_ms": 0.0},
+    "decB": {"last_ns": 0, "max_gap_ms": 0.0},
+    "screen": {"last_ns": 0, "max_gap_ms": 0.0},
+}
 
 try:
     fps_log_file = open("/tmp/wipe_fps.log", "a", buffering=1)
@@ -385,8 +518,17 @@ except OSError as _exc:
 
 
 def _make_counter_probe(key):
+    state = gap_state[key]
+
     def _probe(_pad, _info):
         counters[key] += 1
+        now_ns = time.monotonic_ns()
+        last = state["last_ns"]
+        if last:
+            gap_ms = (now_ns - last) / 1e6
+            if gap_ms > state["max_gap_ms"]:
+                state["max_gap_ms"] = gap_ms
+        state["last_ns"] = now_ns
         return Gst.PadProbeReturn.OK
     return _probe
 
@@ -413,15 +555,38 @@ def _query_pos_s(elem):
 _t_start = time.monotonic()
 
 
+def _q_level_ms(q):
+    if q is None:
+        return -1.0
+    try:
+        return q.get_property("current-level-time") / 1e6
+    except Exception:
+        return -1.0
+
+
 def fps_tick():
     uptime = int(time.monotonic() - _t_start)
     posA = _query_pos_s(demuxA)
     posB = _query_pos_s(demuxB)
+
+    # Reservoir queue level per branch -- should hold near
+    # RESERVOIR_NS/1e6 ms in steady state; drops at a re-seek boundary
+    # are visible here.
+    res_a_ms = _q_level_ms(pipe_a.get_by_name("res"))
+    res_b_ms = _q_level_ms(pipe_b.get_by_name("res"))
+
+    # Max inter-buffer gap per probe site over the past second.
+    # > ~40ms at decA/decB or > ~50ms at screen flags a stall.
+    gaps = {k: int(s["max_gap_ms"]) for k, s in gap_state.items()}
+
     line = (
         f"[fps] t={uptime} "
-        f"decA={counters['decA']} decB={counters['decB']} "
-        f"screen={counters['screen']} "
-        f"posA={posA} posB={posB} state={state}"
+        f"decA={counters['decA']}(g{gaps['decA']}) "
+        f"decB={counters['decB']}(g{gaps['decB']}) "
+        f"screen={counters['screen']}(g{gaps['screen']}) "
+        f"posA={posA} posB={posB} "
+        f"res_a={int(res_a_ms)}ms res_b={int(res_b_ms)}ms "
+        f"state={state}"
     )
     print(line, file=sys.stderr, flush=True)
     if fps_log_file is not None:
@@ -432,6 +597,8 @@ def fps_tick():
     counters["decA"] = 0
     counters["decB"] = 0
     counters["screen"] = 0
+    for s in gap_state.values():
+        s["max_gap_ms"] = 0.0
     return True
 
 
@@ -623,10 +790,16 @@ if shutdown_requested:
 DUR_A = query_dur_ns(pipe_a, "decodeA", int(4.75 * Gst.SECOND))
 DUR_B = query_dur_ns(pipe_b, "decodeB", int(9.08 * Gst.SECOND))
 
-# Install the EVENT pad probe BEFORE the initial seek so the very
-# first segment boundary is caught even if it lands surprisingly early.
-install_loop_probe(demuxA, "A", DUR_A)
-install_loop_probe(demuxB, "B", DUR_B)
+# Install BOTH probes BEFORE the initial seek so the very first segment
+# boundary is caught even if it lands surprisingly early. Early-reseek
+# (BUFFER probe) fires the re-seek BEFORE SEGMENT_DONE arrives; loop
+# probe (EVENT probe) DROPs the boundary event so it never reaches the
+# decoder. The two collaborate: early-reseek is the action, loop probe
+# is the safety net.
+install_early_reseek_probe(demuxA, "A", DUR_A, LEAD_NS)
+install_early_reseek_probe(demuxB, "B", DUR_B, LEAD_NS)
+install_loop_probe(demuxA, "A")
+install_loop_probe(demuxB, "B")
 
 # Arm SEGMENT-seek mode on each demuxer BEFORE PLAYING so the very
 # first segment runs in segment mode (stop=dur triggers SEGMENT_DONE
