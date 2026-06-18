@@ -146,18 +146,43 @@ DUR_FALLBACK_NS = {
 
 # Leak-prevention fallback toggle (per QA spec). OFF by default --
 # the primary defense is the 250ms teardown grace + bus.remove_signal
-# _watch in ClipBin.teardown. If a long QA leak-soak ever shows CMA
-# drift over many cycles, set this env var to "1" to insert a
-# videoconvert before each decode bin's intervideosink -- the convert
-# copies NV12 into a NEW non-V4L2 buffer pool, severing the back-ref
-# chain from intervideo/compositor/kmssink to the dying decoder's
-# CAPTURE pool. Cost: per-frame 1280x720 NV12 copy (~42MB/s per bin,
-# 2x during cross-fade) -- exactly the per-frame pixel work that the
-# videoscale removal lifted, so do NOT flip on without leak evidence.
+# _watch in ClipBin.teardown + event-gated teardown (only after the
+# wipe completes) + T5 all-three queue caps EVERYWHERE.
+#
+# If a long QA leak-soak ever shows CMA drift over many cycles, set
+# this env var to "1" to insert a videoconvert before each decode
+# bin's intervideosink. Intent: copy NV12 into a NEW non-V4L2 buffer
+# pool, severing the back-ref chain from intervideo/compositor/
+# kmssink to the dying decoder's CAPTURE pool.
+#
+# CAVEAT (QA guardrail #3): a NV12 -> NV12 videoconvert can detect
+# matching caps and PASSTHROUGH (zero-copy), which preserves the
+# back-ref and defeats the fallback. If this toggle is ever flipped
+# on and CMA still drifts, we will need to either (a) force a caps
+# transition that requires an actual copy (e.g. NV12 -> I420 ->
+# NV12), or (b) use a copying element such as gdpdepay or appsink+
+# appsrc to guarantee buffer-pool detachment. Not implemented now.
+#
+# Cost per frame at 720p: ~42MB/s per bin, doubled during the
+# crossfade overlap -- exactly the per-frame pixel work that the
+# videoscale removal lifted. Do NOT flip on without leak evidence.
 INSERT_TEARDOWN_VIDEOCONVERT = (
     os.environ.get("OPENMARQUEE_VIDEOCONVERT_BEFORE_INTERVIDEOSINK",
                    "0").lower() in ("1", "true", "yes")
 )
+
+# QA guardrail #4 (note-only, not enabled): v4l2h264dec capture-io-
+# mode=dmabuf could decouple the MMAL slot lifecycle from buffer
+# refs entirely. Two reasons not to enable now:
+#   - Our CPU compositor must read pixels, so it would map the
+#     dmabuf back to system memory anyway -- no zero-copy win on
+#     this path.
+#   - bcm2835 slot-free-with-fds-outstanding behavior is
+#     unverified on this build; could change the leak surface in
+#     surprising ways.
+# Note for the QA-soak follow-up if B leaks despite the
+# guardrails: evaluate v4l2h264dec capture-io-mode=dmabuf as the
+# next lever.
 
 
 def die(msg, code=1):
@@ -214,19 +239,29 @@ def build_compositor_pipeline():
         f"  sink_1::xpos=0 sink_1::ypos=0 "
         f"  sink_1::width=0 sink_1::height={DH} sink_1::zorder=1 "
         f"! video/x-raw,width={DW},height={DH},framerate={FPS}/1 "
-        f"! queue max-size-buffers=2 leaky=downstream "
+        # T5 all-three caps: bound the buffer count AND bytes AND
+        # time. Default max-size-bytes=10MB ~= 7 NV12 720p frames;
+        # default max-size-time=1s ~= 30 frames. Either alone
+        # silently keeps ~30 v4l2-pool-backed buffers in flight ->
+        # MMAL slot leak on bin teardown. Cap all three to the
+        # smallest of (4 buffers, 0 bytes-unlimited, 0 time-
+        # unlimited), so only the 4-buffer cap actually gates.
+        f"! queue max-size-buffers=4 max-size-bytes=0 "
+        f"  max-size-time=0 leaky=downstream "
         f"! videoconvert "
         f"! {NV12_DISP} "
         f"! kmssink name=sink sync=true "
         f"intervideosrc name=srcA channel=chA "
         f"  timeout=200000000 do-timestamp=true "
         f"  ! videorate skip-to-first=true ! {RATE_30} "
-        f"  ! queue max-size-buffers=2 leaky=downstream "
+        f"  ! queue max-size-buffers=4 max-size-bytes=0 "
+        f"    max-size-time=0 leaky=downstream "
         f"  ! comp.sink_0 "
         f"intervideosrc name=srcB channel=chB "
         f"  timeout=200000000 do-timestamp=true "
         f"  ! videorate skip-to-first=true ! {RATE_30} "
-        f"  ! queue max-size-buffers=2 leaky=downstream "
+        f"  ! queue max-size-buffers=4 max-size-bytes=0 "
+        f"    max-size-time=0 leaky=downstream "
         f"  ! comp.sink_1"
     )
     try:
@@ -328,6 +363,9 @@ class ClipBin:
         self.preload_fired = False
         self.wipe_fired = False
         self.eos_dispatched = False
+        # S1: teardown is gated on three independent events; this
+        # flag dedupes the schedule call across them.
+        self.teardown_scheduled = False
         # Cross-fade readiness gates (asymmetric -- only checked on
         # the INCOMING bin before starting the wipe).
         self.async_done = False    # G1: ASYNC_DONE on bus
@@ -559,11 +597,17 @@ slot_state = {
 }
 
 # Wipe state. Mirrors the prior code's HOLD/WIPE animation timer.
+# post_wipe_frame_emitted is S1: starts True (no wipe pending);
+# _start_wipe_animation sets False; the screen counter probe sees
+# the next kmssink-sink buffer AFTER phase returns to HOLD and
+# sets it True -- only then is the cross-fade considered complete
+# for teardown-gating purposes.
 wipe_state = {
-    "phase": "HOLD",          # "HOLD" or "WIPE"
-    "start_ns": 0,            # monotonic_ns when WIPE began
-    "incoming_pad_idx": -1,   # 0 or 1
+    "phase": "HOLD",                    # "HOLD" or "WIPE"
+    "start_ns": 0,                      # monotonic_ns when WIPE began
+    "incoming_pad_idx": -1,             # 0 or 1
     "outgoing_pad_idx": -1,
+    "post_wipe_frame_emitted": True,    # S1 gate
 }
 
 
@@ -662,6 +706,9 @@ def _start_wipe_animation(outgoing_bin, incoming_bin):
     wipe_state["start_ns"] = now_ns()
     wipe_state["incoming_pad_idx"] = in_idx
     wipe_state["outgoing_pad_idx"] = out_idx
+    # S1: a new wipe begins, so the "final composited frame past
+    # kmssink" event hasn't happened yet for this cross-fade.
+    wipe_state["post_wipe_frame_emitted"] = False
     print(f"[sched] WIPE {outgoing_bin.label} -> {incoming_bin.label}")
 
 
@@ -675,37 +722,70 @@ TEARDOWN_GRACE_MS = 250
 
 
 def on_bin_eos(bin_):
-    """Outgoing bin reached EOS. Move role bookkeeping immediately;
-    schedule actual teardown after a short grace so in-flight
-    intervideo buffer refs from the bridge can flush (else a stray
-    dmabuf ref keeps the decoder fd open -> MMAL slot leak)."""
+    """S3: bus EOS only updates bookkeeping + flags. The actual
+    teardown schedule is gated by try_schedule_teardown_for_outgoing
+    which checks ALL THREE conditions (eos, post-wipe-frame, phase).
+    Calling _schedule_teardown directly from here would defeat S1
+    (the post-wipe-frame condition) when EOS lands post-wipe-timer
+    but before the next composited frame is actually painted."""
     print(f"[sched] EOS handler: {bin_.label}")
     if bin_ is slot_state.get("main"):
-        # Main reached EOS. If wipe was still mid-animation
-        # (clip ended early?), snap it to done.
-        if wipe_state["phase"] == "WIPE":
-            finish_wipe_animation()
         slot_state["outgoing"] = bin_
         slot_state["main"] = slot_state["next"]
         slot_state["next"] = None
     elif bin_ is slot_state.get("outgoing"):
-        pass  # expected -- already moved aside, just teardown
+        pass  # already moved aside via prior path
     else:
         print(f"[sched] EOS from unknown role {bin_.label}",
               file=sys.stderr)
+    try_schedule_teardown_for_outgoing()
+    return False
 
-    def _deferred_teardown():
-        bin_.teardown()
-        if slot_state.get("outgoing") is bin_:
+
+def try_schedule_teardown_for_outgoing():
+    """S1+S3 triple gate. Schedules teardown of the outgoing bin
+    only when ALL of:
+      - outgoing exists (slot_state has been promoted)
+      - outgoing.eos_dispatched (bus EOS has fired)
+      - wipe_state.phase == HOLD (animation timer hit final)
+      - wipe_state.post_wipe_frame_emitted (the FIRST kmssink-sink
+        buffer AFTER phase returned to HOLD has been observed --
+        proves the final composited frame actually painted, not
+        just that the alpha-animation timer expired)
+    Each event point calls this helper; the LAST one to arrive
+    crosses the gate. Dedupes via bin.teardown_scheduled."""
+    out = slot_state.get("outgoing")
+    if out is None:
+        return False
+    if not out.eos_dispatched:
+        return False
+    if wipe_state["phase"] != "HOLD":
+        return False
+    if not wipe_state["post_wipe_frame_emitted"]:
+        return False
+    if out.teardown_scheduled:
+        return False
+    out.teardown_scheduled = True
+    print(f"[sched] {out.label} all 3 gates passed -- "
+          f"schedule teardown +{TEARDOWN_GRACE_MS}ms")
+
+    def _deferred():
+        out.teardown()
+        if slot_state.get("outgoing") is out:
             slot_state["outgoing"] = None
-        return False  # one-shot
-
-    GLib.timeout_add(TEARDOWN_GRACE_MS, _deferred_teardown)
+        return False
+    GLib.timeout_add(TEARDOWN_GRACE_MS, _deferred)
     return False
 
 
 def finish_wipe_animation():
-    """Snap pad geometry to post-wipe state + reset wipe phase."""
+    """Snap pad geometry to post-wipe state + reset wipe phase.
+    DOES NOT directly schedule teardown -- per S1, teardown waits
+    for the NEXT kmssink-sink buffer to actually paint (proves
+    final composited frame emitted, not just that the alpha-
+    animation timer expired). The screen counter probe sets
+    wipe_state.post_wipe_frame_emitted on that buffer and calls
+    try_schedule_teardown_for_outgoing."""
     in_idx = wipe_state["incoming_pad_idx"]
     out_idx = wipe_state["outgoing_pad_idx"]
     if in_idx >= 0:
@@ -713,7 +793,12 @@ def finish_wipe_animation():
     if out_idx >= 0:
         set_geom(pads[out_idx], 0, 0)
     wipe_state["phase"] = "HOLD"
-    print(f"[sched] HOLD (wipe complete, in_idx={in_idx})")
+    print(f"[sched] HOLD (wipe alpha-timer done, in_idx={in_idx} "
+          "-- waiting on post-wipe kmssink frame for teardown gate)")
+    # Try anyway: if a frame happens to have painted in the same
+    # tick that the timer expired, the screen probe may already
+    # have set the flag.
+    try_schedule_teardown_for_outgoing()
 
 
 def animation_tick():
@@ -761,6 +846,17 @@ def _make_counter_probe(key):
             if gap_ms > s["max_gap_ms"]:
                 s["max_gap_ms"] = gap_ms
         s["last_ns"] = now_ns_local
+        # S1 trigger: when this is the SCREEN (kmssink.sink) probe
+        # AND a wipe just transitioned to HOLD without yet seeing a
+        # post-wipe frame, mark the gate satisfied + ask the
+        # scheduler to recheck the teardown triple-gate. Streaming
+        # thread -> main-thread hand-off via idle_add (NEVER
+        # call set_state from a streaming/probe context).
+        if (key == "screen"
+                and not wipe_state["post_wipe_frame_emitted"]
+                and wipe_state["phase"] == "HOLD"):
+            wipe_state["post_wipe_frame_emitted"] = True
+            GLib.idle_add(try_schedule_teardown_for_outgoing)
         return Gst.PadProbeReturn.OK
     return _probe
 
