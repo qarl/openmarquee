@@ -60,11 +60,13 @@ NOT included (deliberately, per qarl "tear it all out"):
   intervideo bridge, no segment-seek loop.
 """
 
+import gc
 import os
 import signal
 import subprocess
 import sys
 import time
+import weakref
 
 import gi
 
@@ -102,7 +104,7 @@ Gst.init(None)
 
 REQUIRED_ELEMENTS = (
     "filesrc", "qtdemux", "h264parse", "v4l2h264dec",
-    "videoconvert", "capsfilter", "concat", "kmssink",
+    "capsfilter", "queue", "concat", "kmssink",
 )
 for el in REQUIRED_ELEMENTS:
     if not Gst.ElementFactory.find(el):
@@ -140,33 +142,50 @@ pipeline = Gst.Pipeline.new("cutloop")
 if pipeline is None:
     die("Gst.Pipeline.new returned None")
 
+# Per code's bulletproof spec: keep a format-only capsfilter
+# (NV12, no size) + queue between decoder and kmssink. The
+# capsfilter pins the format to avoid caps-negotiation surprise
+# (zero CPU -- it's just an assertion, not a converter). The
+# queue gives a small buffer between decoder and kmssink. The
+# 7fps throttle QA saw on 4bf2b05 was NOT this path (the
+# videoconvert+capsfilter combo was the suspect because it forced
+# a NV12 detile-to-plain-NV12 copy); it was the retire leak (27
+# leaked sub-bins thrashing the single core). The leak fix is in
+# retire_subgraph; this format+queue is defense in depth against
+# caps-negotiation surprise.
 concat = Gst.ElementFactory.make("concat", "c")
 decoder = Gst.ElementFactory.make("v4l2h264dec", "dec")
-videoconvert = Gst.ElementFactory.make("videoconvert", "conv")
-caps_filter = Gst.ElementFactory.make("capsfilter", "outcaps")
-caps_filter.set_property("caps", Gst.Caps.from_string(
-    f"video/x-raw,format=NV12,width={DW},height={DH}"))
+nv12_caps = Gst.ElementFactory.make("capsfilter", "nv12caps")
+nv12_caps.set_property("caps", Gst.Caps.from_string(
+    "video/x-raw,format=NV12"))
+out_queue = Gst.ElementFactory.make("queue", "outq")
 sink = Gst.ElementFactory.make("kmssink", "sink")
 sink.set_property("sync", True)
 
-for el in (concat, decoder, videoconvert, caps_filter, sink):
+for el in (concat, decoder, nv12_caps, out_queue, sink):
     if el is None:
         die("factory.make returned None for a core element")
     pipeline.add(el)
 
 if not concat.link(decoder):
     die("link concat -> decoder failed")
-if not decoder.link(videoconvert):
-    die("link decoder -> videoconvert failed")
-if not videoconvert.link(caps_filter):
-    die("link videoconvert -> capsfilter failed")
-if not caps_filter.link(sink):
-    die("link capsfilter -> kmssink failed")
+if not decoder.link(nv12_caps):
+    die("link decoder -> nv12_caps failed")
+if not nv12_caps.link(out_queue):
+    die("link nv12_caps -> queue failed")
+if not out_queue.link(sink):
+    die("link queue -> kmssink failed")
 
 
 # --- Dynamic source addition (the loop mechanism) ----------------------
 
-playlist_added_count = [0]  # next clip index to append; cycles
+playlist_added_count = [0]  # cumulative adds (cycles through VIDEOS)
+live_subgraph_count = [0]   # current live sub-bin count (incremented
+                            # in add_next_clip, decremented in
+                            # retire_subgraph). Per QA: this is the
+                            # value that should hover at ~2, NOT the
+                            # cumulative playlist_added_count which
+                            # grows unbounded.
 
 
 def add_next_clip():
@@ -211,7 +230,10 @@ def add_next_clip():
         if sink_pad is None or sink_pad.is_linked():
             return
         pad.link(sink_pad)
-    qtdemux.connect("pad-added", _on_pad_added)
+    # STORE handler id so retire_subgraph can disconnect later.
+    # Per QA leak analysis: without this, the closure on _on_pad_added
+    # keeps h264parse alive -> keeps the sub-bin alive -> leak.
+    pad_added_id = qtdemux.connect("pad-added", _on_pad_added)
 
     # Ghost the h264parse src pad up through the sub-bin so we can
     # link it into a concat request pad.
@@ -244,45 +266,104 @@ def add_next_clip():
     # EOS internally -- no downstream EOS, no STREAMOFF on the
     # decoder. The probe schedules two main-thread ops via
     # idle_add: (a) RETIRE this subgraph (NULL state, remove from
-    # pipeline, release concat request pad), and (b) ADD the next
-    # playlist clip to keep the queue-ahead invariant.
+    # pipeline, release concat request pad, AND disconnect the
+    # qtdemux pad-added handler + remove this probe so the
+    # closures release the sub-bin), and (b) ADD the next playlist
+    # clip to keep the queue-ahead invariant.
+    eos_probe_id = None  # filled in below
+
     def _on_concat_sink_event(_pad, info):
         ev = info.get_event()
         if ev and ev.type == Gst.EventType.EOS:
             print(f"[cutloop] concat sink EOS from bin {serial} "
                   f"({asset_name}) -> retire + queue next",
                   file=sys.stderr)
-            GLib.idle_add(retire_subgraph, sub, concat_sink)
+            # Pass IDs needed for clean retire (disconnect signal +
+            # remove probe so closures release the sub-bin). Per QA
+            # leak analysis: without these, set_state(NULL) +
+            # pipeline.remove + release_request_pad alone leaks.
+            GLib.idle_add(retire_subgraph, sub, concat_sink,
+                          qtdemux, pad_added_id, eos_probe_id)
             GLib.idle_add(add_next_clip)
         return Gst.PadProbeReturn.OK
-    concat_sink.add_probe(
+    eos_probe_id = concat_sink.add_probe(
         Gst.PadProbeType.EVENT_DOWNSTREAM, _on_concat_sink_event
     )
 
     sub.sync_state_with_parent()
+    live_subgraph_count[0] += 1
     print(f"[cutloop] queued bin {serial} = {asset_name} "
-          f"(playlist_added={playlist_added_count[0]})",
+          f"(live_bins={live_subgraph_count[0]} "
+          f"playlist_added={playlist_added_count[0]})",
           file=sys.stderr)
     return False  # one-shot when called via GLib.idle_add
 
 
-def retire_subgraph(sub_bin, concat_sink_pad):
+def retire_subgraph(sub_bin, concat_sink_pad, qtdemux_elem,
+                    pad_added_id, eos_probe_id):
     """Tear down a sub-bin after its EOS has passed through concat.
-    Per QA dispatch: do this on main thread (called via idle_add),
-    NOT from the streaming-thread EOS probe.
+    Per QA leak analysis: set_state(NULL) + pipeline.remove +
+    release_request_pad ALONE LEAKS because Python closures captured
+    by the qtdemux pad-added handler AND the concat-sink EOS probe
+    still hold refs to the sub-bin's elements. Without explicit
+    disconnect + remove_probe, the sub-bin is never garbage-collected
+    -- queued_clips grows unbounded, threads + heap thrash a single
+    core, throttling kmssink to ~7fps over a 180s soak (QA observed
+    4bf2b05). The retire-leak IS the throttle; fixing it should
+    restore 30fps without other changes.
 
-    Sequence: NULL the sub-bin (releases its filesrc fd, qtdemux
-    parsed state, h264parse), remove from pipeline (auto-unref via
-    the pipeline parentage), release the concat request pad. The
-    long-lived v4l2h264dec downstream of concat is UNTOUCHED."""
+    Sequence per QA priority:
+      1. qtdemux_elem.disconnect(pad_added_id) -- releases the
+         pad-added closure which captures h264parse + sub_bin.
+      2. concat_sink_pad.remove_probe(eos_probe_id) -- releases
+         the EOS-probe closure which captures sub + concat_sink.
+      3. sub_bin.set_state(NULL) -- releases filesrc fd, qtdemux
+         parsed state, h264parse.
+      4. pipeline.remove(sub_bin) -- detaches from parent.
+      5. concat.release_request_pad(concat_sink_pad).
+      6. Decrement live_subgraph_count.
+      7. weakref.ref + GLib.idle_add(gc.collect + check_alive) for
+         leak evidence -- logs '[retire] LEAK ref still held' if
+         the bin survives our cleanup."""
     name = sub_bin.get_name() if sub_bin else "?"
-    print(f"[cutloop] retire {name}", file=sys.stderr)
+    weak = weakref.ref(sub_bin)
     try:
+        # (1) Disconnect closures FIRST -- this is what was missing.
+        if pad_added_id:
+            try:
+                qtdemux_elem.disconnect(pad_added_id)
+            except Exception as exc:
+                print(f"[cutloop] retire {name} pad-added "
+                      f"disconnect WARN: {exc}", file=sys.stderr)
+        if eos_probe_id:
+            try:
+                concat_sink_pad.remove_probe(eos_probe_id)
+            except Exception as exc:
+                print(f"[cutloop] retire {name} probe remove "
+                      f"WARN: {exc}", file=sys.stderr)
+        # (3-5) Tear down the bin + release the concat pad.
         sub_bin.set_state(Gst.State.NULL)
         pipeline.remove(sub_bin)
         concat.release_request_pad(concat_sink_pad)
+        live_subgraph_count[0] -= 1
+        print(f"[cutloop] retire {name} "
+              f"(live_bins={live_subgraph_count[0]})",
+              file=sys.stderr)
     except Exception as exc:
-        print(f"[cutloop] retire {name} WARN: {exc}", file=sys.stderr)
+        print(f"[cutloop] retire {name} WARN: {exc}",
+              file=sys.stderr)
+    # (7) Drop our local refs + schedule the leak check as a
+    # SEPARATE idle so the idle source holding our refs has been
+    # cleaned up before we test the weakref.
+    del sub_bin, concat_sink_pad, qtdemux_elem
+
+    def _check_leak():
+        gc.collect()
+        if weak() is not None:
+            print(f"[cutloop] [retire] LEAK ref still held for "
+                  f"{name}", file=sys.stderr)
+        return False
+    GLib.idle_add(_check_leak)
     return False  # one-shot
 
 
@@ -294,6 +375,7 @@ for _ in range(INITIAL_QUEUE_DEPTH):
 # --- Instrument (minimal: frames/sec + gap-warn) -----------------------
 
 counter = {"frames": 0, "last_ns": 0, "max_gap_ms": 0.0,
+           "dec_frames": 0, "dec_last_ns": 0, "dec_max_gap_ms": 0.0,
            "boundary_warns_total": 0}
 
 # Watchdog state: if kmssink.sink sees 0 frames for 2 consecutive
@@ -337,15 +419,41 @@ def attach_kmssink_probe():
     sink_pad.add_probe(Gst.PadProbeType.BUFFER, _probe)
 
 
+def attach_decoder_src_probe():
+    """Per QA: count decoder output frames separately so we can
+    localize a throttle to upstream (concat/decoder) vs downstream
+    (kmssink). dec=N(gM) appears in the [fps] line beside the
+    existing screen=frames=N(gM)."""
+    dec_src = decoder.get_static_pad("src")
+    if dec_src is None:
+        die("v4l2h264dec has no src pad")
+
+    def _probe(_pad, _info):
+        now = time.monotonic_ns()
+        counter["dec_frames"] += 1
+        last = counter["dec_last_ns"]
+        if last:
+            gap_ms = (now - last) / 1e6
+            if gap_ms > counter["dec_max_gap_ms"]:
+                counter["dec_max_gap_ms"] = gap_ms
+        counter["dec_last_ns"] = now
+        return Gst.PadProbeReturn.OK
+
+    dec_src.add_probe(Gst.PadProbeType.BUFFER, _probe)
+
+
 _t_start = time.monotonic()
 
 
 def fps_tick():
     uptime = int(time.monotonic() - _t_start)
     line = (f"[fps] t={uptime} "
-            f"frames={counter['frames']} "
-            f"max_gap_ms={int(counter['max_gap_ms'])} "
-            f"queued_clips={playlist_added_count[0]} "
+            f"dec={counter['dec_frames']}"
+            f"(g{int(counter['dec_max_gap_ms'])}) "
+            f"screen={counter['frames']}"
+            f"(g{int(counter['max_gap_ms'])}) "
+            f"live_bins={live_subgraph_count[0]} "
+            f"total_added={playlist_added_count[0]} "
             f"gap_warns_total={counter['boundary_warns_total']}")
     print(line, file=sys.stderr, flush=True)
     if log_file is not None:
@@ -373,6 +481,8 @@ def fps_tick():
         watchdog_state["zero_frame_seconds"] = 0
     counter["frames"] = 0
     counter["max_gap_ms"] = 0.0
+    counter["dec_frames"] = 0
+    counter["dec_max_gap_ms"] = 0.0
     return True
 
 
@@ -431,6 +541,7 @@ if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
     die("set_state PLAYING failed")
 
 attach_kmssink_probe()
+attach_decoder_src_probe()
 GLib.timeout_add(1000, fps_tick)
 
 try:
