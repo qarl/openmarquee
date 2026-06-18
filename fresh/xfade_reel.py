@@ -210,6 +210,33 @@ ADVANCE_FIRST_FRAME_WAIT_MS = 800
 # (single-threaded), so the gap targets CMA-settle time
 # rather than thread synchronization.
 MIN_INTER_ADD_MS = 200
+# Per QA 8b74684 glass diagnosis: the FLUSH-based seek-loop
+# causes a 110-203ms hitch ~24% of seconds because FLUSH
+# empties the dec -> queue -> glupload pipeline and refilling
+# takes ~100-200ms. The hitch-free seamless loop uses:
+#   (1) RESERVOIR queue after dec (time-based, ~500ms of
+#       decoded frames buffered ahead of mixer).
+#   (2) EARLY non-flushing SEGMENT|KEY_UNIT seek BEFORE the
+#       clip's natural EOS, so the decoder refills from frame
+#       0 while the reservoir still holds enough frames to
+#       hide the refill gap.
+#   (3) Drop EOS + SEGMENT_DONE events so the decoder never
+#       sees EOS -> no STREAMOFF/flush -> no wedge.
+# CMA budget: 1280x720 NV12 = 1.4MB/frame x 24fps x 0.5s =
+# ~17MB per stream; 2 streams = ~34MB reservoir capacity.
+# Env-tunable: shrink to ~0.3s (~10MB per stream) if CMA
+# tight; grow to ~0.8s if hitches still observed.
+RESERVOIR_MS = int(os.environ.get(
+    "OPENMARQUEE_XFADE_RESERVOIR_MS", "500"
+))
+RESERVOIR_TIME_NS = RESERVOIR_MS * 1_000_000
+# Lead time before clip's natural EOS at which to fire the
+# non-flushing seek. Should be >= the typical dec restart
+# latency so reservoir hides the refill gap.
+SEEK_LEAD_MS = int(os.environ.get(
+    "OPENMARQUEE_XFADE_SEEK_LEAD_MS", "500"
+))
+SEEK_LEAD_NS = SEEK_LEAD_MS * 1_000_000
 # Fallback per-clip duration if query_duration fails at startup.
 DUR_FALLBACK_S = 6.0
 # cutloop's invariant: keep >=1 pad pending ahead of current,
@@ -334,12 +361,17 @@ def _build_stream(label, mix_sink_idx):
     upl = Gst.ElementFactory.make("glupload", f"upl_{label}")
     if concat is None or dec is None or queue is None or upl is None:
         die(f"[{label}] core static element factory returned None")
-    # Cap downstream depth. max-size-bytes/time = 0 disables those
-    # backpressure axes; max-size-buffers=2 keeps the queue at
-    # most 2 decoded frames behind glupload.
-    queue.set_property("max-size-buffers", 2)
+    # Reservoir queue per QA 8b74684 fix. Time-based depth
+    # (~500ms by default) holds decoded frames ahead of the
+    # mixer so the visible's non-flushing seek can refill the
+    # decoder without producing a visible gap. max-size-bytes
+    # and max-size-buffers = 0 (disabled) so only time gates
+    # backpressure. Disable downstream-leak so the reservoir
+    # blocks upstream (the decoder) when full instead of
+    # dropping frames.
+    queue.set_property("max-size-time", RESERVOIR_TIME_NS)
     queue.set_property("max-size-bytes", 0)
-    queue.set_property("max-size-time", 0)
+    queue.set_property("max-size-buffers", 0)
     for el in (concat, dec, queue, upl):
         pipeline.add(el)
     if not concat.link(dec):
@@ -430,17 +462,25 @@ for sid, s in streams.items():
     # behind the crossfade. Drained by _process_pending_retires
     # in _fade_tick's on-complete branch.
     s["pending_retires"] = []
-    # SEEK-LOOP per QA a84cee9 mid-flight refinement: while this
-    # stream is VISIBLE, intercept EOS at the sub-bin's ghost pad
-    # and SEEK the source back to 0 instead of letting concat
-    # tear down + queue next. Matches xfade_demo.py's proven
-    # hitch-free 20s-hold pattern. seek_loop_probe_id /
-    # seek_loop_ghost track the installed probe so it can be
-    # removed when the stream transitions to hidden (after which
-    # normal cutloop-style natural-EOS advance resumes for the
-    # clip-advance on the OUTGOING side of the next crossfade).
-    s["seek_loop_probe_id"] = None
+    # SEAMLESS SEEK-LOOP per QA 8b74684 fix. While this stream
+    # is VISIBLE we install TWO probes on the front sub-bin's
+    # ghost pad:
+    #   (a) BUFFER probe that watches PTS; when PTS >=
+    #       dur - SEEK_LEAD_NS, fires a NON-FLUSHING
+    #       SEGMENT|KEY_UNIT seek back to 0. The reservoir
+    #       queue downstream hides the dec refill gap.
+    #   (b) EVENT_DOWNSTREAM probe that DROPS EOS +
+    #       SEGMENT_DONE so the decoder never sees EOS and
+    #       no STREAMOFF / flush wedge happens.
+    # State + probe IDs tracked for cleanup on hide.
+    s["seek_loop_buffer_probe_id"] = None
+    s["seek_loop_event_probe_id"] = None
     s["seek_loop_ghost"] = None
+    s["seek_loop_state"] = {
+        "seeking": False,
+        "seek_count": 0,
+        "dur_ns": 0,
+    }
 
 
 # Per QA 7561fac soak cross-stream collision fix: global
@@ -909,16 +949,23 @@ def _start_fade():
 
 
 def _install_seek_loop_probe(stream_id):
-    """Install an EOS-DROP-and-SEEK probe on the visible stream's
-    front sub-bin (the one feeding concat). When the sub-bin's
-    clip naturally EOSes, the probe drops the EOS event and
-    issues a TIME seek back to 0 -- the source replays from
-    frame 0 WITHOUT a teardown / queue churn / concat switch.
-    Matches xfade_demo.py's proven hitch-free hold pattern.
+    """Install the SEAMLESS SEEK-LOOP probes on the visible
+    stream's front sub-bin. Two probes attached to the
+    sub-bin's src ghost pad:
+      (a) BUFFER probe tracking PTS. When PTS >= dur -
+          SEEK_LEAD_NS, issues a NON-FLUSHING SEGMENT|
+          KEY_UNIT seek back to 0. The reservoir queue
+          downstream holds enough decoded frames to bridge
+          the dec refill gap, so the mixer sees no
+          interruption.
+      (b) EVENT_DOWNSTREAM probe that DROPs EOS +
+          SEGMENT_DONE so the decoder never sees EOS -> no
+          STREAMOFF / flush -> no wedge.
 
-    Per qarl's principle: teardown NEVER touches the visible
-    stream. SEEK-LOOP replaces concat re-queue as the visible-
-    hold mechanism."""
+    Per qarl's principle + xfade_demo's proven hitch-free
+    hold: teardown NEVER touches the visible stream. The
+    seek is non-flushing AND fires EARLY, so the pipeline
+    keeps producing frames continuously."""
     s = streams[stream_id]
     if not s["sub_bin_queue"]:
         print(f"[xfade] WARN install_seek_loop_probe {stream_id}: "
@@ -933,45 +980,112 @@ def _install_seek_loop_probe(stream_id):
               file=sys.stderr)
         return
 
-    def _on_eos_drop(_pad, info, sb=sub_bin, sid=stream_id):
-        ev = info.get_event()
-        if ev and ev.type == Gst.EventType.EOS:
-            print(f"[xfade] SEEK-LOOP {sid}: EOS dropped, "
-                  "seeking source -> 0", file=sys.stderr)
-            sb.seek_simple(
-                Gst.Format.TIME,
-                Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-                0,
+    # Look up the clip's duration (cached at startup).
+    clip_path = s["current_loop_clip"]
+    dur_s = CLIP_DURATIONS.get(clip_path, DUR_FALLBACK_S)
+    dur_ns = int(dur_s * 1e9)
+    state = s["seek_loop_state"]
+    state["seeking"] = False
+    state["seek_count"] = 0
+    state["dur_ns"] = dur_ns
+    threshold_ns = dur_ns - SEEK_LEAD_NS
+    if threshold_ns <= 0:
+        # Edge case: clip shorter than seek lead. Use a tiny
+        # threshold so we still loop (degenerate, but won't
+        # crash).
+        threshold_ns = max(int(dur_ns / 2), 100_000_000)
+        print(f"[xfade] SEEK-LOOP {stream_id} WARN: dur "
+              f"{dur_s:.2f}s shorter than SEEK_LEAD; "
+              f"threshold={threshold_ns/1e9:.2f}s",
+              file=sys.stderr)
+
+    def _on_buffer(_pad, info, sb=sub_bin, sid=stream_id,
+                   thr=threshold_ns, dn=dur_ns, st=state):
+        buf = info.get_buffer()
+        if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+            return Gst.PadProbeReturn.OK
+        pts = buf.pts
+        # Reset the seeking-armed flag once PTS has dropped
+        # back well below threshold (post-seek the source's
+        # PTS resets near 0).
+        if st["seeking"] and pts < (thr // 2):
+            st["seeking"] = False
+        if not st["seeking"] and pts >= thr:
+            st["seeking"] = True
+            ok = sb.seek(
+                1.0, Gst.Format.TIME,
+                (Gst.SeekFlags.SEGMENT
+                 | Gst.SeekFlags.KEY_UNIT),
+                Gst.SeekType.SET, 0,
+                Gst.SeekType.SET, dn,
             )
-            return Gst.PadProbeReturn.DROP
+            st["seek_count"] += 1
+            print(f"[xfade] SEEK-LOOP {sid}: non-flushing "
+                  f"SEGMENT seek at pts={pts/1e9:.2f}s "
+                  f"thr={thr/1e9:.2f}s ok={ok} "
+                  f"count={st['seek_count']}",
+                  file=sys.stderr)
         return Gst.PadProbeReturn.OK
 
-    probe_id = ghost.add_probe(
-        Gst.PadProbeType.EVENT_DOWNSTREAM, _on_eos_drop
+    def _on_event(_pad, info, sid=stream_id):
+        ev = info.get_event()
+        if ev:
+            et = ev.type
+            if et == Gst.EventType.EOS:
+                print(f"[xfade] SEEK-LOOP {sid}: DROP EOS",
+                      file=sys.stderr)
+                return Gst.PadProbeReturn.DROP
+            if et == Gst.EventType.SEGMENT_DONE:
+                print(f"[xfade] SEEK-LOOP {sid}: DROP "
+                      "SEGMENT_DONE", file=sys.stderr)
+                return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.OK
+
+    buffer_probe_id = ghost.add_probe(
+        Gst.PadProbeType.BUFFER, _on_buffer
     )
-    s["seek_loop_probe_id"] = probe_id
+    event_probe_id = ghost.add_probe(
+        Gst.PadProbeType.EVENT_DOWNSTREAM, _on_event
+    )
+    s["seek_loop_buffer_probe_id"] = buffer_probe_id
+    s["seek_loop_event_probe_id"] = event_probe_id
     s["seek_loop_ghost"] = ghost
     print(f"[xfade] SEEK-LOOP installed on {stream_id} "
-          f"sub={sub_bin.get_name()}", file=sys.stderr)
+          f"sub={sub_bin.get_name()} dur={dur_s:.2f}s "
+          f"threshold={threshold_ns/1e9:.2f}s "
+          f"reservoir={RESERVOIR_MS}ms "
+          f"seek_lead={SEEK_LEAD_MS}ms",
+          file=sys.stderr)
 
 
 def _remove_seek_loop_probe(stream_id):
-    """Remove the SEEK-LOOP probe. Called when the stream
-    transitions visible -> hidden; the next natural EOS will
-    propagate to concat normally and the cutloop-style retire
-    + queue-next cycle resumes for the hidden-stream clip
-    advance."""
+    """Remove the SEEK-LOOP buffer + event probes. Called when
+    the stream transitions visible -> hidden; the next natural
+    EOS will propagate to concat normally and the cutloop-style
+    retire + queue-next cycle resumes for the hidden-stream
+    clip advance."""
     s = streams[stream_id]
-    probe_id = s.get("seek_loop_probe_id")
+    buf_id = s.get("seek_loop_buffer_probe_id")
+    evt_id = s.get("seek_loop_event_probe_id")
     ghost = s.get("seek_loop_ghost")
-    if probe_id and ghost is not None:
-        try:
-            ghost.remove_probe(probe_id)
-        except Exception as exc:
-            print(f"[xfade] WARN remove_seek_loop_probe "
-                  f"{stream_id}: {exc}", file=sys.stderr)
-    s["seek_loop_probe_id"] = None
+    if ghost is not None:
+        if buf_id:
+            try:
+                ghost.remove_probe(buf_id)
+            except Exception as exc:
+                print(f"[xfade] WARN remove buffer probe "
+                      f"{stream_id}: {exc}", file=sys.stderr)
+        if evt_id:
+            try:
+                ghost.remove_probe(evt_id)
+            except Exception as exc:
+                print(f"[xfade] WARN remove event probe "
+                      f"{stream_id}: {exc}", file=sys.stderr)
+    s["seek_loop_buffer_probe_id"] = None
+    s["seek_loop_event_probe_id"] = None
     s["seek_loop_ghost"] = None
+    if s.get("seek_loop_state"):
+        s["seek_loop_state"]["seeking"] = False
     print(f"[xfade] SEEK-LOOP removed from {stream_id}",
           file=sys.stderr)
 
