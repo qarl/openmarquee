@@ -390,29 +390,45 @@ class ClipBin:
         # Optional videoconvert before intervideosink (leak fallback).
         leak_convert = ("! videoconvert "
                         if INSERT_TEARDOWN_VIDEOCONVERT else "")
-        # Primary fix per QA discriminator dispatch: deepen the
-        # post-decoder queue so the v4l2h264dec CAPTURE pool gets
-        # negotiated to a larger size (gst-plugins-good propagates
-        # the queue max-size-buffers downstream to the pool min).
-        # Shallow pools (~4/4 default) cause "Uncertain or not
-        # enough buffers, enabling copy threshold" at every bin,
-        # and the INCOMING decoder intermittently starves at
-        # concurrent cold-start (decB=0 on ~20% of preloads). Our
-        # own ffmpeg dual-1080p proof shows deep pools 16/20 =
-        # reliable concurrent decode. CMA budget: ~16 NV12 720p
-        # buffers ~= 22MB/decoder x 2 decoders ~= 44MB (under the
-        # 50MB-free Pi Zero 2 W watermark).
+        # Primary fix per QA pre-flight (CMA=320M on FYS, NOT 256M;
+        # v4l2h264dec has NO min-buffers prop; min_number_of_capture
+        # _buffers v4l2 control is READ-ONLY). The only working
+        # levers per QA pre-flight:
+        #   K1 = explicit MMAP io-modes (capture+output) -- the
+        #        only io-mode that works on this driver / our CPU-
+        #        compositor path (dmabuf was ruled out per S4).
+        #   K3 = post-decoder queue max-size-buffers=20 (per QA
+        #        spec; 4->20 drives CAPTURE pool growth INDIRECTLY
+        #        via downstream propose_allocation negotiation).
+        # Shallow 4/4 default + "Uncertain or not enough buffers,
+        # enabling copy threshold" at every bin = starvation under
+        # concurrent dual-decode cold-start (~20% wedge rate per
+        # QA discriminator soak). ffmpeg dual-1080p proof = deep
+        # pools 16-20 give reliable concurrent decode.
+        # CMA budget (FYS 327680kB total, ~79MB active): 20 NV12
+        # 720p buffers ~= 28MB/decoder x 2 decoders ~= 56MB peak
+        # during the 1s wipe overlap. Plenty of margin.
+        # VERIFICATION (silent): if "not enough buffers, enabling
+        # copy threshold" log line disappears post-deploy, the
+        # pool grew; if it still fires, K3-alone is insufficient
+        # and we surface back.
         desc = (
             f'filesrc location="{self.asset}" name=src '
             f"! qtdemux name=demux ! h264parse "
             f"! v4l2h264dec name=dec "
+            f"  capture-io-mode=mmap output-io-mode=mmap "  # K1
             f"! videorate ! {RATE_30} "
-            f"! queue max-size-buffers=16 max-size-bytes=0 "
+            f"! queue max-size-buffers=20 max-size-bytes=0 "      # K3
             f"  max-size-time=0 "
             f"{leak_convert}"
             f"! intervideosink channel={self.channel} "
             f"  sync=true async=false"
         )
+        # R7 (per QA): log the actual pipeline knob values at build
+        # so QA can verify in the journal that K1+K3 took.
+        print(f"[{self.label}] decode bin queue cap=20 "
+              "capture-io-mode=mmap output-io-mode=mmap",
+              file=sys.stderr)
         try:
             self.pipeline = Gst.parse_launch(desc)
         except GLib.Error as exc:
@@ -1021,6 +1037,22 @@ def check_main_wedge():
         wedge_state["last_pos_ns"] = cur_pos
 
 
+def _read_cma_free_kb():
+    """Parse /proc/meminfo for CmaFree (KB). Cheap (~3 lines read).
+    Surfaced in the [fps] line (R8 per QA) so the 1Hz log records
+    the CMA trend in /tmp/wipe_fps.log. Used to verify the deeper
+    pool fix is not eating the CMA headroom (FYS CmaTotal=320MB,
+    keep >=50MB free)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("CmaFree:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return -1
+
+
 def _count_video10_fds():
     """Count open file descriptors pointing at /dev/video10.
     Each v4l2h264dec instance opens it once -> normal range is
@@ -1204,6 +1236,10 @@ def fps_tick():
         pos_s = "?"
     gaps = {k: int(s["max_gap_ms"]) for k, s in gap_state.items()}
     dec_gaps = {k: int(s["max_gap_ms"]) for k, s in dec_gap_state.items()}
+    cma_kb = _read_cma_free_kb()  # R8 per QA: CMA trend in fps line.
+    # cmaFreeMB is placed BEFORE state= so the line continues to end
+    # with state=HOLD|WIPE -- preserves any end-anchored QA grep on
+    # the prior [fps] line format.
     line = (
         f"[fps] t={uptime} "
         f"inA={counters['inA']}(g{gaps['inA']}) "
@@ -1212,7 +1248,9 @@ def fps_tick():
         f"decA={dec_counters['A']}(g{dec_gaps['A']}) "
         f"decB={dec_counters['B']}(g{dec_gaps['B']}) "
         f"main={main_label} next={next_label} "
-        f"pts={pos_s} state={wipe_state['phase']}"
+        f"pts={pos_s} "
+        f"cmaFreeMB={cma_kb // 1024 if cma_kb >= 0 else '?'} "
+        f"state={wipe_state['phase']}"
     )
     print(line, file=sys.stderr, flush=True)
     if fps_log_file is not None:
