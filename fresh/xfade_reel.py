@@ -442,16 +442,15 @@ for sid, s in streams.items():
     # B from clip1 to clip0, making the viewer see clip0 twice
     # in a row (A.clip0 then B.clip0). Reviewer's catch.
     s["has_been_visible"] = (sid == "A")
-    # pending_retires: list of retire-arg dicts for sub-bins that
-    # EOSed while this stream was VISIBLE. Per QA a84cee9 glass
-    # diagnosis: retire_subgraph's set_state(NULL) + pipeline.remove
-    # + concat.release_request_pad stalls the aggregator on-screen
-    # (377ms hitch observed at t=22 with A visible, live_A 2->1).
-    # qarl's principle: NEVER touch the visible stream. Defer ALL
-    # retires until the stream goes hidden, then process them
-    # behind the crossfade. Drained by _process_pending_retires
-    # in _fade_tick's on-complete branch.
-    s["pending_retires"] = []
+    # NOTE: pending_retires (visible-defer mechanism) was REMOVED
+    # per QA c41cf01 soak: the visible-side defer caused live_<sid>
+    # to climb to 7 over a 20s linger (~4-5 visible-clip loops, each
+    # EOS'd sub-bin queued but never drained), exhausting CMA to
+    # ~3MB free = near-brick. Retires now run unconditionally on
+    # GLib.idle_add from the EOS probe (matches cutloop's shipped
+    # pattern exactly). Safe because concat absorbs the EOS and
+    # switches to the next pending sub-bin BEFORE the idle fires,
+    # so the retiring sub-bin is no longer feeding the mix pad.
 
 
 # Per QA 7561fac soak cross-stream collision fix: global
@@ -606,29 +605,24 @@ def add_next_clip(stream_id):
             # both streams = no seek, no flush, no HW decoder
             # repositioning = the cutloop pattern that ships.
             schedule_add(stream_id)
-            # Per QA a84cee9 visible-stream-protection: gate
-            # the retire on visibility. While visible, defer
-            # the retire (set_state(NULL) + pipeline.remove +
-            # release_request_pad on concat stalls the
-            # aggregator on-screen).
-            retire_args = {
-                "sub": sub, "concat_sink": concat_sink,
-                "qtdemux": qtdemux,
-                "pad_added_id": pad_added_id,
-                "eos_probe_id": eos_probe_id,
-            }
-            if is_visible:
-                streams[stream_id]["pending_retires"].append(
-                    retire_args
-                )
-                print(f"[xfade] {stream_id} retire DEFERRED "
-                      "(visible); will run on hide; pending="
-                      f"{len(streams[stream_id]['pending_retires'])}",
-                      file=sys.stderr)
-            else:
-                GLib.idle_add(retire_subgraph, stream_id, sub,
-                              concat_sink, qtdemux,
-                              pad_added_id, eos_probe_id)
+            # Per QA c41cf01 soak diagnosis: retire UNCONDITIONALLY
+            # on idle, even when the stream is visible. The original
+            # a84cee9 visible-defer was over-protective: by the
+            # time GLib.idle_add fires retire, concat has already
+            # absorbed the EOS and switched to the next pending
+            # sub-bin. So `sub` is a SWITCHED-AWAY sub-bin at
+            # retire time -- it no longer feeds the mix pad, so
+            # set_state(NULL) + release_request_pad cannot stall
+            # the active concat -> dec -> mix path. cutloop ships
+            # exactly this pattern (always-retire-on-idle, one
+            # stream, no visible/hidden distinction) with live ~2
+            # and no leak. Without this, visible-side retires
+            # accumulated in pending_retires across the 20s linger
+            # (clip loops 4-5x), live climbed to 7, CMA exhausted
+            # to ~3MB free -- near-brick (QA c41cf01 116s soak).
+            GLib.idle_add(retire_subgraph, stream_id, sub,
+                          concat_sink, qtdemux,
+                          pad_added_id, eos_probe_id)
         return Gst.PadProbeReturn.OK
     eos_probe_id = concat_sink.add_probe(
         Gst.PadProbeType.EVENT_DOWNSTREAM, _on_concat_sink_event
@@ -707,16 +701,13 @@ def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
         return False
     GLib.idle_add(_check_leak)
 
-    # NOTE: schedule_add was MOVED to the EOS probe (see
-    # _on_concat_sink_event in add_next_clip). Rationale: per
-    # QA a84cee9 visible-stream-protection, retire_subgraph is
-    # now ONLY called when the stream is hidden -- either
-    # immediately from the EOS probe (when hidden at EOS time)
-    # or deferred via _process_pending_retires when the stream
-    # transitions visible->hidden after a fade. The "schedule
-    # add to keep concat fed" responsibility is independent of
-    # retire and fires unconditionally on EOS (gated only by
-    # cross-stream serialization).
+    # NOTE: schedule_add (queue the next sub-bin) is independent
+    # of retire and fires from the EOS probe in add_next_clip,
+    # gated only by cross-stream serialization. retire_subgraph
+    # runs unconditionally on GLib.idle_add from the same EOS
+    # probe -- matches cutloop's shipped pattern. By the time
+    # idle fires, concat has switched to the next pending sub-
+    # bin so the retiring sub-bin is no longer feeding the mix.
     return False  # one-shot
 
 
@@ -919,34 +910,9 @@ def _start_fade():
     return False
 
 
-def _process_pending_retires(stream_id):
-    """Drain pending_retires for a stream that just transitioned
-    visible -> hidden. Runs each deferred retire_subgraph now
-    that the stream is off-screen (alpha=0), so the aggregator
-    stall caused by set_state(NULL)+pipeline.remove+
-    release_request_pad doesn't show as an on-screen hitch.
-    Per QA a84cee9 + qarl's principle: ALL teardown on a stream
-    happens ONLY when that stream is hidden."""
-    s = streams[stream_id]
-    pending = s["pending_retires"]
-    if not pending:
-        return
-    print(f"[xfade] processing {len(pending)} deferred retires "
-          f"on {stream_id} (now hidden)", file=sys.stderr)
-    # Drain via idle_add so each runs on its own main-loop tick,
-    # spreading the work and allowing the just-completed fade
-    # animation to settle first.
-    while pending:
-        args = pending.pop(0)
-        GLib.idle_add(retire_subgraph, stream_id, args["sub"],
-                      args["concat_sink"], args["qtdemux"],
-                      args["pad_added_id"], args["eos_probe_id"])
-
-
 def _fade_tick():
     """Per-tick linear alpha animation. On completion: swap
-    visible_stream, process the now-hidden stream's deferred
-    retires, re-enter LINGERING_VISIBLE."""
+    visible_stream, re-enter LINGERING_VISIBLE."""
     if linger_state["phase"] != "FADING":
         return False
     from_id = linger_state["from_stream"]
@@ -961,11 +927,11 @@ def _fade_tick():
         visible_stream[0] = to_id
         print(f"[xfade] FADE complete; visible={to_id}",
               file=sys.stderr)
-        # from_id is now HIDDEN: drain its deferred retires
-        # off-screen. Both streams use the same concat-re-add
-        # gapless loop (cutloop pattern); the visible-vs-hidden
-        # distinction is now only about retire deferral.
-        _process_pending_retires(from_id)
+        # Both streams use the same concat-re-add gapless loop
+        # AND the same unconditional-retire-on-idle pattern
+        # (cutloop's proven model). No deferred-retire drain
+        # is needed at fade-completion -- retires ran inline
+        # via idle as each sub-bin EOSed.
         _enter_lingering_visible()
         return False
     t = max(0.0, min(1.0, elapsed_s / FADE_S))
