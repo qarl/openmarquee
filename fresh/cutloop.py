@@ -61,6 +61,7 @@ NOT included (deliberately, per qarl "tear it all out"):
 """
 
 import gc
+import glob
 import os
 import signal
 import subprocess
@@ -74,10 +75,15 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
-VIDEOS = [
-    "/var/openmarquee/content/029c4d68-744c-4d30-9adc-0f37c55514f1/asset.mp4",
-    "/var/openmarquee/content/3f54a4d2-a120-4c0c-aa80-5b99aaf7c9ff/asset.mp4",
-]
+# Dynamic playlist discovery per QA: glob all asset.mp4 under
+# /var/openmarquee/content/<uuid>/, sorted by path for stable cycle
+# order. Per QA pre-flight all 17 current assets are uniform
+# (h264 Main 1280x720 24fps) so the single long-lived v4l2h264dec
+# + concat handles them identically to the 2-clip A->B test.
+# Auto-includes future additions. Cycle is clip0->clip1->...->clipN
+# ->clip0; full loop ~100s for 17 clips averaging 6s each.
+CONTENT_GLOB = "/var/openmarquee/content/*/asset.mp4"
+VIDEOS = sorted(glob.glob(CONTENT_GLOB))
 DW, DH = 1280, 720
 GAP_WARN_MS = 60  # per QA: 50ms was too tight for 24fps's 41.7ms
                   # interval -- 98% of warns were 50-55ms benign
@@ -99,9 +105,18 @@ def die(msg, code=1):
 
 # --- Pre-flights --------------------------------------------------------
 
+if not VIDEOS:
+    die(f"no videos discovered under {CONTENT_GLOB} -- "
+        "check /var/openmarquee/content exists and contains "
+        "<uuid>/asset.mp4 files")
 for v in VIDEOS:
     if not os.path.exists(v):
         die(f"missing video: {v}")
+print(f"[cutloop] discovered {len(VIDEOS)} videos:",
+      file=sys.stderr)
+for v in VIDEOS:
+    print(f"[cutloop]   {os.path.basename(os.path.dirname(v))}",
+          file=sys.stderr)
 
 Gst.init(None)
 
