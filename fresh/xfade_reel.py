@@ -66,28 +66,56 @@ ARCHITECTURE:
                                                         v
                                                 glimagesink sync=false
 
-CROSSFADE SCHEDULING (v1: time-based, deterministic):
-  visible_stream starts as "A" with alpha=1.0; B alpha=0.0.
-  TARGET_VISIBLE_S=4.0 wall-clock after each crossfade
-  completes, schedule the next crossfade. Crossfade animates
-  the two alphas over FADE_S=1.0 (linear). When done, swap
-  visible_stream and schedule the next TARGET_VISIBLE_S
-  timer. The HIDDEN stream keeps playing its concat (its
-  v4l2h264dec produces frames continuously); its current
-  clip drifts independently of when it's shown. QA accepts
-  this drift for v1: "If drift looks bad, a v2 refinement is
-  to time the incoming clip's start to the crossfade -- but
-  DON'T let an incoming stream go unfed to achieve that; the
-  pad must always have buffers." This v1 always feeds.
+CROSSFADE SCHEDULING (v2: clip-gated linger, per QA glass):
+  v1's fixed 4s TARGET_VISIBLE_S fired mid-clip and produced
+  weird drift / cutting. v2 replaces it with a clip-gated
+  linger: each visible clip plays FULL LENGTH AND >=
+  LINGER_MIN_S (short clips LOOP via re-queue of the same
+  clip). Crossfade fires ONLY at a clean boundary: the
+  incoming stream is FORCE-ADVANCED (2x EOS to current active)
+  to its next playlist clip so its first frame is FROM ITS
+  START at the crossfade moment.
+
+  STATE MACHINE:
+    LINGERING_VISIBLE -- visible turn alive; polled every
+        LINGER_CHECK_MS. When elapsed wall-clock since
+        visible_turn_started >= max(clip_dur, LINGER_MIN_S),
+        transition to ADVANCING_INCOMING.
+    ADVANCING_INCOMING -- incoming.current_loop_clip reassigned
+        to its next playlist entry; force_eos_active fired
+        twice (with a small delay between) so concat advances
+        pending -> new clip from frame 0. Wait
+        ADVANCE_FIRST_FRAME_WAIT_MS for buffers to flow
+        through dec -> queue -> glupload -> mix.
+    FADING -- linear alpha animation over FADE_S. On
+        completion: swap visible_stream, re-enter
+        LINGERING_VISIBLE with new linger_target.
+
+  LOOPING: each stream's add_next_clip queues a fresh sub-bin
+  of current_loop_clip. On natural EOS the cutloop pattern
+  retires + queues another instance of the same clip. The
+  per-stream playlist index (next_idx) only advances inside
+  _start_advancing, NOT on every EOS.
+
+  PRESERVED FROM v1: both streams ALWAYS feeding via concat
+  so the mixer never starves; 2 PERMANENT mix sink pads
+  (never released / flushed / re-primed / EOS-sent to);
+  cutloop's leak-safe retire (disconnect handlers + remove
+  probes BEFORE NULL) per stream; the f3fd066 CMA peak fixes
+  (queue cap 2 between dec and glupload, deferred add after
+  retire by ADD_AFTER_RETIRE_MS=50ms, CmaFree_min logging).
 
 OBSERVABILITY: 1Hz [fps] line:
   [fps] t=N screen=N max_gap_ms=N visible=X alphaA=. alphaB=.
-        live_A=N live_B=N queued_A=N queued_B=N
-        CmaFree_kB=N
+        phase=PHASE linger_rem=N.Ns live_A=N live_B=N
+        added_A=N added_B=N CmaFree_kB=N CmaFree_min_kB=N
 
-GATE: all 3 clips cycle with a visible crossfade at each
-boundary, screen ~24 sustained, CmaFree>50MB, NO black/
-stall/jam over minutes.
+GATE per QA v2 dispatch: all 3 clips show in clean rotation
+(each visible clip starts from frame 0, plays full length AND
+>=10s, then a 1s dissolve to the next fresh clip), screen
+~24 sustained, CmaFree_min_kB > 55-60MB (raised from the v1
+43-47MB dip), NO mid-clip flashing/cutting, NO black/stall/
+jam over minutes.
 
 DO NOT touch cutloop.py, cutfade.py, glblend_probe.py, or
 dissolve_proof.py. cutloop stays the sign default; QA
@@ -149,10 +177,26 @@ PLAYLIST = [
     "86b3eba8-3063-4c21-a2b1-749f7665e4d3/asset.mp4",
 ]
 
-TARGET_VISIBLE_S = 4.0   # wall-clock visible time before next fade
+# Per QA glass feedback (qarl): fixed 4s TARGET_VISIBLE_S fires
+# mid-clip and produces weird drift/cutting. Replaced with a
+# CLIP-GATED linger. Each visible clip plays FULL LENGTH AND at
+# least LINGER_MIN_S; short clips LOOP to reach the floor.
+# Crossfade fires ONLY at a clean boundary: the incoming stream
+# is advanced to its NEXT clip just before the crossfade so its
+# first frame is FROM ITS START at the crossfade moment.
+LINGER_MIN_S = 10.0      # min wall-clock per visible clip turn
 FADE_S = 1.0             # crossfade duration
 FADE_TICK_MS = 33        # ~30Hz alpha animation
+LINGER_CHECK_MS = 500    # how often to poll the linger gate
 PREROLL_BUDGET_S = 30
+# After force-advancing the incoming stream (2x force-EOS so
+# concat advances pending -> new-clip), wait this long for the
+# new clip's first frames to flow through dec -> queue ->
+# glupload -> mix sink before starting the alpha animation.
+# Tuned for bcm2835-codec first-frame latency (~0.5-1s).
+ADVANCE_FIRST_FRAME_WAIT_MS = 800
+# Fallback per-clip duration if query_duration fails at startup.
+DUR_FALLBACK_S = 6.0
 # cutloop's invariant: keep >=1 pad pending ahead of current,
 # per stream. Pre-queue 2 sub-bins per stream at startup; on
 # each EOS the probe schedules add_next_clip so the queue
@@ -182,8 +226,56 @@ for p in PLAYLIST:
     if not os.path.isfile(p):
         die(f"clip not found: {p}")
 print(f"[xfade] PLAYLIST: {len(PLAYLIST)} clips, "
-      f"TARGET_VISIBLE_S={TARGET_VISIBLE_S} FADE_S={FADE_S}",
+      f"LINGER_MIN_S={LINGER_MIN_S} FADE_S={FADE_S}",
       file=sys.stderr)
+
+
+# --- Per-clip duration cache ----------------------------------------
+#
+# Query each clip's duration ONCE at startup via a transient parse
+# pipeline. Cache results so the linger gate can compute hold_target
+# = max(clip_dur, LINGER_MIN_S) without per-cycle querying.
+CLIP_DURATIONS = {}
+
+
+def _query_clip_duration(path):
+    """One-shot duration query via a transient
+    filesrc!qtdemux!h264parse!fakesink pipeline. Blocks up to 5s
+    for PAUSED state, then queries qtdemux. Returns float seconds
+    or DUR_FALLBACK_S on failure."""
+    pipe = None
+    try:
+        pipe = Gst.parse_launch(
+            f'filesrc location="{path}" ! qtdemux ! h264parse '
+            "! fakesink name=fs"
+        )
+        if pipe is None:
+            return DUR_FALLBACK_S
+        if (pipe.set_state(Gst.State.PAUSED)
+                == Gst.StateChangeReturn.FAILURE):
+            return DUR_FALLBACK_S
+        ret, _cur, _pending = pipe.get_state(5 * Gst.SECOND)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            return DUR_FALLBACK_S
+        ok, dur = pipe.query_duration(Gst.Format.TIME)
+        if ok and dur > 0:
+            return dur / 1e9
+    except Exception as exc:
+        print(f"[xfade] dur query WARN {path}: {exc}",
+              file=sys.stderr)
+    finally:
+        if pipe is not None:
+            pipe.set_state(Gst.State.NULL)
+    return DUR_FALLBACK_S
+
+
+for p in PLAYLIST:
+    d = _query_clip_duration(p)
+    CLIP_DURATIONS[p] = d
+    name = os.path.basename(os.path.dirname(p)) or p
+    print(f"[xfade] dur {name}: {d:.2f}s "
+          f"(linger_target={max(d, LINGER_MIN_S):.2f}s)",
+          file=sys.stderr)
 
 
 # --- Pipeline --------------------------------------------------------
@@ -277,21 +369,53 @@ print("[xfade] both static spines built; permanent mix pads "
 # Mod len(PLAYLIST) wraps the cycle.
 
 for sid, s in streams.items():
+    # next_idx walks the GLOBAL playlist in alternating stride.
+    # A: 0, 2, 4, ... -> PLAYLIST[idx mod len] picks the per-A
+    # clip; B: 1, 3, 5, ... similarly. Both reach all clips
+    # without repeats over a full cycle (verified for len=3).
     s["next_idx"] = 0 if sid == "A" else 1
     s["playlist_added_count"] = 0
     s["live_subgraph_count"] = 0
+    # current_loop_clip: the clip path being looped through this
+    # stream's concat right now. add_next_clip uses this when no
+    # explicit clip_path is passed. Updated only by the advance
+    # path, which sets it to the new clip just before crossfade.
+    s["current_loop_clip"] = PLAYLIST[s["next_idx"] % len(PLAYLIST)]
+    # Bump next_idx past this initial assignment so the FIRST
+    # advance picks the next clip in the per-stream walk.
+    s["next_idx"] += 2
+    # sub_bin_queue: list of (sub_bin, filesrc) tuples in
+    # concat-input order. Front (idx 0) is the currently-active
+    # source feeding concat; rest are pending. add_next_clip
+    # appends; retire_subgraph pops front (the one that just
+    # EOSed). force_eos_active reads queue[0]["filesrc"] and
+    # sends EOS to it.
+    s["sub_bin_queue"] = []
+    # has_been_visible: True if this stream has been the visible
+    # stream at any prior point. A is initialized True (it's
+    # the startup-visible stream). B is False until the first
+    # crossfade-to-B. _start_advancing reads this to decide
+    # whether to advance the playlist on the incoming side:
+    # on the incoming's FIRST crossfade-to-it, KEEP the
+    # current_loop_clip (the stream was initialized with the
+    # correct first clip and just needs a "fresh from frame 0"
+    # restart via force-EOS). On subsequent crossfades-to-this-
+    # stream, advance the playlist to the next assigned clip.
+    # Without this gate, B's first crossfade would advance
+    # B from clip1 to clip0, making the viewer see clip0 twice
+    # in a row (A.clip0 then B.clip0). Reviewer's catch.
+    s["has_been_visible"] = (sid == "A")
 
 
 def add_next_clip(stream_id):
-    """Append the next assigned playlist clip to this stream's
-    concat as a new sub-bin. cutloop pattern verbatim, scoped to
-    the per-stream concat. Called from main thread (initial loop
-    + GLib.idle_add from EOS probe on prior sub-bin)."""
+    """Append THIS STREAM'S current_loop_clip to its concat as a
+    new sub-bin. Per QA dispatch the per-stream playlist no longer
+    advances on every EOS -- the same loop clip is queued until
+    the orchestrator advances current_loop_clip just before the
+    crossfade. cutloop's add+retire pattern verbatim otherwise."""
     s = streams[stream_id]
     concat = s["concat"]
-    clip_idx = s["next_idx"] % len(PLAYLIST)
-    asset = PLAYLIST[clip_idx]
-    s["next_idx"] += 2  # alternating playlist stride
+    asset = s["current_loop_clip"]
     serial = s["playlist_added_count"]
     s["playlist_added_count"] += 1
     asset_name = os.path.basename(os.path.dirname(asset)) or asset
@@ -375,8 +499,14 @@ def add_next_clip(stream_id):
 
     sub.sync_state_with_parent()
     s["live_subgraph_count"] += 1
+    # Append to per-stream queue (concat-input order). Front of
+    # this queue is the currently-active source feeding concat;
+    # rest are pending. force_eos_active reads queue[0]'s filesrc
+    # to advance on demand.
+    s["sub_bin_queue"].append({"sub": sub, "filesrc": filesrc})
     print(f"[xfade] queued {stream_id} bin {serial} = "
-          f"{asset_name} (live_bins={s['live_subgraph_count']} "
+          f"{asset_name} (live={s['live_subgraph_count']} "
+          f"queue_len={len(s['sub_bin_queue'])} "
           f"added={s['playlist_added_count']})",
           file=sys.stderr)
     return False  # one-shot when called via GLib.idle_add
@@ -410,8 +540,23 @@ def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
         pipeline.remove(sub_bin)
         s["concat"].release_request_pad(concat_sink_pad)
         s["live_subgraph_count"] -= 1
-        print(f"[xfade] retire {name} (live_bins_"
-              f"{stream_id}={s['live_subgraph_count']})",
+        # Pop the front of sub_bin_queue (the just-EOSed sub-bin
+        # is always the front per cutloop concat ordering). Guard
+        # for the unlikely case where sub_bin isn't queue[0] --
+        # filter-and-rebuild rather than crash.
+        if (s["sub_bin_queue"]
+                and s["sub_bin_queue"][0]["sub"] is sub_bin):
+            s["sub_bin_queue"].pop(0)
+        else:
+            s["sub_bin_queue"] = [
+                e for e in s["sub_bin_queue"]
+                if e["sub"] is not sub_bin
+            ]
+            print(f"[xfade] retire {name} WARN sub_bin not at "
+                  "queue front; filtered.", file=sys.stderr)
+        print(f"[xfade] retire {name} (live_{stream_id}="
+              f"{s['live_subgraph_count']} "
+              f"queue_len={len(s['sub_bin_queue'])})",
               file=sys.stderr)
     except Exception as exc:
         print(f"[xfade] retire {name} WARN: {exc}",
@@ -446,30 +591,193 @@ for sid in ("A", "B"):
         add_next_clip(sid)
 
 
-# --- Crossfade scheduler --------------------------------------------
+# --- Crossfade orchestrator (clip-gated linger) ---------------------
 #
-# Time-based: visible_stream alpha 1.0 -> 0.0 and hidden_stream
-# 0.0 -> 1.0 over FADE_S linear. v1 simplicity; QA explicit on
-# accepting drift for v1.
+# Per QA glass feedback (qarl): the v1 fixed 4s TARGET_VISIBLE_S
+# fires mid-clip and produces weird drift/cutting. Replace with a
+# clip-gated linger:
+#   - Each visible clip plays FULL LENGTH AND >= LINGER_MIN_S
+#     (short clips LOOP via re-queue of the same clip).
+#   - Crossfade ONLY at a CLEAN boundary: the incoming stream
+#     is FORCE-ADVANCED to its next clip so its first frame is
+#     FROM ITS START at the crossfade moment.
+#
+# Phases:
+#   LINGERING_VISIBLE: visible stream is showing current clip.
+#       Polled every LINGER_CHECK_MS. When elapsed wall-clock
+#       since visible_turn_started >= linger_target, transition
+#       to ADVANCING_INCOMING.
+#   ADVANCING_INCOMING: incoming stream's current_loop_clip is
+#       reassigned to its next playlist entry; 2x force_eos_active
+#       so concat advances pending -> new clip from frame 0. Then
+#       wait ADVANCE_FIRST_FRAME_WAIT_MS for the new clip's
+#       buffers to flow through dec/queue/glupload/mix.
+#   FADING: linear alpha animation over FADE_S. On completion:
+#       swap visible_stream, stamp new visible_turn_started, set
+#       new linger_target, re-enter LINGERING_VISIBLE.
 
 visible_stream = ["A"]
-fade_state = {
-    "in_flight": False,
-    "start_ns": 0,
+linger_state = {
+    "phase": "LINGERING_VISIBLE",
+    "visible_turn_started_ns": 0,
+    "visible_turn_clip": None,
+    "linger_target_s": 0.0,
+    "advance_eos_count": 0,
+    "fade_started_ns": 0,
     "from_stream": None,
     "to_stream": None,
 }
 
 
-def _start_crossfade():
-    if fade_state["in_flight"]:
-        return False
+def _enter_lingering_visible():
+    """Stamp the visible-turn state and arm the LINGER_CHECK
+    poll. Called at startup (initial visible turn) and after
+    each crossfade completes."""
+    vis = visible_stream[0]
+    s = streams[vis]
+    clip = s["current_loop_clip"]
+    dur = CLIP_DURATIONS.get(clip, DUR_FALLBACK_S)
+    target = max(dur, LINGER_MIN_S)
+    linger_state["phase"] = "LINGERING_VISIBLE"
+    linger_state["visible_turn_started_ns"] = (
+        GLib.get_monotonic_time() * 1000
+    )
+    linger_state["visible_turn_clip"] = clip
+    linger_state["linger_target_s"] = target
+    name = os.path.basename(os.path.dirname(clip)) or clip
+    print(f"[xfade] LINGER start: visible={vis} clip={name} "
+          f"dur={dur:.2f}s linger_target={target:.2f}s",
+          file=sys.stderr)
+
+
+def _linger_check():
+    """1Hz-ish poll: if visible turn has elapsed past the linger
+    target, transition to ADVANCING_INCOMING. Returns True to
+    re-arm the timeout."""
+    if linger_state["phase"] != "LINGERING_VISIBLE":
+        return True
+    now_ns = GLib.get_monotonic_time() * 1000
+    elapsed_s = (
+        (now_ns - linger_state["visible_turn_started_ns"]) / 1e9
+    )
+    if elapsed_s >= linger_state["linger_target_s"]:
+        _start_advancing()
+    return True
+
+
+def force_eos_active(stream_id):
+    """Send EOS to the currently-active source bin's filesrc
+    (front of sub_bin_queue). concat then switches to the next
+    queued sub-bin (pending) and the existing EOS-probe path
+    retires the just-EOSed sub-bin + queues another."""
+    s = streams[stream_id]
+    if not s["sub_bin_queue"]:
+        print(f"[xfade] force_eos_active {stream_id} WARN: "
+              "sub_bin_queue empty; skipping",
+              file=sys.stderr)
+        return
+    front = s["sub_bin_queue"][0]
+    filesrc = front.get("filesrc")
+    if filesrc is None:
+        print(f"[xfade] force_eos_active {stream_id} WARN: "
+              "front filesrc is None; skipping",
+              file=sys.stderr)
+        return
+    print(f"[xfade] force_eos_active {stream_id} (queue_len="
+          f"{len(s['sub_bin_queue'])})", file=sys.stderr)
+    filesrc.send_event(Gst.Event.new_eos())
+
+
+def _start_advancing():
+    """LINGERING_VISIBLE -> ADVANCING_INCOMING.
+    On the incoming's FIRST visible turn: KEEP current_loop_clip
+    (the stream was initialized with the correct first clip);
+    force-EOS still fires for "fresh from frame 0" semantics.
+    On subsequent crossfades-to-this-stream: reassign
+    incoming.current_loop_clip to its next playlist entry.
+    Either way, schedule 2x force_eos_active so concat advances
+    past the still-pending OLD loop clip to the freshly-queued
+    new (or same) clip. The 2nd force-EOS is deferred to allow
+    the 1st cycle's retire+add (ADD_AFTER_RETIRE_MS=50ms) to
+    complete."""
     from_id = visible_stream[0]
     to_id = "B" if from_id == "A" else "A"
-    fade_state["in_flight"] = True
-    fade_state["start_ns"] = GLib.get_monotonic_time() * 1000
-    fade_state["from_stream"] = from_id
-    fade_state["to_stream"] = to_id
+    incoming = streams[to_id]
+    if incoming["has_been_visible"]:
+        new_idx = incoming["next_idx"] % len(PLAYLIST)
+        new_clip = PLAYLIST[new_idx]
+        incoming["next_idx"] += 2  # alternating playlist stride
+        old_clip = incoming["current_loop_clip"]
+        incoming["current_loop_clip"] = new_clip
+        new_name = (os.path.basename(os.path.dirname(new_clip))
+                    or new_clip)
+        old_name = (os.path.basename(os.path.dirname(old_clip))
+                    or old_clip)
+        print(f"[xfade] ADVANCE incoming={to_id}: "
+              f"loop_clip {old_name} -> {new_name} "
+              f"(playlist idx={new_idx})", file=sys.stderr)
+    else:
+        # First crossfade-to-this-stream. KEEP current_loop_clip
+        # (it was initialized correctly at startup). Force-EOS
+        # still fires below so the incoming is shown from
+        # frame 0 at the crossfade moment. Per reviewer catch
+        # of v2-pre-bugfix where B would show clip0 (same as
+        # A's prior turn) instead of its initialized clip1.
+        incoming["has_been_visible"] = True
+        keep_name = (os.path.basename(
+            os.path.dirname(incoming["current_loop_clip"])
+        ) or incoming["current_loop_clip"])
+        print(f"[xfade] ADVANCE incoming={to_id}: "
+              f"FIRST visible turn -- KEEP loop_clip={keep_name} "
+              "(force-EOS will reset to frame 0)",
+              file=sys.stderr)
+    linger_state["phase"] = "ADVANCING_INCOMING"
+    linger_state["advance_eos_count"] = 0
+    linger_state["from_stream"] = from_id
+    linger_state["to_stream"] = to_id
+    # 1st force-EOS: concat advances active (old_loop) -> pending
+    # (old_loop again). The retire+add cycle then queues NEW_clip
+    # as the new pending. After ADD_AFTER_RETIRE_MS the new clip
+    # is the pending of the now-active old_loop.
+    force_eos_active(to_id)
+    linger_state["advance_eos_count"] += 1
+    # 2nd force-EOS: scheduled to fire AFTER the first retire+add
+    # cycle so the pending is now new_clip; this EOS switches
+    # concat to it, making new_clip active from frame 0.
+    # ADD_AFTER_RETIRE_MS = 50ms covers the retire idle + the
+    # deferred add timer; pad another 100ms for the new sub-bin
+    # to sync_state_with_parent and become a real pending in
+    # concat's queue.
+    GLib.timeout_add(ADD_AFTER_RETIRE_MS + 100, _second_advance_eos)
+
+
+def _second_advance_eos():
+    """Fire the 2nd force-EOS so the now-pending new clip
+    becomes active. Then schedule the wait-for-first-frame
+    before starting the alpha animation."""
+    if linger_state["phase"] != "ADVANCING_INCOMING":
+        return False
+    to_id = linger_state["to_stream"]
+    force_eos_active(to_id)
+    linger_state["advance_eos_count"] += 1
+    # Wait ADVANCE_FIRST_FRAME_WAIT_MS for the new clip's
+    # buffers to flow through dec -> queue -> glupload -> mix
+    # before starting the crossfade. bcm2835 first-frame
+    # latency drives this; tuned for ~500-1000ms.
+    GLib.timeout_add(ADVANCE_FIRST_FRAME_WAIT_MS, _start_fade)
+    return False
+
+
+def _start_fade():
+    """ADVANCING_INCOMING -> FADING. Stamp the fade start and
+    arm the alpha-animation tick. The incoming stream's
+    current active is now the new_clip from ~frame 0."""
+    if linger_state["phase"] != "ADVANCING_INCOMING":
+        return False
+    linger_state["phase"] = "FADING"
+    linger_state["fade_started_ns"] = GLib.get_monotonic_time() * 1000
+    from_id = linger_state["from_stream"]
+    to_id = linger_state["to_stream"]
     print(f"[xfade] FADE start: {from_id} -> {to_id}",
           file=sys.stderr)
     GLib.timeout_add(FADE_TICK_MS, _fade_tick)
@@ -477,24 +785,23 @@ def _start_crossfade():
 
 
 def _fade_tick():
-    if not fade_state["in_flight"]:
+    """Per-tick linear alpha animation. On completion: swap
+    visible_stream, re-enter LINGERING_VISIBLE."""
+    if linger_state["phase"] != "FADING":
         return False
-    from_id = fade_state["from_stream"]
-    to_id = fade_state["to_stream"]
+    from_id = linger_state["from_stream"]
+    to_id = linger_state["to_stream"]
     from_pad = streams[from_id]["mix_pad"]
     to_pad = streams[to_id]["mix_pad"]
     now_ns = GLib.get_monotonic_time() * 1000
-    elapsed_s = (now_ns - fade_state["start_ns"]) / 1e9
+    elapsed_s = (now_ns - linger_state["fade_started_ns"]) / 1e9
     if elapsed_s >= FADE_S:
         from_pad.set_property("alpha", 0.0)
         to_pad.set_property("alpha", 1.0)
         visible_stream[0] = to_id
-        fade_state["in_flight"] = False
-        print(f"[xfade] FADE complete; visible={to_id}; "
-              f"next fade in {TARGET_VISIBLE_S}s",
+        print(f"[xfade] FADE complete; visible={to_id}",
               file=sys.stderr)
-        GLib.timeout_add(int(TARGET_VISIBLE_S * 1000),
-                         _start_crossfade)
+        _enter_lingering_visible()
         return False
     t = max(0.0, min(1.0, elapsed_s / FADE_S))
     from_pad.set_property("alpha", 1.0 - t)
@@ -560,12 +867,25 @@ def fps_tick():
             cma_state["min_kb"] = cma_kb
     cma_min_str = (str(cma_state["min_kb"])
                    if cma_state["min_kb"] is not None else "?")
+    # Linger orchestrator visibility: which phase + remaining
+    # wall-clock on the current visible turn (if applicable).
+    phase = linger_state["phase"]
+    if phase == "LINGERING_VISIBLE":
+        now_ns = GLib.get_monotonic_time() * 1000
+        elapsed_s = (
+            (now_ns - linger_state["visible_turn_started_ns"]) / 1e9
+        )
+        rem = linger_state["linger_target_s"] - elapsed_s
+        linger_rem_str = f"linger_rem={max(0.0, rem):.1f}s"
+    else:
+        linger_rem_str = "linger_rem=-"
     line = (
         f"[fps] t={uptime} "
         f"screen={screen_state['frames']} "
         f"max_gap_ms={int(screen_state['max_gap_ms'])} "
         f"visible={vis} "
         f"alphaA={a_alpha:.2f} alphaB={b_alpha:.2f} "
+        f"phase={phase} {linger_rem_str} "
         f"live_A={streams['A']['live_subgraph_count']} "
         f"live_B={streams['B']['live_subgraph_count']} "
         f"added_A={streams['A']['playlist_added_count']} "
@@ -648,9 +968,13 @@ if (pipeline.set_state(Gst.State.PLAYING)
         == Gst.StateChangeReturn.FAILURE):
     die("set_state PLAYING failed")
 
-print(f"[xfade] first crossfade in {TARGET_VISIBLE_S}s",
-      file=sys.stderr)
-GLib.timeout_add(int(TARGET_VISIBLE_S * 1000), _start_crossfade)
+# Enter the initial LINGERING_VISIBLE state for the startup
+# visible turn (A is visible by alpha=1.0/0.0). Arm the linger
+# poll at LINGER_CHECK_MS so the gate is evaluated regularly;
+# when elapsed >= linger_target, _start_advancing fires and the
+# crossfade orchestrator takes over.
+_enter_lingering_visible()
+GLib.timeout_add(LINGER_CHECK_MS, _linger_check)
 GLib.timeout_add(1000, fps_tick)
 
 
