@@ -140,6 +140,21 @@ if gl_context is None:
     die("GstGL.GLContext.new() returned None")
 if not gl_context.create(None):
     die("gl_context.create() failed (EGL/GBM unavailable?)")
+# Register the GLContext with the GLDisplay so elements that
+# discover shared contexts via the display (rather than via the
+# bus need-context handshake) ALSO see ours. Belt-and-suspenders:
+# if the bus app_context structure-set is broken on this PyGObject
+# (the 3e7167f bug), some elements may still find the gl_context
+# through the display. The fix in _on_sync_message still
+# FATAL-exits on bus-reply failure so we don't silently rely on
+# this fallback.
+try:
+    gl_display.add_context(gl_context)
+    print("[probe] gl_display.add_context(gl_context) OK",
+          file=sys.stderr)
+except Exception as exc:
+    print(f"[probe] gl_display.add_context() WARN: {exc}",
+          file=sys.stderr)
 print(f"[probe] shared GLDisplay + GLContext created", file=sys.stderr)
 
 
@@ -162,27 +177,109 @@ def _on_sync_message(_bus, msg, _user_data):
     elif ctx_type == "gst.gl.app_context":
         ctx = Gst.Context.new("gst.gl.app_context", True)
         s = ctx.writable_structure()
-        s.set_value("context", gl_context)
-        # Verify the round-trip: in some PyGObject versions
-        # set_value on a generic GstStructure field with a
-        # GObject value can silently no-op, leading to separate
-        # per-pipeline contexts and a black screen with NO error.
-        # Loud-fail at startup so QA's soak immediately spots it.
-        roundtrip = s.get_value("context")
-        if roundtrip is None:
-            print(f"[probe] FATAL app_context set_value("
-                  "'context', gl_context) did not round-trip "
-                  "(GValue marshalling failed); shared-context "
-                  "wiring is BROKEN -- expect black output. "
-                  "Aborting now rather than discovering on glass.",
+        # PyGObject binding bug per QA 3e7167f soak: on gst 1.26
+        # the wrapper returned by writable_structure() may be a
+        # `StructureWrapper` boxed proxy that LACKS set_value
+        # (the Gst.Structure override's __setitem__ +
+        # set_value methods don't apply to the boxed return).
+        # Try multiple known idioms; FATAL-exit if none work.
+        worked = _set_app_context_via_pygobject(s, gl_context,
+                                                src_name)
+        if worked is None:
+            print("[probe] FATAL no PyGObject method available "
+                  "to set 'context' on the app_context Gst."
+                  "Structure -- shared-context wiring is "
+                  "BROKEN. Aborting now rather than running a "
+                  "black soak. Tried: set_value, __setitem__, "
+                  "set. dir() of wrapper:", file=sys.stderr)
+            # Keep dunders visible -- we are specifically debugging
+            # whether the override's __setitem__ is applied to this
+            # wrapper class. Only filter `__` true-dunders that
+            # add no signal (e.g. __class__, __doc__).
+            print(f"[probe]   class={type(s).__name__} "
+                  f"dir={[m for m in dir(s) if not m.startswith('__')]}",
                   file=sys.stderr)
             sys.exit(2)
+        # Verify the round-trip via the CONTEXT's own structure
+        # (not the writable_structure() return), so we catch the
+        # case where writable_structure() returned a transient
+        # proxy and the set mutated a copy detached from `ctx`.
+        # If that happened, ctx.get_structure() would NOT hold the
+        # field even though `s.get_value` does.
+        roundtrip_msg = "unverified"
+        try:
+            ctx_struct = ctx.get_structure()
+            if hasattr(ctx_struct, "get_value"):
+                got = ctx_struct.get_value("context")
+                if got is None:
+                    print(f"[probe] FATAL app_context set via "
+                          f"{worked} did NOT round-trip via "
+                          "ctx.get_structure().get_value("
+                          "'context') -> None. The writable "
+                          "structure was likely a transient "
+                          "proxy detached from ctx; the field "
+                          "did not propagate. Aborting now.",
+                          file=sys.stderr)
+                    sys.exit(2)
+                roundtrip_msg = "ok via ctx.get_structure()"
+            else:
+                roundtrip_msg = (
+                    "ctx.get_structure() lacks get_value; "
+                    f"trusting {worked}"
+                )
+        except Exception as exc:
+            roundtrip_msg = (
+                f"ctx.get_structure().get_value raised "
+                f"{type(exc).__name__}: {exc} "
+                f"(trusting {worked})"
+            )
         if msg.src is not None:
             msg.src.set_context(ctx)
         print(f"[probe] provided app_context to {src_name} "
-              f"(round-trip ok={roundtrip is not None})",
+              f"(set via {worked}, roundtrip {roundtrip_msg})",
               file=sys.stderr)
     return Gst.BusSyncReply.PASS
+
+
+def _set_app_context_via_pygobject(s, gl_context, label):
+    """Try multiple PyGObject idioms to set the 'context' field
+    on `s` (an app_context Gst.Structure / StructureWrapper) to
+    gl_context. Returns the method name that worked, or None if
+    all failed. Per QA 3e7167f traceback diagnosis: the wrapper
+    returned by ctx.writable_structure() on this gst version is
+    a StructureWrapper that lacks the Gst.Structure override's
+    set_value. Walks fallbacks in order of likelihood."""
+    # Method 1: set_value (canonical; broken on 3e7167f).
+    if hasattr(s, "set_value"):
+        try:
+            s.set_value("context", gl_context)
+            return "set_value"
+        except Exception as exc:
+            print(f"[probe] {label} set_value attempt failed: "
+                  f"{type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+    else:
+        print(f"[probe] {label} no set_value attribute on "
+              f"{type(s).__name__}", file=sys.stderr)
+    # Method 2: __setitem__ (Gst.Structure override exposes
+    # this; the boxed wrapper may inherit it).
+    try:
+        s["context"] = gl_context
+        return "__setitem__"
+    except Exception as exc:
+        print(f"[probe] {label} __setitem__ attempt failed: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+    # Method 3: set (variadic in C; sometimes bound as a name
+    # + value method in introspection).
+    if hasattr(s, "set"):
+        try:
+            s.set("context", gl_context)
+            return "set"
+        except Exception as exc:
+            print(f"[probe] {label} set attempt failed: "
+                  f"{type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+    return None
 
 
 # --- Input pipeline: videotestsrc -> appsink --------------------------
@@ -241,7 +338,7 @@ glsink = out_pipeline.get_by_name("sink")
 if appsrc is None or shader is None or glsink is None:
     die("output pipeline: appsrc/shader/sink not found")
 shader.set_property("fragment", FRAG_SRC)
-# DO NOT set vertex to "" -- on gst 1.22 the empty string can
+# DO NOT set vertex to "" -- on gst 1.x the empty string can
 # trigger "no vertex shader" instead of falling back to the
 # built-in fullscreen-quad vertex. Leave the property at its
 # default per glshader docs.
