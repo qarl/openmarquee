@@ -665,17 +665,29 @@ slot_state = {
 }
 
 # Wipe state. Mirrors the prior code's HOLD/WIPE animation timer.
-# post_wipe_frame_emitted is S1: starts True (no wipe pending);
-# _start_wipe_animation sets False; the screen counter probe sees
-# the next kmssink-sink buffer AFTER phase returns to HOLD and
-# sets it True -- only then is the cross-fade considered complete
-# for teardown-gating purposes.
+#
+# post_wipe_frame_emitted is the S1 gate. Lifecycle per cycle:
+#   start of cycle (no wipe pending): True (default below).
+#   _start_wipe_animation: flip to False at wipe begin.
+#   screen counter probe (kmssink.sink): flip back to True on the
+#     first buffer that paints AFTER phase has returned to HOLD --
+#     proves the FINAL composited frame actually emitted past the
+#     sink, not just that the alpha-animation timer expired.
+#
+# CLARIFICATION on the initial value True: it does NOT short-
+# circuit the teardown gate. try_schedule_teardown_for_outgoing
+# first checks `out = slot_state.get("outgoing")`; at startup
+# there is no outgoing yet, so the gate returns False there
+# regardless of this flag's value. The True default only matters
+# for the very first cycle where the flag is read before any wipe
+# has occurred -- consistent with "no wipe-in-flight, no missed
+# post-wipe frame to wait for".
 wipe_state = {
     "phase": "HOLD",                    # "HOLD" or "WIPE"
     "start_ns": 0,                      # monotonic_ns when WIPE began
     "incoming_pad_idx": -1,             # 0 or 1
     "outgoing_pad_idx": -1,
-    "post_wipe_frame_emitted": True,    # S1 gate
+    "post_wipe_frame_emitted": True,    # S1 gate -- see above
 }
 
 
