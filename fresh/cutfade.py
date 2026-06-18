@@ -264,15 +264,23 @@ loop = GLib.MainLoop()
 #     FALSE whenever any repeat pad is involved -- a single
 #     source EOS can NEVER tear down the pipeline. This replaces
 #     every reason the EOS-DROP probe existed.
-#   - Retire sets alpha=0 on the kept pad. With alpha==0,
-#     gst_gl_video_mixer_process_textures skips the pad
-#     entirely, so the frozen-last-frame is never composited:
-#     zero visual cost, zero stall on the next tick.
+#   - Retire SENDS EOS directly to the kept mix sink pad
+#     (send_event is synchronous on the aggregator sink-event
+#     handler, so priv->eos = True by return). This ENGAGES the
+#     repeat-after-eos behavior: without an EOS the property
+#     does nothing -- sub.set_state(NULL) alone does NOT emit
+#     EOS downstream. After the EOS the aggregator freezes the
+#     pad's last buffer and subsequent ticks treat it as
+#     "has a buffer" so the live pad keeps compositing at
+#     24fps. Then retire sets alpha=0 on the kept pad, so
+#     gst_gl_video_mixer_process_textures skips it entirely
+#     (continue on alpha==0): zero visual cost, zero stall.
 #   - On re-prime, FLUSH_START + FLUSH_STOP(reset_time=False) on
-#     the kept mix sink pad clears priv->eos and re-inits ONLY
-#     this aggpad segment (per aggregator_pad_reset_unlocked).
-#     reset_time=False keeps the srcpad/output running-time
-#     stable -- the live pad sees no clock jump.
+#     the kept mix sink pad clears priv->eos (and the sticky
+#     EOS event) and re-inits ONLY this aggpad segment (per
+#     aggregator_pad_reset_unlocked). reset_time=False keeps the
+#     srcpad/output running-time stable -- the live pad sees no
+#     clock jump. Pad goes live again with the new branch.
 #
 # NEVER release_request_pad on a glvideomixer sink pad
 # mid-stream (proven on 00ca09e to stop aggregator output).
@@ -537,15 +545,36 @@ def retire_slot(slot_idx):
                               f"trigger probe WARN: {exc}",
                               file=sys.stderr)
                     break
-        # Per QA design fix: do NOT release_request_pad on the
-        # glvideomixer mix sink pad mid-stream. That disrupts the
-        # aggregator and output stops (screen goes black after the
-        # first retire). The mix sink pads stay allocated for the
-        # pipeline's life; here we just UNLINK the dying sub-bin's
-        # ghost from the persistent mix sink pad. Next clip
-        # re-links to the same pad. Set alpha=0 defensively (the
-        # fade already drove it there but be safe).
+        # Per QA glass diagnosis of 3d36db1: repeat-after-eos only
+        # ENGAGES once the pad RECEIVES an EOS event. Setting the
+        # source sub-bin to NULL does NOT emit EOS downstream to
+        # the kept mix sink pad. Without an EOS the aggregator
+        # still treats the kept pad as a live waiter -> blocks
+        # waiting for a buffer that never arrives -> screen=0
+        # (same stall shape as 559897f).
+        #
+        # Fix: send EOS DIRECTLY into the kept mix sink pad before
+        # we unlink the peer. send_event is synchronous on the
+        # sink pad's event function (gst_aggregator_default_sink
+        # _event), so aggpad->priv->eos = True by the time we
+        # return. With repeat-after-eos=True (set in
+        # _ensure_mix_pad) the aggregator then freezes the last
+        # buffer on this pad so subsequent ticks treat it as
+        # "has a buffer" (composited-then-skipped on alpha==0).
+        # global-eos is forced FALSE whenever any repeat pad is
+        # involved -> the pipeline can NEVER tear down from this
+        # single pad's EOS. The re-prime FLUSH_START + FLUSH_STOP
+        # (already in build_slot for the re-prime branch) clears
+        # this priv->eos when the next clip relinks -> pad goes
+        # live again.
+        #
+        # Order: EOS first (pad object still valid + linked at
+        # that point so the event routes cleanly), then peer
+        # unlink, then alpha=0, then sub NULL + remove.
+        # NEVER release_request_pad on a glvideomixer sink pad
+        # (proven on 00ca09e to stop aggregator output cold).
         if slot["mix_sink"] is not None:
+            slot["mix_sink"].send_event(Gst.Event.new_eos())
             peer = slot["mix_sink"].get_peer()
             if peer is not None:
                 peer.unlink(slot["mix_sink"])
