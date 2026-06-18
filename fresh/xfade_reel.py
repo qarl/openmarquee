@@ -216,25 +216,27 @@ ADVANCE_FIRST_FRAME_WAIT_MS = 800
 # rather than thread synchronization.
 MIN_INTER_ADD_MS = 200
 # Time-based queue between v4l2h264dec and glupload (env-tunable).
-# Acts as a jitter buffer that bridges the concat sub-bin advance
-# gap: when concat switches from EOS'd active to next pending, the
-# dec briefly restarts on the new IDR while the queue continues
-# feeding glupload->mix. Default grown from 500 -> 600ms per QA
-# 1c737bc soak (60-337ms wrap hitches observed at 500ms cap);
-# 600ms gives bcm2835 enough headroom for dec restart + concat-
-# switch latency without exhausting CMA.
-# CMA budget at 600ms: 1280x720 NV12 = 1.4MB/frame x 24fps x 0.6s
-# = ~20MB per stream reservoir; 2 streams = ~40MB. PLUS the EAGER
-# pattern adds ~1 extra sub-bin per stream (live=3 steady vs old
-# live=2), but sub-bin contents are filesrc+qtdemux+h264parse
-# (no CMA-using elements; +1-2MB parsed-NALU buffers per stream).
-# Combined projection: CmaFree_min from 1c737bc's 62MB drops to
-# ~51-53MB. Still above the 50MB brick floor, but TIGHT. Do NOT
-# raise to 800ms without a soak proving the headroom.
+# Bridges the wrap underrun: when concat switches from EOS'd active
+# to next pending, the dec briefly pauses on the new IDR while the
+# queue continues feeding glupload->mix. Grown 600 -> 700ms per QA
+# 8e2215e soak diagnosis (60-264ms wrap hitches at 600ms; +100ms
+# gives margin if queue isn't at full-cap when wrap fires) AND now
+# coupled with leaky=downstream on the queue so the decoder runs
+# unthrottled (queue retains the NEWEST 700ms instead of being
+# back-pressured by the cap; ensures the buffer is actually FULL
+# at wrap moments rather than oscillating below cap due to mixer
+# rate matching).
+# CMA budget at 700ms: 1280x720 NV12 = 1.4MB/frame x 24fps x 0.7s
+# = ~23.5MB per stream; 2 streams = ~47MB. EAGER pattern adds ~1
+# extra sub-bin per stream (live=3 vs old live=2) at ~1-2MB CMA
+# each. Combined projection: CmaFree_min from 8e2215e's 58MB
+# (62MB at fade boundary) drops by ~7MB to ~51-55MB. Still above
+# the 50MB brick floor but TIGHTER than 8e2215e. Do NOT raise
+# to 800ms without a soak proving the headroom.
 # Env-tunable: shrink if CMA tight; grow only if hitches persist
 # AND a soak shows headroom for it.
 RESERVOIR_MS = int(os.environ.get(
-    "OPENMARQUEE_XFADE_RESERVOIR_MS", "600"
+    "OPENMARQUEE_XFADE_RESERVOIR_MS", "700"
 ))
 RESERVOIR_TIME_NS = RESERVOIR_MS * 1_000_000
 # Fallback per-clip duration if query_duration fails at startup.
@@ -362,17 +364,25 @@ def _build_stream(label, mix_sink_idx):
     upl = Gst.ElementFactory.make("glupload", f"upl_{label}")
     if concat is None or dec is None or queue is None or upl is None:
         die(f"[{label}] core static element factory returned None")
-    # Time-based queue (~600ms by default) between dec and
-    # glupload. Original purpose was to bridge a non-flushing
-    # seek's dec-refill gap; the seek-loop is gone but the queue
-    # is still useful as a jitter buffer at concat sub-bin
+    # Time-based queue (~700ms by default) between dec and
+    # glupload. Bridges the wrap underrun at concat sub-bin
     # advances. max-size-bytes and max-size-buffers = 0
-    # (disabled) so only time gates backpressure. No
-    # downstream-leak so the queue blocks upstream (the decoder)
-    # when full instead of dropping frames.
+    # (disabled) so only time gates the cap.
+    # leaky=DOWNSTREAM (mode 2) per QA 8e2215e wrap-hitch
+    # diagnosis: without leak, queue back-pressures the decoder
+    # when full so dec runs at exactly mixer rate; queue level
+    # oscillates BELOW cap (not at it). At wrap, queue may have
+    # only 100-300ms buffered when it needs 600+ms to bridge
+    # the dec restart. With downstream-leak, dec runs at its
+    # full ~60-100fps speed; queue keeps the NEWEST 700ms
+    # cap-worth of frames at all times. Mixer pulls oldest;
+    # queue refills with newer. End-to-end latency rises by
+    # ~700ms (acceptable for a non-interactive reel; was ~600ms
+    # under back-pressure with similar effect anyway).
     queue.set_property("max-size-time", RESERVOIR_TIME_NS)
     queue.set_property("max-size-bytes", 0)
     queue.set_property("max-size-buffers", 0)
+    queue.set_property("leaky", 2)  # 2 = downstream-leaky
     for el in (concat, dec, queue, upl):
         pipeline.add(el)
     if not concat.link(dec):
@@ -1028,20 +1038,64 @@ if sink_pad_for_probe is None:
     die("glimagesink has no sink pad")
 
 
-def _on_sink_buf(_pad, _info):
-    now = time.monotonic_ns()
-    screen_state["frames"] += 1
-    last = screen_state["last_ns"]
-    if last:
-        gap_ms = (now - last) / 1e6
-        if gap_ms > screen_state["max_gap_ms"]:
-            screen_state["max_gap_ms"] = gap_ms
-    screen_state["last_ns"] = now
-    return Gst.PadProbeReturn.OK
+def _make_gap_probe(state):
+    """BUFFER probe that records frames + max inter-buffer gap (ms)
+    per fps_tick interval. State is a {"frames", "last_ns",
+    "max_gap_ms"} dict that fps_tick reads + resets each second."""
+    def _on_buf(_pad, _info):
+        now = time.monotonic_ns()
+        state["frames"] += 1
+        last = state["last_ns"]
+        if last:
+            gap_ms = (now - last) / 1e6
+            if gap_ms > state["max_gap_ms"]:
+                state["max_gap_ms"] = gap_ms
+        state["last_ns"] = now
+        return Gst.PadProbeReturn.OK
+    return _on_buf
 
 
 sink_pad_for_probe.add_probe(
-    Gst.PadProbeType.BUFFER, _on_sink_buf
+    Gst.PadProbeType.BUFFER, _make_gap_probe(screen_state)
+)
+
+
+# Wrap-hitch instrumentation per QA 8e2215e dispatch. Three probes
+# localize where the underrun is:
+#   outq_<sid>.src: per-stream queue output (downstream of dec,
+#       upstream of glupload). If gaps here, dec/queue is starving.
+#   mix.sink_0 / mix.sink_1: per-pad arrival at the aggregator.
+#       If steady but screen has gaps, glupload is the bottleneck.
+#   mix.src: mixer output rate. Should be ~24fps steady.
+# Per-second [probe] lines emitted in fps_tick interpret as:
+#   outq>=mix.sink>=mix.src steady AND screen gaps -> sink-side.
+#   outq has gaps -> dec/queue starvation (the wrap underrun).
+for sid in ("A", "B"):
+    s = streams[sid]
+    s["outq_probe_state"] = {
+        "frames": 0, "last_ns": 0, "max_gap_ms": 0.0
+    }
+    outq_src = s["queue"].get_static_pad("src")
+    if outq_src is None:
+        die(f"outq_{sid} has no src pad")
+    outq_src.add_probe(
+        Gst.PadProbeType.BUFFER,
+        _make_gap_probe(s["outq_probe_state"])
+    )
+    s["mixsink_probe_state"] = {
+        "frames": 0, "last_ns": 0, "max_gap_ms": 0.0
+    }
+    s["mix_pad"].add_probe(
+        Gst.PadProbeType.BUFFER,
+        _make_gap_probe(s["mixsink_probe_state"])
+    )
+
+mix_src_probe_state = {"frames": 0, "last_ns": 0, "max_gap_ms": 0.0}
+mix_src_pad = mix.get_static_pad("src")
+if mix_src_pad is None:
+    die("mix has no src pad")
+mix_src_pad.add_probe(
+    Gst.PadProbeType.BUFFER, _make_gap_probe(mix_src_probe_state)
 )
 
 
@@ -1104,6 +1158,38 @@ def fps_tick():
         f"CmaFree_min_kB={cma_min_str}"
     )
     print(line, file=sys.stderr, flush=True)
+    # Wrap-hitch localization probes (per QA 8e2215e dispatch).
+    # Each line gives frames-this-second + worst inter-buffer gap (ms)
+    # at that probe point. Read pattern at a wrap-hitch second:
+    #   outq_A gap >> mix_src gap -> dec/queue underrun on A.
+    #   outq_A gap == mix_sink_A gap -> glupload passthrough; problem
+    #     is upstream of glupload (queue underrun confirmed).
+    #   outq_A small AND mix_sink_A large -> glupload bottleneck.
+    #   all small AND mix_src small AND screen_gap large -> sink/
+    #     glimagesink anomaly (unlikely).
+    for sid in ("A", "B"):
+        st_outq = streams[sid]["outq_probe_state"]
+        st_mix = streams[sid]["mixsink_probe_state"]
+        print(
+            f"[probe] t={uptime} {sid} "
+            f"outq_frames={st_outq['frames']} "
+            f"outq_max_gap_ms={int(st_outq['max_gap_ms'])} "
+            f"mix_sink_frames={st_mix['frames']} "
+            f"mix_sink_max_gap_ms={int(st_mix['max_gap_ms'])}",
+            file=sys.stderr, flush=True
+        )
+        st_outq["frames"] = 0
+        st_outq["max_gap_ms"] = 0.0
+        st_mix["frames"] = 0
+        st_mix["max_gap_ms"] = 0.0
+    print(
+        f"[probe] t={uptime} mix_src "
+        f"frames={mix_src_probe_state['frames']} "
+        f"max_gap_ms={int(mix_src_probe_state['max_gap_ms'])}",
+        file=sys.stderr, flush=True
+    )
+    mix_src_probe_state["frames"] = 0
+    mix_src_probe_state["max_gap_ms"] = 0.0
     screen_state["frames"] = 0
     screen_state["max_gap_ms"] = 0.0
     return True
