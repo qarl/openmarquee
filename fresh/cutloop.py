@@ -104,7 +104,7 @@ Gst.init(None)
 
 REQUIRED_ELEMENTS = (
     "filesrc", "qtdemux", "h264parse", "v4l2h264dec",
-    "capsfilter", "queue", "concat", "kmssink",
+    "queue", "concat", "kmssink",
 )
 for el in REQUIRED_ELEMENTS:
     if not Gst.ElementFactory.find(el):
@@ -142,37 +142,33 @@ pipeline = Gst.Pipeline.new("cutloop")
 if pipeline is None:
     die("Gst.Pipeline.new returned None")
 
-# Per code's bulletproof spec: keep a format-only capsfilter
-# (NV12, no size) + queue between decoder and kmssink. The
-# capsfilter pins the format to avoid caps-negotiation surprise
-# (zero CPU -- it's just an assertion, not a converter). The
-# queue gives a small buffer between decoder and kmssink. The
-# 7fps throttle QA saw on 4bf2b05 was NOT this path (the
-# videoconvert+capsfilter combo was the suspect because it forced
-# a NV12 detile-to-plain-NV12 copy); it was the retire leak (27
-# leaked sub-bins thrashing the single core). The leak fix is in
-# retire_subgraph; this format+queue is defense in depth against
-# caps-negotiation surprise.
+# Pipeline: concat -> v4l2h264dec -> queue -> kmssink.
+#
+# Drop the format-only capsfilter that was here in cf03a8f -- per
+# QA isolation: a "video/x-raw,format=NV12" capsfilter BEFORE
+# kmssink fails preroll because v4l2h264dec src caps are not fixed
+# until it decodes the first frame via V4L2 SOURCE_CHANGE. The
+# capsfilter blocked the PAUSED transition with no first frame
+# yet to negotiate against. QA tested the naked concat ! decoder
+# ! kmssink directly on glass and it prerolled + ran clean.
+#
+# Keep a plain queue (no caps) between decoder and kmssink for
+# jitter absorption -- QA explicitly OK'd this.
 concat = Gst.ElementFactory.make("concat", "c")
 decoder = Gst.ElementFactory.make("v4l2h264dec", "dec")
-nv12_caps = Gst.ElementFactory.make("capsfilter", "nv12caps")
-nv12_caps.set_property("caps", Gst.Caps.from_string(
-    "video/x-raw,format=NV12"))
 out_queue = Gst.ElementFactory.make("queue", "outq")
 sink = Gst.ElementFactory.make("kmssink", "sink")
 sink.set_property("sync", True)
 
-for el in (concat, decoder, nv12_caps, out_queue, sink):
+for el in (concat, decoder, out_queue, sink):
     if el is None:
         die("factory.make returned None for a core element")
     pipeline.add(el)
 
 if not concat.link(decoder):
     die("link concat -> decoder failed")
-if not decoder.link(nv12_caps):
-    die("link decoder -> nv12_caps failed")
-if not nv12_caps.link(out_queue):
-    die("link nv12_caps -> queue failed")
+if not decoder.link(out_queue):
+    die("link decoder -> queue failed")
 if not out_queue.link(sink):
     die("link queue -> kmssink failed")
 
