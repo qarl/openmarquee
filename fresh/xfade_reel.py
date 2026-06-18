@@ -528,6 +528,10 @@ def add_next_clip(stream_id):
     s["playlist_added_count"] += 1
     asset_name = os.path.basename(os.path.dirname(asset)) or asset
 
+    # Per QA 22382ad [stall] dispatch: time every main-thread op so
+    # the [wrap-timing] log pins which one eats the 100-330ms.
+    _wt_start = time.monotonic_ns()
+
     sub = Gst.Bin.new(f"src_{stream_id}_{serial}")
     filesrc = Gst.ElementFactory.make("filesrc", None)
     filesrc.set_property("location", asset)
@@ -541,6 +545,7 @@ def add_next_clip(stream_id):
             loop.quit()
             return False
         sub.add(el)
+    _wt_create = time.monotonic_ns()
     if not filesrc.link(qtdemux):
         print(f"[xfade] [{stream_id}/{serial}] filesrc -> qtdemux "
               "link failed -- quitting", file=sys.stderr)
@@ -560,10 +565,13 @@ def add_next_clip(stream_id):
     # cutloop leak fix.
     pad_added_id = qtdemux.connect("pad-added", _on_pad_added)
 
+    _wt_link = time.monotonic_ns()
     h264_src = h264parse.get_static_pad("src")
     ghost = Gst.GhostPad.new("src", h264_src)
     sub.add_pad(ghost)
+    _wt_ghost = time.monotonic_ns()
     pipeline.add(sub)
+    _wt_pipeadd = time.monotonic_ns()
 
     concat_sink = concat.request_pad_simple("sink_%u")
     if concat_sink is None:
@@ -571,12 +579,14 @@ def add_next_clip(stream_id):
               "request failed -- quitting", file=sys.stderr)
         loop.quit()
         return False
+    _wt_reqpad = time.monotonic_ns()
     if ghost.link(concat_sink) != Gst.PadLinkReturn.OK:
         print(f"[xfade] [{stream_id}/{serial}] ghost -> "
               "concat.sink link failed -- quitting",
               file=sys.stderr)
         loop.quit()
         return False
+    _wt_padlink = time.monotonic_ns()
 
     # EOS probe on the CONCAT SINK pad (cutloop pattern). When
     # concat sees EOS on this sink pad, it switches to the next
@@ -674,7 +684,16 @@ def add_next_clip(stream_id):
         Gst.PadProbeType.BUFFER, _on_concat_sink_first_buffer
     )
 
-    sub.sync_state_with_parent()
+    _wt_probes = time.monotonic_ns()
+    # Per QA 22382ad dispatch: move sub.sync_state_with_parent
+    # (prime suspect for the 100-330ms main-thread block) off main
+    # to the setup-worker. The worker calls set_state(PLAYING) +
+    # get_state(2s); qtdemux's moov-parse runs on its task thread
+    # which the worker drives. By the time concat needs this sub-
+    # bin's data (at the next wrap), the worker has long since
+    # completed the transition.
+    _setup_q.put((sub, f"src_{stream_id}_{serial}"))
+    _wt_setup_enqueue = time.monotonic_ns()
     s["live_subgraph_count"] += 1
     # Append to per-stream queue (concat-input order). Front of
     # this queue is the currently-active source feeding concat;
@@ -686,17 +705,43 @@ def add_next_clip(stream_id):
           f"queue_len={len(s['sub_bin_queue'])} "
           f"added={s['playlist_added_count']})",
           file=sys.stderr)
+    # Per-op timing summary for QA wrap-stall localization.
+    print(
+        f"[wrap-timing] {stream_id}/{serial} "
+        f"create_ms={(_wt_create - _wt_start)/1e6:.0f} "
+        f"link_ms={(_wt_link - _wt_create)/1e6:.0f} "
+        f"ghost_ms={(_wt_ghost - _wt_link)/1e6:.0f} "
+        f"pipeadd_ms={(_wt_pipeadd - _wt_ghost)/1e6:.0f} "
+        f"reqpad_ms={(_wt_reqpad - _wt_pipeadd)/1e6:.0f} "
+        f"padlink_ms={(_wt_padlink - _wt_reqpad)/1e6:.0f} "
+        f"probes_ms={(_wt_probes - _wt_padlink)/1e6:.0f} "
+        f"setup_enqueue_ms="
+        f"{(_wt_setup_enqueue - _wt_probes)/1e6:.0f} "
+        f"TOTAL_main_ms="
+        f"{(_wt_setup_enqueue - _wt_start)/1e6:.0f}",
+        file=sys.stderr
+    )
     return False  # one-shot when called via GLib.idle_add
 
 
-# Per QA 339213c [stall] data + 4-agent convergence: the wrap-stall
-# is a GLib MAIN-THREAD BLOCK at retire. sub_bin.set_state(NULL)
-# blocks the main thread for ~150-270ms while it joins streaming
-# tasks. Because GST_GL_WINDOW=gbm dispatches glupload + mixer +
-# glimagesink GL ops via the GLib MainContext on the main thread,
-# blocking that thread starves the entire GL output and BOTH
-# streams gap together (matches the measured signature -- t=5
-# screen_gap=245ms / stall=269ms, t=50 266ms / 202ms, etc).
+# Per QA 22382ad [stall] result: off-thread retire did NOT help
+# ([stall] 109 vs 104 overruns; main thread STILL blocks 136-333ms
+# at every wrap). set_state(NULL) was NOT the blocker. Suspect
+# shifts to add_next_clip's sub.sync_state_with_parent() which
+# transitions the new sub-bin to PLAYING and includes a
+# READY->PAUSED transition where qtdemux opens the file and parses
+# moov synchronously on the main thread.
+#
+# This commit:
+#   (1) INSTRUMENTS every op in add_next_clip with per-op time
+#       deltas -> [wrap-timing] log lines. The data will pin
+#       which op eats the 100-330ms.
+#   (2) MOVES sub.sync_state_with_parent() off the main thread to
+#       a new setup-worker (analogous to retire-worker).
+#
+# The original 339213c diagnosis (set_state(NULL) suspected but
+# wrong) is left below for history. Keep the retire-worker (now
+# correctly hygienic + not harmful).
 # cutloop is immune because kmssink presents from streaming
 # thread / KMS pageflip, not GLib main.
 #
@@ -752,6 +797,56 @@ _retire_thread = threading.Thread(
     target=_retire_worker, name="xfade-retire", daemon=True
 )
 _retire_thread.start()
+
+
+# Setup-worker per QA 22382ad [stall]-still-fires diagnosis. Moves
+# sub.set_state(PLAYING) -- the main-thread-blocking call inside
+# add_next_clip -- to a dedicated worker thread. Pipeline.add and
+# pad linking still happen on main (they are cheap; the suspect is
+# the state-change cascade that triggers qtdemux's moov parse).
+_setup_q = _queue_module.Queue()
+
+
+def _setup_worker():
+    """Single serialized worker for sub-bin state-change-to-PLAYING.
+    Frees the GLib main thread from the qtdemux moov-parse +
+    state-change cascade that was blocking it 100-330ms at every
+    wrap. Outer try/except per sacred-review MOD-1."""
+    while True:
+        try:
+            item = _setup_q.get()
+            if item is None:
+                break
+            sub_bin, label = item
+            try:
+                t0 = time.monotonic_ns()
+                ret = sub_bin.set_state(Gst.State.PLAYING)
+                t1 = time.monotonic_ns()
+                # Bound the worker's get_state wait so a stuck
+                # transition does not block subsequent setups.
+                state_ret, _cur, _pen = sub_bin.get_state(
+                    2 * Gst.SECOND
+                )
+                t2 = time.monotonic_ns()
+                print(f"[setup-worker] {label} "
+                      f"set_state_ms={(t1-t0)/1e6:.0f} "
+                      f"get_state_ms={(t2-t1)/1e6:.0f} "
+                      f"ret={ret.value_nick} "
+                      f"state_ret={state_ret.value_nick}",
+                      file=sys.stderr)
+            except Exception as exc:
+                print(f"[setup-worker] {label} WARN: {exc}",
+                      file=sys.stderr)
+            _setup_q.task_done()
+        except Exception as exc:
+            print(f"[setup-worker] LOOP WARN: {exc} (continuing)",
+                  file=sys.stderr)
+
+
+_setup_thread = threading.Thread(
+    target=_setup_worker, name="xfade-setup", daemon=True
+)
+_setup_thread.start()
 
 
 def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
@@ -968,6 +1063,17 @@ def _force_eos_with_pre_fortify(stream_id):
               "add_next_clip to keep concat fed past force-EOS",
               file=sys.stderr)
         add_next_clip(stream_id)
+    # Per setup-worker review: pre-fortify must guarantee data-
+    # ready, not just queue-len >= 2. add_next_clip now enqueues
+    # state-change to PLAYING on the setup worker; the new bin is
+    # in NULL/READY until the worker transitions it. Drain the
+    # setup queue here so force-EOS can switch concat to a
+    # PLAYING pending pad with imminent buffers, not a not-yet-
+    # transitioned pad. Fires at most twice per crossfade
+    # (1st + 2nd force-EOS) and blocks main only as long as the
+    # worker would have blocked main under the pre-22382ad code.
+    # Preserves the 36ed49b drain-to-zero crash protection.
+    _setup_q.join()
     force_eos_active(stream_id)
 
 
