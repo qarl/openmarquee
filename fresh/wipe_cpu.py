@@ -536,25 +536,39 @@ class ClipBin:
         # firing (qtdemux problem upstream).
         pad_name = pad.get_name()
         caps = pad.get_current_caps() or pad.query_caps(None)
-        struct_name = ""
-        if caps and caps.get_size() > 0:
-            struct_name = caps.get_structure(0).get_name()
+        # REAL-ROOT FIX (per QA dispatch with run-scoped log proof):
+        # caps.get_structure(0).get_name() raises
+        #   AttributeError: 'StructureWrapper' object has no
+        #   attribute 'get_name'
+        # in this PyGObject/gst-python build. The exception silently
+        # aborted the handler -> trigger_probe_installed never set
+        # -> probe never attached -> preload/wipe never fired ->
+        # gap-killer hard-cut every clip. Binding-portable fix:
+        # use caps.to_string() (returns e.g.
+        # "video/x-h264, parsed=(boolean)true, ..."), then take the
+        # first media-type token before any comma/semicolon. Works
+        # on every PyGObject version because to_string returns a
+        # plain str.
+        caps_str = caps.to_string() if caps else ""
+        media_type = (
+            caps_str.split(",", 1)[0].split(";", 1)[0].strip()
+        )
         print(f"[{self.label}] pad-added pad={pad_name} "
-              f"caps={struct_name or 'NONE'}")
+              f"caps={media_type or 'NONE'}", file=sys.stderr)
         if self.trigger_probe_installed:
             return
-        # G4 (per QA dispatch): robust caps filter. R2 was caps-
-        # structure-name; QA flags that caps can be NULL at pad-
-        # added on some qtdemux paths. Backup: pad name starts with
-        # "video" (qtdemux convention "video_0"). Either signal is
-        # sufficient to identify the video pad.
+        # G4 (per QA dispatch): robust caps filter. caps may be NULL
+        # at pad-added on some qtdemux paths; pad name (qtdemux
+        # convention "video_0") is the binding-independent backup.
+        # Either signal is sufficient to identify the video pad.
         is_video = (
-            struct_name.startswith("video/")
+            media_type.startswith("video/")
             or pad_name.startswith("video")
         )
         if not is_video:
             print(f"[{self.label}] pad-added skip non-video "
-                  f"(pad={pad_name} caps={struct_name or 'NONE'})")
+                  f"(pad={pad_name} caps={media_type or 'NONE'})",
+                  file=sys.stderr)
             return
         self.trigger_probe_installed = True
         # R3: query duration on the DEMUXER, not the pipeline.
@@ -566,11 +580,11 @@ class ClipBin:
             self.dur_ns = dur
             print(f"[{self.label}] duration = {dur} ns "
                   f"({dur / 1e9:.3f}s) [pad-added, caps="
-                  f"{struct_name}]")
+                  f"{media_type}]", file=sys.stderr)
         else:
             print(f"[{self.label}] duration query on demuxer failed "
                   f"in pad-added; keeping fallback {self.dur_ns} ns "
-                  f"({self.dur_ns / 1e9:.3f}s)")
+                  f"({self.dur_ns / 1e9:.3f}s)", file=sys.stderr)
         # Cosmetic note (per QA secondary): the trigger probe sits
         # on the qtdemux src (pre-decode); G2 (first_buffer on the
         # intervideosink sink) is post-decode. They lag by the
@@ -609,20 +623,23 @@ class ClipBin:
                 self.preload_fired = True
                 print(f"[{self.label}] preload trigger at "
                       f"pts={pts / 1e9:.2f}s "
-                      f"(>={preload_at / 1e9:.2f}s)")
+                      f"(>={preload_at / 1e9:.2f}s)",
+                      file=sys.stderr)
                 GLib.idle_add(on_preload_trigger, self)
             if not self.wipe_fired and pts >= wipe_at:
                 self.wipe_fired = True
                 print(f"[{self.label}] wipe trigger at "
                       f"pts={pts / 1e9:.2f}s "
-                      f"(>={wipe_at / 1e9:.2f}s)")
+                      f"(>={wipe_at / 1e9:.2f}s)",
+                      file=sys.stderr)
                 GLib.idle_add(on_wipe_trigger, self)
             return Gst.PadProbeReturn.OK
 
         pad.add_probe(Gst.PadProbeType.BUFFER, _on_buffer)
         print(f"[{self.label}] trigger probe attached on "
               f"{pad.get_name()} (preload>={preload_at / 1e9:.2f}s, "
-              f"wipe>={wipe_at / 1e9:.2f}s)")
+              f"wipe>={wipe_at / 1e9:.2f}s)",
+              file=sys.stderr)
 
     def install_trigger_probe(self):
         """DEPRECATED no-op kept for compat. Probe installation
@@ -1165,8 +1182,13 @@ def preroll_to_paused(p, label):
 
 # --- Run ---------------------------------------------------------------
 
+# RUN-START marker per QA dispatch: a unique single-token line at
+# startup so a run-scoped log capture (/tmp/wipe_run.log) is
+# unambiguously bracketed and grep-able from journal carry-over.
+print("==RUN-START== wipe_cpu", file=sys.stderr)
 print(f"[wipe_cpu] starting; WIPE={WIPE_S}s "
-      f"display={DW}x{DH}@{FPS} fresh-bin-per-clip; ctrl-c to stop")
+      f"display={DW}x{DH}@{FPS} fresh-bin-per-clip; ctrl-c to stop",
+      file=sys.stderr)
 print(f"[wipe_cpu] leak-fallback videoconvert before intervideosink: "
       f"{'ON' if INSERT_TEARDOWN_VIDEOCONVERT else 'off'} "
       "(env OPENMARQUEE_VIDEOCONVERT_BEFORE_INTERVIDEOSINK)")
