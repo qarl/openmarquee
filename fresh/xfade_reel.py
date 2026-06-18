@@ -125,7 +125,9 @@ cutloop.
 
 import gc
 import os
+import queue as _queue_module
 import sys
+import threading
 import time
 import weakref
 
@@ -687,17 +689,97 @@ def add_next_clip(stream_id):
     return False  # one-shot when called via GLib.idle_add
 
 
+# Per QA 339213c [stall] data + 4-agent convergence: the wrap-stall
+# is a GLib MAIN-THREAD BLOCK at retire. sub_bin.set_state(NULL)
+# blocks the main thread for ~150-270ms while it joins streaming
+# tasks. Because GST_GL_WINDOW=gbm dispatches glupload + mixer +
+# glimagesink GL ops via the GLib MainContext on the main thread,
+# blocking that thread starves the entire GL output and BOTH
+# streams gap together (matches the measured signature -- t=5
+# screen_gap=245ms / stall=269ms, t=50 266ms / 202ms, etc).
+# cutloop is immune because kmssink presents from streaming
+# thread / KMS pageflip, not GLib main.
+#
+# FIX: move the BLOCKING TRIO -- set_state(NULL) + pipeline.remove
+# + concat.release_request_pad -- to a single dedicated worker
+# thread. Serialize via a queue.Queue so A+B retires within ~50ms
+# don't stack (each is sequential). Keep the cheap main-thread
+# parts (disconnect handlers, remove probes, filter sub_bin_queue)
+# on the main thread.
+_retire_q = _queue_module.Queue()
+
+
+def _retire_worker():
+    """Single serialized worker for the blocking part of retire.
+    GStreamer's set_state, bin.remove, and release_request_pad
+    are thread-safe (internally mutex-protected). The worker
+    drains _retire_q sequentially so A+B retires don't stack
+    concurrent NULL transitions in the kernel.
+
+    Outer try/except wraps the whole loop body per sacred-review
+    MOD-1: if get(), unpack, or idle_add raises, log+continue so
+    the worker survives. If the worker silently died, retires
+    would accumulate in _retire_q forever (live_subgraph_count
+    never decrements, CMA exhausts)."""
+    while True:
+        try:
+            item = _retire_q.get()
+            if item is None:
+                break
+            sub_bin, concat_sink_pad, concat, on_done, label = item
+            try:
+                # Strict order per QA dispatch: NULL -> remove ->
+                # release.
+                sub_bin.set_state(Gst.State.NULL)
+                # Block until NULL is fully reached; bounded by 2s.
+                sub_bin.get_state(2 * Gst.SECOND)
+                pipeline.remove(sub_bin)
+                concat.release_request_pad(concat_sink_pad)
+            except Exception as exc:
+                print(f"[xfade] retire-worker {label} WARN: "
+                      f"{exc}", file=sys.stderr)
+            # Notify main thread via idle_add for live-count
+            # decrement + leak check.
+            if on_done is not None:
+                GLib.idle_add(on_done)
+            _retire_q.task_done()
+        except Exception as exc:
+            print(f"[xfade] retire-worker LOOP WARN: {exc} "
+                  "(continuing)", file=sys.stderr)
+
+
+_retire_thread = threading.Thread(
+    target=_retire_worker, name="xfade-retire", daemon=True
+)
+_retire_thread.start()
+
+
 def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
                     qtdemux_elem, pad_added_id, eos_probe_id):
-    """cutloop's proven leak-safe retire: disconnect handlers +
-    remove probes BEFORE set_state(NULL) so the closures release
-    the sub-bin's elements; then NULL + pipeline.remove +
-    concat.release_request_pad. Scoped per stream."""
+    """Split per QA 339213c [stall]-data fix:
+    MAIN THREAD (this fn):
+      - Disconnect qtdemux pad-added handler (closure-leak).
+      - Remove concat-sink EOS probe (closure-leak).
+      - Filter sub_bin_queue defensively.
+    WORKER THREAD (_retire_worker, via _retire_q):
+      - sub_bin.set_state(Gst.State.NULL) (the blocker, ~150-270ms).
+      - pipeline.remove(sub_bin).
+      - concat.release_request_pad(concat_sink_pad).
+    POST (via GLib.idle_add from worker):
+      - Decrement live_subgraph_count.
+      - Run weakref leak-check.
+      - Emit retire-complete log line.
+
+    Holding sub_bin/concat_sink_pad refs in the queue item keeps
+    them alive across the worker's set_state(NULL) (no GC mid-
+    teardown). cutloop's leak-safe disconnect-before-NULL
+    discipline is preserved: handlers/probes are released on the
+    main thread BEFORE the worker touches the elements."""
     s = streams[stream_id]
     name = sub_bin.get_name() if sub_bin else "?"
     weak = weakref.ref(sub_bin)
     try:
-        # (1) Disconnect closures FIRST.
+        # (1) Main-thread-safe closures release.
         if pad_added_id:
             try:
                 qtdemux_elem.disconnect(pad_added_id)
@@ -710,16 +792,8 @@ def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
             except Exception as exc:
                 print(f"[xfade] retire {name} probe remove "
                       f"WARN: {exc}", file=sys.stderr)
-        # (2-4) Tear down + release.
-        sub_bin.set_state(Gst.State.NULL)
-        pipeline.remove(sub_bin)
-        s["concat"].release_request_pad(concat_sink_pad)
-        s["live_subgraph_count"] -= 1
-        # NOTE: sub_bin_queue pop is now done in the EOS probe
-        # (so the queue reflects concat's active correctly even
-        # when retire is deferred). retire_subgraph defensively
-        # filters here in case the sub_bin somehow remained in
-        # the queue (shouldn't happen post-EOS).
+        # (2) Filter sub_bin_queue defensively (the EOS probe
+        # has already popped on normal paths).
         before_len = len(s["sub_bin_queue"])
         s["sub_bin_queue"] = [
             e for e in s["sub_bin_queue"]
@@ -728,31 +802,40 @@ def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
         if len(s["sub_bin_queue"]) != before_len:
             print(f"[xfade] retire {name} WARN sub_bin was "
                   "still in queue; filtered.", file=sys.stderr)
-        print(f"[xfade] retire {name} (live_{stream_id}="
-              f"{s['live_subgraph_count']} "
-              f"queue_len={len(s['sub_bin_queue'])})",
-              file=sys.stderr)
+
+        # (3) Enqueue the BLOCKING TRIO for the worker thread.
+        def _on_retire_complete():
+            s["live_subgraph_count"] -= 1
+            print(f"[xfade] retire {name} complete "
+                  f"(live_{stream_id}="
+                  f"{s['live_subgraph_count']} "
+                  f"queue_len={len(s['sub_bin_queue'])})",
+                  file=sys.stderr)
+            # Leak-check now (closures + queue ref dropped;
+            # weakref should resolve to None).
+            def _check_leak():
+                gc.collect()
+                if weak() is not None:
+                    print(f"[xfade] [retire] LEAK ref still "
+                          f"held for {name}", file=sys.stderr)
+                return False
+            GLib.idle_add(_check_leak)
+            return False  # one-shot idle_add
+        _retire_q.put(
+            (sub_bin, concat_sink_pad, s["concat"],
+             _on_retire_complete, name)
+        )
     except Exception as exc:
         print(f"[xfade] retire {name} WARN: {exc}",
               file=sys.stderr)
-    del sub_bin, concat_sink_pad, qtdemux_elem
-
-    def _check_leak():
-        gc.collect()
-        if weak() is not None:
-            print(f"[xfade] [retire] LEAK ref still held for "
-                  f"{name}", file=sys.stderr)
-        return False
-    GLib.idle_add(_check_leak)
 
     # NOTE: schedule_add (queue the next sub-bin) is independent
     # of retire. Under the EAGER pattern (post-1c737bc) it fires
     # from the FIRST-BUFFER probe on concat_sink, not from the
-    # EOS probe. retire_subgraph still runs unconditionally on
-    # GLib.idle_add from the EOS probe -- matches cutloop's
-    # shipped retire-on-idle. By the time idle fires, concat has
-    # switched to the next pending sub-bin so the retiring sub-
-    # bin is no longer feeding the mix.
+    # EOS probe. The retire-worker handles set_state(NULL) +
+    # remove + release_request_pad off-main-thread; the main
+    # thread returns immediately, freeing the GLib main loop to
+    # service the GL output without the 150-270ms stall.
     return False  # one-shot
 
 
