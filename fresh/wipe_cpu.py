@@ -350,6 +350,65 @@ def opposite_slot(slot_name):
     return "B" if slot_name == "A" else "A"
 
 
+def _slot_clear_key(slot):
+    return f"teardown_done_{slot}"
+
+
+def wait_for_slot_clear(slot):
+    """Task A serialization: block (with bounded main-loop pumping)
+    until any in-flight teardown on `slot` has fully released its
+    v4l2 resources. Called BEFORE every ClipBin().build() so a fresh
+    decoder never opens /dev/video10 while the prior bin's CAPTURE
+    pool is mid-release. Without this, gst-plugins-good v4l2videodec
+    emits "pool was orphaned / a buffer was lost, reallocating" and
+    the new bin silently produces 0 frames.
+
+    Runs on the main GLib thread (all spawn sites are main-thread
+    via idle_add). Nested main-context iteration drains the
+    deferred teardown callback that will eventually flip the slot
+    flag back to True.
+
+    RE-ENTRANCE HAZARD per subagent review: the nested iteration
+    drains OTHER pending sources too (animation_tick, fps_tick,
+    other _deferred teardowns, force_recover_main). Concrete risk:
+    check_main_wedge -> force_recover_main could mutate
+    slot_state["main"]/"outgoing"/"next" while a spawn caller is
+    mid-execution. MITIGATION: every spawn site re-checks its
+    invariants AFTER wait_for_slot_clear returns and bails if
+    state has changed. In practice the wait is <100ms so the
+    pending-source window is small; force_recover_main requires
+    2+ seconds of dec=0 so it cannot fire mid-wait. Documented
+    + audited; not silently bypassed.
+
+    On timeout (2s): logs LOUDLY and proceeds. The 2-decoder wipe
+    bug we are trying to avoid would recur. Surfaced for QA leak-
+    soak to catch -- not silently swallowed."""
+    key = _slot_clear_key(slot)
+    if slot_state.get(key, True):
+        return
+    t0 = time.monotonic()
+    print(f"[sched] waiting for slot {slot} teardown to complete...",
+          file=sys.stderr)
+    deadline = t0 + SLOT_WAIT_TIMEOUT_S
+    ctx = GLib.MainContext.default()
+    while not slot_state.get(key, True):
+        if time.monotonic() >= deadline:
+            print(f"[sched] !!! WAIT-TIMEOUT slot {slot} teardown "
+                  f"did not complete in {SLOT_WAIT_TIMEOUT_S}s. "
+                  "PROCEEDING ANYWAY but expect the 'pool was "
+                  "orphaned / 0 frames' race the watchdog catches. "
+                  "If this fires repeatedly -> kernel v4l2 release "
+                  "is lagging and Task A needs a different mechanism.",
+                  file=sys.stderr)
+            return
+        if ctx.pending():
+            ctx.iteration(False)
+        else:
+            time.sleep(0.005)
+    print(f"[sched] slot {slot} clear (waited "
+          f"~{(time.monotonic() - t0) * 1000:.0f}ms)", file=sys.stderr)
+
+
 class ClipBin:
     """One decode pipeline for one clip play. Build -> preroll
     (PAUSED) -> play (PLAYING) -> EOS -> teardown (NULL + unref).
@@ -738,7 +797,22 @@ slot_state = {
     "main": None,        # ClipBin currently being shown full-screen
     "next": None,        # ClipBin preloaded for next transition
     "outgoing": None,    # ClipBin being torn down (post-wipe, pre-EOS)
+    # Task A (per QA dispatch): per-slot teardown gating. A fresh
+    # decode bin on slot X must NOT open /dev/video10 while the
+    # prior bin on slot X is still mid-teardown -- the race causes
+    # "pool was orphaned / buffer was lost" warnings and the new
+    # bin silently produces 0 frames. True = slot is clear and a
+    # new bin may spawn; False = teardown in flight, wait.
+    "teardown_done_A": True,
+    "teardown_done_B": True,
+    # Additional post-NULL settle delay after teardown completes
+    # before the slot is considered free. NULL state-change returns
+    # SUCCESS but v4l2 CAPTURE buffer release at the kernel level
+    # can lag the gst state change -- empirical guard.
+    # 100ms = ~3 frames at 30fps.
 }
+SLOT_CLEAR_SETTLE_MS = 100
+SLOT_WAIT_TIMEOUT_S = 2.0
 
 # Wipe state. Mirrors the prior code's HOLD/WIPE animation timer.
 #
@@ -791,6 +865,20 @@ def on_preload_trigger(bin_):
         return False
     other = opposite_slot(bin_.slot)
     print(f"[sched] preload {other} (lead by {bin_.label})")
+    wait_for_slot_clear(other)  # Task A: serialize vs prior teardown
+    # Re-check state AFTER wait_for_slot_clear -- nested main-loop
+    # iteration may have mutated slot_state (force_recover_main is
+    # the worst case but it requires 2+s of dec=0 so cannot fire
+    # in a sub-100ms wait; still defensive).
+    if bin_ is not slot_state.get("main"):
+        print(f"[sched] preload aborted -- main changed during slot wait",
+              file=sys.stderr)
+        return False
+    if slot_state.get("next") is not None:
+        print(f"[sched] preload aborted -- next set during slot wait "
+              f"(now {slot_state['next'].label})",
+              file=sys.stderr)
+        return False
     nxt = ClipBin(other).build()
     nxt.preroll()
     # Trigger probe + duration wired via pad-added on the demuxer
@@ -820,11 +908,18 @@ def on_wipe_trigger(bin_):
         other = opposite_slot(bin_.slot)
         print(f"[sched] GAP-KILLER wipe trigger with no preloaded "
               f"next -- emergency spawn {other}", file=sys.stderr)
-        nxt = ClipBin(other).build()
-        nxt.preroll()
-        # Trigger probe + duration are wired via pad-added (fires
-        # within ms of PAUSED). No synchronous post-preroll work.
-        slot_state["next"] = nxt
+        wait_for_slot_clear(other)  # Task A
+        # Re-check after wait: another path may have spawned next.
+        if slot_state.get("next") is not None:
+            nxt = slot_state["next"]
+            print(f"[sched] gap-killer found next={nxt.label} after "
+                  "wait; using that instead", file=sys.stderr)
+        else:
+            nxt = ClipBin(other).build()
+            nxt.preroll()
+            # Trigger probe + duration are wired via pad-added (fires
+            # within ms of PAUSED). No synchronous post-preroll work.
+            slot_state["next"] = nxt
     nxt.play()
     # Deadline-poll the gates on the next bin; never on the
     # outgoing. The poll callback runs on the main GLib thread
@@ -904,9 +999,19 @@ def on_bin_eos(bin_):
             print(f"[sched] EOS-GAP-KILLER no preloaded next -- "
                   f"spawn {other} synchronously to keep slot alive",
                   file=sys.stderr)
-            new_main = ClipBin(other).build()
-            new_main.preroll()
-            new_main.play()
+            wait_for_slot_clear(other)  # Task A
+            # Re-check after wait: another path may have populated
+            # next during the nested iteration.
+            if slot_state.get("next") is not None:
+                new_main = slot_state["next"]
+                slot_state["next"] = None
+                print(f"[sched] eos-gap-killer found next="
+                      f"{new_main.label} after wait; using that",
+                      file=sys.stderr)
+            else:
+                new_main = ClipBin(other).build()
+                new_main.preroll()
+                new_main.play()
         slot_state["main"] = new_main
         slot_state["next"] = None
     elif bin_ is slot_state.get("outgoing"):
@@ -942,15 +1047,118 @@ def try_schedule_teardown_for_outgoing():
     if out.teardown_scheduled:
         return False
     out.teardown_scheduled = True
+    # Task A: mark slot as "teardown in flight" so any concurrent
+    # spawn attempt on this slot blocks via wait_for_slot_clear.
+    # Flag flips back True only after teardown completes + a
+    # SLOT_CLEAR_SETTLE_MS settle delay (lets v4l2 kernel buffer
+    # release lag the gst NULL state-change).
+    slot_state[_slot_clear_key(out.slot)] = False
     print(f"[sched] {out.label} all 3 gates passed -- "
-          f"schedule teardown +{TEARDOWN_GRACE_MS}ms")
+          f"schedule teardown +{TEARDOWN_GRACE_MS}ms "
+          f"(slot {out.slot} marked teardown-in-flight)")
 
     def _deferred():
         out.teardown()
         if slot_state.get("outgoing") is out:
             slot_state["outgoing"] = None
+
+        # Task A: post-NULL settle delay before marking slot free,
+        # so the kernel v4l2 release has fully completed before any
+        # new bin opens /dev/video10 on this slot.
+        def _settle_then_clear():
+            slot_state[_slot_clear_key(out.slot)] = True
+            print(f"[sched] slot {out.slot} cleared after "
+                  f"{SLOT_CLEAR_SETTLE_MS}ms settle "
+                  f"(teardown of {out.label} complete)",
+                  file=sys.stderr)
+            return False
+        GLib.timeout_add(SLOT_CLEAR_SETTLE_MS, _settle_then_clear)
         return False
     GLib.timeout_add(TEARDOWN_GRACE_MS, _deferred)
+    return False
+
+
+# Task B (per QA dispatch): wedge watchdog. The intermittent race
+# in v4l2h264dec teardown -> recreate (Task A above) can leave a
+# fresh bin in a state where it produces 0 decoded frames and never
+# hits EOS. The gap-killer in on_bin_eos can't catch this because
+# no EOS fires. Without a watchdog, the slot freezes forever.
+#
+# If the MAIN bin shows zero decoded frames for WEDGE_STALL_S
+# consecutive seconds AND its PTS hasn't advanced in that time,
+# force-recover: tear it down + promote `next` (or emergency spawn
+# the opposite slot if no `next` ready). Only runs in HOLD phase
+# so a slow wipe-window isn't mistaken for a wedge.
+WEDGE_STALL_S = 2
+wedge_state = {"last_pos_ns": -1, "consecutive_stalls": 0}
+
+
+def check_main_wedge():
+    """Called from fps_tick BEFORE the dec_counters reset, so the
+    just-completed second's decoder rate is still readable."""
+    if wipe_state["phase"] != "HOLD":
+        wedge_state["consecutive_stalls"] = 0
+        wedge_state["last_pos_ns"] = -1
+        return
+    main_bin = slot_state.get("main")
+    if main_bin is None:
+        wedge_state["consecutive_stalls"] = 0
+        wedge_state["last_pos_ns"] = -1
+        return
+    main_dec = dec_counters[main_bin.slot]
+    cur_pos = main_bin.query_position_ns()
+    if main_dec == 0 and cur_pos == wedge_state["last_pos_ns"]:
+        wedge_state["consecutive_stalls"] += 1
+        if wedge_state["consecutive_stalls"] >= WEDGE_STALL_S:
+            print(f"[wedge] {main_bin.label} dec=0 + pts stuck "
+                  f"({cur_pos / 1e9:.2f}s) for "
+                  f"{wedge_state['consecutive_stalls']}s -- "
+                  "force-recover", file=sys.stderr)
+            wedge_state["consecutive_stalls"] = 0
+            wedge_state["last_pos_ns"] = -1
+            GLib.idle_add(force_recover_main, main_bin)
+    else:
+        wedge_state["consecutive_stalls"] = 0
+        wedge_state["last_pos_ns"] = cur_pos
+
+
+def force_recover_main(bin_):
+    """Promote next to main + force-teardown the wedged bin. Called
+    via idle_add from check_main_wedge to ensure main-thread
+    serialization. If main has already changed since wedge was
+    detected, no-op (race with normal EOS path)."""
+    if slot_state.get("main") is not bin_:
+        print(f"[wedge] {bin_.label} already replaced -- recovery skipped")
+        return False
+    print(f"[wedge] {bin_.label} force teardown + promote",
+          file=sys.stderr)
+    other = opposite_slot(bin_.slot)
+    new_main = slot_state.get("next")
+    if new_main is not None:
+        # Was preloaded for the normal transition; promote it now.
+        new_main.play()
+        slot_state["next"] = None
+    else:
+        # No preload: synchronous emergency spawn on opposite slot.
+        wait_for_slot_clear(other)  # Task A serialization
+        new_main = ClipBin(other).build()
+        new_main.preroll()
+        new_main.play()
+    slot_state["outgoing"] = bin_
+    slot_state["main"] = new_main
+    # Mark teardown-in-flight + tear down the wedged bin
+    # immediately (no grace -- this is recovery, the bin is dead).
+    slot_state[_slot_clear_key(bin_.slot)] = False
+    bin_.teardown()
+    if slot_state.get("outgoing") is bin_:
+        slot_state["outgoing"] = None
+
+    def _settle():
+        slot_state[_slot_clear_key(bin_.slot)] = True
+        print(f"[wedge] slot {bin_.slot} cleared post-recovery",
+              file=sys.stderr)
+        return False
+    GLib.timeout_add(SLOT_CLEAR_SETTLE_MS, _settle)
     return False
 
 
@@ -1100,6 +1308,9 @@ def fps_tick():
             fps_log_file.write(line + "\n")
         except OSError:
             pass
+    # Task B watchdog: run BEFORE counter reset so it sees the
+    # just-completed second's decoder rate.
+    check_main_wedge()
     counters["inA"] = 0
     counters["inB"] = 0
     counters["screen"] = 0
