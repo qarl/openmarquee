@@ -61,7 +61,7 @@ LOOP MECHANISM (per QA scheduler-redesign spec 2026-06-18):
                         should_start_priming() each cycle:
                         (a) MIN_DWELL_S wall-clock gate
                         (cascade killer), (b) adaptive lead
-                        min(PRIME_LEAD_S+FADE_S, dur*0.4), or
+                        min(PRIME_LEAD_S+FADE_S, dur*0.35), or
                         (c) FROZEN_TIMEOUT_S backstop.
        |
        v  _do_start_priming() asserts off slot empty,
@@ -173,17 +173,25 @@ MIN_DWELL_S         = 0.5    # cascade killer: clip must be
                              # from clip PTS (the incoming was
                              # primed early so its PTS at swap is
                              # already ~FADE_S into the file).
-PRIME_LEAD_FRACTION = 0.6    # adaptive lead = min(
+PRIME_LEAD_FRACTION = 0.35   # adaptive lead = min(
                              # PRIME_LEAD_S + FADE_S,
                              # dur_s * PRIME_LEAD_FRACTION).
-                             # Bumped 0.4 -> 0.6 per QA 50e791c
-                             # soak: with the 2.0s priming
-                             # deadline a short 4.75s clip needs
-                             # dur*0.6 = 2.85s of runway so
-                             # prime + first-frame + fade fits
-                             # before/around outgoing EOS (any
-                             # overshoot is covered by retire
-                             # EOS + repeat-after-eos freeze).
+                             # Tuned 0.6 -> 0.35 per QA 1e95f37
+                             # soak: 0.6 was sized for the 2.0s
+                             # deadline budget, but first_frame
+                             # actually arrives in ~0.5s (not
+                             # ~2.0s) on glass, so the real lead
+                             # only needs ~1.5s (0.5 prime +
+                             # 1.0 fade). 0.6 cycled every ~2.6s
+                             # on a 4.75s clip (46 cycles in
+                             # 120s) -> rapid open/close churn
+                             # saturated codec/GL -> screen=0
+                             # even in PLAYING_CURRENT. 0.35
+                             # gives 4.75s*0.35=1.66s lead ->
+                             # shows ~3.1s, cycles ~4s near
+                             # real-time, far fewer retires.
+                             # PRIME_LEAD_S=2.0 cap still
+                             # bounds long clips at 3.0s lead.
 PRIMING_DEADLINE_S  = 2.0    # max wait for incoming first
                              # frame. Bumped 0.5 -> 2.0 per QA
                              # 50e791c soak: bcm2835 first frame
@@ -849,7 +857,7 @@ def retire_slot(slot_idx):
 #   - MIN_DWELL_S wall-clock from became_current_ns: a newly-
 #     current short clip cannot immediately re-trigger ->
 #     cascade dead at source.
-#   - Adaptive lead min(PRIME_LEAD_S + FADE_S, dur * 0.4):
+#   - Adaptive lead min(PRIME_LEAD_S + FADE_S, dur * 0.35):
 #     short clips get a smaller lead -> no overshoot off end.
 #   - FROZEN_TIMEOUT_S backstop branch INSIDE
 #     should_start_priming: no separate timer, no race with
