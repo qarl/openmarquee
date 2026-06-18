@@ -108,6 +108,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import weakref
 
@@ -152,7 +153,12 @@ from gi.repository import GLib, Gst  # noqa: E402
 CONTENT_GLOB = "/var/openmarquee/content/*/asset.mp4"
 VIDEOS = sorted(glob.glob(CONTENT_GLOB))
 
-PRIME_LEAD_S = 1.5           # absolute lead cap (s)
+PRIME_LEAD_S = 2.0           # absolute lead cap (s). Bumped
+                             # from 1.5 per QA 50e791c soak: with
+                             # PRIMING_DEADLINE_S 2.0 + FADE_S
+                             # 1.0 the new fractional lead needs
+                             # 3.0s for fit on long clips, so the
+                             # cap must not clip below that.
 FADE_S = 1.0                 # crossfade duration (s)
 PREROLL_BUDGET_S = 30        # GL cold-start budget under systemd
 
@@ -167,19 +173,29 @@ MIN_DWELL_S         = 0.5    # cascade killer: clip must be
                              # from clip PTS (the incoming was
                              # primed early so its PTS at swap is
                              # already ~FADE_S into the file).
-PRIME_LEAD_FRACTION = 0.4    # adaptive lead = min(
+PRIME_LEAD_FRACTION = 0.6    # adaptive lead = min(
                              # PRIME_LEAD_S + FADE_S,
                              # dur_s * PRIME_LEAD_FRACTION).
-                             # Short clips get a smaller lead;
-                             # long clips behave like today.
-PRIMING_DEADLINE_S  = 0.5    # max wait for incoming first frame
-                             # before _do_start_fade forces the
-                             # PRIMING_NEXT -> FADING transition.
-                             # Per QA review note #2: may be
-                             # tight for a cold-start incoming
-                             # decoder -- we LOG when this fires
-                             # before first_frame so QA can see
-                             # any black-flashes and bump it.
+                             # Bumped 0.4 -> 0.6 per QA 50e791c
+                             # soak: with the 2.0s priming
+                             # deadline a short 4.75s clip needs
+                             # dur*0.6 = 2.85s of runway so
+                             # prime + first-frame + fade fits
+                             # before/around outgoing EOS (any
+                             # overshoot is covered by retire
+                             # EOS + repeat-after-eos freeze).
+PRIMING_DEADLINE_S  = 2.0    # max wait for incoming first
+                             # frame. Bumped 0.5 -> 2.0 per QA
+                             # 50e791c soak: bcm2835 first frame
+                             # takes up to ~2s (matches the
+                             # proven d489fd8 GATE_DEADLINE_MS
+                             # budget). 0.5s caused the deadline
+                             # to fire EVERY cycle -> every fade
+                             # started on a not-yet-decoded
+                             # incoming = black fade-in. The
+                             # deadline log stays in
+                             # _do_start_fade so a future cold-
+                             # start regression surfaces.
 FROZEN_TIMEOUT_S    = 12.0   # backstop: max wall-clock in
                              # PLAYING_CURRENT before force-
                              # advance. Replaces the deleted
@@ -449,6 +465,40 @@ next_clip_idx = [0]       # cycling counter through VIDEOS
 # Cycle serial (every spawned bin gets a unique id for log clarity)
 spawn_serial = [0]
 
+# Per QA 50e791c soak: retire #23 produced an intermittent
+# qtdemux not-linked / Internal-data-stream crash despite sync
+# retire + the assert. The dying outgoing qtdemux's streaming
+# thread pushes a buffer just after we unlink the mix peer ->
+# qtdemux posts a fatal-looking error on the bus.
+#
+# Defensive part (B) per QA: track currently-retiring sub-bin
+# names; on_bus's ERROR handler ignores errors whose source
+# element lives inside any of those bins (the state machine has
+# already moved on; a teardown-window error is benign).
+#
+# Set is touched only on the GLib main loop thread (retire_slot
+# add/discard, on_bus read) so no lock needed.
+retiring_bin_names = set()
+
+
+def _is_in_retiring_bin(elem):
+    """Walk elem's parent chain; True if any ancestor's name is
+    in retiring_bin_names. Used by on_bus to treat teardown-race
+    errors as benign."""
+    while elem is not None:
+        try:
+            name = elem.get_name()
+        except Exception:
+            return False
+        if name in retiring_bin_names:
+            return True
+        try:
+            elem = elem.get_parent()
+        except Exception:
+            return False
+    return False
+
+
 # Single linear-state-machine state per QA scheduler spec. ONLY
 # mutated inside scheduler_tick's three transition helpers
 # (_do_start_priming, _do_start_fade, _do_complete_fade). Read by
@@ -605,6 +655,44 @@ def build_slot(slot_idx, clip_idx):
     return slot
 
 
+def _await_idle(pad, timeout_s, label=""):
+    """One-shot IDLE-pad wait with short timeout. Returns True if
+    pad was observed idle, False on timeout.
+
+    Per QA 50e791c coordination note (after a 1/23 not-linked
+    teardown race on synchronous retire): use an IDLE probe
+    (REMOVE on fire) with a SHORT timeout and PROCEED on timeout,
+    NOT a permanent BLOCK probe. A raw BLOCK probe can deadlock
+    the NULL transition because it holds the streaming thread.
+    IDLE fires when the pad currently has no buffer in flight
+    (or immediately on the calling thread if the pad is already
+    idle). The defensive (B) bus handler ignore-retiring-bin
+    check catches any teardown-race error if a buffer slips
+    through after the IDLE wait returns."""
+    evt = threading.Event()
+
+    def _on_idle(_pad, _info):
+        evt.set()
+        return Gst.PadProbeReturn.REMOVE
+
+    probe_id = pad.add_probe(Gst.PadProbeType.IDLE, _on_idle)
+    if probe_id == 0:
+        print(f"[cutfade] _await_idle {label} add_probe "
+              "returned 0", file=sys.stderr)
+        return False
+    if not evt.wait(timeout=timeout_s):
+        print(f"[cutfade] _await_idle {label} did NOT idle "
+              f"within {timeout_s:.2f}s; proceeding (bus "
+              "handler will ignore any teardown-race error)",
+              file=sys.stderr)
+        try:
+            pad.remove_probe(probe_id)
+        except Exception:
+            pass
+        return False
+    return True
+
+
 def retire_slot(slot_idx):
     """Tear down the sub-bin in slots[slot_idx]. SYNCHRONOUS per
     QA scheduler spec section (4): blocks until the sub is fully
@@ -618,79 +706,120 @@ def retire_slot(slot_idx):
     will produce a ~1s main-loop pause at each boundary (=
     the known secondary boundary-hitch, now systematic).
     EXPECTED and ACCEPTED this round; smoothing is the final
-    step after the reel cycles crash-free."""
+    step after the reel cycles crash-free.
+
+    Per QA 50e791c soak teardown-race fix:
+    - Part (A): _await_idle(glupload.src, 0.1) BEFORE unlink so
+      no buffer is in flight on the chain at the unlink instant.
+      Proceed-on-timeout so retire never deadlocks the NULL.
+    - Part (B): retiring_bin_names tracks this sub-bin's name
+      across the whole teardown so on_bus's ERROR handler can
+      treat a streaming-thread error from inside as benign and
+      log + ignore (not loop.quit). Tracked via try/finally so
+      even an exception in teardown still discards the name."""
     slot = slots[slot_idx]
     sub = slot["sub"]
     if sub is None:
         return
     label = slot["label"] or f"slot_{slot_idx}"
+    sub_name = sub.get_name()
     weak = weakref.ref(sub)
 
+    # Part (B): announce this bin as retiring BEFORE we touch
+    # anything else, so on_bus catches any error from the
+    # streaming thread during the entire teardown window.
+    retiring_bin_names.add(sub_name)
     try:
-        # 1. Disconnect pad-added handler (closure-leak prevention).
-        if slot["pad_added_id"] and slot["demux"] is not None:
-            try:
-                slot["demux"].disconnect(slot["pad_added_id"])
-            except Exception as exc:
-                print(f"[cutfade] retire {label} pad-added "
-                      f"disconnect WARN: {exc}", file=sys.stderr)
-        # 2. Remove decoder.src probes (first-frame + dec_pts).
-        if slot["dec"] is not None:
-            dec_src = slot["dec"].get_static_pad("src")
-            if dec_src is not None:
-                if slot["first_frame_probe_id"]:
-                    try:
-                        dec_src.remove_probe(
-                            slot["first_frame_probe_id"]
-                        )
-                    except Exception as exc:
-                        print(f"[cutfade] retire {label} first-frame "
-                              f"probe WARN: {exc}", file=sys.stderr)
-                if slot["dec_pts_probe_id"]:
-                    try:
-                        dec_src.remove_probe(
-                            slot["dec_pts_probe_id"]
-                        )
-                    except Exception as exc:
-                        print(f"[cutfade] retire {label} dec_pts "
-                              f"probe WARN: {exc}", file=sys.stderr)
-        # 3. EOS into the kept mix sink pad to ENGAGE
-        # repeat-after-eos before unlinking (proven on d489fd8).
-        # send_event is synchronous on the aggregator sink-event
-        # handler so priv->eos = True by return.
-        if slot["mix_sink"] is not None:
-            if not slot["mix_sink"].send_event(
-                Gst.Event.new_eos()
-            ):
-                print(f"[cutfade] retire {label} mix_sink EOS "
-                      "send_event returned False (proceeding)",
-                      file=sys.stderr)
-            # 4. Unlink old peer from kept mix sink pad.
-            peer = slot["mix_sink"].get_peer()
-            if peer is not None:
-                peer.unlink(slot["mix_sink"])
-            # alpha=0 -> composite path skips the frozen frame.
-            slot["mix_sink"].set_property("alpha", 0.0)
-        # 5. BLOCKING set_state(NULL). ASYNC -> wait up to 2s.
-        ret = sub.set_state(Gst.State.NULL)
-        if ret == Gst.StateChangeReturn.ASYNC:
-            ret2, _cur, _pend = sub.get_state(2 * Gst.SECOND)
-            if ret2 != Gst.StateChangeReturn.SUCCESS:
-                print(f"[cutfade] retire {label} NULL get_state "
-                      f"WARN ret={ret2.value_nick} after 2s "
-                      "(proceeding; downstream assert will surface "
-                      "corrupted state)", file=sys.stderr)
-        # 6. pipeline.remove.
-        pipeline.remove(sub)
-        print(f"[cutfade] retire {label} (slot {slot_idx}; "
-              "mix.sink pad kept allocated)",
-              file=sys.stderr)
-    except Exception as exc:
-        print(f"[cutfade] retire {label} WARN: {exc}",
-              file=sys.stderr)
+        try:
+            # 1. Disconnect pad-added handler (closure-leak prevention).
+            if slot["pad_added_id"] and slot["demux"] is not None:
+                try:
+                    slot["demux"].disconnect(slot["pad_added_id"])
+                except Exception as exc:
+                    print(f"[cutfade] retire {label} pad-added "
+                          f"disconnect WARN: {exc}",
+                          file=sys.stderr)
+            # 2. Remove decoder.src probes (first-frame + dec_pts).
+            if slot["dec"] is not None:
+                dec_src = slot["dec"].get_static_pad("src")
+                if dec_src is not None:
+                    if slot["first_frame_probe_id"]:
+                        try:
+                            dec_src.remove_probe(
+                                slot["first_frame_probe_id"]
+                            )
+                        except Exception as exc:
+                            print(f"[cutfade] retire {label} "
+                                  f"first-frame probe WARN: "
+                                  f"{exc}", file=sys.stderr)
+                    if slot["dec_pts_probe_id"]:
+                        try:
+                            dec_src.remove_probe(
+                                slot["dec_pts_probe_id"]
+                            )
+                        except Exception as exc:
+                            print(f"[cutfade] retire {label} "
+                                  f"dec_pts probe WARN: {exc}",
+                                  file=sys.stderr)
+            # 3. EOS into the kept mix sink pad to ENGAGE
+            # repeat-after-eos before unlinking (proven on
+            # d489fd8). send_event is synchronous on the
+            # aggregator sink-event handler so priv->eos = True
+            # by return.
+            if slot["mix_sink"] is not None:
+                if not slot["mix_sink"].send_event(
+                    Gst.Event.new_eos()
+                ):
+                    print(f"[cutfade] retire {label} mix_sink "
+                          "EOS send_event returned False "
+                          "(proceeding)", file=sys.stderr)
+                # 4. Part (A): IDLE-pad wait on the outgoing
+                # branch's peer (= glupload.src, reached via the
+                # ghost's target on mix_sink's peer). Short
+                # timeout; proceed on timeout. Prevents the
+                # qtdemux not-linked race observed on 50e791c
+                # retire #23.
+                peer = slot["mix_sink"].get_peer()
+                if peer is not None:
+                    # peer is the ghost pad on the sub-bin;
+                    # its target IS glupload.src.
+                    target = peer.get_target() if hasattr(
+                        peer, "get_target"
+                    ) else None
+                    idle_target = target if target is not None else peer
+                    _await_idle(idle_target, 0.1,
+                                label=f"{label} glupload.src")
+                    # 5. Unlink old peer from kept mix sink pad.
+                    peer.unlink(slot["mix_sink"])
+                # alpha=0 -> composite path skips the frozen frame.
+                slot["mix_sink"].set_property("alpha", 0.0)
+            # 6. BLOCKING set_state(NULL). ASYNC -> wait up to 2s.
+            ret = sub.set_state(Gst.State.NULL)
+            if ret == Gst.StateChangeReturn.ASYNC:
+                ret2, _cur, _pend = sub.get_state(2 * Gst.SECOND)
+                if ret2 != Gst.StateChangeReturn.SUCCESS:
+                    print(f"[cutfade] retire {label} NULL "
+                          f"get_state WARN ret="
+                          f"{ret2.value_nick} after 2s "
+                          "(proceeding; downstream assert will "
+                          "surface corrupted state)",
+                          file=sys.stderr)
+            # 7. pipeline.remove.
+            pipeline.remove(sub)
+            print(f"[cutfade] retire {label} (slot {slot_idx}; "
+                  "mix.sink pad kept allocated)",
+                  file=sys.stderr)
+        except Exception as exc:
+            print(f"[cutfade] retire {label} WARN: {exc}",
+                  file=sys.stderr)
 
-    # 7. Clear slot fields (mix_sink NOT cleared -- persistent).
-    _slot_clear(slot)
+        # 8. Clear slot fields (mix_sink NOT cleared -- persistent).
+        _slot_clear(slot)
+    finally:
+        # Part (B): even if teardown raised, drop this bin from
+        # the retiring set so on_bus stops ignoring its errors
+        # (any subsequent error from this name IS real).
+        retiring_bin_names.discard(sub_name)
 
     # 8. Defensive leak check (existing cf03a8f instrumentation).
     def _check_leak():
@@ -900,11 +1029,32 @@ def _do_start_priming():
     time_as_current_s = (
         (now_ns - sched["became_current_ns"]) / 1e9
     )
+    # Per QA 50e791c soak: log the pacing math at the decision
+    # point so the soak shows current playback position,
+    # remaining playback, and the adaptive lead the predicate
+    # used to fire. Lets QA judge whether the predicate is
+    # firing at the right time relative to clip-internal pts.
+    dur_s = sched["current_clip_dur_s"]
+    current_pts_ns = _query_current_pts_ns()
+    if current_pts_ns >= 0:
+        current_pts_ms = current_pts_ns // 1_000_000
+        remaining_s = dur_s - (current_pts_ns / 1e9)
+    else:
+        current_pts_ms = -1
+        remaining_s = -1.0
+    if dur_s > 0:
+        adaptive_lead_s = min(PRIME_LEAD_S + FADE_S,
+                              dur_s * PRIME_LEAD_FRACTION)
+    else:
+        adaptive_lead_s = -1.0
     clip_idx = next_clip_idx[0] % len(VIDEOS)
     next_clip_idx[0] += 1
     print(f"[cutfade] [sched] PLAYING_CURRENT -> PRIMING_NEXT "
-          f"(current_dur={sched['current_clip_dur_s']:.2f}s, "
-          f"time_as_current={time_as_current_s:.2f}s)",
+          f"(current_dur={dur_s:.2f}s, "
+          f"time_as_current={time_as_current_s:.2f}s, "
+          f"cur_pts_ms={current_pts_ms}, "
+          f"remaining_s={remaining_s:.2f}, "
+          f"adaptive_lead_s={adaptive_lead_s:.2f})",
           file=sys.stderr)
     print(f"[cutfade] prime next: clip {clip_idx} -> slot {off_idx}",
           file=sys.stderr)
@@ -961,6 +1111,17 @@ def _do_start_fade():
     now_ns = GLib.get_monotonic_time() * 1000
     elapsed_s = (now_ns - sched["priming_started_ns"]) / 1e9
     first_frame = sched["next_first_frame_arrived"]
+    incoming_idx = 1 - current_slot_idx[0]
+    # Per QA 50e791c+ ask: log the incoming decoder's latest
+    # decoded PTS at the moment we start fading so the soak
+    # shows where (in clip-internal time) the incoming begins
+    # being visible. If the incoming runs ahead during the 2s
+    # prime, it may fade in from its MIDDLE not its start --
+    # the soak should make that visible without us guessing.
+    incoming_first_pts_ns = (
+        slots[incoming_idx].get("last_dec_pts_ns") or 0
+    )
+    incoming_first_pts_ms = incoming_first_pts_ns // 1_000_000
     if not first_frame:
         print(f"[cutfade] [sched] PRIMING deadline hit, "
               f"first_frame=False (elapsed={elapsed_s:.2f}s; "
@@ -968,10 +1129,12 @@ def _do_start_fade():
               "PRIMING_DEADLINE_S if soak shows black-flashes)",
               file=sys.stderr)
     print(f"[cutfade] [sched] PRIMING_NEXT    -> FADING       "
-          f"(first_frame={first_frame}, elapsed={elapsed_s:.2f}s)",
+          f"(first_frame={first_frame}, "
+          f"elapsed={elapsed_s:.2f}s, "
+          f"incoming_first_pts_ms={incoming_first_pts_ms})",
           file=sys.stderr)
     sched["outgoing_slot_idx"] = current_slot_idx[0]
-    sched["incoming_slot_idx"] = 1 - current_slot_idx[0]
+    sched["incoming_slot_idx"] = incoming_idx
     sched["fade_started_ns"] = now_ns
     sched["state"] = "FADING"
 
@@ -1129,16 +1292,37 @@ def fps_tick():
 def on_bus(_bus, msg):
     if msg.type == Gst.MessageType.ERROR:
         err, dbg = msg.parse_error()
-        src = msg.src.get_name() if msg.src else "?"
-        print(f"[cutfade] ERROR {src}: {err.message}",
+        src_elem = msg.src
+        src_name = (
+            src_elem.get_name() if src_elem is not None else "?"
+        )
+        # Per QA 50e791c soak teardown-race fix part (B):
+        # if the error originates from inside a currently-
+        # retiring sub-bin, this is the streaming thread
+        # emitting after our unlink window. The state machine
+        # has already moved on; the error is benign. LOG +
+        # IGNORE (do NOT loop.quit). _is_in_retiring_bin walks
+        # the parent chain so a deeply nested element (e.g.
+        # qtdemux inside the sub-bin) is still recognized.
+        if (src_elem is not None
+                and _is_in_retiring_bin(src_elem)):
+            print(f"[cutfade] BUS ERROR ignored "
+                  f"(source {src_name} inside retiring bin): "
+                  f"{err.message}", file=sys.stderr)
+            if dbg:
+                print(f"[cutfade]  debug: {dbg}",
+                      file=sys.stderr)
+            return
+        print(f"[cutfade] ERROR {src_name}: {err.message}",
               file=sys.stderr)
         if dbg:
             print(f"[cutfade]  debug: {dbg}", file=sys.stderr)
         loop.quit()
     elif msg.type == Gst.MessageType.EOS:
-        # Should not happen -- each clip's EOS is absorbed by the
-        # fade-then-retire cycle. If it reaches the bus, something
-        # escaped. Watchdog also catches it.
+        # Should not happen -- each clip's EOS is absorbed by
+        # repeat-after-eos on the kept mix pad + the retire
+        # EOS-into-mix_sink. If pipeline EOS reaches the bus,
+        # something escaped the design and the loop should quit.
         print("[cutfade] pipeline EOS (unexpected)",
               file=sys.stderr)
         loop.quit()
