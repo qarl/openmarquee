@@ -236,6 +236,46 @@ else:
 loop = GLib.MainLoop()
 
 
+# --- Pre-allocate the two persistent mix sink pads ---------------------
+#
+# Per QA design fix: glvideomixer sink pads must NOT be released
+# mid-stream (release_request_pad disrupts the aggregator + output
+# stops -> black screen after first retire). Allocate both pads
+# ONCE here at startup; build_slot links to the pre-allocated
+# pad for its slot; retire unlinks (does NOT release). Same pads
+# get re-linked by the next clip into that slot.
+
+mix_pads = [
+    mix.request_pad_simple("sink_%u"),
+    mix.request_pad_simple("sink_%u"),
+]
+for idx, p in enumerate(mix_pads):
+    if p is None:
+        die(f"mix.request_pad_simple failed for slot {idx} at init")
+    # Initial state: both alpha=0 + zorder=0 (no sub-bin linked
+    # yet). build_slot for slot 0 will set alpha=1 before PLAYING.
+    p.set_property("alpha", 0.0)
+    p.set_property("zorder", 0)
+
+# Per-pad EOS-DROP probe (one-time attach, lives for pipeline life).
+# glvideomixer does NOT auto-absorb a single source EOS the way
+# concat did; without DROP, the first clip's natural EOS propagates
+# mixer -> sink -> pipeline EOS -> shutdown after one cycle.
+def _make_eos_drop_probe(slot_idx):
+    def _on_event(_pad, info):
+        ev = info.get_event()
+        if ev and ev.type == Gst.EventType.EOS:
+            print(f"[cutfade] DROP EOS at mix.sink_{slot_idx} "
+                  "(prevent mixer-EOS cascade)", file=sys.stderr)
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.OK
+    return _on_event
+
+for idx, p in enumerate(mix_pads):
+    p.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM,
+                _make_eos_drop_probe(idx))
+
+
 # --- Slot state machine -------------------------------------------------
 
 # Two slots, each can hold a sub-bin feeding mix.sink_0 / sink_1.
@@ -323,30 +363,26 @@ def build_slot(slot_idx, clip_idx):
     sub.add_pad(ghost)
 
     pipeline.add(sub)
-    mix_sink = mix.request_pad_simple("sink_%u")
-    if mix_sink is None:
-        die(f"[{label}] mix.request_pad_simple failed")
+    # Per QA design fix: mix sink pads are PERSISTENT for the
+    # pipeline's life. Pre-allocated in mix_pads[0/1] at init time
+    # so we never call release_request_pad mid-stream (which
+    # disrupts the glvideomixer aggregator -> output stops, screen
+    # goes black after first retire). Each retire just unlinks the
+    # ghost from the persistent pad; the next clip re-links.
+    mix_sink = mix_pads[slot_idx]
+    # Defensive: if a prior retire missed an unlink, clear it.
+    prior_peer = mix_sink.get_peer()
+    if prior_peer is not None:
+        print(f"[cutfade] WARN mix.sink_{slot_idx} had stale peer "
+              "at build; unlinking before relink", file=sys.stderr)
+        prior_peer.unlink(mix_sink)
     if ghost.link(mix_sink) != Gst.PadLinkReturn.OK:
         die(f"[{label}] ghost -> mix.sink link failed")
 
-    # EOS-DROP probe on the mix sink pad. glvideomixer does NOT
-    # auto-absorb a single source's EOS the way concat did; without
-    # this DROP, the first clip's natural EOS propagates through the
-    # mixer -> sink -> pipeline EOS bus message -> shutdown after
-    # one crossfade. Per QA dispatch: drop the per-source EOS so
-    # one clip ending never tears down the pipeline. This probe
-    # stays attached for the life of the mix_sink (released when
-    # retire calls mix.release_request_pad).
-    def _on_mix_sink_event(_pad, info):
-        ev = info.get_event()
-        if ev and ev.type == Gst.EventType.EOS:
-            print(f"[cutfade] DROP EOS at mix.sink for {label} "
-                  "(prevent mixer-EOS cascade)", file=sys.stderr)
-            return Gst.PadProbeReturn.DROP
-        return Gst.PadProbeReturn.OK
-    mix_sink.add_probe(
-        Gst.PadProbeType.EVENT_DOWNSTREAM, _on_mix_sink_event
-    )
+    # NOTE: the EOS-DROP probe on this mix_sink pad was attached
+    # ONCE at init time (alongside the pad allocation) and stays
+    # attached for the pipeline's life. Do NOT re-attach here --
+    # adding a duplicate per-build would leak probe handles.
 
     slot = slots[slot_idx]
     slot["sub"] = sub
@@ -405,11 +441,23 @@ def retire_slot(slot_idx):
                               f"trigger probe WARN: {exc}",
                               file=sys.stderr)
                     break
+        # Per QA design fix: do NOT release_request_pad on the
+        # glvideomixer mix sink pad mid-stream. That disrupts the
+        # aggregator and output stops (screen goes black after the
+        # first retire). The mix sink pads stay allocated for the
+        # pipeline's life; here we just UNLINK the dying sub-bin's
+        # ghost from the persistent mix sink pad. Next clip
+        # re-links to the same pad. Set alpha=0 defensively (the
+        # fade already drove it there but be safe).
+        if slot["mix_sink"] is not None:
+            peer = slot["mix_sink"].get_peer()
+            if peer is not None:
+                peer.unlink(slot["mix_sink"])
+            slot["mix_sink"].set_property("alpha", 0.0)
         sub.set_state(Gst.State.NULL)
         pipeline.remove(sub)
-        if slot["mix_sink"] is not None:
-            mix.release_request_pad(slot["mix_sink"])
-        print(f"[cutfade] retire {label} (slot {slot_idx})",
+        print(f"[cutfade] retire {label} (slot {slot_idx}; "
+              "mix.sink pad kept allocated)",
               file=sys.stderr)
     except Exception as exc:
         print(f"[cutfade] retire {label} WARN: {exc}",
