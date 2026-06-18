@@ -1,62 +1,89 @@
 #!/usr/bin/env python3
-"""fresh/cutfade.py -- 1s GL crossfade between two clips. POC.
+"""fresh/cutfade.py -- continuous 1s GL crossfade reel across all clips.
 
-Per qarl + QA dispatch (2026-06-18): revive the 1s crossfade in the
-NEW Python clean-room renderer (cutloop). NOT touching the old Rust
-renderer (qarl explicit: clean-room means start over). NOT modifying
-cutloop.py (production-deployed on the sign right now); cutfade.py
-is the experimental sibling so the production cutloop stays the
-proven baseline.
+Per qarl + QA dispatch 2026-06-18: revive the 1s crossfade in the
+NEW Python clean-room renderer. NOT the old Rust renderer; NOT
+modifying cutloop.py. This file IS the cycling crossfade reel.
 
-ARCHITECTURE per QA dispatch:
-  - Two v4l2h264dec instances during the 1s crossfade window only.
-    Steady state is still ONE decoder (cutloop's premise preserved).
-  - GL blend on V3D, NOT CPU compositor (which we measured ~14fps).
-    glvideomixer + glimagesink.
-  - Incoming decoder spawned 1-2s EARLY (off the hot path) so its
-    cold-start completes before the fade window opens.
-  - First-frame GATE on the incoming decoder: alpha animation only
-    starts after the gate passes (BUFFER probe on dec_b.src). If the
-    gate misses its deadline, hold the outgoing's last frame visible
-    until the incoming is ready.
-  - Cap concurrent priming to 1-2 (in this POC only ever 2; built
-    in to the design).
-  - Pools MODEST (no max-size-buffers boost; the prior dual-decode
-    starvation work suggested deeper pools, but per QA dispatch
-    that worsens swap).
+QA on-glass verified bc0cbcc POC: glimagesink (GL->EGL->KMS direct,
+NO gldownload/videoconvert) prerolled + ran a clean 1s A->B fade at
+~24fps (screen steady 24, max_gap 43-53ms during the fade = smooth).
+GL crossfade architecture + the 24fps path are PROVEN on this Pi.
 
-POC SCOPE (THIS COMMIT):
-  - Plays VIDEOS[0] on decA -> mix.sink_0 -> glimagesink (alpha 1).
-  - At PRIME_LEAD_S into VIDEOS[0], spawns VIDEOS[1] on decB ->
-    mix.sink_1 (alpha 0), PAUSED -> PLAYING when the GL pipeline
-    is ready.
-  - Gate on decB first frame (BUFFER probe on decB.src). Once gated,
-    schedule the 1s alpha fade.
-  - Fade alpha sink_0 1->0 and sink_1 0->1 over FADE_S=1s.
-  - After fade: both stay alive (POC is one-shot, not looping).
+THIS COMMIT extends the one-shot POC into a continuous cycling reel:
+  - glimagesink is the DEFAULT sink (the proven 24fps path).
+  - Dynamic glob discovery of every asset.mp4 under
+    /var/openmarquee/content/<uuid>/ (sorted by path; same as
+    cutloop's discovery).
+  - Two-slot state machine on mix.sink_0 / mix.sink_1. At any
+    moment one slot is the CURRENT (alpha=1) and the other is
+    either empty or being PRIMED for the next crossfade.
+  - On each clip cycle: prime the next clip into the OFF slot
+    PRIME_LEAD_S=1.5s before its currently-active clip ends, gate
+    on the incoming decoder's first frame (or deadline fallback),
+    fade alpha 1<->0 over FADE_S=1.0s, swap which slot is current,
+    retire the (now-outgoing) slot with the closure-disconnect
+    pattern from cutloop's retire-leak fix.
+  - WATCHDOG: 1Hz check, if screen frames = 0 for 2 consecutive
+    seconds, force-prime + force-PLAY.
+  - Pools MODEST per QA: no max-size-buffers boost.
+  - Concurrent decoder count capped at 2 (one current + one
+    being-primed) -- intrinsic to the two-slot design.
 
-NOT in this POC (follow-ups if QA likes the architecture):
-  - Playlist cycling across 17 clips (currently hardcoded to first 2).
-  - glob discovery.
-  - Retire of the outgoing path post-fade.
-  - Watchdog.
-  - Re-prime cycle for the NEXT crossfade.
+ARCHITECTURE:
 
-GL HEADLESS SYSTEMD CAVEAT: glimagesink + GST_GL_WINDOW=gbm has
-historically hung at READY->PAUSED as a transient systemd unit (per
-wipe_cpu.py earlier work). The XDG_RUNTIME_DIR fallback below
-mitigates one known cause (logind not allocating /run/user/<uid>).
-If the glimagesink path still hangs on first soak, set the env var
-OPENMARQUEE_CUTFADE_SINK=kmssink to fall back to gldownload+
-videoconvert+kmssink (the wipe_cpu.py path that did eventually work
-under systemd once we sorted the env).
+  Slot 0:                            mix.sink_0 (alpha animated)
+    Gst.Bin "slot_0":                    |
+      filesrc -> qtdemux ----- video --> h264parse(cfg=-1)
+        |                                  |
+        +--<pad-added>--> link             v4l2h264dec
+                                           |
+                                           glupload
+                                           |
+                                           ghost src ----------|
+                                                               v
+  Slot 1:                            mix.sink_1 (alpha animated)
+    same structure
+                                                               |
+                                  glvideomixer name=mix <------+
+                                       |
+                                       v
+                                  glimagesink sync=true
+                                  (or gldownload->videoconvert->
+                                  kmssink fallback via env flag)
+
+LOOP MECHANISM:
+  - Each new slot (sub-bin) gets:
+      stored pad_added_handler_id from qtdemux.connect.
+      stored first_frame_probe_id from dec.src.add_probe.
+      stored prime_trigger_probe_id from qtdemux video src.add_probe.
+  - Retire releases ALL of those plus mix.release_request_pad
+    plus sub.set_state(NULL) plus pipeline.remove (cutloop's
+    proven sequence).
+  - Prime trigger BUFFER probe on the CURRENT slot's qtdemux video
+    src pad. When pts >= (dur - PRIME_LEAD_S - FADE_S), idle_add
+    the prime; one-shot via REMOVE.
+  - Gate BUFFER probe on the OFF slot's v4l2h264dec src pad. When
+    first buffer arrives, schedule start_fade; one-shot via REMOVE.
+  - Deadline timer: if gate doesn't fire within GATE_DEADLINE_MS,
+    start_fade anyway (hold-last-frame semantics of glvideomixer).
+  - fade_tick animates alphas over FADE_S; on completion swaps
+    current slot index, schedules retire of old slot, attaches a
+    new prime trigger on the new current slot's qtdemux pad.
+
+WATCHDOG: per QA spec. fps_tick reads screen_state.frames; if 0
+for 2 consecutive ticks (= 2s of black), force-prime the OFF slot
+on the next clip in cycle order + force the pipeline to PLAYING.
 """
 
+import gc
+import glob
 import os
 import signal
 import subprocess
 import sys
 import time
+import weakref
 
 # GL env vars MUST be set before Gst.init so gstreamer-gl picks the
 # headless GBM/EGL backend on dri/card0 (no X/Wayland needed).
@@ -67,10 +94,9 @@ os.environ.setdefault("GST_GL_API", "gles2")
 
 def _ensure_xdg_runtime_dir():
     """systemd transient units launched without logind get no
-    XDG_RUNTIME_DIR. Mesa vc4 EGL/GBM uses it for dri socket path
-    and shader cache discovery; without it the first GL context
-    cold-compiles every shader -> PAUSED preroll past 10s. Per
-    wipe_cpu.py earlier work."""
+    XDG_RUNTIME_DIR. Mesa vc4 EGL/GBM uses it for the dri socket
+    path and the shader cache discovery; without it the first GL
+    context cold-compiles every shader -> PAUSED preroll past 10s."""
     if os.environ.get("XDG_RUNTIME_DIR"):
         return
     uid = os.getuid()
@@ -95,28 +121,29 @@ gi.require_version("GLib", "2.0")
 from gi.repository import GLib, Gst  # noqa: E402
 
 
-VIDEOS = [
-    "/var/openmarquee/content/029c4d68-744c-4d30-9adc-0f37c55514f1/asset.mp4",
-    "/var/openmarquee/content/3f54a4d2-a120-4c0c-aa80-5b99aaf7c9ff/asset.mp4",
-]
+# --- Config -------------------------------------------------------------
 
-# Timing per QA dispatch.
-PRIME_LEAD_S = 1.5     # spawn decB at this many s after decA starts
+CONTENT_GLOB = "/var/openmarquee/content/*/asset.mp4"
+VIDEOS = sorted(glob.glob(CONTENT_GLOB))
+
+PRIME_LEAD_S = 1.5     # seconds before current EOS to spawn next
 FADE_S = 1.0           # crossfade duration
 FADE_TICK_MS = 33      # animation tick (~30fps geometry update)
-GATE_DEADLINE_MS = 2000  # max wait for decB first frame before
-                          # falling back to hold-current-last-frame
-PREROLL_BUDGET_S = 30  # cold-start headroom under systemd
+GATE_DEADLINE_MS = 2000  # max wait for incoming first frame
+PREROLL_BUDGET_S = 30  # GL cold-start budget under systemd
+WATCHDOG_STALL_S = 2   # consecutive seconds of screen=0 -> recover
 
-# Output sink choice. Defaulting to kmssink per subagent review:
-# glimagesink + GBM has a hang-at-READY-to-PAUSED history on this
-# Pi build (wipe_cpu.py struggled with the same configuration).
-# wipe_cpu.py's working path under systemd was glvideomixer ->
-# gldownload -> videoconvert -> NV12 -> kmssink. Flip via env
-# OPENMARQUEE_CUTFADE_SINK=glimagesink to try the direct GL sink
-# (may still be the better path if it prerolls; flip and test).
+# Fallback durations if qtdemux query_duration fails. Per QA assets
+# are uniform h264 Main 1280x720 24fps but vary in length; if a
+# specific asset's query fails the fallback is ~6s (rough average).
+DUR_FALLBACK_NS = 6_000_000_000
+
+# Default to glimagesink per QA glass-verified 24fps path. Set
+# OPENMARQUEE_CUTFADE_SINK=kmssink to use the gldownload+
+# videoconvert+kmssink fallback path (the wipe_cpu.py path; runs
+# ~1-7fps so only useful for verification).
 SINK_CHOICE = os.environ.get(
-    "OPENMARQUEE_CUTFADE_SINK", "kmssink"
+    "OPENMARQUEE_CUTFADE_SINK", "glimagesink"
 ).lower()
 
 
@@ -127,9 +154,17 @@ def die(msg, code=1):
 
 # --- Pre-flights --------------------------------------------------------
 
+if not VIDEOS:
+    die(f"no videos discovered under {CONTENT_GLOB} -- "
+        "check /var/openmarquee/content exists + contains "
+        "<uuid>/asset.mp4 files")
 for v in VIDEOS:
     if not os.path.exists(v):
         die(f"missing video: {v}")
+print(f"[cutfade] discovered {len(VIDEOS)} videos:", file=sys.stderr)
+for v in VIDEOS:
+    print(f"[cutfade]   {os.path.basename(os.path.dirname(v))}",
+          file=sys.stderr)
 
 Gst.init(None)
 
@@ -144,9 +179,6 @@ for el in REQUIRED_ELEMENTS:
     if not Gst.ElementFactory.find(el):
         die(f"missing gstreamer element: {el}")
 
-# Single HW decoder context check. Two are expected DURING the
-# fade window only; outside that window the production cutloop /
-# mini may still hold one. Refuse double-start vs production.
 self_pid = os.getpid()
 parent_pid = os.getppid()
 own_pids = (str(self_pid), str(parent_pid))
@@ -171,10 +203,8 @@ pipeline = Gst.Pipeline.new("cutfade")
 if pipeline is None:
     die("Gst.Pipeline.new returned None")
 
-# Output: glvideomixer -> (glimagesink | gldownload + videoconvert
-# + kmssink).
 mix = Gst.ElementFactory.make("glvideomixer", "mix")
-mix.set_property("background", 1)  # 1 = black
+mix.set_property("background", 1)  # black
 
 if SINK_CHOICE == "glimagesink":
     sink = Gst.ElementFactory.make("glimagesink", "sink")
@@ -199,22 +229,71 @@ else:
     if not videoconvert.link(sink):
         die("link videoconvert -> kmssink failed")
     print("[cutfade] sink path: glvideomixer -> gldownload -> "
-          "videoconvert -> kmssink",
-          file=sys.stderr)
+          "videoconvert -> kmssink (fallback)", file=sys.stderr)
+
+# Define loop here so any code path can call loop.quit() safely
+# (before loop.run() it's a no-op; after, triggers finally cleanup).
+loop = GLib.MainLoop()
 
 
-def build_decode_path(clip_idx, label):
-    """One filesrc -> qtdemux -> h264parse -> v4l2h264dec -> glupload
-    sub-bin with a ghost src pad. Caller links the ghost into a
-    glvideomixer request pad. Returns (sub_bin, decoder)."""
+# --- Slot state machine -------------------------------------------------
+
+# Two slots, each can hold a sub-bin feeding mix.sink_0 / sink_1.
+# At any moment one is the CURRENT (alpha=1) and the other is
+# either empty (no sub-bin) or being PRIMED (alpha=0, pre-fade).
+slots = [
+    {"sub": None, "dec": None, "demux": None, "mix_sink": None,
+     "label": None, "serial": None, "dur_ns": 0,
+     "pad_added_id": None, "first_frame_probe_id": None,
+     "prime_trigger_probe_id": None},
+    {"sub": None, "dec": None, "demux": None, "mix_sink": None,
+     "label": None, "serial": None, "dur_ns": 0,
+     "pad_added_id": None, "first_frame_probe_id": None,
+     "prime_trigger_probe_id": None},
+]
+current_slot_idx = [0]   # which slots[] entry is the active one
+next_clip_idx = [0]       # cycling counter through VIDEOS
+
+# Fade state
+fade_state = {"start_ns": 0, "in_flight": False,
+              "incoming_slot": -1, "outgoing_slot": -1}
+
+# Watchdog state
+watchdog_state = {"zero_frame_seconds": 0}
+
+# Cycle serial (every spawned bin gets a unique id for log clarity)
+spawn_serial = [0]
+
+
+def _slot_clear(slot):
+    """Reset slot dict to "empty" state (does not touch gst -- caller
+    must have already retired the elements)."""
+    for k in ("sub", "dec", "demux", "mix_sink", "label", "serial",
+              "pad_added_id", "first_frame_probe_id",
+              "prime_trigger_probe_id"):
+        slot[k] = None
+    slot["dur_ns"] = 0
+
+
+def build_slot(slot_idx, clip_idx):
+    """Build a sub-bin for VIDEOS[clip_idx] into slots[slot_idx].
+    Returns (sub_bin, mix_sink_pad, decoder, demuxer, ids...).
+    Caller is responsible for setting alpha + state. Stores all
+    teardown-required IDs on the slot dict so retire_slot can
+    disconnect/remove them all."""
     asset = VIDEOS[clip_idx]
-    sub = Gst.Bin.new(f"dec_{label}")
+    spawn_serial[0] += 1
+    serial = spawn_serial[0]
+    label = f"clip{serial}"
+    asset_name = os.path.basename(os.path.dirname(asset)) or asset
+
+    sub = Gst.Bin.new(f"slot_{slot_idx}_{label}")
     filesrc = Gst.ElementFactory.make("filesrc", None)
     filesrc.set_property("location", asset)
     qtdemux = Gst.ElementFactory.make("qtdemux", None)
     h264parse = Gst.ElementFactory.make("h264parse", None)
     h264parse.set_property("config-interval", -1)
-    decoder = Gst.ElementFactory.make("v4l2h264dec", f"dec{label}")
+    decoder = Gst.ElementFactory.make("v4l2h264dec", f"dec_{label}")
     glupload = Gst.ElementFactory.make("glupload", None)
     for el in (filesrc, qtdemux, h264parse, decoder, glupload):
         if el is None:
@@ -223,7 +302,7 @@ def build_decode_path(clip_idx, label):
 
     if not filesrc.link(qtdemux):
         die(f"[{label}] filesrc -> qtdemux link failed")
-    # qtdemux dynamic pad
+
     def _pad_added(_demux, pad):
         caps = pad.get_current_caps() or pad.query_caps(None)
         caps_str = caps.to_string() if caps else ""
@@ -232,7 +311,7 @@ def build_decode_path(clip_idx, label):
         sink_pad = h264parse.get_static_pad("sink")
         if sink_pad and not sink_pad.is_linked():
             pad.link(sink_pad)
-    qtdemux.connect("pad-added", _pad_added)
+    pad_added_id = qtdemux.connect("pad-added", _pad_added)
 
     if not h264parse.link(decoder):
         die(f"[{label}] h264parse -> v4l2h264dec link failed")
@@ -242,122 +321,314 @@ def build_decode_path(clip_idx, label):
     glupload_src = glupload.get_static_pad("src")
     ghost = Gst.GhostPad.new("src", glupload_src)
     sub.add_pad(ghost)
-    return sub, decoder
+
+    pipeline.add(sub)
+    mix_sink = mix.request_pad_simple("sink_%u")
+    if mix_sink is None:
+        die(f"[{label}] mix.request_pad_simple failed")
+    if ghost.link(mix_sink) != Gst.PadLinkReturn.OK:
+        die(f"[{label}] ghost -> mix.sink link failed")
+
+    slot = slots[slot_idx]
+    slot["sub"] = sub
+    slot["dec"] = decoder
+    slot["demux"] = qtdemux
+    slot["mix_sink"] = mix_sink
+    slot["label"] = label
+    slot["serial"] = serial
+    slot["pad_added_id"] = pad_added_id
+    print(f"[cutfade] build slot {slot_idx}: {label} = {asset_name}",
+          file=sys.stderr)
+    return slot
 
 
-# Path A: active from t=0.
-sub_a, dec_a = build_decode_path(0, "A")
-pipeline.add(sub_a)
-mix_sink_a = mix.request_pad_simple("sink_%u")
-if mix_sink_a is None:
-    die("mix.request_pad_simple failed for A")
-ghost_a = sub_a.get_static_pad("src")
-if ghost_a.link(mix_sink_a) != Gst.PadLinkReturn.OK:
-    die("A: ghost -> mix.sink link failed")
-mix_sink_a.set_property("alpha", 1.0)
-print("[cutfade] path A built + linked + alpha=1.0", file=sys.stderr)
+def retire_slot(slot_idx):
+    """Tear down the sub-bin in slots[slot_idx]. Uses cutloop's
+    proven disconnect-before-NULL sequence to prevent closure-ref
+    leaks (Python closures captured by the pad-added handler + any
+    probes hold the sub-bin alive otherwise)."""
+    slot = slots[slot_idx]
+    sub = slot["sub"]
+    if sub is None:
+        return False
+    label = slot["label"] or f"slot_{slot_idx}"
+    weak = weakref.ref(sub)
 
-# Path B: built later via prime_incoming().
-sub_b = None
-dec_b = None
-mix_sink_b = None
-gate_state = {"first_frame_seen": False, "deadline_at_ns": 0}
+    try:
+        if slot["pad_added_id"] and slot["demux"] is not None:
+            try:
+                slot["demux"].disconnect(slot["pad_added_id"])
+            except Exception as exc:
+                print(f"[cutfade] retire {label} pad-added "
+                      f"disconnect WARN: {exc}", file=sys.stderr)
+        if (slot["first_frame_probe_id"]
+                and slot["dec"] is not None):
+            dec_src = slot["dec"].get_static_pad("src")
+            if dec_src is not None:
+                try:
+                    dec_src.remove_probe(slot["first_frame_probe_id"])
+                except Exception as exc:
+                    print(f"[cutfade] retire {label} first-frame "
+                          f"probe WARN: {exc}", file=sys.stderr)
+        if (slot["prime_trigger_probe_id"]
+                and slot["demux"] is not None):
+            # demux video src pad -- find it
+            it = slot["demux"].iterate_src_pads()
+            while True:
+                res, p = it.next()
+                if res != Gst.IteratorResult.OK:
+                    break
+                if p.get_name().startswith("video"):
+                    try:
+                        p.remove_probe(slot["prime_trigger_probe_id"])
+                    except Exception as exc:
+                        print(f"[cutfade] retire {label} prime "
+                              f"trigger probe WARN: {exc}",
+                              file=sys.stderr)
+                    break
+        sub.set_state(Gst.State.NULL)
+        pipeline.remove(sub)
+        if slot["mix_sink"] is not None:
+            mix.release_request_pad(slot["mix_sink"])
+        print(f"[cutfade] retire {label} (slot {slot_idx})",
+              file=sys.stderr)
+    except Exception as exc:
+        print(f"[cutfade] retire {label} WARN: {exc}",
+              file=sys.stderr)
 
+    _slot_clear(slot)
 
-def prime_incoming():
-    """Build + link + start playing path B (the incoming clip).
-    Spawn a first-frame BUFFER probe on dec_b.src; once it fires,
-    schedule the alpha fade."""
-    global sub_b, dec_b, mix_sink_b
-    print(f"[cutfade] prime incoming (clip {1})", file=sys.stderr)
-    sub_b, dec_b = build_decode_path(1, "B")
-    pipeline.add(sub_b)
-    mix_sink_b = mix.request_pad_simple("sink_%u")
-    if mix_sink_b is None:
-        die("mix.request_pad_simple failed for B")
-    ghost_b = sub_b.get_static_pad("src")
-    if ghost_b.link(mix_sink_b) != Gst.PadLinkReturn.OK:
-        die("B: ghost -> mix.sink link failed")
-    mix_sink_b.set_property("alpha", 0.0)
-    mix_sink_b.set_property("zorder", 1)  # B on top of A
-    mix_sink_a.set_property("zorder", 0)
-
-    # First-frame gate.
-    dec_b_src = dec_b.get_static_pad("src")
-    if dec_b_src is None:
-        die("[B] v4l2h264dec has no src pad")
-
-    def _on_first_frame(_pad, _info):
-        if not gate_state["first_frame_seen"]:
-            gate_state["first_frame_seen"] = True
-            print("[cutfade] decB first frame -> ready, scheduling fade",
-                  file=sys.stderr)
-            GLib.idle_add(start_fade)
-            return Gst.PadProbeReturn.REMOVE
-        return Gst.PadProbeReturn.OK
-    dec_b_src.add_probe(Gst.PadProbeType.BUFFER, _on_first_frame)
-
-    # Deadline + fallback: if no first frame within GATE_DEADLINE_MS,
-    # fall back to "hold-last-frame" semantics (just fade anyway;
-    # glvideomixer holds the last-presented frame on a stalled pad
-    # by default, so the visual is the last A frame held while B
-    # comes up).
-    gate_state["deadline_at_ns"] = (
-        GLib.get_monotonic_time() * 1000
-        + GATE_DEADLINE_MS * 1_000_000
-    )
-    GLib.timeout_add(GATE_DEADLINE_MS, _gate_deadline_check)
-
-    sub_b.sync_state_with_parent()
-    if sub_b.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-        die("[B] sub_b set_state PLAYING failed")
-    return False  # one-shot from GLib.timeout_add
-
-
-def _gate_deadline_check():
-    if gate_state["first_frame_seen"]:
-        return False  # gate already passed; nothing to do
-    print(f"[cutfade] GATE DEADLINE ({GATE_DEADLINE_MS}ms) -- "
-          "decB never produced a frame; starting fade anyway "
-          "(hold-last-frame fallback)", file=sys.stderr)
-    start_fade()
+    def _check_leak():
+        gc.collect()
+        if weak() is not None:
+            print(f"[cutfade] [retire] LEAK ref still held for "
+                  f"{label}", file=sys.stderr)
+        return False
+    GLib.idle_add(_check_leak)
     return False
 
 
-fade_state = {"start_ns": 0, "in_flight": False, "done": False}
+# --- Prime trigger via PTS probe on demuxer src ------------------------
 
-
-def start_fade():
-    if fade_state["in_flight"] or fade_state["done"]:
+def attach_prime_trigger(slot_idx):
+    """Attach a BUFFER probe on the slot's demuxer video src pad.
+    When pts >= dur - (PRIME_LEAD_S + FADE_S), schedule prime_next
+    via GLib.idle_add and remove the probe. dur is queried from
+    the demuxer."""
+    slot = slots[slot_idx]
+    if slot["demux"] is None:
+        return
+    # qtdemux is dynamic; the video src pad may not exist yet at
+    # the moment of attach. Defer until pad-added fires (which we
+    # already hooked). Use iterate when ready -- if the video pad
+    # exists now, attach immediately; otherwise reschedule.
+    it = slot["demux"].iterate_src_pads()
+    video_pad = None
+    while True:
+        res, p = it.next()
+        if res != Gst.IteratorResult.OK:
+            break
+        if p.get_name().startswith("video"):
+            video_pad = p
+            break
+    if video_pad is None:
+        # Pad not yet available; retry shortly. qtdemux exposes its
+        # src pads within ms of PAUSED.
+        GLib.timeout_add(50, lambda: attach_prime_trigger(slot_idx)
+                         or False)
         return False
-    fade_state["in_flight"] = True
+
+    # Query duration on the demuxer. Per cutloop pattern, this works
+    # once the moov box is parsed (which is what triggers pad-added).
+    ok, dur = slot["demux"].query_duration(Gst.Format.TIME)
+    if ok and dur > 0:
+        slot["dur_ns"] = dur
+    else:
+        slot["dur_ns"] = DUR_FALLBACK_NS
+        print(f"[cutfade] {slot['label']} duration query failed; "
+              f"fallback {DUR_FALLBACK_NS / 1e9:.2f}s",
+              file=sys.stderr)
+    prime_at = slot["dur_ns"] - int(
+        (PRIME_LEAD_S + FADE_S) * 1_000_000_000
+    )
+    if prime_at <= 0:
+        # Clip too short for prime-lead arithmetic; skip prime,
+        # rely on watchdog to keep things moving. Should not
+        # happen for our assets but defensive.
+        print(f"[cutfade] {slot['label']} dur too short for "
+              f"prime arithmetic ({slot['dur_ns'] / 1e9:.2f}s); "
+              "watchdog will handle", file=sys.stderr)
+        return False
+    print(f"[cutfade] {slot['label']} duration "
+          f"{slot['dur_ns'] / 1e9:.2f}s, "
+          f"prime trigger at {prime_at / 1e9:.2f}s",
+          file=sys.stderr)
+
+    fired = [False]
+
+    def _on_buffer(_pad, info):
+        if fired[0]:
+            return Gst.PadProbeReturn.REMOVE
+        buf = info.get_buffer()
+        if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+            return Gst.PadProbeReturn.OK
+        if buf.pts >= prime_at:
+            fired[0] = True
+            print(f"[cutfade] {slot['label']} prime trigger at "
+                  f"pts={buf.pts / 1e9:.2f}s", file=sys.stderr)
+            GLib.idle_add(prime_next)
+            return Gst.PadProbeReturn.REMOVE
+        return Gst.PadProbeReturn.OK
+    probe_id = video_pad.add_probe(
+        Gst.PadProbeType.BUFFER, _on_buffer
+    )
+    slot["prime_trigger_probe_id"] = probe_id
+    return False
+
+
+# --- Prime next clip into the OFF slot ----------------------------------
+
+def prime_next():
+    """Build the next playlist clip into the OFF slot, gate on its
+    first frame, then start_fade. Returns False so callers via
+    GLib.idle_add fire only once."""
+    if fade_state["in_flight"]:
+        print("[cutfade] prime_next called while fade in flight; "
+              "skipping (next prime will fire on the new current)",
+              file=sys.stderr)
+        return False
+    off_idx = 1 - current_slot_idx[0]
+    if slots[off_idx]["sub"] is not None:
+        print(f"[cutfade] prime_next: slot {off_idx} already "
+              "occupied; skipping", file=sys.stderr)
+        return False
+    clip_idx = next_clip_idx[0] % len(VIDEOS)
+    next_clip_idx[0] += 1
+    print(f"[cutfade] prime next: clip {clip_idx} -> slot {off_idx}",
+          file=sys.stderr)
+    slot = build_slot(off_idx, clip_idx)
+    slot["mix_sink"].set_property("alpha", 0.0)
+    slot["mix_sink"].set_property("zorder", 1)  # incoming on top
+    slots[current_slot_idx[0]]["mix_sink"].set_property("zorder", 0)
+
+    # First-frame gate on the new decoder.
+    dec_src = slot["dec"].get_static_pad("src")
+    if dec_src is None:
+        die(f"[{slot['label']}] v4l2h264dec has no src pad")
+
+    gate = {"fired": False}
+
+    def _on_first_frame(_pad, _info):
+        if not gate["fired"]:
+            gate["fired"] = True
+            print(f"[cutfade] {slot['label']} first frame -> "
+                  "scheduling fade", file=sys.stderr)
+            GLib.idle_add(start_fade, off_idx)
+            return Gst.PadProbeReturn.REMOVE
+        return Gst.PadProbeReturn.OK
+    probe_id = dec_src.add_probe(
+        Gst.PadProbeType.BUFFER, _on_first_frame
+    )
+    slot["first_frame_probe_id"] = probe_id
+
+    # Deadline timer: if gate doesn't fire, start_fade anyway
+    # (hold-last-frame fallback semantic of glvideomixer).
+    def _deadline():
+        if gate["fired"]:
+            return False
+        gate["fired"] = True  # gate flag to prevent later
+                              # probe call from also firing
+        print(f"[cutfade] {slot['label']} GATE DEADLINE "
+              f"({GATE_DEADLINE_MS}ms) -- "
+              "no first frame; starting fade anyway "
+              "(hold-last-frame fallback)", file=sys.stderr)
+        GLib.idle_add(start_fade, off_idx)
+        return False
+    GLib.timeout_add(GATE_DEADLINE_MS, _deadline)
+
+    slot["sub"].sync_state_with_parent()
+    if (slot["sub"].set_state(Gst.State.PLAYING)
+            == Gst.StateChangeReturn.FAILURE):
+        die(f"[{slot['label']}] sub set_state PLAYING failed")
+    return False
+
+
+# --- Fade animation -----------------------------------------------------
+
+def start_fade(incoming_slot_idx):
+    """Start the 1s alpha animation. Outgoing alpha 1->0, incoming
+    alpha 0->1. Returns False so GLib.idle_add fires once."""
+    if fade_state["in_flight"]:
+        return False
+    fade_state["incoming_slot"] = incoming_slot_idx
+    fade_state["outgoing_slot"] = current_slot_idx[0]
     fade_state["start_ns"] = GLib.get_monotonic_time() * 1000
-    print("[cutfade] FADE start (1s)", file=sys.stderr)
+    fade_state["in_flight"] = True
+    print(f"[cutfade] FADE start: slot {fade_state['outgoing_slot']}"
+          f" -> slot {incoming_slot_idx}", file=sys.stderr)
     GLib.timeout_add(FADE_TICK_MS, fade_tick)
     return False
 
 
 def fade_tick():
+    outgoing = slots[fade_state["outgoing_slot"]]
+    incoming = slots[fade_state["incoming_slot"]]
+    if outgoing["mix_sink"] is None or incoming["mix_sink"] is None:
+        # Slot was retired mid-fade somehow; abort fade
+        print("[cutfade] fade_tick: slot mix_sink None; aborting",
+              file=sys.stderr)
+        fade_state["in_flight"] = False
+        return False
     elapsed_s = (
-        (GLib.get_monotonic_time() * 1000 - fade_state["start_ns"]) / 1e9
+        (GLib.get_monotonic_time() * 1000 - fade_state["start_ns"])
+        / 1e9
     )
     if elapsed_s >= FADE_S:
-        mix_sink_a.set_property("alpha", 0.0)
-        mix_sink_b.set_property("alpha", 1.0)
-        fade_state["in_flight"] = False
-        fade_state["done"] = True
-        print("[cutfade] FADE complete (alpha_a=0, alpha_b=1)",
-              file=sys.stderr)
+        outgoing["mix_sink"].set_property("alpha", 0.0)
+        incoming["mix_sink"].set_property("alpha", 1.0)
+        finish_fade()
         return False
     t = elapsed_s / FADE_S
-    mix_sink_a.set_property("alpha", 1.0 - t)
-    mix_sink_b.set_property("alpha", t)
+    outgoing["mix_sink"].set_property("alpha", 1.0 - t)
+    incoming["mix_sink"].set_property("alpha", t)
     return True
 
 
-# --- Instrument (minimal) -----------------------------------------------
+def finish_fade():
+    """Called when fade_tick reaches elapsed >= FADE_S. Swap which
+    slot is current, schedule retire of the old current, and attach
+    the next prime trigger to the new current."""
+    outgoing_idx = fade_state["outgoing_slot"]
+    incoming_idx = fade_state["incoming_slot"]
+    current_slot_idx[0] = incoming_idx
+    fade_state["in_flight"] = False
+    print(f"[cutfade] FADE complete; current is now slot "
+          f"{incoming_idx}; retiring slot {outgoing_idx}",
+          file=sys.stderr)
+    # Retire outgoing on a low-priority idle so the heavy NULL
+    # teardown does not compete with the new active stream's
+    # cold-start moment. Positional form (priority, callable,
+    # *args) is binding-version-portable; the `priority=` kwarg
+    # form is not.
+    GLib.idle_add(GLib.PRIORITY_LOW, retire_slot, outgoing_idx)
+    # Attach prime trigger to the new current.
+    attach_prime_trigger(incoming_idx)
 
-screen_state = {"frames": 0, "last_ns": 0, "max_gap_ms": 0.0}
+
+# --- Instrument + watchdog ---------------------------------------------
+
+screen_state = {"frames": 0, "last_ns": 0, "max_gap_ms": 0.0,
+                "boundary_warns_total": 0}
+
+try:
+    log_file = open("/tmp/cutfade_fps.log", "w", buffering=1)
+    log_file.write(f"# cutfade run start pid={os.getpid()}\n")
+    print("[cutfade] tee fps to /tmp/cutfade_fps.log "
+          "(truncated on open)", file=sys.stderr)
+except OSError as _exc:
+    log_file = None
+    print(f"[cutfade] /tmp/cutfade_fps.log unavailable ({_exc}); "
+          "stderr only", file=sys.stderr)
 
 
 def attach_screen_probe():
@@ -373,6 +644,8 @@ def attach_screen_probe():
             gap_ms = (now - last) / 1e6
             if gap_ms > screen_state["max_gap_ms"]:
                 screen_state["max_gap_ms"] = gap_ms
+            if gap_ms > 50:
+                screen_state["boundary_warns_total"] += 1
         screen_state["last_ns"] = now
         return Gst.PadProbeReturn.OK
     sink_pad.add_probe(Gst.PadProbeType.BUFFER, _probe)
@@ -383,23 +656,45 @@ _t_start = time.monotonic()
 
 def fps_tick():
     uptime = int(time.monotonic() - _t_start)
+    cur = current_slot_idx[0]
+    cur_label = slots[cur]["label"] or "-"
+    off = 1 - cur
+    off_label = slots[off]["label"] or "-"
+    fade_str = "in_flight" if fade_state["in_flight"] else "idle"
     line = (
         f"[fps] t={uptime} "
         f"screen={screen_state['frames']} "
         f"max_gap_ms={int(screen_state['max_gap_ms'])} "
-        f"gate={'yes' if gate_state['first_frame_seen'] else 'no'} "
-        f"fade={'done' if fade_state['done'] else ('in_flight' if fade_state['in_flight'] else 'pending')}"
+        f"cur={cur_label}(slot{cur}) "
+        f"off={off_label}(slot{off}) "
+        f"fade={fade_str} "
+        f"gap_warns_total={screen_state['boundary_warns_total']}"
     )
     print(line, file=sys.stderr, flush=True)
+    if log_file is not None:
+        try:
+            log_file.write(line + "\n")
+        except OSError:
+            pass
+    # Watchdog: 0 frames for 2 consecutive ticks -> force prime
+    if screen_state["frames"] == 0:
+        watchdog_state["zero_frame_seconds"] += 1
+        if watchdog_state["zero_frame_seconds"] >= WATCHDOG_STALL_S:
+            print("[cutfade] WATCHDOG: 0 frames for 2s -- "
+                  "force prime + re-PLAY", file=sys.stderr)
+            watchdog_state["zero_frame_seconds"] = 0
+            GLib.idle_add(prime_next)
+            GLib.idle_add(
+                lambda: pipeline.set_state(Gst.State.PLAYING) or False
+            )
+    else:
+        watchdog_state["zero_frame_seconds"] = 0
     screen_state["frames"] = 0
     screen_state["max_gap_ms"] = 0.0
     return True
 
 
 # --- Bus + signals + run -----------------------------------------------
-
-loop = GLib.MainLoop()
-
 
 def on_bus(_bus, msg):
     if msg.type == Gst.MessageType.ERROR:
@@ -411,7 +706,10 @@ def on_bus(_bus, msg):
             print(f"[cutfade]  debug: {dbg}", file=sys.stderr)
         loop.quit()
     elif msg.type == Gst.MessageType.EOS:
-        print("[cutfade] pipeline EOS (one-shot POC ends here)",
+        # Should not happen -- each clip's EOS is absorbed by the
+        # fade-then-retire cycle. If it reaches the bus, something
+        # escaped. Watchdog also catches it.
+        print("[cutfade] pipeline EOS (unexpected)",
               file=sys.stderr)
         loop.quit()
 
@@ -428,16 +726,23 @@ def shutdown(*_):
 signal.signal(signal.SIGINT, shutdown)
 signal.signal(signal.SIGTERM, shutdown)
 
-print("==RUN-START== cutfade POC", file=sys.stderr)
+
+# --- Initial setup + run ------------------------------------------------
+
+print("==RUN-START== cutfade", file=sys.stderr)
 print(f"[cutfade] PRIME_LEAD_S={PRIME_LEAD_S} FADE_S={FADE_S} "
       f"GATE_DEADLINE_MS={GATE_DEADLINE_MS} sink={SINK_CHOICE}",
       file=sys.stderr)
 
+# Build the initial slot (slot 0, VIDEOS[0]) before going PLAYING.
+build_slot(0, next_clip_idx[0])
+next_clip_idx[0] += 1
+slots[0]["mix_sink"].set_property("alpha", 1.0)
+slots[0]["mix_sink"].set_property("zorder", 0)
+
 # Preroll the pipeline.
 if pipeline.set_state(Gst.State.PAUSED) == Gst.StateChangeReturn.FAILURE:
     die("set_state PAUSED failed")
-# Poll for preroll with budget (GL cold-start under systemd can take
-# 10-20s).
 prerolled = False
 for elapsed in range(1, PREROLL_BUDGET_S + 1):
     ret, cur, pending = pipeline.get_state(1 * Gst.SECOND)
@@ -463,12 +768,18 @@ if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
     die("set_state PLAYING failed")
 
 attach_screen_probe()
+# Attach the first prime trigger on the initial slot. May reschedule
+# itself if the demuxer's video src pad isn't ready yet.
+attach_prime_trigger(0)
 GLib.timeout_add(1000, fps_tick)
-# Schedule the prime to fire PRIME_LEAD_S into A's playback.
-GLib.timeout_add(int(PRIME_LEAD_S * 1000), prime_incoming)
 
 try:
     loop.run()
 finally:
     print("[cutfade] shutdown -> NULL", file=sys.stderr)
     pipeline.set_state(Gst.State.NULL)
+    if log_file is not None:
+        try:
+            log_file.close()
+        except OSError:
+            pass
