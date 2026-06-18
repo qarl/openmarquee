@@ -288,6 +288,10 @@ def add_next_clip():
 
     sub.sync_state_with_parent()
     live_subgraph_count[0] += 1
+    # Stamp the boundary timestamp so subsequent GAP-WARNs within
+    # BOUNDARY_PROXIMITY_MS are tagged BOUNDARY (i.e. the sub-bin
+    # build spike) rather than INTERIOR (steady pacing).
+    last_boundary_ns[0] = time.monotonic_ns()
     print(f"[cutloop] queued bin {serial} = {asset_name} "
           f"(live_bins={live_subgraph_count[0]} "
           f"playlist_added={playlist_added_count[0]})",
@@ -342,6 +346,10 @@ def retire_subgraph(sub_bin, concat_sink_pad, qtdemux_elem,
         pipeline.remove(sub_bin)
         concat.release_request_pad(concat_sink_pad)
         live_subgraph_count[0] -= 1
+        # Stamp the boundary timestamp so subsequent GAP-WARNs are
+        # tagged BOUNDARY -- retire (NULL state-change) is also on
+        # the hot path and can spike the single core.
+        last_boundary_ns[0] = time.monotonic_ns()
         print(f"[cutloop] retire {name} "
               f"(live_bins={live_subgraph_count[0]})",
               file=sys.stderr)
@@ -372,7 +380,19 @@ for _ in range(INITIAL_QUEUE_DEPTH):
 
 counter = {"frames": 0, "last_ns": 0, "max_gap_ms": 0.0,
            "dec_frames": 0, "dec_last_ns": 0, "dec_max_gap_ms": 0.0,
-           "boundary_warns_total": 0}
+           "boundary_warns_total": 0,
+           "gap_warns_boundary": 0,
+           "gap_warns_interior": 0}
+
+# Per QA: tag each GAP-WARN with whether it falls within
+# BOUNDARY_PROXIMITY_MS of the most recent add_next_clip or
+# retire_subgraph call. If clustered at boundaries: sub-bin
+# build/retire is spiking the single core (fix = move work off
+# the hot path). If uniform/interior: kmssink/queue pacing on
+# one core (fix = deeper jitter queue). The split-counter in
+# the [fps] line tells us which.
+BOUNDARY_PROXIMITY_MS = 200
+last_boundary_ns = [0]  # monotonic ns of most recent add/retire
 
 # Watchdog state: if kmssink.sink sees 0 frames for 2 consecutive
 # seconds, concat queue may have run dry and the pipeline EOSed.
@@ -405,9 +425,22 @@ def attach_kmssink_probe():
                 counter["max_gap_ms"] = gap_ms
             if gap_ms > GAP_WARN_MS:
                 counter["boundary_warns_total"] += 1
+                # Tag per QA: BOUNDARY if within
+                # BOUNDARY_PROXIMITY_MS of the most recent
+                # add_next_clip or retire_subgraph; else INTERIOR.
+                since_boundary_ms = (
+                    (now - last_boundary_ns[0]) / 1e6
+                    if last_boundary_ns[0] else float("inf")
+                )
+                if since_boundary_ms < BOUNDARY_PROXIMITY_MS:
+                    counter["gap_warns_boundary"] += 1
+                    tag = (f"BOUNDARY (+{since_boundary_ms:.0f}ms "
+                           "since add/retire)")
+                else:
+                    counter["gap_warns_interior"] += 1
+                    tag = "INTERIOR (steady pacing)"
                 print(f"[cutloop] GAP-WARN {gap_ms:.0f}ms "
-                      f"(> {GAP_WARN_MS}ms threshold; this is the "
-                      "boundary stall qarl wants verified absent)",
+                      f"(> {GAP_WARN_MS}ms threshold) {tag}",
                       file=sys.stderr)
         counter["last_ns"] = now
         return Gst.PadProbeReturn.OK
@@ -450,7 +483,9 @@ def fps_tick():
             f"(g{int(counter['max_gap_ms'])}) "
             f"live_bins={live_subgraph_count[0]} "
             f"total_added={playlist_added_count[0]} "
-            f"gap_warns_total={counter['boundary_warns_total']}")
+            f"gap_warns_total={counter['boundary_warns_total']} "
+            f"gap_boundary={counter['gap_warns_boundary']} "
+            f"gap_interior={counter['gap_warns_interior']}")
     print(line, file=sys.stderr, flush=True)
     if log_file is not None:
         try:
