@@ -605,12 +605,15 @@ def finish_fade():
     print(f"[cutfade] FADE complete; current is now slot "
           f"{incoming_idx}; retiring slot {outgoing_idx}",
           file=sys.stderr)
-    # Retire outgoing on a low-priority idle so the heavy NULL
-    # teardown does not compete with the new active stream's
-    # cold-start moment. Positional form (priority, callable,
-    # *args) is binding-version-portable; the `priority=` kwarg
-    # form is not.
-    GLib.idle_add(GLib.PRIORITY_LOW, retire_slot, outgoing_idx)
+    # Retire outgoing on next idle. QA caught my prior soak-killer:
+    # GLib.idle_add(GLib.PRIORITY_LOW, callable, ...) raises
+    # TypeError on this PyGObject ("Callback needs to be a function
+    # or method not int") -- the canonical PyGObject signature is
+    # function-first, with priority as a kwarg. Per QA's
+    # simplest/safest: drop the priority entirely. retire workload
+    # is small (NULL teardown of a single sub-bin) so default
+    # priority is fine.
+    GLib.idle_add(retire_slot, outgoing_idx)
     # Attach prime trigger to the new current.
     attach_prime_trigger(incoming_idx)
 
