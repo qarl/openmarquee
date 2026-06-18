@@ -79,16 +79,14 @@ from gi.repository import GLib, Gst  # noqa: E402
 # /var/openmarquee/content/<uuid>/, sorted by path for stable cycle
 # order. Per QA pre-flight all 17 current assets are uniform
 # (h264 Main 1280x720 24fps) so the single long-lived v4l2h264dec
-# + concat handles them identically to the 2-clip A->B test.
-# Auto-includes future additions. Cycle is clip0->clip1->...->clipN
-# ->clip0; full loop ~100s for 17 clips averaging 6s each.
+# + concat handles them identically to the 2-clip A->B test --
+# no resolution reconfigure / no encode-change risk per source
+# boundary. Auto-includes future additions. INITIAL_QUEUE_DEPTH=2
+# stays regardless of playlist length so CMA is unchanged.
 CONTENT_GLOB = "/var/openmarquee/content/*/asset.mp4"
 VIDEOS = sorted(glob.glob(CONTENT_GLOB))
 DW, DH = 1280, 720
-GAP_WARN_MS = 60  # per QA: 50ms was too tight for 24fps's 41.7ms
-                  # interval -- 98% of warns were 50-55ms benign
-                  # threshold-clipping. 60ms catches real >1-frame
-                  # hitches without the noise.
+GAP_WARN_MS = 50
 # Per QA QUEUE-AHEAD INVARIANT: ALWAYS keep >=1 pad pending ahead of
 # current. Pre-queue both playlist clips at startup; on each EOS the
 # probe eagerly schedules add_next_clip so the queue stays at >=1
@@ -278,65 +276,34 @@ def add_next_clip():
     # the sub-bin ghost. When concat sees EOS on this sink pad, it
     # switches away to the next pending sink pad and ABSORBS the
     # EOS internally -- no downstream EOS, no STREAMOFF on the
-    # decoder. Schedules RETIRE this subgraph via LOW-priority
-    # idle so the NULL teardown work does NOT compete with active
-    # streaming at the boundary instant. The next-clip ADD is NOT
-    # scheduled here -- it was already scheduled by the eager pre-
-    # build probe (below) when THIS bin became active. So at the
-    # boundary, no add/build CPU spike either; only the low-pri
-    # retire which can run any time during the next clip.
+    # decoder. The probe schedules two main-thread ops via
+    # idle_add: (a) RETIRE this subgraph (NULL state, remove from
+    # pipeline, release concat request pad, AND disconnect the
+    # qtdemux pad-added handler + remove this probe so the
+    # closures release the sub-bin), and (b) ADD the next playlist
+    # clip to keep the queue-ahead invariant.
     eos_probe_id = None  # filled in below
 
     def _on_concat_sink_event(_pad, info):
         ev = info.get_event()
         if ev and ev.type == Gst.EventType.EOS:
             print(f"[cutloop] concat sink EOS from bin {serial} "
-                  f"({asset_name}) -> retire (low-pri)",
+                  f"({asset_name}) -> retire + queue next",
                   file=sys.stderr)
             # Pass IDs needed for clean retire (disconnect signal +
             # remove probe so closures release the sub-bin). Per QA
             # leak analysis: without these, set_state(NULL) +
             # pipeline.remove + release_request_pad alone leaks.
-            # priority=PRIORITY_LOW: defer the actual NULL/remove
-            # off the boundary hot path.
             GLib.idle_add(retire_subgraph, sub, concat_sink,
-                          qtdemux, pad_added_id, eos_probe_id,
-                          priority=GLib.PRIORITY_LOW)
+                          qtdemux, pad_added_id, eos_probe_id)
+            GLib.idle_add(add_next_clip)
         return Gst.PadProbeReturn.OK
     eos_probe_id = concat_sink.add_probe(
         Gst.PadProbeType.EVENT_DOWNSTREAM, _on_concat_sink_event
     )
 
-    # EAGER PRE-BUILD per QA case-(I) fix: a BUFFER probe on the
-    # same concat sink pad fires once on the FIRST buffer through
-    # this sub-bin (= concat just switched TO this bin = this bin
-    # is now active). At that moment we schedule add_next_clip so
-    # the NEXT-NEXT sub-bin's parse_launch + element creation +
-    # sync_state happens MID-CLIP (calm streaming, idle CPU), not
-    # AT THE BOUNDARY where it competes with the active streaming
-    # threads on the single-core path. The probe removes itself
-    # after the first fire to avoid spinning per-frame.
-    prebuild_fired = [False]
-
-    def _on_concat_sink_buffer(_pad, _info):
-        if not prebuild_fired[0]:
-            prebuild_fired[0] = True
-            print(f"[cutloop] bin {serial} ({asset_name}) became "
-                  "active -> eager pre-build next",
-                  file=sys.stderr)
-            GLib.idle_add(add_next_clip)
-            return Gst.PadProbeReturn.REMOVE
-        return Gst.PadProbeReturn.OK
-    concat_sink.add_probe(
-        Gst.PadProbeType.BUFFER, _on_concat_sink_buffer
-    )
-
     sub.sync_state_with_parent()
     live_subgraph_count[0] += 1
-    # Stamp the boundary timestamp so subsequent GAP-WARNs within
-    # BOUNDARY_PROXIMITY_MS are tagged BOUNDARY (i.e. the sub-bin
-    # build spike) rather than INTERIOR (steady pacing).
-    last_boundary_ns[0] = time.monotonic_ns()
     print(f"[cutloop] queued bin {serial} = {asset_name} "
           f"(live_bins={live_subgraph_count[0]} "
           f"playlist_added={playlist_added_count[0]})",
@@ -391,10 +358,6 @@ def retire_subgraph(sub_bin, concat_sink_pad, qtdemux_elem,
         pipeline.remove(sub_bin)
         concat.release_request_pad(concat_sink_pad)
         live_subgraph_count[0] -= 1
-        # Stamp the boundary timestamp so subsequent GAP-WARNs are
-        # tagged BOUNDARY -- retire (NULL state-change) is also on
-        # the hot path and can spike the single core.
-        last_boundary_ns[0] = time.monotonic_ns()
         print(f"[cutloop] retire {name} "
               f"(live_bins={live_subgraph_count[0]})",
               file=sys.stderr)
@@ -425,19 +388,7 @@ for _ in range(INITIAL_QUEUE_DEPTH):
 
 counter = {"frames": 0, "last_ns": 0, "max_gap_ms": 0.0,
            "dec_frames": 0, "dec_last_ns": 0, "dec_max_gap_ms": 0.0,
-           "boundary_warns_total": 0,
-           "gap_warns_boundary": 0,
-           "gap_warns_interior": 0}
-
-# Per QA: tag each GAP-WARN with whether it falls within
-# BOUNDARY_PROXIMITY_MS of the most recent add_next_clip or
-# retire_subgraph call. If clustered at boundaries: sub-bin
-# build/retire is spiking the single core (fix = move work off
-# the hot path). If uniform/interior: kmssink/queue pacing on
-# one core (fix = deeper jitter queue). The split-counter in
-# the [fps] line tells us which.
-BOUNDARY_PROXIMITY_MS = 200
-last_boundary_ns = [0]  # monotonic ns of most recent add/retire
+           "boundary_warns_total": 0}
 
 # Watchdog state: if kmssink.sink sees 0 frames for 2 consecutive
 # seconds, concat queue may have run dry and the pipeline EOSed.
@@ -470,22 +421,9 @@ def attach_kmssink_probe():
                 counter["max_gap_ms"] = gap_ms
             if gap_ms > GAP_WARN_MS:
                 counter["boundary_warns_total"] += 1
-                # Tag per QA: BOUNDARY if within
-                # BOUNDARY_PROXIMITY_MS of the most recent
-                # add_next_clip or retire_subgraph; else INTERIOR.
-                since_boundary_ms = (
-                    (now - last_boundary_ns[0]) / 1e6
-                    if last_boundary_ns[0] else float("inf")
-                )
-                if since_boundary_ms < BOUNDARY_PROXIMITY_MS:
-                    counter["gap_warns_boundary"] += 1
-                    tag = (f"BOUNDARY (+{since_boundary_ms:.0f}ms "
-                           "since add/retire)")
-                else:
-                    counter["gap_warns_interior"] += 1
-                    tag = "INTERIOR (steady pacing)"
                 print(f"[cutloop] GAP-WARN {gap_ms:.0f}ms "
-                      f"(> {GAP_WARN_MS}ms threshold) {tag}",
+                      f"(> {GAP_WARN_MS}ms threshold; this is the "
+                      "boundary stall qarl wants verified absent)",
                       file=sys.stderr)
         counter["last_ns"] = now
         return Gst.PadProbeReturn.OK
@@ -528,9 +466,7 @@ def fps_tick():
             f"(g{int(counter['max_gap_ms'])}) "
             f"live_bins={live_subgraph_count[0]} "
             f"total_added={playlist_added_count[0]} "
-            f"gap_warns_total={counter['boundary_warns_total']} "
-            f"gap_boundary={counter['gap_warns_boundary']} "
-            f"gap_interior={counter['gap_warns_interior']}")
+            f"gap_warns_total={counter['boundary_warns_total']}")
     print(line, file=sys.stderr, flush=True)
     if log_file is not None:
         try:
