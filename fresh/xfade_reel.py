@@ -625,21 +625,29 @@ def add_next_clip(stream_id):
                 print(f"[xfade] {stream_id} EOS bin {serial} "
                       "WARN sub_bin not at queue front; "
                       "filtered.", file=sys.stderr)
-            # ALWAYS schedule_add so concat stays fed (cutloop
-            # queue-ahead invariant). Per QA a84cee9 cross-
-            # stream serialization, this routes through the
-            # global next-allowed gate.
-            schedule_add(stream_id)
+            # GATE schedule_add on NOT is_visible. Per QA
+            # af85b3a soak: while a stream is VISIBLE the
+            # seek-loop replays the current front sub-bin in
+            # place; queueing AHEAD adds extra sub-bins that
+            # accumulate (live_A=3 observed) and the cutloop-
+            # style EOS-then-switch races the seek-loop -> SEGV
+            # at ~14s in. Visible stream NEVER gets queue-ahead.
+            # Hidden stream resumes normal cutloop pattern.
+            # _remove_seek_loop_probe tops off the queue on
+            # transition to hidden so the new hidden stream has
+            # a pending sub-bin ready.
+            if not is_visible:
+                schedule_add(stream_id)
+            else:
+                print(f"[xfade] {stream_id} schedule_add "
+                      "SUPPRESSED (visible; seek-loop holds "
+                      "the visible clip in place, no queue-"
+                      "ahead needed)", file=sys.stderr)
             # Per QA a84cee9 visible-stream-protection: gate
-            # the retire on visibility. If this stream is
-            # currently the visible one, the retire's
-            # set_state(NULL) + pipeline.remove +
+            # the retire on visibility. While visible, defer
+            # the retire (set_state(NULL) + pipeline.remove +
             # release_request_pad on concat stalls the
-            # aggregator on-screen (377ms hitch observed on
-            # 7561fac soak at t=22, A visible, live_A 2->1).
-            # qarl's principle: NEVER touch the visible stream.
-            # Queue the retire args for processing AFTER the
-            # next crossfade hides this stream.
+            # aggregator on-screen).
             retire_args = {
                 "sub": sub, "concat_sink": concat_sink,
                 "qtdemux": qtdemux,
@@ -1012,19 +1020,35 @@ def _install_seek_loop_probe(stream_id):
             st["seeking"] = False
         if not st["seeking"] and pts >= thr:
             st["seeking"] = True
-            ok = sb.seek(
-                1.0, Gst.Format.TIME,
-                (Gst.SeekFlags.SEGMENT
-                 | Gst.SeekFlags.KEY_UNIT),
-                Gst.SeekType.SET, 0,
-                Gst.SeekType.SET, dn,
-            )
             st["seek_count"] += 1
-            print(f"[xfade] SEEK-LOOP {sid}: non-flushing "
-                  f"SEGMENT seek at pts={pts/1e9:.2f}s "
-                  f"thr={thr/1e9:.2f}s ok={ok} "
-                  f"count={st['seek_count']}",
-                  file=sys.stderr)
+            # DEFER the seek call to the main loop via
+            # GLib.idle_add. Per QA af85b3a SEGV: calling
+            # Gst.Element.seek() from the streaming thread
+            # (this buffer probe runs on it) can deadlock /
+            # corrupt state when the seek's internal flush
+            # needs to wait for the very thread it's called
+            # from. Main-loop deferral is the canonical
+            # gstreamer-python pattern for "seek from a probe
+            # callback".
+            count_at_fire = st["seek_count"]
+            pts_at_fire = pts
+
+            def _do_seek():
+                ok = sb.seek(
+                    1.0, Gst.Format.TIME,
+                    (Gst.SeekFlags.SEGMENT
+                     | Gst.SeekFlags.KEY_UNIT),
+                    Gst.SeekType.SET, 0,
+                    Gst.SeekType.SET, dn,
+                )
+                print(f"[xfade] SEEK-LOOP {sid}: non-flushing "
+                      f"SEGMENT seek "
+                      f"pts_at_fire={pts_at_fire/1e9:.2f}s "
+                      f"thr={thr/1e9:.2f}s ok={ok} "
+                      f"count={count_at_fire}",
+                      file=sys.stderr)
+                return False
+            GLib.idle_add(_do_seek)
         return Gst.PadProbeReturn.OK
 
     def _on_event(_pad, info, sid=stream_id):
@@ -1060,10 +1084,17 @@ def _install_seek_loop_probe(stream_id):
 
 def _remove_seek_loop_probe(stream_id):
     """Remove the SEEK-LOOP buffer + event probes. Called when
-    the stream transitions visible -> hidden; the next natural
+    the stream transitions visible -> hidden. The next natural
     EOS will propagate to concat normally and the cutloop-style
     retire + queue-next cycle resumes for the hidden-stream
-    clip advance."""
+    clip advance.
+
+    Tops off sub_bin_queue if shorter than INITIAL_QUEUE_DEPTH.
+    While the stream was visible, EOS-probe schedule_add was
+    suppressed; the queue may have shrunk if any sub-bin got
+    EOS-popped without a replacement. Add one now so the
+    hidden-stream cutloop pattern starts with the queue-ahead
+    invariant (>=1 pending) held."""
     s = streams[stream_id]
     buf_id = s.get("seek_loop_buffer_probe_id")
     evt_id = s.get("seek_loop_event_probe_id")
@@ -1086,8 +1117,18 @@ def _remove_seek_loop_probe(stream_id):
     s["seek_loop_ghost"] = None
     if s.get("seek_loop_state"):
         s["seek_loop_state"]["seeking"] = False
-    print(f"[xfade] SEEK-LOOP removed from {stream_id}",
+    print(f"[xfade] SEEK-LOOP removed from {stream_id} "
+          f"queue_len={len(s['sub_bin_queue'])}",
           file=sys.stderr)
+    # Top off the queue if shrunk during the visible turn.
+    # Aim for INITIAL_QUEUE_DEPTH so cutloop's >=1 pending
+    # invariant holds when the hidden-stream cycle resumes.
+    while len(s["sub_bin_queue"]) < INITIAL_QUEUE_DEPTH:
+        print(f"[xfade] SEEK-LOOP {stream_id} queue top-off: "
+              f"adding sub-bin (queue_len="
+              f"{len(s['sub_bin_queue'])} < "
+              f"{INITIAL_QUEUE_DEPTH})", file=sys.stderr)
+        add_next_clip(stream_id)
 
 
 def _process_pending_retires(stream_id):
