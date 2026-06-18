@@ -140,14 +140,15 @@ if gl_context is None:
     die("GstGL.GLContext.new() returned None")
 if not gl_context.create(None):
     die("gl_context.create() failed (EGL/GBM unavailable?)")
-# Register the GLContext with the GLDisplay so elements that
-# discover shared contexts via the display (rather than via the
-# bus need-context handshake) ALSO see ours. Belt-and-suspenders:
-# if the bus app_context structure-set is broken on this PyGObject
-# (the 3e7167f bug), some elements may still find the gl_context
-# through the display. The fix in _on_sync_message still
-# FATAL-exits on bus-reply failure so we don't silently rely on
-# this fallback.
+# Register the GLContext with the GLDisplay so elements
+# discover shared contexts via the display. Per QA c85d312
+# soak: gst 1.26 / PyGObject 3.42's StructureWrapper is
+# READ-ONLY (no Python method writes 'context' into it), so
+# the app_context bus reply is a dead end on this stack. The
+# display-add path is now LOAD-BEARING -- _on_sync_message's
+# app_context branch warns + skips when the structure-set
+# fails, relying on this registration for the actual
+# context sharing.
 try:
     gl_display.add_context(gl_context)
     print("[probe] gl_display.add_context(gl_context) OK",
@@ -175,52 +176,62 @@ def _on_sync_message(_bus, msg, _user_data):
         print(f"[probe] provided GLDisplay to {src_name}",
               file=sys.stderr)
     elif ctx_type == "gst.gl.app_context":
+        # Per QA c85d312 soak: on gst 1.26 / PyGObject 3.42 the
+        # wrapper returned by ctx.writable_structure() is a READ-
+        # ONLY `StructureWrapper` (dir() = only the mangled
+        # `_StructureWrapper__structure`). NO Python method can
+        # write 'context' into it -- set_value, __setitem__, and
+        # set all fail. The pure-Python app_context bus reply
+        # path is therefore a DEAD END on this stack.
+        #
+        # BUT gl_display.add_context(gl_context) succeeded at
+        # startup, AND the GLDisplay branch of this handler is
+        # working. GstGL creates each element's GLContext SHARED
+        # with contexts already registered on the shared
+        # GLDisplay. So elements may pick up our shared context
+        # via the display WITHOUT the app_context bus reply.
+        #
+        # Strategy: WARN + SKIP the app_context reply (NON-FATAL).
+        # If display-based sharing alone is sufficient, the soak
+        # passes (screen ~24 + pushed ~24 + pulled ~24). If
+        # display sharing is insufficient (pushed >0 but screen=0
+        # or garbage), QA dispatches the ctypes path next round.
         ctx = Gst.Context.new("gst.gl.app_context", True)
         s = ctx.writable_structure()
-        # PyGObject binding bug per QA 3e7167f soak: on gst 1.26
-        # the wrapper returned by writable_structure() may be a
-        # `StructureWrapper` boxed proxy that LACKS set_value
-        # (the Gst.Structure override's __setitem__ +
-        # set_value methods don't apply to the boxed return).
-        # Try multiple known idioms; FATAL-exit if none work.
         worked = _set_app_context_via_pygobject(s, gl_context,
                                                 src_name)
         if worked is None:
-            print("[probe] FATAL no PyGObject method available "
-                  "to set 'context' on the app_context Gst."
-                  "Structure -- shared-context wiring is "
-                  "BROKEN. Aborting now rather than running a "
-                  "black soak. Tried: set_value, __setitem__, "
-                  "set. dir() of wrapper:", file=sys.stderr)
-            # Keep dunders visible -- we are specifically debugging
-            # whether the override's __setitem__ is applied to this
-            # wrapper class. Only filter `__` true-dunders that
-            # add no signal (e.g. __class__, __doc__).
+            # All three Python methods failed. Display path takes
+            # over. Log the diagnostic once (per element) so we
+            # can confirm the StructureWrapper class + dir() in
+            # the soak log, then SKIP the bus reply.
+            print("[probe] WARN no PyGObject method to set "
+                  "'context' on app_context structure -- "
+                  "tried set_value, __setitem__, set. "
+                  "SKIPPING app_context bus reply; relying on "
+                  "gl_display.add_context() for sharing.",
+                  file=sys.stderr)
             print(f"[probe]   class={type(s).__name__} "
                   f"dir={[m for m in dir(s) if not m.startswith('__')]}",
                   file=sys.stderr)
-            sys.exit(2)
-        # Verify the round-trip via the CONTEXT's own structure
-        # (not the writable_structure() return), so we catch the
-        # case where writable_structure() returned a transient
-        # proxy and the set mutated a copy detached from `ctx`.
-        # If that happened, ctx.get_structure() would NOT hold the
-        # field even though `s.get_value` does.
+            return Gst.BusSyncReply.PASS
+        # Set succeeded via one of the methods. Verify the
+        # round-trip via the CONTEXT's own structure (not the
+        # writable_structure return), so we catch the case where
+        # writable_structure was a transient proxy and the set
+        # mutated a copy detached from `ctx`.
         roundtrip_msg = "unverified"
         try:
             ctx_struct = ctx.get_structure()
             if hasattr(ctx_struct, "get_value"):
                 got = ctx_struct.get_value("context")
                 if got is None:
-                    print(f"[probe] FATAL app_context set via "
-                          f"{worked} did NOT round-trip via "
-                          "ctx.get_structure().get_value("
-                          "'context') -> None. The writable "
-                          "structure was likely a transient "
-                          "proxy detached from ctx; the field "
-                          "did not propagate. Aborting now.",
+                    print(f"[probe] WARN app_context set via "
+                          f"{worked} did NOT round-trip "
+                          "(transient proxy?). SKIPPING bus "
+                          "reply; relying on display path.",
                           file=sys.stderr)
-                    sys.exit(2)
+                    return Gst.BusSyncReply.PASS
                 roundtrip_msg = "ok via ctx.get_structure()"
             else:
                 roundtrip_msg = (
