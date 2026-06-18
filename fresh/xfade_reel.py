@@ -64,7 +64,7 @@ ARCHITECTURE:
                                                 glvideomixer mix
                                                         |
                                                         v
-                                                glimagesink sync=true
+                                                glimagesink sync=false
 
 CROSSFADE SCHEDULING (v2: clip-gated linger, per QA glass):
   v1's fixed 4s TARGET_VISIBLE_S fired mid-clip and produced
@@ -330,18 +330,14 @@ if mix is None:
     die("glvideomixer factory returned None")
 if sink is None:
     die("glimagesink factory returned None")
-# sync=True per QA 446511d burst-regression diagnosis:
-# bcm2835 v4l2h264dec decodes each 4.75s clip in a ~1s burst then
-# idles ~2.6s. With sync=False the sink presents as fast as buffers
-# arrive; mid-burst the screen is fast, post-burst it starves --
-# screen rate becomes 22 -> 39 -> stall (bursty). cutloop ships
-# kmssink sync=True and is smooth because the sink PTS-paces the
-# whole chain to a steady 24fps and the decoder runs a few frames
-# ahead to cover wrap IDR-decode. Match the proven pacing model
-# here. glvideomixer is an aggregator; it composites at its src
-# caps framerate (24fps) regardless of sink pacing; sync=True at
-# the sink applies its PTS-wait at presentation.
-sink.set_property("sync", True)
+# sync=False (8e2215e baseline). 12458ae tried sync=True per the
+# cutloop-pattern hypothesis; QA glass-soak showed it brought BACK
+# the drain-crash at the first crossfade (sync pacing changes EOS
+# propagation so the crossfade force-EOS path drains to pipeline-
+# EOS even with the pre-fortify guard) AND was still hitchy (12%
+# smooth). Reverted to 8e2215e behavior (our BEST so far: stable 8
+# crossfades, 66% smooth, 264ms worst wrap-hitch).
+sink.set_property("sync", False)
 for el in (mix, sink):
     pipeline.add(el)
 if not mix.link(sink):
@@ -373,17 +369,10 @@ def _build_stream(label, mix_sink_idx):
     # Time-based queue (~600ms by default) between dec and
     # glupload. Bridges the wrap underrun at concat sub-bin
     # advances. max-size-bytes and max-size-buffers = 0
-    # (disabled) so only time gates the cap. Non-leaky (default):
-    # decoder runs faster than mixer-pull-rate, fills queue to
-    # cap; at wrap dec briefly pauses, queue feeds mixer from
-    # its buffered frames.
-    # leaky=DOWNSTREAM was tried on 446511d and REGRESSED:
-    # bcm2835 v4l2h264dec decodes each 4.75s clip in a ~1s
-    # BURST then idles ~2.6s waiting for next sub-bin. With
-    # leaky=2 the queue retains only the newest 700ms and the
-    # inter-burst gap STARVES the visible path (QA probes
-    # showed outq_frames=0 across whole seconds, screen-gap
-    # 762ms). Reverted to non-leaky per QA 446511d soak.
+    # (disabled) so only time gates the cap. Non-leaky
+    # (default): decoder fills queue to cap then back-pressures;
+    # at wrap, dec briefly pauses, queue feeds mixer from its
+    # buffered frames. 8e2215e baseline behavior.
     queue.set_property("max-size-time", RESERVOIR_TIME_NS)
     queue.set_property("max-size-bytes", 0)
     queue.set_property("max-size-buffers", 0)
@@ -1064,43 +1053,43 @@ sink_pad_for_probe.add_probe(
 )
 
 
-# Wrap-hitch instrumentation per QA 8e2215e dispatch. Three probes
-# localize where the underrun is:
-#   outq_<sid>.src: per-stream queue output (downstream of dec,
-#       upstream of glupload). If gaps here, dec/queue is starving.
-#   mix.sink_0 / mix.sink_1: per-pad arrival at the aggregator.
-#       If steady but screen has gaps, glupload is the bottleneck.
-#   mix.src: mixer output rate. Should be ~24fps steady.
-# Per-second [probe] lines emitted in fps_tick interpret as:
-#   outq>=mix.sink>=mix.src steady AND screen gaps -> sink-side.
-#   outq has gaps -> dec/queue starvation (the wrap underrun).
-for sid in ("A", "B"):
-    s = streams[sid]
-    s["outq_probe_state"] = {
-        "frames": 0, "last_ns": 0, "max_gap_ms": 0.0
-    }
-    outq_src = s["queue"].get_static_pad("src")
-    if outq_src is None:
-        die(f"outq_{sid} has no src pad")
-    outq_src.add_probe(
-        Gst.PadProbeType.BUFFER,
-        _make_gap_probe(s["outq_probe_state"])
-    )
-    s["mixsink_probe_state"] = {
-        "frames": 0, "last_ns": 0, "max_gap_ms": 0.0
-    }
-    s["mix_pad"].add_probe(
-        Gst.PadProbeType.BUFFER,
-        _make_gap_probe(s["mixsink_probe_state"])
-    )
+# Main-loop-stall detector per QA 12458ae dispatch. The 3 heavy
+# per-buffer probes from 446511d CONTAMINATED the measurement:
+# 4 pads x 2 streams x 24fps = ~192 Python-callback fires/sec
+# adding GIL load that's itself burstier at retire/re-add moments,
+# making the instrumented soak look worse (6%) than uninstrumented
+# 8e2215e (66%). Replace with a single low-frequency timer that
+# logs ONLY when its actual wall-clock interval overruns a
+# threshold = the GLib main thread was blocked that long. Near-
+# zero overhead (one timer, logs only on overrun). If overruns
+# correlate with the wrap-hitch seconds, the retire/re-add path
+# IS blocking the main thread and a non-blocking refactor is the
+# next fix. If main loop is smooth but screen still hitches, the
+# hitch is in the GL/decode path (different fix).
+STALL_CHECK_INTERVAL_MS = 20
+STALL_THRESHOLD_MS = int(os.environ.get(
+    "OPENMARQUEE_XFADE_STALL_THRESHOLD_MS", "50"
+))
+stall_state = {"last_ns": 0, "overruns_this_sec": 0,
+                "max_overrun_ms": 0}
 
-mix_src_probe_state = {"frames": 0, "last_ns": 0, "max_gap_ms": 0.0}
-mix_src_pad = mix.get_static_pad("src")
-if mix_src_pad is None:
-    die("mix has no src pad")
-mix_src_pad.add_probe(
-    Gst.PadProbeType.BUFFER, _make_gap_probe(mix_src_probe_state)
-)
+
+def _stall_check():
+    now = time.monotonic_ns()
+    last = stall_state["last_ns"]
+    if last:
+        interval_ms = (now - last) / 1e6
+        if interval_ms > STALL_THRESHOLD_MS:
+            stall_state["overruns_this_sec"] += 1
+            if interval_ms > stall_state["max_overrun_ms"]:
+                stall_state["max_overrun_ms"] = int(interval_ms)
+            uptime = int(time.monotonic() - _t_start)
+            print(f"[stall] t={uptime} interval={int(interval_ms)}ms "
+                  f"over threshold={STALL_THRESHOLD_MS}ms "
+                  f"(main GLib thread was blocked)",
+                  file=sys.stderr, flush=True)
+    stall_state["last_ns"] = now
+    return True
 
 
 def _cma_free_kb():
@@ -1162,38 +1151,18 @@ def fps_tick():
         f"CmaFree_min_kB={cma_min_str}"
     )
     print(line, file=sys.stderr, flush=True)
-    # Wrap-hitch localization probes (per QA 8e2215e dispatch).
-    # Each line gives frames-this-second + worst inter-buffer gap (ms)
-    # at that probe point. Read pattern at a wrap-hitch second:
-    #   outq_A gap >> mix_src gap -> dec/queue underrun on A.
-    #   outq_A gap == mix_sink_A gap -> glupload passthrough; problem
-    #     is upstream of glupload (queue underrun confirmed).
-    #   outq_A small AND mix_sink_A large -> glupload bottleneck.
-    #   all small AND mix_src small AND screen_gap large -> sink/
-    #     glimagesink anomaly (unlikely).
-    for sid in ("A", "B"):
-        st_outq = streams[sid]["outq_probe_state"]
-        st_mix = streams[sid]["mixsink_probe_state"]
-        print(
-            f"[probe] t={uptime} {sid} "
-            f"outq_frames={st_outq['frames']} "
-            f"outq_max_gap_ms={int(st_outq['max_gap_ms'])} "
-            f"mix_sink_frames={st_mix['frames']} "
-            f"mix_sink_max_gap_ms={int(st_mix['max_gap_ms'])}",
-            file=sys.stderr, flush=True
-        )
-        st_outq["frames"] = 0
-        st_outq["max_gap_ms"] = 0.0
-        st_mix["frames"] = 0
-        st_mix["max_gap_ms"] = 0.0
+    # Main-loop-stall summary (per QA 12458ae dispatch). Counts +
+    # max overrun observed this 1s window. Per-overrun lines are
+    # already emitted by _stall_check at the moment they happen;
+    # this summary makes the data trivial to correlate with [fps].
     print(
-        f"[probe] t={uptime} mix_src "
-        f"frames={mix_src_probe_state['frames']} "
-        f"max_gap_ms={int(mix_src_probe_state['max_gap_ms'])}",
+        f"[stall-1s] t={uptime} "
+        f"overruns={stall_state['overruns_this_sec']} "
+        f"max_overrun_ms={stall_state['max_overrun_ms']}",
         file=sys.stderr, flush=True
     )
-    mix_src_probe_state["frames"] = 0
-    mix_src_probe_state["max_gap_ms"] = 0.0
+    stall_state["overruns_this_sec"] = 0
+    stall_state["max_overrun_ms"] = 0
     screen_state["frames"] = 0
     screen_state["max_gap_ms"] = 0.0
     return True
@@ -1279,6 +1248,12 @@ if (pipeline.set_state(Gst.State.PLAYING)
 _enter_lingering_visible()
 GLib.timeout_add(LINGER_CHECK_MS, _linger_check)
 GLib.timeout_add(1000, fps_tick)
+# Main-loop-stall detector at ~20ms. Logs only when its actual
+# wall-clock interval exceeds STALL_THRESHOLD_MS (default 50ms)
+# = the GLib main thread was blocked that long. Cheap (~50 fires/
+# sec doing arithmetic + a comparison). No buffer probes, no
+# per-frame Python callback. Per QA 12458ae dispatch.
+GLib.timeout_add(STALL_CHECK_INTERVAL_MS, _stall_check)
 
 
 try:
