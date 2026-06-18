@@ -520,23 +520,41 @@ class ClipBin:
         """qtdemux dynamic-pad callback. Fires on a streaming thread
         when qtdemux finishes parsing moov and exposes a src pad
         (once per stream -- video + maybe audio). Filter by caps
-        structure name so audio/subtitle pads are ignored.
+        structure name OR pad name so audio/subtitle pads are
+        ignored and a NULL-caps pad on rare qtdemux paths is still
+        accepted as the video pad.
 
         Lightweight ops only per QA note (add_probe, query_duration,
         compute thresholds, set flags). No spawns / set_state here
         -- those would deadlock on the streaming thread; the
         scheduler defers all heavy work via GLib.idle_add already."""
-        if self.trigger_probe_installed:
-            return
-        # R2: canonical caps-structure filter. Pad name "video_0" is
-        # consistent in qtdemux but not the API contract; the caps
-        # structure name "video/x-h264" etc. is what defines stream
-        # type. Match startswith("video/") for any video codec.
+        # Early-entry log (G7 diagnostic ask): proves _on_demux_pad_
+        # added fired for THIS bin regardless of whether the filter
+        # downstream accepts it. If the journal shows
+        # "[A#1] pad-added pad=..." then qtdemux is exposing pads
+        # correctly; if it's missing, pad-added itself is not
+        # firing (qtdemux problem upstream).
+        pad_name = pad.get_name()
         caps = pad.get_current_caps() or pad.query_caps(None)
         struct_name = ""
         if caps and caps.get_size() > 0:
             struct_name = caps.get_structure(0).get_name()
-        if not struct_name.startswith("video/"):
+        print(f"[{self.label}] pad-added pad={pad_name} "
+              f"caps={struct_name or 'NONE'}")
+        if self.trigger_probe_installed:
+            return
+        # G4 (per QA dispatch): robust caps filter. R2 was caps-
+        # structure-name; QA flags that caps can be NULL at pad-
+        # added on some qtdemux paths. Backup: pad name starts with
+        # "video" (qtdemux convention "video_0"). Either signal is
+        # sufficient to identify the video pad.
+        is_video = (
+            struct_name.startswith("video/")
+            or pad_name.startswith("video")
+        )
+        if not is_video:
+            print(f"[{self.label}] pad-added skip non-video "
+                  f"(pad={pad_name} caps={struct_name or 'NONE'})")
             return
         self.trigger_probe_installed = True
         # R3: query duration on the DEMUXER, not the pipeline.
@@ -564,6 +582,21 @@ class ClipBin:
     def _attach_trigger_probe(self, pad):
         """BUFFER probe on demuxer src pad: fires preload threshold +
         wipe-start threshold each ONCE. Pad comes from pad-added."""
+        # G5 (per QA dispatch): clamp / short-dur guard. If dur is
+        # bogus or shorter than (preload_lead + wipe), the computed
+        # thresholds go <= 0 and the first buffer fires both -- a
+        # permanent dual-decode + immediate hard cut. Our actual
+        # clips (A=4.75s, B=9.08s) are fine, but DUR_FALLBACK_NS
+        # could be wrong and a future asset might be short. Skip
+        # arming in that case; the gap-killer in on_bin_eos will
+        # cleanly hard-cut at natural EOS.
+        min_arm_dur = WIPE_S_NS + PRELOAD_LEAD_NS
+        if self.dur_ns <= min_arm_dur:
+            print(f"[{self.label}] dur={self.dur_ns / 1e9:.2f}s "
+                  f"<= preload+wipe={min_arm_dur / 1e9:.2f}s -- "
+                  "skipping trigger arm (EOS gap-killer will handle)",
+                  file=sys.stderr)
+            return
         preload_at = self.dur_ns - WIPE_S_NS - PRELOAD_LEAD_NS
         wipe_at = self.dur_ns - WIPE_S_NS
 
@@ -966,8 +999,12 @@ dec_gap_state = {
 }
 
 try:
-    fps_log_file = open("/tmp/wipe_fps.log", "a", buffering=1)
-    print("[wipe_cpu] tee fps to /tmp/wipe_fps.log")
+    # G7 (per QA dispatch): TRUNCATE on open so each script run is
+    # self-contained -- QA does not have to disambiguate the new
+    # soak from journal carry-over of a prior run.
+    fps_log_file = open("/tmp/wipe_fps.log", "w", buffering=1)
+    fps_log_file.write(f"# wipe_cpu run start; pid={os.getpid()}\n")
+    print("[wipe_cpu] tee fps to /tmp/wipe_fps.log (truncated on open)")
 except OSError as _exc:
     fps_log_file = None
     print(f"[wipe_cpu] /tmp/wipe_fps.log unavailable ({_exc}); "
