@@ -856,6 +856,35 @@ def force_eos_active(stream_id):
     filesrc.send_event(Gst.Event.new_eos())
 
 
+def _force_eos_with_pre_fortify(stream_id):
+    """force_eos_active wrapped with a pre-fortify guarantee that
+    the queue has at least one pending sub-bin BEFORE the force-
+    EOS pops the active. Crash fix per QA 36ed49b soak: the
+    EAGER schedule_add timing (fires from the first-buffer probe
+    when concat unblocks the new active, plus ADD_AFTER_RETIRE_MS
+    + cross-stream MIN_INTER_ADD_MS serialization) can leave the
+    incoming stream's queue at exactly 1 (active only, no
+    pending) at a crossfade moment. force_eos_active would then
+    pop the active -> queue=0 -> concat has no pending -> emits
+    downstream EOS -> pipeline EOS -> shutdown.
+
+    SYNCHRONOUS add_next_clip is used here (bypassing the
+    MIN_INTER_ADD_MS gate). Acceptable because this fires at
+    crossfade time, a controlled moment, not steady state; CMA
+    peak overshoot is ~1-2MB per added sub-bin (filesrc +
+    qtdemux + h264parse only, no decoder allocation), well
+    within the 1c737bc->36ed49b CMA headroom (~51-53MB CmaFree
+    projection)."""
+    s = streams[stream_id]
+    while len(s["sub_bin_queue"]) < 2:
+        print(f"[xfade] pre-fortify {stream_id} queue_len="
+              f"{len(s['sub_bin_queue'])} < 2; synchronous "
+              "add_next_clip to keep concat fed past force-EOS",
+              file=sys.stderr)
+        add_next_clip(stream_id)
+    force_eos_active(stream_id)
+
+
 def _start_advancing():
     """LINGERING_VISIBLE -> ADVANCING_INCOMING.
     On the incoming's FIRST visible turn: KEEP current_loop_clip
@@ -907,7 +936,10 @@ def _start_advancing():
     # (old_loop again). The retire+add cycle then queues NEW_clip
     # as the new pending. After ADD_AFTER_RETIRE_MS the new clip
     # is the pending of the now-active old_loop.
-    force_eos_active(to_id)
+    # _force_eos_with_pre_fortify guarantees queue >= 2 (active +
+    # >=1 pending) BEFORE issuing force-EOS -- prevents the
+    # 36ed49b drain-to-zero crash when EAGER hasn't replenished.
+    _force_eos_with_pre_fortify(to_id)
     linger_state["advance_eos_count"] += 1
     # 2nd force-EOS: scheduled to fire AFTER the first retire+add
     # cycle so the pending is now new_clip; this EOS switches
@@ -926,7 +958,12 @@ def _second_advance_eos():
     if linger_state["phase"] != "ADVANCING_INCOMING":
         return False
     to_id = linger_state["to_stream"]
-    force_eos_active(to_id)
+    # Same pre-fortify guard as the 1st force-EOS. Between the
+    # 1st and 2nd, EAGER's first-buffer probe on the new active
+    # may not have fired+materialized an add yet (~50-300ms vs
+    # this timer's 150ms). Without the guard, the 2nd force-EOS
+    # could be the one to drain queue to zero.
+    _force_eos_with_pre_fortify(to_id)
     linger_state["advance_eos_count"] += 1
     # Wait ADVANCE_FIRST_FRAME_WAIT_MS for the new clip's
     # buffers to flow through dec -> queue -> glupload -> mix
