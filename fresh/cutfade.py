@@ -480,6 +480,64 @@ next_clip_idx = [0]       # cycling counter through VIDEOS
 # Cycle serial (every spawned bin gets a unique id for log clarity)
 spawn_serial = [0]
 
+# Per QA b5edbb9 soak: NEW PATTERN -- the display works for ~2
+# cycles then dies once the re-prime path runs repeatedly. Async
+# retire did NOT fix the wedge; d489fd8's "alive" was actually a
+# FROZEN frame after a single retire (it never cycled past clip2).
+# This is the FIRST time the FLUSH-kept-pad + relink path runs
+# more than once.
+#
+# DIAGNOSTIC instrumentation -- localize the failure:
+#   mix_out_counter:  buffers/sec leaving glvideomixer's src pad.
+#                     If mix_out drops to 0 when screen=0 -> the
+#                     aggregator stopped outputting (pad-state /
+#                     repeat-after-eos / FLUSH churn broke it).
+#                     If mix_out stays ~24 but screen=0 -> the
+#                     glimagesink/GL sink stopped consuming (GL
+#                     context churn from per-branch glupload
+#                     create/destroy).
+mix_out_counter = [0]
+
+
+def _read_mix_pad_eos_state(slot_idx):
+    """Return a short string describing the kept mix sink pad's
+    current EOS state for the [fps] line. Tries the
+    GstAggregatorPad `is-eos` property first; falls back to the
+    sticky-EOS-event presence. 'na' if pad not allocated yet."""
+    pad = mix_pads[slot_idx]
+    if pad is None:
+        return "na"
+    try:
+        if pad.get_property("is-eos"):
+            return "EOS"
+    except Exception:
+        pass
+    try:
+        ev = pad.get_sticky_event(Gst.EventType.EOS, 0)
+        if ev is not None:
+            return "EOS"
+    except Exception:
+        pass
+    return "ok"
+
+
+def _attach_mix_out_counter():
+    """One-shot at startup: attach a BUFFER probe on the
+    glvideomixer's static src pad that increments
+    mix_out_counter on every output buffer. fps_tick reads +
+    resets the counter each second."""
+    src_pad = mix.get_static_pad("src")
+    if src_pad is None:
+        print("[cutfade] mix has no static src pad; mix_out "
+              "instrumentation OFFLINE", file=sys.stderr)
+        return
+
+    def _on_mix_out_buf(_pad, _info):
+        mix_out_counter[0] += 1
+        return Gst.PadProbeReturn.OK
+
+    src_pad.add_probe(Gst.PadProbeType.BUFFER, _on_mix_out_buf)
+
 # Per QA 50e791c soak: retire #23 produced an intermittent
 # qtdemux not-linked / Internal-data-stream crash despite sync
 # retire + the assert. The dying outgoing qtdemux's streaming
@@ -1301,9 +1359,20 @@ def fps_tick():
     off_label = slots[off]["label"] or "-"
     cur_dec_pts_ns = slots[cur].get("last_dec_pts_ns") or 0
     cur_dec_pts_ms = cur_dec_pts_ns // 1_000_000
+    # Per QA b5edbb9 diagnostic ask: surface the aggregator
+    # output rate + the kept mix sink pads' EOS state per tick
+    # so the soak can localize the wedge: aggregator-stop (pad
+    # stuck EOS, FLUSH not reviving) vs glimagesink-stop (GL
+    # sink stopped consuming despite mix output flowing).
+    mix_out = mix_out_counter[0]
+    mix_out_counter[0] = 0
+    pad_eos_0 = _read_mix_pad_eos_state(0)
+    pad_eos_1 = _read_mix_pad_eos_state(1)
     line = (
         f"[fps] t={uptime} "
         f"screen={screen_state['frames']} "
+        f"mix_out={mix_out} "
+        f"padEOS=[{pad_eos_0},{pad_eos_1}] "
         f"max_gap_ms={int(screen_state['max_gap_ms'])} "
         f"cur={cur_label}(slot{cur}) "
         f"off={off_label}(slot{off}) "
@@ -1423,6 +1492,7 @@ if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
     die("set_state PLAYING failed")
 
 attach_screen_probe()
+_attach_mix_out_counter()
 
 # Per QA scheduler spec section "Implementation notes for code2":
 # stamp became_current_ns RIGHT after PLAYING + populate sched
