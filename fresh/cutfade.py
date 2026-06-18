@@ -329,6 +329,25 @@ def build_slot(slot_idx, clip_idx):
     if ghost.link(mix_sink) != Gst.PadLinkReturn.OK:
         die(f"[{label}] ghost -> mix.sink link failed")
 
+    # EOS-DROP probe on the mix sink pad. glvideomixer does NOT
+    # auto-absorb a single source's EOS the way concat did; without
+    # this DROP, the first clip's natural EOS propagates through the
+    # mixer -> sink -> pipeline EOS bus message -> shutdown after
+    # one crossfade. Per QA dispatch: drop the per-source EOS so
+    # one clip ending never tears down the pipeline. This probe
+    # stays attached for the life of the mix_sink (released when
+    # retire calls mix.release_request_pad).
+    def _on_mix_sink_event(_pad, info):
+        ev = info.get_event()
+        if ev and ev.type == Gst.EventType.EOS:
+            print(f"[cutfade] DROP EOS at mix.sink for {label} "
+                  "(prevent mixer-EOS cascade)", file=sys.stderr)
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.OK
+    mix_sink.add_probe(
+        Gst.PadProbeType.EVENT_DOWNSTREAM, _on_mix_sink_event
+    )
+
     slot = slots[slot_idx]
     slot["sub"] = sub
     slot["dec"] = decoder
@@ -477,6 +496,9 @@ def attach_prime_trigger(slot_idx):
             print(f"[cutfade] {slot['label']} prime trigger at "
                   f"pts={buf.pts / 1e9:.2f}s", file=sys.stderr)
             GLib.idle_add(prime_next)
+            # Self-clear so retire does not double-remove (gst warns
+            # "pad has no probe with id N").
+            slot["prime_trigger_probe_id"] = None
             return Gst.PadProbeReturn.REMOVE
         return Gst.PadProbeReturn.OK
     probe_id = video_pad.add_probe(
@@ -524,6 +546,10 @@ def prime_next():
             print(f"[cutfade] {slot['label']} first frame -> "
                   "scheduling fade", file=sys.stderr)
             GLib.idle_add(start_fade, off_idx)
+            # Mark probe as auto-removed so retire does not try
+            # to remove it again (gst warns "pad has no probe with
+            # id N" on double-removal).
+            slot["first_frame_probe_id"] = None
             return Gst.PadProbeReturn.REMOVE
         return Gst.PadProbeReturn.OK
     probe_id = dec_src.add_probe(
