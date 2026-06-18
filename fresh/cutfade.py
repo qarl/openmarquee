@@ -132,6 +132,14 @@ FADE_TICK_MS = 33      # animation tick (~30fps geometry update)
 GATE_DEADLINE_MS = 2000  # max wait for incoming first frame
 PREROLL_BUDGET_S = 30  # GL cold-start budget under systemd
 WATCHDOG_STALL_S = 2   # consecutive seconds of screen=0 -> recover
+# Per QA d489fd8 soak: repeat-after-eos can freeze a composite
+# at 24fps so screen=24 is no longer proof of motion. Detect
+# "no decode-PTS progress on the current slot" as a third-line
+# defense behind the pts-threshold trigger and the EOS-backup
+# trigger. Threshold low enough to catch a freeze quickly, high
+# enough not to trip on a slow-decode hiccup or natural
+# end-of-clip + fade lag.
+FROZEN_STALL_S = 3     # consecutive seconds of unchanged dec PTS
 
 # Fallback durations if qtdemux query_duration fails. Per QA assets
 # are uniform h264 Main 1280x720 24fps but vary in length; if a
@@ -382,11 +390,13 @@ slots = [
     {"sub": None, "dec": None, "demux": None, "mix_sink": None,
      "label": None, "serial": None, "dur_ns": 0,
      "pad_added_id": None, "first_frame_probe_id": None,
-     "prime_trigger_probe_id": None},
+     "prime_trigger_probe_id": None, "prime_eos_probe_id": None,
+     "dec_pts_probe_id": None, "last_dec_pts_ns": 0},
     {"sub": None, "dec": None, "demux": None, "mix_sink": None,
      "label": None, "serial": None, "dur_ns": 0,
      "pad_added_id": None, "first_frame_probe_id": None,
-     "prime_trigger_probe_id": None},
+     "prime_trigger_probe_id": None, "prime_eos_probe_id": None,
+     "dec_pts_probe_id": None, "last_dec_pts_ns": 0},
 ]
 current_slot_idx = [0]   # which slots[] entry is the active one
 next_clip_idx = [0]       # cycling counter through VIDEOS
@@ -395,8 +405,19 @@ next_clip_idx = [0]       # cycling counter through VIDEOS
 fade_state = {"start_ns": 0, "in_flight": False,
               "incoming_slot": -1, "outgoing_slot": -1}
 
-# Watchdog state
-watchdog_state = {"zero_frame_seconds": 0}
+# Per-slot "this slot's succession is already scheduled" flag. Set
+# by ANY trigger that calls prime_next (pts-threshold trigger, EOS
+# backup trigger, FROZEN watchdog). Cleared in finish_fade for the
+# new current slot (fresh) and in retire_slot defensively.
+# Prevents double-prime when two triggers race on the same slot.
+advance_scheduled = [False, False]
+
+# Watchdog state. zero_frame_seconds: legacy screen=0 counter.
+# last_dec_pts_ns + frozen_seconds: FROZEN-detection on the current
+# slot (catches "screen=24 of frozen composite" per QA d489fd8).
+watchdog_state = {"zero_frame_seconds": 0,
+                  "last_dec_pts_ns": 0,
+                  "frozen_seconds": 0}
 
 # Cycle serial (every spawned bin gets a unique id for log clarity)
 spawn_serial = [0]
@@ -407,9 +428,11 @@ def _slot_clear(slot):
     must have already retired the elements)."""
     for k in ("sub", "dec", "demux", "mix_sink", "label", "serial",
               "pad_added_id", "first_frame_probe_id",
-              "prime_trigger_probe_id"):
+              "prime_trigger_probe_id", "prime_eos_probe_id",
+              "dec_pts_probe_id"):
         slot[k] = None
     slot["dur_ns"] = 0
+    slot["last_dec_pts_ns"] = 0
 
 
 def build_slot(slot_idx, clip_idx):
@@ -496,6 +519,25 @@ def build_slot(slot_idx, clip_idx):
     slot["label"] = label
     slot["serial"] = serial
     slot["pad_added_id"] = pad_added_id
+    slot["last_dec_pts_ns"] = 0
+
+    # Per QA d489fd8 ask #3: FROZEN watchdog needs per-slot
+    # decoder-PTS visibility. Attach a BUFFER probe on dec.src
+    # that updates slot["last_dec_pts_ns"] on every decoded
+    # frame. Cheap (one int store per 24fps), lifelong (removed
+    # in retire_slot). Used by fps_tick to detect "screen=24 but
+    # the composite is a frozen last frame" and force-advance.
+    dec_src_for_pts = decoder.get_static_pad("src")
+    if dec_src_for_pts is not None:
+        def _on_dec_buf(_pad, info, _slot=slot):
+            buf = info.get_buffer()
+            if buf is not None and buf.pts != Gst.CLOCK_TIME_NONE:
+                _slot["last_dec_pts_ns"] = buf.pts
+            return Gst.PadProbeReturn.OK
+        slot["dec_pts_probe_id"] = dec_src_for_pts.add_probe(
+            Gst.PadProbeType.BUFFER, _on_dec_buf
+        )
+
     print(f"[cutfade] build slot {slot_idx}: {label} = {asset_name}",
           file=sys.stderr)
     return slot
@@ -520,30 +562,55 @@ def retire_slot(slot_idx):
             except Exception as exc:
                 print(f"[cutfade] retire {label} pad-added "
                       f"disconnect WARN: {exc}", file=sys.stderr)
-        if (slot["first_frame_probe_id"]
-                and slot["dec"] is not None):
+        if slot["dec"] is not None:
             dec_src = slot["dec"].get_static_pad("src")
             if dec_src is not None:
-                try:
-                    dec_src.remove_probe(slot["first_frame_probe_id"])
-                except Exception as exc:
-                    print(f"[cutfade] retire {label} first-frame "
-                          f"probe WARN: {exc}", file=sys.stderr)
-        if (slot["prime_trigger_probe_id"]
-                and slot["demux"] is not None):
-            # demux video src pad -- find it
+                if slot["first_frame_probe_id"]:
+                    try:
+                        dec_src.remove_probe(
+                            slot["first_frame_probe_id"]
+                        )
+                    except Exception as exc:
+                        print(f"[cutfade] retire {label} first-frame "
+                              f"probe WARN: {exc}", file=sys.stderr)
+                if slot["dec_pts_probe_id"]:
+                    try:
+                        dec_src.remove_probe(
+                            slot["dec_pts_probe_id"]
+                        )
+                    except Exception as exc:
+                        print(f"[cutfade] retire {label} dec_pts "
+                              f"probe WARN: {exc}", file=sys.stderr)
+        if (slot["demux"] is not None
+                and (slot["prime_trigger_probe_id"]
+                     or slot["prime_eos_probe_id"])):
+            # demux video src pad -- find it; same pad holds
+            # both the prime-threshold BUFFER probe and the EOS
+            # backup-trigger EVENT probe (attach_prime_trigger).
             it = slot["demux"].iterate_src_pads()
             while True:
                 res, p = it.next()
                 if res != Gst.IteratorResult.OK:
                     break
                 if p.get_name().startswith("video"):
-                    try:
-                        p.remove_probe(slot["prime_trigger_probe_id"])
-                    except Exception as exc:
-                        print(f"[cutfade] retire {label} prime "
-                              f"trigger probe WARN: {exc}",
-                              file=sys.stderr)
+                    if slot["prime_trigger_probe_id"]:
+                        try:
+                            p.remove_probe(
+                                slot["prime_trigger_probe_id"]
+                            )
+                        except Exception as exc:
+                            print(f"[cutfade] retire {label} prime "
+                                  f"trigger probe WARN: {exc}",
+                                  file=sys.stderr)
+                    if slot["prime_eos_probe_id"]:
+                        try:
+                            p.remove_probe(
+                                slot["prime_eos_probe_id"]
+                            )
+                        except Exception as exc:
+                            print(f"[cutfade] retire {label} prime "
+                                  f"eos probe WARN: {exc}",
+                                  file=sys.stderr)
                     break
         # Per QA glass diagnosis of 3d36db1: repeat-after-eos only
         # ENGAGES once the pad RECEIVES an EOS event. Setting the
@@ -588,6 +655,12 @@ def retire_slot(slot_idx):
         print(f"[cutfade] retire {label} WARN: {exc}",
               file=sys.stderr)
 
+    # Clear the per-slot succession-scheduled flag defensively.
+    # finish_fade already clears the new current's flag; this
+    # covers the outgoing slot so a future re-prime of THIS
+    # slot starts with a clean flag.
+    advance_scheduled[slot_idx] = False
+
     _slot_clear(slot)
 
     def _check_leak():
@@ -630,31 +703,38 @@ def attach_prime_trigger(slot_idx):
                          or False)
         return False
 
-    # Query duration on the demuxer. Per cutloop pattern, this works
-    # once the moov box is parsed (which is what triggers pad-added).
+    # Query duration on the demuxer. Per cutloop pattern, this
+    # works once the moov box is parsed (which is what triggers
+    # pad-added). Per QA d489fd8: log WIN/FALLBACK so the next
+    # soak can confirm or kill the "fallback duration overshoots
+    # real EOS -> trigger misses" hypothesis.
     ok, dur = slot["demux"].query_duration(Gst.Format.TIME)
     if ok and dur > 0:
         slot["dur_ns"] = dur
+        dur_source = "WIN"
     else:
         slot["dur_ns"] = DUR_FALLBACK_NS
+        dur_source = "FALLBACK"
         print(f"[cutfade] {slot['label']} duration query failed; "
               f"fallback {DUR_FALLBACK_NS / 1e9:.2f}s",
               file=sys.stderr)
     prime_at = slot["dur_ns"] - int(
         (PRIME_LEAD_S + FADE_S) * 1_000_000_000
     )
+    print(f"[cutfade] [trigger] slot={slot_idx} "
+          f"{dur_source} dur_ns={slot['dur_ns']} "
+          f"threshold_ns={prime_at} "
+          f"({slot['dur_ns'] / 1e9:.2f}s -> "
+          f"fire at {prime_at / 1e9:.2f}s)",
+          file=sys.stderr)
     if prime_at <= 0:
-        # Clip too short for prime-lead arithmetic; skip prime,
-        # rely on watchdog to keep things moving. Should not
-        # happen for our assets but defensive.
+        # Clip too short for prime-lead arithmetic; skip the
+        # pts-threshold trigger and rely on the EOS backup
+        # trigger below to advance at natural EOS. Should not
+        # happen for our 5-9s assets but defensive.
         print(f"[cutfade] {slot['label']} dur too short for "
               f"prime arithmetic ({slot['dur_ns'] / 1e9:.2f}s); "
-              "watchdog will handle", file=sys.stderr)
-        return False
-    print(f"[cutfade] {slot['label']} duration "
-          f"{slot['dur_ns'] / 1e9:.2f}s, "
-          f"prime trigger at {prime_at / 1e9:.2f}s",
-          file=sys.stderr)
+              "relying on EOS backup trigger", file=sys.stderr)
 
     fired = [False]
 
@@ -664,20 +744,62 @@ def attach_prime_trigger(slot_idx):
         buf = info.get_buffer()
         if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
             return Gst.PadProbeReturn.OK
-        if buf.pts >= prime_at:
+        if prime_at > 0 and buf.pts >= prime_at:
             fired[0] = True
-            print(f"[cutfade] {slot['label']} prime trigger at "
-                  f"pts={buf.pts / 1e9:.2f}s", file=sys.stderr)
+            print(f"[cutfade] {slot['label']} prime_trigger FIRED "
+                  f"at pts={buf.pts / 1e9:.2f}s "
+                  f"(threshold={prime_at / 1e9:.2f}s)",
+                  file=sys.stderr)
+            advance_scheduled[slot_idx] = True
             GLib.idle_add(prime_next)
-            # Self-clear so retire does not double-remove (gst warns
-            # "pad has no probe with id N").
+            # Self-clear so retire does not double-remove (gst
+            # warns "pad has no probe with id N").
             slot["prime_trigger_probe_id"] = None
             return Gst.PadProbeReturn.REMOVE
         return Gst.PadProbeReturn.OK
-    probe_id = video_pad.add_probe(
+
+    # Per QA d489fd8 ask #2: EOS-driven BACKUP trigger. If the
+    # pts-threshold buffer probe missed (e.g. fallback duration
+    # too long), the clip will naturally EOS before fired[0]
+    # ever flips. Catch the EOS on the same demux video src pad
+    # and drive prime_next + start_fade if no advance is
+    # already scheduled. Guards: not in fade, this slot IS the
+    # current visible slot, and not already advance-scheduled.
+    # This is the safety net QA asked for -- "a cut-style
+    # advance as the safety net beats a frozen reel."
+    def _on_event(_pad, info):
+        ev = info.get_event()
+        if ev is None or ev.type != Gst.EventType.EOS:
+            return Gst.PadProbeReturn.OK
+        if fired[0]:
+            print(f"[cutfade] {slot['label']} EOS after "
+                  f"prime_trigger (normal end)", file=sys.stderr)
+            return Gst.PadProbeReturn.OK
+        print(f"[cutfade] {slot['label']} EOS BEFORE "
+              f"prime_trigger (threshold={prime_at / 1e9:.2f}s "
+              f"source={dur_source}); BACKUP advance",
+              file=sys.stderr)
+        fired[0] = True
+        if (not fade_state["in_flight"]
+                and current_slot_idx[0] == slot_idx
+                and not advance_scheduled[slot_idx]):
+            advance_scheduled[slot_idx] = True
+            GLib.idle_add(prime_next)
+        else:
+            print(f"[cutfade] {slot['label']} EOS BACKUP "
+                  "advance suppressed (fade in flight, slot "
+                  "not current, or advance already scheduled)",
+                  file=sys.stderr)
+        return Gst.PadProbeReturn.OK
+
+    buffer_probe_id = video_pad.add_probe(
         Gst.PadProbeType.BUFFER, _on_buffer
     )
-    slot["prime_trigger_probe_id"] = probe_id
+    slot["prime_trigger_probe_id"] = buffer_probe_id
+    eos_probe_id = video_pad.add_probe(
+        Gst.PadProbeType.EVENT_DOWNSTREAM, _on_event
+    )
+    slot["prime_eos_probe_id"] = eos_probe_id
     return False
 
 
@@ -801,6 +923,14 @@ def finish_fade():
     incoming_idx = fade_state["incoming_slot"]
     current_slot_idx[0] = incoming_idx
     fade_state["in_flight"] = False
+    # The new current is fresh: its succession has not yet been
+    # scheduled. Clear the flag so the new triggers can run.
+    advance_scheduled[incoming_idx] = False
+    # Reset FROZEN tracking on slot swap -- the new current's
+    # decoder will start producing buffers with a brand-new PTS
+    # sequence and the prior "last seen" was for the outgoing.
+    watchdog_state["last_dec_pts_ns"] = 0
+    watchdog_state["frozen_seconds"] = 0
     print(f"[cutfade] FADE complete; current is now slot "
           f"{incoming_idx}; retiring slot {outgoing_idx}",
           file=sys.stderr)
@@ -863,6 +993,9 @@ def fps_tick():
     off = 1 - cur
     off_label = slots[off]["label"] or "-"
     fade_str = "in_flight" if fade_state["in_flight"] else "idle"
+    cur_dec_pts_ns = slots[cur].get("last_dec_pts_ns") or 0
+    cur_dec_pts_ms = cur_dec_pts_ns // 1_000_000
+    sched_str = "y" if advance_scheduled[cur] else "n"
     line = (
         f"[fps] t={uptime} "
         f"screen={screen_state['frames']} "
@@ -870,6 +1003,8 @@ def fps_tick():
         f"cur={cur_label}(slot{cur}) "
         f"off={off_label}(slot{off}) "
         f"fade={fade_str} "
+        f"dec_pts_ms={cur_dec_pts_ms} "
+        f"sched={sched_str} "
         f"gap_warns_total={screen_state['boundary_warns_total']}"
     )
     print(line, file=sys.stderr, flush=True)
@@ -878,19 +1013,54 @@ def fps_tick():
             log_file.write(line + "\n")
         except OSError:
             pass
-    # Watchdog: 0 frames for 2 consecutive ticks -> force prime
+    # Watchdog: 0 frames for 2 consecutive ticks -> force prime.
+    # Legacy screen=0 path. Still useful for catching pipeline
+    # death that bypasses both the pts trigger and the EOS
+    # backup trigger.
     if screen_state["frames"] == 0:
         watchdog_state["zero_frame_seconds"] += 1
         if watchdog_state["zero_frame_seconds"] >= WATCHDOG_STALL_S:
             print("[cutfade] WATCHDOG: 0 frames for 2s -- "
                   "force prime + re-PLAY", file=sys.stderr)
             watchdog_state["zero_frame_seconds"] = 0
+            advance_scheduled[cur] = True
             GLib.idle_add(prime_next)
             GLib.idle_add(
                 lambda: pipeline.set_state(Gst.State.PLAYING) or False
             )
     else:
         watchdog_state["zero_frame_seconds"] = 0
+
+    # Per QA d489fd8 ask #3: FROZEN watchdog. repeat-after-eos
+    # can freeze a composite at 24fps so screen=24 no longer
+    # proves motion. If the current slot's decoder PTS has not
+    # advanced since the last tick AND no fade is in flight AND
+    # no advance is already scheduled for this slot, count it
+    # as a frozen second. After FROZEN_STALL_S consecutive
+    # seconds, force-advance via prime_next. Cleared on natural
+    # progress, on slot swap (finish_fade), or when the
+    # zero-frame branch above force-advances.
+    if (cur_dec_pts_ns > 0
+            and not fade_state["in_flight"]
+            and not advance_scheduled[cur]):
+        if cur_dec_pts_ns == watchdog_state["last_dec_pts_ns"]:
+            watchdog_state["frozen_seconds"] += 1
+            if (watchdog_state["frozen_seconds"]
+                    >= FROZEN_STALL_S):
+                print(f"[cutfade] FROZEN WATCHDOG: dec_pts on "
+                      f"slot {cur} unchanged for "
+                      f"{FROZEN_STALL_S}s (pts_ms="
+                      f"{cur_dec_pts_ms}) -- force advance",
+                      file=sys.stderr)
+                watchdog_state["frozen_seconds"] = 0
+                advance_scheduled[cur] = True
+                GLib.idle_add(prime_next)
+        else:
+            watchdog_state["frozen_seconds"] = 0
+    else:
+        watchdog_state["frozen_seconds"] = 0
+    watchdog_state["last_dec_pts_ns"] = cur_dec_pts_ns
+
     screen_state["frames"] = 0
     screen_state["max_gap_ms"] = 0.0
     return True
