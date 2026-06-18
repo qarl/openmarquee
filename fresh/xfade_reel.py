@@ -181,12 +181,15 @@ PLAYLIST = [
 # clip holds for max(clip_dur, LINGER_MIN_S). Short clips that
 # would EOS before LINGER_MIN_S elapses are LOOPED via concat-
 # re-add of the SAME current_loop_clip (cutloop's proven gapless
-# mechanism: each natural EOS triggers schedule_add which queues
-# another sub-bin of the same clip; concat advances pending ->
+# mechanism: EAGER first-buffer probe on each sub-bin's concat
+# sink pad triggers schedule_add when concat unblocks that pad
+# = becomes active. The next instance of the same clip queues
+# ahead of the current's natural EOS; concat advances pending ->
 # next gaplessly). NO seek (a non-flushing SEGMENT seek on the
 # bcm2835 V4L2 decoder is a proven HW dead end: visible stream
-# freezes or SIGSEGVs -- two glass tests 2026-06-18). Teardown
-# happens ONLY on the hidden stream, behind the crossfade.
+# freezes or SIGSEGVs -- two glass tests 2026-06-18). Retire on
+# idle on EVERY EOS (cutloop pattern); no visible-vs-hidden
+# defer (post-1c737bc).
 LINGER_MIN_S = float(os.environ.get(
     "OPENMARQUEE_XFADE_LINGER_MIN_S", "20.0"
 ))
@@ -212,30 +215,38 @@ ADVANCE_FIRST_FRAME_WAIT_MS = 800
 # (single-threaded), so the gap targets CMA-settle time
 # rather than thread synchronization.
 MIN_INTER_ADD_MS = 200
-# Time-based queue after dec (env-tunable). Holds decoded
-# frames between v4l2h264dec and glupload. Original purpose
-# was to bridge a non-flushing seek's dec-refill gap; the
-# seek-loop is gone (proven HW dead end on bcm2835 V4L2
-# decoder) but the time-capped queue is harmless and gives
-# headroom to absorb cross-boundary jitter when concat
-# advances between same-clip sub-bins.
-# CMA budget: 1280x720 NV12 = 1.4MB/frame x 24fps x 0.5s =
-# ~17MB per stream; 2 streams = ~34MB.
-# Env-tunable: shrink to ~0.3s (~10MB per stream) if CMA
-# tight; grow if cross-boundary hitches observed.
+# Time-based queue between v4l2h264dec and glupload (env-tunable).
+# Acts as a jitter buffer that bridges the concat sub-bin advance
+# gap: when concat switches from EOS'd active to next pending, the
+# dec briefly restarts on the new IDR while the queue continues
+# feeding glupload->mix. Default grown from 500 -> 600ms per QA
+# 1c737bc soak (60-337ms wrap hitches observed at 500ms cap);
+# 600ms gives bcm2835 enough headroom for dec restart + concat-
+# switch latency without exhausting CMA.
+# CMA budget at 600ms: 1280x720 NV12 = 1.4MB/frame x 24fps x 0.6s
+# = ~20MB per stream reservoir; 2 streams = ~40MB. PLUS the EAGER
+# pattern adds ~1 extra sub-bin per stream (live=3 steady vs old
+# live=2), but sub-bin contents are filesrc+qtdemux+h264parse
+# (no CMA-using elements; +1-2MB parsed-NALU buffers per stream).
+# Combined projection: CmaFree_min from 1c737bc's 62MB drops to
+# ~51-53MB. Still above the 50MB brick floor, but TIGHT. Do NOT
+# raise to 800ms without a soak proving the headroom.
+# Env-tunable: shrink if CMA tight; grow only if hitches persist
+# AND a soak shows headroom for it.
 RESERVOIR_MS = int(os.environ.get(
-    "OPENMARQUEE_XFADE_RESERVOIR_MS", "500"
+    "OPENMARQUEE_XFADE_RESERVOIR_MS", "600"
 ))
 RESERVOIR_TIME_NS = RESERVOIR_MS * 1_000_000
 # Fallback per-clip duration if query_duration fails at startup.
 DUR_FALLBACK_S = 6.0
-# cutloop's invariant: keep >=1 pad pending ahead of current,
-# per stream. Pre-queue 2 sub-bins per stream at startup; on
-# each EOS the probe schedules add_next_clip so the queue
-# stays at >=1 pending at all times. Steady state: 2 sub-bins
-# alive per stream (one active + one pending) = 4 sub-bins
-# pipeline-wide. Decoder count is still 2 (one per stream,
-# permanent).
+# Pre-queue depth at startup. Pre-queue this many sub-bins per
+# stream at startup. Once playing, the EAGER first-buffer probe
+# on each sub-bin's concat sink pad schedules add_next_clip when
+# concat unblocks that pad (= becomes active), keeping the queue
+# one ahead of the current active. Steady state under EAGER:
+# 3 sub-bins alive per stream (active + 2 pending) = 6 sub-bins
+# pipeline-wide; brief 4 during fade-driven double-EOS. Decoder
+# count is still 2 (one per stream, permanent in the static spine).
 INITIAL_QUEUE_DEPTH = 2
 # Per QA cf992e4 CMA peak fix: defer the next add_next_clip
 # scheduling until ADD_AFTER_RETIRE_MS after retire_subgraph
@@ -351,7 +362,7 @@ def _build_stream(label, mix_sink_idx):
     upl = Gst.ElementFactory.make("glupload", f"upl_{label}")
     if concat is None or dec is None or queue is None or upl is None:
         die(f"[{label}] core static element factory returned None")
-    # Time-based queue (~500ms by default) between dec and
+    # Time-based queue (~600ms by default) between dec and
     # glupload. Original purpose was to bridge a non-flushing
     # seek's dec-refill gap; the seek-loop is gone but the queue
     # is still useful as a jitter buffer at concat sub-bin
@@ -595,16 +606,17 @@ def add_next_clip(stream_id):
                 print(f"[xfade] {stream_id} EOS bin {serial} "
                       "WARN sub_bin not at queue front; "
                       "filtered.", file=sys.stderr)
-            # Per QA xfade-concat-loop-fix dispatch: schedule_add
-            # is UNCONDITIONAL on both visible and hidden streams.
-            # The visible stream loops its CURRENT clip gaplessly
-            # via concat-re-add (current_loop_clip is unchanged
-            # while visible; _start_advancing reassigns it on the
-            # incoming side just before the next crossfade). The
-            # hidden stream advances normally. Same mechanism for
-            # both streams = no seek, no flush, no HW decoder
-            # repositioning = the cutloop pattern that ships.
-            schedule_add(stream_id)
+            # NOTE: schedule_add is NO LONGER called from EOS per
+            # QA 1c737bc soak diagnosis. The wrap hitch (60-337ms
+            # gaps, 37/104 LINGERING seconds) was the new sub-bin
+            # not being decode-ready when concat switched. Moving
+            # schedule_add to the EAGER first-buffer probe below
+            # (fires when a sub-bin becomes active) lets the next
+            # sub-bin add at activation-time + 50ms, so it has the
+            # full current-clip-duration to preroll AHEAD of the
+            # next wrap. The blocked-pending sub-bin then has data
+            # buffered at concat's sink, ready to flow the instant
+            # concat unblocks it.
             # Per QA c41cf01 soak diagnosis: retire UNCONDITIONALLY
             # on idle, even when the stream is visible. The original
             # a84cee9 visible-defer was over-protective: by the
@@ -626,6 +638,35 @@ def add_next_clip(stream_id):
         return Gst.PadProbeReturn.OK
     eos_probe_id = concat_sink.add_probe(
         Gst.PadProbeType.EVENT_DOWNSTREAM, _on_concat_sink_event
+    )
+
+    # EAGER re-add per QA 1c737bc soak: install a BUFFER probe on
+    # concat_sink that fires ONCE when the FIRST buffer flows
+    # through (i.e. this sub-bin just became concat's active
+    # source). At that moment, schedule the NEXT add so the
+    # following sub-bin pre-rolls during this clip's lifetime
+    # (~5-9s of preroll vs the prior pattern's ~50-250ms post-EOS).
+    # By the time concat switches AGAIN at this sub-bin's natural
+    # EOS, the next sub-bin has been blocked-and-buffered at
+    # concat's pending pad for the whole clip duration; its data
+    # flows the instant concat unblocks it. Cuts the wrap latency
+    # to the dec restart on the new IDR (single-digit-ms on
+    # bcm2835 for same SPS/PPS) + tiny concat-switch overhead.
+    first_buffer_seen = [False]
+
+    def _on_concat_sink_first_buffer(_pad, _info):
+        if first_buffer_seen[0]:
+            return Gst.PadProbeReturn.OK
+        first_buffer_seen[0] = True
+        print(f"[xfade] {stream_id} concat ACTIVE bin {serial} "
+              f"({asset_name}) -- eager schedule_add",
+              file=sys.stderr)
+        # Defer to main loop so the probe returns quickly and the
+        # streaming thread isn't blocked on GLib state mutation.
+        GLib.idle_add(schedule_add, stream_id)
+        return Gst.PadProbeReturn.REMOVE
+    concat_sink.add_probe(
+        Gst.PadProbeType.BUFFER, _on_concat_sink_first_buffer
     )
 
     sub.sync_state_with_parent()
@@ -702,12 +743,13 @@ def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
     GLib.idle_add(_check_leak)
 
     # NOTE: schedule_add (queue the next sub-bin) is independent
-    # of retire and fires from the EOS probe in add_next_clip,
-    # gated only by cross-stream serialization. retire_subgraph
-    # runs unconditionally on GLib.idle_add from the same EOS
-    # probe -- matches cutloop's shipped pattern. By the time
-    # idle fires, concat has switched to the next pending sub-
-    # bin so the retiring sub-bin is no longer feeding the mix.
+    # of retire. Under the EAGER pattern (post-1c737bc) it fires
+    # from the FIRST-BUFFER probe on concat_sink, not from the
+    # EOS probe. retire_subgraph still runs unconditionally on
+    # GLib.idle_add from the EOS probe -- matches cutloop's
+    # shipped retire-on-idle. By the time idle fires, concat has
+    # switched to the next pending sub-bin so the retiring sub-
+    # bin is no longer feeding the mix.
     return False  # one-shot
 
 
