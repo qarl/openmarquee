@@ -161,6 +161,16 @@ PREROLL_BUDGET_S = 30
 # pipeline-wide. Decoder count is still 2 (one per stream,
 # permanent).
 INITIAL_QUEUE_DEPTH = 2
+# Per QA cf992e4 CMA peak fix: defer the next add_next_clip
+# scheduling until ADD_AFTER_RETIRE_MS after retire_subgraph
+# has run. retire's sub_bin.set_state(NULL) returns
+# synchronously for most elements but the streaming-thread
+# tail (V4L2 STREAMOFF, GL buffer pool drain, etc.) may take
+# milliseconds; allocating the next sub-bin immediately
+# creates an overlap window where old+new resources are held.
+# 50ms is comfortably longer than the typical tail and
+# negligible vs the multi-second clip durations.
+ADD_AFTER_RETIRE_MS = 50
 
 
 def die(msg, code=1):
@@ -197,21 +207,40 @@ if not mix.link(sink):
 
 def _build_stream(label, mix_sink_idx):
     """Build a stream's static spine: concat -> v4l2h264dec ->
-    glupload -> mix.sink_<mix_sink_idx>. Returns the dict of
-    the static elements + the PERMANENT mix sink pad. Per-clip
-    sub-bins are added/retired into concat by add_next_clip /
-    retire_subgraph (cutloop pattern)."""
+    queue (cap 2) -> glupload -> mix.sink_<mix_sink_idx>.
+    Returns the dict of the static elements + the PERMANENT mix
+    sink pad. Per-clip sub-bins are added/retired into concat
+    by add_next_clip / retire_subgraph (cutloop pattern).
+
+    Per QA cf992e4 CMA peak fix: a small queue with
+    max-size-buffers=2 between dec and glupload caps the depth
+    of decoded-frame refs held downstream. Without it,
+    glupload's default-pool depth is uncapped and the
+    v4l2h264dec CAPTURE pool stays pinned longer than
+    necessary, contributing to the per-cycle CMA dip we saw
+    (43-47MB low, 99MB high). Capping the queue lets the
+    decoder release CAPTURE buffers as soon as glupload's
+    GL-upload chain absorbs them."""
     concat = Gst.ElementFactory.make("concat", f"concat_{label}")
     dec = Gst.ElementFactory.make("v4l2h264dec", f"dec_{label}")
+    queue = Gst.ElementFactory.make("queue", f"outq_{label}")
     upl = Gst.ElementFactory.make("glupload", f"upl_{label}")
-    if concat is None or dec is None or upl is None:
+    if concat is None or dec is None or queue is None or upl is None:
         die(f"[{label}] core static element factory returned None")
-    for el in (concat, dec, upl):
+    # Cap downstream depth. max-size-bytes/time = 0 disables those
+    # backpressure axes; max-size-buffers=2 keeps the queue at
+    # most 2 decoded frames behind glupload.
+    queue.set_property("max-size-buffers", 2)
+    queue.set_property("max-size-bytes", 0)
+    queue.set_property("max-size-time", 0)
+    for el in (concat, dec, queue, upl):
         pipeline.add(el)
     if not concat.link(dec):
         die(f"[{label}] concat -> dec link failed")
-    if not dec.link(upl):
-        die(f"[{label}] dec -> upl link failed")
+    if not dec.link(queue):
+        die(f"[{label}] dec -> queue link failed")
+    if not queue.link(upl):
+        die(f"[{label}] queue -> upl link failed")
     mix_pad = mix.request_pad_simple("sink_%u")
     if mix_pad is None:
         die(f"[{label}] mix.request_pad_simple failed")
@@ -225,7 +254,7 @@ def _build_stream(label, mix_sink_idx):
     if upl_src.link(mix_pad) != Gst.PadLinkReturn.OK:
         die(f"[{label}] upload.src -> mix.sink link failed")
     return {"label": label, "concat": concat, "dec": dec,
-            "upl": upl, "mix_pad": mix_pad}
+            "queue": queue, "upl": upl, "mix_pad": mix_pad}
 
 
 # Build both streams BEFORE setting alphas so the link order is
@@ -330,10 +359,15 @@ def add_next_clip(stream_id):
             print(f"[xfade] {stream_id} concat EOS bin {serial} "
                   f"({asset_name}) -> retire + queue next",
                   file=sys.stderr)
+            # Schedule retire only here. retire_subgraph itself
+            # schedules add_next_clip with a SHORT delay so the
+            # streaming thread can finish the NULL transition on
+            # this just-retired bin before the new bin allocates
+            # (per QA cf992e4 CMA peak fix: tighten retire-before-
+            # add ordering to drop the per-cycle overlap window).
             GLib.idle_add(retire_subgraph, stream_id, sub,
                           concat_sink, qtdemux, pad_added_id,
                           eos_probe_id)
-            GLib.idle_add(add_next_clip, stream_id)
         return Gst.PadProbeReturn.OK
     eos_probe_id = concat_sink.add_probe(
         Gst.PadProbeType.EVENT_DOWNSTREAM, _on_concat_sink_event
@@ -391,6 +425,18 @@ def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
                   f"{name}", file=sys.stderr)
         return False
     GLib.idle_add(_check_leak)
+
+    # Per QA cf992e4 CMA peak fix: defer the next add by
+    # ADD_AFTER_RETIRE_MS so the streaming thread has time to
+    # finish the NULL transition on this just-retired bin
+    # before the new bin starts allocating. Tightens the
+    # per-cycle overlap where old+new resources are
+    # simultaneously held. Concat starvation risk is
+    # negligible: INITIAL_QUEUE_DEPTH=2 means at this point
+    # there is still 1 active sub-bin feeding concat; the
+    # delay only briefly drops the pending count from 1 to 0.
+    GLib.timeout_add(ADD_AFTER_RETIRE_MS, add_next_clip,
+                     stream_id)
     return False  # one-shot
 
 
@@ -496,11 +542,24 @@ def _cma_free_kb():
 _t_start = time.monotonic()
 
 
+cma_state = {"min_kb": None}  # running min across the soak
+
+
 def fps_tick():
     uptime = int(time.monotonic() - _t_start)
     vis = visible_stream[0]
     a_alpha = streams["A"]["mix_pad"].get_property("alpha")
     b_alpha = streams["B"]["mix_pad"].get_property("alpha")
+    # Per QA cf992e4 dispatch: track + log CmaFree_min so the
+    # per-cycle dip is visible in the soak log. The dip (not
+    # the mean) is what bricks the Pi if it crosses the
+    # CMA-exhaustion floor.
+    cma_kb = _cma_free_kb()
+    if cma_kb >= 0:
+        if cma_state["min_kb"] is None or cma_kb < cma_state["min_kb"]:
+            cma_state["min_kb"] = cma_kb
+    cma_min_str = (str(cma_state["min_kb"])
+                   if cma_state["min_kb"] is not None else "?")
     line = (
         f"[fps] t={uptime} "
         f"screen={screen_state['frames']} "
@@ -511,7 +570,8 @@ def fps_tick():
         f"live_B={streams['B']['live_subgraph_count']} "
         f"added_A={streams['A']['playlist_added_count']} "
         f"added_B={streams['B']['playlist_added_count']} "
-        f"CmaFree_kB={_cma_free_kb()}"
+        f"CmaFree_kB={cma_kb} "
+        f"CmaFree_min_kB={cma_min_str}"
     )
     print(line, file=sys.stderr, flush=True)
     screen_state["frames"] = 0
