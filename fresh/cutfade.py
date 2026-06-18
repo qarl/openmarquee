@@ -236,32 +236,34 @@ else:
 loop = GLib.MainLoop()
 
 
-# --- Pre-allocate the two persistent mix sink pads ---------------------
+# --- Lazy mix sink pad allocation --------------------------------------
 #
-# Per QA design fix: glvideomixer sink pads must NOT be released
-# mid-stream (release_request_pad disrupts the aggregator + output
-# stops -> black screen after first retire). Allocate both pads
-# ONCE here at startup; build_slot links to the pre-allocated
-# pad for its slot; retire unlinks (does NOT release). Same pads
-# get re-linked by the next clip into that slot.
+# Per QA glass diagnosis of 1dcf4f4: pre-allocating BOTH mix sink
+# pads at startup breaks preroll. glvideomixer is a GstAggregator
+# and cannot reach PAUSED until ALL allocated sink pads have data.
+# With slot 1 unfed at startup, the aggregator waited forever ->
+# preroll timeout after 30s.
+#
+# Lazy alloc: request each pad ONLY when its slot is first built;
+# keep allocated forever afterwards (never release_request_pad,
+# which disrupts the aggregator and stops output -- proven on
+# 00ca09e). Pads created-on-first-use + never released. EOS-DROP
+# probe attached ONCE per pad on its first allocation.
+#
+# Result: at startup only mix_pads[0] is allocated + fed by slot 0,
+# so the aggregator prerolls fine on the single fed pad (like
+# 00ca09e did). mix_pads[1] is allocated when slot 1 is first
+# primed mid-stream (in PLAYING, aggregator timeout-proceeds; not
+# a hard block like preroll). Subsequent cycles re-use both pads
+# without re-allocating.
+mix_pads = [None, None]
 
-mix_pads = [
-    mix.request_pad_simple("sink_%u"),
-    mix.request_pad_simple("sink_%u"),
-]
-for idx, p in enumerate(mix_pads):
-    if p is None:
-        die(f"mix.request_pad_simple failed for slot {idx} at init")
-    # Initial state: both alpha=0 + zorder=0 (no sub-bin linked
-    # yet). build_slot for slot 0 will set alpha=1 before PLAYING.
-    p.set_property("alpha", 0.0)
-    p.set_property("zorder", 0)
 
-# Per-pad EOS-DROP probe (one-time attach, lives for pipeline life).
-# glvideomixer does NOT auto-absorb a single source EOS the way
-# concat did; without DROP, the first clip's natural EOS propagates
-# mixer -> sink -> pipeline EOS -> shutdown after one cycle.
 def _make_eos_drop_probe(slot_idx):
+    """EOS-DROP probe factory. glvideomixer does NOT auto-absorb a
+    single source EOS the way concat did; without DROP, the first
+    clip's natural EOS propagates mixer -> sink -> pipeline EOS ->
+    shutdown after one cycle."""
     def _on_event(_pad, info):
         ev = info.get_event()
         if ev and ev.type == Gst.EventType.EOS:
@@ -271,9 +273,24 @@ def _make_eos_drop_probe(slot_idx):
         return Gst.PadProbeReturn.OK
     return _on_event
 
-for idx, p in enumerate(mix_pads):
-    p.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM,
-                _make_eos_drop_probe(idx))
+
+def _ensure_mix_pad(slot_idx):
+    """Lazy-allocate mix_pads[slot_idx] on first use; attach
+    EOS-DROP probe at the same time. Returns the persistent pad.
+    Subsequent calls for the same slot return the existing pad."""
+    if mix_pads[slot_idx] is None:
+        p = mix.request_pad_simple("sink_%u")
+        if p is None:
+            die(f"mix.request_pad_simple failed for slot {slot_idx}")
+        p.set_property("alpha", 0.0)
+        p.set_property("zorder", 0)
+        p.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM,
+                    _make_eos_drop_probe(slot_idx))
+        mix_pads[slot_idx] = p
+        print(f"[cutfade] lazy-allocated mix.sink_{slot_idx} "
+              "+ EOS-DROP probe (first build for this slot)",
+              file=sys.stderr)
+    return mix_pads[slot_idx]
 
 
 # --- Slot state machine -------------------------------------------------
@@ -363,13 +380,16 @@ def build_slot(slot_idx, clip_idx):
     sub.add_pad(ghost)
 
     pipeline.add(sub)
-    # Per QA design fix: mix sink pads are PERSISTENT for the
-    # pipeline's life. Pre-allocated in mix_pads[0/1] at init time
-    # so we never call release_request_pad mid-stream (which
-    # disrupts the glvideomixer aggregator -> output stops, screen
-    # goes black after first retire). Each retire just unlinks the
-    # ghost from the persistent pad; the next clip re-links.
-    mix_sink = mix_pads[slot_idx]
+    # Per QA design fix: mix sink pads are PERSISTENT once
+    # allocated and never released. _ensure_mix_pad does
+    # lazy allocation on first use for this slot AND attaches the
+    # EOS-DROP probe at the same time; on subsequent builds it
+    # just returns the existing pad. Lazy alloc is necessary
+    # because glvideomixer is a GstAggregator -- preroll requires
+    # ALL allocated pads to have data. Pre-allocating both at
+    # init breaks preroll (1dcf4f4 soak result); allocating only
+    # what is currently fed lets preroll succeed.
+    mix_sink = _ensure_mix_pad(slot_idx)
     # Defensive: if a prior retire missed an unlink, clear it.
     prior_peer = mix_sink.get_peer()
     if prior_peer is not None:
@@ -378,11 +398,6 @@ def build_slot(slot_idx, clip_idx):
         prior_peer.unlink(mix_sink)
     if ghost.link(mix_sink) != Gst.PadLinkReturn.OK:
         die(f"[{label}] ghost -> mix.sink link failed")
-
-    # NOTE: the EOS-DROP probe on this mix_sink pad was attached
-    # ONCE at init time (alongside the pad allocation) and stays
-    # attached for the pipeline's life. Do NOT re-attach here --
-    # adding a duplicate per-build would leak probe handles.
 
     slot = slots[slot_idx]
     slot["sub"] = sub
