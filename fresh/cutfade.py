@@ -412,6 +412,17 @@ fade_state = {"start_ns": 0, "in_flight": False,
 # Prevents double-prime when two triggers race on the same slot.
 advance_scheduled = [False, False]
 
+# Per QA d489fd8+5ec8044 soak: a prime_next that hits a fade
+# in-flight USED to be dropped (logged + returned False). The
+# log message promised "next prime will fire on the new current"
+# but nothing actually re-fired it. On short clips this stranded
+# the reel until FROZEN WATCHDOG force-advanced 3s later (visible
+# freeze + churn). Fix: defer the dropped prime onto this flag;
+# finish_fade re-fires it for the new current after the swap.
+# Module-level singleton -- prime_next is the only writer when
+# deferring; finish_fade clears and re-schedules.
+pending_prime = [False]
+
 # Watchdog state. zero_frame_seconds: legacy screen=0 counter.
 # last_dec_pts_ns + frozen_seconds: FROZEN-detection on the current
 # slot (catches "screen=24 of frozen composite" per QA d489fd8).
@@ -810,9 +821,19 @@ def prime_next():
     first frame, then start_fade. Returns False so callers via
     GLib.idle_add fire only once."""
     if fade_state["in_flight"]:
+        # Per QA 5ec8044 soak: short clips cross their pts
+        # threshold while the prior fade is still in flight. The
+        # old behavior dropped the call and the promised "next
+        # prime will fire on the new current" never happened ->
+        # the new current ran to natural EOS, repeat-after-eos
+        # froze its composite, and FROZEN WATCHDOG had to rescue
+        # it 3s later (visible freeze + screen=0 churn). Fix:
+        # DEFER the prime onto pending_prime; finish_fade re-fires
+        # it for the new current immediately after the swap.
         print("[cutfade] prime_next called while fade in flight; "
-              "skipping (next prime will fire on the new current)",
+              "DEFERRING (finish_fade will re-fire for new current)",
               file=sys.stderr)
+        pending_prime[0] = True
         return False
     off_idx = 1 - current_slot_idx[0]
     if slots[off_idx]["sub"] is not None:
@@ -943,8 +964,29 @@ def finish_fade():
     # is small (NULL teardown of a single sub-bin) so default
     # priority is fine.
     GLib.idle_add(retire_slot, outgoing_idx)
-    # Attach prime trigger to the new current.
+    # Attach prime trigger to the new current. Fresh closure each
+    # call -> fired[0]=False, so even non-deferred cases re-trigger
+    # cleanly on the new current's pts threshold.
     attach_prime_trigger(incoming_idx)
+
+    # Per QA 5ec8044 soak: if prime_next was DEFERRED during this
+    # fade (pts threshold crossed mid-fade on a short clip),
+    # fire it now for the new current. Set advance_scheduled
+    # for the incoming so the just-attached pts trigger does NOT
+    # race us (the trigger will idle_add prime_next; the slot-
+    # occupied guard in prime_next then catches the duplicate).
+    # If the new current is ALREADY past its own threshold (short
+    # clip case is exactly this), the buffer probe would fire on
+    # the next decoded buffer anyway; the deferred path just
+    # fires sooner and skips the "wait for next buffer" latency.
+    had_pending = pending_prime[0]
+    pending_prime[0] = False
+    if had_pending:
+        print(f"[cutfade] finish_fade: re-firing DEFERRED prime "
+              f"for new current slot {incoming_idx}",
+              file=sys.stderr)
+        advance_scheduled[incoming_idx] = True
+        GLib.idle_add(prime_next)
 
 
 # --- Instrument + watchdog ---------------------------------------------
