@@ -64,7 +64,7 @@ ARCHITECTURE:
                                                 glvideomixer mix
                                                         |
                                                         v
-                                                glimagesink sync=false
+                                                glimagesink sync=true
 
 CROSSFADE SCHEDULING (v2: clip-gated linger, per QA glass):
   v1's fixed 4s TARGET_VISIBLE_S fired mid-clip and produced
@@ -216,27 +216,22 @@ ADVANCE_FIRST_FRAME_WAIT_MS = 800
 # rather than thread synchronization.
 MIN_INTER_ADD_MS = 200
 # Time-based queue between v4l2h264dec and glupload (env-tunable).
-# Bridges the wrap underrun: when concat switches from EOS'd active
-# to next pending, the dec briefly pauses on the new IDR while the
-# queue continues feeding glupload->mix. Grown 600 -> 700ms per QA
-# 8e2215e soak diagnosis (60-264ms wrap hitches at 600ms; +100ms
-# gives margin if queue isn't at full-cap when wrap fires) AND now
-# coupled with leaky=downstream on the queue so the decoder runs
-# unthrottled (queue retains the NEWEST 700ms instead of being
-# back-pressured by the cap; ensures the buffer is actually FULL
-# at wrap moments rather than oscillating below cap due to mixer
-# rate matching).
-# CMA budget at 700ms: 1280x720 NV12 = 1.4MB/frame x 24fps x 0.7s
-# = ~23.5MB per stream; 2 streams = ~47MB. EAGER pattern adds ~1
-# extra sub-bin per stream (live=3 vs old live=2) at ~1-2MB CMA
-# each. Combined projection: CmaFree_min from 8e2215e's 58MB
-# (62MB at fade boundary) drops by ~7MB to ~51-55MB. Still above
-# the 50MB brick floor but TIGHTER than 8e2215e. Do NOT raise
-# to 800ms without a soak proving the headroom.
-# Env-tunable: shrink if CMA tight; grow only if hitches persist
-# AND a soak shows headroom for it.
+# Bridges the wrap underrun at concat sub-bin advances. Default
+# 600ms (reverted from 446511d's 700ms experiment after the leaky=2
+# regression made the bigger reservoir irrelevant). With glimagesink
+# sync=true (set below) pacing the chain to steady 24fps and a
+# non-leaky queue, dec is back-pressured to mixer rate; queue stays
+# near cap and provides head-start for the wrap IDR-decode.
+# CMA budget at 600ms: 1280x720 NV12 = 1.4MB/frame x 24fps x 0.6s
+# = ~20MB per stream; 2 streams = ~40MB. Plus EAGER's +1 sub-bin
+# per stream (~1-2MB each, filesrc+qtdemux+h264parse only). Combined
+# projection: CmaFree_min ~58MB at steady, ~61MB at fade boundary
+# (matches 8e2215e measured headroom).
+# Env-tunable: shrink to ~300ms if sync=true pacing proves the big
+# reservoir unneeded (cutloop ships with effective ~290ms and is
+# smooth); grow only if hitches persist AND a soak shows headroom.
 RESERVOIR_MS = int(os.environ.get(
-    "OPENMARQUEE_XFADE_RESERVOIR_MS", "700"
+    "OPENMARQUEE_XFADE_RESERVOIR_MS", "600"
 ))
 RESERVOIR_TIME_NS = RESERVOIR_MS * 1_000_000
 # Fallback per-clip duration if query_duration fails at startup.
@@ -335,7 +330,18 @@ if mix is None:
     die("glvideomixer factory returned None")
 if sink is None:
     die("glimagesink factory returned None")
-sink.set_property("sync", False)
+# sync=True per QA 446511d burst-regression diagnosis:
+# bcm2835 v4l2h264dec decodes each 4.75s clip in a ~1s burst then
+# idles ~2.6s. With sync=False the sink presents as fast as buffers
+# arrive; mid-burst the screen is fast, post-burst it starves --
+# screen rate becomes 22 -> 39 -> stall (bursty). cutloop ships
+# kmssink sync=True and is smooth because the sink PTS-paces the
+# whole chain to a steady 24fps and the decoder runs a few frames
+# ahead to cover wrap IDR-decode. Match the proven pacing model
+# here. glvideomixer is an aggregator; it composites at its src
+# caps framerate (24fps) regardless of sink pacing; sync=True at
+# the sink applies its PTS-wait at presentation.
+sink.set_property("sync", True)
 for el in (mix, sink):
     pipeline.add(el)
 if not mix.link(sink):
@@ -364,25 +370,23 @@ def _build_stream(label, mix_sink_idx):
     upl = Gst.ElementFactory.make("glupload", f"upl_{label}")
     if concat is None or dec is None or queue is None or upl is None:
         die(f"[{label}] core static element factory returned None")
-    # Time-based queue (~700ms by default) between dec and
+    # Time-based queue (~600ms by default) between dec and
     # glupload. Bridges the wrap underrun at concat sub-bin
     # advances. max-size-bytes and max-size-buffers = 0
-    # (disabled) so only time gates the cap.
-    # leaky=DOWNSTREAM (mode 2) per QA 8e2215e wrap-hitch
-    # diagnosis: without leak, queue back-pressures the decoder
-    # when full so dec runs at exactly mixer rate; queue level
-    # oscillates BELOW cap (not at it). At wrap, queue may have
-    # only 100-300ms buffered when it needs 600+ms to bridge
-    # the dec restart. With downstream-leak, dec runs at its
-    # full ~60-100fps speed; queue keeps the NEWEST 700ms
-    # cap-worth of frames at all times. Mixer pulls oldest;
-    # queue refills with newer. End-to-end latency rises by
-    # ~700ms (acceptable for a non-interactive reel; was ~600ms
-    # under back-pressure with similar effect anyway).
+    # (disabled) so only time gates the cap. Non-leaky (default):
+    # decoder runs faster than mixer-pull-rate, fills queue to
+    # cap; at wrap dec briefly pauses, queue feeds mixer from
+    # its buffered frames.
+    # leaky=DOWNSTREAM was tried on 446511d and REGRESSED:
+    # bcm2835 v4l2h264dec decodes each 4.75s clip in a ~1s
+    # BURST then idles ~2.6s waiting for next sub-bin. With
+    # leaky=2 the queue retains only the newest 700ms and the
+    # inter-burst gap STARVES the visible path (QA probes
+    # showed outq_frames=0 across whole seconds, screen-gap
+    # 762ms). Reverted to non-leaky per QA 446511d soak.
     queue.set_property("max-size-time", RESERVOIR_TIME_NS)
     queue.set_property("max-size-bytes", 0)
     queue.set_property("max-size-buffers", 0)
-    queue.set_property("leaky", 2)  # 2 = downstream-leaky
     for el in (concat, dec, queue, upl):
         pipeline.add(el)
     if not concat.link(dec):
