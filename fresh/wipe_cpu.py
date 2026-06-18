@@ -443,6 +443,32 @@ class ClipBin:
             return Gst.PadProbeReturn.OK
 
         sink_pad.add_probe(Gst.PadProbeType.BUFFER, _on_first_buffer)
+        # Decoded-frame probe (per QA diagnostic): BUFFER probe on
+        # v4l2h264dec src pad increments the per-SLOT decoded counter.
+        # Surfaced as decA / decB in the [fps] line. Distinguishes
+        # "decoder never driven" (dec=0, only intervideosrc fallback
+        # to compositor) from "frames flow + bug elsewhere" (dec~30).
+        decoder = self.pipeline.get_by_name("dec")
+        if decoder is None:
+            die(f"[{self.label}] v4l2h264dec named dec not found")
+        dec_src = decoder.get_static_pad("src")
+        if dec_src is None:
+            die(f"[{self.label}] v4l2h264dec has no src pad")
+        slot_key = self.slot
+        gs = dec_gap_state[slot_key]
+
+        def _on_dec_buffer(_pad, _info):
+            dec_counters[slot_key] += 1
+            now_ns_local = time.monotonic_ns()
+            last = gs["last_ns"]
+            if last:
+                gap_ms = (now_ns_local - last) / 1e6
+                if gap_ms > gs["max_gap_ms"]:
+                    gs["max_gap_ms"] = gap_ms
+            gs["last_ns"] = now_ns_local
+            return Gst.PadProbeReturn.OK
+
+        dec_src.add_probe(Gst.PadProbeType.BUFFER, _on_dec_buffer)
         # qtdemux dynamic-pad: connect pad-added BEFORE state change
         # so we do not miss the signal regardless of preroll timing.
         self.demuxer.connect("pad-added", self._on_demux_pad_added)
@@ -925,6 +951,20 @@ gap_state = {
     "screen": {"last_ns": 0, "max_gap_ms": 0.0},
 }
 
+# Per-SLOT decoded-frame counter (per QA diagnostic ask): a BUFFER
+# probe on each ClipBin's v4l2h264dec src pad increments the slot's
+# counter so we can distinguish "decoder never driven, only
+# intervideosrc fallback feeds compositor" (decA=0 inA=30) from
+# "frames flow normally + bug is elsewhere" (decA~24-30). Two bins
+# on the same slot cannot be alive simultaneously (slot has one
+# channel), so per-second slot-attribution is unambiguous. During a
+# crossfade BOTH slots have active bins -> both counters rise.
+dec_counters = {"A": 0, "B": 0}
+dec_gap_state = {
+    "A": {"last_ns": 0, "max_gap_ms": 0.0},
+    "B": {"last_ns": 0, "max_gap_ms": 0.0},
+}
+
 try:
     fps_log_file = open("/tmp/wipe_fps.log", "a", buffering=1)
     print("[wipe_cpu] tee fps to /tmp/wipe_fps.log")
@@ -989,11 +1029,14 @@ def fps_tick():
     else:
         pos_s = "?"
     gaps = {k: int(s["max_gap_ms"]) for k, s in gap_state.items()}
+    dec_gaps = {k: int(s["max_gap_ms"]) for k, s in dec_gap_state.items()}
     line = (
         f"[fps] t={uptime} "
         f"inA={counters['inA']}(g{gaps['inA']}) "
         f"inB={counters['inB']}(g{gaps['inB']}) "
         f"screen={counters['screen']}(g{gaps['screen']}) "
+        f"decA={dec_counters['A']}(g{dec_gaps['A']}) "
+        f"decB={dec_counters['B']}(g{dec_gaps['B']}) "
         f"main={main_label} next={next_label} "
         f"pts={pos_s} state={wipe_state['phase']}"
     )
@@ -1006,7 +1049,11 @@ def fps_tick():
     counters["inA"] = 0
     counters["inB"] = 0
     counters["screen"] = 0
+    dec_counters["A"] = 0
+    dec_counters["B"] = 0
     for s in gap_state.values():
+        s["max_gap_ms"] = 0.0
+    for s in dec_gap_state.values():
         s["max_gap_ms"] = 0.0
     return True
 
