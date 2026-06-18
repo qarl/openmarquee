@@ -75,8 +75,10 @@ LOOP MECHANISM (per QA scheduler-redesign spec 2026-06-18):
     FADING           -- _animate_fade() runs per tick; advance on
                         elapsed >= FADE_S.
        |
-       v  _do_complete_fade(): SYNCHRONOUS retire (blocks NULL
-          via get_state 2s) + swap + duration query.
+       v  _do_complete_fade(): retire outgoing (slot fields
+          cleared immediately; sub's NULL transition completes
+          async on the streaming thread to keep main loop
+          responsive for glimagesink GBM/EGL) + swap + dur query.
 
   Probe callbacks may set passive flags only; MUST NOT call
   _do_* or write sched["state"]. The single-in-flight invariant
@@ -88,10 +90,15 @@ LOOP MECHANISM (per QA scheduler-redesign spec 2026-06-18):
   dec_pts probe ID are stored on the slot dict for retire_slot
   to disconnect/remove (cutloop's proven sequence).
 
-  retire_slot is synchronous and sends EOS to the kept
-  mix.sink pad to engage repeat-after-eos before unlink + alpha=0
-  + sub NULL + pipeline.remove. NEVER release_request_pad
-  on a glvideomixer sink pad.
+  retire_slot sends EOS to the kept mix.sink pad to engage
+  repeat-after-eos, then _await_idle on the outgoing branch
+  (IDLE-pad wait, short timeout) so no buffer is in flight at
+  the instant of unlink, then unlink + alpha=0 + ASYNC NULL +
+  pipeline.remove. Slot fields cleared immediately; the bin's
+  NULL transition tail and any streaming-thread errors are
+  covered by retiring_bin_names + on_bus's _is_in_retiring_bin
+  ignore branch for 500ms after retire_slot returns. NEVER
+  release_request_pad on a glvideomixer sink pad.
 
 OBSERVABILITY: fps_tick at 1Hz emits a [fps] line with
 state=, dec_pts_ms=, cur_dur_s=, screen=, max_gap_ms=. The
@@ -702,29 +709,44 @@ def _await_idle(pad, timeout_s, label=""):
 
 
 def retire_slot(slot_idx):
-    """Tear down the sub-bin in slots[slot_idx]. SYNCHRONOUS per
-    QA scheduler spec section (4): blocks until the sub is fully
-    NULL'd and slot fields are cleared. Called only from
-    _do_complete_fade. Uses cutloop's proven disconnect-before-
-    NULL sequence to prevent closure-ref leaks (Python closures
-    captured by the pad-added handler + any probes hold the
-    sub-bin alive otherwise).
+    """Tear down the sub-bin in slots[slot_idx]. Called only
+    from _do_complete_fade. Uses cutloop's proven disconnect-
+    before-NULL sequence to prevent closure-ref leaks.
 
-    Per QA review note #1: the blocking NULL via get_state(2s)
-    will produce a ~1s main-loop pause at each boundary (=
-    the known secondary boundary-hitch, now systematic).
-    EXPECTED and ACCEPTED this round; smoothing is the final
-    step after the reel cycles crash-free.
+    Per QA 62dcd7f glass diagnosis: the 50e791c synchronous NULL
+    via get_state(2*Gst.SECOND) STARVES glimagesink's GBM/EGL
+    main-loop -> screen=0 in PLAYING_CURRENT. d489fd8's no-block
+    pattern kept the display alive. So this retire is ASYNC:
+    set_state(NULL) + pipeline.remove() without waiting on the
+    state change. The streaming thread completes the NULL on
+    its own; the main loop stays responsive for glimagesink.
 
-    Per QA 50e791c soak teardown-race fix:
+    The single-in-flight scheduler invariant (state-machine
+    serialization) and (B) bus-ignore-retiring-bin together
+    handle the not-linked race without needing the sync block.
+    The sync block was buying nothing -- 50e791c still crashed
+    at retire #23 WITH it; (A)+(B) in 1e95f37 fixed the crash.
+
+    Teardown-race protections (preserved):
     - Part (A): _await_idle(glupload.src, 0.1) BEFORE unlink so
       no buffer is in flight on the chain at the unlink instant.
-      Proceed-on-timeout so retire never deadlocks the NULL.
+      Proceed-on-timeout.
     - Part (B): retiring_bin_names tracks this sub-bin's name
-      across the whole teardown so on_bus's ERROR handler can
-      treat a streaming-thread error from inside as benign and
-      log + ignore (not loop.quit). Tracked via try/finally so
-      even an exception in teardown still discards the name."""
+      across the teardown window AND for 500ms after retire_slot
+      returns (delayed-discard via GLib.timeout_add) -- the
+      streaming thread tail may still emit errors after the
+      async NULL transitions, and we want bus_handler to ignore
+      them. on_bus's _is_in_retiring_bin walks the parent chain
+      so a deeply nested element still matches.
+
+    Slot dict fields are cleared IMMEDIATELY on return -- the
+    underlying mix sink PAD persists across retire via the
+    module-level mix_pads[slot_idx] reference, so when build_slot
+    runs next for this slot, _ensure_mix_pad returns the same
+    persistent pad. So _do_complete_fade's post-retire assert
+    `slots[outgoing_idx]['sub'] is None` is satisfied even
+    though the underlying GstBin's state change is still in
+    flight."""
     slot = slots[slot_idx]
     sub = slot["sub"]
     if sub is None:
@@ -733,103 +755,96 @@ def retire_slot(slot_idx):
     sub_name = sub.get_name()
     weak = weakref.ref(sub)
 
-    # Part (B): announce this bin as retiring BEFORE we touch
-    # anything else, so on_bus catches any error from the
-    # streaming thread during the entire teardown window.
+    # Part (B): announce retiring BEFORE we touch anything.
     retiring_bin_names.add(sub_name)
+
     try:
-        try:
-            # 1. Disconnect pad-added handler (closure-leak prevention).
-            if slot["pad_added_id"] and slot["demux"] is not None:
-                try:
-                    slot["demux"].disconnect(slot["pad_added_id"])
-                except Exception as exc:
-                    print(f"[cutfade] retire {label} pad-added "
-                          f"disconnect WARN: {exc}",
-                          file=sys.stderr)
-            # 2. Remove decoder.src probes (first-frame + dec_pts).
-            if slot["dec"] is not None:
-                dec_src = slot["dec"].get_static_pad("src")
-                if dec_src is not None:
-                    if slot["first_frame_probe_id"]:
-                        try:
-                            dec_src.remove_probe(
-                                slot["first_frame_probe_id"]
-                            )
-                        except Exception as exc:
-                            print(f"[cutfade] retire {label} "
-                                  f"first-frame probe WARN: "
-                                  f"{exc}", file=sys.stderr)
-                    if slot["dec_pts_probe_id"]:
-                        try:
-                            dec_src.remove_probe(
-                                slot["dec_pts_probe_id"]
-                            )
-                        except Exception as exc:
-                            print(f"[cutfade] retire {label} "
-                                  f"dec_pts probe WARN: {exc}",
-                                  file=sys.stderr)
-            # 3. EOS into the kept mix sink pad to ENGAGE
-            # repeat-after-eos before unlinking (proven on
-            # d489fd8). send_event is synchronous on the
-            # aggregator sink-event handler so priv->eos = True
-            # by return.
-            if slot["mix_sink"] is not None:
-                if not slot["mix_sink"].send_event(
-                    Gst.Event.new_eos()
-                ):
-                    print(f"[cutfade] retire {label} mix_sink "
-                          "EOS send_event returned False "
-                          "(proceeding)", file=sys.stderr)
-                # 4. Part (A): IDLE-pad wait on the outgoing
-                # branch's peer (= glupload.src, reached via the
-                # ghost's target on mix_sink's peer). Short
-                # timeout; proceed on timeout. Prevents the
-                # qtdemux not-linked race observed on 50e791c
-                # retire #23.
-                peer = slot["mix_sink"].get_peer()
-                if peer is not None:
-                    # peer is the ghost pad on the sub-bin;
-                    # its target IS glupload.src.
-                    target = peer.get_target() if hasattr(
-                        peer, "get_target"
-                    ) else None
-                    idle_target = target if target is not None else peer
-                    _await_idle(idle_target, 0.1,
-                                label=f"{label} glupload.src")
-                    # 5. Unlink old peer from kept mix sink pad.
-                    peer.unlink(slot["mix_sink"])
-                # alpha=0 -> composite path skips the frozen frame.
-                slot["mix_sink"].set_property("alpha", 0.0)
-            # 6. BLOCKING set_state(NULL). ASYNC -> wait up to 2s.
-            ret = sub.set_state(Gst.State.NULL)
-            if ret == Gst.StateChangeReturn.ASYNC:
-                ret2, _cur, _pend = sub.get_state(2 * Gst.SECOND)
-                if ret2 != Gst.StateChangeReturn.SUCCESS:
-                    print(f"[cutfade] retire {label} NULL "
-                          f"get_state WARN ret="
-                          f"{ret2.value_nick} after 2s "
-                          "(proceeding; downstream assert will "
-                          "surface corrupted state)",
-                          file=sys.stderr)
-            # 7. pipeline.remove.
-            pipeline.remove(sub)
-            print(f"[cutfade] retire {label} (slot {slot_idx}; "
-                  "mix.sink pad kept allocated)",
-                  file=sys.stderr)
-        except Exception as exc:
-            print(f"[cutfade] retire {label} WARN: {exc}",
-                  file=sys.stderr)
+        # 1. Disconnect pad-added handler (closure-leak prevention).
+        if slot["pad_added_id"] and slot["demux"] is not None:
+            try:
+                slot["demux"].disconnect(slot["pad_added_id"])
+            except Exception as exc:
+                print(f"[cutfade] retire {label} pad-added "
+                      f"disconnect WARN: {exc}", file=sys.stderr)
+        # 2. Remove decoder.src probes (first-frame + dec_pts).
+        if slot["dec"] is not None:
+            dec_src = slot["dec"].get_static_pad("src")
+            if dec_src is not None:
+                if slot["first_frame_probe_id"]:
+                    try:
+                        dec_src.remove_probe(
+                            slot["first_frame_probe_id"]
+                        )
+                    except Exception as exc:
+                        print(f"[cutfade] retire {label} "
+                              f"first-frame probe WARN: {exc}",
+                              file=sys.stderr)
+                if slot["dec_pts_probe_id"]:
+                    try:
+                        dec_src.remove_probe(
+                            slot["dec_pts_probe_id"]
+                        )
+                    except Exception as exc:
+                        print(f"[cutfade] retire {label} "
+                              f"dec_pts probe WARN: {exc}",
+                              file=sys.stderr)
+        # 3. EOS into the kept mix sink pad to ENGAGE
+        # repeat-after-eos before unlinking (proven on d489fd8).
+        if slot["mix_sink"] is not None:
+            if not slot["mix_sink"].send_event(
+                Gst.Event.new_eos()
+            ):
+                print(f"[cutfade] retire {label} mix_sink EOS "
+                      "send_event returned False (proceeding)",
+                      file=sys.stderr)
+            # 4. Part (A): IDLE-pad wait on the outgoing branch.
+            peer = slot["mix_sink"].get_peer()
+            if peer is not None:
+                target = peer.get_target() if hasattr(
+                    peer, "get_target"
+                ) else None
+                idle_target = target if target is not None else peer
+                _await_idle(idle_target, 0.1,
+                            label=f"{label} glupload.src")
+                # 5. Unlink old peer from kept mix sink pad.
+                peer.unlink(slot["mix_sink"])
+            slot["mix_sink"].set_property("alpha", 0.0)
+        # 6. ASYNC set_state(NULL). DO NOT wait on get_state --
+        # blocking the main loop ~1s per boundary starves
+        # glimagesink's GBM/EGL output and kills the display
+        # (QA 62dcd7f glass-confirmed). The streaming thread
+        # completes the NULL transition on its own. (B)
+        # bus-ignore-retiring-bin handles any error emitted
+        # during the async tail.
+        sub.set_state(Gst.State.NULL)
+        # 7. pipeline.remove immediately. The remove triggers
+        # the bin's element-NULL cascade and unparents it from
+        # the pipeline. d489fd8's proven pattern.
+        pipeline.remove(sub)
+        print(f"[cutfade] retire {label} (slot {slot_idx}; "
+              "mix.sink pad kept; NULL async)",
+              file=sys.stderr)
+    except Exception as exc:
+        print(f"[cutfade] retire {label} WARN: {exc}",
+              file=sys.stderr)
 
-        # 8. Clear slot fields (mix_sink NOT cleared -- persistent).
-        _slot_clear(slot)
-    finally:
-        # Part (B): even if teardown raised, drop this bin from
-        # the retiring set so on_bus stops ignoring its errors
-        # (any subsequent error from this name IS real).
-        retiring_bin_names.discard(sub_name)
+    # 8. Clear slot fields immediately so the post-retire assert
+    # in _do_complete_fade passes and the scheduler's next
+    # PRIMING_NEXT sees the slot as empty. The underlying mix
+    # sink PAD persists via mix_pads[slot_idx] (module-level);
+    # _slot_clear blanks the slot["mix_sink"] reference but
+    # build_slot re-fetches the persistent pad via _ensure_mix_pad.
+    _slot_clear(slot)
 
-    # 8. Defensive leak check (existing cf03a8f instrumentation).
+    # 9. Discard from retiring_bin_names AFTER 500ms so any
+    # streaming-thread error from the async NULL tail is still
+    # ignored by on_bus. 500ms comfortably covers the typical
+    # bcm2835 STREAMOFF tail.
+    GLib.timeout_add(500, lambda n=sub_name: (
+        retiring_bin_names.discard(n) or False
+    ))
+
+    # 10. Defensive leak check (cf03a8f instrumentation).
     def _check_leak():
         gc.collect()
         if weak() is not None:
@@ -869,9 +884,16 @@ def retire_slot(slot_idx):
 #   2. scheduler_tick runs on the GLib main loop (single thread).
 #   3. The first-frame probe and any other event callbacks may
 #      only set passive flags.
-#   4. retire_slot is synchronous (blocks NULL via get_state)
-#      so FADING -> PLAYING_CURRENT is atomic from the state
-#      machine's perspective.
+#   4. retire_slot clears slot fields IMMEDIATELY (slot["sub"]
+#      = None) before returning, so FADING -> PLAYING_CURRENT
+#      is atomic from the state machine's perspective even
+#      though the underlying GstBin's NULL transition completes
+#      async on the streaming thread. Sync get_state was
+#      tried on 50e791c and starved glimagesink's GBM/EGL main
+#      loop -> screen=0 (QA 62dcd7f glass). The async pattern
+#      from d489fd8 keeps the display alive; (A) _await_idle
+#      + (B) retiring_bin_names + on_bus ignore handle the
+#      teardown race without needing a sync block.
 #   5. _do_start_priming asserts slots[off_idx]["sub"] is None
 #      before building -- turns any residual race into a loud
 #      assertion error instead of the silent qtdemux not-linked
@@ -1149,14 +1171,18 @@ def _do_start_fade():
 
 def _do_complete_fade():
     """FADING -> PLAYING_CURRENT. Lock final alpha values,
-    synchronously retire the outgoing sub-bin (blocks until
-    NULL), swap current_slot_idx, stamp became_current_ns, and
-    query the new current's duration.
+    retire the outgoing sub-bin (slot fields cleared
+    immediately; bin's NULL transition completes async on the
+    streaming thread to keep the main loop responsive for
+    glimagesink GBM/EGL output), swap current_slot_idx, stamp
+    became_current_ns, query the new current's duration.
 
-    Per QA review note #1: synchronous retire WILL produce a
-    ~1s main-loop pause at each boundary (= the known
-    secondary boundary-hitch, now systematic). EXPECTED and
-    ACCEPTED this round."""
+    Per QA 62dcd7f glass diagnosis: the prior synchronous
+    get_state(2s) wait blocked the main loop ~1s per boundary
+    and starved glimagesink -> screen=0 in PLAYING_CURRENT.
+    Async retire (d489fd8's proven pattern) keeps the display
+    alive; the not-linked race is handled by retire_slot's
+    (A) _await_idle + (B) retiring_bin_names + on_bus ignore."""
     outgoing_idx = sched["outgoing_slot_idx"]
     incoming_idx = sched["incoming_slot_idx"]
     out_pad = slots[outgoing_idx].get("mix_sink")
@@ -1168,12 +1194,14 @@ def _do_complete_fade():
 
     retire_slot(outgoing_idx)
     # Spec section (5) point 5: assert post-retire state to turn
-    # any "retire didn't fully complete" residual into a loud
+    # any "retire didn't clear slot fields" residual into a loud
     # fail rather than a downstream crash on the next prime.
+    # _slot_clear inside retire_slot sets slot["sub"] = None
+    # synchronously before retire_slot returns even though the
+    # underlying GstBin's NULL is still in flight async.
     assert slots[outgoing_idx]["sub"] is None, (
         f"_do_complete_fade: slots[{outgoing_idx}]['sub'] still "
-        "not None after synchronous retire_slot; the BLOCKING "
-        "NULL transition did not complete"
+        "not None after retire_slot; _slot_clear did not run"
     )
 
     current_slot_idx[0] = incoming_idx
