@@ -79,7 +79,10 @@ VIDEOS = [
     "/var/openmarquee/content/3f54a4d2-a120-4c0c-aa80-5b99aaf7c9ff/asset.mp4",
 ]
 DW, DH = 1280, 720
-GAP_WARN_MS = 50
+GAP_WARN_MS = 60  # per QA: 50ms was too tight for 24fps's 41.7ms
+                  # interval -- 98% of warns were 50-55ms benign
+                  # threshold-clipping. 60ms catches real >1-frame
+                  # hitches without the noise.
 # Per QA QUEUE-AHEAD INVARIANT: ALWAYS keep >=1 pad pending ahead of
 # current. Pre-queue both playlist clips at startup; on each EOS the
 # probe eagerly schedules add_next_clip so the queue stays at >=1
@@ -260,30 +263,57 @@ def add_next_clip():
     # the sub-bin ghost. When concat sees EOS on this sink pad, it
     # switches away to the next pending sink pad and ABSORBS the
     # EOS internally -- no downstream EOS, no STREAMOFF on the
-    # decoder. The probe schedules two main-thread ops via
-    # idle_add: (a) RETIRE this subgraph (NULL state, remove from
-    # pipeline, release concat request pad, AND disconnect the
-    # qtdemux pad-added handler + remove this probe so the
-    # closures release the sub-bin), and (b) ADD the next playlist
-    # clip to keep the queue-ahead invariant.
+    # decoder. Schedules RETIRE this subgraph via LOW-priority
+    # idle so the NULL teardown work does NOT compete with active
+    # streaming at the boundary instant. The next-clip ADD is NOT
+    # scheduled here -- it was already scheduled by the eager pre-
+    # build probe (below) when THIS bin became active. So at the
+    # boundary, no add/build CPU spike either; only the low-pri
+    # retire which can run any time during the next clip.
     eos_probe_id = None  # filled in below
 
     def _on_concat_sink_event(_pad, info):
         ev = info.get_event()
         if ev and ev.type == Gst.EventType.EOS:
             print(f"[cutloop] concat sink EOS from bin {serial} "
-                  f"({asset_name}) -> retire + queue next",
+                  f"({asset_name}) -> retire (low-pri)",
                   file=sys.stderr)
             # Pass IDs needed for clean retire (disconnect signal +
             # remove probe so closures release the sub-bin). Per QA
             # leak analysis: without these, set_state(NULL) +
             # pipeline.remove + release_request_pad alone leaks.
+            # priority=PRIORITY_LOW: defer the actual NULL/remove
+            # off the boundary hot path.
             GLib.idle_add(retire_subgraph, sub, concat_sink,
-                          qtdemux, pad_added_id, eos_probe_id)
-            GLib.idle_add(add_next_clip)
+                          qtdemux, pad_added_id, eos_probe_id,
+                          priority=GLib.PRIORITY_LOW)
         return Gst.PadProbeReturn.OK
     eos_probe_id = concat_sink.add_probe(
         Gst.PadProbeType.EVENT_DOWNSTREAM, _on_concat_sink_event
+    )
+
+    # EAGER PRE-BUILD per QA case-(I) fix: a BUFFER probe on the
+    # same concat sink pad fires once on the FIRST buffer through
+    # this sub-bin (= concat just switched TO this bin = this bin
+    # is now active). At that moment we schedule add_next_clip so
+    # the NEXT-NEXT sub-bin's parse_launch + element creation +
+    # sync_state happens MID-CLIP (calm streaming, idle CPU), not
+    # AT THE BOUNDARY where it competes with the active streaming
+    # threads on the single-core path. The probe removes itself
+    # after the first fire to avoid spinning per-frame.
+    prebuild_fired = [False]
+
+    def _on_concat_sink_buffer(_pad, _info):
+        if not prebuild_fired[0]:
+            prebuild_fired[0] = True
+            print(f"[cutloop] bin {serial} ({asset_name}) became "
+                  "active -> eager pre-build next",
+                  file=sys.stderr)
+            GLib.idle_add(add_next_clip)
+            return Gst.PadProbeReturn.REMOVE
+        return Gst.PadProbeReturn.OK
+    concat_sink.add_probe(
+        Gst.PadProbeType.BUFFER, _on_concat_sink_buffer
     )
 
     sub.sync_state_with_parent()
