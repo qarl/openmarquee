@@ -177,24 +177,16 @@ PLAYLIST = [
     "86b3eba8-3063-4c21-a2b1-749f7665e4d3/asset.mp4",
 ]
 
-# Per QA glass feedback (qarl): fixed 4s TARGET_VISIBLE_S fires
-# mid-clip and produces weird drift/cutting. Replaced with a
-# CLIP-GATED linger: each visible clip plays max(clip_dur,
-# LINGER_MIN_S); short clips LOOP to reach the floor (only when
-# LINGER_MIN_S > clip_dur). Crossfade fires ONLY at a clean
-# boundary: the incoming stream is advanced to its NEXT clip
-# just before the crossfade so its first frame is FROM ITS
-# START at the crossfade moment.
-#
-# Per QA 7561fac soak: short-clip LOOPING (4.75s clips re-queue
-# every ~4.75s to fill a 10s linger) causes frequent retire/add
-# churn + loop-seam stutter + raises cross-stream collision
-# odds. QA's option (A): NATURAL-LENGTH linger -- each clip
-# shows its OWN full length, NO forced 10s, NO looping. Default
-# the floor to 0.0 (natural mode); env override to opt back into
-# a forced-10s floor when desired.
+# Per QA a84cee9 + qarl's firm 20s-per-video rule: each visible
+# clip holds for max(clip_dur, LINGER_MIN_S). Short clips that
+# would EOS before LINGER_MIN_S elapses are LOOPED via SEAMLESS
+# SEEK on the source -- NOT via concat re-queue / sub-bin
+# teardown. Seek-loop matches xfade_demo.py's proven hitch-free
+# pattern (262 loops + 20s holds, screen steady ~22-23, no
+# hitch). Teardown happens ONLY on the hidden stream, behind the
+# crossfade.
 LINGER_MIN_S = float(os.environ.get(
-    "OPENMARQUEE_XFADE_LINGER_MIN_S", "0.0"
+    "OPENMARQUEE_XFADE_LINGER_MIN_S", "20.0"
 ))
 FADE_S = 1.0             # crossfade duration
 FADE_TICK_MS = 33        # ~30Hz alpha animation
@@ -428,6 +420,27 @@ for sid, s in streams.items():
     # B from clip1 to clip0, making the viewer see clip0 twice
     # in a row (A.clip0 then B.clip0). Reviewer's catch.
     s["has_been_visible"] = (sid == "A")
+    # pending_retires: list of retire-arg dicts for sub-bins that
+    # EOSed while this stream was VISIBLE. Per QA a84cee9 glass
+    # diagnosis: retire_subgraph's set_state(NULL) + pipeline.remove
+    # + concat.release_request_pad stalls the aggregator on-screen
+    # (377ms hitch observed at t=22 with A visible, live_A 2->1).
+    # qarl's principle: NEVER touch the visible stream. Defer ALL
+    # retires until the stream goes hidden, then process them
+    # behind the crossfade. Drained by _process_pending_retires
+    # in _fade_tick's on-complete branch.
+    s["pending_retires"] = []
+    # SEEK-LOOP per QA a84cee9 mid-flight refinement: while this
+    # stream is VISIBLE, intercept EOS at the sub-bin's ghost pad
+    # and SEEK the source back to 0 instead of letting concat
+    # tear down + queue next. Matches xfade_demo.py's proven
+    # hitch-free 20s-hold pattern. seek_loop_probe_id /
+    # seek_loop_ghost track the installed probe so it can be
+    # removed when the stream transitions to hidden (after which
+    # normal cutloop-style natural-EOS advance resumes for the
+    # clip-advance on the OUTGOING side of the next crossfade).
+    s["seek_loop_probe_id"] = None
+    s["seek_loop_ghost"] = None
 
 
 # Per QA 7561fac soak cross-stream collision fix: global
@@ -549,18 +562,62 @@ def add_next_clip(stream_id):
     def _on_concat_sink_event(_pad, info):
         ev = info.get_event()
         if ev and ev.type == Gst.EventType.EOS:
+            is_visible = (visible_stream[0] == stream_id)
             print(f"[xfade] {stream_id} concat EOS bin {serial} "
-                  f"({asset_name}) -> retire + queue next",
+                  f"({asset_name}) "
+                  f"is_visible={is_visible}",
                   file=sys.stderr)
-            # Schedule retire only here. retire_subgraph itself
-            # schedules add_next_clip with a SHORT delay so the
-            # streaming thread can finish the NULL transition on
-            # this just-retired bin before the new bin allocates
-            # (per QA cf992e4 CMA peak fix: tighten retire-before-
-            # add ordering to drop the per-cycle overlap window).
-            GLib.idle_add(retire_subgraph, stream_id, sub,
-                          concat_sink, qtdemux, pad_added_id,
-                          eos_probe_id)
+            # Pop queue front so sub_bin_queue reflects concat's
+            # actual active (post-switch). force_eos_active reads
+            # queue[0]'s filesrc to advance; an orphaned-but-not-
+            # popped sub-bin would point force-EOS at the wrong
+            # source. Queue pop is independent of retire timing.
+            s_for_pop = streams[stream_id]
+            if (s_for_pop["sub_bin_queue"]
+                    and s_for_pop["sub_bin_queue"][0]["sub"]
+                        is sub):
+                s_for_pop["sub_bin_queue"].pop(0)
+            else:
+                s_for_pop["sub_bin_queue"] = [
+                    e for e in s_for_pop["sub_bin_queue"]
+                    if e["sub"] is not sub
+                ]
+                print(f"[xfade] {stream_id} EOS bin {serial} "
+                      "WARN sub_bin not at queue front; "
+                      "filtered.", file=sys.stderr)
+            # ALWAYS schedule_add so concat stays fed (cutloop
+            # queue-ahead invariant). Per QA a84cee9 cross-
+            # stream serialization, this routes through the
+            # global next-allowed gate.
+            schedule_add(stream_id)
+            # Per QA a84cee9 visible-stream-protection: gate
+            # the retire on visibility. If this stream is
+            # currently the visible one, the retire's
+            # set_state(NULL) + pipeline.remove +
+            # release_request_pad on concat stalls the
+            # aggregator on-screen (377ms hitch observed on
+            # 7561fac soak at t=22, A visible, live_A 2->1).
+            # qarl's principle: NEVER touch the visible stream.
+            # Queue the retire args for processing AFTER the
+            # next crossfade hides this stream.
+            retire_args = {
+                "sub": sub, "concat_sink": concat_sink,
+                "qtdemux": qtdemux,
+                "pad_added_id": pad_added_id,
+                "eos_probe_id": eos_probe_id,
+            }
+            if is_visible:
+                streams[stream_id]["pending_retires"].append(
+                    retire_args
+                )
+                print(f"[xfade] {stream_id} retire DEFERRED "
+                      "(visible); will run on hide; pending="
+                      f"{len(streams[stream_id]['pending_retires'])}",
+                      file=sys.stderr)
+            else:
+                GLib.idle_add(retire_subgraph, stream_id, sub,
+                              concat_sink, qtdemux,
+                              pad_added_id, eos_probe_id)
         return Gst.PadProbeReturn.OK
     eos_probe_id = concat_sink.add_probe(
         Gst.PadProbeType.EVENT_DOWNSTREAM, _on_concat_sink_event
@@ -609,20 +666,19 @@ def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
         pipeline.remove(sub_bin)
         s["concat"].release_request_pad(concat_sink_pad)
         s["live_subgraph_count"] -= 1
-        # Pop the front of sub_bin_queue (the just-EOSed sub-bin
-        # is always the front per cutloop concat ordering). Guard
-        # for the unlikely case where sub_bin isn't queue[0] --
-        # filter-and-rebuild rather than crash.
-        if (s["sub_bin_queue"]
-                and s["sub_bin_queue"][0]["sub"] is sub_bin):
-            s["sub_bin_queue"].pop(0)
-        else:
-            s["sub_bin_queue"] = [
-                e for e in s["sub_bin_queue"]
-                if e["sub"] is not sub_bin
-            ]
-            print(f"[xfade] retire {name} WARN sub_bin not at "
-                  "queue front; filtered.", file=sys.stderr)
+        # NOTE: sub_bin_queue pop is now done in the EOS probe
+        # (so the queue reflects concat's active correctly even
+        # when retire is deferred). retire_subgraph defensively
+        # filters here in case the sub_bin somehow remained in
+        # the queue (shouldn't happen post-EOS).
+        before_len = len(s["sub_bin_queue"])
+        s["sub_bin_queue"] = [
+            e for e in s["sub_bin_queue"]
+            if e["sub"] is not sub_bin
+        ]
+        if len(s["sub_bin_queue"]) != before_len:
+            print(f"[xfade] retire {name} WARN sub_bin was "
+                  "still in queue; filtered.", file=sys.stderr)
         print(f"[xfade] retire {name} (live_{stream_id}="
               f"{s['live_subgraph_count']} "
               f"queue_len={len(s['sub_bin_queue'])})",
@@ -640,14 +696,16 @@ def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
         return False
     GLib.idle_add(_check_leak)
 
-    # Per QA cf992e4 CMA peak fix: defer the next add by
-    # ADD_AFTER_RETIRE_MS so the streaming thread has time to
-    # finish the NULL transition on this just-retired bin
-    # before the new bin starts allocating. Per QA 7561fac
-    # soak: ALSO serialize across streams via schedule_add so
-    # A's and B's adds never run concurrently (cross-stream
-    # CMA-collision is the brick risk).
-    schedule_add(stream_id)
+    # NOTE: schedule_add was MOVED to the EOS probe (see
+    # _on_concat_sink_event in add_next_clip). Rationale: per
+    # QA a84cee9 visible-stream-protection, retire_subgraph is
+    # now ONLY called when the stream is hidden -- either
+    # immediately from the EOS probe (when hidden at EOS time)
+    # or deferred via _process_pending_retires when the stream
+    # transitions visible->hidden after a fade. The "schedule
+    # add to keep concat fed" responsibility is independent of
+    # retire and fires unconditionally on EOS (gated only by
+    # cross-stream serialization).
     return False  # one-shot
 
 
@@ -850,9 +908,102 @@ def _start_fade():
     return False
 
 
+def _install_seek_loop_probe(stream_id):
+    """Install an EOS-DROP-and-SEEK probe on the visible stream's
+    front sub-bin (the one feeding concat). When the sub-bin's
+    clip naturally EOSes, the probe drops the EOS event and
+    issues a TIME seek back to 0 -- the source replays from
+    frame 0 WITHOUT a teardown / queue churn / concat switch.
+    Matches xfade_demo.py's proven hitch-free hold pattern.
+
+    Per qarl's principle: teardown NEVER touches the visible
+    stream. SEEK-LOOP replaces concat re-queue as the visible-
+    hold mechanism."""
+    s = streams[stream_id]
+    if not s["sub_bin_queue"]:
+        print(f"[xfade] WARN install_seek_loop_probe {stream_id}: "
+              "queue empty", file=sys.stderr)
+        return
+    front = s["sub_bin_queue"][0]
+    sub_bin = front["sub"]
+    ghost = sub_bin.get_static_pad("src")
+    if ghost is None:
+        print(f"[xfade] WARN install_seek_loop_probe {stream_id}: "
+              f"no src ghost on {sub_bin.get_name()}",
+              file=sys.stderr)
+        return
+
+    def _on_eos_drop(_pad, info, sb=sub_bin, sid=stream_id):
+        ev = info.get_event()
+        if ev and ev.type == Gst.EventType.EOS:
+            print(f"[xfade] SEEK-LOOP {sid}: EOS dropped, "
+                  "seeking source -> 0", file=sys.stderr)
+            sb.seek_simple(
+                Gst.Format.TIME,
+                Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                0,
+            )
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.OK
+
+    probe_id = ghost.add_probe(
+        Gst.PadProbeType.EVENT_DOWNSTREAM, _on_eos_drop
+    )
+    s["seek_loop_probe_id"] = probe_id
+    s["seek_loop_ghost"] = ghost
+    print(f"[xfade] SEEK-LOOP installed on {stream_id} "
+          f"sub={sub_bin.get_name()}", file=sys.stderr)
+
+
+def _remove_seek_loop_probe(stream_id):
+    """Remove the SEEK-LOOP probe. Called when the stream
+    transitions visible -> hidden; the next natural EOS will
+    propagate to concat normally and the cutloop-style retire
+    + queue-next cycle resumes for the hidden-stream clip
+    advance."""
+    s = streams[stream_id]
+    probe_id = s.get("seek_loop_probe_id")
+    ghost = s.get("seek_loop_ghost")
+    if probe_id and ghost is not None:
+        try:
+            ghost.remove_probe(probe_id)
+        except Exception as exc:
+            print(f"[xfade] WARN remove_seek_loop_probe "
+                  f"{stream_id}: {exc}", file=sys.stderr)
+    s["seek_loop_probe_id"] = None
+    s["seek_loop_ghost"] = None
+    print(f"[xfade] SEEK-LOOP removed from {stream_id}",
+          file=sys.stderr)
+
+
+def _process_pending_retires(stream_id):
+    """Drain pending_retires for a stream that just transitioned
+    visible -> hidden. Runs each deferred retire_subgraph now
+    that the stream is off-screen (alpha=0), so the aggregator
+    stall caused by set_state(NULL)+pipeline.remove+
+    release_request_pad doesn't show as an on-screen hitch.
+    Per QA a84cee9 + qarl's principle: ALL teardown on a stream
+    happens ONLY when that stream is hidden."""
+    s = streams[stream_id]
+    pending = s["pending_retires"]
+    if not pending:
+        return
+    print(f"[xfade] processing {len(pending)} deferred retires "
+          f"on {stream_id} (now hidden)", file=sys.stderr)
+    # Drain via idle_add so each runs on its own main-loop tick,
+    # spreading the work and allowing the just-completed fade
+    # animation to settle first.
+    while pending:
+        args = pending.pop(0)
+        GLib.idle_add(retire_subgraph, stream_id, args["sub"],
+                      args["concat_sink"], args["qtdemux"],
+                      args["pad_added_id"], args["eos_probe_id"])
+
+
 def _fade_tick():
     """Per-tick linear alpha animation. On completion: swap
-    visible_stream, re-enter LINGERING_VISIBLE."""
+    visible_stream, process the now-hidden stream's deferred
+    retires, re-enter LINGERING_VISIBLE."""
     if linger_state["phase"] != "FADING":
         return False
     from_id = linger_state["from_stream"]
@@ -867,6 +1018,15 @@ def _fade_tick():
         visible_stream[0] = to_id
         print(f"[xfade] FADE complete; visible={to_id}",
               file=sys.stderr)
+        # from_id is now HIDDEN: remove its SEEK-LOOP probe so
+        # natural EOS resumes for the hidden-stream clip-advance
+        # cycle. Drain its deferred retires off-screen too.
+        _remove_seek_loop_probe(from_id)
+        _process_pending_retires(from_id)
+        # to_id is now VISIBLE: install the SEEK-LOOP probe on
+        # the new visible's front sub-bin so its clip replays
+        # via seamless seek-to-0 instead of teardown.
+        _install_seek_loop_probe(to_id)
         _enter_lingering_visible()
         return False
     t = max(0.0, min(1.0, elapsed_s / FADE_S))
@@ -1035,11 +1195,12 @@ if (pipeline.set_state(Gst.State.PLAYING)
     die("set_state PLAYING failed")
 
 # Enter the initial LINGERING_VISIBLE state for the startup
-# visible turn (A is visible by alpha=1.0/0.0). Arm the linger
-# poll at LINGER_CHECK_MS so the gate is evaluated regularly;
-# when elapsed >= linger_target, _start_advancing fires and the
-# crossfade orchestrator takes over.
+# visible turn (A is visible by alpha=1.0/0.0). Install the
+# SEEK-LOOP probe on A's front sub-bin so its short clip
+# (<LINGER_MIN_S=20s) replays via seamless seek-to-0 instead
+# of teardown. Arm the linger poll at LINGER_CHECK_MS.
 _enter_lingering_visible()
+_install_seek_loop_probe(visible_stream[0])
 GLib.timeout_add(LINGER_CHECK_MS, _linger_check)
 GLib.timeout_add(1000, fps_tick)
 
