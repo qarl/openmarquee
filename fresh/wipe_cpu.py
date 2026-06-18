@@ -251,6 +251,13 @@ def build_compositor_pipeline():
         f"! videoconvert "
         f"! {NV12_DISP} "
         f"! kmssink name=sink sync=true "
+        # DO NOT RAISE this timeout near/above the cross-fade
+        # duration. intervideosrc holds the last upstream
+        # (v4l2-pool) buffer for timeout x fps frames; at 200ms =
+        # 6 frames it releases ~970ms before teardown (safe).
+        # >~1300ms would pin the decoder pool across a teardown ->
+        # MMAL slot leak. (code source-verified in
+        # gst-plugins-bad.)
         f"intervideosrc name=srcA channel=chA "
         f"  timeout=200000000 do-timestamp=true "
         f"  ! videorate skip-to-first=true ! {RATE_30} "
@@ -366,6 +373,13 @@ class ClipBin:
         # S1: teardown is gated on three independent events; this
         # flag dedupes the schedule call across them.
         self.teardown_scheduled = False
+        # Per qtdemux dynamic-pad race fix: pad-added on the demuxer
+        # fires once when qtdemux exposes its video pad. We install
+        # the trigger BUFFER probe + query_duration FROM that
+        # callback (not synchronously after preroll, which races the
+        # dynamic pad because intervideosink async=false returns
+        # SUCCESS before qtdemux has parsed moov).
+        self.trigger_probe_installed = False
         # Cross-fade readiness gates (asymmetric -- only checked on
         # the INCOMING bin before starting the wipe).
         self.async_done = False    # G1: ASYNC_DONE on bus
@@ -429,6 +443,9 @@ class ClipBin:
             return Gst.PadProbeReturn.OK
 
         sink_pad.add_probe(Gst.PadProbeType.BUFFER, _on_first_buffer)
+        # qtdemux dynamic-pad: connect pad-added BEFORE state change
+        # so we do not miss the signal regardless of preroll timing.
+        self.demuxer.connect("pad-added", self._on_demux_pad_added)
         return self
 
     def preroll(self):
@@ -464,22 +481,63 @@ class ClipBin:
         die(f"[{self.label}] preroll exceeded {PREROLL_BUDGET_S}s budget")
 
     def query_duration(self):
-        ok, dur = self.pipeline.query_duration(Gst.Format.TIME)
+        """DEPRECATED no-op kept for compat. Duration is now queried
+        inside _on_demux_pad_added, which avoids the qtdemux dynamic-
+        pad race with intervideosink async=false. Calling this
+        synchronously after preroll RAN BEFORE qtdemux had parsed
+        moov -> always failed -> fell back to DUR_FALLBACK_NS even
+        though the real value would have been available a few ms
+        later via pad-added."""
+        pass
+
+    def _on_demux_pad_added(self, _demux, pad):
+        """qtdemux dynamic-pad callback. Fires on a streaming thread
+        when qtdemux finishes parsing moov and exposes a src pad
+        (once per stream -- video + maybe audio). Filter by caps
+        structure name so audio/subtitle pads are ignored.
+
+        Lightweight ops only per QA note (add_probe, query_duration,
+        compute thresholds, set flags). No spawns / set_state here
+        -- those would deadlock on the streaming thread; the
+        scheduler defers all heavy work via GLib.idle_add already."""
+        if self.trigger_probe_installed:
+            return
+        # R2: canonical caps-structure filter. Pad name "video_0" is
+        # consistent in qtdemux but not the API contract; the caps
+        # structure name "video/x-h264" etc. is what defines stream
+        # type. Match startswith("video/") for any video codec.
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        struct_name = ""
+        if caps and caps.get_size() > 0:
+            struct_name = caps.get_structure(0).get_name()
+        if not struct_name.startswith("video/"):
+            return
+        self.trigger_probe_installed = True
+        # R3: query duration on the DEMUXER, not the pipeline.
+        # qtdemux is the canonical duration source for an mp4 file;
+        # asking the pipeline routes the query the same place
+        # eventually but goes through more elements.
+        ok, dur = self.demuxer.query_duration(Gst.Format.TIME)
         if ok and dur > 0:
             self.dur_ns = dur
             print(f"[{self.label}] duration = {dur} ns "
-                  f"({dur / 1e9:.3f}s)")
+                  f"({dur / 1e9:.3f}s) [pad-added, caps="
+                  f"{struct_name}]")
         else:
-            print(f"[{self.label}] duration query failed; "
-                  f"fallback {self.dur_ns} ns "
-                  f"({self.dur_ns / 1e9:.3f}s)", file=sys.stderr)
+            print(f"[{self.label}] duration query on demuxer failed "
+                  f"in pad-added; keeping fallback {self.dur_ns} ns "
+                  f"({self.dur_ns / 1e9:.3f}s)")
+        # Cosmetic note (per QA secondary): the trigger probe sits
+        # on the qtdemux src (pre-decode); G2 (first_buffer on the
+        # intervideosink sink) is post-decode. They lag by the
+        # ~70-270ms decode prime, so the "preload trigger" log may
+        # appear BEFORE G2 is ready. Not a bug -- the gates have
+        # plenty of margin (1s preload lead + 1s wipe).
+        self._attach_trigger_probe(pad)
 
-    def install_trigger_probe(self):
-        """BUFFER probe on demuxer src: fires preload threshold and
-        wipe-start threshold each ONCE."""
-        pad = find_video_src_pad(self.demuxer)
-        if pad is None:
-            die(f"[{self.label}] no video src pad for trigger probe")
+    def _attach_trigger_probe(self, pad):
+        """BUFFER probe on demuxer src pad: fires preload threshold +
+        wipe-start threshold each ONCE. Pad comes from pad-added."""
         preload_at = self.dur_ns - WIPE_S_NS - PRELOAD_LEAD_NS
         wipe_at = self.dur_ns - WIPE_S_NS
 
@@ -503,9 +561,19 @@ class ClipBin:
             return Gst.PadProbeReturn.OK
 
         pad.add_probe(Gst.PadProbeType.BUFFER, _on_buffer)
-        print(f"[{self.label}] trigger probe attached "
-              f"(preload>={preload_at / 1e9:.2f}s, "
+        print(f"[{self.label}] trigger probe attached on "
+              f"{pad.get_name()} (preload>={preload_at / 1e9:.2f}s, "
               f"wipe>={wipe_at / 1e9:.2f}s)")
+
+    def install_trigger_probe(self):
+        """DEPRECATED no-op kept for compat. Probe installation
+        happens inside _on_demux_pad_added (via _attach_trigger_probe)
+        so it cannot race the qtdemux dynamic pad. The old version
+        of this method called find_video_src_pad synchronously after
+        preroll, which returned None because qtdemux hadn't yet
+        parsed moov (intervideosink async=false makes set_state
+        return SUCCESS without waiting for the first buffer)."""
+        pass
 
     def play(self):
         if (self.pipeline.set_state(Gst.State.PLAYING)
@@ -637,8 +705,8 @@ def on_preload_trigger(bin_):
     print(f"[sched] preload {other} (lead by {bin_.label})")
     nxt = ClipBin(other).build()
     nxt.preroll()
-    nxt.query_duration()
-    nxt.install_trigger_probe()
+    # Trigger probe + duration wired via pad-added on the demuxer
+    # (fires within ms of PAUSED, BEFORE we ever need either value).
     slot_state["next"] = nxt
     return False  # one-shot idle_add
 
@@ -666,8 +734,8 @@ def on_wipe_trigger(bin_):
               f"next -- emergency spawn {other}", file=sys.stderr)
         nxt = ClipBin(other).build()
         nxt.preroll()
-        nxt.query_duration()
-        nxt.install_trigger_probe()
+        # Trigger probe + duration are wired via pad-added (fires
+        # within ms of PAUSED). No synchronous post-preroll work.
         slot_state["next"] = nxt
     nxt.play()
     # Deadline-poll the gates on the next bin; never on the
@@ -1002,12 +1070,13 @@ print(f"[wipe_cpu] shared clock={shared_clock.get_name()} "
       f"base_time={shared_base_time} ns")
 pipe_c.set_base_time(shared_base_time)
 
-# Initial bin: spawn slot A, preroll, install triggers, play.
+# Initial bin: spawn slot A, preroll, then play. Trigger probe +
+# duration wire themselves via pad-added on the demuxer when
+# qtdemux exposes its video pad (within ms of PAUSED). No
+# synchronous post-preroll work that would race the dynamic pad.
 print("[wipe_cpu] spawn initial main bin (slot A)")
 first = ClipBin("A").build()
 first.preroll()
-first.query_duration()
-first.install_trigger_probe()
 slot_state["main"] = first
 
 # Start compositor PLAYING.
