@@ -179,12 +179,23 @@ PLAYLIST = [
 
 # Per QA glass feedback (qarl): fixed 4s TARGET_VISIBLE_S fires
 # mid-clip and produces weird drift/cutting. Replaced with a
-# CLIP-GATED linger. Each visible clip plays FULL LENGTH AND at
-# least LINGER_MIN_S; short clips LOOP to reach the floor.
-# Crossfade fires ONLY at a clean boundary: the incoming stream
-# is advanced to its NEXT clip just before the crossfade so its
-# first frame is FROM ITS START at the crossfade moment.
-LINGER_MIN_S = 10.0      # min wall-clock per visible clip turn
+# CLIP-GATED linger: each visible clip plays max(clip_dur,
+# LINGER_MIN_S); short clips LOOP to reach the floor (only when
+# LINGER_MIN_S > clip_dur). Crossfade fires ONLY at a clean
+# boundary: the incoming stream is advanced to its NEXT clip
+# just before the crossfade so its first frame is FROM ITS
+# START at the crossfade moment.
+#
+# Per QA 7561fac soak: short-clip LOOPING (4.75s clips re-queue
+# every ~4.75s to fill a 10s linger) causes frequent retire/add
+# churn + loop-seam stutter + raises cross-stream collision
+# odds. QA's option (A): NATURAL-LENGTH linger -- each clip
+# shows its OWN full length, NO forced 10s, NO looping. Default
+# the floor to 0.0 (natural mode); env override to opt back into
+# a forced-10s floor when desired.
+LINGER_MIN_S = float(os.environ.get(
+    "OPENMARQUEE_XFADE_LINGER_MIN_S", "0.0"
+))
 FADE_S = 1.0             # crossfade duration
 FADE_TICK_MS = 33        # ~30Hz alpha animation
 LINGER_CHECK_MS = 500    # how often to poll the linger gate
@@ -195,6 +206,18 @@ PREROLL_BUDGET_S = 30
 # glupload -> mix sink before starting the alpha animation.
 # Tuned for bcm2835-codec first-frame latency (~0.5-1s).
 ADVANCE_FIRST_FRAME_WAIT_MS = 800
+# Per QA 7561fac soak: cross-stream retire collision is the
+# CMA-floor risk. When A and B retire+add within ~50ms, two
+# new sub-bins allocate concurrently and the per-cycle CMA
+# dip doubles (observed: CmaFree_min 41.2MB below the 50MB
+# brick floor on a 2nd live run). FIX: SERIALIZE add_next_clip
+# calls across streams via a global next-allowed timestamp.
+# Each scheduled add cannot run within MIN_INTER_ADD_MS of the
+# previously-scheduled add (across BOTH streams). The
+# allocation work itself is already on the GLib main loop
+# (single-threaded), so the gap targets CMA-settle time
+# rather than thread synchronization.
+MIN_INTER_ADD_MS = 200
 # Fallback per-clip duration if query_duration fails at startup.
 DUR_FALLBACK_S = 6.0
 # cutloop's invariant: keep >=1 pad pending ahead of current,
@@ -407,6 +430,52 @@ for sid, s in streams.items():
     s["has_been_visible"] = (sid == "A")
 
 
+# Per QA 7561fac soak cross-stream collision fix: global
+# next-allowed timestamp gates ALL deferred add_next_clip calls
+# (across both streams) so two streams' retire-then-add cycles
+# never run their allocations concurrently. Single int wrapped
+# in a list for mutability from inside schedule_add.
+_next_add_allowed_ns = [0]
+
+
+def schedule_add(stream_id):
+    """Schedule add_next_clip(stream_id) such that:
+    - it runs at least ADD_AFTER_RETIRE_MS after retire fires
+      (per-stream NULL-transition completion window), AND
+    - it runs at least MIN_INTER_ADD_MS after the previous
+      add was scheduled to run (cross-stream allocation
+      serialization).
+
+    The allocation work itself is already on the GLib main loop
+    (single-threaded), so this serialization targets CMA-settle
+    time rather than thread synchronization. Without it, A's
+    and B's adds firing within ~50ms double the per-cycle CMA
+    peak (QA 7561fac soak: CmaFree_min 41.2MB on a 2nd live
+    run vs 51.6MB on the first -- the only difference was
+    timing alignment of the two streams' boundaries)."""
+    now_ns = GLib.get_monotonic_time() * 1000
+    earliest_ns = max(
+        now_ns + ADD_AFTER_RETIRE_MS * 1_000_000,
+        _next_add_allowed_ns[0],
+    )
+    delay_ms = int(max(0, (earliest_ns - now_ns) // 1_000_000))
+    # The NEXT scheduled add can't run until this one's
+    # earliest + MIN_INTER_ADD_MS later.
+    _next_add_allowed_ns[0] = (
+        earliest_ns + MIN_INTER_ADD_MS * 1_000_000
+    )
+    if delay_ms > ADD_AFTER_RETIRE_MS + 10:
+        # Logged only when serialization actually inserted
+        # extra delay beyond the per-stream deferred-add
+        # window (i.e. cross-stream collision was detected
+        # and elided).
+        print(f"[xfade] schedule_add {stream_id}: "
+              f"serialized delay={delay_ms}ms "
+              f"(cross-stream collision elided)",
+              file=sys.stderr)
+    GLib.timeout_add(delay_ms, add_next_clip, stream_id)
+
+
 def add_next_clip(stream_id):
     """Append THIS STREAM'S current_loop_clip to its concat as a
     new sub-bin. Per QA dispatch the per-stream playlist no longer
@@ -574,14 +643,11 @@ def retire_subgraph(stream_id, sub_bin, concat_sink_pad,
     # Per QA cf992e4 CMA peak fix: defer the next add by
     # ADD_AFTER_RETIRE_MS so the streaming thread has time to
     # finish the NULL transition on this just-retired bin
-    # before the new bin starts allocating. Tightens the
-    # per-cycle overlap where old+new resources are
-    # simultaneously held. Concat starvation risk is
-    # negligible: INITIAL_QUEUE_DEPTH=2 means at this point
-    # there is still 1 active sub-bin feeding concat; the
-    # delay only briefly drops the pending count from 1 to 0.
-    GLib.timeout_add(ADD_AFTER_RETIRE_MS, add_next_clip,
-                     stream_id)
+    # before the new bin starts allocating. Per QA 7561fac
+    # soak: ALSO serialize across streams via schedule_add so
+    # A's and B's adds never run concurrently (cross-stream
+    # CMA-collision is the brick risk).
+    schedule_add(stream_id)
     return False  # one-shot
 
 
