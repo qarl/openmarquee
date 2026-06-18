@@ -1,129 +1,113 @@
 #!/usr/bin/env python3
-"""fresh/wipe_cpu.py — A <-> B wipe via 3-pipeline intervideo architecture.
+"""fresh/wipe_cpu.py -- A <-> B wipe via fresh-decoder-per-clip, NO seeks.
 
-Step 2b root-fix (2026-06-17). Built on the per-second [fps] instrument
-introduced in fb49201, which localized two structural failures in the
-prior single-pipeline approach:
+Step 2b pivot to the OLD-RENDERER proven pattern (2026-06-17).
 
-  (P1) Compositor rate-collapse to ~1 fps. compositor's src had no fixed
-       framerate; the aggregator ran in deadline-alignment mode against
-       two inputs whose running-times diverged (A loops every 4.75s, B
-       every 9.08s) under kmssink sync=true backpressure, so it emitted
-       roughly one buffer per second to the screen.
-  (P2) SEGMENT-seek loop did not re-arm behind the aggregator. Per-source
-       SEGMENT_DONE on a multi-pad aggregator is not actionable the same
-       way it is for a single-source/single-sink chain; rearmed buffers
-       landed behind the compositor's shared running-time and were dropped.
+WHY NOT SEEK-AND-RESERVOIR. The prior arc landed real-time looping
+plus smooth mid-clip but hit two coupled problems at every loop
+boundary: a ~1s screen stall (empty decode chain by the time the
+idle re-seek ran, dominated by v4l2h264dec input -> first-output
+refill latency on bcm2835) AND a frame discontinuity (the
+non-flushing SEGMENT seek resets the producer PTS backward
+4.75s/9.08s while the compositor running-time marches forward).
+The "code" coder mined the old Rust renderer and found that the
+proven gap-free technique used by hdmi.rs / playback.py is NOT a
+buffer-depth trick (more buffering wedges the Zero 2 W CMA) -- it
+is a fresh-decoder-per-clip architecture with NO seeks.
 
-Both are topology problems, not tuning. The fix decouples looping from
-compositing via the intervideo bridge:
+THE PROVEN PATTERN (this file).
 
-  DECODE PIPELINE A (its own Gst.Pipeline; single source, single sink)
-    filesrc -> qtdemux -> h264parse -> v4l2h264dec
-    -> queue name=res (time=1.2s, non-leaky)  -- RESERVOIR; absorbs
-                                                 the decoder pause at
-                                                 each re-seek boundary
-    -> videorate -> video/x-raw,framerate=30/1
-    -> queue (4 buf, non-leaky)
-    -> intervideosink channel=chA sync=false async=false
-       (decode pipeline decoupled from real-time; pacing authority
-        is kmssink sync=true in pipe_c on the shared clock, which
-        back-pressures the whole compositor pipeline so average
-        decode consumption is real-time. Decoder runs ahead, fills
-        the reservoir, then back-pressures.)
+  1. NO SEEKS. Each clip play = a FRESH decode bin (filesrc ->
+     qtdemux -> h264parse -> v4l2h264dec -> videorate -> caps ->
+     queue -> intervideosink channel=ch?), played ONCE to EOS, then
+     torn down. The "loop" = a SEQUENCE of fresh bins on the same
+     channel. Each bin has monotonic PTS from 0 -> no discontinuity
+     by construction.
 
-  DECODE PIPELINE B
-    identical, channel=chB, file B
+  2. PRELOAD ~1s ahead. When the currently-playing bin crosses the
+     preload threshold (PTS >= dur - WIPE_S - PRELOAD_LEAD), spawn
+     the NEXT clip's fresh bin on the OTHER channel and set it to
+     PAUSED. Preroll decodes its first frames offscreen so it is
+     WARM by the time the cross-fade starts.
 
-  COMPOSITOR PIPELINE (its own Gst.Pipeline; runs forever, never sees
-                       any decode-side EOS / flush / segment event)
-    intervideosrc channel=chA timeout=200ms do-timestamp=false
-    -> videorate skip-to-first=true
-    -> video/x-raw,framerate=30/1
-    -> queue -> comp.sink_0
-    (same for chB -> comp.sink_1)
-    compositor name=comp background=black
-    -> video/x-raw,width=1280,height=720,framerate=30/1
-    -> queue -> videoconvert
-    -> video/x-raw,format=NV12,width=1280,height=720
-    -> kmssink name=sink sync=true       (HW-scales 1280x720 -> 1360x768
-                                          via the vc4 DRM plane)
+  3. CROSS-FADE. When the currently-playing bin crosses the wipe
+     threshold (PTS >= dur - WIPE_S), set the preloaded bin to
+     PLAYING and start the wipe animation. Both bins are live + the
+     compositor reads from both for WIPE_S seconds.
 
-Why this gets the frame flow right:
+  4. TEAR DOWN on EOS. The outgoing bin hits EOS at roughly the end
+     of the wipe; its pipeline is set to NULL and unreferenced. The
+     channel is now free for the next cycle on the same channel.
 
-  - FIXED framerate=30/1 on the compositor pipeline (src cap + per-pad
-    videorate) means the aggregator emits at a steady 30 fps regardless
-    of input alignment. The 4.75s vs 9.08s loop-duration mismatch
-    becomes invisible to the compositor.
-  - videorate after each intervideosrc REPEATS the last buffer to
-    maintain 30 fps when its decode pipeline briefly stalls (e.g.
-    during a SEGMENT_DONE -> re-seek transient). Both compositor pads
-    are always fed, so the aggregator never deadline-waits.
-  - LOOPING is contained in each single-source / single-sink decode
-    bin. Three pieces, two probes + a reservoir:
-      (a) SEGMENT seek with stop=duration (NOT NONE) -- segment
-          completion is defined as "streaming reached the segment STOP
-          time"; stop=NONE meant SEGMENT_DONE never fired. Duration
-          comes from query_duration after PAUSED (asset fallbacks A
-          =4.75s / B=9.08s).
-      (b) BUFFER pad probe on each qtdemux video src pad fires the
-          SEGMENT re-seek EARLY -- as soon as a buffer with PTS >=
-          duration - LEAD_NS (1.2s) passes through. The decoder begins
-          refilling from frame 0 WHILE the reservoir is still being
-          drained from the tail of the OLD segment. The ~1s refill
-          latency of v4l2h264dec on bcm2835 is hidden under reservoir
-          frames; the consumer sees no gap. Re-arms when PTS resets to
-          near 0 after the seek lands. Re-seek is dispatched via
-          GLib.idle_add (the seek call must run on the main thread to
-          avoid streaming-thread re-entry/deadlock).
-      (c) EVENT pad probe on the same pad is DROP-ONLY: when the
-          actual SEGMENT_DONE or EOS finally arrives, the probe drops
-          it so it never propagates to v4l2h264dec (no flush, no
-          STREAMOFF, no bcm2835-codec REQBUFS/EINVAL wedge BY
-          CONSTRUCTION). Re-seek is NOT initiated here -- the BUFFER
-          probe has already fired one and the EVENT probe must not
-          double-seek.
-  - intervideo bridge isolates each decode pipeline's EOS / flush /
-    segment events from the compositor pipeline at the BUFFER level:
-    no event propagates across the bridge, so the compositor cannot
-    be tipped into EOS or be flushed by a decoder-side restart.
-    (Note: operational error-recovery is NOT in this step -- any
-    GStreamer ERROR message on any bus still quits the GLib main
-    loop and exits the script. A future iteration could NULL the
-    affected decode pipeline and keep the compositor running on its
-    timeout-fallback frames.)
-  - SHARED CLOCK + SHARED BASE-TIME across all three pipelines (forced
-    after PAUSED, before any PLAYING). use_clock(SystemClock) + an
-    identical set_base_time gives all three a single shared running-
-    time origin. do-timestamp=false on each intervideosrc preserves
-    the producer PTS instead of re-stamping. (Kept after QA confirmed
-    clock alignment alone did NOT change the slow-motion symptom; the
-    real bottleneck was CPU videoscale, fixed below. Shared clock
-    remains the architecturally-correct setup for three Gst.Pipeline
-    objects bridged by intervideo and is harmless to keep.)
-  - NO CPU VIDEOSCALE. Source assets are native 1280x720 = the
-    composite size; the decode pipelines emit native-size frames
-    straight into intervideosink, the compositor pads are sized to
-    match, and kmssink HW-scales 1280x720 -> 1360x768 via the vc4
-    DRM plane (zero CPU pixel work). QA bisection on glass showed
-    `videoscale 1280x720 -> 1360x768` cost ~140ms/frame on a single
-    A53 core, pegging the cores and throttling the whole system to
-    ~7% real-time. Was present since 674ae5a; was masked by the
-    launch/freeze failures.
+  5. GAP-KILLER (safety net). If on_wipe_threshold fires and no
+     preloaded next bin is ready (cold), spawn an emergency bin
+     synchronously and start the wipe -- prefer a brief stall over a
+     missed transition. Logged loudly.
 
-WIPE (unchanged): GLib timer animates comp.sink_1 xpos/width 0->DW
-over WIPE_S; after the wipe roles swap. Both inputs are genuinely
-live every frame now (videorate-fed), so motion-through-the-transition
-is preserved without any decoder-warm trickery.
+  6. TIGHT BUFFERS. 4-buffer queue between videorate and
+     intervideosink. NO large reservoir. CMA stays modest (~30MB per
+     active bin at 720p NV12); two active bins during the wipe
+     overlap = ~60MB peak.
 
-INSTRUMENT (preserved + adapted to new topology): per-second [fps]
-line continues to print to stderr + /tmp/wipe_fps.log. Probes attach
-in the new locations: decA.src in pipe_a, decB.src in pipe_b,
-kmssink.sink in pipe_c. Position queries hit pipe_a.demux and
-pipe_b.demux. A WORKING result must show screen ~= 30 sustained and
-positions cycling 0->dur->0 forever.
+COMPOSITOR PIPELINE (pipe_c -- always running, never re-built):
 
-NOT in this step (still): the TODO(warm) decoder-warm-up site.
+  intervideosrc channel=chA timeout=200ms do-timestamp=TRUE
+    ! videorate skip-to-first=true ! framerate=30/1
+    ! queue (leaky downstream) ! comp.sink_0
+  intervideosrc channel=chB ... ! comp.sink_1
+  compositor name=comp background=black
+    ! width=1280,height=720,framerate=30/1
+    ! videoconvert ! NV12@1280x720
+    ! kmssink name=sink sync=true   (HW-scales 1280x720 -> 1360x768
+                                     via the vc4 DRM plane)
+
+  do-timestamp=TRUE on intervideosrc is the DISCONTINUITY FIX. Each
+  fresh ClipBin restarts PTS at 0, while the compositor running-
+  time has marched forward across previous clips. Without re-stamp,
+  kmssink sync=true would treat the new clip's first second as
+  "late" and drop frames -- the visible discontinuity. With
+  do-timestamp=true, intervideosrc re-stamps each pulled buffer
+  with the CURRENT compositor running-time, so the consumer sees a
+  monotonic timeline regardless of how many bins have come and gone
+  upstream.
+
+DECODE BIN PER CLIP (spawned fresh, torn down at EOS):
+
+  filesrc -> qtdemux -> h264parse -> v4l2h264dec
+    -> videorate ! framerate=30/1
+    -> queue max-size-buffers=4 (non-leaky)
+    -> intervideosink channel=ch? sync=true async=false
+
+  sync=true paces decode to real-time via the SHARED clock the
+  ClipBin sets on the pipeline at build time (use_clock +
+  set_base_time matching pipe_c). async=false avoids the async
+  preroll wait on this non-display sink.
+
+RISK + WATCH. v4l2h264dec bin teardown must cleanly release the
+bcm2835 CAPTURE buffers each cycle. If gstreamer leaks V4L2 slots
+on .set_state(NULL) + unref, continuous fresh-bin cycling will
+eventually wedge the codec (REQBUFS EINVAL). The old Rust renderer
+needed explicit eviction fixes (r102.x) to make per-clip teardown
+safe. QA watches CmaFree + dmesg over many cycles; if leaks appear,
+fallback is segment-seek + reservoir (which keeps the
+discontinuity, so this is the preferred path).
+
+INSTRUMENT. Per-second [fps] line continues to print to stderr + a
+/tmp/wipe_fps.log tee. Probes attach to the COMPOSITOR pipeline's
+intervideosrc src pads (counting frames reaching the compositor)
+and kmssink sink pad (counting frames painted). Per-bin probes are
+not used for fps counting because bins come and go; the compositor-
+side probes are stable. Output:
+
+  [fps] t=12 inA=30 inB=29 screen=30 \
+        main=A#3 next=- pts=2.43 state=HOLD
+
+  inA/inB  = frames reaching compositor on chA/chB this second
+  screen   = frames into kmssink.sink this second
+  main     = label of the currently-playing main bin (slot#serial)
+  next     = label of the preloaded next bin, or "-"
+  pts      = main bin position in its clip (seconds)
+  state    = HOLD or WIPE
 """
 
 import os
@@ -144,35 +128,36 @@ VIDEOS = [
 ]
 DW, DH = 1280, 720
 FPS = 30
-HOLD_S = 4.0
 WIPE_S = 1.0
 TICK_MS = 33
 PREROLL_BUDGET_S = 30
 
-# Decode-bin reservoir: queue between v4l2h264dec and videorate that
-# decouples decoder rate from real-time. Decoder fills it (then back-
-# pressures); videorate drains it at the source rate. At a loop re-
-# seek the decoder briefly stalls (~1s for v4l2h264dec on bcm2835 to
-# refill its CAPTURE queue); the reservoir covers the consumer side
-# during that window. Hardcoded ns (1.2s) -- do NOT use Gst.SECOND
-# at module-import time (it is gi-typelib-loaded but the PyGObject
-# contract is "after Gst.init"; on some versions accessing it pre-
-# init raises). Bounds CMA cost (~42MB at 720p NV12 @ 1.2s per decode
-# branch).
-RESERVOIR_NS = 1_200_000_000  # 1.2 seconds in nanoseconds
+# Hardcoded ns constants (Gst.SECOND at module-import time is
+# pre-Gst.init, may raise on some PyGObject versions).
+PRELOAD_LEAD_NS = 1_000_000_000  # 1.0s -- per old renderer
+                                 # OPENMARQUEE_PRELOAD_LEAD_MS=1000
+WIPE_S_NS = int(WIPE_S * 1_000_000_000)
 
-# Early re-seek lead time: fire the SEGMENT re-seek when the current
-# buffer's PTS reaches (duration - LEAD_NS), so the decoder refills
-# from frame 0 WHILE the reservoir is still being drained from the
-# old segment. LEAD_NS = RESERVOIR_NS so the in-flight old-segment
-# frames cover the v4l2h264dec refill latency.
-LEAD_NS = RESERVOIR_NS
+# Fallback durations if query_duration on the demuxer fails.
+DUR_FALLBACK_NS = {
+    "A": 4_750_000_000,  # 4.75s
+    "B": 9_080_000_000,  # 9.08s
+}
 
-# Re-arm threshold: any backward PTS jump larger than this on the
-# qtdemux video src pad is treated as "a SEGMENT seek landed" (B-frame
-# reorder backward jumps are << 500ms; a non-flushing SEGMENT seek
-# back to time 0 produces a near-full-duration backward jump).
-SEEK_DROP_NS = 500_000_000  # 500ms in nanoseconds
+# Leak-prevention fallback toggle (per QA spec). OFF by default --
+# the primary defense is the 250ms teardown grace + bus.remove_signal
+# _watch in ClipBin.teardown. If a long QA leak-soak ever shows CMA
+# drift over many cycles, set this env var to "1" to insert a
+# videoconvert before each decode bin's intervideosink -- the convert
+# copies NV12 into a NEW non-V4L2 buffer pool, severing the back-ref
+# chain from intervideo/compositor/kmssink to the dying decoder's
+# CAPTURE pool. Cost: per-frame 1280x720 NV12 copy (~42MB/s per bin,
+# 2x during cross-fade) -- exactly the per-frame pixel work that the
+# videoscale removal lifted, so do NOT flip on without leak evidence.
+INSERT_TEARDOWN_VIDEOCONVERT = (
+    os.environ.get("OPENMARQUEE_VIDEOCONVERT_BEFORE_INTERVIDEOSINK",
+                   "0").lower() in ("1", "true", "yes")
+)
 
 
 def die(msg, code=1):
@@ -203,7 +188,8 @@ self_pid = os.getpid()
 parent_pid = os.getppid()
 own_pids = (str(self_pid), str(parent_pid))
 ps = subprocess.run(
-    ["pgrep", "-af", "v4l2h264dec|openmarquee-render|mini-play|wipe.py|wipe_cpu"],
+    ["pgrep", "-af",
+     "v4l2h264dec|openmarquee-render|mini-play|wipe.py|wipe_cpu"],
     capture_output=True, text=True,
 )
 peers = [
@@ -214,64 +200,13 @@ if peers:
     die("another HW-decode process is already running:\n  "
         + "\n  ".join(peers))
 
-# --- Pipelines ----------------------------------------------------------
+# --- Compositor pipeline (always running) ------------------------------
 
 NV12_DISP = f"video/x-raw,format=NV12,width={DW},height={DH}"
 RATE_30 = f"video/x-raw,framerate={FPS}/1"
 
 
-def build_decode_pipeline(video_path, channel):
-    """One source, one sink. SEGMENT-seek loop lives inside this bin
-    where it is canonically supported.
-
-    NO videoscale and NO size capsfilter. Source assets are native
-    1280x720 = the chosen composite size (DW x DH); CPU videoscale
-    from 1280x720 to a different size cost ~140ms/frame on the Pi
-    Zero 2 W ISP-less A53 cores (QA bisection on glass), pegging one
-    core per branch and throttling the whole system to ~7% real-time.
-    Decoder emits at native 1280x720 in whatever pixel format the
-    asset is (I420 for these clips); videorate normalizes the rate to
-    30 fps; that goes straight into intervideosink. The compositor
-    pads are sized to match (DW x DH) so they do NOT scale either.
-    kmssink HW-scales the final NV12 1280x720 to the connector mode
-    (1360x768) via the vc4 DRM plane -- zero CPU pixel work."""
-    # Pacing moves to a single authority: kmssink sync=true in pipe_c
-    # on the shared clock back-pressures the whole compositor pipeline,
-    # so average decode consumption stays at 30 fps wall-clock. The
-    # decode pipeline is decoupled from real-time so it can run AHEAD
-    # and fill the RESERVOIR queue between v4l2h264dec and videorate.
-    #
-    #   intervideosink sync=false async=false -- not the throttle.
-    #     async=false avoids the async preroll wait on this non-display
-    #     sink in the decoupled-from-real-time setup.
-    #   reservoir queue (name=res, time=1.2s, non-leaky) -- decoder
-    #     fills it then back-pressures (bounded CMA ~42MB per branch at
-    #     720p NV12). When the boundary re-seek pauses the decoder for
-    #     ~1s, videorate keeps draining the reservoir at the source
-    #     rate (~24 fps), so the downstream consumer never starves.
-    #   second small queue between videorate and intervideosink keeps
-    #     the bridge-handoff smooth.
-    desc = (
-        f'filesrc location="{video_path}" name=src '
-        f"! qtdemux name=demux ! h264parse "
-        f"! v4l2h264dec name=dec "
-        f"! queue name=res "
-        f"  max-size-buffers=0 max-size-bytes=0 "
-        f"  max-size-time={RESERVOIR_NS} "
-        f"! videorate ! {RATE_30} "
-        f"! queue max-size-buffers=4 max-size-bytes=0 max-size-time=0 "
-        f"! intervideosink channel={channel} sync=false async=false"
-    )
-    try:
-        return Gst.parse_launch(desc)
-    except GLib.Error as exc:
-        die(f"decode pipeline ({channel}) parse failed: {exc.message}")
-
-
 def build_compositor_pipeline():
-    """Runs forever. NEVER sees an EOS or flush from the decoders.
-    Per-pad videorate keeps the compositor fed at 30 fps even when an
-    upstream intervideosrc momentarily has no buffer."""
     desc = (
         f"compositor name=comp background=black "
         f"  sink_0::xpos=0 sink_0::ypos=0 "
@@ -283,11 +218,13 @@ def build_compositor_pipeline():
         f"! videoconvert "
         f"! {NV12_DISP} "
         f"! kmssink name=sink sync=true "
-        f"intervideosrc channel=chA timeout=200000000 do-timestamp=false "
+        f"intervideosrc name=srcA channel=chA "
+        f"  timeout=200000000 do-timestamp=true "
         f"  ! videorate skip-to-first=true ! {RATE_30} "
         f"  ! queue max-size-buffers=2 leaky=downstream "
         f"  ! comp.sink_0 "
-        f"intervideosrc channel=chB timeout=200000000 do-timestamp=false "
+        f"intervideosrc name=srcB channel=chB "
+        f"  timeout=200000000 do-timestamp=true "
         f"  ! videorate skip-to-first=true ! {RATE_30} "
         f"  ! queue max-size-buffers=2 leaky=downstream "
         f"  ! comp.sink_1"
@@ -298,21 +235,16 @@ def build_compositor_pipeline():
         die(f"compositor pipeline parse failed: {exc.message}")
 
 
-pipe_a = build_decode_pipeline(VIDEOS[0], "chA")
-pipe_b = build_decode_pipeline(VIDEOS[1], "chB")
 pipe_c = build_compositor_pipeline()
 
-decA = pipe_a.get_by_name("dec")
-decB = pipe_b.get_by_name("dec")
-demuxA = pipe_a.get_by_name("demux")
-demuxB = pipe_b.get_by_name("demux")
 comp = pipe_c.get_by_name("comp")
 sink = pipe_c.get_by_name("sink")
-for label, el in [("decA", decA), ("decB", decB),
-                  ("demuxA", demuxA), ("demuxB", demuxB),
-                  ("comp", comp), ("sink", sink)]:
+srcA = pipe_c.get_by_name("srcA")
+srcB = pipe_c.get_by_name("srcB")
+for label, el in [("comp", comp), ("sink", sink),
+                  ("srcA", srcA), ("srcB", srcB)]:
     if el is None:
-        die(f"required element {label} not found after parse_launch")
+        die(f"required element {label} not found in compositor pipeline")
 
 
 def find_sink_pad(element, name):
@@ -326,42 +258,6 @@ def find_sink_pad(element, name):
             return None
         if p.get_name() == name:
             return p
-
-
-pads = [find_sink_pad(comp, "sink_0"), find_sink_pad(comp, "sink_1")]
-if pads[0] is None or pads[1] is None:
-    die(f"could not locate compositor pads sink_0/sink_1: {pads}")
-
-# --- Looping (per decode bin) -------------------------------------------
-#
-# Two pieces:
-#  - segment_seek(elem, stop_ns): non-flushing SEGMENT|ACCURATE seek
-#    from 0 to stop_ns (NOT NONE). stop=NONE was the prior bug -- segment
-#    completion is defined as "streaming reached the segment STOP time",
-#    so stop=NONE meant SEGMENT_DONE never fired and SEGMENT-mode also
-#    suppresses EOS -> position froze at duration with no re-arm signal.
-#  - install_loop_probe(demuxer, channel, dur_ns): downstream EVENT pad
-#    probe on the demuxer video src pad. Catches SEGMENT_DONE OR EOS;
-#    DROPs the event so it never propagates to v4l2h264dec (no flush,
-#    no STREAMOFF, no codec wedge -- BY CONSTRUCTION); schedules the
-#    re-seek via GLib.idle_add (the seek() call itself must run on the
-#    main GLib thread, NOT inside the streaming-thread probe callback,
-#    or we get re-entry into the streaming chain).
-#
-# Why the probe rather than the bus SEGMENT_DONE message: bus messages
-# arrive on the main thread but go through async queueing; the probe
-# fires the moment the event reaches the qtdemux src pad, so the re-
-# seek lands with one-frame-or-better boundary latency. Sink-independent
-# and topology-proof.
-
-
-def segment_seek(elem, stop_ns):
-    return elem.seek(
-        1.0, Gst.Format.TIME,
-        Gst.SeekFlags.SEGMENT | Gst.SeekFlags.ACCURATE,
-        Gst.SeekType.SET, 0,
-        Gst.SeekType.SET, stop_ns,
-    )
 
 
 def find_video_src_pad(demuxer):
@@ -378,236 +274,297 @@ def find_video_src_pad(demuxer):
             return pad
 
 
-def query_dur_ns(pipeline_or_elem, label, fallback_ns):
-    ok, dur = pipeline_or_elem.query_duration(Gst.Format.TIME)
-    if ok and dur > 0:
-        print(f"[wipe_cpu] {label} duration = {dur} ns "
-              f"({dur / 1e9:.3f}s)")
-        return dur
-    print(f"[wipe_cpu] {label} duration query failed; "
-          f"using fallback {fallback_ns} ns "
-          f"({fallback_ns / 1e9:.3f}s)", file=sys.stderr)
-    return fallback_ns
+# pads[0] = comp.sink_0 (slot A), pads[1] = comp.sink_1 (slot B).
+# Static for the script lifetime; do not regenerate per bin.
+pads = [find_sink_pad(comp, "sink_0"), find_sink_pad(comp, "sink_1")]
+if pads[0] is None or pads[1] is None:
+    die(f"could not locate compositor pads sink_0/sink_1: {pads}")
 
 
-def install_loop_probe(demuxer, channel):
-    """DROP SEGMENT_DONE / EOS at the demuxer src pad so neither ever
-    propagates to v4l2h264dec (no flush -> no STREAMOFF/STREAMON ->
-    no bcm2835-codec REQBUFS/EINVAL wedge BY CONSTRUCTION).
+# --- Shared clock + base time (set once, applied to every bin) ---------
 
-    Re-seek is OWNED BY install_early_reseek_probe (a BUFFER probe on
-    the same pad that fires re-seek when PTS approaches the duration
-    boundary, BEFORE SEGMENT_DONE arrives). By the time SEGMENT_DONE
-    or EOS hits here, the decoder is already mid-refill from a prior
-    early-seek -- this probe just makes sure the boundary event does
-    not also reach the decoder."""
-    pad = find_video_src_pad(demuxer)
-    if pad is None:
-        die(f"[{channel}] no video src pad found on demuxer")
-
-    def _on_event(_pad, info):
-        event = info.get_event()
-        if event is None:
-            return Gst.PadProbeReturn.OK
-        if event.type in (Gst.EventType.SEGMENT_DONE, Gst.EventType.EOS):
-            print(f"[{channel}] {event.type.value_nick} DROPped at demux src "
-                  "(early-reseek already armed)")
-            return Gst.PadProbeReturn.DROP
-        return Gst.PadProbeReturn.OK
-
-    pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, _on_event)
-    print(f"[{channel}] DROP-only event probe attached on {pad.get_name()}")
+shared_clock = Gst.SystemClock.obtain()
+shared_base_time = None  # set after compositor PAUSED
 
 
-def install_early_reseek_probe(demuxer, channel, dur_ns, lead_ns):
-    """BUFFER pad probe on the qtdemux video src pad. Schedules the
-    non-flushing SEGMENT re-seek as soon as a buffer with
-    PTS >= duration - lead_ns passes through, so the decoder begins
-    refilling from frame 0 WHILE the reservoir is still being drained
-    from the tail of the OLD segment. The refill latency
-    (~1s for v4l2h264dec on bcm2835 to refill its CAPTURE queue) is
-    hidden under reservoir frames; the consumer sees no gap.
+# --- ClipBin: a short-lived decode pipeline ----------------------------
 
-    Idle_add hands the seek to the main GLib thread; calling seek()
-    inside the streaming-thread probe would re-enter the streaming
-    chain and deadlock.
-
-    Re-arm guard: 'armed' goes False after a fire, then back True on
-    the first buffer with PTS < dur/4 in the NEW segment (PTS resets
-    to 0 after the SEGMENT seek). Without the guard the probe would
-    re-fire every frame above the threshold."""
-    pad = find_video_src_pad(demuxer)
-    if pad is None:
-        die(f"[{channel}] no video src pad found for early-reseek")
-
-    # State: armed governs whether the next fire-threshold crossing
-    # triggers a re-seek (one fire per cycle). max_pts tracks the
-    # highest PTS seen since last re-arm; a sudden backward jump of
-    # > SEEK_DROP_NS detects a SEGMENT seek landing (tolerates
-    # B-frame reorder which is << 500ms).
-    state = {"armed": True, "max_pts": 0}
-    fire_threshold = dur_ns - lead_ns
-
-    def _re_seek():
-        if not segment_seek(demuxer, dur_ns):
-            print(f"[{channel}] early re-seek FAILED", file=sys.stderr)
-        return False
-
-    def _on_buffer(_pad, info):
-        buf = info.get_buffer()
-        if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
-            return Gst.PadProbeReturn.OK
-        pts = buf.pts
-
-        # Re-arm on a large backward PTS jump (= a SEGMENT seek landed).
-        # Small backward jumps (B-frame reorder) tolerated by the
-        # SEEK_DROP_NS threshold.
-        if state["max_pts"] - pts > SEEK_DROP_NS:
-            state["armed"] = True
-            state["max_pts"] = pts
-        elif pts > state["max_pts"]:
-            state["max_pts"] = pts
-
-        # Watchdog: PTS shouldn't ever exceed duration. If it does AND
-        # we're still armed, the early re-seek slot was missed -- fire
-        # a recovery seek (loud log). If armed=False the early re-seek
-        # is already in-flight; just wait for the large-drop re-arm.
-        if pts > dur_ns:
-            if state["armed"]:
-                state["armed"] = False
-                print(f"[{channel}] WATCHDOG pts={pts / 1e9:.2f}s "
-                      f"> dur={dur_ns / 1e9:.2f}s and armed -- "
-                      "early-reseek missed; firing recovery",
-                      file=sys.stderr)
-                GLib.idle_add(_re_seek)
-            return Gst.PadProbeReturn.OK
-
-        if state["armed"] and pts >= fire_threshold:
-            state["armed"] = False
-            print(f"[{channel}] early re-seek at pts={pts / 1e9:.2f}s "
-                  f"(fire>={fire_threshold / 1e9:.2f}s, "
-                  f"dur={dur_ns / 1e9:.2f}s)")
-            GLib.idle_add(_re_seek)
-        return Gst.PadProbeReturn.OK
-
-    pad.add_probe(Gst.PadProbeType.BUFFER, _on_buffer)
-    print(f"[{channel}] early-reseek probe attached "
-          f"(fire>={fire_threshold / 1e9:.2f}s, "
-          f"rearm if backward jump>{SEEK_DROP_NS / 1e9:.1f}s)")
-
-
-# --- Frame-flow instrument ---------------------------------------------
-
-counters = {"decA": 0, "decB": 0, "screen": 0}
-# Per-pad max inter-buffer gap (ms) seen in the past second. A frame
-# stall shows up here as a high gap value even if the per-second count
-# is unchanged (e.g. burst-then-stall vs steady delivery). Reset after
-# each fps_tick.
-gap_state = {
-    "decA": {"last_ns": 0, "max_gap_ms": 0.0},
-    "decB": {"last_ns": 0, "max_gap_ms": 0.0},
-    "screen": {"last_ns": 0, "max_gap_ms": 0.0},
+# Slot mapping: A=chA=sink_0, B=chB=sink_1. The wipe direction
+# alternates which slot is "outgoing" vs "incoming".
+SLOT_INFO = {
+    "A": {"asset": VIDEOS[0], "channel": "chA", "pad_idx": 0},
+    "B": {"asset": VIDEOS[1], "channel": "chB", "pad_idx": 1},
 }
 
-try:
-    fps_log_file = open("/tmp/wipe_fps.log", "a", buffering=1)
-    print("[wipe_cpu] tee fps to /tmp/wipe_fps.log")
-except OSError as _exc:
-    fps_log_file = None
-    print(f"[wipe_cpu] /tmp/wipe_fps.log unavailable ({_exc}); stderr only")
+_serial_counter = [0]
 
 
-def _make_counter_probe(key):
-    state = gap_state[key]
-
-    def _probe(_pad, _info):
-        counters[key] += 1
-        now_ns = time.monotonic_ns()
-        last = state["last_ns"]
-        if last:
-            gap_ms = (now_ns - last) / 1e6
-            if gap_ms > state["max_gap_ms"]:
-                state["max_gap_ms"] = gap_ms
-        state["last_ns"] = now_ns
-        return Gst.PadProbeReturn.OK
-    return _probe
+def _next_serial():
+    _serial_counter[0] += 1
+    return _serial_counter[0]
 
 
-def attach_flow_probes():
-    for label, element, padname in [
-        ("decA", decA, "src"),
-        ("decB", decB, "src"),
-        ("screen", sink, "sink"),
-    ]:
-        pad = element.get_static_pad(padname)
-        if pad is None:
-            die(f"{label}: element has no {padname} pad")
-        pad.add_probe(Gst.PadProbeType.BUFFER, _make_counter_probe(label))
+def opposite_slot(slot_name):
+    return "B" if slot_name == "A" else "A"
 
 
-def _query_pos_s(elem):
-    ok, pos_ns = elem.query_position(Gst.Format.TIME)
-    if not ok or pos_ns < 0:
-        return "?"
-    return f"{pos_ns / 1e9:.2f}"
+class ClipBin:
+    """One decode pipeline for one clip play. Build -> preroll
+    (PAUSED) -> play (PLAYING) -> EOS -> teardown (NULL + unref).
+    Triggers (preload, wipe-start) fire from a BUFFER probe on the
+    demuxer src pad."""
 
+    def __init__(self, slot_name):
+        s = SLOT_INFO[slot_name]
+        self.slot = slot_name
+        self.asset = s["asset"]
+        self.channel = s["channel"]
+        self.serial = _next_serial()
+        self.label = f"{slot_name}#{self.serial}"
+        self.pipeline = None
+        self.demuxer = None
+        self.intersink = None
+        self.dur_ns = DUR_FALLBACK_NS[slot_name]
+        self.preload_fired = False
+        self.wipe_fired = False
+        self.eos_dispatched = False
+        # Cross-fade readiness gates (asymmetric -- only checked on
+        # the INCOMING bin before starting the wipe).
+        self.async_done = False    # G1: ASYNC_DONE on bus
+        self.first_buffer = False  # G2: at least one buffer past
+                                   # the intervideosink sink pad
 
-_t_start = time.monotonic()
-
-
-def _q_level_ms(q):
-    if q is None:
-        return -1.0
-    try:
-        return q.get_property("current-level-time") / 1e6
-    except Exception:
-        return -1.0
-
-
-def fps_tick():
-    uptime = int(time.monotonic() - _t_start)
-    posA = _query_pos_s(demuxA)
-    posB = _query_pos_s(demuxB)
-
-    # Reservoir queue level per branch -- should hold near
-    # RESERVOIR_NS/1e6 ms in steady state; drops at a re-seek boundary
-    # are visible here.
-    res_a_ms = _q_level_ms(pipe_a.get_by_name("res"))
-    res_b_ms = _q_level_ms(pipe_b.get_by_name("res"))
-
-    # Max inter-buffer gap per probe site over the past second.
-    # > ~40ms at decA/decB or > ~50ms at screen flags a stall.
-    gaps = {k: int(s["max_gap_ms"]) for k, s in gap_state.items()}
-
-    line = (
-        f"[fps] t={uptime} "
-        f"decA={counters['decA']}(g{gaps['decA']}) "
-        f"decB={counters['decB']}(g{gaps['decB']}) "
-        f"screen={counters['screen']}(g{gaps['screen']}) "
-        f"posA={posA} posB={posB} "
-        f"res_a={int(res_a_ms)}ms res_b={int(res_b_ms)}ms "
-        f"state={state}"
-    )
-    print(line, file=sys.stderr, flush=True)
-    if fps_log_file is not None:
+    def build(self):
+        # Optional videoconvert before intervideosink (leak fallback).
+        leak_convert = ("! videoconvert "
+                        if INSERT_TEARDOWN_VIDEOCONVERT else "")
+        desc = (
+            f'filesrc location="{self.asset}" name=src '
+            f"! qtdemux name=demux ! h264parse "
+            f"! v4l2h264dec name=dec "
+            f"! videorate ! {RATE_30} "
+            f"! queue max-size-buffers=4 max-size-bytes=0 "
+            f"  max-size-time=0 "
+            f"{leak_convert}"
+            f"! intervideosink channel={self.channel} "
+            f"  sync=true async=false"
+        )
         try:
-            fps_log_file.write(line + "\n")
-        except OSError:
-            pass
-    counters["decA"] = 0
-    counters["decB"] = 0
-    counters["screen"] = 0
-    for s in gap_state.values():
-        s["max_gap_ms"] = 0.0
-    return True
+            self.pipeline = Gst.parse_launch(desc)
+        except GLib.Error as exc:
+            die(f"[{self.label}] parse failed: {exc.message}")
+        self.demuxer = self.pipeline.get_by_name("demux")
+        if self.demuxer is None:
+            die(f"[{self.label}] demux not found post-parse")
+        # Find intervideosink via element iteration (no explicit
+        # name= in the desc).
+        it = self.pipeline.iterate_elements()
+        while True:
+            res, el = it.next()
+            if res != Gst.IteratorResult.OK:
+                break
+            fac = el.get_factory()
+            if fac and fac.get_name() == "intervideosink":
+                self.intersink = el
+                break
+        if self.intersink is None:
+            die(f"[{self.label}] intervideosink not found post-parse")
+        # Pin clock + base-time BEFORE state change so PLAYING does
+        # not auto-select something else.
+        self.pipeline.use_clock(shared_clock)
+        if shared_base_time is not None:
+            self.pipeline.set_base_time(shared_base_time)
+        # Bus handler for ASYNC_DONE + EOS + ERROR.
+        bus = self.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message", self._on_bus)
+        # Gate G2: first-buffer probe on intervideosink sink pad.
+        sink_pad = self.intersink.get_static_pad("sink")
+        if sink_pad is None:
+            die(f"[{self.label}] intervideosink has no sink pad")
+
+        def _on_first_buffer(_pad, _info):
+            if not self.first_buffer:
+                self.first_buffer = True
+                print(f"[{self.label}] first buffer past "
+                      "intervideosink sink (G2 ready)")
+            return Gst.PadProbeReturn.OK
+
+        sink_pad.add_probe(Gst.PadProbeType.BUFFER, _on_first_buffer)
+        return self
+
+    def preroll(self):
+        """Set PAUSED + block-poll for state. File-backed source
+        prerolls a frame -> SUCCESS via ASYNC. Returns True if
+        reached PAUSED.
+
+        On SUCCESS we set async_done=True directly: the ASYNC_DONE
+        bus message can race the wipe deadline-poll because spawn/
+        preroll runs inside a GLib.idle_add callback that blocks the
+        main loop's message dispatch. preroll SUCCESS already proves
+        async-state-change completion, so treat it as G1."""
+        ret = self.pipeline.set_state(Gst.State.PAUSED)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            die(f"[{self.label}] failed to enter PAUSED")
+        for elapsed in range(1, PREROLL_BUDGET_S + 1):
+            if shutdown_requested:
+                return False
+            r, cur, pending = self.pipeline.get_state(1 * Gst.SECOND)
+            if r == Gst.StateChangeReturn.SUCCESS:
+                print(f"[{self.label}] preroll done after ~{elapsed}s "
+                      f"state={cur.value_nick}")
+                self.async_done = True  # G1 satisfied; do not wait on
+                                        # bus dispatch.
+                return True
+            if r == Gst.StateChangeReturn.NO_PREROLL:
+                print(f"[{self.label}] preroll NO_PREROLL "
+                      "(unexpected for file source)")
+                self.async_done = True
+                return True
+            if r == Gst.StateChangeReturn.FAILURE:
+                die(f"[{self.label}] preroll FAILURE")
+        die(f"[{self.label}] preroll exceeded {PREROLL_BUDGET_S}s budget")
+
+    def query_duration(self):
+        ok, dur = self.pipeline.query_duration(Gst.Format.TIME)
+        if ok and dur > 0:
+            self.dur_ns = dur
+            print(f"[{self.label}] duration = {dur} ns "
+                  f"({dur / 1e9:.3f}s)")
+        else:
+            print(f"[{self.label}] duration query failed; "
+                  f"fallback {self.dur_ns} ns "
+                  f"({self.dur_ns / 1e9:.3f}s)", file=sys.stderr)
+
+    def install_trigger_probe(self):
+        """BUFFER probe on demuxer src: fires preload threshold and
+        wipe-start threshold each ONCE."""
+        pad = find_video_src_pad(self.demuxer)
+        if pad is None:
+            die(f"[{self.label}] no video src pad for trigger probe")
+        preload_at = self.dur_ns - WIPE_S_NS - PRELOAD_LEAD_NS
+        wipe_at = self.dur_ns - WIPE_S_NS
+
+        def _on_buffer(_pad, info):
+            buf = info.get_buffer()
+            if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
+                return Gst.PadProbeReturn.OK
+            pts = buf.pts
+            if not self.preload_fired and pts >= preload_at:
+                self.preload_fired = True
+                print(f"[{self.label}] preload trigger at "
+                      f"pts={pts / 1e9:.2f}s "
+                      f"(>={preload_at / 1e9:.2f}s)")
+                GLib.idle_add(on_preload_trigger, self)
+            if not self.wipe_fired and pts >= wipe_at:
+                self.wipe_fired = True
+                print(f"[{self.label}] wipe trigger at "
+                      f"pts={pts / 1e9:.2f}s "
+                      f"(>={wipe_at / 1e9:.2f}s)")
+                GLib.idle_add(on_wipe_trigger, self)
+            return Gst.PadProbeReturn.OK
+
+        pad.add_probe(Gst.PadProbeType.BUFFER, _on_buffer)
+        print(f"[{self.label}] trigger probe attached "
+              f"(preload>={preload_at / 1e9:.2f}s, "
+              f"wipe>={wipe_at / 1e9:.2f}s)")
+
+    def play(self):
+        if (self.pipeline.set_state(Gst.State.PLAYING)
+                == Gst.StateChangeReturn.FAILURE):
+            die(f"[{self.label}] failed to enter PLAYING")
+        print(f"[{self.label}] PLAYING")
+
+    def teardown(self):
+        """Teardown sequence per QA leak-prevention spec:
+          T1: caller must be on main GLib thread (NOT a streaming
+              thread / pad probe -- streaming-thread NULL deadlocks).
+              Enforced upstream: _deferred_teardown runs via
+              GLib.timeout_add, on_bin_eos is itself dispatched via
+              GLib.idle_add from the bus handler.
+          T3: explicitly detach the bus signal watch + null every
+              `self.*` element reference here. The bus closure
+              captures `self` (via _on_bus method), which keeps
+              self.intersink alive even after pipeline=None, which
+              keeps the downstream peer pinned -- exactly the leak
+              vector code flagged.
+          T5: the decode-bin queue is capped max-size-buffers=4
+              (build_decode_pipeline) so only ~4 back-refs need
+              to drain.
+        """
+        if self.pipeline is None:
+            return
+        print(f"[{self.label}] teardown -> NULL")
+        # Detach bus signal first so _on_bus does not fire on
+        # state-change messages during NULL transition.
+        bus = self.pipeline.get_bus()
+        if bus is not None:
+            try:
+                bus.remove_signal_watch()
+            except Exception as exc:
+                print(f"[{self.label}] WARN bus.remove_signal_watch "
+                      f"failed: {exc}", file=sys.stderr)
+        self.pipeline.set_state(Gst.State.NULL)
+        # Wait for NULL so V4L2 CAPTURE slots are actually released
+        # before another bin tries to take the channel. Per spec
+        # cap=1s; log + force-continue if exceeded.
+        r, _, _ = self.pipeline.get_state(1 * Gst.SECOND)
+        if r != Gst.StateChangeReturn.SUCCESS:
+            print(f"[{self.label}] WARN teardown to NULL not "
+                  f"confirmed within 1s: ret={r.value_nick} "
+                  "-- proceeding with unref anyway",
+                  file=sys.stderr)
+        # T3: drop every element ref so the closure-holds chain
+        # cannot pin a downstream peer.
+        self.pipeline = None
+        self.demuxer = None
+        self.intersink = None
+
+    def query_position_ns(self):
+        if self.pipeline is None:
+            return -1
+        ok, pos = self.pipeline.query_position(Gst.Format.TIME)
+        return pos if (ok and pos >= 0) else -1
+
+    def _on_bus(self, _bus, msg):
+        if msg.type == Gst.MessageType.ASYNC_DONE:
+            if not self.async_done:
+                self.async_done = True
+                print(f"[{self.label}] ASYNC_DONE (G1 ready)")
+            return
+        if msg.type == Gst.MessageType.ERROR:
+            err, dbg = msg.parse_error()
+            src = msg.src.get_name() if msg.src else "?"
+            print(f"[{self.label}] ERROR {src}: {err.message}",
+                  file=sys.stderr)
+            if dbg:
+                print(f"[{self.label}]  debug: {dbg}",
+                      file=sys.stderr)
+            loop.quit()
+            return
+        if msg.type == Gst.MessageType.EOS:
+            if not self.eos_dispatched:
+                self.eos_dispatched = True
+                print(f"[{self.label}] EOS")
+                GLib.idle_add(on_bin_eos, self)
 
 
-# --- State machine ------------------------------------------------------
+# --- Slot state machine ------------------------------------------------
 
-outgoing = 0
-incoming = 1
-state = "HOLD"
-phase_start_ns = 0
+# Slot state. Always has at most one bin in each slot.
+slot_state = {
+    "main": None,        # ClipBin currently being shown full-screen
+    "next": None,        # ClipBin preloaded for next transition
+    "outgoing": None,    # ClipBin being torn down (post-wipe, pre-EOS)
+}
+
+# Wipe state. Mirrors the prior code's HOLD/WIPE animation timer.
+wipe_state = {
+    "phase": "HOLD",          # "HOLD" or "WIPE"
+    "start_ns": 0,            # monotonic_ns when WIPE began
+    "incoming_pad_idx": -1,   # 0 or 1
+    "outgoing_pad_idx": -1,
+}
 
 
 def now_ns():
@@ -619,75 +576,248 @@ def set_geom(pad, x, w):
     pad.set_property("width", int(w))
 
 
-def start_wipe():
-    global state, phase_start_ns
-    # TODO(warm): with intervideosrc + videorate the incoming pad is
-    # already being driven at 30 fps from its decoder, so warming should
-    # be implicit. If glass shows a stutter at the leading edge of the
-    # reveal, this is the site: temporarily zorder=1 + width=1 on the
-    # incoming pad for ~150-300ms before animation start.
-    pads[incoming].set_property("zorder", 1)
-    pads[outgoing].set_property("zorder", 0)
-    state = "WIPE"
-    phase_start_ns = now_ns()
-    print(f"[wipe_cpu] wipe {outgoing} -> {incoming} begin")
+def on_preload_trigger(bin_):
+    """Main bin crossed preload threshold. Spawn the OTHER slot
+    fresh + PAUSED. Skip if already preloaded (e.g. trigger fired
+    twice across a stale probe)."""
+    if bin_ is not slot_state["main"]:
+        print(f"[sched] preload from {bin_.label} but main is "
+              f"{slot_state['main'].label if slot_state['main'] else None}"
+              " -- stale, ignoring")
+        return False
+    if slot_state["next"] is not None:
+        print(f"[sched] preload from {bin_.label} but next already "
+              f"= {slot_state['next'].label} -- ignoring")
+        return False
+    other = opposite_slot(bin_.slot)
+    print(f"[sched] preload {other} (lead by {bin_.label})")
+    nxt = ClipBin(other).build()
+    nxt.preroll()
+    nxt.query_duration()
+    nxt.install_trigger_probe()
+    slot_state["next"] = nxt
+    return False  # one-shot idle_add
 
 
-def finish_wipe():
-    global state, phase_start_ns, outgoing, incoming
-    set_geom(pads[incoming], 0, DW)
-    set_geom(pads[outgoing], 0, 0)
-    outgoing, incoming = incoming, outgoing
-    state = "HOLD"
-    phase_start_ns = now_ns()
-    print(f"[wipe_cpu] hold {outgoing}")
+CROSSFADE_POLL_MS = 2     # sleep between gate-checks
+CROSSFADE_DEADLINE_MS = 100  # cap; start wipe anyway after this
 
 
-def tick():
-    global state
-    elapsed_s = (now_ns() - phase_start_ns) / 1e9
-    if state == "HOLD":
-        if elapsed_s >= HOLD_S:
-            start_wipe()
-    elif state == "WIPE":
-        if elapsed_s >= WIPE_S:
-            finish_wipe()
-        else:
-            set_geom(pads[incoming], 0, (elapsed_s / WIPE_S) * DW)
+def on_wipe_trigger(bin_):
+    """Main bin crossed wipe threshold. Set the preloaded next bin
+    PLAYING, then deadline-poll the two readiness gates (G1
+    ASYNC_DONE, G2 first buffer past intervideosink) before starting
+    the wipe animation. Gap-killer: if no preloaded next is ready,
+    emergency-spawn (logged loudly). Asymmetric: never gate the
+    outgoing bin -- it is warm by definition."""
+    if bin_ is not slot_state["main"]:
+        print(f"[sched] wipe from {bin_.label} but main is "
+              f"{slot_state['main'].label if slot_state['main'] else None}"
+              " -- stale, ignoring")
+        return False
+    nxt = slot_state["next"]
+    if nxt is None:
+        other = opposite_slot(bin_.slot)
+        print(f"[sched] GAP-KILLER wipe trigger with no preloaded "
+              f"next -- emergency spawn {other}", file=sys.stderr)
+        nxt = ClipBin(other).build()
+        nxt.preroll()
+        nxt.query_duration()
+        nxt.install_trigger_probe()
+        slot_state["next"] = nxt
+    nxt.play()
+    # Deadline-poll the gates on the next bin; never on the
+    # outgoing. The poll callback runs on the main GLib thread
+    # (GLib.timeout_add), so it does not block the streaming
+    # threads that drive the gates.
+    deadline_ns = now_ns() + CROSSFADE_DEADLINE_MS * 1_000_000
+
+    def _check_gates():
+        ready = nxt.async_done and nxt.first_buffer
+        if ready:
+            _start_wipe_animation(bin_, nxt)
+            return False  # stop polling
+        if now_ns() >= deadline_ns:
+            print(f"[sched] {nxt.label} wipe DEADLINE "
+                  f"exhausted ({CROSSFADE_DEADLINE_MS}ms) -- "
+                  f"async_done={nxt.async_done} "
+                  f"first_buffer={nxt.first_buffer}; "
+                  "starting wipe anyway",
+                  file=sys.stderr)
+            _start_wipe_animation(bin_, nxt)
+            return False
+        return True  # keep polling
+
+    GLib.timeout_add(CROSSFADE_POLL_MS, _check_gates)
+    return False
+
+
+def _start_wipe_animation(outgoing_bin, incoming_bin):
+    in_idx = SLOT_INFO[incoming_bin.slot]["pad_idx"]
+    out_idx = SLOT_INFO[outgoing_bin.slot]["pad_idx"]
+    pads[in_idx].set_property("zorder", 1)
+    pads[out_idx].set_property("zorder", 0)
+    set_geom(pads[in_idx], 0, 0)
+    wipe_state["phase"] = "WIPE"
+    wipe_state["start_ns"] = now_ns()
+    wipe_state["incoming_pad_idx"] = in_idx
+    wipe_state["outgoing_pad_idx"] = out_idx
+    print(f"[sched] WIPE {outgoing_bin.label} -> {incoming_bin.label}")
+
+
+# Grace before teardown: let in-flight buffer refs flush through the
+# intervideo bridge so the dying decoder's last dmabuf does not get
+# wrapped by a still-queued compositor buffer (which would keep the
+# v4l2h264dec fd open -> bcm2835 MMAL slot leak). Per QA leak-spec:
+# 250ms is the baseline grace that empirically covers the bridge +
+# compositor + kmssink in-flight ref-drain on Pi Zero 2 W at 30fps.
+TEARDOWN_GRACE_MS = 250
+
+
+def on_bin_eos(bin_):
+    """Outgoing bin reached EOS. Move role bookkeeping immediately;
+    schedule actual teardown after a short grace so in-flight
+    intervideo buffer refs from the bridge can flush (else a stray
+    dmabuf ref keeps the decoder fd open -> MMAL slot leak)."""
+    print(f"[sched] EOS handler: {bin_.label}")
+    if bin_ is slot_state.get("main"):
+        # Main reached EOS. If wipe was still mid-animation
+        # (clip ended early?), snap it to done.
+        if wipe_state["phase"] == "WIPE":
+            finish_wipe_animation()
+        slot_state["outgoing"] = bin_
+        slot_state["main"] = slot_state["next"]
+        slot_state["next"] = None
+    elif bin_ is slot_state.get("outgoing"):
+        pass  # expected -- already moved aside, just teardown
+    else:
+        print(f"[sched] EOS from unknown role {bin_.label}",
+              file=sys.stderr)
+
+    def _deferred_teardown():
+        bin_.teardown()
+        if slot_state.get("outgoing") is bin_:
+            slot_state["outgoing"] = None
+        return False  # one-shot
+
+    GLib.timeout_add(TEARDOWN_GRACE_MS, _deferred_teardown)
+    return False
+
+
+def finish_wipe_animation():
+    """Snap pad geometry to post-wipe state + reset wipe phase."""
+    in_idx = wipe_state["incoming_pad_idx"]
+    out_idx = wipe_state["outgoing_pad_idx"]
+    if in_idx >= 0:
+        set_geom(pads[in_idx], 0, DW)
+    if out_idx >= 0:
+        set_geom(pads[out_idx], 0, 0)
+    wipe_state["phase"] = "HOLD"
+    print(f"[sched] HOLD (wipe complete, in_idx={in_idx})")
+
+
+def animation_tick():
+    if wipe_state["phase"] != "WIPE":
+        return True
+    elapsed_s = (now_ns() - wipe_state["start_ns"]) / 1e9
+    if elapsed_s >= WIPE_S:
+        finish_wipe_animation()
+    else:
+        in_idx = wipe_state["incoming_pad_idx"]
+        set_geom(pads[in_idx], 0, (elapsed_s / WIPE_S) * DW)
     return True
 
 
-set_geom(pads[0], 0, DW)
-set_geom(pads[1], 0, 0)
-phase_start_ns = now_ns()
+# --- Frame-flow instrument ---------------------------------------------
 
-# --- Bus + signals ------------------------------------------------------
+# Probes attach to the COMPOSITOR pipeline (stable, never re-built).
+# Per-bin probes are not used for fps counting because bins come and
+# go. The pipe_c-side probes count what reaches the compositor.
+counters = {"inA": 0, "inB": 0, "screen": 0}
+gap_state = {
+    "inA": {"last_ns": 0, "max_gap_ms": 0.0},
+    "inB": {"last_ns": 0, "max_gap_ms": 0.0},
+    "screen": {"last_ns": 0, "max_gap_ms": 0.0},
+}
+
+try:
+    fps_log_file = open("/tmp/wipe_fps.log", "a", buffering=1)
+    print("[wipe_cpu] tee fps to /tmp/wipe_fps.log")
+except OSError as _exc:
+    fps_log_file = None
+    print(f"[wipe_cpu] /tmp/wipe_fps.log unavailable ({_exc}); "
+          "stderr only")
+
+
+def _make_counter_probe(key):
+    s = gap_state[key]
+
+    def _probe(_pad, _info):
+        counters[key] += 1
+        now_ns_local = time.monotonic_ns()
+        last = s["last_ns"]
+        if last:
+            gap_ms = (now_ns_local - last) / 1e6
+            if gap_ms > s["max_gap_ms"]:
+                s["max_gap_ms"] = gap_ms
+        s["last_ns"] = now_ns_local
+        return Gst.PadProbeReturn.OK
+    return _probe
+
+
+def attach_flow_probes():
+    for label, element, padname in [
+        ("inA", srcA, "src"),
+        ("inB", srcB, "src"),
+        ("screen", sink, "sink"),
+    ]:
+        pad = element.get_static_pad(padname)
+        if pad is None:
+            die(f"{label}: element has no {padname} pad")
+        pad.add_probe(Gst.PadProbeType.BUFFER,
+                      _make_counter_probe(label))
+
+
+_t_start = time.monotonic()
+
+
+def fps_tick():
+    uptime = int(time.monotonic() - _t_start)
+    main_bin = slot_state.get("main")
+    next_bin = slot_state.get("next")
+    main_label = main_bin.label if main_bin else "-"
+    next_label = next_bin.label if next_bin else "-"
+    if main_bin is not None:
+        pos_ns = main_bin.query_position_ns()
+        pos_s = f"{pos_ns / 1e9:.2f}" if pos_ns >= 0 else "?"
+    else:
+        pos_s = "?"
+    gaps = {k: int(s["max_gap_ms"]) for k, s in gap_state.items()}
+    line = (
+        f"[fps] t={uptime} "
+        f"inA={counters['inA']}(g{gaps['inA']}) "
+        f"inB={counters['inB']}(g{gaps['inB']}) "
+        f"screen={counters['screen']}(g{gaps['screen']}) "
+        f"main={main_label} next={next_label} "
+        f"pts={pos_s} state={wipe_state['phase']}"
+    )
+    print(line, file=sys.stderr, flush=True)
+    if fps_log_file is not None:
+        try:
+            fps_log_file.write(line + "\n")
+        except OSError:
+            pass
+    counters["inA"] = 0
+    counters["inB"] = 0
+    counters["screen"] = 0
+    for s in gap_state.values():
+        s["max_gap_ms"] = 0.0
+    return True
+
+
+# --- Compositor bus + signals -----------------------------------------
 
 loop = GLib.MainLoop()
-
-
-def _make_decode_bus_handler(channel):
-    """Decode-pipeline bus: ERROR + EOS reporting only. The loop re-arm
-    is owned by the EVENT pad probe (install_loop_probe), NOT the bus
-    -- bus SEGMENT_DONE messages would double-fire alongside the probe.
-    EOS on the bus is unexpected (the probe DROPs EOS at the demuxer
-    src) and indicates the probe missed an event; we log + quit so the
-    failure is visible rather than silent."""
-    def _on_bus(_bus, msg):
-        if msg.type == Gst.MessageType.ERROR:
-            err, dbg = msg.parse_error()
-            src = msg.src.get_name() if msg.src else "?"
-            print(f"[{channel}] ERROR {src}: {err.message}",
-                  file=sys.stderr)
-            if dbg:
-                print(f"[{channel}]  debug: {dbg}", file=sys.stderr)
-            loop.quit()
-            return
-        if msg.type == Gst.MessageType.EOS:
-            print(f"[{channel}] pipeline EOS reached bus "
-                  "(probe should have DROPped this!)", file=sys.stderr)
-            loop.quit()
-    return _on_bus
 
 
 def on_comp_bus(_bus, msg):
@@ -700,19 +830,14 @@ def on_comp_bus(_bus, msg):
         loop.quit()
         return
     if msg.type == Gst.MessageType.EOS:
-        print("[comp] pipeline EOS (decoder-isolated bridge should "
-              "have prevented this)", file=sys.stderr)
+        print("[comp] pipeline EOS (decoder-isolated bridge "
+              "should have prevented this)", file=sys.stderr)
         loop.quit()
 
 
-for p, h in [
-    (pipe_a, _make_decode_bus_handler("A")),
-    (pipe_b, _make_decode_bus_handler("B")),
-    (pipe_c, on_comp_bus),
-]:
-    bus = p.get_bus()
-    bus.add_signal_watch()
-    bus.connect("message", h)
+bus = pipe_c.get_bus()
+bus.add_signal_watch()
+bus.connect("message", on_comp_bus)
 
 
 shutdown_requested = False
@@ -727,22 +852,10 @@ def shutdown(*_):
 signal.signal(signal.SIGINT, shutdown)
 signal.signal(signal.SIGTERM, shutdown)
 
-# --- Run ----------------------------------------------------------------
 
+# --- Compositor preroll helper ----------------------------------------
 
 def preroll_to_paused(p, label):
-    """Set p to PAUSED and poll get_state up to PREROLL_BUDGET_S
-    seconds. Logs each ASYNC tick. Honors shutdown_requested.
-
-    Live pipelines (compositor pipe_c contains intervideosrc x2) reach
-    PAUSED but return NO_PREROLL rather than SUCCESS -- live sources
-    only produce buffers in PLAYING. NO_PREROLL is a "yes, in PAUSED,
-    will produce on PLAYING" answer, NOT a failure; accept it as
-    success-equivalent so the live compositor pipeline does not
-    30-second-budget-out waiting for a SUCCESS that will never arrive.
-    File-backed decode pipelines still return SUCCESS via the ASYNC
-    path (their non-live sources DO preroll a buffer in PAUSED, which
-    is what the initial SEGMENT seek then arms)."""
     ret = p.set_state(Gst.State.PAUSED)
     if ret == Gst.StateChangeReturn.FAILURE:
         die(f"{label}: pipeline failed to enter PAUSED")
@@ -753,16 +866,16 @@ def preroll_to_paused(p, label):
     for elapsed in range(1, PREROLL_BUDGET_S + 1):
         if shutdown_requested:
             return False
-        ret, cur, pending = p.get_state(1 * Gst.SECOND)
-        if ret == Gst.StateChangeReturn.SUCCESS:
+        r, cur, pending = p.get_state(1 * Gst.SECOND)
+        if r == Gst.StateChangeReturn.SUCCESS:
             print(f"[wipe_cpu] {label} preroll done after ~{elapsed}s "
-                  f"(state={cur.value_nick})")
+                  f"state={cur.value_nick}")
             return True
-        if ret == Gst.StateChangeReturn.NO_PREROLL:
-            print(f"[wipe_cpu] {label} reached PAUSED after ~{elapsed}s "
-                  "(NO_PREROLL -- live source)")
+        if r == Gst.StateChangeReturn.NO_PREROLL:
+            print(f"[wipe_cpu] {label} reached PAUSED after "
+                  f"~{elapsed}s (NO_PREROLL)")
             return True
-        if ret == Gst.StateChangeReturn.FAILURE:
+        if r == Gst.StateChangeReturn.FAILURE:
             die(f"{label} preroll FAILURE")
         print(f"[wipe_cpu] {label} preroll... state={cur.value_nick} "
               f"pending={pending.value_nick} "
@@ -770,92 +883,63 @@ def preroll_to_paused(p, label):
     die(f"{label} preroll exceeded {PREROLL_BUDGET_S}s budget")
 
 
-print(f"[wipe_cpu] starting; HOLD={HOLD_S}s WIPE={WIPE_S}s "
-      f"display={DW}x{DH}@{FPS} intervideo-bridged; ctrl-c to stop")
+# --- Run ---------------------------------------------------------------
 
-# Start the compositor pipeline first so the intervideosrc endpoints on
-# chA / chB exist before the decode pipelines start emitting buffers.
+print(f"[wipe_cpu] starting; WIPE={WIPE_S}s "
+      f"display={DW}x{DH}@{FPS} fresh-bin-per-clip; ctrl-c to stop")
+print(f"[wipe_cpu] leak-fallback videoconvert before intervideosink: "
+      f"{'ON' if INSERT_TEARDOWN_VIDEOCONVERT else 'off'} "
+      "(env OPENMARQUEE_VIDEOCONVERT_BEFORE_INTERVIDEOSINK)")
+
+# Compositor pipeline first (live sources -> NO_PREROLL accepted).
 preroll_to_paused(pipe_c, "compositor")
-preroll_to_paused(pipe_a, "decodeA")
-preroll_to_paused(pipe_b, "decodeB")
 
 if shutdown_requested:
-    for p in (pipe_a, pipe_b, pipe_c):
-        p.set_state(Gst.State.NULL)
+    pipe_c.set_state(Gst.State.NULL)
     sys.exit(0)
 
-# Query each demuxer for its file duration (qtdemux has parsed the
-# moov box by PAUSED). Fall back to known asset durations if the
-# query fails. These durations become the SEGMENT seek stop= boundary.
-DUR_A = query_dur_ns(pipe_a, "decodeA", int(4.75 * Gst.SECOND))
-DUR_B = query_dur_ns(pipe_b, "decodeB", int(9.08 * Gst.SECOND))
-
-# Install BOTH probes BEFORE the initial seek so the very first segment
-# boundary is caught even if it lands surprisingly early. Early-reseek
-# (BUFFER probe) fires the re-seek BEFORE SEGMENT_DONE arrives; loop
-# probe (EVENT probe) DROPs the boundary event so it never reaches the
-# decoder. The two collaborate: early-reseek is the action, loop probe
-# is the safety net.
-install_early_reseek_probe(demuxA, "A", DUR_A, LEAD_NS)
-install_early_reseek_probe(demuxB, "B", DUR_B, LEAD_NS)
-install_loop_probe(demuxA, "A")
-install_loop_probe(demuxB, "B")
-
-# Arm SEGMENT-seek mode on each demuxer BEFORE PLAYING so the very
-# first segment runs in segment mode (stop=dur triggers SEGMENT_DONE
-# at the end; without stop=dur the previous version froze at end).
-for label, demux, dur in [("demuxA", demuxA, DUR_A), ("demuxB", demuxB, DUR_B)]:
-    if not segment_seek(demux, dur):
-        die(f"initial SEGMENT seek failed on {label}")
-
-# Force one shared clock + one shared base-time on all three pipelines
-# BEFORE any of them goes PLAYING. Each Gst.Pipeline normally
-# auto-selects its own clock at PLAYING and stamps buffers in its own
-# timebase; the intervideo bridge then carries PTS that are only valid
-# in the producer pipeline -- pipe_c interprets them against ITS clock,
-# kmssink sync=true throttles to match the timebase mismatch, the
-# blocking intervideo handoff back-pressures all the way to the
-# decoders, and the whole system runs at ~8% real-time (the prior
-# slow-motion bug). use_clock pins the clock so the PLAYING transition
-# will not re-select; set_base_time after PAUSED with the same value
-# everywhere gives all three pipelines a single shared running-time
-# origin. do-timestamp=false on intervideosrc (above) preserves the
-# producer's PTS instead of re-stamping against the throttled cadence.
-shared_clock = Gst.SystemClock.obtain()
+# Capture shared base-time AFTER compositor is in PAUSED, BEFORE
+# anything else goes PLAYING. Every fresh ClipBin pins this same
+# base-time so PTS is comparable across pipelines.
 shared_base_time = shared_clock.get_time()
-for label, p in [("compositor", pipe_c),
-                 ("decodeA", pipe_a),
-                 ("decodeB", pipe_b)]:
-    p.use_clock(shared_clock)
-    p.set_base_time(shared_base_time)
-
-# Inline verification log so QA can grep the journal for clock/base-time
-# match without needing to add their own probe.
-clock_name = shared_clock.get_name() or "?"
-print(f"[wipe_cpu] shared clock: {clock_name} "
+print(f"[wipe_cpu] shared clock={shared_clock.get_name()} "
       f"base_time={shared_base_time} ns")
-for label, p in [("compositor", pipe_c),
-                 ("decodeA", pipe_a),
-                 ("decodeB", pipe_b)]:
-    c = p.get_clock()
-    bt = p.get_base_time()
-    cn = c.get_name() if c is not None else "NONE"
-    print(f"[wipe_cpu]   {label}: clock={cn} base_time={bt} ns")
+pipe_c.set_base_time(shared_base_time)
 
-for label, p in [("compositor", pipe_c),
-                 ("decodeA", pipe_a),
-                 ("decodeB", pipe_b)]:
-    if p.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-        die(f"{label}: pipeline failed to enter PLAYING")
+# Initial bin: spawn slot A, preroll, install triggers, play.
+print("[wipe_cpu] spawn initial main bin (slot A)")
+first = ClipBin("A").build()
+first.preroll()
+first.query_duration()
+first.install_trigger_probe()
+slot_state["main"] = first
+
+# Start compositor PLAYING.
+if pipe_c.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+    die("compositor: pipeline failed to enter PLAYING")
+
+# Set initial pad geometry: slot 0 (A) full, slot 1 (B) hidden.
+set_geom(pads[0], 0, DW)
+set_geom(pads[1], 0, 0)
+pads[0].set_property("zorder", 0)
+pads[1].set_property("zorder", 1)
+
+# Start first bin PLAYING.
+first.play()
 
 attach_flow_probes()
-GLib.timeout_add(TICK_MS, tick)
+GLib.timeout_add(TICK_MS, animation_tick)
 GLib.timeout_add(1000, fps_tick)
 try:
     loop.run()
 finally:
-    for p in (pipe_a, pipe_b, pipe_c):
-        p.set_state(Gst.State.NULL)
+    print("[wipe_cpu] shutdown -> teardown all bins + comp")
+    for key in ("main", "next", "outgoing"):
+        b = slot_state.get(key)
+        if b is not None:
+            b.teardown()
+            slot_state[key] = None
+    pipe_c.set_state(Gst.State.NULL)
     if fps_log_file is not None:
         try:
             fps_log_file.close()
