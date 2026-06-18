@@ -52,28 +52,54 @@ ARCHITECTURE:
                                   (or gldownload->videoconvert->
                                   kmssink fallback via env flag)
 
-LOOP MECHANISM:
-  - Each new slot (sub-bin) gets:
-      stored pad_added_handler_id from qtdemux.connect.
-      stored first_frame_probe_id from dec.src.add_probe.
-      stored prime_trigger_probe_id from qtdemux video src.add_probe.
-  - Retire releases ALL of those plus mix.release_request_pad
-    plus sub.set_state(NULL) plus pipeline.remove (cutloop's
-    proven sequence).
-  - Prime trigger BUFFER probe on the CURRENT slot's qtdemux video
-    src pad. When pts >= (dur - PRIME_LEAD_S - FADE_S), idle_add
-    the prime; one-shot via REMOVE.
-  - Gate BUFFER probe on the OFF slot's v4l2h264dec src pad. When
-    first buffer arrives, schedule start_fade; one-shot via REMOVE.
-  - Deadline timer: if gate doesn't fire within GATE_DEADLINE_MS,
-    start_fade anyway (hold-last-frame semantics of glvideomixer).
-  - fade_tick animates alphas over FADE_S; on completion swaps
-    current slot index, schedules retire of old slot, attaches a
-    new prime trigger on the new current slot's qtdemux pad.
+LOOP MECHANISM (per QA scheduler-redesign spec 2026-06-18):
+  Single linear state machine driven by scheduler_tick at
+  SCHEDULER_TICK_MS=50ms cadence. scheduler_tick is the SOLE
+  mutator of sched["state"]:
 
-WATCHDOG: per QA spec. fps_tick reads screen_state.frames; if 0
-for 2 consecutive ticks (= 2s of black), force-prime the OFF slot
-on the next clip in cycle order + force the pipeline to PLAYING.
+    PLAYING_CURRENT  -- visible clip; tick re-evaluates
+                        should_start_priming() each cycle:
+                        (a) MIN_DWELL_S wall-clock gate
+                        (cascade killer), (b) adaptive lead
+                        min(PRIME_LEAD_S+FADE_S, dur*0.4), or
+                        (c) FROZEN_TIMEOUT_S backstop.
+       |
+       v  _do_start_priming() asserts off slot empty,
+          builds sub-bin, attaches passive first-frame probe.
+
+    PRIMING_NEXT     -- incoming decoder warming. Advance on
+                        first_frame_arrived OR PRIMING_DEADLINE_S.
+       |
+       v  _do_start_fade()
+
+    FADING           -- _animate_fade() runs per tick; advance on
+                        elapsed >= FADE_S.
+       |
+       v  _do_complete_fade(): SYNCHRONOUS retire (blocks NULL
+          via get_state 2s) + swap + duration query.
+
+  Probe callbacks may set passive flags only; MUST NOT call
+  _do_* or write sched["state"]. The single-in-flight invariant
+  + the assert in _do_start_priming convert any residual race
+  into a loud assertion error instead of a silent qtdemux
+  not-linked / Internal-data-stream pipeline crash.
+
+  Per-slot pad-added handler ID + first-frame probe ID +
+  dec_pts probe ID are stored on the slot dict for retire_slot
+  to disconnect/remove (cutloop's proven sequence).
+
+  retire_slot is synchronous and sends EOS to the kept
+  mix.sink pad to engage repeat-after-eos before unlink + alpha=0
+  + sub NULL + pipeline.remove. NEVER release_request_pad
+  on a glvideomixer sink pad.
+
+OBSERVABILITY: fps_tick at 1Hz emits a [fps] line with
+state=, dec_pts_ms=, cur_dur_s=, screen=, max_gap_ms=. The
+legacy screen=0 watchdog and FROZEN dec-PTS watchdog are
+DELETED: under repeat-after-eos a frozen composite can drive
+screen>0 falsely, so neither signal is informative anymore.
+The FROZEN_TIMEOUT_S backstop inside should_start_priming
+replaces both.
 """
 
 import gc
@@ -126,24 +152,45 @@ from gi.repository import GLib, Gst  # noqa: E402
 CONTENT_GLOB = "/var/openmarquee/content/*/asset.mp4"
 VIDEOS = sorted(glob.glob(CONTENT_GLOB))
 
-PRIME_LEAD_S = 1.5     # seconds before current EOS to spawn next
-FADE_S = 1.0           # crossfade duration
-FADE_TICK_MS = 33      # animation tick (~30fps geometry update)
-GATE_DEADLINE_MS = 2000  # max wait for incoming first frame
-PREROLL_BUDGET_S = 30  # GL cold-start budget under systemd
-WATCHDOG_STALL_S = 2   # consecutive seconds of screen=0 -> recover
-# Per QA d489fd8 soak: repeat-after-eos can freeze a composite
-# at 24fps so screen=24 is no longer proof of motion. Detect
-# "no decode-PTS progress on the current slot" as a third-line
-# defense behind the pts-threshold trigger and the EOS-backup
-# trigger. Threshold low enough to catch a freeze quickly, high
-# enough not to trip on a slow-decode hiccup or natural
-# end-of-clip + fade lag.
-FROZEN_STALL_S = 3     # consecutive seconds of unchanged dec PTS
+PRIME_LEAD_S = 1.5           # absolute lead cap (s)
+FADE_S = 1.0                 # crossfade duration (s)
+PREROLL_BUDGET_S = 30        # GL cold-start budget under systemd
 
-# Fallback durations if qtdemux query_duration fails. Per QA assets
-# are uniform h264 Main 1280x720 24fps but vary in length; if a
-# specific asset's query fails the fallback is ~6s (rough average).
+# Scheduler constants per QA spec (single linear state machine
+# replacing the 4-scheduler/2-flag tangle of 5ec8044+1777846).
+SCHEDULER_TICK_MS   = 50     # state-machine tick cadence (ms)
+MIN_DWELL_S         = 0.5    # cascade killer: clip must be
+                             # visible >= MIN_DWELL_S wall-clock
+                             # as current before any advance can
+                             # start. Measured from
+                             # sched["became_current_ns"], NOT
+                             # from clip PTS (the incoming was
+                             # primed early so its PTS at swap is
+                             # already ~FADE_S into the file).
+PRIME_LEAD_FRACTION = 0.4    # adaptive lead = min(
+                             # PRIME_LEAD_S + FADE_S,
+                             # dur_s * PRIME_LEAD_FRACTION).
+                             # Short clips get a smaller lead;
+                             # long clips behave like today.
+PRIMING_DEADLINE_S  = 0.5    # max wait for incoming first frame
+                             # before _do_start_fade forces the
+                             # PRIMING_NEXT -> FADING transition.
+                             # Per QA review note #2: may be
+                             # tight for a cold-start incoming
+                             # decoder -- we LOG when this fires
+                             # before first_frame so QA can see
+                             # any black-flashes and bump it.
+FROZEN_TIMEOUT_S    = 12.0   # backstop: max wall-clock in
+                             # PLAYING_CURRENT before force-
+                             # advance. Replaces the deleted
+                             # FROZEN-watchdog (3s dec PTS) and
+                             # screen=0-watchdog. No separate
+                             # timer; lives as a single branch
+                             # inside should_start_priming().
+
+# Fallback duration if qtdemux query_duration fails. Per QA
+# assets are uniform h264 Main 1280x720 24fps but vary in length;
+# if a specific asset's query fails the fallback is ~6s.
 DUR_FALLBACK_NS = 6_000_000_000
 
 # Default to glimagesink per QA glass-verified 24fps path. Set
@@ -390,48 +437,53 @@ slots = [
     {"sub": None, "dec": None, "demux": None, "mix_sink": None,
      "label": None, "serial": None, "dur_ns": 0,
      "pad_added_id": None, "first_frame_probe_id": None,
-     "prime_trigger_probe_id": None, "prime_eos_probe_id": None,
      "dec_pts_probe_id": None, "last_dec_pts_ns": 0},
     {"sub": None, "dec": None, "demux": None, "mix_sink": None,
      "label": None, "serial": None, "dur_ns": 0,
      "pad_added_id": None, "first_frame_probe_id": None,
-     "prime_trigger_probe_id": None, "prime_eos_probe_id": None,
      "dec_pts_probe_id": None, "last_dec_pts_ns": 0},
 ]
 current_slot_idx = [0]   # which slots[] entry is the active one
 next_clip_idx = [0]       # cycling counter through VIDEOS
 
-# Fade state
-fade_state = {"start_ns": 0, "in_flight": False,
-              "incoming_slot": -1, "outgoing_slot": -1}
-
-# Per-slot "this slot's succession is already scheduled" flag. Set
-# by ANY trigger that calls prime_next (pts-threshold trigger, EOS
-# backup trigger, FROZEN watchdog). Cleared in finish_fade for the
-# new current slot (fresh) and in retire_slot defensively.
-# Prevents double-prime when two triggers race on the same slot.
-advance_scheduled = [False, False]
-
-# Per QA d489fd8+5ec8044 soak: a prime_next that hits a fade
-# in-flight USED to be dropped (logged + returned False). The
-# log message promised "next prime will fire on the new current"
-# but nothing actually re-fired it. On short clips this stranded
-# the reel until FROZEN WATCHDOG force-advanced 3s later (visible
-# freeze + churn). Fix: defer the dropped prime onto this flag;
-# finish_fade re-fires it for the new current after the swap.
-# Module-level singleton -- prime_next is the only writer when
-# deferring; finish_fade clears and re-schedules.
-pending_prime = [False]
-
-# Watchdog state. zero_frame_seconds: legacy screen=0 counter.
-# last_dec_pts_ns + frozen_seconds: FROZEN-detection on the current
-# slot (catches "screen=24 of frozen composite" per QA d489fd8).
-watchdog_state = {"zero_frame_seconds": 0,
-                  "last_dec_pts_ns": 0,
-                  "frozen_seconds": 0}
-
 # Cycle serial (every spawned bin gets a unique id for log clarity)
 spawn_serial = [0]
+
+# Single linear-state-machine state per QA scheduler spec. ONLY
+# mutated inside scheduler_tick's three transition helpers
+# (_do_start_priming, _do_start_fade, _do_complete_fade). Read by
+# scheduler_tick's predicates. Probe callbacks set passive flags
+# (next_first_frame_arrived) but MUST NOT mutate state.
+#
+# Fields:
+#   state                    : "PLAYING_CURRENT" | "PRIMING_NEXT" | "FADING"
+#   became_current_ns        : monotonic ns; written at startup and
+#                              inside _do_complete_fade. Used by
+#                              MIN_DWELL + FROZEN_TIMEOUT gates.
+#   current_clip_dur_s       : duration of the clip currently
+#                              displayed (seconds). Written at
+#                              startup and in _do_complete_fade.
+#   priming_started_ns       : monotonic ns; written in
+#                              _do_start_priming. Used by
+#                              _priming_deadline.
+#   next_first_frame_arrived : bool. Set True by the incoming
+#                              decoder's first-frame probe.
+#                              Cleared in _do_start_priming.
+#   fade_started_ns          : monotonic ns; written in
+#                              _do_start_fade. Used by
+#                              _fade_animation_done + _animate_fade.
+#   outgoing_slot_idx        : int; written in _do_start_fade.
+#   incoming_slot_idx        : int; written in _do_start_fade.
+sched = {
+    "state": "PLAYING_CURRENT",
+    "became_current_ns": 0,
+    "current_clip_dur_s": 0.0,
+    "priming_started_ns": 0,
+    "next_first_frame_arrived": False,
+    "fade_started_ns": 0,
+    "outgoing_slot_idx": -1,
+    "incoming_slot_idx": -1,
+}
 
 
 def _slot_clear(slot):
@@ -439,7 +491,6 @@ def _slot_clear(slot):
     must have already retired the elements)."""
     for k in ("sub", "dec", "demux", "mix_sink", "label", "serial",
               "pad_added_id", "first_frame_probe_id",
-              "prime_trigger_probe_id", "prime_eos_probe_id",
               "dec_pts_probe_id"):
         slot[k] = None
     slot["dur_ns"] = 0
@@ -555,24 +606,35 @@ def build_slot(slot_idx, clip_idx):
 
 
 def retire_slot(slot_idx):
-    """Tear down the sub-bin in slots[slot_idx]. Uses cutloop's
-    proven disconnect-before-NULL sequence to prevent closure-ref
-    leaks (Python closures captured by the pad-added handler + any
-    probes hold the sub-bin alive otherwise)."""
+    """Tear down the sub-bin in slots[slot_idx]. SYNCHRONOUS per
+    QA scheduler spec section (4): blocks until the sub is fully
+    NULL'd and slot fields are cleared. Called only from
+    _do_complete_fade. Uses cutloop's proven disconnect-before-
+    NULL sequence to prevent closure-ref leaks (Python closures
+    captured by the pad-added handler + any probes hold the
+    sub-bin alive otherwise).
+
+    Per QA review note #1: the blocking NULL via get_state(2s)
+    will produce a ~1s main-loop pause at each boundary (=
+    the known secondary boundary-hitch, now systematic).
+    EXPECTED and ACCEPTED this round; smoothing is the final
+    step after the reel cycles crash-free."""
     slot = slots[slot_idx]
     sub = slot["sub"]
     if sub is None:
-        return False
+        return
     label = slot["label"] or f"slot_{slot_idx}"
     weak = weakref.ref(sub)
 
     try:
+        # 1. Disconnect pad-added handler (closure-leak prevention).
         if slot["pad_added_id"] and slot["demux"] is not None:
             try:
                 slot["demux"].disconnect(slot["pad_added_id"])
             except Exception as exc:
                 print(f"[cutfade] retire {label} pad-added "
                       f"disconnect WARN: {exc}", file=sys.stderr)
+        # 2. Remove decoder.src probes (first-frame + dec_pts).
         if slot["dec"] is not None:
             dec_src = slot["dec"].get_static_pad("src")
             if dec_src is not None:
@@ -592,72 +654,33 @@ def retire_slot(slot_idx):
                     except Exception as exc:
                         print(f"[cutfade] retire {label} dec_pts "
                               f"probe WARN: {exc}", file=sys.stderr)
-        if (slot["demux"] is not None
-                and (slot["prime_trigger_probe_id"]
-                     or slot["prime_eos_probe_id"])):
-            # demux video src pad -- find it; same pad holds
-            # both the prime-threshold BUFFER probe and the EOS
-            # backup-trigger EVENT probe (attach_prime_trigger).
-            it = slot["demux"].iterate_src_pads()
-            while True:
-                res, p = it.next()
-                if res != Gst.IteratorResult.OK:
-                    break
-                if p.get_name().startswith("video"):
-                    if slot["prime_trigger_probe_id"]:
-                        try:
-                            p.remove_probe(
-                                slot["prime_trigger_probe_id"]
-                            )
-                        except Exception as exc:
-                            print(f"[cutfade] retire {label} prime "
-                                  f"trigger probe WARN: {exc}",
-                                  file=sys.stderr)
-                    if slot["prime_eos_probe_id"]:
-                        try:
-                            p.remove_probe(
-                                slot["prime_eos_probe_id"]
-                            )
-                        except Exception as exc:
-                            print(f"[cutfade] retire {label} prime "
-                                  f"eos probe WARN: {exc}",
-                                  file=sys.stderr)
-                    break
-        # Per QA glass diagnosis of 3d36db1: repeat-after-eos only
-        # ENGAGES once the pad RECEIVES an EOS event. Setting the
-        # source sub-bin to NULL does NOT emit EOS downstream to
-        # the kept mix sink pad. Without an EOS the aggregator
-        # still treats the kept pad as a live waiter -> blocks
-        # waiting for a buffer that never arrives -> screen=0
-        # (same stall shape as 559897f).
-        #
-        # Fix: send EOS DIRECTLY into the kept mix sink pad before
-        # we unlink the peer. send_event is synchronous on the
-        # sink pad's event function (gst_aggregator_default_sink
-        # _event), so aggpad->priv->eos = True by the time we
-        # return. With repeat-after-eos=True (set in
-        # _ensure_mix_pad) the aggregator then freezes the last
-        # buffer on this pad so subsequent ticks treat it as
-        # "has a buffer" (composited-then-skipped on alpha==0).
-        # global-eos is forced FALSE whenever any repeat pad is
-        # involved -> the pipeline can NEVER tear down from this
-        # single pad's EOS. The re-prime FLUSH_START + FLUSH_STOP
-        # (already in build_slot for the re-prime branch) clears
-        # this priv->eos when the next clip relinks -> pad goes
-        # live again.
-        #
-        # Order: EOS first (pad object still valid + linked at
-        # that point so the event routes cleanly), then peer
-        # unlink, then alpha=0, then sub NULL + remove.
-        # NEVER release_request_pad on a glvideomixer sink pad
-        # (proven on 00ca09e to stop aggregator output cold).
+        # 3. EOS into the kept mix sink pad to ENGAGE
+        # repeat-after-eos before unlinking (proven on d489fd8).
+        # send_event is synchronous on the aggregator sink-event
+        # handler so priv->eos = True by return.
         if slot["mix_sink"] is not None:
-            slot["mix_sink"].send_event(Gst.Event.new_eos())
+            if not slot["mix_sink"].send_event(
+                Gst.Event.new_eos()
+            ):
+                print(f"[cutfade] retire {label} mix_sink EOS "
+                      "send_event returned False (proceeding)",
+                      file=sys.stderr)
+            # 4. Unlink old peer from kept mix sink pad.
             peer = slot["mix_sink"].get_peer()
             if peer is not None:
                 peer.unlink(slot["mix_sink"])
+            # alpha=0 -> composite path skips the frozen frame.
             slot["mix_sink"].set_property("alpha", 0.0)
-        sub.set_state(Gst.State.NULL)
+        # 5. BLOCKING set_state(NULL). ASYNC -> wait up to 2s.
+        ret = sub.set_state(Gst.State.NULL)
+        if ret == Gst.StateChangeReturn.ASYNC:
+            ret2, _cur, _pend = sub.get_state(2 * Gst.SECOND)
+            if ret2 != Gst.StateChangeReturn.SUCCESS:
+                print(f"[cutfade] retire {label} NULL get_state "
+                      f"WARN ret={ret2.value_nick} after 2s "
+                      "(proceeding; downstream assert will surface "
+                      "corrupted state)", file=sys.stderr)
+        # 6. pipeline.remove.
         pipeline.remove(sub)
         print(f"[cutfade] retire {label} (slot {slot_idx}; "
               "mix.sink pad kept allocated)",
@@ -666,14 +689,10 @@ def retire_slot(slot_idx):
         print(f"[cutfade] retire {label} WARN: {exc}",
               file=sys.stderr)
 
-    # Clear the per-slot succession-scheduled flag defensively.
-    # finish_fade already clears the new current's flag; this
-    # covers the outgoing slot so a future re-prime of THIS
-    # slot starts with a clean flag.
-    advance_scheduled[slot_idx] = False
-
+    # 7. Clear slot fields (mix_sink NOT cleared -- persistent).
     _slot_clear(slot)
 
+    # 8. Defensive leak check (existing cf03a8f instrumentation).
     def _check_leak():
         gc.collect()
         if weak() is not None:
@@ -681,312 +700,351 @@ def retire_slot(slot_idx):
                   f"{label}", file=sys.stderr)
         return False
     GLib.idle_add(_check_leak)
-    return False
 
 
-# --- Prime trigger via PTS probe on demuxer src ------------------------
+# --- Scheduler state machine -------------------------------------------
+#
+# Per QA scheduler-redesign spec (replaces the 4-scheduler /
+# 2-flag tangle of 5ec8044+1777846 that oscillated between
+# drop-prime-freeze and defer-prime-cascade failure modes).
+#
+# Single linear state machine:
+#   PLAYING_CURRENT -> PRIMING_NEXT -> FADING -> PLAYING_CURRENT
+#
+# Driven by scheduler_tick at SCHEDULER_TICK_MS cadence.
+# scheduler_tick is the SOLE mutator of sched["state"]. Probe
+# callbacks may set passive flags (next_first_frame_arrived) but
+# MUST NOT call _do_* or write sched["state"].
+#
+# Gates that kill the prior failure modes:
+#   - MIN_DWELL_S wall-clock from became_current_ns: a newly-
+#     current short clip cannot immediately re-trigger ->
+#     cascade dead at source.
+#   - Adaptive lead min(PRIME_LEAD_S + FADE_S, dur * 0.4):
+#     short clips get a smaller lead -> no overshoot off end.
+#   - FROZEN_TIMEOUT_S backstop branch INSIDE
+#     should_start_priming: no separate timer, no race with
+#     the primary trigger predicate.
+#
+# Single-in-flight invariant enforcement:
+#   1. sched["state"] = ... appears only in the three _do_*
+#      transition helpers. Lexical search confirms.
+#   2. scheduler_tick runs on the GLib main loop (single thread).
+#   3. The first-frame probe and any other event callbacks may
+#      only set passive flags.
+#   4. retire_slot is synchronous (blocks NULL via get_state)
+#      so FADING -> PLAYING_CURRENT is atomic from the state
+#      machine's perspective.
+#   5. _do_start_priming asserts slots[off_idx]["sub"] is None
+#      before building -- turns any residual race into a loud
+#      assertion error instead of the silent qtdemux not-linked
+#      / Internal-data-stream pipeline crash.
 
-def attach_prime_trigger(slot_idx):
-    """Attach a BUFFER probe on the slot's demuxer video src pad.
-    When pts >= dur - (PRIME_LEAD_S + FADE_S), schedule prime_next
-    via GLib.idle_add and remove the probe. dur is queried from
-    the demuxer."""
+
+def _query_clip_dur_s(slot_idx):
+    """Best-effort duration in seconds for slot's clip.
+    Try demux.query_duration, then per-pad query_duration on the
+    video src pad, then DUR_FALLBACK_NS with a WARN log."""
     slot = slots[slot_idx]
-    if slot["demux"] is None:
-        return
-    # qtdemux is dynamic; the video src pad may not exist yet at
-    # the moment of attach. Defer until pad-added fires (which we
-    # already hooked). Use iterate when ready -- if the video pad
-    # exists now, attach immediately; otherwise reschedule.
-    it = slot["demux"].iterate_src_pads()
-    video_pad = None
-    while True:
-        res, p = it.next()
-        if res != Gst.IteratorResult.OK:
-            break
-        if p.get_name().startswith("video"):
-            video_pad = p
-            break
-    if video_pad is None:
-        # Pad not yet available; retry shortly. qtdemux exposes its
-        # src pads within ms of PAUSED.
-        GLib.timeout_add(50, lambda: attach_prime_trigger(slot_idx)
-                         or False)
-        return False
-
-    # Query duration on the demuxer. Per cutloop pattern, this
-    # works once the moov box is parsed (which is what triggers
-    # pad-added). Per QA d489fd8: log WIN/FALLBACK so the next
-    # soak can confirm or kill the "fallback duration overshoots
-    # real EOS -> trigger misses" hypothesis.
-    ok, dur = slot["demux"].query_duration(Gst.Format.TIME)
+    demux = slot.get("demux")
+    if demux is None:
+        print(f"[cutfade] WARN _query_clip_dur_s slot {slot_idx} "
+              "demux is None; using fallback",
+              file=sys.stderr)
+        return DUR_FALLBACK_NS / 1e9
+    ok, dur = demux.query_duration(Gst.Format.TIME)
     if ok and dur > 0:
-        slot["dur_ns"] = dur
-        dur_source = "WIN"
-    else:
-        slot["dur_ns"] = DUR_FALLBACK_NS
-        dur_source = "FALLBACK"
-        print(f"[cutfade] {slot['label']} duration query failed; "
-              f"fallback {DUR_FALLBACK_NS / 1e9:.2f}s",
-              file=sys.stderr)
-    prime_at = slot["dur_ns"] - int(
-        (PRIME_LEAD_S + FADE_S) * 1_000_000_000
+        return dur / 1e9
+    try:
+        it = demux.iterate_src_pads()
+        while True:
+            res, p = it.next()
+            if res != Gst.IteratorResult.OK:
+                break
+            if p.get_name().startswith("video"):
+                ok, dur = p.query_duration(Gst.Format.TIME)
+                if ok and dur > 0:
+                    return dur / 1e9
+                break
+    except Exception as exc:
+        print(f"[cutfade] WARN _query_clip_dur_s slot {slot_idx} "
+              f"pad query exc: {exc}", file=sys.stderr)
+    print(f"[cutfade] WARN _query_clip_dur_s slot {slot_idx} "
+          f"both queries failed; fallback "
+          f"{DUR_FALLBACK_NS / 1e9:.2f}s", file=sys.stderr)
+    return DUR_FALLBACK_NS / 1e9
+
+
+def _query_current_pts_ns():
+    """Return the current decoder's playback position in ns, or
+    -1 if the query fails. Used by should_start_priming's
+    adaptive-lead remaining-time math."""
+    cur = current_slot_idx[0]
+    dec = slots[cur].get("dec")
+    if dec is None:
+        return -1
+    try:
+        ok, pos = dec.query_position(Gst.Format.TIME)
+        if ok and pos >= 0:
+            return pos
+    except Exception:
+        pass
+    return -1
+
+
+# --- Predicates --------------------------------------------------------
+
+def should_start_priming():
+    """Return True iff PLAYING_CURRENT should advance to
+    PRIMING_NEXT. Two gates + one backstop per spec section (2).
+
+    Wall-clock dwell + remaining-time test, NOT a PTS threshold:
+    the incoming clip was primed during the prior fade so by the
+    time it becomes current its PTS is already ~FADE_S into the
+    file. A PTS-based threshold races against the swap; the
+    wall-clock dwell is independent of clip-internal time."""
+    now_ns = GLib.get_monotonic_time() * 1000
+    time_as_current_s = (
+        (now_ns - sched["became_current_ns"]) / 1e9
     )
-    print(f"[cutfade] [trigger] slot={slot_idx} "
-          f"{dur_source} dur_ns={slot['dur_ns']} "
-          f"threshold_ns={prime_at} "
-          f"({slot['dur_ns'] / 1e9:.2f}s -> "
-          f"fire at {prime_at / 1e9:.2f}s)",
-          file=sys.stderr)
-    if prime_at <= 0:
-        # Clip too short for prime-lead arithmetic; skip the
-        # pts-threshold trigger and rely on the EOS backup
-        # trigger below to advance at natural EOS. Should not
-        # happen for our 5-9s assets but defensive.
-        print(f"[cutfade] {slot['label']} dur too short for "
-              f"prime arithmetic ({slot['dur_ns'] / 1e9:.2f}s); "
-              "relying on EOS backup trigger", file=sys.stderr)
 
-    fired = [False]
-
-    def _on_buffer(_pad, info):
-        if fired[0]:
-            return Gst.PadProbeReturn.REMOVE
-        buf = info.get_buffer()
-        if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
-            return Gst.PadProbeReturn.OK
-        if prime_at > 0 and buf.pts >= prime_at:
-            fired[0] = True
-            print(f"[cutfade] {slot['label']} prime_trigger FIRED "
-                  f"at pts={buf.pts / 1e9:.2f}s "
-                  f"(threshold={prime_at / 1e9:.2f}s)",
-                  file=sys.stderr)
-            advance_scheduled[slot_idx] = True
-            GLib.idle_add(prime_next)
-            # Self-clear so retire does not double-remove (gst
-            # warns "pad has no probe with id N").
-            slot["prime_trigger_probe_id"] = None
-            return Gst.PadProbeReturn.REMOVE
-        return Gst.PadProbeReturn.OK
-
-    # Per QA d489fd8 ask #2: EOS-driven BACKUP trigger. If the
-    # pts-threshold buffer probe missed (e.g. fallback duration
-    # too long), the clip will naturally EOS before fired[0]
-    # ever flips. Catch the EOS on the same demux video src pad
-    # and drive prime_next + start_fade if no advance is
-    # already scheduled. Guards: not in fade, this slot IS the
-    # current visible slot, and not already advance-scheduled.
-    # This is the safety net QA asked for -- "a cut-style
-    # advance as the safety net beats a frozen reel."
-    def _on_event(_pad, info):
-        ev = info.get_event()
-        if ev is None or ev.type != Gst.EventType.EOS:
-            return Gst.PadProbeReturn.OK
-        if fired[0]:
-            print(f"[cutfade] {slot['label']} EOS after "
-                  f"prime_trigger (normal end)", file=sys.stderr)
-            return Gst.PadProbeReturn.OK
-        print(f"[cutfade] {slot['label']} EOS BEFORE "
-              f"prime_trigger (threshold={prime_at / 1e9:.2f}s "
-              f"source={dur_source}); BACKUP advance",
-              file=sys.stderr)
-        fired[0] = True
-        if (not fade_state["in_flight"]
-                and current_slot_idx[0] == slot_idx
-                and not advance_scheduled[slot_idx]):
-            advance_scheduled[slot_idx] = True
-            GLib.idle_add(prime_next)
-        else:
-            print(f"[cutfade] {slot['label']} EOS BACKUP "
-                  "advance suppressed (fade in flight, slot "
-                  "not current, or advance already scheduled)",
-                  file=sys.stderr)
-        return Gst.PadProbeReturn.OK
-
-    buffer_probe_id = video_pad.add_probe(
-        Gst.PadProbeType.BUFFER, _on_buffer
-    )
-    slot["prime_trigger_probe_id"] = buffer_probe_id
-    eos_probe_id = video_pad.add_probe(
-        Gst.PadProbeType.EVENT_DOWNSTREAM, _on_event
-    )
-    slot["prime_eos_probe_id"] = eos_probe_id
-    return False
-
-
-# --- Prime next clip into the OFF slot ----------------------------------
-
-def prime_next():
-    """Build the next playlist clip into the OFF slot, gate on its
-    first frame, then start_fade. Returns False so callers via
-    GLib.idle_add fire only once."""
-    if fade_state["in_flight"]:
-        # Per QA 5ec8044 soak: short clips cross their pts
-        # threshold while the prior fade is still in flight. The
-        # old behavior dropped the call and the promised "next
-        # prime will fire on the new current" never happened ->
-        # the new current ran to natural EOS, repeat-after-eos
-        # froze its composite, and FROZEN WATCHDOG had to rescue
-        # it 3s later (visible freeze + screen=0 churn). Fix:
-        # DEFER the prime onto pending_prime; finish_fade re-fires
-        # it for the new current immediately after the swap.
-        print("[cutfade] prime_next called while fade in flight; "
-              "DEFERRING (finish_fade will re-fire for new current)",
-              file=sys.stderr)
-        pending_prime[0] = True
+    # (a) MIN_DWELL -- cascade killer. First gate.
+    if time_as_current_s < MIN_DWELL_S:
         return False
-    off_idx = 1 - current_slot_idx[0]
-    if slots[off_idx]["sub"] is not None:
-        print(f"[cutfade] prime_next: slot {off_idx} already "
-              "occupied; skipping", file=sys.stderr)
-        return False
+
+    # (c) FROZEN BACKSTOP -- replaces FROZEN-watchdog and
+    # screen=0-watchdog. Loud-log when this fires.
+    if time_as_current_s > FROZEN_TIMEOUT_S:
+        print(f"[cutfade] FROZEN BACKSTOP: forcing advance from "
+              f"PLAYING_CURRENT (time_as_current="
+              f"{time_as_current_s:.2f}s, dur="
+              f"{sched['current_clip_dur_s']:.2f}s)",
+              file=sys.stderr)
+        return True
+
+    # (b) ADAPTIVE LEAD -- replaces pts-threshold + EOS-backup.
+    dur_s = sched["current_clip_dur_s"]
+    if dur_s <= 0:
+        return False  # duration unknown yet; wait for next tick.
+    adaptive_lead_s = min(PRIME_LEAD_S + FADE_S,
+                          dur_s * PRIME_LEAD_FRACTION)
+
+    current_pts_ns = _query_current_pts_ns()
+    if current_pts_ns < 0:
+        return False  # position query failed; FROZEN catches.
+    remaining_s = dur_s - (current_pts_ns / 1e9)
+    return remaining_s <= adaptive_lead_s
+
+
+def _priming_done():
+    """True once the incoming decoder's first frame has been
+    observed (passive flag set by the first-frame probe)."""
+    return sched["next_first_frame_arrived"]
+
+
+def _priming_deadline():
+    """True once PRIMING_NEXT has been in flight beyond
+    PRIMING_DEADLINE_S wall-clock."""
+    now_ns = GLib.get_monotonic_time() * 1000
+    elapsed_s = (now_ns - sched["priming_started_ns"]) / 1e9
+    return elapsed_s > PRIMING_DEADLINE_S
+
+
+def _fade_animation_done():
+    """True once FADING has been in flight beyond FADE_S
+    wall-clock."""
+    now_ns = GLib.get_monotonic_time() * 1000
+    elapsed_s = (now_ns - sched["fade_started_ns"]) / 1e9
+    return elapsed_s >= FADE_S
+
+
+def _animate_fade():
+    """Per-tick alpha update during FADING. Outgoing 1->0,
+    incoming 0->1, linear over FADE_S."""
+    outgoing_idx = sched["outgoing_slot_idx"]
+    incoming_idx = sched["incoming_slot_idx"]
+    out_pad = slots[outgoing_idx].get("mix_sink")
+    in_pad = slots[incoming_idx].get("mix_sink")
+    if out_pad is None or in_pad is None:
+        return
+    now_ns = GLib.get_monotonic_time() * 1000
+    elapsed_s = (now_ns - sched["fade_started_ns"]) / 1e9
+    t = max(0.0, min(1.0, elapsed_s / FADE_S))
+    out_pad.set_property("alpha", 1.0 - t)
+    in_pad.set_property("alpha", t)
+
+
+# --- Transitions -------------------------------------------------------
+#
+# The three _do_* helpers are the ONLY places that mutate
+# sched["state"]. Each is called exclusively from scheduler_tick
+# after the corresponding predicate returns True.
+
+def _do_start_priming():
+    """PLAYING_CURRENT -> PRIMING_NEXT. Builds the next sub-bin
+    into the off slot, attaches a first-frame probe (passive
+    flag setter only), transitions the new sub to PLAYING."""
+    cur_idx = current_slot_idx[0]
+    off_idx = 1 - cur_idx
+    # Spec section (5) point 5: assert slot empty BEFORE building
+    # to turn any single-in-flight invariant violation into a
+    # loud assertion error rather than a silent downstream
+    # qtdemux not-linked / Internal-data-stream pipeline crash.
+    assert slots[off_idx]["sub"] is None, (
+        f"_do_start_priming: slots[{off_idx}]['sub'] is not "
+        "None at PLAYING_CURRENT -> PRIMING_NEXT transition; "
+        "single-in-flight invariant violated"
+    )
+
+    now_ns = GLib.get_monotonic_time() * 1000
+    time_as_current_s = (
+        (now_ns - sched["became_current_ns"]) / 1e9
+    )
     clip_idx = next_clip_idx[0] % len(VIDEOS)
     next_clip_idx[0] += 1
+    print(f"[cutfade] [sched] PLAYING_CURRENT -> PRIMING_NEXT "
+          f"(current_dur={sched['current_clip_dur_s']:.2f}s, "
+          f"time_as_current={time_as_current_s:.2f}s)",
+          file=sys.stderr)
     print(f"[cutfade] prime next: clip {clip_idx} -> slot {off_idx}",
           file=sys.stderr)
+
     slot = build_slot(off_idx, clip_idx)
     slot["mix_sink"].set_property("alpha", 0.0)
-    slot["mix_sink"].set_property("zorder", 1)  # incoming on top
-    slots[current_slot_idx[0]]["mix_sink"].set_property("zorder", 0)
+    slot["mix_sink"].set_property("zorder", 1)   # incoming on top
+    slots[cur_idx]["mix_sink"].set_property("zorder", 0)
 
-    # First-frame gate on the new decoder.
+    # Reset first-frame flag BEFORE installing the probe so a
+    # late-arriving probe from a prior cycle (impossible under
+    # the invariant but defensive) does not falsely satisfy
+    # _priming_done.
+    sched["next_first_frame_arrived"] = False
+
     dec_src = slot["dec"].get_static_pad("src")
     if dec_src is None:
         die(f"[{slot['label']}] v4l2h264dec has no src pad")
 
-    gate = {"fired": False}
-
+    # Spec section (5) point 3: the first-frame probe is a
+    # PASSIVE flag setter only. MUST NOT call any _do_* function
+    # and MUST NOT write sched["state"].
     def _on_first_frame(_pad, _info):
-        if not gate["fired"]:
-            gate["fired"] = True
-            print(f"[cutfade] {slot['label']} first frame -> "
-                  "scheduling fade", file=sys.stderr)
-            GLib.idle_add(start_fade, off_idx)
-            # Mark probe as auto-removed so retire does not try
-            # to remove it again (gst warns "pad has no probe with
-            # id N" on double-removal).
+        if not sched["next_first_frame_arrived"]:
+            sched["next_first_frame_arrived"] = True
+            print(f"[cutfade] {slot['label']} first frame "
+                  "observed (PRIMING_NEXT)", file=sys.stderr)
             slot["first_frame_probe_id"] = None
             return Gst.PadProbeReturn.REMOVE
         return Gst.PadProbeReturn.OK
-    probe_id = dec_src.add_probe(
+
+    slot["first_frame_probe_id"] = dec_src.add_probe(
         Gst.PadProbeType.BUFFER, _on_first_frame
     )
-    slot["first_frame_probe_id"] = probe_id
-
-    # Deadline timer: if gate doesn't fire, start_fade anyway
-    # (hold-last-frame fallback semantic of glvideomixer).
-    def _deadline():
-        if gate["fired"]:
-            return False
-        gate["fired"] = True  # gate flag to prevent later
-                              # probe call from also firing
-        print(f"[cutfade] {slot['label']} GATE DEADLINE "
-              f"({GATE_DEADLINE_MS}ms) -- "
-              "no first frame; starting fade anyway "
-              "(hold-last-frame fallback)", file=sys.stderr)
-        GLib.idle_add(start_fade, off_idx)
-        return False
-    GLib.timeout_add(GATE_DEADLINE_MS, _deadline)
 
     slot["sub"].sync_state_with_parent()
     if (slot["sub"].set_state(Gst.State.PLAYING)
             == Gst.StateChangeReturn.FAILURE):
         die(f"[{slot['label']}] sub set_state PLAYING failed")
-    return False
+
+    sched["priming_started_ns"] = now_ns
+    sched["state"] = "PRIMING_NEXT"
 
 
-# --- Fade animation -----------------------------------------------------
+def _do_start_fade():
+    """PRIMING_NEXT -> FADING. Stamps fade_started_ns and the
+    outgoing/incoming slot indices; alpha animation runs on
+    subsequent ticks via _animate_fade.
 
-def start_fade(incoming_slot_idx):
-    """Start the 1s alpha animation. Outgoing alpha 1->0, incoming
-    alpha 0->1. Returns False so GLib.idle_add fires once."""
-    if fade_state["in_flight"]:
-        return False
-    fade_state["incoming_slot"] = incoming_slot_idx
-    fade_state["outgoing_slot"] = current_slot_idx[0]
-    fade_state["start_ns"] = GLib.get_monotonic_time() * 1000
-    fade_state["in_flight"] = True
-    print(f"[cutfade] FADE start: slot {fade_state['outgoing_slot']}"
-          f" -> slot {incoming_slot_idx}", file=sys.stderr)
-    GLib.timeout_add(FADE_TICK_MS, fade_tick)
-    return False
-
-
-def fade_tick():
-    outgoing = slots[fade_state["outgoing_slot"]]
-    incoming = slots[fade_state["incoming_slot"]]
-    if outgoing["mix_sink"] is None or incoming["mix_sink"] is None:
-        # Slot was retired mid-fade somehow; abort fade
-        print("[cutfade] fade_tick: slot mix_sink None; aborting",
+    Per QA review note #2: if the PRIMING_DEADLINE_S deadline
+    fires before the first frame arrives, log it so the soak can
+    show whether a brief black-flash occurs at the start of the
+    crossfade -- bump PRIMING_DEADLINE_S if it does."""
+    now_ns = GLib.get_monotonic_time() * 1000
+    elapsed_s = (now_ns - sched["priming_started_ns"]) / 1e9
+    first_frame = sched["next_first_frame_arrived"]
+    if not first_frame:
+        print(f"[cutfade] [sched] PRIMING deadline hit, "
+              f"first_frame=False (elapsed={elapsed_s:.2f}s; "
+              "incoming may show black at fade start -- bump "
+              "PRIMING_DEADLINE_S if soak shows black-flashes)",
               file=sys.stderr)
-        fade_state["in_flight"] = False
-        return False
-    elapsed_s = (
-        (GLib.get_monotonic_time() * 1000 - fade_state["start_ns"])
-        / 1e9
-    )
-    if elapsed_s >= FADE_S:
-        outgoing["mix_sink"].set_property("alpha", 0.0)
-        incoming["mix_sink"].set_property("alpha", 1.0)
-        finish_fade()
-        return False
-    t = elapsed_s / FADE_S
-    outgoing["mix_sink"].set_property("alpha", 1.0 - t)
-    incoming["mix_sink"].set_property("alpha", t)
-    return True
-
-
-def finish_fade():
-    """Called when fade_tick reaches elapsed >= FADE_S. Swap which
-    slot is current, schedule retire of the old current, and attach
-    the next prime trigger to the new current."""
-    outgoing_idx = fade_state["outgoing_slot"]
-    incoming_idx = fade_state["incoming_slot"]
-    current_slot_idx[0] = incoming_idx
-    fade_state["in_flight"] = False
-    # The new current is fresh: its succession has not yet been
-    # scheduled. Clear the flag so the new triggers can run.
-    advance_scheduled[incoming_idx] = False
-    # Reset FROZEN tracking on slot swap -- the new current's
-    # decoder will start producing buffers with a brand-new PTS
-    # sequence and the prior "last seen" was for the outgoing.
-    watchdog_state["last_dec_pts_ns"] = 0
-    watchdog_state["frozen_seconds"] = 0
-    print(f"[cutfade] FADE complete; current is now slot "
-          f"{incoming_idx}; retiring slot {outgoing_idx}",
+    print(f"[cutfade] [sched] PRIMING_NEXT    -> FADING       "
+          f"(first_frame={first_frame}, elapsed={elapsed_s:.2f}s)",
           file=sys.stderr)
-    # Retire outgoing on next idle. QA caught my prior soak-killer:
-    # GLib.idle_add(GLib.PRIORITY_LOW, callable, ...) raises
-    # TypeError on this PyGObject ("Callback needs to be a function
-    # or method not int") -- the canonical PyGObject signature is
-    # function-first, with priority as a kwarg. Per QA's
-    # simplest/safest: drop the priority entirely. retire workload
-    # is small (NULL teardown of a single sub-bin) so default
-    # priority is fine.
-    GLib.idle_add(retire_slot, outgoing_idx)
-    # Attach prime trigger to the new current. Fresh closure each
-    # call -> fired[0]=False, so even non-deferred cases re-trigger
-    # cleanly on the new current's pts threshold.
-    attach_prime_trigger(incoming_idx)
+    sched["outgoing_slot_idx"] = current_slot_idx[0]
+    sched["incoming_slot_idx"] = 1 - current_slot_idx[0]
+    sched["fade_started_ns"] = now_ns
+    sched["state"] = "FADING"
 
-    # Per QA 5ec8044 soak: if prime_next was DEFERRED during this
-    # fade (pts threshold crossed mid-fade on a short clip),
-    # fire it now for the new current. Set advance_scheduled
-    # for the incoming so the just-attached pts trigger does NOT
-    # race us (the trigger will idle_add prime_next; the slot-
-    # occupied guard in prime_next then catches the duplicate).
-    # If the new current is ALREADY past its own threshold (short
-    # clip case is exactly this), the buffer probe would fire on
-    # the next decoded buffer anyway; the deferred path just
-    # fires sooner and skips the "wait for next buffer" latency.
-    had_pending = pending_prime[0]
-    pending_prime[0] = False
-    if had_pending:
-        print(f"[cutfade] finish_fade: re-firing DEFERRED prime "
-              f"for new current slot {incoming_idx}",
+
+def _do_complete_fade():
+    """FADING -> PLAYING_CURRENT. Lock final alpha values,
+    synchronously retire the outgoing sub-bin (blocks until
+    NULL), swap current_slot_idx, stamp became_current_ns, and
+    query the new current's duration.
+
+    Per QA review note #1: synchronous retire WILL produce a
+    ~1s main-loop pause at each boundary (= the known
+    secondary boundary-hitch, now systematic). EXPECTED and
+    ACCEPTED this round."""
+    outgoing_idx = sched["outgoing_slot_idx"]
+    incoming_idx = sched["incoming_slot_idx"]
+    out_pad = slots[outgoing_idx].get("mix_sink")
+    in_pad = slots[incoming_idx].get("mix_sink")
+    if out_pad is not None:
+        out_pad.set_property("alpha", 0.0)
+    if in_pad is not None:
+        in_pad.set_property("alpha", 1.0)
+
+    retire_slot(outgoing_idx)
+    # Spec section (5) point 5: assert post-retire state to turn
+    # any "retire didn't fully complete" residual into a loud
+    # fail rather than a downstream crash on the next prime.
+    assert slots[outgoing_idx]["sub"] is None, (
+        f"_do_complete_fade: slots[{outgoing_idx}]['sub'] still "
+        "not None after synchronous retire_slot; the BLOCKING "
+        "NULL transition did not complete"
+    )
+
+    current_slot_idx[0] = incoming_idx
+    sched["became_current_ns"] = GLib.get_monotonic_time() * 1000
+    sched["current_clip_dur_s"] = _query_clip_dur_s(incoming_idx)
+    sched["state"] = "PLAYING_CURRENT"
+    print(f"[cutfade] [sched] FADING          -> PLAYING_CURRENT "
+          f"(incoming_slot={incoming_idx}, "
+          f"dur={sched['current_clip_dur_s']:.2f}s)",
+          file=sys.stderr)
+
+
+# --- Scheduler tick ----------------------------------------------------
+
+def scheduler_tick():
+    """Sole state mutator. Called via GLib.timeout_add at
+    SCHEDULER_TICK_MS cadence. Reads sched["state"], dispatches
+    to at most one transition helper per tick. Returns True to
+    keep the timeout firing."""
+    state = sched["state"]
+    if state == "PLAYING_CURRENT":
+        if should_start_priming():
+            _do_start_priming()
+    elif state == "PRIMING_NEXT":
+        if _priming_done() or _priming_deadline():
+            _do_start_fade()
+    elif state == "FADING":
+        _animate_fade()
+        if _fade_animation_done():
+            _do_complete_fade()
+    else:
+        # Per spec section (5) point 1: sched["state"] is
+        # written EXCLUSIVELY by the three _do_* helpers (and
+        # the startup populate). Recovery here would violate
+        # that lexical invariant. If we reach this branch the
+        # implementation has been corrupted -- log every tick
+        # so the soak surfaces it via the absence of [sched]
+        # transitions; do not silently self-heal.
+        print(f"[cutfade] scheduler_tick: unknown state "
+              f"{state!r} -- no-op (invariant violated)",
               file=sys.stderr)
-        advance_scheduled[incoming_idx] = True
-        GLib.idle_add(prime_next)
+    return True
 
 
 # --- Instrument + watchdog ---------------------------------------------
@@ -1029,24 +1087,30 @@ _t_start = time.monotonic()
 
 
 def fps_tick():
+    """1Hz observability tick. Diagnostic only -- the scheduler
+    state machine drives all advance decisions. The legacy
+    screen=0 watchdog and FROZEN-dec-pts watchdog are DELETED
+    per QA spec section (4): under repeat-after-eos a frozen
+    composite can drive screen>0 falsely, so neither signal is
+    informative anymore. State machine progress + the
+    FROZEN_TIMEOUT_S backstop inside should_start_priming
+    replace both."""
     uptime = int(time.monotonic() - _t_start)
     cur = current_slot_idx[0]
     cur_label = slots[cur]["label"] or "-"
     off = 1 - cur
     off_label = slots[off]["label"] or "-"
-    fade_str = "in_flight" if fade_state["in_flight"] else "idle"
     cur_dec_pts_ns = slots[cur].get("last_dec_pts_ns") or 0
     cur_dec_pts_ms = cur_dec_pts_ns // 1_000_000
-    sched_str = "y" if advance_scheduled[cur] else "n"
     line = (
         f"[fps] t={uptime} "
         f"screen={screen_state['frames']} "
         f"max_gap_ms={int(screen_state['max_gap_ms'])} "
         f"cur={cur_label}(slot{cur}) "
         f"off={off_label}(slot{off}) "
-        f"fade={fade_str} "
+        f"state={sched['state']} "
         f"dec_pts_ms={cur_dec_pts_ms} "
-        f"sched={sched_str} "
+        f"cur_dur_s={sched['current_clip_dur_s']:.2f} "
         f"gap_warns_total={screen_state['boundary_warns_total']}"
     )
     print(line, file=sys.stderr, flush=True)
@@ -1055,54 +1119,6 @@ def fps_tick():
             log_file.write(line + "\n")
         except OSError:
             pass
-    # Watchdog: 0 frames for 2 consecutive ticks -> force prime.
-    # Legacy screen=0 path. Still useful for catching pipeline
-    # death that bypasses both the pts trigger and the EOS
-    # backup trigger.
-    if screen_state["frames"] == 0:
-        watchdog_state["zero_frame_seconds"] += 1
-        if watchdog_state["zero_frame_seconds"] >= WATCHDOG_STALL_S:
-            print("[cutfade] WATCHDOG: 0 frames for 2s -- "
-                  "force prime + re-PLAY", file=sys.stderr)
-            watchdog_state["zero_frame_seconds"] = 0
-            advance_scheduled[cur] = True
-            GLib.idle_add(prime_next)
-            GLib.idle_add(
-                lambda: pipeline.set_state(Gst.State.PLAYING) or False
-            )
-    else:
-        watchdog_state["zero_frame_seconds"] = 0
-
-    # Per QA d489fd8 ask #3: FROZEN watchdog. repeat-after-eos
-    # can freeze a composite at 24fps so screen=24 no longer
-    # proves motion. If the current slot's decoder PTS has not
-    # advanced since the last tick AND no fade is in flight AND
-    # no advance is already scheduled for this slot, count it
-    # as a frozen second. After FROZEN_STALL_S consecutive
-    # seconds, force-advance via prime_next. Cleared on natural
-    # progress, on slot swap (finish_fade), or when the
-    # zero-frame branch above force-advances.
-    if (cur_dec_pts_ns > 0
-            and not fade_state["in_flight"]
-            and not advance_scheduled[cur]):
-        if cur_dec_pts_ns == watchdog_state["last_dec_pts_ns"]:
-            watchdog_state["frozen_seconds"] += 1
-            if (watchdog_state["frozen_seconds"]
-                    >= FROZEN_STALL_S):
-                print(f"[cutfade] FROZEN WATCHDOG: dec_pts on "
-                      f"slot {cur} unchanged for "
-                      f"{FROZEN_STALL_S}s (pts_ms="
-                      f"{cur_dec_pts_ms}) -- force advance",
-                      file=sys.stderr)
-                watchdog_state["frozen_seconds"] = 0
-                advance_scheduled[cur] = True
-                GLib.idle_add(prime_next)
-        else:
-            watchdog_state["frozen_seconds"] = 0
-    else:
-        watchdog_state["frozen_seconds"] = 0
-    watchdog_state["last_dec_pts_ns"] = cur_dec_pts_ns
-
     screen_state["frames"] = 0
     screen_state["max_gap_ms"] = 0.0
     return True
@@ -1145,7 +1161,12 @@ signal.signal(signal.SIGTERM, shutdown)
 
 print("==RUN-START== cutfade", file=sys.stderr)
 print(f"[cutfade] PRIME_LEAD_S={PRIME_LEAD_S} FADE_S={FADE_S} "
-      f"GATE_DEADLINE_MS={GATE_DEADLINE_MS} sink={SINK_CHOICE}",
+      f"MIN_DWELL_S={MIN_DWELL_S} "
+      f"PRIME_LEAD_FRACTION={PRIME_LEAD_FRACTION} "
+      f"PRIMING_DEADLINE_S={PRIMING_DEADLINE_S} "
+      f"FROZEN_TIMEOUT_S={FROZEN_TIMEOUT_S} "
+      f"SCHEDULER_TICK_MS={SCHEDULER_TICK_MS} "
+      f"sink={SINK_CHOICE}",
       file=sys.stderr)
 
 # Build the initial slot (slot 0, VIDEOS[0]) before going PLAYING.
@@ -1182,9 +1203,20 @@ if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
     die("set_state PLAYING failed")
 
 attach_screen_probe()
-# Attach the first prime trigger on the initial slot. May reschedule
-# itself if the demuxer's video src pad isn't ready yet.
-attach_prime_trigger(0)
+
+# Per QA scheduler spec section "Implementation notes for code2":
+# stamp became_current_ns RIGHT after PLAYING + populate sched
+# state BEFORE arming scheduler_tick. current_slot_idx[0] is
+# already 0 (from the slot 0 build above) so _query_current_pts_ns
+# has a valid decoder once the scheduler starts ticking.
+sched["state"] = "PLAYING_CURRENT"
+sched["became_current_ns"] = GLib.get_monotonic_time() * 1000
+sched["current_clip_dur_s"] = _query_clip_dur_s(0)
+print(f"[cutfade] [sched] initial state PLAYING_CURRENT slot=0 "
+      f"dur={sched['current_clip_dur_s']:.2f}s",
+      file=sys.stderr)
+
+GLib.timeout_add(SCHEDULER_TICK_MS, scheduler_tick)
 GLib.timeout_add(1000, fps_tick)
 
 try:
