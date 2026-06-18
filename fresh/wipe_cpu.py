@@ -807,11 +807,31 @@ def on_bin_eos(bin_):
     which checks ALL THREE conditions (eos, post-wipe-frame, phase).
     Calling _schedule_teardown directly from here would defeat S1
     (the post-wipe-frame condition) when EOS lands post-wipe-timer
-    but before the next composited frame is actually painted."""
+    but before the next composited frame is actually painted.
+
+    GAP-KILLER at the EOS boundary: if no `next` was preloaded (the
+    preload_trigger never fired for this main, OR fired too late),
+    spawn the opposite-slot bin SYNCHRONOUSLY here so the scheduler
+    never lands in slot_state["main"] = None / next = None / dead.
+    Per QA soak diagnosis (ace7b20): without this, a single missed
+    preload kills the entire system forever. With it, the first
+    cycle may have a visible cut (no wipe, just a hard switch via
+    the synchronous spawn), but the scheduler cannot wedge -- on
+    the next clip the normal preload_trigger has another chance to
+    fire and restore smooth crossfades."""
     print(f"[sched] EOS handler: {bin_.label}")
     if bin_ is slot_state.get("main"):
         slot_state["outgoing"] = bin_
-        slot_state["main"] = slot_state["next"]
+        new_main = slot_state["next"]
+        if new_main is None:
+            other = opposite_slot(bin_.slot)
+            print(f"[sched] EOS-GAP-KILLER no preloaded next -- "
+                  f"spawn {other} synchronously to keep slot alive",
+                  file=sys.stderr)
+            new_main = ClipBin(other).build()
+            new_main.preroll()
+            new_main.play()
+        slot_state["main"] = new_main
         slot_state["next"] = None
     elif bin_ is slot_state.get("outgoing"):
         pass  # already moved aside via prior path
