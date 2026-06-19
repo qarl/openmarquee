@@ -347,10 +347,19 @@ mod linux {
             raw_id: u32,
         ) -> Result<()> {
             unsafe {
+                // Drain stale GL errors so per-op checks below
+                // see only NEW errors caused by this draw's ops.
+                drain_gl_errors(&self.gl);
+
                 self.gl.use_program(Some(self.prog_2d));
+                check_gl_err(&self.gl, "2d.use_program(prog_2d)")?;
+
                 self.gl.active_texture(glow::TEXTURE0);
+                check_gl_err(&self.gl, "2d.active_texture(TEXTURE0)")?;
+
                 if let Some(t) = owned {
                     self.gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                    check_gl_err(&self.gl, "2d.bind_texture(TEXTURE_2D, owned)")?;
                 } else {
                     // Bind by raw id: glow::NativeTexture wraps
                     // NonZeroU32; build one to satisfy the API.
@@ -358,10 +367,21 @@ mod linux {
                         .ok_or_else(|| anyhow!("video tex_id is 0"))?;
                     self.gl
                         .bind_texture(glow::TEXTURE_2D, Some(glow::NativeTexture(nz)));
+                    check_gl_err(
+                        &self.gl,
+                        &format!("2d.bind_texture(TEXTURE_2D, raw={raw_id})"),
+                    )?;
                 }
+
                 self.gl.uniform_1_i32(Some(&self.u_tex_loc_2d), 0);
+                check_gl_err(&self.gl, "2d.uniform_1_i32(u_tex_2d)")?;
+
                 self.bind_quad_attribs(self.a_pos_loc_2d, self.a_uv_loc_2d)?;
+                check_gl_err(&self.gl, "2d.bind_quad_attribs")?;
+
                 self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                check_gl_err(&self.gl, "2d.draw_arrays")?;
+
                 self.gl.disable_vertex_attrib_array(self.a_pos_loc_2d);
                 self.gl.disable_vertex_attrib_array(self.a_uv_loc_2d);
                 Ok(())
@@ -370,14 +390,21 @@ mod linux {
 
         unsafe fn draw_quad_external(&self, tex_id: u32) -> Result<()> {
             unsafe {
+                drain_gl_errors(&self.gl);
+
                 let prog = self.prog_ext.ok_or_else(|| {
                     anyhow!("external-OES program not compiled yet")
                 })?;
                 let u_loc = self.u_tex_loc_ext.as_ref().ok_or_else(|| {
                     anyhow!("external-OES u_tex uniform missing")
                 })?;
+
                 self.gl.use_program(Some(prog));
+                check_gl_err(&self.gl, "ext.use_program(prog_ext)")?;
+
                 self.gl.active_texture(glow::TEXTURE0);
+                check_gl_err(&self.gl, "ext.active_texture(TEXTURE0)")?;
+
                 // glow doesn't expose GL_TEXTURE_EXTERNAL_OES; use
                 // the literal lifted from the OLD renderer's
                 // hdmi.rs.
@@ -388,9 +415,20 @@ mod linux {
                     GL_TEXTURE_EXTERNAL_OES,
                     Some(glow::NativeTexture(nz)),
                 );
+                check_gl_err(
+                    &self.gl,
+                    &format!("ext.bind_texture(EXTERNAL_OES, raw={tex_id})"),
+                )?;
+
                 self.gl.uniform_1_i32(Some(u_loc), 0);
+                check_gl_err(&self.gl, "ext.uniform_1_i32(u_tex_ext)")?;
+
                 self.bind_quad_attribs(self.a_pos_loc_ext, self.a_uv_loc_ext)?;
+                check_gl_err(&self.gl, "ext.bind_quad_attribs")?;
+
                 self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                check_gl_err(&self.gl, "ext.draw_arrays")?;
+
                 self.gl.disable_vertex_attrib_array(self.a_pos_loc_ext);
                 self.gl.disable_vertex_attrib_array(self.a_uv_loc_ext);
                 Ok(())
@@ -420,6 +458,7 @@ mod linux {
                 Ok(())
             }
         }
+
     }
 
     impl Presenter {
@@ -504,6 +543,34 @@ mod linux {
                 }
             }
         }
+    }
+
+    /// Drain any pre-existing GL error flags so subsequent
+    /// per-op `check_gl_err` calls report only NEW errors.
+    ///
+    /// SAFETY: GL context must be current on the caller's thread.
+    unsafe fn drain_gl_errors(gl: &glow::Context) {
+        // GLES2 spec: get_error returns + clears one flag per
+        // call until NO_ERROR.
+        // SAFETY: caller assertion above.
+        unsafe {
+            while gl.get_error() != glow::NO_ERROR {}
+        }
+    }
+
+    /// Check the GL error queue and return an anyhow Err naming
+    /// `op` if non-NO_ERROR. Use AFTER each GL call in
+    /// instrumented paths so the next run pinpoints which op
+    /// throws (e.g. 0x502 = GL_INVALID_OPERATION).
+    ///
+    /// SAFETY: GL context must be current on the caller's thread.
+    unsafe fn check_gl_err(gl: &glow::Context, op: &str) -> Result<()> {
+        // SAFETY: caller assertion above.
+        let err = unsafe { gl.get_error() };
+        if err != glow::NO_ERROR {
+            return Err(anyhow!("GL error {err:#x} after {op}"));
+        }
+        Ok(())
     }
 
     unsafe fn compile(
