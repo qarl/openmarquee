@@ -55,8 +55,33 @@ mod linux {
     }
 
     pub struct Gbm {
-        pub dev: gbm::Device<CardFd>,
+        // ===== FIELD ORDER IS LOAD-BEARING — DO NOT REORDER ====
+        //
+        // Rust drops struct fields in DECLARATION order:
+        // `surface` must drop BEFORE `dev`. gbm_device_destroy
+        // unloads the gbm backend module (the DRI driver .so);
+        // if `dev` drops first, the surface's front-buffer
+        // gbm_bo destructor runs AFTER unload and calls into
+        // unmapped code -> SEGV at process exit. This was a
+        // LATENT BUG since Phase 0 (caught Phase 2 by QA's
+        // ExecMainStatus check; --capture writes the PPM +
+        // run_loop EXITs Ok BOTH happen BEFORE this teardown
+        // SEGV, so it was invisible to pixel-only verification).
+        //
+        // The gbm::Surface holds its own Ptr to the bo pool but
+        // does NOT keep gbm::Device alive (separate Arc graph),
+        // so declaration order is the only thing pinning the
+        // unload-then-bo-destroy hazard.
+        //
+        // If you ever add a third gbm field, put it BEFORE
+        // `dev` so dev is always the LAST field to drop.
+        //
+        // Verified on glass 2026-06-19 by QA via gdb backtrace
+        // (PtrDrop<gbm_bo>::drop calling into unmapped addr in
+        // an unloaded module).
+        // =======================================================
         pub surface: gbm::Surface<()>,
+        pub dev: gbm::Device<CardFd>,
     }
 
     impl Gbm {
@@ -77,7 +102,13 @@ mod linux {
             log::info!(
                 "[gbm] surface {w}x{h} ARGB8888 SCANOUT|RENDERING"
             );
-            Ok(Gbm { dev, surface })
+            // Field construction order MATCHES declaration order
+            // (surface, dev) -- keeps the load-bearing comment
+            // above honest. Named-struct construction is
+            // order-insensitive but mirroring the declaration
+            // makes the load-bearing intent visible at the
+            // construction site too.
+            Ok(Gbm { surface, dev })
         }
     }
 
