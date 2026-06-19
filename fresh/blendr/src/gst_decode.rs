@@ -241,8 +241,12 @@ mod linux {
             // this writing).
             appsink.set_property("emit-signals", false);
 
-            // (d) Install SYNC bus handler for NEED_CONTEXT.
-            // MUST run before set_state(PAUSED).
+            // (d) Install SYNC bus handler for NEED_CONTEXT + log
+            // STATE_CHANGED / ERROR / WARNING / EOS so we see
+            // what's actually happening on the pipeline bus.
+            // (No GLib main loop running, so the async bus would
+            // otherwise be silent.) MUST run before
+            // set_state(PAUSED).
             let bus = pipeline
                 .bus()
                 .ok_or_else(|| anyhow!("pipeline has no bus"))?;
@@ -250,46 +254,116 @@ mod linux {
             let context_for_bus = gst_context.clone();
             bus.set_sync_handler(move |_bus, msg| {
                 use gst::MessageView;
-                if let MessageView::NeedContext(nc) = msg.view() {
-                    let ctx_type = nc.context_type();
-                    // gst::Context is a MiniObject (refcounted). To
-                    // mutate the structure we must obtain a mutable
-                    // ref via make_mut() — it clones on write if
-                    // the context is shared. Freshly created here,
-                    // so the clone path is never taken.
-                    if ctx_type == "gst.gl.GLDisplay" {
-                        let mut c = gst::Context::new(ctx_type, true);
-                        c.make_mut()
-                            .structure_mut()
-                            .set("gst.gl.GLDisplay", &display_for_bus);
-                        if let Some(el) =
-                            msg.src().and_then(|s| s.downcast_ref::<gst::Element>())
-                        {
-                            el.set_context(&c);
+                let src_name = msg
+                    .src()
+                    .map(|s| s.name().to_string())
+                    .unwrap_or_else(|| "?".into());
+                match msg.view() {
+                    MessageView::NeedContext(nc) => {
+                        let ctx_type = nc.context_type();
+                        log::info!(
+                            "[gst-bus] NEED_CONTEXT type={ctx_type} src={src_name}"
+                        );
+                        // gst::Context is a MiniObject (refcounted).
+                        // make_mut clones on write if shared.
+                        if ctx_type == "gst.gl.GLDisplay" {
+                            let mut c = gst::Context::new(ctx_type, true);
+                            c.make_mut()
+                                .structure_mut()
+                                .set("gst.gl.GLDisplay", &display_for_bus);
+                            if let Some(el) = msg
+                                .src()
+                                .and_then(|s| s.downcast_ref::<gst::Element>())
+                            {
+                                el.set_context(&c);
+                            }
+                        } else if ctx_type == "gst.gl.app_context" {
+                            let mut c = gst::Context::new(ctx_type, true);
+                            c.make_mut()
+                                .structure_mut()
+                                .set("context", &context_for_bus);
+                            if let Some(el) = msg
+                                .src()
+                                .and_then(|s| s.downcast_ref::<gst::Element>())
+                            {
+                                el.set_context(&c);
+                            }
                         }
-                    } else if ctx_type == "gst.gl.app_context" {
-                        let mut c = gst::Context::new(ctx_type, true);
-                        c.make_mut()
-                            .structure_mut()
-                            .set("context", &context_for_bus);
-                        if let Some(el) =
-                            msg.src().and_then(|s| s.downcast_ref::<gst::Element>())
-                        {
-                            el.set_context(&c);
+                        return gst::BusSyncReply::Drop;
+                    }
+                    MessageView::StateChanged(sc) => {
+                        // Filter for top-of-pipeline transitions
+                        // (src == "pipeline0" by default) +
+                        // anything reaching PLAYING -- otherwise
+                        // every per-element transition floods.
+                        let reaching_playing =
+                            sc.current() == gst::State::Playing;
+                        let from_pipeline = src_name == "pipeline0";
+                        if reaching_playing || from_pipeline {
+                            log::info!(
+                                "[gst-bus] STATE src={src_name} {:?}->{:?} pending={:?}",
+                                sc.old(),
+                                sc.current(),
+                                sc.pending(),
+                            );
                         }
                     }
-                    return gst::BusSyncReply::Drop;
+                    MessageView::Error(e) => {
+                        log::error!(
+                            "[gst-bus] ERROR src={src_name} {} ({:?})",
+                            e.error(),
+                            e.debug(),
+                        );
+                    }
+                    MessageView::Warning(w) => {
+                        log::warn!(
+                            "[gst-bus] WARN src={src_name} {} ({:?})",
+                            w.error(),
+                            w.debug(),
+                        );
+                    }
+                    MessageView::Eos(_) => {
+                        log::info!("[gst-bus] EOS src={src_name}");
+                    }
+                    MessageView::AsyncDone(_) => {
+                        log::info!("[gst-bus] ASYNC_DONE src={src_name}");
+                    }
+                    _ => {}
                 }
                 gst::BusSyncReply::Pass
             });
 
-            // (e) State -> PAUSED. If FAILURE, retry with RGBA
-            //     sampler2D fallback caps.
+            // (e) State -> PAUSED. set_state may return ASYNC;
+            //     we MUST wait via pipeline.state(timeout) to
+            //     confirm PAUSED actually settled. Fallback path
+            //     same: try external-oes; on failure retry with
+            //     RGBA sampler2D.
             let mut tex_target = TexTarget::External;
-            let preroll =
+            log::info!("[gst] set_state(PAUSED) external-oes try");
+            let preroll_attempt =
                 pipeline.set_state(gst::State::Paused).map_err(|e| anyhow!("{e:?}"));
-            let preroll = match preroll {
-                Ok(_) => Ok(()),
+            let preroll_ok = match preroll_attempt {
+                Ok(ret) => {
+                    log::info!("[gst] set_state(PAUSED) returned {ret:?}; waiting...");
+                    let (wait_res, cur, pending) =
+                        pipeline.state(gst::ClockTime::from_seconds(5));
+                    log::info!(
+                        "[gst] state-wait after PAUSED: {wait_res:?} \
+                         cur={cur:?} pending={pending:?}"
+                    );
+                    if cur == gst::State::Paused {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "preroll did not settle to PAUSED \
+                             (cur={cur:?}, pending={pending:?})"
+                        ))
+                    }
+                }
+                Err(e) => Err(e),
+            };
+            let preroll_ok = match preroll_ok {
+                Ok(()) => Ok(()),
                 Err(e) => {
                     log::warn!(
                         "[gst] external-oes preroll failed ({e}); \
@@ -302,21 +376,60 @@ mod linux {
                         .build();
                     appsink.set_caps(Some(&caps_2d));
                     tex_target = TexTarget::TwoD;
-                    pipeline
+                    log::info!("[gst] set_state(PAUSED) sampler2D fallback");
+                    let ret = pipeline
                         .set_state(gst::State::Paused)
-                        .map_err(|e| anyhow!("preroll fallback also failed: {e:?}"))
-                        .map(|_| ())
+                        .map_err(|e| anyhow!("preroll fallback set_state: {e:?}"))?;
+                    log::info!(
+                        "[gst] set_state(PAUSED) returned {ret:?}; waiting..."
+                    );
+                    let (wait_res, cur, pending) =
+                        pipeline.state(gst::ClockTime::from_seconds(5));
+                    log::info!(
+                        "[gst] state-wait after PAUSED (2d): {wait_res:?} \
+                         cur={cur:?} pending={pending:?}"
+                    );
+                    if cur == gst::State::Paused {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "sampler2D preroll did not settle to PAUSED \
+                             (cur={cur:?}, pending={pending:?})"
+                        ))
+                    }
                 }
             };
-            preroll?;
+            preroll_ok?;
             log::info!(
-                "[gst] preroll OK; negotiated tex_target={tex_target:?}"
+                "[gst] preroll PAUSED confirmed; negotiated tex_target={tex_target:?}"
             );
 
-            // Pump to PLAYING.
-            pipeline
+            // Pump to PLAYING. set_state may return ASYNC; wait
+            // via pipeline.state(timeout) and confirm we actually
+            // reached PLAYING. Without this, streaming buffers
+            // never flow and appsink.pull_sample times out
+            // forever (QA Phase 1 keystone glass: 133/133
+            // 5s-timeouts; this is the missing-PLAYING-confirm
+            // bug).
+            log::info!("[gst] set_state(PLAYING) starting");
+            let play_ret = pipeline
                 .set_state(gst::State::Playing)
                 .map_err(|e| anyhow!("set_state PLAYING: {e:?}"))?;
+            log::info!("[gst] set_state(PLAYING) returned {play_ret:?}; waiting...");
+            let (wait_res, cur, pending) =
+                pipeline.state(gst::ClockTime::from_seconds(10));
+            log::info!(
+                "[gst] state-wait after PLAYING: {wait_res:?} \
+                 cur={cur:?} pending={pending:?}"
+            );
+            if cur != gst::State::Playing {
+                return Err(anyhow!(
+                    "pipeline did NOT reach PLAYING within 10s \
+                     (cur={cur:?} pending={pending:?}); buffers will \
+                     never flow"
+                ));
+            }
+            log::info!("[gst] PLAYING confirmed; pipeline streaming");
 
             Ok(GstDecoder {
                 pipeline,
