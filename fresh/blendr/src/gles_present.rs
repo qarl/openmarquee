@@ -313,7 +313,13 @@ mod linux {
                 }
                 let err = self.gl.get_error();
                 if err != glow::NO_ERROR {
-                    return Err(anyhow!("glGetError={err:#x}"));
+                    return Err(anyhow!(
+                        "glGetError={err:#x} step={:?} video_tex_id={:?} \
+                         video_target={:?}",
+                        self.step,
+                        self.video_tex_id,
+                        self.video_target
+                    ));
                 }
             }
             Ok(())

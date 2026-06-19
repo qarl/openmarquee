@@ -228,17 +228,27 @@ mod linux {
         let start = Instant::now();
         let max_dur = Duration::from_secs(duration_sec);
         let mut last_log = Instant::now();
+        // Log the FIRST video tex bound to the presenter so we can
+        // distinguish "gst delivered" (gst_decode logs that
+        // separately) from "blendr accepted + bound" (this log).
+        let mut first_video_tex_logged = false;
+        // Track which exit cause fires so the post-loop summary
+        // log can name it explicitly (otherwise we have to infer
+        // from the absence of a duration / signal log).
+        let mut exit_cause: &'static str = "loop body returned";
 
         let result: Result<()> = (|| {
             loop {
                 if exit_flag.load(Ordering::Relaxed) {
                     log::info!("[kms] exit flag set; breaking loop");
+                    exit_cause = "exit flag";
                     break;
                 }
                 if start.elapsed() >= max_dur {
                     log::info!(
                         "[kms] duration {duration_sec}s reached; breaking loop"
                     );
+                    exit_cause = "duration reached";
                     break;
                 }
 
@@ -252,10 +262,19 @@ mod linux {
                     // Re-claim EGL on this thread; gst-gl's
                     // streaming thread may have made-current the
                     // shared handle for upload/conversion.
-                    egl.make_current()?;
+                    egl.make_current()
+                        .context("egl.make_current pre-gst-pull")?;
                     match g.try_pull_texture() {
                         Ok(Some(tex_id)) => {
                             presenter.set_video_texture(tex_id, g.tex_target);
+                            if !first_video_tex_logged {
+                                log::info!(
+                                    "[kms] FIRST video tex bound to presenter: \
+                                     tex_id={tex_id} target={:?} frame={frame_idx}",
+                                    g.tex_target,
+                                );
+                                first_video_tex_logged = true;
+                            }
                         }
                         Ok(None) => {
                             // Pull miss; reuse previous tex.
@@ -266,9 +285,19 @@ mod linux {
                             );
                         }
                     }
+                    // GLVideoFrame::from_buffer_readable may have
+                    // made-current gst-gl's child context inside
+                    // try_pull_texture (gst-gl makes-current to
+                    // map the GLMemory). Re-claim blendr's
+                    // context before the draw so glow ops hit
+                    // OUR context, not gst-gl's child.
+                    egl.make_current()
+                        .context("egl.make_current post-gst-pull")?;
                 }
 
-                presenter.draw_frame(frame_idx)?;
+                presenter
+                    .draw_frame(frame_idx)
+                    .with_context(|| format!("draw_frame {frame_idx}"))?;
 
                 // One-shot capture BEFORE swap_buffers so we read
                 // the just-drawn back buffer. Capture is
@@ -286,24 +315,26 @@ mod linux {
                     }
                 }
 
-                egl.swap_buffers()?;
+                egl.swap_buffers()
+                    .with_context(|| format!("swap_buffers {frame_idx}"))?;
 
                 // Pull the freshly-rendered BO off the GBM surface.
                 // SAFETY: surface is current; lock_front_buffer must
                 // be paired with release_buffer.
                 let new_bo: BufferObject<()> = unsafe {
                     gbm.surface.lock_front_buffer()
-                        .map_err(|e| anyhow!("gbm lock_front_buffer: {e:?}"))?
+                        .map_err(|e| anyhow!("gbm lock_front_buffer {frame_idx}: {e:?}"))?
                 };
                 let fb_buf = GbmBufferAdapter::new(&new_bo)
-                    .context("GbmBufferAdapter::new")?;
+                    .with_context(|| format!("GbmBufferAdapter::new {frame_idx}"))?;
                 let new_fb = card
                     .add_framebuffer(&fb_buf, 32, 32)
-                    .context("add_framebuffer")?;
+                    .with_context(|| format!("add_framebuffer {frame_idx}"))?;
 
                 // Drain any in-flight flip BEFORE issuing the next.
                 if flip_pending {
-                    drain_one_flip(card, Duration::from_millis(500))?;
+                    drain_one_flip(card, Duration::from_millis(500))
+                        .with_context(|| format!("drain_one_flip {frame_idx}"))?;
                     flip_pending = false;
                     if let Some(fb) = prev_fb.take() {
                         let _ = card.destroy_framebuffer(fb);
@@ -319,7 +350,7 @@ mod linux {
                         &[pick.connector],
                         Some(pick.mode),
                     )
-                    .context("set_crtc(initial modeset)")?;
+                    .with_context(|| format!("set_crtc initial modeset {frame_idx}"))?;
                     modeset_done = true;
                     log::info!(
                         "[kms] initial modeset done crtc={:?} fb={:?}",
@@ -333,7 +364,7 @@ mod linux {
                         PageFlipFlags::EVENT,
                         None,
                     )
-                    .context("page_flip")?;
+                    .with_context(|| format!("page_flip {frame_idx}"))?;
                     flip_pending = true;
                 }
 
@@ -355,6 +386,23 @@ mod linux {
             }
             Ok(())
         })();
+
+        // Log the exit cause + result BEFORE the cleanup so QA
+        // sees it even if a downstream Drop in main panics
+        // somehow. Per QA Phase 1 ccb27ea: blendr exited at
+        // ~frame 5 silently; this log makes that impossible.
+        match &result {
+            Ok(()) => log::info!(
+                "[kms] run_loop EXIT Ok at frame={frame_idx} \
+                 elapsed={:.2}s cause={exit_cause}",
+                start.elapsed().as_secs_f32()
+            ),
+            Err(e) => log::error!(
+                "[kms] run_loop EXIT ERR at frame={frame_idx} \
+                 elapsed={:.2}s cause={exit_cause}: {e:#}",
+                start.elapsed().as_secs_f32()
+            ),
+        }
 
         // Drain trailing flip so the kernel is not racing scan-out
         // with our front_bo when restore() retargets.
