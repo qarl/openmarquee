@@ -12,6 +12,21 @@ pub use linux::*;
 #[cfg(not(target_os = "linux"))]
 pub use stub::*;
 
+/// Phase 1 + Phase 2 stream dispatch. Owned by main; passed
+/// as &mut into run_loop.
+pub enum Streams {
+    /// Step::Solid / Step::Checker: no gst decoders.
+    None,
+    /// Step::Video: one decoder.
+    Single(crate::gst_decode::GstDecoder),
+    /// Step::Blend: two decoders + static alpha.
+    Blend {
+        a: crate::gst_decode::GstDecoder,
+        b: crate::gst_decode::GstDecoder,
+        alpha: f32,
+    },
+}
+
 #[cfg(not(target_os = "linux"))]
 mod stub {
     use super::*;
@@ -29,7 +44,7 @@ mod stub {
         _: &mut crate::egl_gbm::Gbm,
         _: &mut crate::egl_gbm::Egl,
         _: &mut crate::gles_present::Presenter,
-        _: Option<&mut crate::gst_decode::GstDecoder>,
+        _: &mut super::Streams,
         _: u64,
         _: Option<&std::path::Path>,
         _: u64,
@@ -205,7 +220,7 @@ mod linux {
         gbm: &mut Gbm,
         egl: &mut Egl,
         presenter: &mut Presenter,
-        mut gst: Option<&mut crate::gst_decode::GstDecoder>,
+        streams: &mut super::Streams,
         duration_sec: u64,
         capture_path: Option<&std::path::Path>,
         capture_after_frame: u64,
@@ -252,47 +267,77 @@ mod linux {
                     break;
                 }
 
-                // Phase 1: if a GstDecoder is wired in, pull the
-                // latest video texture and hand it to the
-                // presenter BEFORE the draw. First pull blocks
-                // generously; subsequent pulls are best-effort
-                // (None => reuse previous texture, render-loop
-                // catches up).
-                if let Some(g) = gst.as_mut() {
-                    // Re-claim EGL on this thread; gst-gl's
-                    // streaming thread may have made-current the
-                    // shared handle for upload/conversion.
-                    egl.make_current()
-                        .context("egl.make_current pre-gst-pull")?;
-                    match g.try_pull_texture() {
-                        Ok(Some(tex_id)) => {
-                            presenter.set_video_texture(tex_id, g.tex_target);
+                // Phase 1 / Phase 2: pull latest texture(s)
+                // from each stream BEFORE the draw. The pull
+                // thread keeps the slot warm; latest_texture is
+                // non-blocking on decode/import. GLVideoFrame
+                // map happens on THIS thread (blendr's EGL
+                // current). Re-claim make_current both BEFORE
+                // pull (gst-gl's streaming may have stolen for
+                // upload) AND AFTER each map (the map itself
+                // can poke eglMakeCurrent under gst-gl).
+                match streams {
+                    super::Streams::None => {}
+                    super::Streams::Single(g) => {
+                        egl.make_current()
+                            .context("egl.make_current pre-gst-pull(single)")?;
+                        match g.latest_texture() {
+                            Ok(Some((tex_id, tgt))) => {
+                                presenter.set_video_texture(tex_id, tgt);
+                                if !first_video_tex_logged {
+                                    log::info!(
+                                        "[kms] FIRST video tex bound: \
+                                         tex_id={tex_id} target={tgt:?} frame={frame_idx}",
+                                    );
+                                    first_video_tex_logged = true;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => log::warn!(
+                                "[kms] gst pull err at frame {frame_idx}: {e:#}"
+                            ),
+                        }
+                        egl.make_current()
+                            .context("egl.make_current post-gst-pull(single)")?;
+                    }
+                    super::Streams::Blend { a, b, alpha } => {
+                        egl.make_current()
+                            .context("egl.make_current pre-gst-pull(blend-a)")?;
+                        let a_pair = match a.latest_texture() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::warn!(
+                                    "[kms] gst A pull err at frame {frame_idx}: {e:#}"
+                                );
+                                None
+                            }
+                        };
+                        egl.make_current()
+                            .context("egl.make_current post-gst-pull(blend-a)")?;
+                        let b_pair = match b.latest_texture() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::warn!(
+                                    "[kms] gst B pull err at frame {frame_idx}: {e:#}"
+                                );
+                                None
+                            }
+                        };
+                        egl.make_current()
+                            .context("egl.make_current post-gst-pull(blend-b)")?;
+                        if let (Some(a_t), Some(b_t)) = (a_pair, b_pair) {
+                            presenter.set_video_textures(a_t, b_t, *alpha);
                             if !first_video_tex_logged {
                                 log::info!(
-                                    "[kms] FIRST video tex bound to presenter: \
-                                     tex_id={tex_id} target={:?} frame={frame_idx}",
-                                    g.tex_target,
+                                    "[kms] FIRST blend tex pair bound: \
+                                     A=(tex={} target={:?}) B=(tex={} target={:?}) \
+                                     alpha={alpha} frame={frame_idx}",
+                                    a_t.0, a_t.1, b_t.0, b_t.1,
                                 );
                                 first_video_tex_logged = true;
                             }
                         }
-                        Ok(None) => {
-                            // Pull miss; reuse previous tex.
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "[kms] gst pull err at frame {frame_idx}: {e:#}"
-                            );
-                        }
                     }
-                    // GLVideoFrame::from_buffer_readable may have
-                    // made-current gst-gl's child context inside
-                    // try_pull_texture (gst-gl makes-current to
-                    // map the GLMemory). Re-claim blendr's
-                    // context before the draw so glow ops hit
-                    // OUR context, not gst-gl's child.
-                    egl.make_current()
-                        .context("egl.make_current post-gst-pull")?;
                 }
 
                 presenter

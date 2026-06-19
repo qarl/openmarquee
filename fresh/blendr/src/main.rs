@@ -34,6 +34,9 @@ struct Args {
     ///             (Phase 0; proves the GLES2 path is up too).
     ///   video   = Phase 1 KEYSTONE: one GStreamer pipeline decodes
     ///             --clip and hands frames to blendr as GL textures.
+    ///   blend   = Phase 2: TWO pipelines (--clip-a + --clip-b),
+    ///             mix(texA, texB, u_alpha) shader; --alpha controls
+    ///             the static blend (default 0.5 = 50/50 ghosted).
     #[arg(long, value_enum, default_value_t = Step::Checker)]
     step: Step,
 
@@ -42,6 +45,20 @@ struct Args {
     /// /var/openmarquee/content/<uuid>/asset.mp4.
     #[arg(long)]
     clip: Option<PathBuf>,
+
+    /// Required when --step blend. First clip (stream A).
+    #[arg(long)]
+    clip_a: Option<PathBuf>,
+
+    /// Required when --step blend. Second clip (stream B).
+    #[arg(long)]
+    clip_b: Option<PathBuf>,
+
+    /// Phase 2 blend alpha: 0.0 = pure A, 1.0 = pure B, 0.5 =
+    /// 50/50 dissolve (default). Phase 3 will animate this; for
+    /// now it stays static across the run.
+    #[arg(long, default_value_t = 0.5)]
+    alpha: f32,
 
     /// Bypass /dev/dri/card* auto-probe. Use only for debug.
     #[arg(long)]
@@ -109,19 +126,32 @@ fn run(args: Args) -> Result<()> {
     )
     .context("Presenter::new")?;
 
-    // Phase 1: build GstDecoder iff --step video.
-    let mut gst_dec: Option<gst_decode::GstDecoder> =
-        if matches!(args.step, Step::Video) {
+    // Phase 1 / Phase 2: build GstDecoders per step.
+    let mut streams: kms::Streams = match args.step {
+        Step::Video => {
             let clip = args.clip.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("--step video requires --clip <PATH>")
             })?;
-            Some(
+            kms::Streams::Single(
                 gst_decode::GstDecoder::new(&egl, clip)
-                    .context("GstDecoder::new")?,
+                    .context("GstDecoder::new (video)")?,
             )
-        } else {
-            None
-        };
+        }
+        Step::Blend => {
+            let clip_a = args.clip_a.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--step blend requires --clip-a <PATH>")
+            })?;
+            let clip_b = args.clip_b.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--step blend requires --clip-b <PATH>")
+            })?;
+            let a = gst_decode::GstDecoder::new(&egl, clip_a)
+                .context("GstDecoder::new (blend A)")?;
+            let b = gst_decode::GstDecoder::new(&egl, clip_b)
+                .context("GstDecoder::new (blend B)")?;
+            kms::Streams::Blend { a, b, alpha: args.alpha }
+        }
+        _ => kms::Streams::None,
+    };
 
     let run_result = kms::run_loop(
         &card,
@@ -129,18 +159,22 @@ fn run(args: Args) -> Result<()> {
         &mut gbm,
         &mut egl,
         &mut pres,
-        gst_dec.as_mut(),
+        &mut streams,
         args.duration_sec,
         args.capture.as_deref(),
         args.capture_after_frame,
         &signals::EXIT_REQUESTED,
     );
 
-    // LOAD-BEARING DROP ORDER (gst_dec -> pres -> egl -> gbm
-    // -> restore -> card). gst_dec holds wrapped handles into
-    // blendr's EGL ctx; if egl drops first, gst-gl's
+    // LOAD-BEARING DROP ORDER:
+    //   streams (each GstDecoder) -> presenter -> egl -> gbm
+    //   -> restore -> card.
+    // Each GstDecoder holds wrapped GLContext/GLDisplay refs
+    // into blendr's EGL ctx; if egl drops first, gst-gl's
     // finalize segfaults dereferencing a dead EGLDisplay.
-    drop(gst_dec);
+    // Streams::Drop tears down each pipeline (NULL) + joins
+    // each pull thread before the inner GstDecoders deallocate.
+    drop(streams);
     drop(pres);
     drop(egl);
     drop(gbm);

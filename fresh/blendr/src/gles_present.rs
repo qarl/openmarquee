@@ -13,6 +13,12 @@ pub enum Step {
     /// by gst_decode (one cutloop-style GStreamer pipeline)
     /// onto the fullscreen quad. --clip <PATH> required.
     Video,
+    /// Phase 2: two decode pipelines, two EXTERNAL_OES
+    /// textures, mix(texA, texB, u_alpha) shader. Requires
+    /// --clip-a + --clip-b; --alpha defaults to 0.5 (static
+    /// 50/50 blend); the alpha ramp / crossfade timing comes
+    /// in Phase 3.
+    Blend,
 }
 
 #[cfg(target_os = "linux")]
@@ -41,6 +47,13 @@ mod stub {
             &mut self,
             _tex_id: u32,
             _target: crate::gst_decode::TexTarget,
+        ) {
+        }
+        pub fn set_video_textures(
+            &mut self,
+            _a: (u32, crate::gst_decode::TexTarget),
+            _b: (u32, crate::gst_decode::TexTarget),
+            _alpha: f32,
         ) {
         }
     }
@@ -86,6 +99,26 @@ mod linux {
         }
     "#;
 
+    /// Phase 2 blend shader: samplerExternalOES x 2 + mix.
+    /// Both textures bind to GL_TEXTURE_EXTERNAL_OES via the
+    /// extension; u_alpha selects between them (0.0 = pure A,
+    /// 1.0 = pure B, 0.5 = 50/50 dissolve). For Phase 2
+    /// u_alpha is static; Phase 3 animates it for the
+    /// crossfade timing.
+    const FS_BLEND_EXT_EXT: &str = r#"
+        #extension GL_OES_EGL_image_external : require
+        precision mediump float;
+        varying vec2 v_uv;
+        uniform samplerExternalOES u_tex_a;
+        uniform samplerExternalOES u_tex_b;
+        uniform float u_alpha;
+        void main() {
+            vec4 a = texture2D(u_tex_a, v_uv);
+            vec4 b = texture2D(u_tex_b, v_uv);
+            gl_FragColor = mix(a, b, u_alpha);
+        }
+    "#;
+
     pub struct Presenter {
         gl: glow::Context,
         w: i32,
@@ -98,6 +131,9 @@ mod linux {
         /// so a non-OES driver (where the extension parse fails) does
         /// not break Step::Checker. None until first set.
         prog_ext: Option<glow::Program>,
+        /// Phase 2 blend program (samplerExternalOES x 2). Lazily
+        /// compiled on first Step::Blend frame.
+        prog_blend: Option<glow::Program>,
         vbo: glow::Buffer,
         /// CPU checkerboard for Step::Checker.
         tex_checker: glow::Texture,
@@ -110,10 +146,23 @@ mod linux {
         a_pos_loc_ext: u32,
         a_uv_loc_ext: u32,
         u_tex_loc_ext: Option<glow::UniformLocation>,
+        /// On prog_blend (Some when compiled).
+        a_pos_loc_blend: u32,
+        a_uv_loc_blend: u32,
+        u_tex_a_loc_blend: Option<glow::UniformLocation>,
+        u_tex_b_loc_blend: Option<glow::UniformLocation>,
+        u_alpha_loc_blend: Option<glow::UniformLocation>,
         /// Phase-1 state: the latest video texture id + its target.
         /// Updated by set_video_texture each iteration.
         video_tex_id: Option<u32>,
         video_target: Option<crate::gst_decode::TexTarget>,
+        /// Phase-2 state: the second stream's texture + target +
+        /// the blend alpha. Updated by set_video_textures each
+        /// iteration. video_tex_id / video_target above hold
+        /// stream A.
+        video_tex_id_b: Option<u32>,
+        video_target_b: Option<crate::gst_decode::TexTarget>,
+        blend_alpha: f32,
     }
 
     impl Presenter {
@@ -205,6 +254,7 @@ mod linux {
                     step,
                     prog_2d,
                     prog_ext: None,
+                    prog_blend: None,
                     vbo,
                     tex_checker: tex,
                     a_pos_loc_2d,
@@ -213,8 +263,16 @@ mod linux {
                     a_pos_loc_ext: 0,
                     a_uv_loc_ext: 0,
                     u_tex_loc_ext: None,
+                    a_pos_loc_blend: 0,
+                    a_uv_loc_blend: 0,
+                    u_tex_a_loc_blend: None,
+                    u_tex_b_loc_blend: None,
+                    u_alpha_loc_blend: None,
                     video_tex_id: None,
                     video_target: None,
+                    video_tex_id_b: None,
+                    video_target_b: None,
+                    blend_alpha: 0.5,
                 })
             }
         }
@@ -240,6 +298,72 @@ mod linux {
                     // Caller will see no draw; gl error escalation
                     // happens in draw_frame's draw branch.
                 }
+            }
+        }
+
+        /// Phase 2: update both video textures + blend alpha.
+        /// Lazily compiles prog_blend on first call. Per Phase 2
+        /// plan: only the (External, External) target pair is
+        /// supported; other combos log an error (vc4 always
+        /// returns External, so this is the only path
+        /// exercised on FYS).
+        pub fn set_video_textures(
+            &mut self,
+            a: (u32, crate::gst_decode::TexTarget),
+            b: (u32, crate::gst_decode::TexTarget),
+            alpha: f32,
+        ) {
+            self.video_tex_id = Some(a.0);
+            self.video_target = Some(a.1);
+            self.video_tex_id_b = Some(b.0);
+            self.video_target_b = Some(b.1);
+            self.blend_alpha = alpha;
+            if self.prog_blend.is_none() {
+                if let Err(e) = self.compile_blend_program() {
+                    log::error!(
+                        "[gl] failed to compile blend program: {e:#}"
+                    );
+                }
+            }
+        }
+
+        fn compile_blend_program(&mut self) -> Result<()> {
+            unsafe {
+                let vs = compile(&self.gl, glow::VERTEX_SHADER, VS)?;
+                let fs = compile(
+                    &self.gl,
+                    glow::FRAGMENT_SHADER,
+                    FS_BLEND_EXT_EXT,
+                )?;
+                let prog = link(&self.gl, vs, fs)?;
+                self.gl.delete_shader(vs);
+                self.gl.delete_shader(fs);
+                self.a_pos_loc_blend = self
+                    .gl
+                    .get_attrib_location(prog, "a_pos")
+                    .ok_or_else(|| anyhow!("blend a_pos missing"))?;
+                self.a_uv_loc_blend = self
+                    .gl
+                    .get_attrib_location(prog, "a_uv")
+                    .ok_or_else(|| anyhow!("blend a_uv missing"))?;
+                self.u_tex_a_loc_blend = Some(
+                    self.gl
+                        .get_uniform_location(prog, "u_tex_a")
+                        .ok_or_else(|| anyhow!("blend u_tex_a missing"))?,
+                );
+                self.u_tex_b_loc_blend = Some(
+                    self.gl
+                        .get_uniform_location(prog, "u_tex_b")
+                        .ok_or_else(|| anyhow!("blend u_tex_b missing"))?,
+                );
+                self.u_alpha_loc_blend = Some(
+                    self.gl
+                        .get_uniform_location(prog, "u_alpha")
+                        .ok_or_else(|| anyhow!("blend u_alpha missing"))?,
+                );
+                self.prog_blend = Some(prog);
+                log::info!("[gl] blend program compiled");
+                Ok(())
             }
         }
 
@@ -297,14 +421,64 @@ mod linux {
                                 self.draw_quad_external(tex_id)?;
                             }
                             _ => {
-                                // No video frame yet (first iteration
-                                // before pull_first_texture completes,
-                                // or a transient pull-miss). Just the
-                                // black clear; render loop will catch up.
                                 if frame_idx % 60 == 0 {
                                     log::debug!(
                                         "[gl] Step::Video draw with no tex; \
                                          showing black for frame {frame_idx}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Step::Blend => {
+                        self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                        self.gl.clear(glow::COLOR_BUFFER_BIT);
+                        use crate::gst_decode::TexTarget;
+                        match (
+                            self.video_tex_id,
+                            self.video_target,
+                            self.video_tex_id_b,
+                            self.video_target_b,
+                        ) {
+                            (
+                                Some(a_id),
+                                Some(TexTarget::External),
+                                Some(b_id),
+                                Some(TexTarget::External),
+                            ) => {
+                                self.draw_quad_blend(
+                                    a_id,
+                                    b_id,
+                                    self.blend_alpha,
+                                )?;
+                            }
+                            (
+                                Some(_),
+                                Some(a_t),
+                                Some(_),
+                                Some(b_t),
+                            ) if a_t != TexTarget::External
+                                || b_t != TexTarget::External =>
+                            {
+                                // Phase 2 plan: only (External,
+                                // External) supported. Other combos
+                                // (Mesa /= vc4) would need a third
+                                // shader program; not built yet.
+                                if frame_idx % 60 == 0 {
+                                    log::warn!(
+                                        "[gl] Step::Blend got non-External \
+                                         target pair (a={a_t:?} b={b_t:?}); \
+                                         skipping draw"
+                                    );
+                                }
+                            }
+                            _ => {
+                                if frame_idx % 60 == 0 {
+                                    log::debug!(
+                                        "[gl] Step::Blend draw with no texs \
+                                         (a={:?} b={:?}); showing black \
+                                         for frame {frame_idx}",
+                                        self.video_tex_id, self.video_tex_id_b
                                     );
                                 }
                             }
@@ -435,6 +609,91 @@ mod linux {
             }
         }
 
+        /// Phase 2 blend draw: bind both EXTERNAL_OES textures to
+        /// TEXTURE0 / TEXTURE1, set the 3 uniforms, draw.
+        /// Restores TEXTURE0 as the active unit at the end so
+        /// subsequent single-tex draws (if Streams ever changed
+        /// mid-run, which it doesn't today) start clean.
+        unsafe fn draw_quad_blend(
+            &self,
+            tex_a_id: u32,
+            tex_b_id: u32,
+            alpha: f32,
+        ) -> Result<()> {
+            unsafe {
+                drain_gl_errors(&self.gl);
+
+                let prog = self.prog_blend.ok_or_else(|| {
+                    anyhow!("blend program not compiled yet")
+                })?;
+                let u_tex_a = self.u_tex_a_loc_blend.as_ref().ok_or_else(|| {
+                    anyhow!("blend u_tex_a missing")
+                })?;
+                let u_tex_b = self.u_tex_b_loc_blend.as_ref().ok_or_else(|| {
+                    anyhow!("blend u_tex_b missing")
+                })?;
+                let u_alpha = self.u_alpha_loc_blend.as_ref().ok_or_else(|| {
+                    anyhow!("blend u_alpha missing")
+                })?;
+
+                self.gl.use_program(Some(prog));
+                check_gl_err(&self.gl, "blend.use_program")?;
+
+                use crate::gst_decode::GL_TEXTURE_EXTERNAL_OES;
+                let nz_a = std::num::NonZeroU32::new(tex_a_id)
+                    .ok_or_else(|| anyhow!("blend tex_a_id is 0"))?;
+                let nz_b = std::num::NonZeroU32::new(tex_b_id)
+                    .ok_or_else(|| anyhow!("blend tex_b_id is 0"))?;
+
+                // Slot 0 = texA
+                self.gl.active_texture(glow::TEXTURE0);
+                check_gl_err(&self.gl, "blend.active_texture(0)")?;
+                self.gl.bind_texture(
+                    GL_TEXTURE_EXTERNAL_OES,
+                    Some(glow::NativeTexture(nz_a)),
+                );
+                check_gl_err(
+                    &self.gl,
+                    &format!("blend.bind_texture(EXTERNAL_OES, raw_a={tex_a_id})"),
+                )?;
+                self.gl.uniform_1_i32(Some(u_tex_a), 0);
+                check_gl_err(&self.gl, "blend.uniform_1_i32(u_tex_a)")?;
+
+                // Slot 1 = texB
+                self.gl.active_texture(glow::TEXTURE1);
+                check_gl_err(&self.gl, "blend.active_texture(1)")?;
+                self.gl.bind_texture(
+                    GL_TEXTURE_EXTERNAL_OES,
+                    Some(glow::NativeTexture(nz_b)),
+                );
+                check_gl_err(
+                    &self.gl,
+                    &format!("blend.bind_texture(EXTERNAL_OES, raw_b={tex_b_id})"),
+                )?;
+                self.gl.uniform_1_i32(Some(u_tex_b), 1);
+                check_gl_err(&self.gl, "blend.uniform_1_i32(u_tex_b)")?;
+
+                // alpha uniform
+                self.gl.uniform_1_f32(Some(u_alpha), alpha);
+                check_gl_err(&self.gl, "blend.uniform_1_f32(u_alpha)")?;
+
+                self.bind_quad_attribs(self.a_pos_loc_blend, self.a_uv_loc_blend)?;
+                check_gl_err(&self.gl, "blend.bind_quad_attribs")?;
+
+                self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                check_gl_err(&self.gl, "blend.draw_arrays")?;
+
+                self.gl.disable_vertex_attrib_array(self.a_pos_loc_blend);
+                self.gl.disable_vertex_attrib_array(self.a_uv_loc_blend);
+
+                // Restore TEXTURE0 as active so subsequent
+                // single-tex paths start clean (defense in depth;
+                // every helper sets active_texture(0) itself).
+                self.gl.active_texture(glow::TEXTURE0);
+                Ok(())
+            }
+        }
+
         unsafe fn bind_quad_attribs(
             &self,
             a_pos: u32,
@@ -539,6 +798,9 @@ mod linux {
                 self.gl.delete_buffer(self.vbo);
                 self.gl.delete_program(self.prog_2d);
                 if let Some(p) = self.prog_ext.take() {
+                    self.gl.delete_program(p);
+                }
+                if let Some(p) = self.prog_blend.take() {
                     self.gl.delete_program(p);
                 }
             }
