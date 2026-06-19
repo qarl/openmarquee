@@ -68,11 +68,10 @@ mod stub {
 mod linux {
     use super::*;
     use crate::egl_gbm::Egl;
-    use anyhow::{anyhow, bail, Context};
-    use gst::glib;
+    use anyhow::{anyhow, Context};
     use gst::prelude::*;
+    use gst_gl::prelude::*;
     use std::path::Path;
-    use std::time::Duration;
 
     /// GL_TEXTURE_EXTERNAL_OES — not in glow's enum table.
     /// 0x8D65 per GL_OES_EGL_image_external spec; matches the
@@ -203,7 +202,9 @@ mod linux {
             // sink. Mirrors cutloop.py:236-244.
             let h264parse_for_pad = h264parse.clone();
             qtdemux.connect_pad_added(move |_demux, pad| {
-                let caps = pad.current_caps().or_else(|| pad.query_caps(None));
+                // pad.current_caps() -> Option<Caps>; pad.query_caps(None) -> Caps.
+                // Wrap the latter so the or_else branches both yield Option<Caps>.
+                let caps = pad.current_caps().or_else(|| Some(pad.query_caps(None)));
                 let caps_str = caps.map(|c| c.to_string()).unwrap_or_default();
                 if !caps_str.starts_with("video/") {
                     return;
@@ -234,7 +235,11 @@ mod linux {
             appsink.set_max_buffers(2);
             appsink.set_drop(false);
             appsink.set_sync(false);
-            appsink.set_emit_signals(false);
+            // emit-signals: pull-based API; don't fire callbacks.
+            // gstreamer-app 0.23 exposes this via the GObject
+            // property setter (no typed wrapper at the time of
+            // this writing).
+            appsink.set_property("emit-signals", false);
 
             // (d) Install SYNC bus handler for NEED_CONTEXT.
             // MUST run before set_state(PAUSED).
@@ -247,12 +252,16 @@ mod linux {
                 use gst::MessageView;
                 if let MessageView::NeedContext(nc) = msg.view() {
                     let ctx_type = nc.context_type();
+                    // gst::Context is a MiniObject (refcounted). To
+                    // mutate the structure we must obtain a mutable
+                    // ref via make_mut() — it clones on write if
+                    // the context is shared. Freshly created here,
+                    // so the clone path is never taken.
                     if ctx_type == "gst.gl.GLDisplay" {
                         let mut c = gst::Context::new(ctx_type, true);
-                        {
-                            let s = c.structure_mut();
-                            s.set("gst.gl.GLDisplay", &display_for_bus);
-                        }
+                        c.make_mut()
+                            .structure_mut()
+                            .set("gst.gl.GLDisplay", &display_for_bus);
                         if let Some(el) =
                             msg.src().and_then(|s| s.downcast_ref::<gst::Element>())
                         {
@@ -260,10 +269,9 @@ mod linux {
                         }
                     } else if ctx_type == "gst.gl.app_context" {
                         let mut c = gst::Context::new(ctx_type, true);
-                        {
-                            let s = c.structure_mut();
-                            s.set("context", &context_for_bus);
-                        }
+                        c.make_mut()
+                            .structure_mut()
+                            .set("context", &context_for_bus);
                         if let Some(el) =
                             msg.src().and_then(|s| s.downcast_ref::<gst::Element>())
                         {
@@ -406,12 +414,4 @@ mod linux {
         }
     }
 
-    // glib type re-export so caller doesn't need to import it
-    // just to satisfy trait bounds in the gst_gl APIs.
-    #[allow(unused_imports)]
-    pub(crate) use glib as _glib;
-
-    // Suppress 'unused' on Duration if not used in any pub fn.
-    #[allow(dead_code)]
-    fn _ensure_duration_used(_d: Duration) {}
 }

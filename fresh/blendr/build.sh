@@ -53,6 +53,14 @@ cd "$BUILD_DIR/blendr"
 # Bookworm's exact libs to match runtime ABI). Mirrors the OLD
 # renderer's scripts/renderer_cross_build.sh setup.
 export PKG_CONFIG_PATH_aarch64_unknown_linux_gnu="$SYSROOT/usr/lib/aarch64-linux-gnu/pkgconfig"
+# LIBDIR overrides the system-default search path entirely.
+# Without it, pkg-config falls back to /opt/homebrew/*/pkgconfig
+# on macOS and pulls in the host's glib (with -lintl from
+# gettext) into the link line -- libintl.so does not exist on
+# Debian aarch64 (glibc rolls gettext symbols into libc.so.6)
+# so the link fails. Pinning LIBDIR makes pkg-config see ONLY
+# the sysroot's .pc files.
+export PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu="$SYSROOT/usr/lib/aarch64-linux-gnu/pkgconfig:$SYSROOT/usr/share/pkgconfig"
 export PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_gnu="$SYSROOT"
 export PKG_CONFIG_ALLOW_CROSS=1
 export RUSTFLAGS="-L $SYSROOT/usr/lib/aarch64-linux-gnu -L $SYSROOT/lib/aarch64-linux-gnu"
