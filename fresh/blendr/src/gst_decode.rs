@@ -302,6 +302,12 @@ mod linux {
                 .ok_or_else(|| anyhow!("pipeline has no bus"))?;
             let display_for_bus = gst_display.clone();
             let context_for_bus = gst_context.clone();
+            // Phase 3 v1: capture pipeline ref so the EOS
+            // handler can seek_simple(FLUSH|KEY_UNIT, 0) to
+            // loop the clip when it ends. Without this a 4.75s
+            // clip dies after ~5s; Phase 3 needs continuous
+            // playback across 20s holds.
+            let pipeline_for_bus = pipeline.clone();
             bus.set_sync_handler(move |_bus, msg| {
                 use gst::MessageView;
                 let src_name = msg
@@ -369,7 +375,24 @@ mod linux {
                         );
                     }
                     MessageView::Eos(_) => {
-                        log::info!("[gst-bus] EOS src={src_name}");
+                        // Phase 3 v1 per-decoder loop: clip
+                        // EOS'd -> seek to 0 + keep playing.
+                        // FLUSH causes a brief gap (~ms) at the
+                        // loop point; acceptable per QA's gate
+                        // (steady tick cadence; small loop-
+                        // boundary hitches are not stalls).
+                        // KEY_UNIT snaps to nearest keyframe
+                        // (always frame 0 for these short
+                        // clips). The seek is async; gst
+                        // delivers more samples shortly after.
+                        log::info!(
+                            "[gst-bus] EOS src={src_name} -- seek-to-0 \
+                             for Phase 3 loop"
+                        );
+                        let _ = pipeline_for_bus.seek_simple(
+                            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                            gst::ClockTime::ZERO,
+                        );
                     }
                     MessageView::AsyncDone(_) => {
                         log::info!("[gst-bus] ASYNC_DONE src={src_name}");

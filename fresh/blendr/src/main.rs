@@ -54,11 +54,29 @@ struct Args {
     #[arg(long)]
     clip_b: Option<PathBuf>,
 
-    /// Phase 2 blend alpha: 0.0 = pure A, 1.0 = pure B, 0.5 =
-    /// 50/50 dissolve (default). Phase 3 will animate this; for
-    /// now it stays static across the run.
+    /// Phase 2 alpha (DEPRECATED -- replaced by --hold-sec +
+    /// --crossfade-sec in Phase 3). Kept as a CLI alias for
+    /// the previous static-alpha behavior: when --hold-sec is
+    /// huge (e.g. 9999) the alpha stays at this value forever.
+    /// Default 0.5 = 50/50 dissolve.
     #[arg(long, default_value_t = 0.5)]
     alpha: f32,
+
+    /// Phase 3 slideshow hold duration. Each clip stays
+    /// visible (alpha=0.0 for A, alpha=1.0 for B) for this
+    /// many seconds before the crossfade fires. Default 20.0
+    /// per qarl's "20s per video" rule. For testing the
+    /// crossfade cadence in a bounded --duration-sec run,
+    /// shorten this (e.g. --hold-sec 3 to exercise 7+ cycles
+    /// in 60s).
+    #[arg(long, default_value_t = 20.0)]
+    hold_sec: f32,
+
+    /// Phase 3 crossfade duration. Alpha ramps 0.0->1.0 (or
+    /// 1.0->0.0) over this many seconds. Default 1.0 = 1s
+    /// dissolve.
+    #[arg(long, default_value_t = 1.0)]
+    crossfade_sec: f32,
 
     /// Bypass /dev/dri/card* auto-probe. Use only for debug.
     #[arg(long)]
@@ -148,7 +166,16 @@ fn run(args: Args) -> Result<()> {
                 .context("GstDecoder::new (blend A)")?;
             let b = gst_decode::GstDecoder::new(&egl, clip_b)
                 .context("GstDecoder::new (blend B)")?;
-            kms::Streams::Blend { a, b, alpha: args.alpha }
+            let slideshow =
+                kms::SlideshowState::new(args.hold_sec, args.crossfade_sec);
+            log::info!(
+                "[slideshow] starting: hold_sec={} crossfade_sec={} \
+                 (Phase 3 v1; --alpha={} no longer used unless hold_sec is huge)",
+                args.hold_sec,
+                args.crossfade_sec,
+                args.alpha,
+            );
+            kms::Streams::Blend { a, b, slideshow }
         }
         _ => kms::Streams::None,
     };

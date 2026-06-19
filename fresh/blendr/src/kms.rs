@@ -12,19 +12,123 @@ pub use linux::*;
 #[cfg(not(target_os = "linux"))]
 pub use stub::*;
 
-/// Phase 1 + Phase 2 stream dispatch. Owned by main; passed
-/// as &mut into run_loop.
+/// Phase 1 / Phase 2 / Phase 3 stream dispatch. Owned by
+/// main; passed as &mut into run_loop.
 pub enum Streams {
     /// Step::Solid / Step::Checker: no gst decoders.
     None,
     /// Step::Video: one decoder.
     Single(crate::gst_decode::GstDecoder),
-    /// Step::Blend: two decoders + static alpha.
+    /// Step::Blend (Phase 2 static / Phase 3 slideshow): two
+    /// long-lived decoders. SlideshowState drives the alpha
+    /// each iteration (Phase 3); a static alpha is a special
+    /// case where hold_sec is huge.
     Blend {
         a: crate::gst_decode::GstDecoder,
         b: crate::gst_decode::GstDecoder,
-        alpha: f32,
+        slideshow: SlideshowState,
     },
+}
+
+/// Phase 3 v1: 2-clip A<->B slideshow state machine running on
+/// the present thread. Each tick run_loop calls update() which
+/// returns the current alpha + a "phase changed" flag for
+/// logging.
+///
+/// Cycle (with default hold=20s + crossfade=1s):
+///   HoldingA (20s, alpha=0.0)
+///   FadingAtoB (1s, alpha 0.0->1.0)
+///   HoldingB (20s, alpha=1.0)
+///   FadingBtoA (1s, alpha 1.0->0.0)
+///   repeat
+///
+/// For test runs --hold-sec 3 + --crossfade-sec 1 = 8s/cycle.
+/// QA needs short hold to exercise many crossfades in a 60s
+/// run.
+///
+/// Per-clip looping: each GstDecoder's bus handler issues a
+/// seek_simple(FLUSH|KEY_UNIT, 0) on EOS. So a 4.75s clip
+/// plays/rewinds/plays continuously regardless of where the
+/// slideshow cycle is.
+pub struct SlideshowState {
+    pub hold_sec: f32,
+    pub crossfade_sec: f32,
+    phase: BlendPhase,
+    phase_started: std::time::Instant,
+    cycle_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlendPhase {
+    HoldingA,
+    FadingAtoB,
+    HoldingB,
+    FadingBtoA,
+}
+
+impl SlideshowState {
+    pub fn new(hold_sec: f32, crossfade_sec: f32) -> Self {
+        Self {
+            hold_sec,
+            crossfade_sec,
+            phase: BlendPhase::HoldingA,
+            phase_started: std::time::Instant::now(),
+            cycle_count: 0,
+        }
+    }
+
+    /// Returns (current_alpha, phase_changed_this_tick).
+    pub fn update(&mut self) -> (f32, bool) {
+        let elapsed = self.phase_started.elapsed().as_secs_f32();
+        let mut changed = false;
+        let alpha = match self.phase {
+            BlendPhase::HoldingA => {
+                if elapsed >= self.hold_sec {
+                    self.phase = BlendPhase::FadingAtoB;
+                    self.phase_started = std::time::Instant::now();
+                    changed = true;
+                }
+                0.0
+            }
+            BlendPhase::FadingAtoB => {
+                if elapsed >= self.crossfade_sec {
+                    self.phase = BlendPhase::HoldingB;
+                    self.phase_started = std::time::Instant::now();
+                    changed = true;
+                    1.0
+                } else {
+                    (elapsed / self.crossfade_sec).clamp(0.0, 1.0)
+                }
+            }
+            BlendPhase::HoldingB => {
+                if elapsed >= self.hold_sec {
+                    self.phase = BlendPhase::FadingBtoA;
+                    self.phase_started = std::time::Instant::now();
+                    changed = true;
+                }
+                1.0
+            }
+            BlendPhase::FadingBtoA => {
+                if elapsed >= self.crossfade_sec {
+                    self.phase = BlendPhase::HoldingA;
+                    self.phase_started = std::time::Instant::now();
+                    self.cycle_count += 1;
+                    changed = true;
+                    0.0
+                } else {
+                    (1.0 - elapsed / self.crossfade_sec).clamp(0.0, 1.0)
+                }
+            }
+        };
+        (alpha, changed)
+    }
+
+    pub fn phase(&self) -> BlendPhase {
+        self.phase
+    }
+    pub fn cycle_count(&self) -> u64 {
+        self.cycle_count
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -300,7 +404,19 @@ mod linux {
                         egl.make_current()
                             .context("egl.make_current post-gst-pull(single)")?;
                     }
-                    super::Streams::Blend { a, b, alpha } => {
+                    super::Streams::Blend { a, b, slideshow } => {
+                        // Phase 3: state machine drives alpha.
+                        let (alpha, phase_changed) = slideshow.update();
+                        if phase_changed {
+                            log::info!(
+                                "[slideshow] PHASE -> {:?} alpha={alpha:.2} \
+                                 cycle={} frame={frame_idx} \
+                                 elapsed_total={:.2}s",
+                                slideshow.phase(),
+                                slideshow.cycle_count(),
+                                start.elapsed().as_secs_f32(),
+                            );
+                        }
                         egl.make_current()
                             .context("egl.make_current pre-gst-pull(blend-a)")?;
                         let a_pair = match a.latest_texture() {
@@ -326,12 +442,12 @@ mod linux {
                         egl.make_current()
                             .context("egl.make_current post-gst-pull(blend-b)")?;
                         if let (Some(a_t), Some(b_t)) = (a_pair, b_pair) {
-                            presenter.set_video_textures(a_t, b_t, *alpha);
+                            presenter.set_video_textures(a_t, b_t, alpha);
                             if !first_video_tex_logged {
                                 log::info!(
                                     "[kms] FIRST blend tex pair bound: \
                                      A=(tex={} target={:?}) B=(tex={} target={:?}) \
-                                     alpha={alpha} frame={frame_idx}",
+                                     alpha={alpha:.2} frame={frame_idx}",
                                     a_t.0, a_t.1, b_t.0, b_t.1,
                                 );
                                 first_video_tex_logged = true;
@@ -422,10 +538,24 @@ mod linux {
                 frame_idx += 1;
 
                 if last_log.elapsed() >= Duration::from_secs(1) {
-                    log::info!(
-                        "[kms] tick frame={frame_idx} elapsed={:.1}s",
-                        start.elapsed().as_secs_f32()
-                    );
+                    // Include slideshow phase + alpha if we're in
+                    // Blend mode so QA can grep the cadence + see
+                    // crossfade transitions in the tick stream
+                    // without needing the [slideshow] event lines.
+                    if let super::Streams::Blend { slideshow, .. } = &*streams {
+                        log::info!(
+                            "[kms] tick frame={frame_idx} elapsed={:.1}s \
+                             phase={:?} cycle={}",
+                            start.elapsed().as_secs_f32(),
+                            slideshow.phase(),
+                            slideshow.cycle_count(),
+                        );
+                    } else {
+                        log::info!(
+                            "[kms] tick frame={frame_idx} elapsed={:.1}s",
+                            start.elapsed().as_secs_f32()
+                        );
+                    }
                     last_log = Instant::now();
                 }
             }
