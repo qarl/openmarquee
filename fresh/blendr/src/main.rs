@@ -15,6 +15,7 @@ use std::path::PathBuf;
 mod drm_probe;
 mod egl_gbm;
 mod gles_present;
+mod gst_decode;
 mod kms;
 mod signals;
 
@@ -27,12 +28,20 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     duration_sec: u64,
 
-    /// Which Phase-0 step to render.
-    ///   solid   = hue-cycling clear color (proves swap+flip).
+    /// Which step to render.
+    ///   solid   = hue-cycling clear color (Phase 0; proves swap+flip).
     ///   checker = static 256x256 checkerboard via GLES2 shader
-    ///             (proves the GLES2 path is up too).
+    ///             (Phase 0; proves the GLES2 path is up too).
+    ///   video   = Phase 1 KEYSTONE: one GStreamer pipeline decodes
+    ///             --clip and hands frames to blendr as GL textures.
     #[arg(long, value_enum, default_value_t = Step::Checker)]
     step: Step,
+
+    /// Required when --step video. Absolute path to the H.264
+    /// mp4 clip to decode. cutloop.py's content layout is
+    /// /var/openmarquee/content/<uuid>/asset.mp4.
+    #[arg(long)]
+    clip: Option<PathBuf>,
 
     /// Bypass /dev/dri/card* auto-probe. Use only for debug.
     #[arg(long)]
@@ -100,21 +109,38 @@ fn run(args: Args) -> Result<()> {
     )
     .context("Presenter::new")?;
 
+    // Phase 1: build GstDecoder iff --step video.
+    let mut gst_dec: Option<gst_decode::GstDecoder> =
+        if matches!(args.step, Step::Video) {
+            let clip = args.clip.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("--step video requires --clip <PATH>")
+            })?;
+            Some(
+                gst_decode::GstDecoder::new(&egl, clip)
+                    .context("GstDecoder::new")?,
+            )
+        } else {
+            None
+        };
+
     let run_result = kms::run_loop(
         &card,
         &mode_pick,
         &mut gbm,
         &mut egl,
         &mut pres,
+        gst_dec.as_mut(),
         args.duration_sec,
         args.capture.as_deref(),
         args.capture_after_frame,
         &signals::EXIT_REQUESTED,
     );
 
-    // Drop GLES presenter + EGL + GBM in reverse-of-init order so
-    // the GL context is current when its textures are deleted, and
-    // the GBM surface is alive when EGL destroys its EGLSurface.
+    // LOAD-BEARING DROP ORDER (gst_dec -> pres -> egl -> gbm
+    // -> restore -> card). gst_dec holds wrapped handles into
+    // blendr's EGL ctx; if egl drops first, gst-gl's
+    // finalize segfaults dereferencing a dead EGLDisplay.
+    drop(gst_dec);
     drop(pres);
     drop(egl);
     drop(gbm);

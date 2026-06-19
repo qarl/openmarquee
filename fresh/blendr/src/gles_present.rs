@@ -9,6 +9,10 @@ use anyhow::Result;
 pub enum Step {
     Solid,
     Checker,
+    /// Phase 1 keystone: sample the latest texture handed in
+    /// by gst_decode (one cutloop-style GStreamer pipeline)
+    /// onto the fullscreen quad. --clip <PATH> required.
+    Video,
 }
 
 #[cfg(target_os = "linux")]
@@ -33,6 +37,12 @@ mod stub {
         pub fn capture_back_buffer_ppm(&self, _path: &std::path::Path) -> Result<()> {
             anyhow::bail!("capture stub: Linux only")
         }
+        pub fn set_video_texture(
+            &mut self,
+            _tex_id: u32,
+            _target: crate::gst_decode::TexTarget,
+        ) {
+        }
     }
 }
 
@@ -53,10 +63,24 @@ mod linux {
         }
     "#;
 
-    const FS: &str = r#"
+    /// Sampler2D path (Step::Checker + Step::Video TexTarget::TwoD).
+    const FS_2D: &str = r#"
         precision mediump float;
         varying vec2 v_uv;
         uniform sampler2D u_tex;
+        void main() {
+            gl_FragColor = texture2D(u_tex, v_uv);
+        }
+    "#;
+
+    /// samplerExternalOES path (Step::Video TexTarget::External).
+    /// V3D's GL_OES_EGL_image_external does YUV->RGB at sample
+    /// time -- zero-copy from V4L2 capture via DMABuf.
+    const FS_EXTERNAL_OES: &str = r#"
+        #extension GL_OES_EGL_image_external : require
+        precision mediump float;
+        varying vec2 v_uv;
+        uniform samplerExternalOES u_tex;
         void main() {
             gl_FragColor = texture2D(u_tex, v_uv);
         }
@@ -67,12 +91,29 @@ mod linux {
         w: i32,
         h: i32,
         step: Step,
-        prog: glow::Program,
+        /// sampler2D program (Solid clear unused, Checker, Video TwoD).
+        prog_2d: glow::Program,
+        /// samplerExternalOES program (Video External only).
+        /// Compiled lazily on first Video frame with TexTarget::External
+        /// so a non-OES driver (where the extension parse fails) does
+        /// not break Step::Checker. None until first set.
+        prog_ext: Option<glow::Program>,
         vbo: glow::Buffer,
-        tex: glow::Texture,
-        a_pos_loc: u32,
-        a_uv_loc: u32,
-        u_tex_loc: glow::UniformLocation,
+        /// CPU checkerboard for Step::Checker.
+        tex_checker: glow::Texture,
+        /// Pos/UV attribute locations on prog_2d (same indices on
+        /// prog_ext because the VS is identical and uses bind-by-name).
+        a_pos_loc_2d: u32,
+        a_uv_loc_2d: u32,
+        u_tex_loc_2d: glow::UniformLocation,
+        /// On prog_ext (Some when compiled).
+        a_pos_loc_ext: u32,
+        a_uv_loc_ext: u32,
+        u_tex_loc_ext: Option<glow::UniformLocation>,
+        /// Phase-1 state: the latest video texture id + its target.
+        /// Updated by set_video_texture each iteration.
+        video_tex_id: Option<u32>,
+        video_target: Option<crate::gst_decode::TexTarget>,
     }
 
     impl Presenter {
@@ -84,22 +125,22 @@ mod linux {
             };
             unsafe {
                 let vs = compile(&gl, glow::VERTEX_SHADER, VS)?;
-                let fs = compile(&gl, glow::FRAGMENT_SHADER, FS)?;
-                let prog = link(&gl, vs, fs)?;
+                let fs_2d = compile(&gl, glow::FRAGMENT_SHADER, FS_2D)?;
+                let prog_2d = link(&gl, vs, fs_2d)?;
                 gl.delete_shader(vs);
-                gl.delete_shader(fs);
+                gl.delete_shader(fs_2d);
 
-                gl.use_program(Some(prog));
-                let a_pos_loc = gl
-                    .get_attrib_location(prog, "a_pos")
+                gl.use_program(Some(prog_2d));
+                let a_pos_loc_2d = gl
+                    .get_attrib_location(prog_2d, "a_pos")
                     .ok_or_else(|| anyhow!("attribute a_pos missing"))?;
-                let a_uv_loc = gl
-                    .get_attrib_location(prog, "a_uv")
+                let a_uv_loc_2d = gl
+                    .get_attrib_location(prog_2d, "a_uv")
                     .ok_or_else(|| anyhow!("attribute a_uv missing"))?;
-                let u_tex_loc = gl
-                    .get_uniform_location(prog, "u_tex")
+                let u_tex_loc_2d = gl
+                    .get_uniform_location(prog_2d, "u_tex")
                     .ok_or_else(|| anyhow!("uniform u_tex missing"))?;
-                gl.uniform_1_i32(Some(&u_tex_loc), 0);
+                gl.uniform_1_i32(Some(&u_tex_loc_2d), 0);
 
                 // Full-screen quad: 2 triangles, interleaved [x y u v].
                 #[rustfmt::skip]
@@ -158,9 +199,74 @@ mod linux {
                 );
 
                 Ok(Presenter {
-                    gl, w: w as i32, h: h as i32, step,
-                    prog, vbo, tex, a_pos_loc, a_uv_loc, u_tex_loc,
+                    gl,
+                    w: w as i32,
+                    h: h as i32,
+                    step,
+                    prog_2d,
+                    prog_ext: None,
+                    vbo,
+                    tex_checker: tex,
+                    a_pos_loc_2d,
+                    a_uv_loc_2d,
+                    u_tex_loc_2d,
+                    a_pos_loc_ext: 0,
+                    a_uv_loc_ext: 0,
+                    u_tex_loc_ext: None,
+                    video_tex_id: None,
+                    video_target: None,
                 })
+            }
+        }
+
+        /// Update the "current video texture" -- called once per
+        /// iteration by kms::run_loop from gst_decode's pull.
+        /// Lazily compiles the samplerExternalOES program on
+        /// first External-target frame.
+        pub fn set_video_texture(
+            &mut self,
+            tex_id: u32,
+            target: crate::gst_decode::TexTarget,
+        ) {
+            self.video_tex_id = Some(tex_id);
+            self.video_target = Some(target);
+            if target == crate::gst_decode::TexTarget::External
+                && self.prog_ext.is_none()
+            {
+                if let Err(e) = self.compile_ext_program() {
+                    log::error!(
+                        "[gl] failed to compile external-OES program: {e:#}"
+                    );
+                    // Caller will see no draw; gl error escalation
+                    // happens in draw_frame's draw branch.
+                }
+            }
+        }
+
+        fn compile_ext_program(&mut self) -> Result<()> {
+            unsafe {
+                let vs = compile(&self.gl, glow::VERTEX_SHADER, VS)?;
+                let fs =
+                    compile(&self.gl, glow::FRAGMENT_SHADER, FS_EXTERNAL_OES)?;
+                let prog = link(&self.gl, vs, fs)?;
+                self.gl.delete_shader(vs);
+                self.gl.delete_shader(fs);
+                self.a_pos_loc_ext = self
+                    .gl
+                    .get_attrib_location(prog, "a_pos")
+                    .ok_or_else(|| anyhow!("ext a_pos missing"))?;
+                self.a_uv_loc_ext = self
+                    .gl
+                    .get_attrib_location(prog, "a_uv")
+                    .ok_or_else(|| anyhow!("ext a_uv missing"))?;
+                self.u_tex_loc_ext = Some(
+                    self.gl
+                        .get_uniform_location(prog, "u_tex")
+                        .ok_or_else(|| anyhow!("ext u_tex missing"))?,
+                );
+                self.prog_ext = Some(prog);
+                log::info!("[gl] external-OES program compiled");
+                Ok(())
             }
         }
 
@@ -178,32 +284,31 @@ mod linux {
                     Step::Checker => {
                         self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
                         self.gl.clear(glow::COLOR_BUFFER_BIT);
-                        self.gl.use_program(Some(self.prog));
-                        self.gl.active_texture(glow::TEXTURE0);
-                        self.gl.bind_texture(
-                            glow::TEXTURE_2D,
-                            Some(self.tex),
-                        );
-                        self.gl.uniform_1_i32(Some(&self.u_tex_loc), 0);
-                        self.gl.bind_buffer(
-                            glow::ARRAY_BUFFER,
-                            Some(self.vbo),
-                        );
-                        let stride = 4 * std::mem::size_of::<f32>() as i32;
-                        self.gl.enable_vertex_attrib_array(self.a_pos_loc);
-                        self.gl.vertex_attrib_pointer_f32(
-                            self.a_pos_loc, 2, glow::FLOAT,
-                            false, stride, 0,
-                        );
-                        self.gl.enable_vertex_attrib_array(self.a_uv_loc);
-                        self.gl.vertex_attrib_pointer_f32(
-                            self.a_uv_loc, 2, glow::FLOAT,
-                            false, stride,
-                            (2 * std::mem::size_of::<f32>()) as i32,
-                        );
-                        self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
-                        self.gl.disable_vertex_attrib_array(self.a_pos_loc);
-                        self.gl.disable_vertex_attrib_array(self.a_uv_loc);
+                        self.draw_quad_2d(self.tex_checker)?;
+                    }
+                    Step::Video => {
+                        self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                        self.gl.clear(glow::COLOR_BUFFER_BIT);
+                        match (self.video_tex_id, self.video_target) {
+                            (Some(tex_id), Some(crate::gst_decode::TexTarget::TwoD)) => {
+                                self.draw_quad_2d_raw(tex_id)?;
+                            }
+                            (Some(tex_id), Some(crate::gst_decode::TexTarget::External)) => {
+                                self.draw_quad_external(tex_id)?;
+                            }
+                            _ => {
+                                // No video frame yet (first iteration
+                                // before pull_first_texture completes,
+                                // or a transient pull-miss). Just the
+                                // black clear; render loop will catch up.
+                                if frame_idx % 60 == 0 {
+                                    log::debug!(
+                                        "[gl] Step::Video draw with no tex; \
+                                         showing black for frame {frame_idx}"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 let err = self.gl.get_error();
@@ -212,6 +317,102 @@ mod linux {
                 }
             }
             Ok(())
+        }
+
+        /// Helper: draw fullscreen quad sampling a glow::Texture
+        /// (Checker path; owns the texture handle).
+        unsafe fn draw_quad_2d(&self, tex: glow::Texture) -> Result<()> {
+            // SAFETY: GL context current; tex is a valid handle.
+            unsafe { self.draw_quad_2d_inner(Some(tex), 0) }
+        }
+
+        /// Helper: draw fullscreen quad sampling a raw u32
+        /// texture id (Video TwoD path; gst_decode owns the tex).
+        unsafe fn draw_quad_2d_raw(&self, tex_id: u32) -> Result<()> {
+            // SAFETY: tex_id was just produced by gst-gl in our
+            // shared EGL context; bind_texture-by-id is the GLES2
+            // way for non-glow-owned textures.
+            unsafe { self.draw_quad_2d_inner(None, tex_id) }
+        }
+
+        unsafe fn draw_quad_2d_inner(
+            &self,
+            owned: Option<glow::Texture>,
+            raw_id: u32,
+        ) -> Result<()> {
+            unsafe {
+                self.gl.use_program(Some(self.prog_2d));
+                self.gl.active_texture(glow::TEXTURE0);
+                if let Some(t) = owned {
+                    self.gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                } else {
+                    // Bind by raw id: glow::NativeTexture wraps
+                    // NonZeroU32; build one to satisfy the API.
+                    let nz = std::num::NonZeroU32::new(raw_id)
+                        .ok_or_else(|| anyhow!("video tex_id is 0"))?;
+                    self.gl
+                        .bind_texture(glow::TEXTURE_2D, Some(glow::NativeTexture(nz)));
+                }
+                self.gl.uniform_1_i32(Some(&self.u_tex_loc_2d), 0);
+                self.bind_quad_attribs(self.a_pos_loc_2d, self.a_uv_loc_2d)?;
+                self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                self.gl.disable_vertex_attrib_array(self.a_pos_loc_2d);
+                self.gl.disable_vertex_attrib_array(self.a_uv_loc_2d);
+                Ok(())
+            }
+        }
+
+        unsafe fn draw_quad_external(&self, tex_id: u32) -> Result<()> {
+            unsafe {
+                let prog = self.prog_ext.ok_or_else(|| {
+                    anyhow!("external-OES program not compiled yet")
+                })?;
+                let u_loc = self.u_tex_loc_ext.as_ref().ok_or_else(|| {
+                    anyhow!("external-OES u_tex uniform missing")
+                })?;
+                self.gl.use_program(Some(prog));
+                self.gl.active_texture(glow::TEXTURE0);
+                // glow doesn't expose GL_TEXTURE_EXTERNAL_OES; use
+                // the literal lifted from the OLD renderer's
+                // hdmi.rs.
+                use crate::gst_decode::GL_TEXTURE_EXTERNAL_OES;
+                let nz = std::num::NonZeroU32::new(tex_id)
+                    .ok_or_else(|| anyhow!("video tex_id is 0"))?;
+                self.gl.bind_texture(
+                    GL_TEXTURE_EXTERNAL_OES,
+                    Some(glow::NativeTexture(nz)),
+                );
+                self.gl.uniform_1_i32(Some(u_loc), 0);
+                self.bind_quad_attribs(self.a_pos_loc_ext, self.a_uv_loc_ext)?;
+                self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                self.gl.disable_vertex_attrib_array(self.a_pos_loc_ext);
+                self.gl.disable_vertex_attrib_array(self.a_uv_loc_ext);
+                Ok(())
+            }
+        }
+
+        unsafe fn bind_quad_attribs(
+            &self,
+            a_pos: u32,
+            a_uv: u32,
+        ) -> Result<()> {
+            unsafe {
+                self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+                let stride = 4 * std::mem::size_of::<f32>() as i32;
+                self.gl.enable_vertex_attrib_array(a_pos);
+                self.gl
+                    .vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
+                self.gl.enable_vertex_attrib_array(a_uv);
+                self.gl.vertex_attrib_pointer_f32(
+                    a_uv,
+                    2,
+                    glow::FLOAT,
+                    false,
+                    stride,
+                    (2 * std::mem::size_of::<f32>()) as i32,
+                );
+                Ok(())
+            }
         }
     }
 
@@ -289,9 +490,12 @@ mod linux {
             // AFTER Presenter per main.rs ordering); these FFI
             // ops are well-defined object-delete calls.
             unsafe {
-                self.gl.delete_texture(self.tex);
+                self.gl.delete_texture(self.tex_checker);
                 self.gl.delete_buffer(self.vbo);
-                self.gl.delete_program(self.prog);
+                self.gl.delete_program(self.prog_2d);
+                if let Some(p) = self.prog_ext.take() {
+                    self.gl.delete_program(p);
+                }
             }
         }
     }

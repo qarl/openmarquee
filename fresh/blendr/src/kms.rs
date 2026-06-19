@@ -29,6 +29,7 @@ mod stub {
         _: &mut crate::egl_gbm::Gbm,
         _: &mut crate::egl_gbm::Egl,
         _: &mut crate::gles_present::Presenter,
+        _: Option<&mut crate::gst_decode::GstDecoder>,
         _: u64,
         _: Option<&std::path::Path>,
         _: u64,
@@ -204,6 +205,7 @@ mod linux {
         gbm: &mut Gbm,
         egl: &mut Egl,
         presenter: &mut Presenter,
+        mut gst: Option<&mut crate::gst_decode::GstDecoder>,
         duration_sec: u64,
         capture_path: Option<&std::path::Path>,
         capture_after_frame: u64,
@@ -238,6 +240,32 @@ mod linux {
                         "[kms] duration {duration_sec}s reached; breaking loop"
                     );
                     break;
+                }
+
+                // Phase 1: if a GstDecoder is wired in, pull the
+                // latest video texture and hand it to the
+                // presenter BEFORE the draw. First pull blocks
+                // generously; subsequent pulls are best-effort
+                // (None => reuse previous texture, render-loop
+                // catches up).
+                if let Some(g) = gst.as_mut() {
+                    // Re-claim EGL on this thread; gst-gl's
+                    // streaming thread may have made-current the
+                    // shared handle for upload/conversion.
+                    egl.make_current()?;
+                    match g.try_pull_texture() {
+                        Ok(Some(tex_id)) => {
+                            presenter.set_video_texture(tex_id, g.tex_target);
+                        }
+                        Ok(None) => {
+                            // Pull miss; reuse previous tex.
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[kms] gst pull err at frame {frame_idx}: {e:#}"
+                            );
+                        }
+                    }
                 }
 
                 presenter.draw_frame(frame_idx)?;

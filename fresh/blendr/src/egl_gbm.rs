@@ -174,6 +174,23 @@ mod linux {
                 .map(|p| p as *const _)
                 .unwrap_or(std::ptr::null())
         }
+
+        /// Re-assert that THIS thread holds the GL context
+        /// current. Needed under Phase 1 because gst-gl's
+        /// streaming thread may have made-current the SAME
+        /// shared EGL handle for upload/conversion; before
+        /// blendr's main-thread draw we re-claim it.
+        pub fn make_current(&self) -> Result<()> {
+            self.lib
+                .make_current(
+                    self.display,
+                    Some(self.surface),
+                    Some(self.surface),
+                    Some(self.context),
+                )
+                .map_err(|e| anyhow!("eglMakeCurrent (re-claim): {e:?}"))?;
+            Ok(())
+        }
     }
 
     impl Drop for Egl {
