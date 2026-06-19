@@ -30,6 +30,8 @@ mod stub {
         _: &mut crate::egl_gbm::Egl,
         _: &mut crate::gles_present::Presenter,
         _: u64,
+        _: Option<&std::path::Path>,
+        _: u64,
         _: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
         anyhow::bail!("KMS stub: Linux only")
@@ -191,6 +193,11 @@ mod linux {
     /// flight; drain via poll+receive_events before issuing the
     /// next. PAGE_FLIP_EVENT only (no ASYNC) for firmware-paced
     /// 60Hz vsync.
+    ///
+    /// If `capture_path` is Some, glReadPixels-dumps the rendered
+    /// back buffer once on the `capture_after_frame`-th frame
+    /// BEFORE eglSwapBuffers (so we read what was just drawn,
+    /// not the swapped-out one). One-shot per run.
     pub fn run_loop(
         card: &Card,
         pick: &ModePick,
@@ -198,6 +205,8 @@ mod linux {
         egl: &mut Egl,
         presenter: &mut Presenter,
         duration_sec: u64,
+        capture_path: Option<&std::path::Path>,
+        capture_after_frame: u64,
         exit_flag: &AtomicBool,
     ) -> Result<()> {
         // We have to keep the master lock alive across the whole
@@ -232,6 +241,23 @@ mod linux {
                 }
 
                 presenter.draw_frame(frame_idx)?;
+
+                // One-shot capture BEFORE swap_buffers so we read
+                // the just-drawn back buffer. Capture is
+                // non-destructive: render loop continues after.
+                if let Some(path) = capture_path {
+                    if frame_idx == capture_after_frame {
+                        presenter
+                            .capture_back_buffer_ppm(path)
+                            .with_context(|| {
+                                format!(
+                                    "capture_back_buffer_ppm({})",
+                                    path.display()
+                                )
+                            })?;
+                    }
+                }
+
                 egl.swap_buffers()?;
 
                 // Pull the freshly-rendered BO off the GBM surface.

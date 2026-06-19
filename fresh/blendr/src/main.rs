@@ -37,6 +37,24 @@ struct Args {
     /// Bypass /dev/dri/card* auto-probe. Use only for debug.
     #[arg(long)]
     card_override: Option<PathBuf>,
+
+    /// Write one PPM (P6 binary) capture of the rendered back
+    /// buffer to PATH on the Nth-frame draw (see
+    /// --capture-after-frame). Lets QA verify actual pixels for
+    /// the GL output without depending on qarl-eyes (kmsgrab hangs
+    /// the live plane; the raw GBM/KMS path has no GST pixel-tee).
+    /// PPM is chosen over PNG for zero added deps; QA converts
+    /// with `magick foo.ppm foo.png` or `ffmpeg -i foo.ppm foo.png`.
+    /// The render loop continues normally after the dump.
+    #[arg(long)]
+    capture: Option<PathBuf>,
+
+    /// Which frame index to capture on (zero-based; 0 = the very
+    /// first rendered frame). Default 30 gives ~half a second of
+    /// runtime at 60Hz so the texture upload + first few flips
+    /// have settled.
+    #[arg(long, default_value_t = 30)]
+    capture_after_frame: u64,
 }
 
 fn main() -> Result<()> {
@@ -89,6 +107,8 @@ fn run(args: Args) -> Result<()> {
         &mut egl,
         &mut pres,
         args.duration_sec,
+        args.capture.as_deref(),
+        args.capture_after_frame,
         &signals::EXIT_REQUESTED,
     );
 

@@ -30,6 +30,9 @@ mod stub {
         pub fn draw_frame(&mut self, _frame_idx: u64) -> Result<()> {
             anyhow::bail!("draw_frame stub: Linux only")
         }
+        pub fn capture_back_buffer_ppm(&self, _path: &std::path::Path) -> Result<()> {
+            anyhow::bail!("capture stub: Linux only")
+        }
     }
 }
 
@@ -37,7 +40,7 @@ mod stub {
 mod linux {
     use super::*;
     use crate::egl_gbm::Egl;
-    use anyhow::anyhow;
+    use anyhow::{anyhow, Context};
     use glow::HasContext;
 
     const VS: &str = r#"
@@ -208,6 +211,74 @@ mod linux {
                     return Err(anyhow!("glGetError={err:#x}"));
                 }
             }
+            Ok(())
+        }
+    }
+
+    impl Presenter {
+        /// glReadPixels the back buffer (the just-drawn frame,
+        /// BEFORE eglSwapBuffers) and write a P6 binary PPM to
+        /// `path`. Vertically flipped on write so the file rows
+        /// run top-to-bottom (matches what's on screen; GL's
+        /// glReadPixels returns rows bottom-up).
+        ///
+        /// PPM is chosen over PNG for zero new deps; QA converts
+        /// with `magick foo.ppm foo.png` or
+        /// `ffmpeg -i foo.ppm foo.png`.
+        pub fn capture_back_buffer_ppm(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<()> {
+            use std::io::Write;
+            let w = self.w as usize;
+            let h = self.h as usize;
+            let mut rgba = vec![0u8; w * h * 4];
+            unsafe {
+                // SAFETY: GLES2 context is current; back buffer
+                // is the GL_BACK draw target by default for our
+                // window surface; format/type match what we asked
+                // for (the buffer is sized exactly w*h*4).
+                self.gl.read_pixels(
+                    0,
+                    0,
+                    self.w,
+                    self.h,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(&mut rgba),
+                );
+                let err = self.gl.get_error();
+                if err != glow::NO_ERROR {
+                    return Err(anyhow!(
+                        "glReadPixels glGetError={err:#x}"
+                    ));
+                }
+            }
+            // Build PPM body: row-flip so PPM row 0 = on-screen
+            // top row, strip alpha to get RGB.
+            let mut body: Vec<u8> = Vec::with_capacity(w * h * 3);
+            for screen_row in 0..h {
+                let gl_row = h - 1 - screen_row;
+                let row_off = gl_row * w * 4;
+                for x in 0..w {
+                    let p = row_off + x * 4;
+                    body.extend_from_slice(&rgba[p..p + 3]);
+                }
+            }
+            let mut f = std::fs::File::create(path)
+                .with_context(|| format!("create {}", path.display()))?;
+            writeln!(f, "P6")?;
+            writeln!(f, "{w} {h}")?;
+            writeln!(f, "255")?;
+            f.write_all(&body)
+                .with_context(|| format!("write PPM body to {}", path.display()))?;
+            log::info!(
+                "[capture] wrote PPM {} ({}x{}, {} bytes body)",
+                path.display(),
+                w,
+                h,
+                body.len(),
+            );
             Ok(())
         }
     }
