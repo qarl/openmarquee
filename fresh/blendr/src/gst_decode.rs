@@ -481,6 +481,15 @@ mod linux {
         /// mapped over the sample's buffer. The NEW frame is
         /// mapped BEFORE the OLD one is dropped so we never
         /// have a zero-textures-in-flight moment.
+        ///
+        /// ALSO queries the underlying GLMemory's ACTUAL
+        /// texture target (not the caps-negotiated assumption)
+        /// and updates self.tex_target so kms::run_loop dispatches
+        /// to the matching draw path. Per QA Phase 1 506b0db
+        /// glass: vc4's gst-gl on the RGBA-caps fallback path
+        /// still hands back GL_TEXTURE_EXTERNAL_OES textures;
+        /// the caps label is misleading. Routing by the queried
+        /// target is the safe general fix.
         fn adopt_sample(&mut self, sample: gst::Sample) -> Result<u32> {
             let buffer = sample
                 .buffer_owned()
@@ -488,6 +497,35 @@ mod linux {
             let caps = sample
                 .caps()
                 .ok_or_else(|| anyhow!("sample has no caps"))?;
+
+            // Query the actual GL texture target from the
+            // underlying GLMemory BEFORE moving the buffer into
+            // from_buffer_readable. If the buffer's memory isn't
+            // a GLMemory (shouldn't happen since we negotiated
+            // GLMemory caps), fall back to whatever caps said.
+            let queried_target = buffer
+                .peek_memory(0)
+                .downcast_memory_ref::<gst_gl::GLMemory>()
+                .map(|m| m.texture_target());
+            let real_tex_target = match queried_target {
+                Some(gst_gl::GLTextureTarget::ExternalOes) => TexTarget::External,
+                Some(_) => TexTarget::TwoD,
+                None => self.tex_target,
+            };
+            if !self.first_done {
+                log::info!(
+                    "[gst] tex_target query: caps_negotiated={:?} \
+                     glmemory_actual={:?} -> routing draw path to {:?}",
+                    self.tex_target, queried_target, real_tex_target
+                );
+            } else if real_tex_target != self.tex_target {
+                log::warn!(
+                    "[gst] tex_target CHANGED mid-stream: was {:?} now {:?}",
+                    self.tex_target, real_tex_target
+                );
+            }
+            self.tex_target = real_tex_target;
+
             let video_info = gst_video::VideoInfo::from_caps(&caps)
                 .map_err(|e| anyhow!("VideoInfo::from_caps: {e:?}"))?;
             let new_frame =
