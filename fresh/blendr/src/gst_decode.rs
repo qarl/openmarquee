@@ -597,29 +597,73 @@ mod linux {
 
     impl Drop for GstDecoder {
         fn drop(&mut self) {
-            // 1. Signal pull thread to stop BEFORE NULLing the
-            //    pipeline so the thread's next try_pull_sample
-            //    sees stop=true and exits cleanly (avoids racing
-            //    the appsink teardown).
+            // ORDER MATTERS. Phase 2 (2ced09a) glass surfaced a
+            // teardown SEGV after clean run_loop exit: the
+            // previous Drop did NULL-pipeline BEFORE clearing
+            // our GLMemory refs (latest_sample + current_frame).
+            // glupload's finalize during the NULL transition
+            // tears down its GstGLBufferPool + releases its
+            // GLContext refs while we still held GLMemory refs
+            // pointing into that pool -- the subsequent
+            // GLVideoFrame::drop tried to gst_gl_memory_unmap
+            // on a partly-finalized context -> use-after-free.
+            //
+            // FIX (this commit): stop + join pull thread FIRST,
+            // then DROP our GLMemory refs while the pipeline is
+            // still PLAYING + gst-gl tracking is alive, THEN
+            // NULL + state-wait the pipeline, THEN unset bus.
+            // Phase 3's clip cycling (retire + recreate
+            // decoders mid-run) will hammer this path; a clean
+            // teardown is load-bearing for that.
+
+            // 1. Signal pull thread to stop so it doesn't put a
+            //    NEW sample into the slot while we're clearing.
             self.stop.store(true, Ordering::Relaxed);
-            // 2. NULL the pipeline; unblocks any in-flight
-            //    try_pull_sample on the pull thread + tears down
-            //    decoder + glupload.
-            let _ = self.pipeline.set_state(gst::State::Null);
-            // 3. Drop the latest unconsumed sample so its
-            //    GLMemory ref is released BEFORE the pipeline's
-            //    GL ctx finalizes.
-            if let Ok(mut g) = self.latest_sample.lock() {
-                *g = None;
-            }
-            // 4. Drop the currently-mapped GLVideoFrame for the
-            //    same reason.
-            self.current_frame = None;
-            // 5. Join the pull thread. Worst case ~PULL_TICK_MS
-            //    + scheduling delay; bounded.
+
+            // 2. Join the pull thread. Worst case ~PULL_TICK_MS
+            //    (33ms) for the in-flight try_pull_sample to
+            //    return + scheduling delay; bounded.
             if let Some(h) = self.pull_thread.take() {
                 let _ = h.join();
             }
+
+            // 3. Drop the latest unconsumed sample (if any).
+            //    Pipeline still PLAYING here, so the buffer's
+            //    GLMemory unref + unmap are well-defined; gst-gl
+            //    context tracking is still alive.
+            if let Ok(mut g) = self.latest_sample.lock() {
+                *g = None;
+            }
+
+            // 4. Drop the currently-mapped GLVideoFrame. Same
+            //    reason as step 3: GL ctx tracking alive, unmap
+            //    is well-defined.
+            self.current_frame = None;
+
+            // 5. NULL the pipeline + WAIT for the transition to
+            //    settle (sync; not the old fire-and-forget). By
+            //    this point we hold ZERO GLMemory refs into the
+            //    pipeline, so glupload's finalize can release
+            //    its GLBufferPool cleanly.
+            let _ = self.pipeline.set_state(gst::State::Null);
+            let (_res, cur, _pending) =
+                self.pipeline.state(gst::ClockTime::from_seconds(5));
+            if cur != gst::State::Null {
+                log::warn!(
+                    "[gst] pipeline did not reach NULL on Drop (cur={cur:?})"
+                );
+            }
+
+            // 6. Unset the bus sync handler. This drops the
+            //    closure that captured display_for_bus +
+            //    context_for_bus Arc clones, releasing those
+            //    refs. The wrapped GstGLDisplay / GstGLContext
+            //    fields on Self drop AFTER this method returns
+            //    (struct member drop order), at which point the
+            //    refcount on the wrapped ctx goes to zero;
+            //    gst-gl's finalize for a wrapped ctx does NOT
+            //    call eglDestroyContext / eglTerminate, so
+            //    blendr's Egl::drop still owns those.
             if let Some(bus) = self.pipeline.bus() {
                 bus.unset_sync_handler();
             }
