@@ -7768,6 +7768,20 @@ unsafe fn ensure_transition_fbo_pair(
         if let Some(tex) = session.transition_tex_b.take() {
             session.gl.delete_texture(tex);
         }
+        // Snapshot-side-A Commit 2.1 (2026-06-21): invalidate
+        // the captured still on mid-fade dims change too. A
+        // stale-dims still would blit at old dims into the new-
+        // dims fbo_a via run_blit_pass -> stretched frozen
+        // frame + orphaned-tex leak until the next free hook.
+        // Rare (mode change during ~1s fade -- HDMI hot-plug
+        // or rotation flip) + cosmetic but a correctness gap
+        // QA flagged on independent review. Inline take +
+        // delete mirrors the fbo/tex pattern above; can't call
+        // the free helper because we already hold &mut to
+        // session.gl via the surrounding context.
+        if let Some(tex) = session.transition_still_a_tex.take() {
+            session.gl.delete_texture(tex);
+        }
         session.transition_fbo_dims = None;
     }
     let (slot_fbo, slot_tex) = match side {
