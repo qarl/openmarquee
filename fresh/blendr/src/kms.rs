@@ -82,6 +82,23 @@ pub struct OutlierCtx {
 }
 
 impl Streams {
+    /// True iff a PendingDecoder is currently in flight on
+    /// the worker thread (eglCreateContext + share-group
+    /// context + pipeline + state(PAUSED/PLAYING) work).
+    /// During this window vc4/V3D contention disrupts the
+    /// presenter's render -> screen goes black. Run_loop uses
+    /// this to switch to hold-last-frame mode (skip
+    /// draw+swap+page-flip; the display continues scanning
+    /// out the last good framebuffer).
+    pub fn create_in_flight(&self) -> bool {
+        matches!(
+            self,
+            Streams::Cycle { pending_create: Some(_), .. }
+        )
+    }
+}
+
+impl Streams {
     /// Snapshot context for an outlier-frame log line.
     /// Called only when frame_ms > threshold (rare); the
     /// Mutex locks + format allocations are out of the
@@ -404,6 +421,15 @@ pub struct FrameStats {
     cum_fbo_dirty_count: u64,
     window_fbo_dirty_count: u64,
     last_fbo_dirty: bool,
+    /// Hold-last-frame: count of frames where run_loop
+    /// SKIPPED the GPU render+flip cycle because a
+    /// PendingDecoder worker was in flight (V3D contention
+    /// would black our render). Per-streak [hold] BEGIN/END
+    /// log; summary field. Each held frame leaves the display
+    /// showing the last good FB; no GPU work.
+    cum_hold_count: u64,
+    window_hold_count: u64,
+    last_hold: bool,
     /// Wall-clock at the previous frame's end. None on first
     /// frame (no delta to compute).
     last_present_end: Option<std::time::Instant>,
@@ -438,6 +464,9 @@ impl FrameStats {
             cum_fbo_dirty_count: 0,
             window_fbo_dirty_count: 0,
             last_fbo_dirty: false,
+            cum_hold_count: 0,
+            window_hold_count: 0,
+            last_hold: false,
             last_present_end: None,
             last_summary_at: now,
             run_start: now,
@@ -608,6 +637,7 @@ impl FrameStats {
             self.window_content_black_count = 0;
             self.window_egl_steal_count = 0;
             self.window_fbo_dirty_count = 0;
+            self.window_hold_count = 0;
         }
     }
 
@@ -628,6 +658,8 @@ impl FrameStats {
             (self.window_egl_steal_count as f32 / win_sec) * 60.0;
         let fbo_dirty_per_min =
             (self.window_fbo_dirty_count as f32 / win_sec) * 60.0;
+        let hold_per_min =
+            (self.window_hold_count as f32 / win_sec) * 60.0;
         log::info!(
             "[frame-stats] window={SUMMARY_INTERVAL_S}s frames={} mean={mean_f:.2}ms \
              p50={p50_f:.2} p99={p99_f:.2} p999={p999_f:.2} max={max_f:.2} \
@@ -636,6 +668,7 @@ impl FrameStats {
              content_black={} (CB/min={:.1}) \
              egl_steals={} (S/min={:.1}) \
              fbo_dirty={} (FD/min={:.1}) \
+             held={} (H/min={:.1}) \
              render_mean={mean_r:.2}ms render_max={max_r:.2}ms",
             win_frame.len(),
             self.window_long_count,
@@ -648,6 +681,8 @@ impl FrameStats {
             egl_steal_per_min,
             self.window_fbo_dirty_count,
             fbo_dirty_per_min,
+            self.window_hold_count,
+            hold_per_min,
         );
     }
 
@@ -668,6 +703,8 @@ impl FrameStats {
             (self.cum_egl_steal_count as f32 / run_sec) * 60.0;
         let fbo_dirty_per_min =
             (self.cum_fbo_dirty_count as f32 / run_sec) * 60.0;
+        let hold_per_min =
+            (self.cum_hold_count as f32 / run_sec) * 60.0;
         log::info!(
             "[frame-stats] FINAL run={run_sec:.1}s frames={} mean={mean_f:.2}ms \
              p50={p50_f:.2} p99={p99_f:.2} p999={p999_f:.2} max={max_f:.2} \
@@ -676,6 +713,7 @@ impl FrameStats {
              content_black={} (CB/min={:.1}) \
              egl_steals={} (S/min={:.1}) \
              fbo_dirty={} (FD/min={:.1}) \
+             held={} (H/min={:.1}) \
              render_mean={mean_r:.2}ms render_max={max_r:.2}ms",
             self.cum_frame_ms.len(),
             self.cum_long_count,
@@ -688,6 +726,8 @@ impl FrameStats {
             egl_steal_per_min,
             self.cum_fbo_dirty_count,
             fbo_dirty_per_min,
+            self.cum_hold_count,
+            hold_per_min,
         );
     }
 
@@ -696,6 +736,42 @@ impl FrameStats {
     pub fn stamp_present_end(&mut self, now: std::time::Instant) -> Option<f32> {
         let prev = self.last_present_end.replace(now);
         prev.map(|p| (now - p).as_secs_f32() * 1000.0)
+    }
+
+    /// Record a held-frame: run_loop skipped GPU render+flip
+    /// because a PendingDecoder was in flight (V3D contention
+    /// would black our render). Doesn't push to cum_frame_ms
+    /// / cum_render_ms -- those are for actual rendered
+    /// frames. Emits [hold] BEGIN/END at streak transitions.
+    pub fn note_hold(
+        &mut self,
+        held: bool,
+        frame_idx: u64,
+        streams: &Streams,
+    ) {
+        if held {
+            self.cum_hold_count += 1;
+            self.window_hold_count += 1;
+        }
+        if held && !self.last_hold {
+            let ctx = streams.outlier_context();
+            log::warn!(
+                "[hold] BEGIN frame={frame_idx} phase={} cycle={} \
+                 flags=[{}] ms_since_last_cycle_event={:?}",
+                ctx.phase_str,
+                ctx.cycle,
+                ctx.flags,
+                ctx.ms_since_cycle_event,
+            );
+        } else if !held && self.last_hold {
+            let ctx = streams.outlier_context();
+            log::warn!(
+                "[hold] END frame={frame_idx} phase={} cycle={}",
+                ctx.phase_str,
+                ctx.cycle,
+            );
+        }
+        self.last_hold = held;
     }
 }
 
@@ -1129,6 +1205,49 @@ mod linux {
                         "[kms] streams.tick failed at frame {frame_idx}: {e:#}"
                     );
                     return Err(e);
+                }
+
+                // HOLD-LAST-FRAME (post-API-fixes-all-refuted):
+                // All eight API-level fixes (None/steal/FBO
+                // detectors clean; surfaceless gst-gl ctx +
+                // worker thread + eglCreateContext-off-present)
+                // failed to kill the black flash. Confirmed
+                // root cause: V3D GPU-level contention during
+                // PendingDecoder worker's create work
+                // (decoder bringup + glupload negotiation +
+                // first-decode) disrupts the presenter's render
+                // for ~160ms at every cycle transition.
+                //
+                // Not a code bug we can re-assert away. Like
+                // the 2-decoder ceiling, it's a vc4/V3D
+                // hardware constraint.
+                //
+                // QA's pragmatic fix: when pending_create is
+                // in flight, SKIP the GPU render+flip cycle.
+                // The display continues scanning out the last
+                // good FB (no GPU work needed for that). A
+                // page-flip-to-already-front-fb is a no-op.
+                // Result: bounded ~160ms HOLD instead of black.
+                //
+                // After create completes (next tick), normal
+                // rendering resumes. The pending_create poll
+                // happens in streams.tick() above so this
+                // doesn't stall the create progress.
+                let held = streams.create_in_flight();
+                stats.note_hold(held, frame_idx, &*streams);
+                if held {
+                    // Still pace ourselves at ~vsync rate so
+                    // we keep polling pending_create + the
+                    // slideshow time advances. ~16ms sleep
+                    // matches 60Hz.
+                    std::thread::sleep(Duration::from_millis(16));
+                    // Stamp present-end so frame-stats sees the
+                    // hold as one continuous time block (no
+                    // record() call -- held frames aren't
+                    // "rendered" frames).
+                    let _ = stats.stamp_present_end(Instant::now());
+                    frame_idx += 1;
+                    continue;
                 }
 
                 // Phase 1 / Phase 2: pull latest texture(s)
