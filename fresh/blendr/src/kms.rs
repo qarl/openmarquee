@@ -60,6 +60,14 @@ pub enum Streams {
         /// Measurement infra: stamp at the start of each
         /// create (GstDecoder::new call) inside tick().
         last_create_at: Option<std::time::Instant>,
+        /// #2-alt: in-progress async decoder construction.
+        /// Some when the present thread kicked off start_async
+        /// but poll() hasn't observed Ready yet. The usize is
+        /// the slot index to receive the finalized GstDecoder.
+        /// At normal cadence (hold_sec=20s + create ~500ms)
+        /// this is None for ~97% of ticks; Some for ~30 ticks
+        /// per cycle while AwaitingPaused/AwaitingPlaying.
+        pending_create: Option<(usize, crate::gst_decode::PendingDecoder)>,
     },
 }
 
@@ -146,12 +154,13 @@ impl Streams {
     ) -> Result<()> {
         if let Streams::Cycle {
             playlist,
-            slots: _,
+            slots,
             next_idx,
             recreate_pending,
             slideshow,
-            last_retire_at: _,
-            last_create_at: _,
+            last_retire_at,
+            last_create_at,
+            pending_create,
         } = self
         {
             // Update alpha + check for phase change.
@@ -170,128 +179,159 @@ impl Streams {
                 }
             }
 
-            // Drain recreate_pending (single retire+recreate
-            // per phase, regardless of how many ticks elapse
-            // before we get here).
+            // Drain recreate_pending. Spawns the retire worker
+            // (off-thread per #2) and KICKS OFF the async create
+            // via PendingDecoder::start_async (#2-alt). The
+            // actual GstDecoder lands in slots later, on a tick
+            // when poll() observes Ready.
             if *recreate_pending {
                 *recreate_pending = false;
-                // visible_slot derives from phase:
-                //   HoldingA / FadingAtoB -> slot 0 visible
-                //   HoldingB / FadingBtoA -> slot 1 visible
-                let visible_slot = match slideshow.phase() {
-                    BlendPhase::HoldingA | BlendPhase::FadingAtoB => 0,
-                    BlendPhase::HoldingB | BlendPhase::FadingBtoA => 1,
-                };
-                let retire_slot = 1 - visible_slot;
-                let clip_to_load = playlist[*next_idx].clone();
-                let clip_name = clip_to_load
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?")
-                    .to_string();
-
-                // --- Step 1: log + read CMA pre-retire ----
-                let cma_pre = read_cma_free_kb();
-                log::info!(
-                    "[cycle] retire slot={retire_slot} \
-                     (CmaFree={cma_pre:?}kB) -- starting"
-                );
-                let t_retire = std::time::Instant::now();
-                // Measurement infra: stamp last_retire_at for
-                // [frame-long] near_retire flag.
-                let last_retire_at_slot = match self {
-                    Streams::Cycle { last_retire_at, .. } => last_retire_at,
-                    _ => unreachable!("outer match guarantees Cycle"),
-                };
-                *last_retire_at_slot = Some(t_retire);
-                // The local destructuring above re-borrowed
-                // self; from this point on use the existing
-                // outer destructured bindings (playlist, slots,
-                // ...). Re-shadow them by re-entering the match.
-                let (playlist, slots, next_idx, recreate_pending, slideshow, last_create_at) =
-                    if let Streams::Cycle { playlist, slots, next_idx, recreate_pending, slideshow, last_create_at, .. } = self {
-                        (playlist, slots, next_idx, recreate_pending, slideshow, last_create_at)
-                    } else { unreachable!() };
-                let _ = (playlist, recreate_pending);  // silence unused
-                let visible_slot = match slideshow.phase() {
-                    BlendPhase::HoldingA | BlendPhase::FadingAtoB => 0,
-                    BlendPhase::HoldingB | BlendPhase::FadingBtoA => 1,
-                };
-                let retire_slot = 1 - visible_slot;
-
-                // --- Step 2: retire (Drop the old decoder) on
-                //     a WORKER THREAD per QA #2 fix. The Drop
-                //     sequence (stop pull + join + clear refs +
-                //     FlushStart + NULL + state(5s) wait + bus
-                //     unset) takes ~50-300ms typical, ~5s worst.
-                //     Off-thread = present thread doesn't block.
-                //     Worker is short-lived; spawns once per
-                //     retire boundary (rate-limited to ~once per
-                //     hold_sec, default 20s).
-                let taken = slots[retire_slot].take();
-                if let Some(old) = taken {
-                    let label = format!("retire-slot{retire_slot}");
-                    let _ = std::thread::Builder::new()
-                        .name(label.clone())
-                        .spawn(move || {
-                            // GstDecoder::Drop runs here on the
-                            // worker. All the BUG 3/4/C
-                            // teardown machinery runs as before;
-                            // present thread doesn't wait.
-                            drop(old);
-                        });
-                    log::info!(
-                        "[cycle] retire slot={retire_slot} -> worker thread '{label}'"
+                if pending_create.is_some() {
+                    // Cycle outpaced previous create (degenerate;
+                    // would need create > hold_sec=20s). Skip this
+                    // cycle's retire+create; let the in-flight one
+                    // drive to completion. Slot visibility stays
+                    // with the previous pair until next phase.
+                    log::warn!(
+                        "[cycle] recreate_pending fired but previous create \
+                         still in flight (slot={}); skipping this cycle",
+                        pending_create.as_ref().unwrap().0
                     );
-                }
-                let retire_ms = t_retire.elapsed().as_millis();
-                log::info!(
-                    "[cycle] retire slot={retire_slot} present-thread elapsed_ms={retire_ms} (Drop deferred to worker)"
-                );
+                } else {
+                    let visible_slot = match slideshow.phase() {
+                        BlendPhase::HoldingA | BlendPhase::FadingAtoB => 0,
+                        BlendPhase::HoldingB | BlendPhase::FadingBtoA => 1,
+                    };
+                    let retire_slot = 1 - visible_slot;
+                    let clip_to_load = playlist[*next_idx].clone();
+                    let clip_name = clip_to_load
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                        .to_string();
 
-                // --- Step 3: log + create new decoder.
-                log::info!(
-                    "[cycle] create slot={retire_slot} clip={clip_name} -- starting"
-                );
-                let t_create = std::time::Instant::now();
-                *last_create_at = Some(t_create);
-                let new_dec =
-                    match crate::gst_decode::GstDecoder::new(egl, &clip_to_load) {
-                        Ok(d) => d,
+                    // --- Step 1: log + read CMA pre-retire ----
+                    let cma_pre = read_cma_free_kb();
+                    log::info!(
+                        "[cycle] retire slot={retire_slot} \
+                         (CmaFree={cma_pre:?}kB) -- starting"
+                    );
+                    let t_retire = std::time::Instant::now();
+                    *last_retire_at = Some(t_retire);
+
+                    // --- Step 2: retire on worker thread (#2) ---
+                    let taken = slots[retire_slot].take();
+                    if let Some(old) = taken {
+                        let label = format!("retire-slot{retire_slot}");
+                        let _ = std::thread::Builder::new()
+                            .name(label.clone())
+                            .spawn(move || {
+                                // GstDecoder::Drop runs here on
+                                // the worker. All the BUG 3/4/C
+                                // teardown machinery runs as
+                                // before; present thread does
+                                // not wait.
+                                drop(old);
+                            });
+                        log::info!(
+                            "[cycle] retire slot={retire_slot} -> worker thread '{label}'"
+                        );
+                    }
+                    let retire_ms = t_retire.elapsed().as_millis();
+                    log::info!(
+                        "[cycle] retire slot={retire_slot} \
+                         present-thread elapsed_ms={retire_ms} \
+                         (Drop deferred to worker)"
+                    );
+
+                    // --- Step 3: kick off async create (#2-alt) ---
+                    // start_async builds the pipeline + sub-bins +
+                    // issues set_state(PAUSED) without blocking.
+                    // The GStreamer streaming threads do the
+                    // preroll work off-thread. Polling in the next
+                    // tick drives the state machine.
+                    log::info!(
+                        "[cycle] create slot={retire_slot} clip={clip_name} \
+                         -- starting (async; polling each tick)"
+                    );
+                    let t_create = std::time::Instant::now();
+                    *last_create_at = Some(t_create);
+                    match crate::gst_decode::PendingDecoder::start_async(
+                        egl,
+                        &clip_to_load,
+                    ) {
+                        Ok(pd) => {
+                            *pending_create = Some((retire_slot, pd));
+                        }
                         Err(e) => {
                             log::error!(
-                                "[cycle] create slot={retire_slot} clip={clip_name} \
-                                 FAILED: {e:#}"
+                                "[cycle] create slot={retire_slot} \
+                                 clip={clip_name} start_async FAILED: {e:#}"
                             );
                             return Err(e);
                         }
-                    };
-                let create_ms = t_create.elapsed().as_millis();
-                let cma_post = read_cma_free_kb();
-                slots[retire_slot] = Some(new_dec);
-                log::info!(
-                    "[cycle] create slot={retire_slot} done elapsed_ms={create_ms} \
-                     CmaFree={cma_post:?}kB"
-                );
+                    }
 
-                // CMA brick-floor guard per project memory
-                // (Pi Zero 2 W bricks below ~50MB CmaFree).
-                if let Some(kb) = cma_post {
-                    if kb < 50_000 {
+                    *next_idx = (*next_idx + 1) % n;
+                    log::info!(
+                        "[cycle] next_idx={} playlist_len={n} \
+                         visible_slot={visible_slot} cycle={}",
+                        *next_idx,
+                        slideshow.cycle_count(),
+                    );
+                }
+            }
+
+            // --- Drive in-flight async create (#2-alt) ---
+            // Runs every tick. When None: zero work. When
+            // AwaitingPaused/AwaitingPlaying: one µs-scale
+            // pipeline.state(ZERO) call. When Ready: finalize
+            // (spawns pull thread) + swap into slot.
+            let finalize_now = if let Some((_, pd)) = pending_create.as_mut() {
+                match pd.poll() {
+                    Ok(crate::gst_decode::PendingState::Ready) => true,
+                    Ok(_) => false,
+                    Err(e) => {
                         log::error!(
-                            "[cycle] CMA LOW WARNING: CmaFree={kb}kB < 50MB \
-                             floor; soak may brick"
+                            "[cycle] pending create poll failed: {e:#}; dropping"
                         );
+                        true
                     }
                 }
-
-                *next_idx = (*next_idx + 1) % n;
-                log::info!(
-                    "[cycle] next_idx={} playlist_len={n} visible_slot={visible_slot} \
-                     cycle={}",
-                    *next_idx,
-                    slideshow.cycle_count(),
-                );
+            } else {
+                false
+            };
+            if finalize_now {
+                if let Some((slot_idx, pd)) = pending_create.take() {
+                    match pd.finalize() {
+                        Ok(dec) => {
+                            let create_ms = last_create_at
+                                .as_ref()
+                                .map(|t| t.elapsed().as_millis())
+                                .unwrap_or(0);
+                            let cma_post = read_cma_free_kb();
+                            slots[slot_idx] = Some(dec);
+                            log::info!(
+                                "[cycle] create slot={slot_idx} READY \
+                                 elapsed_ms={create_ms} CmaFree={cma_post:?}kB"
+                            );
+                            if let Some(kb) = cma_post {
+                                if kb < 50_000 {
+                                    log::error!(
+                                        "[cycle] CMA LOW WARNING: \
+                                         CmaFree={kb}kB < 50MB floor; \
+                                         soak may brick"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "[cycle] finalize failed (slot={slot_idx}): {e:#}"
+                            );
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -898,6 +938,7 @@ mod linux {
                         recreate_pending: _,
                         last_retire_at: _,
                         last_create_at: _,
+                        pending_create: _,
                     } => {
                         // Phase 3 v2: drain each slot decoder's
                         // pending pipeline commands (concat add-

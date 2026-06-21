@@ -258,6 +258,7 @@ fn run(args: Args) -> Result<()> {
                     slideshow,
                     last_retire_at: None,
                     last_create_at: None,
+                    pending_create: None,
                 }
             }
         }

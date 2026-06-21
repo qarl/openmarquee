@@ -58,6 +58,13 @@ mod stub {
     pub struct GstDecoder {
         pub tex_target: TexTarget,
     }
+    pub struct PendingDecoder;
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PendingState {
+        AwaitingPaused,
+        AwaitingPlaying,
+        Ready,
+    }
     impl GstDecoder {
         pub fn new(_egl: &crate::egl_gbm::Egl, _clip: &std::path::Path) -> Result<Self> {
             anyhow::bail!("GstDecoder: Linux only")
@@ -73,6 +80,23 @@ mod stub {
         }
         pub fn process_pending(&mut self) -> Result<()> {
             Ok(())
+        }
+    }
+    impl PendingDecoder {
+        pub fn start_async(
+            _egl: &crate::egl_gbm::Egl,
+            _clip: &std::path::Path,
+        ) -> Result<Self> {
+            anyhow::bail!("PendingDecoder: Linux only")
+        }
+        pub fn poll(&mut self) -> Result<PendingState> {
+            anyhow::bail!("PendingDecoder: Linux only")
+        }
+        pub fn finalize(self) -> Result<GstDecoder> {
+            anyhow::bail!("PendingDecoder: Linux only")
+        }
+        pub fn state(&self) -> PendingState {
+            PendingState::AwaitingPaused
         }
     }
 }
@@ -197,7 +221,79 @@ mod linux {
             Some(t.elapsed().as_millis())
         }
 
+        /// SYNC wrapper around PendingDecoder for startup paths
+        /// (main.rs initial decoders, Streams::Single). Mid-run
+        /// Streams::Cycle uses PendingDecoder directly to keep
+        /// the present thread non-blocking (#2-alt).
+        ///
+        /// Polls PendingDecoder in a tight loop until Ready or
+        /// 20s timeout. Equivalent behavior to the pre-#2-alt
+        /// blocking new() for callers that need a fully-driven
+        /// decoder in one call.
         pub fn new(egl: &Egl, clip: &Path) -> Result<Self> {
+            let mut p = PendingDecoder::start_async(egl, clip)?;
+            let timeout = std::time::Duration::from_secs(20);
+            let start = std::time::Instant::now();
+            while p.poll()? != PendingState::Ready {
+                if start.elapsed() > timeout {
+                    return Err(anyhow!(
+                        "GstDecoder::new sync timeout (state={:?})",
+                        p.state()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            p.finalize()
+        }
+    }
+
+    /// State of an in-progress async decoder construction.
+    /// #2-alt: GStreamer state transitions (PAUSED, PLAYING)
+    /// run on internal streaming threads. The expensive
+    /// 140-771ms in the old new() was the CALLER blocking in
+    /// pipeline.state(5s)/state(10s) waits. PendingDecoder
+    /// replaces those blocking waits with non-blocking
+    /// pipeline.state(ZERO) polls driven by the present thread
+    /// once per tick (~16ms). Per-poll cost is ~µs; total
+    /// wall-clock to Ready is the same as the sync path (the
+    /// actual work happens off-thread either way).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PendingState {
+        /// set_state(PAUSED) issued; waiting for preroll
+        /// (v4l2h264dec decoding first frame).
+        AwaitingPaused,
+        /// PAUSED reached; set_state(PLAYING) issued; waiting
+        /// for clock-sync to settle.
+        AwaitingPlaying,
+        /// PLAYING reached; ready for finalize() to spawn the
+        /// pull thread and return a usable GstDecoder.
+        Ready,
+    }
+
+    pub struct PendingDecoder {
+        inner: Option<GstDecoder>,
+        state: PendingState,
+        started_at: std::time::Instant,
+    }
+
+    impl PendingDecoder {
+        pub fn state(&self) -> PendingState {
+            self.state
+        }
+
+        /// Build everything (pipeline + sub-bins + bus handler +
+        /// GL context wrapping), issue set_state(PAUSED), and
+        /// return WITHOUT waiting. The caller drives subsequent
+        /// state transitions via poll() until Ready, then calls
+        /// finalize() to spawn the pull thread and get a
+        /// usable GstDecoder.
+        ///
+        /// pull_thread is None on the inner GstDecoder until
+        /// finalize(). Drop on a non-finalized PendingDecoder
+        /// works because GstDecoder::Drop handles pull_thread=
+        /// None and the BUG C FlushStart pattern is safe at
+        /// any pipeline state.
+        pub fn start_async(egl: &Egl, clip: &Path) -> Result<Self> {
             gst::init().context("gst::init")?;
 
             // (a) Wrap blendr's EGLDisplay + EGLContext per
@@ -446,83 +542,157 @@ mod linux {
                 me.add_next_clip()?;
             }
 
-            // (f) State -> PAUSED + wait.
-            log::info!("[gst] set_state(PAUSED) [{clip_basename}]");
+            // (f) #2-alt: State -> PAUSED (NON-blocking).
+            //     The old new() blocked here in pipeline.state(5s)
+            //     and again in state(10s) after PLAYING. That's
+            //     the 140-771ms freeze QA's SOURCE A residual
+            //     traced to.
+            //
+            //     set_state(PAUSED) returns StateChangeReturn
+            //     immediately (ASYNC for non-live pipelines like
+            //     ours: filesrc->qtdemux->h264parse->v4l2h264dec).
+            //     The actual transition (decoder open + caps
+            //     negotiation + first-buffer preroll) runs on
+            //     GStreamer streaming threads.
+            //
+            //     PendingDecoder::poll() drives non-blocking
+            //     pipeline.state(ZERO) checks per present-thread
+            //     tick. When AwaitingPaused observes settled
+            //     PAUSED, it issues set_state(PLAYING) and
+            //     transitions to AwaitingPlaying. When that
+            //     settles, state becomes Ready.
+            log::info!("[gst] [{clip_basename}] set_state(PAUSED) (async; will poll)");
             let preroll_ret = me
                 .pipeline
                 .set_state(gst::State::Paused)
                 .map_err(|e| anyhow!("set_state(PAUSED): {e:?}"))?;
-            log::info!("[gst] set_state(PAUSED) returned {preroll_ret:?}; waiting...");
-            let (wait_res, cur, pending) =
-                me.pipeline.state(gst::ClockTime::from_seconds(5));
             log::info!(
-                "[gst] state-wait after PAUSED: {wait_res:?} cur={cur:?} pending={pending:?}"
+                "[gst] [{clip_basename}] set_state(PAUSED) returned {preroll_ret:?}"
             );
-            if cur != gst::State::Paused {
+
+            Ok(PendingDecoder {
+                inner: Some(me),
+                state: PendingState::AwaitingPaused,
+                started_at: std::time::Instant::now(),
+            })
+        }
+
+        /// Drive the async state machine. Call once per present
+        /// thread tick. Returns the current state; when Ready,
+        /// the caller should call finalize() to spawn the pull
+        /// thread and consume self into a usable GstDecoder.
+        ///
+        /// Per-call cost: one Element::state(ZERO) call =
+        /// ~microseconds (mutex lock + state read). Plus one
+        /// log::info! per state transition (not per poll).
+        ///
+        /// Timeouts mirror the old sync new(): 10s for PAUSED,
+        /// 20s total. On timeout returns Err; caller drops the
+        /// PendingDecoder (its inner GstDecoder Drop cleans up
+        /// the pipeline normally).
+        pub fn poll(&mut self) -> Result<PendingState> {
+            let inner = self
+                .inner
+                .as_mut()
+                .ok_or_else(|| anyhow!("PendingDecoder already finalized"))?;
+            match self.state {
+                PendingState::AwaitingPaused => {
+                    let (_, cur, pending) =
+                        inner.pipeline.state(gst::ClockTime::ZERO);
+                    if cur == gst::State::Paused
+                        && pending == gst::State::VoidPending
+                    {
+                        let elapsed = self.started_at.elapsed().as_millis();
+                        log::info!(
+                            "[gst] [{}] PAUSED reached after {elapsed}ms; \
+                             set_state(PLAYING) (async)",
+                            inner.clip_basename
+                        );
+                        let play_ret = inner
+                            .pipeline
+                            .set_state(gst::State::Playing)
+                            .map_err(|e| anyhow!("set_state PLAYING: {e:?}"))?;
+                        log::info!(
+                            "[gst] [{}] set_state(PLAYING) returned {play_ret:?}",
+                            inner.clip_basename
+                        );
+                        self.state = PendingState::AwaitingPlaying;
+                    } else if self.started_at.elapsed()
+                        > std::time::Duration::from_secs(10)
+                    {
+                        return Err(anyhow!(
+                            "[{}] timeout awaiting PAUSED \
+                             (cur={cur:?} pending={pending:?})",
+                            inner.clip_basename
+                        ));
+                    }
+                }
+                PendingState::AwaitingPlaying => {
+                    let (_, cur, pending) =
+                        inner.pipeline.state(gst::ClockTime::ZERO);
+                    if cur == gst::State::Playing
+                        && pending == gst::State::VoidPending
+                    {
+                        let elapsed = self.started_at.elapsed().as_millis();
+                        log::info!(
+                            "[gst] [{}] PLAYING reached after {elapsed}ms; \
+                             concat add-next looping armed; ready to finalize",
+                            inner.clip_basename
+                        );
+                        self.state = PendingState::Ready;
+                    } else if self.started_at.elapsed()
+                        > std::time::Duration::from_secs(20)
+                    {
+                        return Err(anyhow!(
+                            "[{}] timeout awaiting PLAYING \
+                             (cur={cur:?} pending={pending:?})",
+                            inner.clip_basename
+                        ));
+                    }
+                }
+                PendingState::Ready => {}
+            }
+            Ok(self.state)
+        }
+
+        /// Consume self into a fully-driven GstDecoder. Spawns
+        /// the pull thread (per QA #2 fix: first-sample wait
+        /// deferred -- latest_sample populated naturally once
+        /// samples flow).
+        ///
+        /// Errors if state is not Ready. Idempotent panic-safe:
+        /// inner.take() leaves None behind so a second call
+        /// errors cleanly.
+        pub fn finalize(mut self) -> Result<GstDecoder> {
+            if self.state != PendingState::Ready {
                 return Err(anyhow!(
-                    "preroll did not settle to PAUSED \
-                     (cur={cur:?}, pending={pending:?})"
+                    "PendingDecoder::finalize called in state {:?}; \
+                     poll until Ready first",
+                    self.state
                 ));
             }
-
-            // (g) PLAYING + wait.
-            log::info!("[gst] set_state(PLAYING) [{clip_basename}]");
-            let play_ret = me
-                .pipeline
-                .set_state(gst::State::Playing)
-                .map_err(|e| anyhow!("set_state PLAYING: {e:?}"))?;
-            log::info!("[gst] set_state(PLAYING) returned {play_ret:?}; waiting...");
-            let (wait_res, cur, pending) =
-                me.pipeline.state(gst::ClockTime::from_seconds(10));
+            let mut inner = self
+                .inner
+                .take()
+                .ok_or_else(|| anyhow!("PendingDecoder already finalized"))?;
             log::info!(
-                "[gst] state-wait after PLAYING: {wait_res:?} cur={cur:?} pending={pending:?}"
+                "[gst] [{}] first-sample wait DEFERRED; spawning pull thread",
+                inner.clip_basename
             );
-            if cur != gst::State::Playing {
-                return Err(anyhow!(
-                    "pipeline did NOT reach PLAYING within 10s \
-                     (cur={cur:?} pending={pending:?})"
-                ));
-            }
-            log::info!("[gst] PLAYING confirmed; concat add-next looping armed");
-
-            // (h) DEFERRED first-sample wait per QA #2 fix.
-            //     Old: blocking try_pull_sample(5s) here was
-            //     the dominant cost in mid-run recreate (per QA
-            //     journal: create_ms 139-771ms, mostly this
-            //     wait). Now we just spawn the pull thread; it
-            //     populates latest_sample whenever the first
-            //     sample arrives naturally.
-            //
-            //     latest_texture() returns Ok(None) until the
-            //     first sample lands; in Streams::Cycle that's
-            //     fine because recreate happens during HoldingX
-            //     when the OTHER slot is visible. By the time
-            //     the next FadingX needs this slot, samples are
-            //     flowing (~50-500ms after PLAYING typical).
-            //
-            //     For startup (main.rs's initial decoders): the
-            //     first few render-loop frames may have no
-            //     video; black-clear shown briefly. Bounded;
-            //     once per process startup.
-            log::info!(
-                "[gst] [{clip_basename}] first-sample wait DEFERRED; \
-                 spawning pull thread"
-            );
-
-            // (i) Spawn pull thread.
-            let appsink_for_pull = me.appsink.clone();
-            let slot_for_pull = me.latest_sample.clone();
-            let stop_for_pull = me.stop.clone();
-            let thread_name = format!("blendr-gst-pull-{clip_basename}");
+            let appsink_for_pull = inner.appsink.clone();
+            let slot_for_pull = inner.latest_sample.clone();
+            let stop_for_pull = inner.stop.clone();
+            let thread_name = format!("blendr-gst-pull-{}", inner.clip_basename);
             let pull_thread = thread::Builder::new()
                 .name(thread_name)
                 .spawn(move || pull_loop(appsink_for_pull, slot_for_pull, stop_for_pull))
                 .context("spawn pull thread")?;
-            me.pull_thread = Some(pull_thread);
-
-            Ok(me)
+            inner.pull_thread = Some(pull_thread);
+            Ok(inner)
         }
+    }
 
+    impl GstDecoder {
         /// Append a new sub-bin (same clip) to concat. cutloop's
         /// add_next_clip ported to Rust. Called at init for
         /// pre-queue + by process_pending() on each EOS.
