@@ -56,6 +56,7 @@ mod stub {
             _alpha: f32,
         ) {
         }
+        pub fn release_video_bindings(&mut self) {}
     }
 }
 
@@ -785,6 +786,64 @@ mod linux {
                 body.len(),
             );
             Ok(())
+        }
+    }
+
+    impl Presenter {
+        /// BUG 4 fix: release any GL bindings into gst-managed
+        /// textures BEFORE gst pipeline teardown. Called from
+        /// main.rs after run_loop returns + before drop(streams).
+        ///
+        /// SYMPTOM (Phase 3 v1 glass): --capture runs deadlock
+        /// at teardown -- "[gst-pull] stop flag set; exiting"
+        /// logs then process spins 100% CPU holding /dev/video10
+        /// forever. WITHOUT --capture, clean exit. Theory: the
+        /// GL state still has TEXTURE0 / TEXTURE1 bound to a
+        /// soon-to-be-freed EXTERNAL_OES texture. When the
+        /// wrapped GstGLContext finalizes during pipeline NULL,
+        /// it walks tracked GL state to clean up; a binding
+        /// into a texture whose underlying GLMemory is being
+        /// concurrently released by gst-gl's pool finalize can
+        /// race -> deadlock or wedge.
+        ///
+        /// THIS METHOD: unbind both texture units (TEXTURE0 +
+        /// TEXTURE1) for both GL_TEXTURE_2D and
+        /// GL_TEXTURE_EXTERNAL_OES targets, clear our internal
+        /// video tex tracking, glFinish() to drain any pending
+        /// GL ops. After this, presenter holds no refs into
+        /// gst-managed textures; safe to drop streams.
+        ///
+        /// CRITICAL for Phase 3 v2: v2's retire+recreate runs
+        /// the GstDecoder::Drop path on EVERY clip change.
+        /// Without releasing the bindings between cycles, every
+        /// crossfade would hang the slideshow. v2 must call
+        /// this (or an equivalent) between hold-phase
+        /// transitions.
+        pub fn release_video_bindings(&mut self) {
+            self.video_tex_id = None;
+            self.video_target = None;
+            self.video_tex_id_b = None;
+            self.video_target_b = None;
+            unsafe {
+                use crate::gst_decode::GL_TEXTURE_EXTERNAL_OES;
+                self.gl.active_texture(glow::TEXTURE0);
+                self.gl.bind_texture(glow::TEXTURE_2D, None);
+                self.gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, None);
+                self.gl.active_texture(glow::TEXTURE1);
+                self.gl.bind_texture(glow::TEXTURE_2D, None);
+                self.gl.bind_texture(GL_TEXTURE_EXTERNAL_OES, None);
+                // Restore TEXTURE0 as the active unit.
+                self.gl.active_texture(glow::TEXTURE0);
+                // glFinish: block until all pending GL ops
+                // (including any sync objects gst-gl may have
+                // created) complete, so the subsequent
+                // gst-gl teardown sees a quiesced context.
+                self.gl.finish();
+            }
+            log::info!(
+                "[gl] release_video_bindings: TEXTURE0 + TEXTURE1 \
+                 unbound, glFinish complete"
+            );
         }
     }
 

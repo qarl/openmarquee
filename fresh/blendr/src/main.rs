@@ -78,6 +78,15 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     crossfade_sec: f32,
 
+    /// Debug aid (per QA ask): freeze the Phase 3 slideshow
+    /// at a fixed alpha. When set, the state machine bypasses
+    /// phase transitions and returns this alpha forever, so
+    /// --capture lands deterministically at a known blend
+    /// ratio instead of the frame-number lottery. Range [0.0,
+    /// 1.0]. Unset = normal animated slideshow.
+    #[arg(long)]
+    static_alpha: Option<f32>,
+
     /// Bypass /dev/dri/card* auto-probe. Use only for debug.
     #[arg(long)]
     card_override: Option<PathBuf>,
@@ -166,15 +175,25 @@ fn run(args: Args) -> Result<()> {
                 .context("GstDecoder::new (blend A)")?;
             let b = gst_decode::GstDecoder::new(&egl, clip_b)
                 .context("GstDecoder::new (blend B)")?;
-            let slideshow =
+            let mut slideshow =
                 kms::SlideshowState::new(args.hold_sec, args.crossfade_sec);
-            log::info!(
-                "[slideshow] starting: hold_sec={} crossfade_sec={} \
-                 (Phase 3 v1; --alpha={} no longer used unless hold_sec is huge)",
-                args.hold_sec,
-                args.crossfade_sec,
-                args.alpha,
-            );
+            if let Some(alpha) = args.static_alpha {
+                let clamped = alpha.clamp(0.0, 1.0);
+                slideshow.set_static_alpha(clamped);
+                log::info!(
+                    "[slideshow] starting: STATIC-ALPHA={} \
+                     (hold_sec / crossfade_sec IGNORED; phase transitions disabled)",
+                    clamped,
+                );
+            } else {
+                log::info!(
+                    "[slideshow] starting: hold_sec={} crossfade_sec={} \
+                     (Phase 3 v1; --alpha={} unused; --static-alpha not set)",
+                    args.hold_sec,
+                    args.crossfade_sec,
+                    args.alpha,
+                );
+            }
             kms::Streams::Blend { a, b, slideshow }
         }
         _ => kms::Streams::None,
@@ -192,6 +211,18 @@ fn run(args: Args) -> Result<()> {
         args.capture_after_frame,
         &signals::EXIT_REQUESTED,
     );
+
+    // BUG 4 fix: BEFORE drop(streams), reclaim EGL on the main
+    // thread and release any GL bindings the presenter holds
+    // into gst-managed textures. Without this, --capture runs
+    // wedge at teardown (Phase 3 v1 glass: "[gst-pull] stop
+    // flag set" logs then process spins on /dev/video10
+    // forever). Also critical for Phase 3 v2's per-clip
+    // retire+recreate path.
+    if let Err(e) = egl.make_current() {
+        log::warn!("[blendr] pre-teardown make_current failed: {e:#}");
+    }
+    pres.release_video_bindings();
 
     // LOAD-BEARING DROP ORDER:
     //   streams (each GstDecoder) -> presenter -> egl -> gbm

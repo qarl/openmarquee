@@ -56,6 +56,12 @@ pub struct SlideshowState {
     phase: BlendPhase,
     phase_started: std::time::Instant,
     cycle_count: u64,
+    /// Debug override per QA ask: when set, update() returns
+    /// this alpha forever and the phase machine is frozen at
+    /// HoldingA (cosmetic; alpha is what's actually read).
+    /// Lets QA deterministically capture at a known blend
+    /// ratio instead of guessing frame numbers.
+    static_alpha: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,11 +80,26 @@ impl SlideshowState {
             phase: BlendPhase::HoldingA,
             phase_started: std::time::Instant::now(),
             cycle_count: 0,
+            static_alpha: None,
         }
+    }
+
+    /// Debug override: freeze the slideshow at a fixed alpha.
+    /// Phase transitions stop firing; update() always returns
+    /// the same alpha + phase_changed=false. Per QA ask for
+    /// deterministic mid-fade captures.
+    pub fn set_static_alpha(&mut self, alpha: f32) {
+        self.static_alpha = Some(alpha.clamp(0.0, 1.0));
     }
 
     /// Returns (current_alpha, phase_changed_this_tick).
     pub fn update(&mut self) -> (f32, bool) {
+        // Static-alpha debug override (QA's --static-alpha
+        // flag): freeze at the configured value; no phase
+        // transitions.
+        if let Some(alpha) = self.static_alpha {
+            return (alpha, false);
+        }
         let elapsed = self.phase_started.elapsed().as_secs_f32();
         let mut changed = false;
         let alpha = match self.phase {
