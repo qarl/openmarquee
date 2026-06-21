@@ -77,6 +77,9 @@ mod stub {
         pub fn ms_since_last_concat_add(&self) -> Option<u128> {
             None
         }
+        pub fn last_was_new_sample(&self) -> bool {
+            false
+        }
         pub fn process_pending(&mut self) -> Result<()> {
             Ok(())
         }
@@ -220,11 +223,30 @@ mod linux {
         /// pbuffer surface.
         #[allow(dead_code)]
         share_group: crate::egl_gbm::ShareGroupContext,
+        /// Per-frame trace probe state: whether the most
+        /// recent latest_texture() returned a NEW sample
+        /// (adopted from the pull-thread slot) vs reused the
+        /// cached current_frame (= decoder starvation: no new
+        /// frame delivered this tick). Read by FrameTrace via
+        /// last_was_new_sample(). False if no sample has been
+        /// pulled yet (initial startup window).
+        last_was_new_sample: bool,
     }
 
     impl GstDecoder {
         pub fn last_pts_ns(&self) -> Option<u64> {
             self.last_pts_ns
+        }
+
+        /// Per-frame trace probe accessor. true iff the most
+        /// recent latest_texture() call adopted a NEW sample
+        /// from the pull-thread slot. false iff the cached
+        /// current_frame was reused (= no new frame delivered
+        /// this tick = decoder starvation). Used by FrameTrace
+        /// to surface qarl's "1s into new clip, frame sticks
+        /// for 50-125ms" symptom.
+        pub fn last_was_new_sample(&self) -> bool {
+            self.last_was_new_sample
         }
 
         /// Measurement infra: ms since the last concat sub-bin
@@ -707,6 +729,7 @@ mod linux {
                 gst_display,
                 gst_context,
                 share_group,
+                last_was_new_sample: false,
             };
 
             // (e) Pre-queue INITIAL_QUEUE_DEPTH sub-bins. concat
@@ -1024,6 +1047,8 @@ mod linux {
 
         /// Take latest sample (if any) and map to GL texture id.
         /// If no new sample, reuse cached current_frame.
+        /// Sets last_was_new_sample so FrameTrace can attribute
+        /// stuck frames to decoder starvation vs render cost.
         pub fn latest_texture(&mut self) -> Result<Option<(u32, TexTarget)>> {
             let new_sample = {
                 let mut guard = self.latest_sample.lock().map_err(|p| {
@@ -1032,9 +1057,11 @@ mod linux {
                 guard.take()
             };
             if let Some(sample) = new_sample {
+                self.last_was_new_sample = true;
                 let tex_id = self.adopt_sample(sample)?;
                 return Ok(Some((tex_id, self.tex_target)));
             }
+            self.last_was_new_sample = false;
             if let Some(frame) = self.current_frame.as_ref() {
                 let tex_id = frame
                     .texture_id(0)

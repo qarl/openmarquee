@@ -96,6 +96,45 @@ impl Streams {
             Streams::Cycle { pending_create: Some(_), .. }
         )
     }
+
+    /// Current BlendPhase (Cycle only; None for other
+    /// variants). Read by FrameTrace to detect Fading->Holding
+    /// transitions and start the ~2s trace window for qarl's
+    /// post-transition stuck-frame symptom.
+    pub fn current_phase(&self) -> Option<BlendPhase> {
+        match self {
+            Streams::Cycle { slideshow, .. } => Some(slideshow.phase()),
+            _ => None,
+        }
+    }
+
+    /// Per-slot cache-hit accessor for FrameTrace. true iff
+    /// the slot's GstDecoder reused its cached current_frame
+    /// instead of adopting a fresh sample from the pull
+    /// thread (= decoder starvation, the candidate for qarl's
+    /// post-transition stick). None iff the slot is empty.
+    pub fn slot_cache_hit(&self, idx: usize) -> Option<bool> {
+        match self {
+            Streams::Cycle { slots, .. } => slots
+                .get(idx)
+                .and_then(|s| s.as_ref())
+                .map(|d| !d.last_was_new_sample()),
+            Streams::Single(d) if idx == 0 => Some(!d.last_was_new_sample()),
+            _ => None,
+        }
+    }
+
+    /// Per-slot source PTS (nanoseconds) accessor.
+    pub fn slot_pts_ns(&self, idx: usize) -> Option<u64> {
+        match self {
+            Streams::Cycle { slots, .. } => slots
+                .get(idx)
+                .and_then(|s| s.as_ref())
+                .and_then(|d| d.last_pts_ns()),
+            Streams::Single(d) if idx == 0 => d.last_pts_ns(),
+            _ => None,
+        }
+    }
 }
 
 impl Streams {
@@ -775,6 +814,204 @@ impl FrameStats {
     }
 }
 
+/// ENV-gated per-frame trace probe for qarl's "~1s into new
+/// clip, single frame sticks for ~50-125ms" symptom (post-
+/// crossfade, during steady playback). Existing [frame-long]
+/// log is blind to this because the stuck frame's delta may
+/// be under 25ms or hidden in held-frame accounting.
+///
+/// Activated via env BLENDR_FRAME_TRACE=1. Output file via
+/// BLENDR_FRAME_TRACE_FILE (default /tmp/blendr-frame-trace.log).
+/// Writes directly to file (NOT to journald) -- per QA: heavy
+/// journal reads themselves perturb the renderer, proven on
+/// glass.
+///
+/// For each FadingX -> HoldingX phase transition, opens a
+/// ~2s trace window and writes EVERY frame within it:
+///   [trace] ms_since_xn=N delta_ms=X render_ms=Y \
+///     cache_hit_a=bool cache_hit_b=bool \
+///     pts_a_ns=NN pts_b_ns=NN present_skipped=bool
+///
+/// cache_hit_X: true iff slot X's GstDecoder reused its
+/// cached current_frame instead of adopting a fresh sample
+/// from the pull-thread slot -- a TRUE indicates decoder
+/// starvation (no new frame delivered this tick), the most
+/// plausible candidate for qarl's stick.
+///
+/// present_skipped: true iff run_loop took the hold-last-
+/// frame skip path (create-in-flight). Distinguishes
+/// "we deliberately didn't render" from "we rendered a stale
+/// frame."
+///
+/// Cost when disabled: ZERO (file=None, all writes
+/// short-circuit). Cost when enabled: one writeln to disk
+/// per frame in the trace window (~2s * ~60fps = ~120 lines
+/// per transition).
+pub struct FrameTrace {
+    file: Option<std::fs::File>,
+    /// Wall-clock of the most recent FadingX->HoldingX
+    /// transition. Used to compute ms_since_xn.
+    transition_at: Option<std::time::Instant>,
+    /// End of the active trace window (transition_at + 2s).
+    /// If None or now > this, no per-frame logging.
+    trace_window_end: Option<std::time::Instant>,
+    /// Previous-tick phase. Used to detect Fading->Holding
+    /// transition.
+    prev_phase: Option<BlendPhase>,
+}
+
+const TRACE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
+
+impl FrameTrace {
+    pub fn from_env() -> Self {
+        let file = if std::env::var("BLENDR_FRAME_TRACE").as_deref() == Ok("1") {
+            let path = std::env::var("BLENDR_FRAME_TRACE_FILE")
+                .unwrap_or_else(|_| "/tmp/blendr-frame-trace.log".to_string());
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(f) => {
+                    log::warn!(
+                        "[trace] BLENDR_FRAME_TRACE=1; appending per-frame trace \
+                         (~2s post-transition) to {path}"
+                    );
+                    Some(f)
+                }
+                Err(e) => {
+                    log::error!(
+                        "[trace] BLENDR_FRAME_TRACE=1 but failed to open {path}: \
+                         {e:#}; trace DISABLED"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Self {
+            file,
+            transition_at: None,
+            trace_window_end: None,
+            prev_phase: None,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// Call once per iter AFTER streams.tick. If the slideshow
+    /// phase just transitioned from a Fading variant to a
+    /// Holding variant, start a ~2s trace window. Writes a
+    /// TRANSITION marker line to the file.
+    pub fn note_phase_if_changed(
+        &mut self,
+        cur_phase: Option<BlendPhase>,
+        cycle: u64,
+    ) {
+        if self.file.is_none() {
+            self.prev_phase = cur_phase;
+            return;
+        }
+        let prev = self.prev_phase;
+        self.prev_phase = cur_phase;
+        let (Some(prev_p), Some(cur_p)) = (prev, cur_phase) else {
+            return;
+        };
+        if prev_p == cur_p {
+            return;
+        }
+        // Trigger only on Fading -> Holding (= crossfade complete,
+        // new clip enters steady playback). qarl's symptom fires
+        // ~1s after this.
+        let was_fading = matches!(
+            prev_p,
+            BlendPhase::FadingAtoB | BlendPhase::FadingBtoA
+        );
+        let now_holding = matches!(
+            cur_p,
+            BlendPhase::HoldingA | BlendPhase::HoldingB
+        );
+        if !(was_fading && now_holding) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.transition_at = Some(now);
+        self.trace_window_end = Some(now + TRACE_WINDOW);
+        if let Some(f) = self.file.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "[trace] TRANSITION at_unix_ms=N/A phase={prev_p:?}->{cur_p:?} \
+                 cycle={cycle} window={}ms",
+                TRACE_WINDOW.as_millis()
+            );
+            let _ = f.flush();
+        }
+    }
+
+    /// Call once per iter AFTER render+flip (or after the
+    /// hold-last-frame skip). If the trace window is open,
+    /// writes a [trace] line for THIS frame.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_frame(
+        &mut self,
+        now: std::time::Instant,
+        delta_ms: f32,
+        render_ms: f32,
+        cache_hit_a: Option<bool>,
+        cache_hit_b: Option<bool>,
+        pts_a_ns: Option<u64>,
+        pts_b_ns: Option<u64>,
+        present_skipped: bool,
+    ) {
+        let trace_until = match self.trace_window_end {
+            Some(t) => t,
+            None => return,
+        };
+        if now > trace_until {
+            // Window closed; clear so next transition reopens.
+            self.trace_window_end = None;
+            return;
+        }
+        let transition_at = match self.transition_at {
+            Some(t) => t,
+            None => return,
+        };
+        let ms_since_xn = (now - transition_at).as_millis();
+        if let Some(f) = self.file.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "[trace] ms_since_xn={ms_since_xn} delta_ms={delta_ms:.2} \
+                 render_ms={render_ms:.2} cache_hit_a={} cache_hit_b={} \
+                 pts_a_ns={} pts_b_ns={} present_skipped={present_skipped}",
+                format_opt_bool(cache_hit_a),
+                format_opt_bool(cache_hit_b),
+                format_opt_u64(pts_a_ns),
+                format_opt_u64(pts_b_ns),
+            );
+        }
+    }
+}
+
+fn format_opt_bool(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "-",
+    }
+}
+
+fn format_opt_u64(v: Option<u64>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "-".to_string(),
+    }
+}
+
 /// Compute (mean, p50, p99, p999, max) of a sample slice.
 /// Sorts a copy (so the caller's data is untouched).
 fn pct_stats(samples: &[f32]) -> (f32, f32, f32, f32, f32) {
@@ -1179,6 +1416,18 @@ mod linux {
         let mut stats = FrameStats::new();
         log::info!("[frame-stats] instrumentation armed; summary every 30s");
 
+        // Per-frame trace probe (qarl's ~1s-post-transition
+        // stuck-frame symptom). Disabled unless BLENDR_FRAME_
+        // TRACE=1. Output: BLENDR_FRAME_TRACE_FILE or
+        // /tmp/blendr-frame-trace.log. Cost when disabled: 0.
+        let mut frame_trace = FrameTrace::from_env();
+        if frame_trace.is_enabled() {
+            log::warn!(
+                "[trace] per-frame probe ENABLED; will log every frame for \
+                 ~2s after each Fading->Holding phase transition"
+            );
+        }
+
         let result: Result<()> = (|| {
             loop {
                 if exit_flag.load(Ordering::Relaxed) {
@@ -1205,6 +1454,18 @@ mod linux {
                         "[kms] streams.tick failed at frame {frame_idx}: {e:#}"
                     );
                     return Err(e);
+                }
+
+                // Per-frame trace: detect Fading->Holding
+                // transition AFTER streams.tick advanced the
+                // slideshow phase. Opens a ~2s trace window.
+                {
+                    let cur_phase = streams.current_phase();
+                    let cycle = match &*streams {
+                        super::Streams::Cycle { slideshow, .. } => slideshow.cycle_count(),
+                        _ => 0,
+                    };
+                    frame_trace.note_phase_if_changed(cur_phase, cycle);
                 }
 
                 // HOLD-LAST-FRAME (post-API-fixes-all-refuted):
@@ -1245,7 +1506,19 @@ mod linux {
                     // hold as one continuous time block (no
                     // record() call -- held frames aren't
                     // "rendered" frames).
-                    let _ = stats.stamp_present_end(Instant::now());
+                    let now_end = Instant::now();
+                    let delta = stats.stamp_present_end(now_end);
+                    // Trace probe: held frames count too (we
+                    // didn't render but the display held a
+                    // good frame).
+                    frame_trace.record_frame(
+                        now_end,
+                        delta.unwrap_or(0.0),
+                        0.0,                  // render_ms
+                        None, None,           // cache_hit_a/b N/A (no pull)
+                        None, None,           // pts_a/b N/A
+                        true,                 // present_skipped
+                    );
                     frame_idx += 1;
                     continue;
                 }
@@ -1511,7 +1784,8 @@ mod linux {
                 // NEXT iteration so frame_ms is roughly
                 // page_flip-call to page_flip-call cadence =
                 // present cadence).
-                if let Some(frame_ms) = stats.stamp_present_end(Instant::now()) {
+                let present_end = Instant::now();
+                if let Some(frame_ms) = stats.stamp_present_end(present_end) {
                     stats.record(
                         frame_ms,
                         render_ms,
@@ -1522,6 +1796,21 @@ mod linux {
                         stolen,
                         fbo_dirty,
                         prev_fbo,
+                    );
+                    // Per-frame trace probe: rendered branch.
+                    // Capture cache_hit + PTS from each slot
+                    // AFTER the pulls above already populated
+                    // GstDecoder.last_was_new_sample +
+                    // last_pts_ns.
+                    frame_trace.record_frame(
+                        present_end,
+                        frame_ms,
+                        render_ms,
+                        streams.slot_cache_hit(0),
+                        streams.slot_cache_hit(1),
+                        streams.slot_pts_ns(0),
+                        streams.slot_pts_ns(1),
+                        false,  // present_skipped: this is the rendered branch
                     );
                 }
 
