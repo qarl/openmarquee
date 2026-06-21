@@ -83,6 +83,9 @@ mod stub {
         pub fn process_pending(&mut self) -> Result<()> {
             Ok(())
         }
+        pub fn switch_to_clip(&mut self, _new_clip: &std::path::Path) -> Result<()> {
+            anyhow::bail!("switch_to_clip: Linux only")
+        }
     }
     impl PendingDecoder {
         pub fn start_async(
@@ -1117,6 +1120,119 @@ mod linux {
                  (queue_depth_after={depth_after})",
                 self.clip_basename
             );
+            Ok(())
+        }
+
+        /// Persistent-pipeline clip switch (cutloop EOS-swap
+        /// pattern; M1 of the real fix for the morning's
+        /// vc4/V3D create-blanks-presenter root). Replaces the
+        /// retire+recreate handoff: same v4l2h264dec + same
+        /// pipeline state PLAYING throughout; only the
+        /// concat sub-bin queue is updated.
+        ///
+        /// Mechanics:
+        ///   1. self.clip_path := new_clip (so future
+        ///      add_next_clip calls -- triggered by EOS-probe
+        ///      -> AddNextClip command -- naturally queue the
+        ///      NEW clip).
+        ///   2. Retire all NON-FRONT sub-bins (they were
+        ///      queued OLD; we want NEW queued instead). The
+        ///      front sub-bin (currently playing OLD) stays
+        ///      and plays to its natural EOS.
+        ///   3. add_next_clip() -- queues ONE NEW-clip sub-bin
+        ///      behind the OLD-front.
+        ///
+        /// At natural EOS of OLD-front (~0-5s for our 4.75s
+        /// clips), concat absorbs the EOS, our EOS-probe sends
+        /// AddNextClip via mpsc, process_pending adds another
+        /// NEW sub-bin (clip_path is now NEW), queue becomes
+        /// [NEW-promoted, NEW-queued] = natural NEW looping
+        /// resumes.
+        ///
+        /// What this AVOIDS (= the morning's root cause):
+        /// no eglCreateContext, no GLContext::new_wrapped, no
+        /// new GLBufferPool, no glupload caps renegotiation,
+        /// no decoder STREAMOFF/STREAMON, no FLUSH events on
+        /// v4l2h264dec (cutloop principle: "permanent never-
+        /// flush pads"). The vc4 V3D has no per-transition
+        /// work to do; the presenter renders normally.
+        ///
+        /// Caps assumption: NEW clip has same caps as OLD
+        /// (h264 720p 24fps Main 0-B uniform for our 17-clip
+        /// reel per QA ffprobe). If caps differ, glupload
+        /// renegotiates -> we're back to the contention.
+        /// h264parse config-interval=-1 + matching caps make
+        /// the SPS/PPS update seamless on the shared decoder.
+        ///
+        /// Timing: switch_to_clip must be called early enough
+        /// that OLD-front EOSes BEFORE the next FadingX
+        /// requires this slot. With default hold_sec=20s and
+        /// 4.75s clips, OLD EOSes within ~5s of the call ->
+        /// ample margin. For short hold_sec or long clips,
+        /// the NEW clip might not be ready in time -- caller
+        /// (Streams::tick) chooses when to invoke.
+        pub fn switch_to_clip(&mut self, new_clip: &Path) -> Result<()> {
+            let old_basename = self.clip_basename.clone();
+            let new_basename = new_clip
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            // 1. Update clip_path so future add_next_clip uses
+            //    the new clip. self.clip_path is only read on
+            //    the present thread (this fn + add_next_clip
+            //    via process_pending), so no synchronization
+            //    needed.
+            self.clip_path = new_clip.to_path_buf();
+            // Update basename for log clarity; the EOS-probe
+            // closures captured the OLD basename at creation
+            // time (immutable), so older sub-bins still log
+            // under OLD's name -- intentional, lets QA see
+            // the boundary in the trace.
+            self.clip_basename = new_basename.clone();
+
+            // 2. Retire all NON-FRONT sub-bins. front =
+            //    currently-playing OLD; stays. Anything queued
+            //    after front is queued OLD (from prior loop
+            //    add_next_clip); we replace those with NEW.
+            let serials_to_retire: Vec<u64> = {
+                let q = self.sub_bins.lock().unwrap();
+                q.iter().skip(1).map(|s| s.serial).collect()
+            };
+            for s in &serials_to_retire {
+                if let Err(e) = self.retire_subgraph(*s) {
+                    log::warn!(
+                        "[gst-cl] {old_basename}->{new_basename} \
+                         switch_to_clip retire serial={s} failed: {e:#}"
+                    );
+                }
+            }
+            log::info!(
+                "[gst-cl] {old_basename}->{new_basename} switch_to_clip: \
+                 retired {} non-front sub-bins (OLD-front continues to \
+                 natural EOS)",
+                serials_to_retire.len()
+            );
+
+            // 3. Queue ONE NEW-clip sub-bin behind the OLD-
+            //    front. concat picks it up at OLD's EOS.
+            self.add_next_clip().with_context(|| {
+                format!(
+                    "switch_to_clip add_next_clip for {new_basename}"
+                )
+            })?;
+
+            // Trace marker on present thread for QA correlation.
+            if crate::kms::trace_enabled() {
+                crate::kms::trace_writeln(&format!(
+                    "[trace-switch] ts_ms={} event=DONE \
+                     old={old_basename} new={new_basename} \
+                     non_front_retired={}",
+                    crate::kms::trace_ts_ms(),
+                    serials_to_retire.len()
+                ));
+            }
+
             Ok(())
         }
 
