@@ -800,6 +800,30 @@ mod linux {
             log::info!("[gst-drop] {name} step=1 set stop flag");
             self.stop.store(true, Ordering::Relaxed);
 
+            // BUG C (Phase 3 v2 prereq): the back-pressure fix
+            // (appsink set_drop(false) in BUG A v3) blocks the
+            // streaming thread upstream when appsink is full.
+            // At teardown, after stop flag is set, the pull
+            // thread stops pulling -> appsink fills -> streaming
+            // thread parks in blocking push -> set_state(NULL)
+            // at step=6 deadlocks (no thread to handle the
+            // transition). Symptom (QA 3x reproduce on 66e8fa2):
+            // RuntimeMaxSec timeout, ExecMainStatus=9.
+            //
+            // FIX: send FLUSH_START on the pipeline BEFORE join.
+            // FlushStart propagates upstream + returns blocked
+            // src-pad pushes with FLOW_FLUSHING; streaming
+            // thread can return, observe stop intent, and let
+            // NULL transition proceed. We don't send FlushStop
+            // because we're going to NULL, not resuming.
+            //
+            // CRITICAL for Phase 3 v2: retire+recreate runs
+            // this Drop on EVERY clip change. Without FlushStart
+            // here, every retire would hang the slideshow.
+            log::info!("[gst-drop] {name} step=1.5 sending FLUSH_START");
+            self.pipeline
+                .send_event(gst::event::FlushStart::new());
+
             log::info!("[gst-drop] {name} step=2 joining pull thread");
             if let Some(h) = self.pull_thread.take() {
                 let _ = h.join();
