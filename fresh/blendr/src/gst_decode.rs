@@ -61,8 +61,7 @@ mod stub {
     pub struct PendingDecoder;
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum PendingState {
-        AwaitingPaused,
-        AwaitingPlaying,
+        AwaitingWorker,
         Ready,
     }
     impl GstDecoder {
@@ -96,7 +95,7 @@ mod stub {
             anyhow::bail!("PendingDecoder: Linux only")
         }
         pub fn state(&self) -> PendingState {
-            PendingState::AwaitingPaused
+            PendingState::AwaitingWorker
         }
     }
 }
@@ -204,6 +203,23 @@ mod linux {
         gst_display: gst_gl::GLDisplay,
         #[allow(dead_code)]
         gst_context: gst_gl::GLContext,
+        /// Dedicated EGL share-group context that gst-gl
+        /// wraps (instead of the presenter context). gst-gl's
+        /// streaming threads eglMakeCurrent THIS context for
+        /// glupload/GLBufferPool work -- they never touch the
+        /// presenter context or window surface, eliminating
+        /// the black-flash root cause (all-cheap-fixes-refuted
+        /// black during create).
+        ///
+        /// Textures created on this context are visible from
+        /// the presenter context via share-group semantics.
+        ///
+        /// Dropped LAST in the Drop sequence (after pipeline
+        /// NULL + bus unset so gst-gl has released its hold).
+        /// ShareGroupContext::Drop destroys the EGL context +
+        /// pbuffer surface.
+        #[allow(dead_code)]
+        share_group: crate::egl_gbm::ShareGroupContext,
     }
 
     impl GstDecoder {
@@ -222,17 +238,15 @@ mod linux {
         }
 
         /// SYNC wrapper around PendingDecoder for startup paths
-        /// (main.rs initial decoders, Streams::Single). Mid-run
-        /// Streams::Cycle uses PendingDecoder directly to keep
-        /// the present thread non-blocking (#2-alt).
-        ///
-        /// Polls PendingDecoder in a tight loop until Ready or
-        /// 20s timeout. Equivalent behavior to the pre-#2-alt
-        /// blocking new() for callers that need a fully-driven
-        /// decoder in one call.
+        /// (main.rs initial decoders, Streams::Single). Calls
+        /// PendingDecoder::start_async + tight poll loop with
+        /// 10ms sleep until Ready. Uses the same worker-thread
+        /// + share-group architecture as mid-run cycles so all
+        /// gst-gl GL ops are isolated from the presenter
+        /// context regardless of when the decoder is created.
         pub fn new(egl: &Egl, clip: &Path) -> Result<Self> {
             let mut p = PendingDecoder::start_async(egl, clip)?;
-            let timeout = std::time::Duration::from_secs(20);
+            let timeout = std::time::Duration::from_secs(30);
             let start = std::time::Instant::now();
             while p.poll()? != PendingState::Ready {
                 if start.elapsed() > timeout {
@@ -248,32 +262,50 @@ mod linux {
     }
 
     /// State of an in-progress async decoder construction.
-    /// #2-alt: GStreamer state transitions (PAUSED, PLAYING)
-    /// run on internal streaming threads. The expensive
-    /// 140-771ms in the old new() was the CALLER blocking in
-    /// pipeline.state(5s)/state(10s) waits. PendingDecoder
-    /// replaces those blocking waits with non-blocking
-    /// pipeline.state(ZERO) polls driven by the present thread
-    /// once per tick (~16ms). Per-poll cost is ~µs; total
-    /// wall-clock to Ready is the same as the sync path (the
-    /// actual work happens off-thread either way).
+    /// Black-flash fix: gst-gl's GL work (set_state PAUSED/
+    /// PLAYING preroll + glupload negotiation) now runs on a
+    /// WORKER THREAD holding a dedicated share-group EGL
+    /// context. The present thread sees only:
+    ///   start_async (~ms; create share-group context + spawn
+    ///                worker)
+    ///   poll        (~µs; non-blocking mpsc try_recv)
+    ///   finalize    (~ns; move the worker-delivered
+    ///                GstDecoder out)
+    ///
+    /// Pre-fix history:
+    ///   - #2 (78bcdaf): off-present-thread retire.
+    ///   - #2-alt (4df9b2a): replace pipeline.state(5s/10s)
+    ///     waits with non-blocking poll on present thread.
+    ///     RESULT: traded ~600ms freeze for ~160-500ms black
+    ///     flash (QA proof: solid-black PNG mid-create).
+    ///   - 96e6c78 + d917239: cheap fixes (EGL steal repair,
+    ///     FBO rebind) -- ALL REFUTED (egl_steals=0,
+    ///     fbo_dirty=0). gst-gl was doing actual draw/clear
+    ///     ops on OUR window surface during its glupload
+    ///     negotiation, not corrupting bindings we could
+    ///     re-assert.
+    ///   - THIS (worker + share-group): full isolation. Worker
+    ///     holds share-group context; gst-gl streaming threads
+    ///     eglMakeCurrent THAT context; presenter context +
+    ///     window surface never touched.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum PendingState {
-        /// set_state(PAUSED) issued; waiting for preroll
-        /// (v4l2h264dec decoding first frame).
-        AwaitingPaused,
-        /// PAUSED reached; set_state(PLAYING) issued; waiting
-        /// for clock-sync to settle.
-        AwaitingPlaying,
-        /// PLAYING reached; ready for finalize() to spawn the
-        /// pull thread and return a usable GstDecoder.
+        /// Worker thread is building the decoder (pipeline +
+        /// PAUSED preroll + PLAYING transition + pull-thread
+        /// spawn). All gst-gl work happens on the worker's
+        /// share-group context, not the presenter's.
+        AwaitingWorker,
+        /// Worker has delivered the finished GstDecoder via
+        /// the mpsc channel; finalize() can move it out.
         Ready,
     }
 
     pub struct PendingDecoder {
-        inner: Option<GstDecoder>,
         state: PendingState,
+        rx: mpsc::Receiver<Result<GstDecoder>>,
+        completed: Option<GstDecoder>,
         started_at: std::time::Instant,
+        clip_basename: String,
     }
 
     impl PendingDecoder {
@@ -281,48 +313,173 @@ mod linux {
             self.state
         }
 
-        /// Build everything (pipeline + sub-bins + bus handler +
-        /// GL context wrapping), issue set_state(PAUSED), and
-        /// return WITHOUT waiting. The caller drives subsequent
-        /// state transitions via poll() until Ready, then calls
-        /// finalize() to spawn the pull thread and get a
-        /// usable GstDecoder.
+        /// Create the share-group EGL context (cheap; FFI only)
+        /// and spawn a worker thread that builds the entire
+        /// GstDecoder (pipeline + sub-bins + PAUSED + PLAYING +
+        /// pull-thread). Returns immediately with a
+        /// PendingDecoder whose poll() picks up the finished
+        /// GstDecoder via mpsc.
         ///
-        /// pull_thread is None on the inner GstDecoder until
-        /// finalize(). Drop on a non-finalized PendingDecoder
-        /// works because GstDecoder::Drop handles pull_thread=
-        /// None and the BUG C FlushStart pattern is safe at
-        /// any pipeline state.
+        /// The worker uses the share-group context so gst-gl's
+        /// GL ops never touch the presenter context or window
+        /// surface -- this kills the black flash that all
+        /// cheap fixes failed to reach.
         pub fn start_async(egl: &Egl, clip: &Path) -> Result<Self> {
-            gst::init().context("gst::init")?;
+            let clip_basename = clip
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let clip_path = clip.to_path_buf();
 
-            // (a) Wrap blendr's EGLDisplay + EGLContext per
-            //     proven Phase 1 setup.
-            let egl_display_ptr = egl.display.as_ptr() as usize;
-            let gst_display: gst_gl::GLDisplay = unsafe {
-                gst_gl_egl::GLDisplayEGL::with_egl_display(egl_display_ptr)
-                    .map_err(|e| anyhow!("GLDisplayEGL::with_egl_display: {e}"))?
+            // Share-group context creation runs on the present
+            // thread (called sites are pre-frame): it's just
+            // 2 EGL FFI (eglCreateContext + eglCreatePbuffer-
+            // Surface), no GL ops. Sub-ms.
+            let share_group = egl
+                .create_share_group_context()
+                .context("create share-group context for PendingDecoder worker")?;
+
+            // mpsc oneshot for worker -> present.
+            let (tx, rx) = mpsc::channel::<Result<GstDecoder>>();
+            let basename_for_worker = clip_basename.clone();
+            std::thread::Builder::new()
+                .name(format!("blendr-pending-{clip_basename}"))
+                .spawn(move || {
+                    let r = build_on_worker(
+                        share_group,
+                        clip_path,
+                        basename_for_worker,
+                    );
+                    let _ = tx.send(r);
+                })
+                .context("spawn PendingDecoder worker")?;
+
+            log::info!(
+                "[gst] [{clip_basename}] worker spawned (share-group EGL); \
+                 present thread unblocked"
+            );
+            Ok(PendingDecoder {
+                state: PendingState::AwaitingWorker,
+                rx,
+                completed: None,
+                started_at: std::time::Instant::now(),
+                clip_basename,
+            })
+        }
+
+        /// Non-blocking check whether the worker has delivered
+        /// the GstDecoder. Per-call cost: one mpsc try_recv
+        /// (~ns). When Ready, the caller calls finalize() to
+        /// take the GstDecoder out.
+        pub fn poll(&mut self) -> Result<PendingState> {
+            if self.state == PendingState::Ready {
+                return Ok(self.state);
             }
-            .upcast();
-            let egl_ctx_handle = egl.context.as_ptr() as usize;
-            let gst_context: gst_gl::GLContext = unsafe {
-                gst_gl::GLContext::new_wrapped(
-                    &gst_display,
-                    egl_ctx_handle,
-                    gst_gl::GLPlatform::EGL,
-                    gst_gl::GLAPI::GLES2,
+            match self.rx.try_recv() {
+                Ok(Ok(dec)) => {
+                    let elapsed = self.started_at.elapsed().as_millis();
+                    log::info!(
+                        "[gst] [{}] worker delivered GstDecoder after {elapsed}ms",
+                        self.clip_basename
+                    );
+                    self.completed = Some(dec);
+                    self.state = PendingState::Ready;
+                }
+                Ok(Err(e)) => {
+                    let elapsed = self.started_at.elapsed().as_millis();
+                    log::error!(
+                        "[gst] [{}] worker FAILED after {elapsed}ms: {e:#}",
+                        self.clip_basename
+                    );
+                    return Err(e);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(anyhow!(
+                        "[{}] PendingDecoder worker disconnected without \
+                         sending (panic?)",
+                        self.clip_basename
+                    ));
+                }
+            }
+            Ok(self.state)
+        }
+
+        /// Move the completed GstDecoder out. Errors if poll()
+        /// hasn't returned Ready yet.
+        pub fn finalize(mut self) -> Result<GstDecoder> {
+            if self.state != PendingState::Ready {
+                return Err(anyhow!(
+                    "PendingDecoder::finalize called in state {:?}; \
+                     poll until Ready first",
+                    self.state
+                ));
+            }
+            self.completed.take().ok_or_else(|| {
+                anyhow!(
+                    "[{}] PendingDecoder already finalized",
+                    self.clip_basename
                 )
-            }
-            .ok_or_else(|| anyhow!("GLContext::new_wrapped returned None"))?;
-            gst_context
-                .activate(true)
-                .map_err(|e| anyhow!("gst_context.activate(true): {e}"))?;
-            gst_context
-                .fill_info()
-                .map_err(|e| anyhow!("gst_context.fill_info: {e}"))?;
-            gst_context
-                .activate(false)
-                .map_err(|e| anyhow!("gst_context.activate(false): {e}"))?;
+            })
+        }
+    }
+
+    /// Build the GstDecoder on a worker thread, isolated from
+    /// the presenter context. Runs entirely on the spawning
+    /// worker; gst-gl's streaming threads use the share-group
+    /// context for their own work. When this returns Ok, the
+    /// GstDecoder is fully-prerolled and the pull thread is
+    /// running.
+    ///
+    /// The worker thread itself releases its hold on the
+    /// share-group context (eglMakeCurrent EGL_NO_CONTEXT)
+    /// before returning so subsequent gst-gl operations on
+    /// their streaming threads can take it freely (EGL
+    /// single-thread-current semantics).
+    fn build_on_worker(
+        share_group: crate::egl_gbm::ShareGroupContext,
+        clip: PathBuf,
+        _clip_basename: String,
+    ) -> Result<GstDecoder> {
+        gst::init().context("gst::init (worker)")?;
+
+        // (a) Make the share-group context current on THIS
+        //     worker thread so the GstGLContext::new_wrapped
+        //     call below sees an active context for fill_info.
+        share_group
+            .make_current_here()
+            .context("share-group make_current on worker")?;
+
+        // (b) Wrap the SHARE context (not presenter's) for
+        //     gst-gl. All subsequent gst-gl operations route
+        //     through THIS context; the presenter context is
+        //     untouched.
+        let egl_display_ptr = share_group.display_handle_as_usize();
+        let gst_display: gst_gl::GLDisplay = unsafe {
+            gst_gl_egl::GLDisplayEGL::with_egl_display(egl_display_ptr)
+                .map_err(|e| anyhow!("GLDisplayEGL::with_egl_display: {e}"))?
+        }
+        .upcast();
+        let egl_ctx_handle = share_group.context_handle_as_usize();
+        let gst_context: gst_gl::GLContext = unsafe {
+            gst_gl::GLContext::new_wrapped(
+                &gst_display,
+                egl_ctx_handle,
+                gst_gl::GLPlatform::EGL,
+                gst_gl::GLAPI::GLES2,
+            )
+        }
+        .ok_or_else(|| anyhow!("GLContext::new_wrapped(share-group) returned None"))?;
+        gst_context
+            .activate(true)
+            .map_err(|e| anyhow!("gst_context.activate(true): {e}"))?;
+        gst_context
+            .fill_info()
+            .map_err(|e| anyhow!("gst_context.fill_info: {e}"))?;
+        gst_context
+            .activate(false)
+            .map_err(|e| anyhow!("gst_context.activate(false): {e}"))?;
 
             // (b) Build the STATIC downstream half:
             //     concat -> v4l2h264dec -> queue -> glupload
@@ -527,13 +684,14 @@ mod linux {
                 tex_target: TexTarget::TwoD,
                 last_pts_ns: None,
                 clip_basename: clip_basename.clone(),
-                clip_path: clip.to_path_buf(),
+                clip_path: clip,
                 sub_bins: Mutex::new(VecDeque::new()),
                 serial_counter: AtomicU64::new(0),
                 pipe_cmd_tx,
                 pipe_cmd_rx,
                 gst_display,
                 gst_context,
+                share_group,
             };
 
             // (e) Pre-queue INITIAL_QUEUE_DEPTH sub-bins. concat
@@ -542,155 +700,92 @@ mod linux {
                 me.add_next_clip()?;
             }
 
-            // (f) #2-alt: State -> PAUSED (NON-blocking).
-            //     The old new() blocked here in pipeline.state(5s)
-            //     and again in state(10s) after PLAYING. That's
-            //     the 140-771ms freeze QA's SOURCE A residual
-            //     traced to.
+            // (f) State -> PAUSED + wait, then PLAYING + wait.
+            //     Both waits BLOCK the worker thread; that's
+            //     fine because we ARE the worker. Present
+            //     thread keeps drawing uninterrupted via its
+            //     OWN context (presenter context; gst-gl
+            //     never touches it now that we wrap the
+            //     share-group context instead).
             //
-            //     set_state(PAUSED) returns StateChangeReturn
-            //     immediately (ASYNC for non-live pipelines like
-            //     ours: filesrc->qtdemux->h264parse->v4l2h264dec).
-            //     The actual transition (decoder open + caps
-            //     negotiation + first-buffer preroll) runs on
-            //     GStreamer streaming threads.
-            //
-            //     PendingDecoder::poll() drives non-blocking
-            //     pipeline.state(ZERO) checks per present-thread
-            //     tick. When AwaitingPaused observes settled
-            //     PAUSED, it issues set_state(PLAYING) and
-            //     transitions to AwaitingPlaying. When that
-            //     settles, state becomes Ready.
-            log::info!("[gst] [{clip_basename}] set_state(PAUSED) (async; will poll)");
+            //     The 5s + 10s timeouts mirror the original
+            //     pre-#2-alt sync new(). Typical wall-clock
+            //     to PLAYING is ~140-500ms per QA history.
+            log::info!("[gst] [{clip_basename}] (worker) set_state(PAUSED)");
             let preroll_ret = me
                 .pipeline
                 .set_state(gst::State::Paused)
                 .map_err(|e| anyhow!("set_state(PAUSED): {e:?}"))?;
             log::info!(
-                "[gst] [{clip_basename}] set_state(PAUSED) returned {preroll_ret:?}"
+                "[gst] [{clip_basename}] (worker) set_state(PAUSED) -> {preroll_ret:?}"
             );
-
-            Ok(PendingDecoder {
-                inner: Some(me),
-                state: PendingState::AwaitingPaused,
-                started_at: std::time::Instant::now(),
-            })
-        }
-
-        /// Drive the async state machine. Call once per present
-        /// thread tick. Returns the current state; when Ready,
-        /// the caller should call finalize() to spawn the pull
-        /// thread and consume self into a usable GstDecoder.
-        ///
-        /// Per-call cost: one Element::state(ZERO) call =
-        /// ~microseconds (mutex lock + state read). Plus one
-        /// log::info! per state transition (not per poll).
-        ///
-        /// Timeouts mirror the old sync new(): 10s for PAUSED,
-        /// 20s total. On timeout returns Err; caller drops the
-        /// PendingDecoder (its inner GstDecoder Drop cleans up
-        /// the pipeline normally).
-        pub fn poll(&mut self) -> Result<PendingState> {
-            let inner = self
-                .inner
-                .as_mut()
-                .ok_or_else(|| anyhow!("PendingDecoder already finalized"))?;
-            match self.state {
-                PendingState::AwaitingPaused => {
-                    let (_, cur, pending) =
-                        inner.pipeline.state(gst::ClockTime::ZERO);
-                    if cur == gst::State::Paused
-                        && pending == gst::State::VoidPending
-                    {
-                        let elapsed = self.started_at.elapsed().as_millis();
-                        log::info!(
-                            "[gst] [{}] PAUSED reached after {elapsed}ms; \
-                             set_state(PLAYING) (async)",
-                            inner.clip_basename
-                        );
-                        let play_ret = inner
-                            .pipeline
-                            .set_state(gst::State::Playing)
-                            .map_err(|e| anyhow!("set_state PLAYING: {e:?}"))?;
-                        log::info!(
-                            "[gst] [{}] set_state(PLAYING) returned {play_ret:?}",
-                            inner.clip_basename
-                        );
-                        self.state = PendingState::AwaitingPlaying;
-                    } else if self.started_at.elapsed()
-                        > std::time::Duration::from_secs(10)
-                    {
-                        return Err(anyhow!(
-                            "[{}] timeout awaiting PAUSED \
-                             (cur={cur:?} pending={pending:?})",
-                            inner.clip_basename
-                        ));
-                    }
-                }
-                PendingState::AwaitingPlaying => {
-                    let (_, cur, pending) =
-                        inner.pipeline.state(gst::ClockTime::ZERO);
-                    if cur == gst::State::Playing
-                        && pending == gst::State::VoidPending
-                    {
-                        let elapsed = self.started_at.elapsed().as_millis();
-                        log::info!(
-                            "[gst] [{}] PLAYING reached after {elapsed}ms; \
-                             concat add-next looping armed; ready to finalize",
-                            inner.clip_basename
-                        );
-                        self.state = PendingState::Ready;
-                    } else if self.started_at.elapsed()
-                        > std::time::Duration::from_secs(20)
-                    {
-                        return Err(anyhow!(
-                            "[{}] timeout awaiting PLAYING \
-                             (cur={cur:?} pending={pending:?})",
-                            inner.clip_basename
-                        ));
-                    }
-                }
-                PendingState::Ready => {}
-            }
-            Ok(self.state)
-        }
-
-        /// Consume self into a fully-driven GstDecoder. Spawns
-        /// the pull thread (per QA #2 fix: first-sample wait
-        /// deferred -- latest_sample populated naturally once
-        /// samples flow).
-        ///
-        /// Errors if state is not Ready. Idempotent panic-safe:
-        /// inner.take() leaves None behind so a second call
-        /// errors cleanly.
-        pub fn finalize(mut self) -> Result<GstDecoder> {
-            if self.state != PendingState::Ready {
+            let (wait_res, cur, pending) =
+                me.pipeline.state(gst::ClockTime::from_seconds(5));
+            log::info!(
+                "[gst] [{clip_basename}] (worker) state-wait PAUSED: \
+                 {wait_res:?} cur={cur:?} pending={pending:?}"
+            );
+            if cur != gst::State::Paused {
                 return Err(anyhow!(
-                    "PendingDecoder::finalize called in state {:?}; \
-                     poll until Ready first",
-                    self.state
+                    "(worker) preroll did not settle to PAUSED \
+                     (cur={cur:?}, pending={pending:?})"
                 ));
             }
-            let mut inner = self
-                .inner
-                .take()
-                .ok_or_else(|| anyhow!("PendingDecoder already finalized"))?;
+
+            log::info!("[gst] [{clip_basename}] (worker) set_state(PLAYING)");
+            let play_ret = me
+                .pipeline
+                .set_state(gst::State::Playing)
+                .map_err(|e| anyhow!("set_state PLAYING: {e:?}"))?;
             log::info!(
-                "[gst] [{}] first-sample wait DEFERRED; spawning pull thread",
-                inner.clip_basename
+                "[gst] [{clip_basename}] (worker) set_state(PLAYING) -> {play_ret:?}"
             );
-            let appsink_for_pull = inner.appsink.clone();
-            let slot_for_pull = inner.latest_sample.clone();
-            let stop_for_pull = inner.stop.clone();
-            let thread_name = format!("blendr-gst-pull-{}", inner.clip_basename);
+            let (wait_res, cur, pending) =
+                me.pipeline.state(gst::ClockTime::from_seconds(10));
+            log::info!(
+                "[gst] [{clip_basename}] (worker) state-wait PLAYING: \
+                 {wait_res:?} cur={cur:?} pending={pending:?}"
+            );
+            if cur != gst::State::Playing {
+                return Err(anyhow!(
+                    "(worker) pipeline did NOT reach PLAYING within 10s \
+                     (cur={cur:?} pending={pending:?})"
+                ));
+            }
+            log::info!(
+                "[gst] [{clip_basename}] (worker) PLAYING confirmed; \
+                 concat add-next looping armed"
+            );
+
+            // (g) Spawn pull thread (per #2: first-sample wait
+            //     deferred -- pull thread populates
+            //     latest_sample naturally).
+            log::info!(
+                "[gst] [{clip_basename}] (worker) first-sample wait DEFERRED; \
+                 spawning pull thread"
+            );
+            let appsink_for_pull = me.appsink.clone();
+            let slot_for_pull = me.latest_sample.clone();
+            let stop_for_pull = me.stop.clone();
+            let thread_name = format!("blendr-gst-pull-{}", me.clip_basename);
             let pull_thread = thread::Builder::new()
                 .name(thread_name)
                 .spawn(move || pull_loop(appsink_for_pull, slot_for_pull, stop_for_pull))
                 .context("spawn pull thread")?;
-            inner.pull_thread = Some(pull_thread);
-            Ok(inner)
+            me.pull_thread = Some(pull_thread);
+
+            // (h) Release the share-group context on THIS
+            //     worker thread so gst-gl's streaming threads
+            //     (and future GstDecoder Drops on the present
+            //     thread) can eglMakeCurrent it freely (EGL
+            //     single-thread-current). The wrapped context
+            //     itself is alive until ShareGroupContext::
+            //     Drop runs (after pipeline NULL during
+            //     GstDecoder::Drop).
+            me.share_group.release_here();
+
+            Ok(me)
         }
-    }
 
     impl GstDecoder {
         /// Append a new sub-bin (same clip) to concat. cutloop's
