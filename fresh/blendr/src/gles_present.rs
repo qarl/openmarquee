@@ -447,11 +447,36 @@ mod linux {
                                 Some(b_id),
                                 Some(TexTarget::External),
                             ) => {
-                                self.draw_quad_blend(
-                                    a_id,
-                                    b_id,
-                                    self.blend_alpha,
-                                )?;
+                                // #3 SOURCE B fix per QA baseline:
+                                // ~95% of frames are constant-alpha
+                                // holds (alpha=0.0 or 1.0) but the
+                                // 2-tex mix() shader was running
+                                // every frame (render_mean=11.23ms
+                                // vs single-tex floor 0.82ms). Branch
+                                // on alpha:
+                                //   alpha <= eps          -> draw A only
+                                //   alpha >= 1.0 - eps    -> draw B only
+                                //   else (mid-fade)       -> existing
+                                //                            draw_quad_blend
+                                // Single-tex path uses the already-
+                                // compiled prog_ext (samplerExternal
+                                // OES, no mix). Halves per-frame
+                                // fragment cost during holds (~95%
+                                // of frames) -> hold-time render
+                                // drops 11ms -> ~0.8ms.
+                                const ALPHA_EPS: f32 = 0.001;
+                                let a = self.blend_alpha;
+                                if a <= ALPHA_EPS {
+                                    self.draw_quad_external(a_id)?;
+                                } else if a >= 1.0 - ALPHA_EPS {
+                                    self.draw_quad_external(b_id)?;
+                                } else {
+                                    self.draw_quad_blend(
+                                        a_id,
+                                        b_id,
+                                        a,
+                                    )?;
+                                }
                             }
                             (
                                 Some(_),
