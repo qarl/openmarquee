@@ -267,7 +267,8 @@ mod linux {
         /// gst-gl GL ops are isolated from the presenter
         /// context regardless of when the decoder is created.
         pub fn new(egl: &Egl, clip: &Path) -> Result<Self> {
-            let mut p = PendingDecoder::start_async(egl, clip)?;
+            // Startup paths (no outgoing decoder to drop).
+            let mut p = PendingDecoder::start_async(egl, clip, None)?;
             let timeout = std::time::Duration::from_secs(30);
             let start = std::time::Instant::now();
             while p.poll()? != PendingState::Ready {
@@ -335,21 +336,36 @@ mod linux {
             self.state
         }
 
-        /// Spawn a worker thread that does EVERYTHING --
-        /// including the eglCreateContext for the share-group
-        /// context. Present thread does ZERO EGL/GL calls in
-        /// this function (just clones an Arc<DynamicInstance>
-        /// + 3 Copy handles into the worker).
+        /// Spawn a worker thread that:
+        ///   (1) optionally drops a `pre_drop` GstDecoder
+        ///       (the OUTGOING slot's decoder being retired
+        ///       this cycle); and
+        ///   (2) calls build_on_worker for the new decoder.
         ///
-        /// Per QA bbf4daa diagnosis: even with gst-gl fully
-        /// isolated (own surfaceless ctx, own thread), the
-        /// black flash persisted because eglCreateContext
-        /// itself, called on the present thread with
-        /// share_context=presenter, triggered vc4/Mesa GPU
-        /// state sync that disrupted the present context's
-        /// rendering for ~160ms. The fix: call
-        /// eglCreateContext on the worker too.
-        pub fn start_async(egl: &Egl, clip: &Path) -> Result<Self> {
+        /// Doing both on the SAME worker sequentially is the
+        /// pattern-(a) fix per QA c012339 analysis: the
+        /// outgoing retire (drop) and the new create were
+        /// previously on DIFFERENT worker threads → wall-
+        /// clock overlap → both contending for vc4 GPU
+        /// (share_group_ctx 19→144-192ms) and HW
+        /// /dev/video10 (paused_reached 151→297ms). With
+        /// serialization, drop completes BEFORE create
+        /// starts → no contention → create stays at baseline
+        /// ~150ms. Total hold window shrinks from 340-813ms
+        /// to ~200-300ms typical.
+        ///
+        /// Present thread still does ZERO EGL/GL calls in
+        /// this function (just clones the seed + moves
+        /// pre_drop into the worker).
+        ///
+        /// pre_drop = None for startup paths (sync new
+        /// wrapper); Some(old_decoder) for mid-run Cycle
+        /// retire+create.
+        pub fn start_async(
+            egl: &Egl,
+            clip: &Path,
+            pre_drop: Option<GstDecoder>,
+        ) -> Result<Self> {
             let clip_basename = clip
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -364,9 +380,39 @@ mod linux {
 
             let (tx, rx) = mpsc::channel::<Result<GstDecoder>>();
             let basename_for_worker = clip_basename.clone();
+            let has_pre_drop = pre_drop.is_some();
             std::thread::Builder::new()
                 .name(format!("blendr-pending-{clip_basename}"))
                 .spawn(move || {
+                    // (1) Pre-drop the outgoing decoder
+                    //     SERIALLY on this worker (the fix).
+                    //     Trace SPAWN/DONE so QA can see the
+                    //     drop's wall-clock cost + confirm
+                    //     it now precedes (doesn't overlap)
+                    //     the build.
+                    if let Some(old) = pre_drop {
+                        let retire_id = crate::kms::trace_ts_ms();
+                        let t_spawn = std::time::Instant::now();
+                        if crate::kms::trace_enabled() {
+                            crate::kms::trace_writeln(&format!(
+                                "[trace-retire] ts_ms={} id={retire_id} \
+                                 phase=SPAWN serialized=true",
+                                crate::kms::trace_ts_ms()
+                            ));
+                        }
+                        drop(old);
+                        if crate::kms::trace_enabled() {
+                            let drop_ms = t_spawn.elapsed().as_millis();
+                            crate::kms::trace_writeln(&format!(
+                                "[trace-retire] ts_ms={} id={retire_id} \
+                                 phase=DONE drop_ms={drop_ms} serialized=true",
+                                crate::kms::trace_ts_ms()
+                            ));
+                        }
+                    }
+                    // (2) Build new decoder. With pre_drop
+                    //     complete, the GPU + HW decoder have
+                    //     no retire contention.
                     let r = build_on_worker(
                         seed,
                         clip_path,
@@ -377,8 +423,9 @@ mod linux {
                 .context("spawn PendingDecoder worker")?;
 
             log::info!(
-                "[gst] [{clip_basename}] worker spawned (NO present-thread \
-                 EGL calls); present thread unblocked"
+                "[gst] [{clip_basename}] worker spawned \
+                 (pre_drop={has_pre_drop}; serialized retire-then-create); \
+                 present thread unblocked"
             );
             Ok(PendingDecoder {
                 state: PendingState::AwaitingWorker,

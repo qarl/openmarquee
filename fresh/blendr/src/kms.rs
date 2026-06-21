@@ -275,71 +275,51 @@ impl Streams {
                     let t_retire = std::time::Instant::now();
                     *last_retire_at = Some(t_retire);
 
-                    // --- Step 2: retire on worker thread (#2) ---
+                    // --- Step 2+3: take outgoing decoder +
+                    //     hand BOTH retire (drop) and create
+                    //     to the SAME PendingDecoder worker
+                    //     so they run SERIALLY (pattern-(a)
+                    //     fix per QA c012339). Previously the
+                    //     retire ran on its own thread
+                    //     CONCURRENTLY with the create's
+                    //     worker -> both contending for vc4
+                    //     GPU (share_group_ctx) + /dev/video10
+                    //     (gst PAUSED bringup) -> create
+                    //     ballooned to 340-813ms (vs ~150ms
+                    //     baseline). With serialization, drop
+                    //     completes BEFORE create starts ->
+                    //     no contention -> create stays at
+                    //     baseline.
+                    //
+                    //     The [trace-retire] SPAWN/DONE lines
+                    //     now emit from INSIDE the
+                    //     PendingDecoder worker (gst_decode.rs)
+                    //     so the trace shows the serialized
+                    //     order: retire SPAWN -> drop ->
+                    //     retire DONE -> create START -> ...
                     let taken = slots[retire_slot].take();
-                    if let Some(old) = taken {
-                        let label = format!("retire-slot{retire_slot}");
-                        // Trace: retire-id = present-thread ts
-                        // at spawn so it's unique + correlatable
-                        // with create-ids via wall-clock.
-                        let retire_id = trace_ts_ms();
-                        if trace_enabled() {
-                            trace_writeln(&format!(
-                                "[trace-retire] ts_ms={} id={retire_id} \
-                                 slot={retire_slot} phase=SPAWN",
-                                trace_ts_ms()
-                            ));
-                        }
-                        let t_spawn = std::time::Instant::now();
-                        let _ = std::thread::Builder::new()
-                            .name(label.clone())
-                            .spawn(move || {
-                                // GstDecoder::Drop runs here on
-                                // the worker. All the BUG 3/4/C
-                                // teardown machinery runs as
-                                // before; present thread does
-                                // not wait.
-                                drop(old);
-                                // Trace: record drop completion
-                                // so QA can correlate with
-                                // create-start timestamps to
-                                // identify HW decoder /dev/video10
-                                // contention windows.
-                                if trace_enabled() {
-                                    let drop_ms = t_spawn.elapsed().as_millis();
-                                    trace_writeln(&format!(
-                                        "[trace-retire] ts_ms={} id={retire_id} \
-                                         slot={retire_slot} phase=DONE drop_ms={drop_ms}",
-                                        trace_ts_ms()
-                                    ));
-                                }
-                            });
-                        log::info!(
-                            "[cycle] retire slot={retire_slot} -> worker thread '{label}'"
-                        );
-                    }
-                    let retire_ms = t_retire.elapsed().as_millis();
+                    let retire_present_ms = t_retire.elapsed().as_millis();
                     log::info!(
                         "[cycle] retire slot={retire_slot} \
-                         present-thread elapsed_ms={retire_ms} \
-                         (Drop deferred to worker)"
+                         present-thread elapsed_ms={retire_present_ms} \
+                         (handing outgoing decoder to serialized worker; \
+                         drop will run BEFORE new create)"
                     );
 
-                    // --- Step 3: kick off async create (#2-alt) ---
-                    // start_async builds the pipeline + sub-bins +
-                    // issues set_state(PAUSED) without blocking.
-                    // The GStreamer streaming threads do the
-                    // preroll work off-thread. Polling in the next
-                    // tick drives the state machine.
+                    // --- Step 4: kick off serialized
+                    //     retire-then-create. PendingDecoder::
+                    //     start_async takes Option<GstDecoder>
+                    //     pre_drop and the worker handles both.
                     log::info!(
                         "[cycle] create slot={retire_slot} clip={clip_name} \
-                         -- starting (async; polling each tick)"
+                         -- starting (serialized after drop; polling each tick)"
                     );
                     let t_create = std::time::Instant::now();
                     *last_create_at = Some(t_create);
                     match crate::gst_decode::PendingDecoder::start_async(
                         egl,
                         &clip_to_load,
+                        taken,
                     ) {
                         Ok(pd) => {
                             *pending_create = Some((retire_slot, pd));
