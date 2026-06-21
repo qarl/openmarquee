@@ -46,11 +46,26 @@ struct Args {
     #[arg(long)]
     clip: Option<PathBuf>,
 
-    /// Required when --step blend. First clip (stream A).
+    /// Phase 3 v2: comma-separated list of clip paths for the
+    /// cycling playlist (arbitrary length N >= 1; full reel
+    /// = all 21). Replaces --clip-a/--clip-b as the canonical
+    /// form. For N=1, behaves like --step video. For N=2,
+    /// behaves like Phase 3 v1 (both clips long-lived;
+    /// alternates A<->B forever; no retire+recreate). For
+    /// N>=3, the slot retire+recreate machinery cycles the
+    /// 2-decoder pool through the full playlist.
+    /// Example: --clips /var/openmarquee/content/aaa/asset.mp4,/var/openmarquee/content/bbb/asset.mp4,...
+    #[arg(long, value_delimiter = ',')]
+    clips: Vec<PathBuf>,
+
+    /// 2-clip back-compat (Phase 3 v1 callers): first clip.
+    /// If --clips is empty AND both --clip-a and --clip-b are
+    /// set, desugars to --clips=A,B. New code should use
+    /// --clips.
     #[arg(long)]
     clip_a: Option<PathBuf>,
 
-    /// Required when --step blend. Second clip (stream B).
+    /// 2-clip back-compat: second clip. See --clip-a.
     #[arg(long)]
     clip_b: Option<PathBuf>,
 
@@ -165,36 +180,84 @@ fn run(args: Args) -> Result<()> {
             )
         }
         Step::Blend => {
-            let clip_a = args.clip_a.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("--step blend requires --clip-a <PATH>")
-            })?;
-            let clip_b = args.clip_b.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("--step blend requires --clip-b <PATH>")
-            })?;
-            let a = gst_decode::GstDecoder::new(&egl, clip_a)
-                .context("GstDecoder::new (blend A)")?;
-            let b = gst_decode::GstDecoder::new(&egl, clip_b)
-                .context("GstDecoder::new (blend B)")?;
-            let mut slideshow =
-                kms::SlideshowState::new(args.hold_sec, args.crossfade_sec);
-            if let Some(alpha) = args.static_alpha {
-                let clamped = alpha.clamp(0.0, 1.0);
-                slideshow.set_static_alpha(clamped);
-                log::info!(
-                    "[slideshow] starting: STATIC-ALPHA={} \
-                     (hold_sec / crossfade_sec IGNORED; phase transitions disabled)",
-                    clamped,
-                );
-            } else {
-                log::info!(
-                    "[slideshow] starting: hold_sec={} crossfade_sec={} \
-                     (Phase 3 v1; --alpha={} unused; --static-alpha not set)",
-                    args.hold_sec,
-                    args.crossfade_sec,
-                    args.alpha,
-                );
+            // Resolve playlist from --clips, falling back to
+            // --clip-a/--clip-b for back-compat.
+            let mut playlist: Vec<PathBuf> = args.clips.clone();
+            if playlist.is_empty() {
+                match (&args.clip_a, &args.clip_b) {
+                    (Some(a), Some(b)) => {
+                        playlist.push(a.clone());
+                        playlist.push(b.clone());
+                    }
+                    _ => {
+                        anyhow::bail!(
+                            "--step blend requires either --clips A,B,C,... \
+                             OR both --clip-a + --clip-b"
+                        );
+                    }
+                }
             }
-            kms::Streams::Blend { a, b, slideshow }
+            let n = playlist.len();
+            if n == 0 {
+                anyhow::bail!("--step blend playlist is empty");
+            }
+            let basenames: Vec<&str> = playlist
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                })
+                .collect();
+            log::info!(
+                "[blendr] playlist N={n} clips={basenames:?}"
+            );
+
+            // N == 1: degenerate -- just play one clip. Use the
+            // simpler Streams::Single path (no slideshow alpha).
+            if n == 1 {
+                let dec = gst_decode::GstDecoder::new(&egl, &playlist[0])
+                    .context("GstDecoder::new (Phase 3 v2 N=1)")?;
+                kms::Streams::Single(dec)
+            } else {
+                // N >= 2: build the Streams::Cycle variant.
+                // Seed slot 0 with playlist[0] and slot 1 with
+                // playlist[1]; next_idx points at the next clip
+                // to load on the first retire+recreate. For N=2
+                // next_idx is unused (no recreate fires).
+                let dec0 = gst_decode::GstDecoder::new(&egl, &playlist[0])
+                    .context("GstDecoder::new (slot 0)")?;
+                let dec1 = gst_decode::GstDecoder::new(&egl, &playlist[1 % n])
+                    .context("GstDecoder::new (slot 1)")?;
+                let next_idx = 2 % n;
+                let mut slideshow =
+                    kms::SlideshowState::new(args.hold_sec, args.crossfade_sec);
+                if let Some(alpha) = args.static_alpha {
+                    let clamped = alpha.clamp(0.0, 1.0);
+                    slideshow.set_static_alpha(clamped);
+                    log::info!(
+                        "[slideshow] starting: STATIC-ALPHA={} \
+                         (hold_sec / crossfade_sec IGNORED)",
+                        clamped,
+                    );
+                } else {
+                    log::info!(
+                        "[slideshow] starting: hold_sec={} crossfade_sec={} \
+                         N={n} next_idx={next_idx} \
+                         (--alpha={} unused; --static-alpha not set)",
+                        args.hold_sec,
+                        args.crossfade_sec,
+                        args.alpha,
+                    );
+                }
+                kms::Streams::Cycle {
+                    playlist,
+                    slots: [Some(dec0), Some(dec1)],
+                    next_idx,
+                    recreate_pending: false,
+                    slideshow,
+                }
+            }
         }
         _ => kms::Streams::None,
     };

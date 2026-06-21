@@ -17,17 +17,187 @@ pub use stub::*;
 pub enum Streams {
     /// Step::Solid / Step::Checker: no gst decoders.
     None,
-    /// Step::Video: one decoder.
+    /// Step::Video: one decoder (one clip; concat-loops
+    /// internally).
     Single(crate::gst_decode::GstDecoder),
-    /// Step::Blend (Phase 2 static / Phase 3 slideshow): two
-    /// long-lived decoders. SlideshowState drives the alpha
-    /// each iteration (Phase 3); a static alpha is a special
-    /// case where hold_sec is huge.
-    Blend {
-        a: crate::gst_decode::GstDecoder,
-        b: crate::gst_decode::GstDecoder,
+    /// Step::Blend (Phase 2 static) / Phase 3 slideshow.
+    /// Arbitrary-N playlist with 2-slot retire+recreate.
+    ///
+    /// Invariants:
+    /// - At most 2 GstDecoder instances are alive at any
+    ///   moment (the 2-decoder hard ceiling on this Pi; 3
+    ///   live = black per cutloop history).
+    /// - Slot 0 maps to the shader's "A" texture; slot 1 to
+    ///   "B". SlideshowState's HoldingA shows slot 0, HoldingB
+    ///   shows slot 1, fades blend between them.
+    /// - For N >= 3: each HoldingX entry triggers
+    ///   recreate_pending = true; the NEXT tick retires the
+    ///   non-visible slot (= just-faded-out clip) and creates
+    ///   a fresh decoder with playlist[next_idx]; next_idx
+    ///   advances (next_idx + 1) % N. Slot 0 and 1 alternate
+    ///   ownership of the "current visible" role naturally
+    ///   via the slideshow phase.
+    /// - For N == 2: no retire+recreate (would just churn
+    ///   between the same two clips). Both decoders alive
+    ///   forever; matches Phase 3 v1 behavior.
+    /// - For N == 1: Streams::Single is used instead (no
+    ///   slideshow).
+    Cycle {
+        playlist: Vec<std::path::PathBuf>,
+        slots: [Option<crate::gst_decode::GstDecoder>; 2],
+        /// Index into playlist of the NEXT clip to load when
+        /// retire+recreate fires.
+        next_idx: usize,
+        /// Set on entering a Holding phase (N>=3 only).
+        /// Drained on the next tick by retire+recreate of the
+        /// non-visible slot.
+        recreate_pending: bool,
         slideshow: SlideshowState,
     },
+}
+
+impl Streams {
+    /// Per-iteration driver. Updates slideshow + processes any
+    /// pending retire+recreate. Called from kms::run_loop
+    /// BEFORE pulling textures so the slot pointers passed to
+    /// the presenter are always valid.
+    ///
+    /// MUST be called on the present thread (where blendr's
+    /// EGL is current). Mid-run GstDecoder::new is a synchronous
+    /// 5s-blocking call (first-sample wait); the present
+    /// thread stalls during retire+recreate, which is bounded
+    /// by hold_sec - tick_overhead. Defer to a worker thread
+    /// only if soak shows the stall exceeds the hold.
+    pub fn tick(
+        &mut self,
+        #[allow(unused_variables)] egl: &crate::egl_gbm::Egl,
+    ) -> Result<()> {
+        if let Streams::Cycle {
+            playlist,
+            slots,
+            next_idx,
+            recreate_pending,
+            slideshow,
+        } = self
+        {
+            // Update alpha + check for phase change.
+            let (_alpha, phase_changed) = slideshow.update();
+            let n = playlist.len();
+
+            // On phase-change INTO a Holding phase, mark for
+            // retire+recreate next tick. N=2 short-circuits
+            // (both clips stay loaded forever, like Phase 3 v1).
+            if phase_changed && n >= 3 {
+                match slideshow.phase() {
+                    BlendPhase::HoldingA | BlendPhase::HoldingB => {
+                        *recreate_pending = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            // Drain recreate_pending (single retire+recreate
+            // per phase, regardless of how many ticks elapse
+            // before we get here).
+            if *recreate_pending {
+                *recreate_pending = false;
+                // visible_slot derives from phase:
+                //   HoldingA / FadingAtoB -> slot 0 visible
+                //   HoldingB / FadingBtoA -> slot 1 visible
+                let visible_slot = match slideshow.phase() {
+                    BlendPhase::HoldingA | BlendPhase::FadingAtoB => 0,
+                    BlendPhase::HoldingB | BlendPhase::FadingBtoA => 1,
+                };
+                let retire_slot = 1 - visible_slot;
+                let clip_to_load = playlist[*next_idx].clone();
+                let clip_name = clip_to_load
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+
+                // --- Step 1: log + read CMA pre-retire ----
+                let cma_pre = read_cma_free_kb();
+                log::info!(
+                    "[cycle] retire slot={retire_slot} \
+                     (CmaFree={cma_pre:?}kB) -- starting"
+                );
+                let t_retire = std::time::Instant::now();
+
+                // --- Step 2: retire (Drop the old decoder).
+                //     BUG 3 sequence runs inside GstDecoder::Drop;
+                //     state(5s)-wait IS the V4L2 STREAMOFF barrier
+                //     that prevents MMAL slot leak.
+                slots[retire_slot] = None;
+                let retire_ms = t_retire.elapsed().as_millis();
+                log::info!(
+                    "[cycle] retire slot={retire_slot} done elapsed_ms={retire_ms}"
+                );
+
+                // --- Step 3: log + create new decoder.
+                log::info!(
+                    "[cycle] create slot={retire_slot} clip={clip_name} -- starting"
+                );
+                let t_create = std::time::Instant::now();
+                let new_dec =
+                    match crate::gst_decode::GstDecoder::new(egl, &clip_to_load) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            log::error!(
+                                "[cycle] create slot={retire_slot} clip={clip_name} \
+                                 FAILED: {e:#}"
+                            );
+                            return Err(e);
+                        }
+                    };
+                let create_ms = t_create.elapsed().as_millis();
+                let cma_post = read_cma_free_kb();
+                slots[retire_slot] = Some(new_dec);
+                log::info!(
+                    "[cycle] create slot={retire_slot} done elapsed_ms={create_ms} \
+                     CmaFree={cma_post:?}kB"
+                );
+
+                // CMA brick-floor guard per project memory
+                // (Pi Zero 2 W bricks below ~50MB CmaFree).
+                if let Some(kb) = cma_post {
+                    if kb < 50_000 {
+                        log::error!(
+                            "[cycle] CMA LOW WARNING: CmaFree={kb}kB < 50MB \
+                             floor; soak may brick"
+                        );
+                    }
+                }
+
+                *next_idx = (*next_idx + 1) % n;
+                log::info!(
+                    "[cycle] next_idx={} playlist_len={n} visible_slot={visible_slot} \
+                     cycle={}",
+                    *next_idx,
+                    slideshow.cycle_count(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Read /proc/meminfo CmaFree value in KB. Returns None on
+/// any parse / IO error (logged but non-fatal). Used by
+/// retire+recreate to log CMA per cycle so QA can spot
+/// drift across long soaks (Pi Zero 2 W bricks below ~50MB
+/// CmaFree).
+fn read_cma_free_kb() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("CmaFree:") {
+            // "CmaFree:       65432 kB"
+            let trimmed = rest.trim();
+            let num = trimmed.split_whitespace().next()?;
+            return num.parse::<u64>().ok();
+        }
+    }
+    None
 }
 
 /// Phase 3 v1: 2-clip A<->B slideshow state machine running on
@@ -392,6 +562,19 @@ mod linux {
                     break;
                 }
 
+                // Phase 3 v2 driver: tick the Streams variant
+                // BEFORE the pull/draw cycle. For Cycle:
+                // updates slideshow alpha + executes any
+                // recreate_pending (retire non-visible slot's
+                // decoder + spawn fresh with playlist[next_idx]).
+                // Runs on the present thread (EGL current).
+                if let Err(e) = streams.tick(&*egl) {
+                    log::error!(
+                        "[kms] streams.tick failed at frame {frame_idx}: {e:#}"
+                    );
+                    return Err(e);
+                }
+
                 // Phase 1 / Phase 2: pull latest texture(s)
                 // from each stream BEFORE the draw. The pull
                 // thread keeps the slot warm; latest_texture is
@@ -428,19 +611,30 @@ mod linux {
                         egl.make_current()
                             .context("egl.make_current post-gst-pull(single)")?;
                     }
-                    super::Streams::Blend { a, b, slideshow } => {
-                        // Phase 3 v1: drain each decoder's
+                    super::Streams::Cycle {
+                        slots,
+                        slideshow,
+                        playlist: _,
+                        next_idx: _,
+                        recreate_pending: _,
+                    } => {
+                        // Phase 3 v2: drain each slot decoder's
                         // pending pipeline commands (concat add-
-                        // next on EOS, etc) on the present
-                        // thread before pulling samples. Bounded
-                        // (few cmds per cycle).
-                        if let Err(e) = a.process_pending() {
-                            log::warn!("[kms] A.process_pending: {e:#}");
+                        // next on EOS) on the present thread.
+                        // `slots` may have None in a recreate
+                        // window — skip if so.
+                        for slot_opt in slots.iter_mut() {
+                            if let Some(d) = slot_opt.as_mut() {
+                                if let Err(e) = d.process_pending() {
+                                    log::warn!("[kms] process_pending: {e:#}");
+                                }
+                            }
                         }
-                        if let Err(e) = b.process_pending() {
-                            log::warn!("[kms] B.process_pending: {e:#}");
-                        }
-                        // Phase 3: state machine drives alpha.
+                        // Phase 3 state machine: alpha.
+                        // (Streams::tick() was already called
+                        // above and may have done retire+
+                        // recreate; this is the per-frame alpha
+                        // read; cheap.)
                         let (alpha, phase_changed) = slideshow.update();
                         if phase_changed {
                             log::info!(
@@ -453,29 +647,35 @@ mod linux {
                             );
                         }
                         egl.make_current()
-                            .context("egl.make_current pre-gst-pull(blend-a)")?;
-                        let a_pair = match a.latest_texture() {
-                            Ok(p) => p,
-                            Err(e) => {
-                                log::warn!(
-                                    "[kms] gst A pull err at frame {frame_idx}: {e:#}"
-                                );
-                                None
-                            }
+                            .context("egl.make_current pre-gst-pull(slot0)")?;
+                        let a_pair = match slots[0].as_mut() {
+                            Some(d) => match d.latest_texture() {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    log::warn!(
+                                        "[kms] slot0 pull err at frame {frame_idx}: {e:#}"
+                                    );
+                                    None
+                                }
+                            },
+                            None => None,
                         };
                         egl.make_current()
-                            .context("egl.make_current post-gst-pull(blend-a)")?;
-                        let b_pair = match b.latest_texture() {
-                            Ok(p) => p,
-                            Err(e) => {
-                                log::warn!(
-                                    "[kms] gst B pull err at frame {frame_idx}: {e:#}"
-                                );
-                                None
-                            }
+                            .context("egl.make_current post-gst-pull(slot0)")?;
+                        let b_pair = match slots[1].as_mut() {
+                            Some(d) => match d.latest_texture() {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    log::warn!(
+                                        "[kms] slot1 pull err at frame {frame_idx}: {e:#}"
+                                    );
+                                    None
+                                }
+                            },
+                            None => None,
                         };
                         egl.make_current()
-                            .context("egl.make_current post-gst-pull(blend-b)")?;
+                            .context("egl.make_current post-gst-pull(slot1)")?;
                         if let (Some(a_t), Some(b_t)) = (a_pair, b_pair) {
                             presenter.set_video_textures(a_t, b_t, alpha);
                             if !first_video_tex_logged {
@@ -573,22 +773,18 @@ mod linux {
                 frame_idx += 1;
 
                 if last_log.elapsed() >= Duration::from_secs(1) {
-                    // Include slideshow phase + alpha if we're in
-                    // Blend mode so QA can grep the cadence + see
-                    // crossfade transitions in the tick stream
-                    // without needing the [slideshow] event lines.
-                    //
-                    // BUG A: also include per-stream PTS so motion
-                    // is verifiable headlessly. "videoA_pts=1.23s"
-                    // advancing tick-over-tick = clip is playing;
-                    // stuck PTS = decoder wedged.
-                    if let super::Streams::Blend { a, b, slideshow } = &*streams {
-                        let pts_a = a
-                            .last_pts_ns()
+                    // Phase 3 v2: per-slot PTS read from
+                    // whichever decoder is currently in each
+                    // slot (may be None during a retire window).
+                    if let super::Streams::Cycle { slots, slideshow, .. } = &*streams {
+                        let pts_a = slots[0]
+                            .as_ref()
+                            .and_then(|d| d.last_pts_ns())
                             .map(|n| n as f64 / 1e9)
                             .unwrap_or(-1.0);
-                        let pts_b = b
-                            .last_pts_ns()
+                        let pts_b = slots[1]
+                            .as_ref()
+                            .and_then(|d| d.last_pts_ns())
                             .map(|n| n as f64 / 1e9)
                             .unwrap_or(-1.0);
                         log::info!(
