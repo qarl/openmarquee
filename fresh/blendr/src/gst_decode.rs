@@ -194,17 +194,33 @@ mod linux {
         /// this to a playlist at the OUTER Streams::Cycle level
         /// by retire+recreate of the whole GstDecoder; each
         /// GstDecoder stays single-clip internally.)
-        clip_path: PathBuf,
+        // Shared with cadence worker. switch_to_clip mutates
+        // via .lock() (present thread). Cadence worker reads
+        // via .lock() at each add_next_clip_inner. Eventually-
+        // consistent semantics (race between switch and an
+        // in-flight add resolves via next add reading NEW;
+        // same as lazy-switch convention).
+        clip_path: Arc<Mutex<PathBuf>>,
         /// Live sub-bins queue (FIFO; front = active source
         /// concat is currently consuming).
-        sub_bins: Mutex<VecDeque<SubBin>>,
+        // Shared with cadence worker. The worker holds Arc
+        // clones and locks per-op (add/retire). Drop owner is
+        // GstDecoder; cadence worker exits before Drop's
+        // retire-all so no contention at teardown.
+        sub_bins: Arc<Mutex<VecDeque<SubBin>>>,
         /// Monotonic sub-bin serial for EOS-probe identification.
-        serial_counter: AtomicU64,
+        // Shared with cadence worker (fetch_add per
+        // add_next_clip_inner call).
+        serial_counter: Arc<AtomicU64>,
         /// EOS probes send commands here from gst streaming
         /// threads. process_pending() drains on the present
         /// thread.
+        // Sender stays on GstDecoder so EOS-probe closures
+        // (created inside add_next_clip_inner) can clone +
+        // capture. Receiver moved INTO the cadence worker
+        // (see cadence_thread). process_pending is now a
+        // no-op since the worker drains the rx directly.
         pipe_cmd_tx: mpsc::Sender<PipelineCmd>,
-        pipe_cmd_rx: mpsc::Receiver<PipelineCmd>,
         #[allow(dead_code)]
         gst_display: gst_gl::GLDisplay,
         #[allow(dead_code)]
@@ -234,6 +250,17 @@ mod linux {
         /// last_was_new_sample(). False if no sample has been
         /// pulled yet (initial startup window).
         last_was_new_sample: bool,
+        /// Long-lived cadence worker handle. Worker owns
+        /// pipe_cmd_rx + holds Arc clones of sub_bins/
+        /// clip_path/serial_counter/etc; sequentially
+        /// processes AddNextClip and Retire commands from
+        /// EOS probes off the present thread. Drop signals
+        /// cadence_stop + joins before existing teardown.
+        cadence_thread: Option<JoinHandle<()>>,
+        /// Stop flag for cadence worker. Drop sets true; the
+        /// worker's recv loop checks each iter (recv_timeout
+        /// short tick) and exits when set.
+        cadence_stop: Arc<AtomicBool>,
     }
 
     impl GstDecoder {
@@ -785,7 +812,11 @@ mod linux {
 
             // (d) Build the GstDecoder struct skeleton so we can
             //     call add_next_clip on it. The channel + state
-            //     get filled here; sub_bins starts empty.
+            //     get filled here; sub_bins starts empty. The
+            //     cadence_thread is spawned LATER (after the
+            //     pipeline reaches PLAYING) so the worker
+            //     starts draining the rx only when commands
+            //     might actually arrive.
             let (pipe_cmd_tx, pipe_cmd_rx) = mpsc::channel::<PipelineCmd>();
             let clip_basename = clip
                 .file_name()
@@ -805,16 +836,20 @@ mod linux {
                 tex_target: TexTarget::TwoD,
                 last_pts_ns: None,
                 clip_basename: clip_basename.clone(),
-                clip_path: clip,
-                sub_bins: Mutex::new(VecDeque::new()),
-                serial_counter: AtomicU64::new(0),
+                clip_path: Arc::new(Mutex::new(clip)),
+                sub_bins: Arc::new(Mutex::new(VecDeque::new())),
+                serial_counter: Arc::new(AtomicU64::new(0)),
                 pipe_cmd_tx,
-                pipe_cmd_rx,
                 gst_display,
                 gst_context,
                 share_group,
                 last_was_new_sample: false,
+                cadence_thread: None,
+                cadence_stop: Arc::new(AtomicBool::new(false)),
             };
+            // Stash pipe_cmd_rx locally; the cadence worker
+            // will receive it via move at spawn time below.
+            let pipe_cmd_rx_for_cadence = pipe_cmd_rx;
             log_phase("pipeline_build", t_phase);
 
             // (e) Pre-queue INITIAL_QUEUE_DEPTH sub-bins. concat
@@ -909,6 +944,48 @@ mod linux {
                 .context("spawn pull thread")?;
             me.pull_thread = Some(pull_thread);
 
+            // (g.2) Spawn the long-lived cadence worker. Takes
+            //       ownership of pipe_cmd_rx + Arc clones of
+            //       sub_bins/clip_path/serial_counter/pipe_
+            //       cmd_tx/last_concat_add_at + pipeline +
+            //       concat. Processes EOS-probe-fired
+            //       AddNextClip/Retire commands off the
+            //       present thread (the ~33-80ms blocking
+            //       sync_state_with_parent goes here).
+            log::info!(
+                "[gst] [{clip_basename}] (worker) spawning cadence worker"
+            );
+            let cadence_stop_for_worker = me.cadence_stop.clone();
+            let pipeline_for_cadence = me.pipeline.clone();
+            let concat_for_cadence = me.concat.clone();
+            let sub_bins_for_cadence = me.sub_bins.clone();
+            let clip_path_for_cadence = me.clip_path.clone();
+            let serial_counter_for_cadence = me.serial_counter.clone();
+            let pipe_cmd_tx_for_cadence = me.pipe_cmd_tx.clone();
+            let last_concat_add_at_for_cadence =
+                me.last_concat_add_at.clone();
+            let basename_for_cadence = me.clip_basename.clone();
+            let cadence_thread_name =
+                format!("blendr-gst-cadence-{}", me.clip_basename);
+            let cadence_handle = thread::Builder::new()
+                .name(cadence_thread_name)
+                .spawn(move || {
+                    cadence_loop(
+                        pipe_cmd_rx_for_cadence,
+                        cadence_stop_for_worker,
+                        pipeline_for_cadence,
+                        concat_for_cadence,
+                        sub_bins_for_cadence,
+                        clip_path_for_cadence,
+                        serial_counter_for_cadence,
+                        pipe_cmd_tx_for_cadence,
+                        last_concat_add_at_for_cadence,
+                        basename_for_cadence,
+                    );
+                })
+                .context("spawn cadence worker")?;
+            me.cadence_thread = Some(cadence_handle);
+
             // (h) Release the share-group context on THIS
             //     worker thread so gst-gl's streaming threads
             //     (and future GstDecoder Drops on the present
@@ -931,196 +1008,298 @@ mod linux {
             Ok(me)
         }
 
-    impl GstDecoder {
-        /// Append a new sub-bin (same clip) to concat. cutloop's
-        /// add_next_clip ported to Rust. Called at init for
-        /// pre-queue + by process_pending() on each EOS.
-        fn add_next_clip(&mut self) -> Result<()> {
-            let serial = self.serial_counter.fetch_add(1, Ordering::Relaxed);
-
-            let sub = gst::Bin::with_name(&format!("sub_{serial}"));
-            let filesrc = gst::ElementFactory::make("filesrc")
-                .property("location", self.clip_path.to_str().ok_or_else(|| {
-                    anyhow!("clip path not UTF-8: {}", self.clip_path.display())
-                })?)
-                .build()
-                .with_context(|| format!("make filesrc [{serial}]"))?;
-            let qtdemux = gst::ElementFactory::make("qtdemux")
-                .build()
-                .with_context(|| format!("make qtdemux [{serial}]"))?;
-            let h264parse = gst::ElementFactory::make("h264parse")
-                .property("config-interval", -1i32)
-                .build()
-                .with_context(|| format!("make h264parse [{serial}]"))?;
-            sub.add_many([&filesrc, &qtdemux, &h264parse])
-                .with_context(|| format!("sub.add_many [{serial}]"))?;
-            filesrc
-                .link(&qtdemux)
-                .with_context(|| format!("link filesrc->qtdemux [{serial}]"))?;
-
-            // qtdemux pad-added: link to h264parse.sink
-            // (mirrors cutloop:236-244). Store the handler id
-            // so retire can disconnect; cutloop showed without
-            // disconnect the closure leaks the sub-bin.
-            let h264parse_for_pad = h264parse.clone();
-            let pad_added_id = qtdemux.connect_pad_added(move |_demux, pad| {
-                let caps = pad.current_caps().or_else(|| Some(pad.query_caps(None)));
-                let caps_str = caps.map(|c| c.to_string()).unwrap_or_default();
-                if !caps_str.starts_with("video/") {
-                    return;
-                }
-                let sink_pad = match h264parse_for_pad.static_pad("sink") {
-                    Some(p) => p,
-                    None => return,
-                };
-                if sink_pad.is_linked() {
-                    return;
-                }
-                if let Err(e) = pad.link(&sink_pad) {
-                    log::warn!(
-                        "[gst-cl] qtdemux pad link to h264parse failed: {e:?}"
-                    );
-                }
-            });
-
-            // Ghost h264parse.src up to sub.src.
-            let h264_src = h264parse.static_pad("src").ok_or_else(|| {
-                anyhow!("h264parse has no src pad [{serial}]")
+    /// Free-function add_next_clip used by BOTH the
+    /// build_on_worker pre-queue (synchronous on the build
+    /// worker) AND the long-lived cadence worker (per-slot
+    /// thread that drains pipe_cmd_rx). Operates on
+    /// Arc-wrapped state so it can run on any thread.
+    fn add_next_clip_inner(
+        pipeline: &gst::Pipeline,
+        concat: &gst::Element,
+        sub_bins: &Arc<Mutex<VecDeque<SubBin>>>,
+        clip_path: &Arc<Mutex<PathBuf>>,
+        serial_counter: &Arc<AtomicU64>,
+        pipe_cmd_tx: &mpsc::Sender<PipelineCmd>,
+        last_concat_add_at: &Arc<Mutex<Option<std::time::Instant>>>,
+    ) -> Result<()> {
+        let serial = serial_counter.fetch_add(1, Ordering::Relaxed);
+        // Snapshot the current clip_path under lock; release
+        // before doing any blocking gst ops (lock-hold-narrow).
+        let (clip_path_buf, clip_basename) = {
+            let g = clip_path.lock().map_err(|p| {
+                anyhow!("clip_path lock poisoned: {p}")
             })?;
-            let ghost = gst::GhostPad::with_target(&h264_src)
-                .with_context(|| format!("GhostPad::with_target [{serial}]"))?;
-            sub.add_pad(&ghost)
-                .with_context(|| format!("sub.add_pad [{serial}]"))?;
+            let pb = g.clone();
+            let bn = pb
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            (pb, bn)
+        };
 
-            self.pipeline
-                .add(&sub)
-                .with_context(|| format!("pipeline.add(sub) [{serial}]"))?;
+        let sub = gst::Bin::with_name(&format!("sub_{serial}"));
+        let filesrc = gst::ElementFactory::make("filesrc")
+            .property("location", clip_path_buf.to_str().ok_or_else(|| {
+                anyhow!("clip path not UTF-8: {}", clip_path_buf.display())
+            })?)
+            .build()
+            .with_context(|| format!("make filesrc [{serial}]"))?;
+        let qtdemux = gst::ElementFactory::make("qtdemux")
+            .build()
+            .with_context(|| format!("make qtdemux [{serial}]"))?;
+        let h264parse = gst::ElementFactory::make("h264parse")
+            .property("config-interval", -1i32)
+            .build()
+            .with_context(|| format!("make h264parse [{serial}]"))?;
+        sub.add_many([&filesrc, &qtdemux, &h264parse])
+            .with_context(|| format!("sub.add_many [{serial}]"))?;
+        filesrc
+            .link(&qtdemux)
+            .with_context(|| format!("link filesrc->qtdemux [{serial}]"))?;
 
-            let concat_sink = self
-                .concat
-                .request_pad_simple("sink_%u")
-                .ok_or_else(|| anyhow!("concat.request_pad_simple [{serial}]"))?;
-            ghost
-                .link(&concat_sink)
-                .map_err(|e| anyhow!("ghost->concat link [{serial}]: {e:?}"))?;
+        let h264parse_for_pad = h264parse.clone();
+        let pad_added_id = qtdemux.connect_pad_added(move |_demux, pad| {
+            let caps = pad.current_caps().or_else(|| Some(pad.query_caps(None)));
+            let caps_str = caps.map(|c| c.to_string()).unwrap_or_default();
+            if !caps_str.starts_with("video/") {
+                return;
+            }
+            let sink_pad = match h264parse_for_pad.static_pad("sink") {
+                Some(p) => p,
+                None => return,
+            };
+            if sink_pad.is_linked() {
+                return;
+            }
+            if let Err(e) = pad.link(&sink_pad) {
+                log::warn!(
+                    "[gst-cl] qtdemux pad link to h264parse failed: {e:?}"
+                );
+            }
+        });
 
-            // EOS probe on the CONCAT SINK PAD (not on the sub-
-            // bin ghost; cutloop:275-303). When concat switches
-            // AWAY from this pad to the next pending sink, the
-            // absorbed EOS flows through this pad and we fire.
-            // The probe sends commands to the channel; the
-            // present thread processes via process_pending().
-            //
-            // BUG A v3 diagnostic: eos_fire_count is the per-
-            // sub-bin counter. Logged each fire. Distinguishes
-            // QA's two hypotheses:
-            //   H1 (back-pressure): each sub-bin's probe fires
-            //       EXACTLY ONCE but at wrong wall-clock time
-            //       (~1.5s instead of ~4.75s). add/retire ratio
-            //       matches sub-bin count.
-            //   H2 (duplicate fire): per-sub-bin probe fires
-            //       MULTIPLE times for the same actual EOS
-            //       event (sticky-pad replay). add/retire ratio
-            //       N:1 → runaway depth.
-            let tx_for_probe = self.pipe_cmd_tx.clone();
-            let serial_for_probe = serial;
-            let basename_for_probe = self.clip_basename.clone();
-            let eos_fire_count = Arc::new(AtomicU64::new(0));
-            let eos_fire_count_for_probe = eos_fire_count.clone();
-            // Measurement infra: stamp last_concat_add_at on
-            // each EOS (= concat switch). Read by
-            // outlier_context for [frame-long] flags.
-            let concat_add_stamp = self.last_concat_add_at.clone();
-            let probe_id = concat_sink.add_probe(
-                gst::PadProbeType::EVENT_DOWNSTREAM,
-                move |_pad, info| {
-                    if let Some(gst::PadProbeData::Event(ev)) = info.data.as_ref() {
-                        if ev.type_() == gst::EventType::Eos {
-                            let n = eos_fire_count_for_probe
-                                .fetch_add(1, Ordering::Relaxed)
-                                + 1;
-                            log::info!(
-                                "[gst-cl] {basename_for_probe} concat-sink EOS \
-                                 serial={serial_for_probe} fire_count={n} \
-                                 -> queue add+retire"
+        let h264_src = h264parse.static_pad("src").ok_or_else(|| {
+            anyhow!("h264parse has no src pad [{serial}]")
+        })?;
+        let ghost = gst::GhostPad::with_target(&h264_src)
+            .with_context(|| format!("GhostPad::with_target [{serial}]"))?;
+        sub.add_pad(&ghost)
+            .with_context(|| format!("sub.add_pad [{serial}]"))?;
+
+        pipeline
+            .add(&sub)
+            .with_context(|| format!("pipeline.add(sub) [{serial}]"))?;
+
+        let concat_sink = concat
+            .request_pad_simple("sink_%u")
+            .ok_or_else(|| anyhow!("concat.request_pad_simple [{serial}]"))?;
+        ghost
+            .link(&concat_sink)
+            .map_err(|e| anyhow!("ghost->concat link [{serial}]: {e:?}"))?;
+
+        let tx_for_probe = pipe_cmd_tx.clone();
+        let serial_for_probe = serial;
+        let basename_for_probe = clip_basename.clone();
+        let eos_fire_count = Arc::new(AtomicU64::new(0));
+        let eos_fire_count_for_probe = eos_fire_count.clone();
+        let concat_add_stamp = last_concat_add_at.clone();
+        let probe_id = concat_sink.add_probe(
+            gst::PadProbeType::EVENT_DOWNSTREAM,
+            move |_pad, info| {
+                if let Some(gst::PadProbeData::Event(ev)) = info.data.as_ref() {
+                    if ev.type_() == gst::EventType::Eos {
+                        let n = eos_fire_count_for_probe
+                            .fetch_add(1, Ordering::Relaxed)
+                            + 1;
+                        log::info!(
+                            "[gst-cl] {basename_for_probe} concat-sink EOS \
+                             serial={serial_for_probe} fire_count={n} \
+                             -> queue add+retire"
+                        );
+                        if let Ok(mut g) = concat_add_stamp.lock() {
+                            *g = Some(std::time::Instant::now());
+                        }
+                        let _ = tx_for_probe.send(PipelineCmd::AddNextClip);
+                        let _ = tx_for_probe.send(PipelineCmd::Retire(serial_for_probe));
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+
+        // sync_state_with_parent: blocks until sub-bin reaches
+        // parent's state. This is the ~33-80ms cost that we
+        // moved off the present thread (cadence worker handles
+        // it now; build_on_worker also OK since it's the
+        // build worker).
+        sub.sync_state_with_parent()
+            .with_context(|| format!("sub.sync_state [{serial}]"))?;
+
+        let depth = {
+            let mut q = sub_bins.lock().unwrap();
+            q.push_back(SubBin {
+                serial,
+                bin: sub,
+                qtdemux,
+                pad_added_id: Some(pad_added_id),
+                concat_sink,
+                probe_id,
+                eos_fire_count,
+            });
+            q.len()
+        };
+        log::info!(
+            "[gst-cl] {clip_basename} ADD sub-bin serial={serial} \
+             (queue_depth={depth})"
+        );
+        Ok(())
+    }
+
+    /// Free-function retire_subgraph (cadence-worker-safe).
+    fn retire_subgraph_inner(
+        pipeline: &gst::Pipeline,
+        concat: &gst::Element,
+        sub_bins: &Arc<Mutex<VecDeque<SubBin>>>,
+        serial: u64,
+    ) -> Result<()> {
+        let mut sub_bin: SubBin = {
+            let mut q = sub_bins.lock().unwrap();
+            match q.iter().position(|s| s.serial == serial) {
+                Some(idx) => q.remove(idx).expect("position found ensures Some"),
+                None => {
+                    log::warn!(
+                        "[gst-cl] retire serial={serial} not found"
+                    );
+                    return Ok(());
+                }
+            }
+        };
+        if let Some(id) = sub_bin.pad_added_id.take() {
+            sub_bin.qtdemux.disconnect(id);
+        }
+        let probe_owned = sub_bin.probe_id.take();
+        if let Some(pid) = probe_owned {
+            sub_bin.concat_sink.remove_probe(pid);
+        }
+        let _ = sub_bin.bin.set_state(gst::State::Null);
+        let _ = pipeline.remove(&sub_bin.bin);
+        concat.release_request_pad(&sub_bin.concat_sink);
+        let depth_after = sub_bins.lock().unwrap().len();
+        let fired = sub_bin.eos_fire_count.load(Ordering::Relaxed);
+        log::info!(
+            "[gst-cl] RETIRE serial={serial} fired={fired} \
+             (queue_depth_after={depth_after})"
+        );
+        Ok(())
+    }
+
+    /// Cadence worker loop. Spawned once per GstDecoder (in
+    /// build_on_worker, after the pipeline reaches PLAYING).
+    /// Owns pipe_cmd_rx + Arc clones of pipeline/concat/
+    /// sub_bins/clip_path/serial_counter/pipe_cmd_tx/
+    /// last_concat_add_at. Sequentially processes AddNextClip
+    /// and Retire commands from the EOS probes off the
+    /// present thread.
+    ///
+    /// Exit conditions:
+    /// - cadence_stop set true (Drop signals this) -> exit cleanly
+    /// - All probe txs dropped (Senders gone) -> recv returns Err -> exit
+    #[allow(clippy::too_many_arguments)]
+    fn cadence_loop(
+        rx: mpsc::Receiver<PipelineCmd>,
+        cadence_stop: Arc<AtomicBool>,
+        pipeline: gst::Pipeline,
+        concat: gst::Element,
+        sub_bins: Arc<Mutex<VecDeque<SubBin>>>,
+        clip_path: Arc<Mutex<PathBuf>>,
+        serial_counter: Arc<AtomicU64>,
+        pipe_cmd_tx: mpsc::Sender<PipelineCmd>,
+        last_concat_add_at: Arc<Mutex<Option<std::time::Instant>>>,
+        clip_basename_initial: String,
+    ) {
+        log::info!(
+            "[gst-cadence] worker up for {clip_basename_initial}"
+        );
+        // Use recv_timeout so we can check cadence_stop
+        // periodically (recv() would block indefinitely).
+        loop {
+            if cadence_stop.load(Ordering::Relaxed) {
+                log::info!(
+                    "[gst-cadence] stop flag set for {clip_basename_initial}; exiting"
+                );
+                break;
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                Ok(cmd) => match cmd {
+                    PipelineCmd::AddNextClip => {
+                        if let Err(e) = add_next_clip_inner(
+                            &pipeline,
+                            &concat,
+                            &sub_bins,
+                            &clip_path,
+                            &serial_counter,
+                            &pipe_cmd_tx,
+                            &last_concat_add_at,
+                        ) {
+                            log::warn!(
+                                "[gst-cadence] add_next_clip failed: {e:#}"
                             );
-                            if let Ok(mut g) = concat_add_stamp.lock() {
-                                *g = Some(std::time::Instant::now());
-                            }
-                            let _ = tx_for_probe.send(PipelineCmd::AddNextClip);
-                            let _ = tx_for_probe.send(PipelineCmd::Retire(serial_for_probe));
                         }
                     }
-                    gst::PadProbeReturn::Ok
+                    PipelineCmd::Retire(serial) => {
+                        if let Err(e) = retire_subgraph_inner(
+                            &pipeline,
+                            &concat,
+                            &sub_bins,
+                            serial,
+                        ) {
+                            log::warn!(
+                                "[gst-cadence] retire serial={serial} failed: {e:#}"
+                            );
+                        }
+                    }
                 },
-            );
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Periodic wakeup; loop back to check stop.
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    log::info!(
+                        "[gst-cadence] all senders dropped; exiting"
+                    );
+                    break;
+                }
+            }
+        }
+    }
 
-            sub.sync_state_with_parent()
-                .with_context(|| format!("sub.sync_state [{serial}]"))?;
-
-            let depth = {
-                let mut q = self.sub_bins.lock().unwrap();
-                q.push_back(SubBin {
-                    serial,
-                    bin: sub,
-                    qtdemux,
-                    pad_added_id: Some(pad_added_id),
-                    concat_sink,
-                    // probe_id is already Option<PadProbeId> in
-                    // gst-rs 0.23 (add_probe returns Option for
-                    // failure cases).
-                    probe_id,
-                    eos_fire_count,
-                });
-                q.len()
-            };
-            log::info!(
-                "[gst-cl] {} ADD sub-bin serial={serial} (queue_depth={depth})",
-                self.clip_basename
-            );
-            Ok(())
+    impl GstDecoder {
+        /// Append a new sub-bin. Used by build_on_worker for
+        /// pre-queue (cadence worker not yet spawned at that
+        /// point). After finalize, the cadence worker handles
+        /// EOS-triggered AddNextClip directly.
+        fn add_next_clip(&mut self) -> Result<()> {
+            add_next_clip_inner(
+                &self.pipeline,
+                &self.concat,
+                &self.sub_bins,
+                &self.clip_path,
+                &self.serial_counter,
+                &self.pipe_cmd_tx,
+                &self.last_concat_add_at,
+            )
         }
 
-        /// Tear down the sub-bin with the matching serial.
-        /// Disconnect handler + remove probe FIRST (releases
-        /// closures), then NULL + remove + release concat pad
-        /// (cutloop's proven leak-safe order, :314-379).
+        /// Tear down a sub-bin. Used by Drop's retire-all step
+        /// (cadence worker has been joined by then; no
+        /// contention on sub_bins).
         fn retire_subgraph(&mut self, serial: u64) -> Result<()> {
-            // VecDeque::remove(idx) returns Option<SubBin>; unwrap to
-            // the inner struct or bail if not found.
-            let mut sub_bin: SubBin = {
-                let mut q = self.sub_bins.lock().unwrap();
-                match q.iter().position(|s| s.serial == serial) {
-                    Some(idx) => q.remove(idx).expect("position found ensures Some"),
-                    None => {
-                        log::warn!(
-                            "[gst-cl] {} retire serial={serial} not found",
-                            self.clip_basename
-                        );
-                        return Ok(());
-                    }
-                }
-            };
-            if let Some(id) = sub_bin.pad_added_id.take() {
-                sub_bin.qtdemux.disconnect(id);
-            }
-            // probe_id may already have been consumed by remove_probe
-            // returning Some; take() to be safe.
-            let probe_owned = sub_bin.probe_id.take();
-            if let Some(pid) = probe_owned {
-                sub_bin.concat_sink.remove_probe(pid);
-            }
-            let _ = sub_bin.bin.set_state(gst::State::Null);
-            let _ = self.pipeline.remove(&sub_bin.bin);
-            self.concat.release_request_pad(&sub_bin.concat_sink);
-            let depth_after = self.sub_bins.lock().unwrap().len();
-            let fired = sub_bin.eos_fire_count.load(Ordering::Relaxed);
-            log::info!(
-                "[gst-cl] {} RETIRE serial={serial} fired={fired} \
-                 (queue_depth_after={depth_after})",
-                self.clip_basename
-            );
-            Ok(())
+            retire_subgraph_inner(
+                &self.pipeline,
+                &self.concat,
+                &self.sub_bins,
+                serial,
+            )
         }
 
         /// Persistent-pipeline clip switch (cutloop EOS-swap
@@ -1224,12 +1403,18 @@ mod linux {
                 .unwrap_or("?")
                 .to_string();
 
-            // Single-threaded mutation: self.clip_path is read
-            // only on present thread (in add_next_clip via
-            // process_pending); this fn also runs on present.
-            // No sync needed. M1 deep-review verified this
-            // threading model.
-            self.clip_path = new_clip.to_path_buf();
+            // Mutate clip_path via Arc<Mutex> (now shared
+            // with cadence worker). switch_to_clip is on
+            // present thread; cadence worker reads clip_path
+            // at each add_next_clip_inner call. Eventually-
+            // consistent: any in-flight add reads OLD; the
+            // next add reads NEW.
+            {
+                let mut g = self.clip_path.lock().map_err(|p| {
+                    anyhow!("clip_path lock poisoned: {p}")
+                })?;
+                *g = new_clip.to_path_buf();
+            }
             self.clip_basename = new_basename.clone();
 
             log::info!(
@@ -1250,31 +1435,14 @@ mod linux {
             Ok(())
         }
 
-        /// Drain pending pipeline commands from EOS probes.
-        /// Called by kms::run_loop per iteration on the present
-        /// thread (where pipeline mutations happen safely;
-        /// cutloop's GLib.idle_add equivalent).
+        /// NO-OP shim. Pre-cadence-worker design called this
+        /// from kms::run_loop per iter to drain pipe_cmd_rx
+        /// on the present thread (the source of the
+        /// near_concat_add ~33-80ms hitches). The long-lived
+        /// cadence worker now owns pipe_cmd_rx and drains it
+        /// directly off-thread. Kept as a stub so the
+        /// existing run_loop call site stays compile-clean.
         pub fn process_pending(&mut self) -> Result<()> {
-            while let Ok(cmd) = self.pipe_cmd_rx.try_recv() {
-                match cmd {
-                    PipelineCmd::AddNextClip => {
-                        if let Err(e) = self.add_next_clip() {
-                            log::warn!(
-                                "[gst-cl] {} add_next_clip failed: {e:#}",
-                                self.clip_basename
-                            );
-                        }
-                    }
-                    PipelineCmd::Retire(serial) => {
-                        if let Err(e) = self.retire_subgraph(serial) {
-                            log::warn!(
-                                "[gst-cl] {} retire serial={serial} failed: {e:#}",
-                                self.clip_basename
-                            );
-                        }
-                    }
-                }
-            }
             Ok(())
         }
 
@@ -1377,6 +1545,18 @@ mod linux {
             // Clone basename out so the later self.retire_subgraph
             // calls don't borrow-conflict with the log strings.
             let name = self.clip_basename.clone();
+
+            log::info!("[gst-drop] {name} step=0 stop+join cadence worker");
+            // Stop the cadence worker FIRST. It owns
+            // pipe_cmd_rx + Arc clones of sub_bins / clip_path /
+            // serial_counter; we need it out of the way before
+            // the synchronous retire-all + pipeline NULL steps
+            // below race with worker-side mutations.
+            self.cadence_stop.store(true, Ordering::Relaxed);
+            if let Some(h) = self.cadence_thread.take() {
+                let _ = h.join();
+            }
+            log::info!("[gst-drop] {name} step=0 cadence joined");
 
             log::info!("[gst-drop] {name} step=1 set stop flag");
             self.stop.store(true, Ordering::Relaxed);
