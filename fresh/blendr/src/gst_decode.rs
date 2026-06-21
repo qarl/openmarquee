@@ -461,9 +461,36 @@ mod linux {
     fn build_on_worker(
         seed: crate::egl_gbm::ShareGroupSeed,
         clip: PathBuf,
-        _clip_basename: String,
+        clip_basename: String,
     ) -> Result<GstDecoder> {
+        // Per-phase trace timing (BLENDR_FRAME_TRACE=1): each
+        // phase emits a [trace-create] line with ts_ms (since
+        // trace_init) + elapsed_ms (within this create). QA
+        // correlates ts_ms across creates + retires to identify
+        // HW decoder contention windows.
+        let t_start = std::time::Instant::now();
+        let create_id = crate::kms::trace_ts_ms(); // unique per-create id; just the ts
+        let log_phase = |phase: &str, t_phase_start: std::time::Instant| {
+            if !crate::kms::trace_enabled() { return; }
+            let phase_ms = t_phase_start.elapsed().as_millis();
+            let total_ms = t_start.elapsed().as_millis();
+            crate::kms::trace_writeln(&format!(
+                "[trace-create] ts_ms={} id={create_id} clip={clip_basename} \
+                 phase={phase} phase_ms={phase_ms} total_ms={total_ms}",
+                crate::kms::trace_ts_ms()
+            ));
+        };
+        if crate::kms::trace_enabled() {
+            crate::kms::trace_writeln(&format!(
+                "[trace-create] ts_ms={} id={create_id} clip={clip_basename} \
+                 phase=START",
+                crate::kms::trace_ts_ms()
+            ));
+        }
+
+        let t_phase = std::time::Instant::now();
         gst::init().context("gst::init (worker)")?;
+        log_phase("gst_init", t_phase);
 
         // (a.1) Create the share-group EGL context on THIS
         //       worker thread (NOT on present). eglCreate-
@@ -473,6 +500,7 @@ mod linux {
         //       did this on present, it would black our screen
         //       for ~160ms (QA proof at bbf4daa). On the
         //       worker, it just disrupts the worker's nothing.
+        let t_phase = std::time::Instant::now();
         let share_group = crate::egl_gbm::ShareGroupContext::create_in_share_group(
             seed.lib,
             seed.display,
@@ -480,13 +508,16 @@ mod linux {
             seed.parent_context,
         )
         .context("create share-group context on worker")?;
+        log_phase("share_group_ctx", t_phase);
 
         // (a.2) Make the share-group context current on THIS
         //       worker thread so the GstGLContext::new_wrapped
         //       call below sees an active context for fill_info.
+        let t_phase = std::time::Instant::now();
         share_group
             .make_current_here()
             .context("share-group make_current on worker")?;
+        log_phase("share_group_make_current", t_phase);
 
         // (b) Wrap the SHARE context (not presenter's) for
         //     gst-gl. All subsequent gst-gl operations route
@@ -508,6 +539,7 @@ mod linux {
             )
         }
         .ok_or_else(|| anyhow!("GLContext::new_wrapped(share-group) returned None"))?;
+        let t_phase = std::time::Instant::now();
         gst_context
             .activate(true)
             .map_err(|e| anyhow!("gst_context.activate(true): {e}"))?;
@@ -517,6 +549,8 @@ mod linux {
         gst_context
             .activate(false)
             .map_err(|e| anyhow!("gst_context.activate(false): {e}"))?;
+        log_phase("gst_gl_wrap", t_phase);
+        let t_phase = std::time::Instant::now();
 
             // (b) Build the STATIC downstream half:
             //     concat -> v4l2h264dec -> queue -> glupload
@@ -731,12 +765,15 @@ mod linux {
                 share_group,
                 last_was_new_sample: false,
             };
+            log_phase("pipeline_build", t_phase);
 
             // (e) Pre-queue INITIAL_QUEUE_DEPTH sub-bins. concat
             //     plays the first; the rest are pending.
+            let t_phase = std::time::Instant::now();
             for _ in 0..INITIAL_QUEUE_DEPTH {
                 me.add_next_clip()?;
             }
+            log_phase("pre_queue", t_phase);
 
             // (f) State -> PAUSED + wait, then PLAYING + wait.
             //     Both waits BLOCK the worker thread; that's
@@ -750,6 +787,7 @@ mod linux {
             //     pre-#2-alt sync new(). Typical wall-clock
             //     to PLAYING is ~140-500ms per QA history.
             log::info!("[gst] [{clip_basename}] (worker) set_state(PAUSED)");
+            let t_phase = std::time::Instant::now();
             let preroll_ret = me
                 .pipeline
                 .set_state(gst::State::Paused)
@@ -757,12 +795,16 @@ mod linux {
             log::info!(
                 "[gst] [{clip_basename}] (worker) set_state(PAUSED) -> {preroll_ret:?}"
             );
+            log_phase("paused_set", t_phase);
+
+            let t_phase = std::time::Instant::now();
             let (wait_res, cur, pending) =
                 me.pipeline.state(gst::ClockTime::from_seconds(5));
             log::info!(
                 "[gst] [{clip_basename}] (worker) state-wait PAUSED: \
                  {wait_res:?} cur={cur:?} pending={pending:?}"
             );
+            log_phase("paused_reached", t_phase);
             if cur != gst::State::Paused {
                 return Err(anyhow!(
                     "(worker) preroll did not settle to PAUSED \
@@ -771,6 +813,7 @@ mod linux {
             }
 
             log::info!("[gst] [{clip_basename}] (worker) set_state(PLAYING)");
+            let t_phase = std::time::Instant::now();
             let play_ret = me
                 .pipeline
                 .set_state(gst::State::Playing)
@@ -778,12 +821,16 @@ mod linux {
             log::info!(
                 "[gst] [{clip_basename}] (worker) set_state(PLAYING) -> {play_ret:?}"
             );
+            log_phase("playing_set", t_phase);
+
+            let t_phase = std::time::Instant::now();
             let (wait_res, cur, pending) =
                 me.pipeline.state(gst::ClockTime::from_seconds(10));
             log::info!(
                 "[gst] [{clip_basename}] (worker) state-wait PLAYING: \
                  {wait_res:?} cur={cur:?} pending={pending:?}"
             );
+            log_phase("playing_reached", t_phase);
             if cur != gst::State::Playing {
                 return Err(anyhow!(
                     "(worker) pipeline did NOT reach PLAYING within 10s \
@@ -821,6 +868,15 @@ mod linux {
             //     Drop runs (after pipeline NULL during
             //     GstDecoder::Drop).
             me.share_group.release_here();
+
+            if crate::kms::trace_enabled() {
+                let total_ms = t_start.elapsed().as_millis();
+                crate::kms::trace_writeln(&format!(
+                    "[trace-create] ts_ms={} id={create_id} clip={clip_basename} \
+                     phase=DONE total_ms={total_ms}",
+                    crate::kms::trace_ts_ms()
+                ));
+            }
 
             Ok(me)
         }

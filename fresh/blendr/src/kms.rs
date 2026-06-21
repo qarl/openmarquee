@@ -279,6 +279,18 @@ impl Streams {
                     let taken = slots[retire_slot].take();
                     if let Some(old) = taken {
                         let label = format!("retire-slot{retire_slot}");
+                        // Trace: retire-id = present-thread ts
+                        // at spawn so it's unique + correlatable
+                        // with create-ids via wall-clock.
+                        let retire_id = trace_ts_ms();
+                        if trace_enabled() {
+                            trace_writeln(&format!(
+                                "[trace-retire] ts_ms={} id={retire_id} \
+                                 slot={retire_slot} phase=SPAWN",
+                                trace_ts_ms()
+                            ));
+                        }
+                        let t_spawn = std::time::Instant::now();
                         let _ = std::thread::Builder::new()
                             .name(label.clone())
                             .spawn(move || {
@@ -288,6 +300,19 @@ impl Streams {
                                 // before; present thread does
                                 // not wait.
                                 drop(old);
+                                // Trace: record drop completion
+                                // so QA can correlate with
+                                // create-start timestamps to
+                                // identify HW decoder /dev/video10
+                                // contention windows.
+                                if trace_enabled() {
+                                    let drop_ms = t_spawn.elapsed().as_millis();
+                                    trace_writeln(&format!(
+                                        "[trace-retire] ts_ms={} id={retire_id} \
+                                         slot={retire_slot} phase=DONE drop_ms={drop_ms}",
+                                        trace_ts_ms()
+                                    ));
+                                }
                             });
                         log::info!(
                             "[cycle] retire slot={retire_slot} -> worker thread '{label}'"
@@ -814,6 +839,92 @@ impl FrameStats {
     }
 }
 
+/// Global trace-file state. Initialized once at run_loop
+/// startup (via trace_init). All threads (present, retire
+/// workers, PendingDecoder workers) write to the same file
+/// via trace_writeln, which takes a Mutex per line so writes
+/// don't interleave.
+///
+/// Per-line cost when enabled: Mutex acquire + writeln syscall
+/// (~µs). When disabled: one OnceLock get + None match (~ns).
+///
+/// On Linux, append-mode writes are atomic per syscall for
+/// payloads < PIPE_BUF (4KB), so even without the Mutex
+/// individual lines wouldn't interleave -- but the Mutex
+/// also serializes order, which makes the trace easier to
+/// read across threads.
+static TRACE_FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+    std::sync::OnceLock::new();
+static TRACE_START: std::sync::OnceLock<std::time::Instant> =
+    std::sync::OnceLock::new();
+
+/// Initialize the global trace file from env (BLENDR_FRAME_
+/// TRACE / BLENDR_FRAME_TRACE_FILE). Called once at startup.
+/// Safe to call multiple times (OnceLock init).
+pub fn trace_init() {
+    TRACE_START.get_or_init(std::time::Instant::now);
+    TRACE_FILE.get_or_init(|| {
+        if std::env::var("BLENDR_FRAME_TRACE").as_deref() == Ok("1") {
+            let path = std::env::var("BLENDR_FRAME_TRACE_FILE")
+                .unwrap_or_else(|_| "/tmp/blendr-frame-trace.log".to_string());
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(f) => {
+                    log::warn!(
+                        "[trace] BLENDR_FRAME_TRACE=1; appending trace lines \
+                         (per-frame ~2s post-transition + per-create phases \
+                         + per-retire) to {path}"
+                    );
+                    Some(std::sync::Mutex::new(f))
+                }
+                Err(e) => {
+                    log::error!(
+                        "[trace] BLENDR_FRAME_TRACE=1 but failed to open {path}: \
+                         {e:#}; trace DISABLED"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    });
+}
+
+/// Check whether the trace file was opened. Cheap (one
+/// OnceLock get + None match).
+pub fn trace_enabled() -> bool {
+    TRACE_FILE
+        .get()
+        .map(|opt| opt.is_some())
+        .unwrap_or(false)
+}
+
+/// Wall-clock milliseconds since trace_init was called.
+/// Returns 0 if trace_init hasn't run. Used to give every
+/// trace line an absolute timestamp so QA can correlate
+/// events across threads (e.g., create-start vs retire-end).
+pub fn trace_ts_ms() -> u128 {
+    TRACE_START
+        .get()
+        .map(|t| t.elapsed().as_millis())
+        .unwrap_or(0)
+}
+
+/// Append `line` (with appended newline) to the global trace
+/// file. Safe to call from any thread; serializes via Mutex.
+/// No-op when trace is disabled.
+pub fn trace_writeln(line: &str) {
+    let Some(maybe) = TRACE_FILE.get() else { return };
+    let Some(mtx) = maybe.as_ref() else { return };
+    let Ok(mut f) = mtx.lock() else { return };
+    use std::io::Write;
+    let _ = writeln!(f, "{line}");
+}
+
 /// ENV-gated per-frame trace probe for qarl's "~1s into new
 /// clip, single frame sticks for ~50-125ms" symptom (post-
 /// crossfade, during steady playback). Existing [frame-long]
@@ -848,7 +959,6 @@ impl FrameStats {
 /// per frame in the trace window (~2s * ~60fps = ~120 lines
 /// per transition).
 pub struct FrameTrace {
-    file: Option<std::fs::File>,
     /// Wall-clock of the most recent FadingX->HoldingX
     /// transition. Used to compute ms_since_xn.
     transition_at: Option<std::time::Instant>,
@@ -863,35 +973,8 @@ pub struct FrameTrace {
 const TRACE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
 
 impl FrameTrace {
-    pub fn from_env() -> Self {
-        let file = if std::env::var("BLENDR_FRAME_TRACE").as_deref() == Ok("1") {
-            let path = std::env::var("BLENDR_FRAME_TRACE_FILE")
-                .unwrap_or_else(|_| "/tmp/blendr-frame-trace.log".to_string());
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-            {
-                Ok(f) => {
-                    log::warn!(
-                        "[trace] BLENDR_FRAME_TRACE=1; appending per-frame trace \
-                         (~2s post-transition) to {path}"
-                    );
-                    Some(f)
-                }
-                Err(e) => {
-                    log::error!(
-                        "[trace] BLENDR_FRAME_TRACE=1 but failed to open {path}: \
-                         {e:#}; trace DISABLED"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+    pub fn new() -> Self {
         Self {
-            file,
             transition_at: None,
             trace_window_end: None,
             prev_phase: None,
@@ -899,19 +982,19 @@ impl FrameTrace {
     }
 
     pub fn is_enabled(&self) -> bool {
-        self.file.is_some()
+        trace_enabled()
     }
 
     /// Call once per iter AFTER streams.tick. If the slideshow
     /// phase just transitioned from a Fading variant to a
     /// Holding variant, start a ~2s trace window. Writes a
-    /// TRANSITION marker line to the file.
+    /// TRANSITION marker line via the global trace_writeln.
     pub fn note_phase_if_changed(
         &mut self,
         cur_phase: Option<BlendPhase>,
         cycle: u64,
     ) {
-        if self.file.is_none() {
+        if !trace_enabled() {
             self.prev_phase = cur_phase;
             return;
         }
@@ -923,9 +1006,6 @@ impl FrameTrace {
         if prev_p == cur_p {
             return;
         }
-        // Trigger only on Fading -> Holding (= crossfade complete,
-        // new clip enters steady playback). qarl's symptom fires
-        // ~1s after this.
         let was_fading = matches!(
             prev_p,
             BlendPhase::FadingAtoB | BlendPhase::FadingBtoA
@@ -940,16 +1020,12 @@ impl FrameTrace {
         let now = std::time::Instant::now();
         self.transition_at = Some(now);
         self.trace_window_end = Some(now + TRACE_WINDOW);
-        if let Some(f) = self.file.as_mut() {
-            use std::io::Write;
-            let _ = writeln!(
-                f,
-                "[trace] TRANSITION at_unix_ms=N/A phase={prev_p:?}->{cur_p:?} \
-                 cycle={cycle} window={}ms",
-                TRACE_WINDOW.as_millis()
-            );
-            let _ = f.flush();
-        }
+        trace_writeln(&format!(
+            "[trace] ts_ms={} TRANSITION phase={prev_p:?}->{cur_p:?} \
+             cycle={cycle} window_ms={}",
+            trace_ts_ms(),
+            TRACE_WINDOW.as_millis()
+        ));
     }
 
     /// Call once per iter AFTER render+flip (or after the
@@ -972,7 +1048,6 @@ impl FrameTrace {
             None => return,
         };
         if now > trace_until {
-            // Window closed; clear so next transition reopens.
             self.trace_window_end = None;
             return;
         }
@@ -981,19 +1056,16 @@ impl FrameTrace {
             None => return,
         };
         let ms_since_xn = (now - transition_at).as_millis();
-        if let Some(f) = self.file.as_mut() {
-            use std::io::Write;
-            let _ = writeln!(
-                f,
-                "[trace] ms_since_xn={ms_since_xn} delta_ms={delta_ms:.2} \
-                 render_ms={render_ms:.2} cache_hit_a={} cache_hit_b={} \
-                 pts_a_ns={} pts_b_ns={} present_skipped={present_skipped}",
-                format_opt_bool(cache_hit_a),
-                format_opt_bool(cache_hit_b),
-                format_opt_u64(pts_a_ns),
-                format_opt_u64(pts_b_ns),
-            );
-        }
+        trace_writeln(&format!(
+            "[trace] ts_ms={} ms_since_xn={ms_since_xn} delta_ms={delta_ms:.2} \
+             render_ms={render_ms:.2} cache_hit_a={} cache_hit_b={} \
+             pts_a_ns={} pts_b_ns={} present_skipped={present_skipped}",
+            trace_ts_ms(),
+            format_opt_bool(cache_hit_a),
+            format_opt_bool(cache_hit_b),
+            format_opt_u64(pts_a_ns),
+            format_opt_u64(pts_b_ns),
+        ));
     }
 }
 
@@ -1416,15 +1488,19 @@ mod linux {
         let mut stats = FrameStats::new();
         log::info!("[frame-stats] instrumentation armed; summary every 30s");
 
-        // Per-frame trace probe (qarl's ~1s-post-transition
-        // stuck-frame symptom). Disabled unless BLENDR_FRAME_
-        // TRACE=1. Output: BLENDR_FRAME_TRACE_FILE or
-        // /tmp/blendr-frame-trace.log. Cost when disabled: 0.
-        let mut frame_trace = FrameTrace::from_env();
+        // Initialize global trace file once (BLENDR_FRAME_
+        // TRACE / BLENDR_FRAME_TRACE_FILE). Used by FrameTrace
+        // (per-frame), gst_decode build_on_worker (per-phase
+        // create timing), and the retire worker (drop end
+        // timestamps). All threads share the same file via
+        // a Mutex<File> for ordered, non-interleaved writes.
+        super::trace_init();
+        let mut frame_trace = FrameTrace::new();
         if frame_trace.is_enabled() {
             log::warn!(
                 "[trace] per-frame probe ENABLED; will log every frame for \
-                 ~2s after each Fading->Holding phase transition"
+                 ~2s after each Fading->Holding phase transition + every \
+                 create/retire phase across all threads"
             );
         }
 
