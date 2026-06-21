@@ -506,6 +506,16 @@ pub struct EglSession<'a> {
     /// must be distinct textures.
     transition_fbo_b: Option<glow::NativeFramebuffer>,
     transition_tex_b: Option<glow::NativeTexture>,
+    /// Snapshot-side-A (2026-06-21): captured outgoing video
+    /// frame for an in-flight video→video transition. Populated
+    /// on the FIRST tick of a v2v fade (after bake_a succeeds);
+    /// freed at progress>=0.99, on entry to a non-v2v transition
+    /// (defensive), and at session teardown. Commit 1 captures
+    /// but does not consume — verifies the GLES2 copy path
+    /// doesn't regress baseline. Commit 2 wires the side-A
+    /// bypass that reads this texture instead of re-feeding the
+    /// outgoing decoder.
+    transition_still_a_tex: Option<glow::NativeTexture>,
     /// r102.2: dims the cached transition_fbo_a/b were
     /// allocated against. Invalidates the cache on mode change
     /// (HDMI hot-plug, rotation flip). `None` while the cache
@@ -884,6 +894,7 @@ where
         transition_tex_a: None,
         transition_fbo_b: None,
         transition_tex_b: None,
+        transition_still_a_tex: None,
         transition_fbo_dims: None,
         external_frame_tex: None,
         external_nv12_tex: None,
@@ -1140,6 +1151,9 @@ where
             gl.delete_framebuffer(fbo);
         }
         if let Some(tex) = session.transition_tex_b.take() {
+            gl.delete_texture(tex);
+        }
+        if let Some(tex) = session.transition_still_a_tex.take() {
             gl.delete_texture(tex);
         }
         session.transition_fbo_dims = None;
@@ -5390,6 +5404,29 @@ pub fn paint_and_present_one_transition_frame(
         }
     }
 
+    // Snapshot-side-A Commit 1 (2026-06-21): detect dual-video
+    // transition (both endpoints video-bearing). Used by the
+    // capture site inside the work closure to gate the
+    // transition_still_a_tex glCopyTexImage2D, and by the
+    // defensive free below to drop a stale still when the next
+    // transition isn't dual-video. Commit 1 captures + frees but
+    // does not yet consume — verifies the capture path on glass.
+    // Commit 2 wires use_poster_a to read this texture, turning
+    // it into the side-A bypass that lets the outgoing decoder
+    // sit idle for the rest of the fade.
+    let is_dual_video = matches!(
+        &endpoint_a,
+        TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
+    ) && matches!(
+        &endpoint_b,
+        TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
+    );
+    if !is_dual_video {
+        if let Some(tex) = session.transition_still_a_tex.take() {
+            unsafe { use glow::HasContext; session.gl.delete_texture(tex); }
+        }
+    }
+
     // Ok(true) = transition frame painted + ready to present;
     // Ok(false) = FYS bug C skip (a video endpoint had no frame
     // ready this tick) — caller skips the swap+commit.
@@ -5595,6 +5632,60 @@ pub fn paint_and_present_one_transition_frame(
             };
             (fa, ta)
         };
+        // Snapshot-side-A Commit 1 (2026-06-21): capture the
+        // freshly-baked side-A frame into transition_still_a_tex
+        // when this is the FIRST tick of a dual-video transition
+        // AND we live-decoded (poster fast-path skipped). Tick 1
+        // is detected via still_a.is_none() — populated here on
+        // tick 1, freed at progress>=0.99 / non-v2v entry / session
+        // teardown. Commit 1 captures but does not consume; the
+        // bake_a path above runs every tick exactly as before. The
+        // GLES2-safe FRAMEBUFFER bind (not READ_FRAMEBUFFER, which
+        // is GLES3-only) is the silent-bite trap QA flagged.
+        //
+        // Skip capture when use_poster_a_now: fbo_a holds the
+        // poster blit, capturing it would duplicate disk content
+        // for no gain. Skip when cached_pair_a is None: the
+        // FBO+tex is non-stable across calls (legacy alloc path),
+        // so copying out is fine but the timing isn't worth
+        // verifying in the scaffold commit.
+        if is_dual_video
+            && !use_poster_a_now
+            && cached_pair_a.is_some()
+            && session.transition_still_a_tex.is_none()
+        {
+            let dest_tex = session.gl.create_texture()
+                .map_err(|e| anyhow!("snapshot-side-A create_texture: {e}"))?;
+            session.gl.bind_texture(glow::TEXTURE_2D, Some(dest_tex));
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
+            );
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32,
+            );
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32,
+            );
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32,
+            );
+            // Explicit bind: bake_slide_to_fbo's inner helpers
+            // may leave the binding at default. GLES2 uses
+            // FRAMEBUFFER as the single bind point (READ_/DRAW_
+            // are GLES3-only).
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a));
+            session.gl.copy_tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA,
+                0, 0, mode_w_u32 as i32, mode_h_u32 as i32, 0,
+            );
+            session.gl.bind_texture(glow::TEXTURE_2D, None);
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.transition_still_a_tex = Some(dest_tex);
+            eprintln!(
+                "[perf] snapshot_side_a_captured progress={:.3} dims={}x{}",
+                progress, mode_w_u32, mode_h_u32,
+            );
+        }
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
         //
         // r80-r92 tried to PRE-PROVIDE endpoint_b's first frame at
@@ -6106,6 +6197,19 @@ pub fn paint_and_present_one_transition_frame(
         // and the next advance retries. Mirrors the single-video
         // paint_and_present_one_video_slide_frame Ok(None) path.
         return Ok(());
+    }
+
+    // Snapshot-side-A Commit 1 (2026-06-21): end-of-transition
+    // free. Last tick of the fade (progress>=0.99) drops the
+    // captured still so the next transition's tick-1 capture
+    // sees still_a == None. Idempotent (Option::take). One of
+    // 3 explicit free sites — the others are the defensive
+    // non-v2v-entry free above and session teardown in
+    // cleanup_resources.
+    if progress >= 0.99 {
+        if let Some(tex) = session.transition_still_a_tex.take() {
+            unsafe { use glow::HasContext; session.gl.delete_texture(tex); }
+        }
     }
 
     // swap → lock → addFB → commit_fb same as paint_and_
