@@ -2116,6 +2116,21 @@ where
                 continue;
             }
 
+            // Snapshot-side-A Commit 2 (2026-06-21): free any
+            // captured outgoing-video still on slide-boundary IPC
+            // ops. BeginSlide covers mid-fade operator cut +
+            // transition-end-to-new-slide setup; BeginTransition
+            // covers superseding a still-in-flight fade. Both fire
+            // BEFORE the standard handler runs the actual load /
+            // dispatch, so the next paint sees a clean slate.
+            // Idempotent (None.take() is a no-op).
+            if matches!(
+                &req,
+                IpcRequest::BeginSlide(_) | IpcRequest::BeginTransition(_)
+            ) {
+                crate::hdmi::free_transition_still_a_tex(session);
+            }
+
             let resp = handle_inner_request(req, &mut state, &mut cache, content_root);
 
             // Phase 9 Step 9a: tag the paint kind (if any) BEFORE
@@ -2165,6 +2180,15 @@ where
                 Some(content_root),
             );
 
+            // Snapshot-side-A Commit 2 (2026-06-21): capture the
+            // "was this a transition paint" bit before paint_kind
+            // is moved into the metrics destructure below. Used
+            // by the after-paint free hook AFTER the destructure.
+            let was_transition_paint = matches!(
+                paint_kind,
+                Some(IpcPaintKind::Transition),
+            );
+
             // Phase 9 Step 9a: record per-Advance paint timing on
             // successful paint. Skipping failures keeps avg/max from
             // being skewed by error-path early returns (which carry
@@ -2174,6 +2198,18 @@ where
                     let elapsed_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
                     paint_metrics.record(kind, elapsed_us);
                 }
+            }
+
+            // Snapshot-side-A Commit 2 (2026-06-21): free the
+            // captured still on any non-Transition paint. This is
+            // the natural end-of-transition signal: state machine
+            // returns PaintSlide for the new current slide, which
+            // means the just-completed fade's still is no longer
+            // useful. Idempotent (None.take() is a no-op) so
+            // cheap on steady-state slide ticks where no still
+            // was ever captured.
+            if !was_transition_paint {
+                crate::hdmi::free_transition_still_a_tex(session);
             }
 
             emit_response(stdout, &resp)?;
