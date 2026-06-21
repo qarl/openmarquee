@@ -239,8 +239,15 @@ mod linux {
                 .map_err(|e| anyhow!("eglBindAPI(GLES): {e:?}"))?;
 
             let attribs = [
+                // SURFACE_TYPE = WINDOW_BIT | PBUFFER_BIT so a
+                // SINGLE config serves both the presenter's
+                // window surface AND the share-group context's
+                // 1x1 pbuffer (per ShareGroupContext for the
+                // black-flash fix). Pure WINDOW_BIT fails
+                // eglCreatePbufferSurface with BadMatch -- QA
+                // caught at 6a275bc startup.
                 egl::SURFACE_TYPE,
-                egl::WINDOW_BIT,
+                egl::WINDOW_BIT | egl::PBUFFER_BIT,
                 egl::RED_SIZE,
                 8,
                 egl::GREEN_SIZE,
