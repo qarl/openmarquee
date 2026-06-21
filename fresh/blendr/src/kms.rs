@@ -394,6 +394,16 @@ pub struct FrameStats {
     cum_egl_steal_count: u64,
     window_egl_steal_count: u64,
     last_egl_stolen: bool,
+    /// FBO-dirt detector: count of frames where
+    /// observe_fbo_binding() returned non-zero (= some other
+    /// GL code path bound an FBO and didn't rebind 0; suspect
+    /// gst-gl glupload). draw_frame unconditionally rebinds 0
+    /// (the repair), so this counter is observation-only.
+    /// Per-occurrence [fbo-dirty] BEGIN/END log on streak
+    /// transitions; includes the prev_fbo handle value.
+    cum_fbo_dirty_count: u64,
+    window_fbo_dirty_count: u64,
+    last_fbo_dirty: bool,
     /// Wall-clock at the previous frame's end. None on first
     /// frame (no delta to compute).
     last_present_end: Option<std::time::Instant>,
@@ -425,6 +435,9 @@ impl FrameStats {
             cum_egl_steal_count: 0,
             window_egl_steal_count: 0,
             last_egl_stolen: false,
+            cum_fbo_dirty_count: 0,
+            window_fbo_dirty_count: 0,
+            last_fbo_dirty: false,
             last_present_end: None,
             last_summary_at: now,
             run_start: now,
@@ -447,6 +460,8 @@ impl FrameStats {
         draw_outcome: crate::gles_present::DrawOutcome,
         content_black: bool,
         egl_stolen: bool,
+        fbo_dirty: bool,
+        prev_fbo: i32,
     ) {
         use crate::gles_present::DrawOutcome;
         self.cum_frame_ms.push(frame_ms);
@@ -559,6 +574,31 @@ impl FrameStats {
             );
         }
         self.last_egl_stolen = egl_stolen;
+        // --- FBO-dirt detector ---
+        if fbo_dirty {
+            self.cum_fbo_dirty_count += 1;
+            self.window_fbo_dirty_count += 1;
+        }
+        if fbo_dirty && !self.last_fbo_dirty {
+            let ctx = streams.outlier_context();
+            log::warn!(
+                "[fbo-dirty] BEGIN frame={frame_idx} prev_fbo={prev_fbo} \
+                 phase={} cycle={} flags=[{}] \
+                 ms_since_last_cycle_event={:?}",
+                ctx.phase_str,
+                ctx.cycle,
+                ctx.flags,
+                ctx.ms_since_cycle_event,
+            );
+        } else if !fbo_dirty && self.last_fbo_dirty {
+            let ctx = streams.outlier_context();
+            log::warn!(
+                "[fbo-dirty] END frame={frame_idx} phase={} cycle={}",
+                ctx.phase_str,
+                ctx.cycle,
+            );
+        }
+        self.last_fbo_dirty = fbo_dirty;
         if self.last_summary_at.elapsed().as_secs() >= SUMMARY_INTERVAL_S {
             self.emit_window_summary();
             self.last_summary_at = std::time::Instant::now();
@@ -567,6 +607,7 @@ impl FrameStats {
             self.window_black_count = 0;
             self.window_content_black_count = 0;
             self.window_egl_steal_count = 0;
+            self.window_fbo_dirty_count = 0;
         }
     }
 
@@ -585,6 +626,8 @@ impl FrameStats {
             (self.window_content_black_count as f32 / win_sec) * 60.0;
         let egl_steal_per_min =
             (self.window_egl_steal_count as f32 / win_sec) * 60.0;
+        let fbo_dirty_per_min =
+            (self.window_fbo_dirty_count as f32 / win_sec) * 60.0;
         log::info!(
             "[frame-stats] window={SUMMARY_INTERVAL_S}s frames={} mean={mean_f:.2}ms \
              p50={p50_f:.2} p99={p99_f:.2} p999={p999_f:.2} max={max_f:.2} \
@@ -592,6 +635,7 @@ impl FrameStats {
              black_draws={} (B/min={:.1}) \
              content_black={} (CB/min={:.1}) \
              egl_steals={} (S/min={:.1}) \
+             fbo_dirty={} (FD/min={:.1}) \
              render_mean={mean_r:.2}ms render_max={max_r:.2}ms",
             win_frame.len(),
             self.window_long_count,
@@ -602,6 +646,8 @@ impl FrameStats {
             content_black_per_min,
             self.window_egl_steal_count,
             egl_steal_per_min,
+            self.window_fbo_dirty_count,
+            fbo_dirty_per_min,
         );
     }
 
@@ -620,6 +666,8 @@ impl FrameStats {
             (self.cum_content_black_count as f32 / run_sec) * 60.0;
         let egl_steal_per_min =
             (self.cum_egl_steal_count as f32 / run_sec) * 60.0;
+        let fbo_dirty_per_min =
+            (self.cum_fbo_dirty_count as f32 / run_sec) * 60.0;
         log::info!(
             "[frame-stats] FINAL run={run_sec:.1}s frames={} mean={mean_f:.2}ms \
              p50={p50_f:.2} p99={p99_f:.2} p999={p999_f:.2} max={max_f:.2} \
@@ -627,6 +675,7 @@ impl FrameStats {
              black_draws={} (B/min={:.1}) \
              content_black={} (CB/min={:.1}) \
              egl_steals={} (S/min={:.1}) \
+             fbo_dirty={} (FD/min={:.1}) \
              render_mean={mean_r:.2}ms render_max={max_r:.2}ms",
             self.cum_frame_ms.len(),
             self.cum_long_count,
@@ -637,6 +686,8 @@ impl FrameStats {
             content_black_per_min,
             self.cum_egl_steal_count,
             egl_steal_per_min,
+            self.cum_fbo_dirty_count,
+            fbo_dirty_per_min,
         );
     }
 
@@ -1199,38 +1250,40 @@ mod linux {
                     }
                 }
 
-                // BLACK-FLASH FIX ATTEMPT: re-claim EGL right
-                // before draw_frame if gst-gl streaming threads
-                // have stolen the binding during the
-                // PendingDecoder create window.
+                // BLACK-FLASH FIX ATTEMPT (post-EGL-steal-
+                // refutation): QA's A/B of 96e6c78 showed
+                // egl_steals=0 + content_black=156 unchanged --
+                // the context is never stolen. Refined
+                // hypothesis: the create's gst-gl GL work runs
+                // ON THE PRESENT THREAD (start_async / poll on
+                // OUR context) and dirties GL state. Primary
+                // suspect: glupload's GLBufferPool binds an
+                // FBO for off-screen RGBA conversion; if we
+                // don't rebind FB 0 (the window surface), our
+                // draws land in that FBO -> screen black.
                 //
-                // QA root-caused (PROOF: captured black frame
-                // mid-create, content_black=145 over 300s, all
-                // flagged near_create|near_retire): the async
-                // create on the present thread does not itself
-                // disrupt rendering, but the gst-gl streaming
-                // threads that run the PAUSED preroll +
-                // glupload negotiation call eglMakeCurrent on
-                // our SHARED context on THEIR threads -- which
-                // unbinds our context from the present thread.
-                // Subsequent draw_quad_X calls then run with
-                // EGL_NO_CONTEXT current -> commands no-op ->
-                // only the clear-to-black is visible.
+                // Two-part response:
+                //   1. Diagnostic (here): observe the bound
+                //      FBO BEFORE draw_frame. If != 0, log +
+                //      count + the [fbo-dirty] BEGIN/END.
+                //      Surfaces in summary as fbo_dirty=K
+                //      (FD/min=...). Proves cause.
+                //   2. Repair (in draw_frame): unconditionally
+                //      bind_framebuffer(0) + disable scissor
+                //      at draw_frame top. 2 extra FFI/frame
+                //      (~µs). Guarantees screen-draw regardless
+                //      of whatever state the create left.
                 //
-                // The 3 defensive make_current calls in the
-                // pull cycle close the window before/after
-                // pull, but a steal between the last one and
-                // draw_frame (or DURING set_video_textures'
-                // rare lazy-compile path) goes unrepaired.
-                //
-                // This unconditional check + repair closes the
-                // gap to zero. Counter accumulates steals so
-                // QA can confirm + see the rate.
+                // The legacy egl-steal check + repair from
+                // 96e6c78 stays as cheap insurance; cost is
+                // one get_current_context ~µs per frame.
                 let stolen = !egl.is_current_context_ours();
                 if stolen {
                     egl.make_current()
                         .context("egl.make_current pre-draw_frame (steal repair)")?;
                 }
+                let prev_fbo = presenter.observe_fbo_binding();
+                let fbo_dirty = prev_fbo != 0;
 
                 // Measurement: stamp before draw to time the GL
                 // draw + swap work (render_ms), excluding the
@@ -1348,6 +1401,8 @@ mod linux {
                         draw_outcome,
                         content_black,
                         stolen,
+                        fbo_dirty,
+                        prev_fbo,
                     );
                 }
 

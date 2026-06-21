@@ -79,6 +79,9 @@ mod stub {
         pub fn sample_back_buffer_is_near_black(&self) -> Result<bool> {
             anyhow::bail!("sample stub: Linux only")
         }
+        pub fn observe_fbo_binding(&self) -> i32 {
+            0
+        }
         pub fn set_video_texture(
             &mut self,
             _tex_id: u32,
@@ -583,6 +586,29 @@ mod linux {
 
         pub fn draw_frame(&mut self, frame_idx: u64) -> Result<DrawOutcome> {
             let outcome = unsafe {
+                // BLACK-FLASH FIX ATTEMPT (post-EGL-steal-refutation):
+                // QA refined hypothesis after egl_steals=0 +
+                // content_black=156 unchanged -- the create's
+                // gst-gl GL work runs on the present thread on
+                // our context and DIRTIES GL state that
+                // draw_frame depends on. Primary suspect:
+                // glupload's GLBufferPool binds an FBO for its
+                // off-screen RGBA conversion target; if we
+                // don't rebind the default framebuffer (FB 0
+                // = the EGL window surface), our draws land
+                // in that FBO instead of on-screen -> screen
+                // shows the clear-to-black from our path with
+                // nothing drawn on top.
+                //
+                // Unconditional bind 0 + disable scissor at
+                // draw_frame top. 2 extra FFI per frame (~µs).
+                // run_loop has a parallel observe_fbo_binding
+                // diagnostic that LOGS + counts when the FBO
+                // was dirty, so QA can confirm cause from
+                // [fbo-dirty] BEGIN/END lines + fbo_dirty
+                // counter in summary.
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                self.gl.disable(glow::SCISSOR_TEST);
                 self.gl.viewport(0, 0, self.w, self.h);
                 let out = match self.step {
                     Step::Solid => {
@@ -898,6 +924,28 @@ mod linux {
         /// PPM is chosen over PNG for zero new deps; QA converts
         /// with `magick foo.ppm foo.png` or
         /// `ffmpeg -i foo.ppm foo.png`.
+        /// Observe the currently-bound draw framebuffer.
+        /// 0 = the default (the EGL window surface).
+        /// Anything else = an FBO some other code path
+        /// (suspect: gst-gl glupload's GLBufferPool for its
+        /// off-screen RGBA conversion target) bound and didn't
+        /// rebind 0 -- the smoking gun for "draw landed in an
+        /// off-screen FBO instead of on-screen".
+        ///
+        /// Cost: one glGetIntegerv (cached state query; no GL
+        /// queue flush on GLES2). ~µs. Safe per-frame.
+        ///
+        /// Use case: run_loop calls this immediately before
+        /// draw_frame to count + log when the FBO was dirty.
+        /// draw_frame itself unconditionally rebinds FB 0 +
+        /// disables SCISSOR (the actual repair) so subsequent
+        /// draws always land on the window surface regardless
+        /// of what gst-gl left bound. This getter is the
+        /// diagnostic that proves the cause.
+        pub fn observe_fbo_binding(&self) -> i32 {
+            unsafe { self.gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING) }
+        }
+
         /// Content-level black detector (QA pivot after the
         /// None-detector returned 0 black_draws while qarl
         /// reports the flash still visible). Sample a small
