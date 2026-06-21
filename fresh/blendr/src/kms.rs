@@ -1203,6 +1203,80 @@ pub fn frame_trace_window_ms() -> u64 {
     })
 }
 
+/// Tick-stall watchdog (post-7066f61 glass hard freeze):
+/// the persistent path's cadence bug halted the pipeline
+/// AND wedged the present thread, leaving the production
+/// sign frozen on rainbow with no auto-recovery. QA fold-in:
+/// "any next glass test needs a tick-stall auto-revert."
+///
+/// Mechanism: the present thread updates a heartbeat (epoch
+/// ms) per iter. A watchdog thread polls every second; if
+/// the heartbeat hasn't advanced in BLENDR_WATCHDOG_TIMEOUT_MS
+/// (default 5000), log + std::process::exit(7). systemd
+/// Restart=always restarts blendr -> production sign
+/// recovers in seconds instead of hard-freezing until
+/// manual intervention.
+///
+/// Cost: 1 atomic store per iter (present thread; ~ns).
+/// 1 atomic load + 1 sleep per second (watchdog thread;
+/// negligible).
+///
+/// To disable: BLENDR_WATCHDOG_TIMEOUT_MS=0.
+pub fn install_tick_watchdog() -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    let heartbeat = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let timeout_ms = std::env::var("BLENDR_WATCHDOG_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5000);
+    if timeout_ms == 0 {
+        log::warn!("[watchdog] DISABLED (BLENDR_WATCHDOG_TIMEOUT_MS=0)");
+        return heartbeat;
+    }
+    log::info!(
+        "[watchdog] armed; will exit(7) if present-thread heartbeat \
+         stalls for >{timeout_ms}ms (systemd Restart=always recovers)"
+    );
+    let hb_clone = heartbeat.clone();
+    let _ = std::thread::Builder::new()
+        .name("blendr-watchdog".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let last = hb_clone.load(std::sync::atomic::Ordering::Relaxed);
+                if last == 0 {
+                    // Run loop hasn't ticked yet (startup).
+                    continue;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let stall_ms = now.saturating_sub(last);
+                if stall_ms > timeout_ms {
+                    log::error!(
+                        "[watchdog] present-thread heartbeat stalled \
+                         {stall_ms}ms (>{timeout_ms}ms); aborting with \
+                         exit(7) for systemd auto-restart"
+                    );
+                    // Brief sleep to let log flush, then hard exit.
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    std::process::exit(7);
+                }
+            }
+        });
+    heartbeat
+}
+
+/// Update the heartbeat with current epoch ms. Called once
+/// per run_loop iter on the present thread.
+pub fn watchdog_heartbeat(hb: &std::sync::Arc<std::sync::atomic::AtomicU64>) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    hb.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Initialize the global trace file from env (BLENDR_FRAME_
 /// TRACE / BLENDR_FRAME_TRACE_FILE). Called once at startup.
 /// Safe to call multiple times (OnceLock init).
@@ -1854,8 +1928,19 @@ mod linux {
             );
         }
 
+        // Install tick-stall watchdog (post-7066f61 fold-in).
+        // Hb updated every iter; watcher thread exits(7) if
+        // we wedge for >BLENDR_WATCHDOG_TIMEOUT_MS (default
+        // 5000) so systemd Restart=always recovers prod.
+        let heartbeat = super::install_tick_watchdog();
+
         let result: Result<()> = (|| {
             loop {
+                // Heartbeat first thing every iter so the
+                // watchdog sees progress even before any
+                // potentially-hanging op.
+                super::watchdog_heartbeat(&heartbeat);
+
                 if exit_flag.load(Ordering::Relaxed) {
                     log::info!("[kms] exit flag set; breaking loop");
                     exit_cause = "exit flag";

@@ -1178,6 +1178,28 @@ mod linux {
                 .and_then(|s| s.to_str())
                 .unwrap_or("?")
                 .to_string();
+
+            // 0. CADENCE-DRAIN FIX (post-7066f61 glass hard
+            //    freeze): drain any pending EOS-probe messages
+            //    BEFORE touching sub_bins. Without this, if a
+            //    concat sub-bin EOSed between the previous
+            //    tick's process_pending and this tick's
+            //    switch_to_clip, the front-of-deque is a stale
+            //    just-EOSed sub-bin awaiting Retire, and the
+            //    SECOND entry is the ACTUALLY-PLAYING one. The
+            //    retire-non-front step below would then retire
+            //    the playing sub-bin -> concat loses its source
+            //    mid-stream -> bus posts DOWNSTREAM EOS
+            //    ("concat ran out of sub-bins") -> pipeline
+            //    halts -> present thread wedges in next
+            //    add_next_clip's sync_state_with_parent.
+            //
+            //    Draining first makes sub_bins reflect actual
+            //    concat state: front-of-deque == actually-
+            //    playing. The retire-non-front step is then
+            //    safe.
+            self.process_pending()?;
+
             // 1. Update clip_path so future add_next_clip uses
             //    the new clip. self.clip_path is only read on
             //    the present thread (this fn + add_next_clip
