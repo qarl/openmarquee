@@ -48,10 +48,6 @@ pub enum Streams {
         /// Index into playlist of the NEXT clip to load when
         /// retire+recreate fires.
         next_idx: usize,
-        /// Set on entering a Holding phase (N>=3 only).
-        /// Drained on the next tick by retire+recreate of the
-        /// non-visible slot.
-        recreate_pending: bool,
         slideshow: SlideshowState,
         /// Measurement infra: stamp at the start of each
         /// retire (Drop call) inside tick(). Read by
@@ -60,14 +56,54 @@ pub enum Streams {
         /// Measurement infra: stamp at the start of each
         /// create (GstDecoder::new call) inside tick().
         last_create_at: Option<std::time::Instant>,
-        /// #2-alt: in-progress async decoder construction.
-        /// Some when the present thread kicked off start_async
-        /// but poll() hasn't observed Ready yet. The usize is
-        /// the slot index to receive the finalized GstDecoder.
-        /// At normal cadence (hold_sec=20s + create ~500ms)
-        /// this is None for ~97% of ticks; Some for ~30 ticks
-        /// per cycle while AwaitingPaused/AwaitingPlaying.
-        pending_create: Option<(usize, crate::gst_decode::PendingDecoder)>,
+        /// qarl's spaced-handoff state machine. Replaces the
+        /// old recreate_pending: bool + pending_create:
+        /// Option<...> pair with an explicit FSM:
+        ///   Idle -> WaitingPreDrop -> DroppingInWorker ->
+        ///   WaitingPreCreate -> CreatingInWorker -> Idle.
+        /// With env BLENDR_HANDOFF_PRE_DROP_MS=0 and
+        /// BLENDR_HANDOFF_PRE_CREATE_MS=0, the Waiting* phases
+        /// fall through instantly = same cascade as 1ccf514.
+        /// With defaults 2000/2000, drop fires 2s after
+        /// Fading->Holding, create fires 2s after drop done.
+        handoff: HandoffState,
+    },
+}
+
+/// qarl's spaced-handoff state machine. See Streams::Cycle.handoff.
+pub enum HandoffState {
+    Idle,
+    /// Fading->Holding transition fired; waiting for the
+    /// pre_drop spacing window to expire before spawning
+    /// the drop worker.
+    WaitingPreDrop {
+        transition_at: std::time::Instant,
+        retire_slot: usize,
+        next_clip: std::path::PathBuf,
+    },
+    /// Drop worker is dropping the outgoing decoder. Will
+    /// signal via the rx channel when done.
+    DroppingInWorker {
+        rx: std::sync::mpsc::Receiver<()>,
+        retire_slot: usize,
+        next_clip: std::path::PathBuf,
+        spawn_at: std::time::Instant,
+        transition_at: std::time::Instant,
+    },
+    /// Drop done; waiting for the pre_create spacing window
+    /// to expire before kicking off the new build worker.
+    WaitingPreCreate {
+        drop_done_at: std::time::Instant,
+        retire_slot: usize,
+        next_clip: std::path::PathBuf,
+        transition_at: std::time::Instant,
+    },
+    /// Build worker is constructing the new decoder. Will
+    /// deliver via PendingDecoder.poll() rx.
+    CreatingInWorker {
+        retire_slot: usize,
+        pd: crate::gst_decode::PendingDecoder,
+        transition_at: std::time::Instant,
     },
 }
 
@@ -91,9 +127,18 @@ impl Streams {
     /// draw+swap+page-flip; the display continues scanning
     /// out the last good framebuffer).
     pub fn create_in_flight(&self) -> bool {
+        // Hold-last-frame fires only during the actual WORK
+        // phases (drop or build runs on a worker, V3D GPU
+        // contention disrupts presenter render). During the
+        // Waiting phases the work hasn't started; no
+        // contention; presenter renders normally.
         matches!(
             self,
-            Streams::Cycle { pending_create: Some(_), .. }
+            Streams::Cycle {
+                handoff: HandoffState::DroppingInWorker { .. }
+                    | HandoffState::CreatingInWorker { .. },
+                ..
+            }
         )
     }
 
@@ -206,197 +251,336 @@ impl Streams {
     /// only if soak shows the stall exceeds the hold.
     pub fn tick(
         &mut self,
-        #[allow(unused_variables)] egl: &crate::egl_gbm::Egl,
+        egl: &crate::egl_gbm::Egl,
     ) -> Result<()> {
         if let Streams::Cycle {
             playlist,
             slots,
             next_idx,
-            recreate_pending,
             slideshow,
             last_retire_at,
             last_create_at,
-            pending_create,
+            handoff,
         } = self
         {
             // Update alpha + check for phase change.
             let (_alpha, phase_changed) = slideshow.update();
             let n = playlist.len();
+            let now = std::time::Instant::now();
+            let pre_drop = std::time::Duration::from_millis(
+                handoff_pre_drop_ms(),
+            );
+            let pre_create = std::time::Duration::from_millis(
+                handoff_pre_create_ms(),
+            );
 
-            // On phase-change INTO a Holding phase, mark for
-            // retire+recreate next tick. N=2 short-circuits
-            // (both clips stay loaded forever, like Phase 3 v1).
+            // ---- On Fading->Holding transition (N>=3), kick
+            //      off the handoff state machine ----
             if phase_changed && n >= 3 {
-                match slideshow.phase() {
-                    BlendPhase::HoldingA | BlendPhase::HoldingB => {
-                        *recreate_pending = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Drain recreate_pending. Spawns the retire worker
-            // (off-thread per #2) and KICKS OFF the async create
-            // via PendingDecoder::start_async (#2-alt). The
-            // actual GstDecoder lands in slots later, on a tick
-            // when poll() observes Ready.
-            if *recreate_pending {
-                *recreate_pending = false;
-                if pending_create.is_some() {
-                    // Cycle outpaced previous create (degenerate;
-                    // would need create > hold_sec=20s). Skip this
-                    // cycle's retire+create; let the in-flight one
-                    // drive to completion. Slot visibility stays
-                    // with the previous pair until next phase.
-                    log::warn!(
-                        "[cycle] recreate_pending fired but previous create \
-                         still in flight (slot={}); skipping this cycle",
-                        pending_create.as_ref().unwrap().0
-                    );
-                } else {
-                    let visible_slot = match slideshow.phase() {
-                        BlendPhase::HoldingA | BlendPhase::FadingAtoB => 0,
-                        BlendPhase::HoldingB | BlendPhase::FadingBtoA => 1,
-                    };
-                    let retire_slot = 1 - visible_slot;
-                    let clip_to_load = playlist[*next_idx].clone();
-                    let clip_name = clip_to_load
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("?")
-                        .to_string();
-
-                    // --- Step 1: log + read CMA pre-retire ----
-                    let cma_pre = read_cma_free_kb();
-                    log::info!(
-                        "[cycle] retire slot={retire_slot} \
-                         (CmaFree={cma_pre:?}kB) -- starting"
-                    );
-                    let t_retire = std::time::Instant::now();
-                    *last_retire_at = Some(t_retire);
-
-                    // --- Step 2+3: take outgoing decoder +
-                    //     hand BOTH retire (drop) and create
-                    //     to the SAME PendingDecoder worker
-                    //     so they run SERIALLY (pattern-(a)
-                    //     fix per QA c012339). Previously the
-                    //     retire ran on its own thread
-                    //     CONCURRENTLY with the create's
-                    //     worker -> both contending for vc4
-                    //     GPU (share_group_ctx) + /dev/video10
-                    //     (gst PAUSED bringup) -> create
-                    //     ballooned to 340-813ms (vs ~150ms
-                    //     baseline). With serialization, drop
-                    //     completes BEFORE create starts ->
-                    //     no contention -> create stays at
-                    //     baseline.
-                    //
-                    //     The [trace-retire] SPAWN/DONE lines
-                    //     now emit from INSIDE the
-                    //     PendingDecoder worker (gst_decode.rs)
-                    //     so the trace shows the serialized
-                    //     order: retire SPAWN -> drop ->
-                    //     retire DONE -> create START -> ...
-                    let taken = slots[retire_slot].take();
-                    let retire_present_ms = t_retire.elapsed().as_millis();
-                    log::info!(
-                        "[cycle] retire slot={retire_slot} \
-                         present-thread elapsed_ms={retire_present_ms} \
-                         (handing outgoing decoder to serialized worker; \
-                         drop will run BEFORE new create)"
-                    );
-
-                    // --- Step 4: kick off serialized
-                    //     retire-then-create. PendingDecoder::
-                    //     start_async takes Option<GstDecoder>
-                    //     pre_drop and the worker handles both.
-                    log::info!(
-                        "[cycle] create slot={retire_slot} clip={clip_name} \
-                         -- starting (serialized after drop; polling each tick)"
-                    );
-                    let t_create = std::time::Instant::now();
-                    *last_create_at = Some(t_create);
-                    match crate::gst_decode::PendingDecoder::start_async(
-                        egl,
-                        &clip_to_load,
-                        taken,
-                    ) {
-                        Ok(pd) => {
-                            *pending_create = Some((retire_slot, pd));
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "[cycle] create slot={retire_slot} \
-                                 clip={clip_name} start_async FAILED: {e:#}"
-                            );
-                            return Err(e);
-                        }
-                    }
-
-                    *next_idx = (*next_idx + 1) % n;
-                    log::info!(
-                        "[cycle] next_idx={} playlist_len={n} \
-                         visible_slot={visible_slot} cycle={}",
-                        *next_idx,
-                        slideshow.cycle_count(),
-                    );
-                }
-            }
-
-            // --- Drive in-flight async create (#2-alt) ---
-            // Runs every tick. When None: zero work. When
-            // AwaitingPaused/AwaitingPlaying: one µs-scale
-            // pipeline.state(ZERO) call. When Ready: finalize
-            // (spawns pull thread) + swap into slot.
-            let finalize_now = if let Some((_, pd)) = pending_create.as_mut() {
-                match pd.poll() {
-                    Ok(crate::gst_decode::PendingState::Ready) => true,
-                    Ok(_) => false,
-                    Err(e) => {
-                        log::error!(
-                            "[cycle] pending create poll failed: {e:#}; dropping"
+                let into_holding = matches!(
+                    slideshow.phase(),
+                    BlendPhase::HoldingA | BlendPhase::HoldingB
+                );
+                if into_holding {
+                    if !matches!(handoff, HandoffState::Idle) {
+                        // Cycle outpaced previous handoff
+                        // (degenerate; need hold + crossfade <
+                        // pre_drop+pre_create+drop+create).
+                        log::warn!(
+                            "[handoff] new Fading->Holding fired but \
+                             previous handoff still in flight; skipping"
                         );
-                        true
+                    } else {
+                        let visible_slot = match slideshow.phase() {
+                            BlendPhase::HoldingA | BlendPhase::FadingAtoB => 0,
+                            BlendPhase::HoldingB | BlendPhase::FadingBtoA => 1,
+                        };
+                        let retire_slot = 1 - visible_slot;
+                        let next_clip = playlist[*next_idx].clone();
+                        log::info!(
+                            "[handoff] Fading->Holding (cycle {}); \
+                             retire_slot={retire_slot} next_idx={} \
+                             pre_drop={}ms (drop target = now+{}ms)",
+                            slideshow.cycle_count(),
+                            *next_idx,
+                            handoff_pre_drop_ms(),
+                            handoff_pre_drop_ms(),
+                        );
+                        if trace_enabled() {
+                            trace_writeln(&format!(
+                                "[trace-handoff] ts_ms={} event=TRANSITION \
+                                 cycle={} retire_slot={} pre_drop_ms={} \
+                                 pre_create_ms={}",
+                                trace_ts_ms(),
+                                slideshow.cycle_count(),
+                                retire_slot,
+                                handoff_pre_drop_ms(),
+                                handoff_pre_create_ms(),
+                            ));
+                        }
+                        *handoff = HandoffState::WaitingPreDrop {
+                            transition_at: now,
+                            retire_slot,
+                            next_clip,
+                        };
+                        // next_idx advances NOW (we've committed
+                        // to this clip; matches pre-spacing
+                        // behavior).
+                        *next_idx = (*next_idx + 1) % n;
                     }
                 }
-            } else {
-                false
-            };
-            if finalize_now {
-                if let Some((slot_idx, pd)) = pending_create.take() {
-                    match pd.finalize() {
-                        Ok(dec) => {
-                            let create_ms = last_create_at
-                                .as_ref()
-                                .map(|t| t.elapsed().as_millis())
-                                .unwrap_or(0);
-                            let cma_post = read_cma_free_kb();
-                            slots[slot_idx] = Some(dec);
+            }
+
+            // ---- Drive the handoff state machine ----
+            // Take + replace pattern (avoids borrow issues
+            // when moving fields out of the enum variants).
+            let cur = std::mem::replace(handoff, HandoffState::Idle);
+            *handoff = match cur {
+                HandoffState::Idle => HandoffState::Idle,
+                HandoffState::WaitingPreDrop {
+                    transition_at,
+                    retire_slot,
+                    next_clip,
+                } => {
+                    if now.saturating_duration_since(transition_at) >= pre_drop {
+                        // Spacing window elapsed -- spawn DROP-
+                        // only worker. The drop completion
+                        // signals via the mpsc channel; the
+                        // next-state target time = drop_done_at
+                        // + pre_create.
+                        let cma_pre = read_cma_free_kb();
+                        let taken = slots[retire_slot].take();
+                        let spawn_at = std::time::Instant::now();
+                        *last_retire_at = Some(spawn_at);
+                        let ms_since_xn =
+                            spawn_at.duration_since(transition_at).as_millis();
+                        log::info!(
+                            "[handoff] DROP FIRE at ms_since_xn={ms_since_xn} \
+                             slot={retire_slot} (CmaFree={cma_pre:?}kB)"
+                        );
+                        if trace_enabled() {
+                            trace_writeln(&format!(
+                                "[trace-handoff] ts_ms={} event=DROP_FIRE \
+                                 ms_since_xn={ms_since_xn} retire_slot={}",
+                                trace_ts_ms(),
+                                retire_slot,
+                            ));
+                        }
+                        let rx = spawn_drop_only_worker(taken);
+                        HandoffState::DroppingInWorker {
+                            rx,
+                            retire_slot,
+                            next_clip,
+                            spawn_at,
+                            transition_at,
+                        }
+                    } else {
+                        HandoffState::WaitingPreDrop {
+                            transition_at,
+                            retire_slot,
+                            next_clip,
+                        }
+                    }
+                }
+                HandoffState::DroppingInWorker {
+                    rx,
+                    retire_slot,
+                    next_clip,
+                    spawn_at,
+                    transition_at,
+                } => {
+                    match rx.try_recv() {
+                        Ok(()) => {
+                            let drop_done_at = std::time::Instant::now();
+                            let drop_ms = drop_done_at
+                                .duration_since(spawn_at)
+                                .as_millis();
                             log::info!(
-                                "[cycle] create slot={slot_idx} READY \
-                                 elapsed_ms={create_ms} CmaFree={cma_post:?}kB"
+                                "[handoff] drop done after {drop_ms}ms \
+                                 (slot={retire_slot}); waiting pre_create={}ms",
+                                handoff_pre_create_ms(),
                             );
-                            if let Some(kb) = cma_post {
-                                if kb < 50_000 {
+                            HandoffState::WaitingPreCreate {
+                                drop_done_at,
+                                retire_slot,
+                                next_clip,
+                                transition_at,
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            // Still dropping.
+                            HandoffState::DroppingInWorker {
+                                rx,
+                                retire_slot,
+                                next_clip,
+                                spawn_at,
+                                transition_at,
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            log::error!(
+                                "[handoff] drop worker disconnected without \
+                                 signaling -- treating as drop done"
+                            );
+                            HandoffState::WaitingPreCreate {
+                                drop_done_at: std::time::Instant::now(),
+                                retire_slot,
+                                next_clip,
+                                transition_at,
+                            }
+                        }
+                    }
+                }
+                HandoffState::WaitingPreCreate {
+                    drop_done_at,
+                    retire_slot,
+                    next_clip,
+                    transition_at,
+                } => {
+                    if now.saturating_duration_since(drop_done_at) >= pre_create {
+                        let ms_since_xn =
+                            now.duration_since(transition_at).as_millis();
+                        let clip_name = next_clip
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        log::info!(
+                            "[handoff] CREATE FIRE at ms_since_xn={ms_since_xn} \
+                             slot={retire_slot} clip={clip_name}"
+                        );
+                        if trace_enabled() {
+                            trace_writeln(&format!(
+                                "[trace-handoff] ts_ms={} event=CREATE_FIRE \
+                                 ms_since_xn={ms_since_xn} retire_slot={} \
+                                 clip={clip_name}",
+                                trace_ts_ms(),
+                                retire_slot,
+                            ));
+                        }
+                        let t_create = std::time::Instant::now();
+                        *last_create_at = Some(t_create);
+                        match crate::gst_decode::PendingDecoder::start_async(
+                            egl,
+                            &next_clip,
+                            None,
+                        ) {
+                            Ok(pd) => HandoffState::CreatingInWorker {
+                                retire_slot,
+                                pd,
+                                transition_at,
+                            },
+                            Err(e) => {
+                                log::error!(
+                                    "[handoff] start_async FAILED for slot=\
+                                     {retire_slot} clip={clip_name}: {e:#} \
+                                     -- returning to Idle"
+                                );
+                                HandoffState::Idle
+                            }
+                        }
+                    } else {
+                        HandoffState::WaitingPreCreate {
+                            drop_done_at,
+                            retire_slot,
+                            next_clip,
+                            transition_at,
+                        }
+                    }
+                }
+                HandoffState::CreatingInWorker {
+                    retire_slot,
+                    mut pd,
+                    transition_at,
+                } => {
+                    match pd.poll() {
+                        Ok(crate::gst_decode::PendingState::Ready) => {
+                            match pd.finalize() {
+                                Ok(dec) => {
+                                    let create_ms = last_create_at
+                                        .as_ref()
+                                        .map(|t| t.elapsed().as_millis())
+                                        .unwrap_or(0);
+                                    let cma_post = read_cma_free_kb();
+                                    slots[retire_slot] = Some(dec);
+                                    let total_ms = transition_at
+                                        .elapsed()
+                                        .as_millis();
+                                    log::info!(
+                                        "[handoff] create slot={retire_slot} \
+                                         READY create_ms={create_ms} \
+                                         total_since_xn={total_ms}ms \
+                                         CmaFree={cma_post:?}kB"
+                                    );
+                                    if let Some(kb) = cma_post {
+                                        if kb < 50_000 {
+                                            log::error!(
+                                                "[handoff] CMA LOW: \
+                                                 CmaFree={kb}kB < 50MB"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
                                     log::error!(
-                                        "[cycle] CMA LOW WARNING: \
-                                         CmaFree={kb}kB < 50MB floor; \
-                                         soak may brick"
+                                        "[handoff] finalize FAILED \
+                                         (slot={retire_slot}): {e:#}"
                                     );
                                 }
                             }
+                            HandoffState::Idle
                         }
+                        Ok(_) => HandoffState::CreatingInWorker {
+                            retire_slot,
+                            pd,
+                            transition_at,
+                        },
                         Err(e) => {
                             log::error!(
-                                "[cycle] finalize failed (slot={slot_idx}): {e:#}"
+                                "[handoff] PendingDecoder::poll FAILED \
+                                 (slot={retire_slot}): {e:#}"
                             );
+                            HandoffState::Idle
                         }
                     }
                 }
-            }
+            };
         }
         Ok(())
     }
+}
+
+/// Spawn a worker thread that drops the outgoing GstDecoder
+/// and signals completion via mpsc. Used by the spaced-
+/// handoff state machine (separate from the create worker).
+fn spawn_drop_only_worker(
+    old: Option<crate::gst_decode::GstDecoder>,
+) -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let _ = std::thread::Builder::new()
+        .name("blendr-drop-worker".to_string())
+        .spawn(move || {
+            let retire_id = trace_ts_ms();
+            let t_spawn = std::time::Instant::now();
+            if trace_enabled() {
+                trace_writeln(&format!(
+                    "[trace-retire] ts_ms={} id={retire_id} phase=SPAWN \
+                     serialized=true source=spaced-handoff",
+                    trace_ts_ms()
+                ));
+            }
+            drop(old);
+            if trace_enabled() {
+                let drop_ms = t_spawn.elapsed().as_millis();
+                trace_writeln(&format!(
+                    "[trace-retire] ts_ms={} id={retire_id} phase=DONE \
+                     drop_ms={drop_ms} serialized=true source=spaced-handoff",
+                    trace_ts_ms()
+                ));
+            }
+            let _ = tx.send(());
+        });
+    rx
 }
 
 /// Per-frame timing measurement (QA overnight mandate). Zero
@@ -837,6 +1021,49 @@ static TRACE_FILE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> 
     std::sync::OnceLock::new();
 static TRACE_START: std::sync::OnceLock<std::time::Instant> =
     std::sync::OnceLock::new();
+
+/// qarl's spaced-handoff experiment (env-tunable):
+/// after a Fading->Holding transition, wait
+/// BLENDR_HANDOFF_PRE_DROP_MS (default 2000) before
+/// dropping the outgoing decoder, then wait
+/// BLENDR_HANDOFF_PRE_CREATE_MS (default 2000) after drop
+/// before kicking off the new create. Hypothesis: spacing
+/// gives the HW decoder time to settle into steady visible-
+/// clip decode before the handoff GPU/decoder contention.
+/// 0/0 = current cascade behavior.
+static HANDOFF_PRE_DROP_MS: std::sync::OnceLock<u64> =
+    std::sync::OnceLock::new();
+static HANDOFF_PRE_CREATE_MS: std::sync::OnceLock<u64> =
+    std::sync::OnceLock::new();
+
+pub fn handoff_init() {
+    HANDOFF_PRE_DROP_MS.get_or_init(|| {
+        std::env::var("BLENDR_HANDOFF_PRE_DROP_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2000)
+    });
+    HANDOFF_PRE_CREATE_MS.get_or_init(|| {
+        std::env::var("BLENDR_HANDOFF_PRE_CREATE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2000)
+    });
+    log::warn!(
+        "[handoff] BLENDR_HANDOFF_PRE_DROP_MS={}ms \
+         BLENDR_HANDOFF_PRE_CREATE_MS={}ms \
+         (0/0 = cascade; 2000/2000 = spaced experiment)",
+        handoff_pre_drop_ms(),
+        handoff_pre_create_ms()
+    );
+}
+
+pub fn handoff_pre_drop_ms() -> u64 {
+    HANDOFF_PRE_DROP_MS.get().copied().unwrap_or(2000)
+}
+pub fn handoff_pre_create_ms() -> u64 {
+    HANDOFF_PRE_CREATE_MS.get().copied().unwrap_or(2000)
+}
 
 /// Initialize the global trace file from env (BLENDR_FRAME_
 /// TRACE / BLENDR_FRAME_TRACE_FILE). Called once at startup.
@@ -1475,6 +1702,7 @@ mod linux {
         // timestamps). All threads share the same file via
         // a Mutex<File> for ordered, non-interleaved writes.
         super::trace_init();
+        super::handoff_init();
         let mut frame_trace = FrameTrace::new();
         if frame_trace.is_enabled() {
             log::warn!(
@@ -1620,10 +1848,9 @@ mod linux {
                         slideshow,
                         playlist: _,
                         next_idx: _,
-                        recreate_pending: _,
                         last_retire_at: _,
                         last_create_at: _,
-                        pending_create: _,
+                        handoff: _,
                     } => {
                         // Phase 3 v2: drain each slot decoder's
                         // pending pipeline commands (concat add-

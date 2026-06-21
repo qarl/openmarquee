@@ -270,11 +270,10 @@ fn run(args: Args) -> Result<()> {
                     playlist,
                     slots: [Some(dec0), Some(dec1)],
                     next_idx,
-                    recreate_pending: false,
                     slideshow,
                     last_retire_at: None,
                     last_create_at: None,
-                    pending_create: None,
+                    handoff: kms::HandoffState::Idle,
                 }
             }
         }
