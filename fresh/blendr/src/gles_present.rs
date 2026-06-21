@@ -114,6 +114,16 @@ mod linux {
         };
     }
 
+    // #4b: fixed attribute-slot indices for the full-screen
+    // quad. Every program (2d / ext / blend) uses the SAME
+    // VS with "a_pos" + "a_uv" attributes; we
+    // bind_attrib_location these slots in link() pre-link, so
+    // all programs end up at identical indices. That lets us
+    // set up enable_vertex_attrib_array + vertex_attrib_pointer
+    // ONCE at Presenter::new() and drop the per-draw churn.
+    const QUAD_ATTRIB_POS: u32 = 0;
+    const QUAD_ATTRIB_UV: u32 = 1;
+
     const VS: &str = r#"
         attribute vec2 a_pos;
         attribute vec2 a_uv;
@@ -182,21 +192,20 @@ mod linux {
         /// Phase 2 blend program (samplerExternalOES x 2). Lazily
         /// compiled on first Step::Blend frame.
         prog_blend: Option<glow::Program>,
+        /// VBO handle. Lives for Presenter's lifetime;
+        /// Presenter::Drop calls delete_buffer on this. After
+        /// #4b the field is no longer used per-draw (the
+        /// vertex_attrib_pointer setup at init captured the
+        /// VBO on the attrib slots), only at teardown.
         vbo: glow::Buffer,
         /// CPU checkerboard for Step::Checker.
         tex_checker: glow::Texture,
-        /// Pos/UV attribute locations on prog_2d (same indices on
-        /// prog_ext because the VS is identical and uses bind-by-name).
-        a_pos_loc_2d: u32,
-        a_uv_loc_2d: u32,
+        // #4b: a_pos_loc_X / a_uv_loc_X removed -- with
+        // bind_attrib_location at link, all programs pin a_pos
+        // to QUAD_ATTRIB_POS=0 and a_uv to QUAD_ATTRIB_UV=1.
+        // The actual values are asserted at compile/link time.
         u_tex_loc_2d: glow::UniformLocation,
-        /// On prog_ext (Some when compiled).
-        a_pos_loc_ext: u32,
-        a_uv_loc_ext: u32,
         u_tex_loc_ext: Option<glow::UniformLocation>,
-        /// On prog_blend (Some when compiled).
-        a_pos_loc_blend: u32,
-        a_uv_loc_blend: u32,
         u_tex_a_loc_blend: Option<glow::UniformLocation>,
         u_tex_b_loc_blend: Option<glow::UniformLocation>,
         u_alpha_loc_blend: Option<glow::UniformLocation>,
@@ -228,12 +237,31 @@ mod linux {
                 gl.delete_shader(fs_2d);
 
                 gl.use_program(Some(prog_2d));
-                let a_pos_loc_2d = gl
+                // #4b: bind_attrib_location at link() pinned
+                // a_pos -> 0 + a_uv -> 1. Sanity-check the
+                // driver honored it (a bind_attrib_location
+                // failure leaves the location at driver-
+                // assigned). If this assert fires, the per-
+                // draw hoisted attrib pointers would source
+                // from the wrong slots -> garbage geometry.
+                let pos_loc = gl
                     .get_attrib_location(prog_2d, "a_pos")
                     .ok_or_else(|| anyhow!("attribute a_pos missing"))?;
-                let a_uv_loc_2d = gl
+                if pos_loc != QUAD_ATTRIB_POS {
+                    return Err(anyhow!(
+                        "bind_attrib_location for prog_2d.a_pos failed: \
+                         expected slot {QUAD_ATTRIB_POS}, got {pos_loc}"
+                    ));
+                }
+                let uv_loc = gl
                     .get_attrib_location(prog_2d, "a_uv")
                     .ok_or_else(|| anyhow!("attribute a_uv missing"))?;
+                if uv_loc != QUAD_ATTRIB_UV {
+                    return Err(anyhow!(
+                        "bind_attrib_location for prog_2d.a_uv failed: \
+                         expected slot {QUAD_ATTRIB_UV}, got {uv_loc}"
+                    ));
+                }
                 let u_tex_loc_2d = gl
                     .get_uniform_location(prog_2d, "u_tex")
                     .ok_or_else(|| anyhow!("uniform u_tex missing"))?;
@@ -257,6 +285,47 @@ mod linux {
                     glow::ARRAY_BUFFER,
                     bytemuck_quad(&quad),
                     glow::STATIC_DRAW,
+                );
+
+                // #4b: hoist vertex-attrib pointer setup +
+                // enable to init. Per GLES2 spec
+                // (glVertexAttribPointer): "this information is
+                // saved as vertex array state" -- the attrib
+                // slot captures the VBO that was bound at the
+                // time of the call, INDEPENDENT of subsequent
+                // ARRAY_BUFFER binding. So we don't need to
+                // re-bind the VBO per draw; the attrib slots
+                // hold a reference. enable_vertex_attrib_array
+                // is also persistent state; once enabled, it
+                // stays enabled until disable_vertex_attrib_
+                // array (which we no longer call per draw).
+                //
+                // Risk note: if gst-gl's pull/upload thread were
+                // to issue disable_vertex_attrib_array on slot 0
+                // or 1, our subsequent draws would source from
+                // generic vertex attribs (zeros) instead of the
+                // VBO. gst-gl's glupload/GLBufferPool do NOT
+                // issue user draws or modify generic vertex
+                // attrib state -- they're confined to texture
+                // upload + PBO state. Verified on glass via
+                // QA's previous #2/#3b/#2-alt runs (no vertex
+                // glitches; same pattern is implicit). If a
+                // future QA report shows quad geometry
+                // corruption, the revert is trivial: restore
+                // bind_quad_attribs + per-draw enable/disable.
+                let stride = 4 * std::mem::size_of::<f32>() as i32;
+                gl.enable_vertex_attrib_array(QUAD_ATTRIB_POS);
+                gl.vertex_attrib_pointer_f32(
+                    QUAD_ATTRIB_POS, 2, glow::FLOAT, false, stride, 0,
+                );
+                gl.enable_vertex_attrib_array(QUAD_ATTRIB_UV);
+                gl.vertex_attrib_pointer_f32(
+                    QUAD_ATTRIB_UV,
+                    2,
+                    glow::FLOAT,
+                    false,
+                    stride,
+                    (2 * std::mem::size_of::<f32>()) as i32,
                 );
 
                 let tex = gl.create_texture()
@@ -305,14 +374,8 @@ mod linux {
                     prog_blend: None,
                     vbo,
                     tex_checker: tex,
-                    a_pos_loc_2d,
-                    a_uv_loc_2d,
                     u_tex_loc_2d,
-                    a_pos_loc_ext: 0,
-                    a_uv_loc_ext: 0,
                     u_tex_loc_ext: None,
-                    a_pos_loc_blend: 0,
-                    a_uv_loc_blend: 0,
                     u_tex_a_loc_blend: None,
                     u_tex_b_loc_blend: None,
                     u_alpha_loc_blend: None,
@@ -402,14 +465,26 @@ mod linux {
                 let prog = link(&self.gl, vs, fs)?;
                 self.gl.delete_shader(vs);
                 self.gl.delete_shader(fs);
-                self.a_pos_loc_blend = self
+                let pos_loc = self
                     .gl
                     .get_attrib_location(prog, "a_pos")
                     .ok_or_else(|| anyhow!("blend a_pos missing"))?;
-                self.a_uv_loc_blend = self
+                if pos_loc != QUAD_ATTRIB_POS {
+                    return Err(anyhow!(
+                        "bind_attrib_location for prog_blend.a_pos failed: \
+                         expected slot {QUAD_ATTRIB_POS}, got {pos_loc}"
+                    ));
+                }
+                let uv_loc = self
                     .gl
                     .get_attrib_location(prog, "a_uv")
                     .ok_or_else(|| anyhow!("blend a_uv missing"))?;
+                if uv_loc != QUAD_ATTRIB_UV {
+                    return Err(anyhow!(
+                        "bind_attrib_location for prog_blend.a_uv failed: \
+                         expected slot {QUAD_ATTRIB_UV}, got {uv_loc}"
+                    ));
+                }
                 self.u_tex_a_loc_blend = Some(
                     self.gl
                         .get_uniform_location(prog, "u_tex_a")
@@ -439,14 +514,26 @@ mod linux {
                 let prog = link(&self.gl, vs, fs)?;
                 self.gl.delete_shader(vs);
                 self.gl.delete_shader(fs);
-                self.a_pos_loc_ext = self
+                let pos_loc = self
                     .gl
                     .get_attrib_location(prog, "a_pos")
                     .ok_or_else(|| anyhow!("ext a_pos missing"))?;
-                self.a_uv_loc_ext = self
+                if pos_loc != QUAD_ATTRIB_POS {
+                    return Err(anyhow!(
+                        "bind_attrib_location for prog_ext.a_pos failed: \
+                         expected slot {QUAD_ATTRIB_POS}, got {pos_loc}"
+                    ));
+                }
+                let uv_loc = self
                     .gl
                     .get_attrib_location(prog, "a_uv")
                     .ok_or_else(|| anyhow!("ext a_uv missing"))?;
+                if uv_loc != QUAD_ATTRIB_UV {
+                    return Err(anyhow!(
+                        "bind_attrib_location for prog_ext.a_uv failed: \
+                         expected slot {QUAD_ATTRIB_UV}, got {uv_loc}"
+                    ));
+                }
                 self.u_tex_loc_ext = Some(
                     self.gl
                         .get_uniform_location(prog, "u_tex")
@@ -636,14 +723,14 @@ mod linux {
                 self.gl.uniform_1_i32(Some(&self.u_tex_loc_2d), 0);
                 gl_check!(&self.gl, "2d.uniform_1_i32(u_tex_2d)");
 
-                self.bind_quad_attribs(self.a_pos_loc_2d, self.a_uv_loc_2d)?;
-                gl_check!(&self.gl, "2d.bind_quad_attribs");
+                // #4b: vertex-attrib setup hoisted to
+                // Presenter::new (enable + pointer + VBO bind).
+                // Slots 0/1 stay enabled for the process
+                // lifetime; the attrib slots captured the VBO
+                // reference at init via vertex_attrib_pointer.
 
                 self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
                 gl_check!(&self.gl, "2d.draw_arrays");
-
-                self.gl.disable_vertex_attrib_array(self.a_pos_loc_2d);
-                self.gl.disable_vertex_attrib_array(self.a_uv_loc_2d);
                 Ok(())
             }
         }
@@ -680,14 +767,10 @@ mod linux {
                 self.gl.uniform_1_i32(Some(u_loc), 0);
                 gl_check!(&self.gl, "ext.uniform_1_i32(u_tex_ext)");
 
-                self.bind_quad_attribs(self.a_pos_loc_ext, self.a_uv_loc_ext)?;
-                gl_check!(&self.gl, "ext.bind_quad_attribs");
+                // #4b: vertex-attrib setup hoisted to init.
 
                 self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
                 gl_check!(&self.gl, "ext.draw_arrays");
-
-                self.gl.disable_vertex_attrib_array(self.a_pos_loc_ext);
-                self.gl.disable_vertex_attrib_array(self.a_uv_loc_ext);
                 Ok(())
             }
         }
@@ -754,14 +837,10 @@ mod linux {
                 self.gl.uniform_1_f32(Some(u_alpha), alpha);
                 gl_check!(&self.gl, "blend.uniform_1_f32(u_alpha)");
 
-                self.bind_quad_attribs(self.a_pos_loc_blend, self.a_uv_loc_blend)?;
-                gl_check!(&self.gl, "blend.bind_quad_attribs");
+                // #4b: vertex-attrib setup hoisted to init.
 
                 self.gl.draw_arrays(glow::TRIANGLES, 0, 6);
                 gl_check!(&self.gl, "blend.draw_arrays");
-
-                self.gl.disable_vertex_attrib_array(self.a_pos_loc_blend);
-                self.gl.disable_vertex_attrib_array(self.a_uv_loc_blend);
 
                 // Restore TEXTURE0 as active so subsequent
                 // single-tex paths start clean (defense in depth;
@@ -771,30 +850,13 @@ mod linux {
             }
         }
 
-        unsafe fn bind_quad_attribs(
-            &self,
-            a_pos: u32,
-            a_uv: u32,
-        ) -> Result<()> {
-            unsafe {
-                self.gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
-                let stride = 4 * std::mem::size_of::<f32>() as i32;
-                self.gl.enable_vertex_attrib_array(a_pos);
-                self.gl
-                    .vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, stride, 0);
-                self.gl.enable_vertex_attrib_array(a_uv);
-                self.gl.vertex_attrib_pointer_f32(
-                    a_uv,
-                    2,
-                    glow::FLOAT,
-                    false,
-                    stride,
-                    (2 * std::mem::size_of::<f32>()) as i32,
-                );
-                Ok(())
-            }
-        }
-
+        // #4b: bind_quad_attribs removed. Its 5 FFI calls
+        // (bind_buffer + enable*2 + vertex_attrib_pointer*2)
+        // happen ONCE in Presenter::new() and are persistent
+        // across the process lifetime per GLES2 vertex-array
+        // state semantics (the attrib slot captures the VBO at
+        // call time; subsequent ARRAY_BUFFER binding doesn't
+        // affect it).
     }
 
     impl Presenter {
@@ -981,6 +1043,18 @@ mod linux {
                 .map_err(|e| anyhow!("glCreateProgram: {e}"))?;
             gl.attach_shader(p, vs);
             gl.attach_shader(p, fs);
+            // #4b: pin "a_pos" and "a_uv" to fixed attrib slots
+            // 0 and 1 BEFORE link. All three programs (2d /
+            // ext / blend) use the same VS with the same
+            // attribute names, so all three end up at identical
+            // slot indices. That lets us set up
+            // enable_vertex_attrib_array + vertex_attrib_pointer
+            // ONCE at init and skip the per-frame bind_quad_attribs
+            // churn (5 FFI/draw) + 2 disable_vertex_attrib_array
+            // (2 FFI/draw). bind_attrib_location must be called
+            // BEFORE link_program -- after link it's ignored.
+            gl.bind_attrib_location(p, QUAD_ATTRIB_POS, "a_pos");
+            gl.bind_attrib_location(p, QUAD_ATTRIB_UV, "a_uv");
             gl.link_program(p);
             if !gl.get_program_link_status(p) {
                 let log = gl.get_program_info_log(p);
