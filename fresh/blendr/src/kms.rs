@@ -358,6 +358,19 @@ pub struct FrameStats {
     cum_long_count: u64,
     /// Long frames inside the current window.
     window_long_count: u64,
+    /// Black-flash detector (QA pivot after #4b): count of
+    /// frames where draw_frame returned DrawOutcome::Black --
+    /// the clear ran but no textured overlay was drawn (a
+    /// slot was None / unsupported). Cumulative + window
+    /// like long frames; surfaced in [frame-stats] summary
+    /// + per-occurrence [black] log.
+    cum_black_count: u64,
+    window_black_count: u64,
+    /// Last frame's DrawOutcome (None on first frame).
+    /// Used to log [black] at streak transitions so the
+    /// log has begin/end markers per flash rather than one
+    /// line per black frame.
+    last_outcome: Option<crate::gles_present::DrawOutcome>,
     /// Wall-clock at the previous frame's end. None on first
     /// frame (no delta to compute).
     last_present_end: Option<std::time::Instant>,
@@ -380,6 +393,9 @@ impl FrameStats {
             window_start_idx: 0,
             cum_long_count: 0,
             window_long_count: 0,
+            cum_black_count: 0,
+            window_black_count: 0,
+            last_outcome: None,
             last_present_end: None,
             last_summary_at: now,
             run_start: now,
@@ -388,14 +404,18 @@ impl FrameStats {
 
     /// Record one frame. Cheap: 2 pushes + 1 compare +
     /// possibly 1 increment. Logs an outlier line if
-    /// frame_ms > LONG_FRAME_MS. Maybe emits a 30s summary.
+    /// frame_ms > LONG_FRAME_MS. Logs a [black] line on
+    /// streak begin/end (transition from Drew to Black or
+    /// vice versa). Maybe emits a 30s summary.
     pub fn record(
         &mut self,
         frame_ms: f32,
         render_ms: f32,
         frame_idx: u64,
         streams: &Streams,
+        draw_outcome: crate::gles_present::DrawOutcome,
     ) {
+        use crate::gles_present::DrawOutcome;
         self.cum_frame_ms.push(frame_ms);
         self.cum_render_ms.push(render_ms);
         if frame_ms > LONG_FRAME_MS {
@@ -413,11 +433,53 @@ impl FrameStats {
                 ctx.ms_since_cycle_event,
             );
         }
+        // --- Black-flash detector ---
+        // A frame is "black" iff draw_outcome is Black(reason)
+        // (clear ran but textured overlay was skipped). Count
+        // every black frame; emit one [black] line per
+        // transition (Drew->Black = streak BEGIN, Black->Drew
+        // = streak END) so the log has exact frame numbers
+        // bracketing each flash.
+        if matches!(draw_outcome, DrawOutcome::Black(_)) {
+            self.cum_black_count += 1;
+            self.window_black_count += 1;
+        }
+        let prev_was_black = matches!(self.last_outcome, Some(DrawOutcome::Black(_)));
+        let now_is_black = matches!(draw_outcome, DrawOutcome::Black(_));
+        if now_is_black && !prev_was_black {
+            // Streak BEGIN. Print phase + reason + which
+            // slot(s) are None for the fix-direction
+            // diagnosis (NoBlendTexA -> slot 0 None at fade
+            // start = QA's hypothesis confirmed).
+            let ctx = streams.outlier_context();
+            let reason = match draw_outcome {
+                DrawOutcome::Black(r) => format!("{r:?}"),
+                _ => "?".into(),
+            };
+            log::warn!(
+                "[black] BEGIN frame={frame_idx} phase={} cycle={} \
+                 reason={reason} flags=[{}] ms_since_last_cycle_event={:?}",
+                ctx.phase_str,
+                ctx.cycle,
+                ctx.flags,
+                ctx.ms_since_cycle_event,
+            );
+        } else if !now_is_black && prev_was_black {
+            // Streak END (current frame is back to normal).
+            let ctx = streams.outlier_context();
+            log::warn!(
+                "[black] END frame={frame_idx} phase={} cycle={}",
+                ctx.phase_str,
+                ctx.cycle,
+            );
+        }
+        self.last_outcome = Some(draw_outcome);
         if self.last_summary_at.elapsed().as_secs() >= SUMMARY_INTERVAL_S {
             self.emit_window_summary();
             self.last_summary_at = std::time::Instant::now();
             self.window_start_idx = self.cum_frame_ms.len();
             self.window_long_count = 0;
+            self.window_black_count = 0;
         }
     }
 
@@ -431,14 +493,18 @@ impl FrameStats {
         let (mean_r, _p50_r, _p99_r, _p999_r, max_r) = pct_stats(win_render);
         let win_sec = self.last_summary_at.elapsed().as_secs_f32().max(0.001);
         let long_per_min = (self.window_long_count as f32 / win_sec) * 60.0;
+        let black_per_min = (self.window_black_count as f32 / win_sec) * 60.0;
         log::info!(
             "[frame-stats] window={SUMMARY_INTERVAL_S}s frames={} mean={mean_f:.2}ms \
              p50={p50_f:.2} p99={p99_f:.2} p999={p999_f:.2} max={max_f:.2} \
              long(>{LONG_FRAME_MS:.0}ms)={} (K/min={:.1}) \
+             black_draws={} (B/min={:.1}) \
              render_mean={mean_r:.2}ms render_max={max_r:.2}ms",
             win_frame.len(),
             self.window_long_count,
             long_per_min,
+            self.window_black_count,
+            black_per_min,
         );
     }
 
@@ -452,14 +518,18 @@ impl FrameStats {
         let (mean_r, _p50_r, _p99_r, _p999_r, max_r) = pct_stats(&self.cum_render_ms);
         let run_sec = self.run_start.elapsed().as_secs_f32().max(0.001);
         let long_per_min = (self.cum_long_count as f32 / run_sec) * 60.0;
+        let black_per_min = (self.cum_black_count as f32 / run_sec) * 60.0;
         log::info!(
             "[frame-stats] FINAL run={run_sec:.1}s frames={} mean={mean_f:.2}ms \
              p50={p50_f:.2} p99={p99_f:.2} p999={p999_f:.2} max={max_f:.2} \
              long(>{LONG_FRAME_MS:.0}ms)={} (K/min={:.1}) \
+             black_draws={} (B/min={:.1}) \
              render_mean={mean_r:.2}ms render_max={max_r:.2}ms",
             self.cum_frame_ms.len(),
             self.cum_long_count,
             long_per_min,
+            self.cum_black_count,
+            black_per_min,
         );
     }
 
@@ -1017,7 +1087,7 @@ mod linux {
                 // draw + swap work (render_ms), excluding the
                 // vsync drain that happens later in the iter.
                 let t_draw_start = Instant::now();
-                presenter
+                let draw_outcome = presenter
                     .draw_frame(frame_idx)
                     .with_context(|| format!("draw_frame {frame_idx}"))?;
 
@@ -1101,7 +1171,13 @@ mod linux {
                 // page_flip-call to page_flip-call cadence =
                 // present cadence).
                 if let Some(frame_ms) = stats.stamp_present_end(Instant::now()) {
-                    stats.record(frame_ms, render_ms, frame_idx, &*streams);
+                    stats.record(
+                        frame_ms,
+                        render_ms,
+                        frame_idx,
+                        &*streams,
+                        draw_outcome,
+                    );
                 }
 
                 // Cycle: front -> prev; new -> front.

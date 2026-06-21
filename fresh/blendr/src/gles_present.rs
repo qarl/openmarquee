@@ -21,6 +21,39 @@ pub enum Step {
     Blend,
 }
 
+/// Black-flash detector (per QA pivot after #4b): a draw is
+/// "black" when the clear-to-black happened but the textured
+/// overlay was skipped because the expected video texture(s)
+/// were None / unsupported. qarl reports a 1-2 frame black
+/// flash at crossfade START (new since #2 + #2-alt async
+/// create). frame-timing instrumentation can't see this
+/// (black frames have normal timing); QA needs this enum
+/// piped up to FrameStats to count + log occurrences.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrawOutcome {
+    /// Step painted a textured (or solid-hue) frame normally.
+    Drew,
+    /// Step::Solid clear (no overlay needed; never black).
+    SolidClear,
+    /// Frame was cleared to black but no overlay drawn.
+    /// Carries the reason for diagnosis.
+    Black(BlackReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlackReason {
+    /// Step::Video and video_tex_id is None / target missing.
+    NoVideoTex,
+    /// Step::Blend and BOTH slot tex_ids are None.
+    NoBlendTexBoth,
+    /// Step::Blend and slot A tex_id is None (B was Some).
+    NoBlendTexA,
+    /// Step::Blend and slot B tex_id is None (A was Some).
+    NoBlendTexB,
+    /// Step::Blend got a non-External target pair (skipped draw).
+    NonExternalBlend,
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::*;
 
@@ -37,7 +70,7 @@ mod stub {
         {
             anyhow::bail!("Presenter stub: Linux only")
         }
-        pub fn draw_frame(&mut self, _frame_idx: u64) -> Result<()> {
+        pub fn draw_frame(&mut self, _frame_idx: u64) -> Result<DrawOutcome> {
             anyhow::bail!("draw_frame stub: Linux only")
         }
         pub fn capture_back_buffer_ppm(&self, _path: &std::path::Path) -> Result<()> {
@@ -545,21 +578,23 @@ mod linux {
             }
         }
 
-        pub fn draw_frame(&mut self, frame_idx: u64) -> Result<()> {
-            unsafe {
+        pub fn draw_frame(&mut self, frame_idx: u64) -> Result<DrawOutcome> {
+            let outcome = unsafe {
                 self.gl.viewport(0, 0, self.w, self.h);
-                match self.step {
+                let out = match self.step {
                     Step::Solid => {
                         // Hue cycle: ~6 deg/frame -> 60s per loop @ 60fps.
                         let h = (frame_idx as f32 * 6.0 / 360.0).fract();
                         let (r, g, b) = hsv_to_rgb(h, 0.8, 0.9);
                         self.gl.clear_color(r, g, b, 1.0);
                         self.gl.clear(glow::COLOR_BUFFER_BIT);
+                        DrawOutcome::SolidClear
                     }
                     Step::Checker => {
                         self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
                         self.gl.clear(glow::COLOR_BUFFER_BIT);
                         self.draw_quad_2d(self.tex_checker)?;
+                        DrawOutcome::Drew
                     }
                     Step::Video => {
                         self.gl.clear_color(0.0, 0.0, 0.0, 1.0);
@@ -567,18 +602,13 @@ mod linux {
                         match (self.video_tex_id, self.video_target) {
                             (Some(tex_id), Some(crate::gst_decode::TexTarget::TwoD)) => {
                                 self.draw_quad_2d_raw(tex_id)?;
+                                DrawOutcome::Drew
                             }
                             (Some(tex_id), Some(crate::gst_decode::TexTarget::External)) => {
                                 self.draw_quad_external(tex_id)?;
+                                DrawOutcome::Drew
                             }
-                            _ => {
-                                if frame_idx % 60 == 0 {
-                                    log::debug!(
-                                        "[gl] Step::Video draw with no tex; \
-                                         showing black for frame {frame_idx}"
-                                    );
-                                }
-                            }
+                            _ => DrawOutcome::Black(BlackReason::NoVideoTex),
                         }
                     }
                     Step::Blend => {
@@ -597,23 +627,10 @@ mod linux {
                                 Some(b_id),
                                 Some(TexTarget::External),
                             ) => {
-                                // #3 SOURCE B fix per QA baseline:
-                                // ~95% of frames are constant-alpha
-                                // holds (alpha=0.0 or 1.0) but the
-                                // 2-tex mix() shader was running
-                                // every frame (render_mean=11.23ms
-                                // vs single-tex floor 0.82ms). Branch
-                                // on alpha:
-                                //   alpha <= eps          -> draw A only
-                                //   alpha >= 1.0 - eps    -> draw B only
-                                //   else (mid-fade)       -> existing
-                                //                            draw_quad_blend
-                                // Single-tex path uses the already-
-                                // compiled prog_ext (samplerExternal
-                                // OES, no mix). Halves per-frame
-                                // fragment cost during holds (~95%
-                                // of frames) -> hold-time render
-                                // drops 11ms -> ~0.8ms.
+                                // #3 SOURCE B fast-path: constant-
+                                // alpha holds skip the 2-tex mix
+                                // and hit the already-compiled
+                                // single-tex prog_ext.
                                 const ALPHA_EPS: f32 = 0.001;
                                 let a = self.blend_alpha;
                                 if a <= ALPHA_EPS {
@@ -621,12 +638,9 @@ mod linux {
                                 } else if a >= 1.0 - ALPHA_EPS {
                                     self.draw_quad_external(b_id)?;
                                 } else {
-                                    self.draw_quad_blend(
-                                        a_id,
-                                        b_id,
-                                        a,
-                                    )?;
+                                    self.draw_quad_blend(a_id, b_id, a)?;
                                 }
+                                DrawOutcome::Drew
                             }
                             (
                                 Some(_),
@@ -638,8 +652,7 @@ mod linux {
                             {
                                 // Phase 2 plan: only (External,
                                 // External) supported. Other combos
-                                // (Mesa /= vc4) would need a third
-                                // shader program; not built yet.
+                                // would need a third shader program.
                                 if frame_idx % 60 == 0 {
                                     log::warn!(
                                         "[gl] Step::Blend got non-External \
@@ -647,20 +660,32 @@ mod linux {
                                          skipping draw"
                                     );
                                 }
+                                DrawOutcome::Black(BlackReason::NonExternalBlend)
                             }
                             _ => {
-                                if frame_idx % 60 == 0 {
-                                    log::debug!(
-                                        "[gl] Step::Blend draw with no texs \
-                                         (a={:?} b={:?}); showing black \
-                                         for frame {frame_idx}",
-                                        self.video_tex_id, self.video_tex_id_b
-                                    );
-                                }
+                                // Classify which slot is missing.
+                                // QA wants to know: is it A, B, or
+                                // both? That picks the fix target
+                                // (gate-fade-start vs alternative).
+                                let a_missing = self.video_tex_id.is_none();
+                                let b_missing = self.video_tex_id_b.is_none();
+                                let reason = match (a_missing, b_missing) {
+                                    (true, true) => BlackReason::NoBlendTexBoth,
+                                    (true, false) => BlackReason::NoBlendTexA,
+                                    (false, true) => BlackReason::NoBlendTexB,
+                                    // Both Some but match-arm hit
+                                    // _ only if one target is None
+                                    // (target=None classified same
+                                    // as tex_id=None for detector
+                                    // purposes; either way the
+                                    // textured overlay was skipped).
+                                    (false, false) => BlackReason::NoBlendTexBoth,
+                                };
+                                DrawOutcome::Black(reason)
                             }
                         }
                     }
-                }
+                };
                 let err = self.gl.get_error();
                 if err != glow::NO_ERROR {
                     return Err(anyhow!(
@@ -671,8 +696,9 @@ mod linux {
                         self.video_target
                     ));
                 }
-            }
-            Ok(())
+                out
+            };
+            Ok(outcome)
         }
 
         /// Helper: draw fullscreen quad sampling a glow::Texture
