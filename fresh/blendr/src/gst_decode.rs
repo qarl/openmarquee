@@ -68,6 +68,9 @@ mod stub {
         pub fn last_pts_ns(&self) -> Option<u64> {
             None
         }
+        pub fn ms_since_last_concat_add(&self) -> Option<u128> {
+            None
+        }
         pub fn process_pending(&mut self) -> Result<()> {
             Ok(())
         }
@@ -139,6 +142,14 @@ mod linux {
         concat: gst::Element,
         #[allow(dead_code)]
         appsink: gst_app::AppSink,
+        /// Measurement infra (per QA overnight mandate). Set
+        /// from the EOS probe (gst streaming thread) to mark
+        /// when concat switches sub-bin (= per-clip loop point).
+        /// Read by Streams::outlier_context() on the present
+        /// thread for outlier log "flags=near_concat_add".
+        /// Mutex held microseconds; contention negligible at
+        /// ~1 event per clip-loop per stream.
+        last_concat_add_at: Arc<Mutex<Option<std::time::Instant>>>,
         /// Latest sample slot (replaced by pull thread; taken
         /// by present thread via latest_texture()).
         latest_sample: Arc<Mutex<Option<gst::Sample>>>,
@@ -173,6 +184,16 @@ mod linux {
     impl GstDecoder {
         pub fn last_pts_ns(&self) -> Option<u64> {
             self.last_pts_ns
+        }
+
+        /// Measurement infra: ms since the last concat sub-bin
+        /// add (= clip loop boundary) on this decoder. None if
+        /// no boundary has fired yet. Read on the present
+        /// thread for [frame-long] outlier context.
+        pub fn ms_since_last_concat_add(&self) -> Option<u128> {
+            let g = self.last_concat_add_at.lock().ok()?;
+            let t = (*g)?;
+            Some(t.elapsed().as_millis())
         }
 
         pub fn new(egl: &Egl, clip: &Path) -> Result<Self> {
@@ -401,6 +422,7 @@ mod linux {
                 pipeline,
                 concat,
                 appsink: appsink.clone(),
+                last_concat_add_at: Arc::new(Mutex::new(None)),
                 latest_sample: Arc::new(Mutex::new(None)),
                 stop: Arc::new(AtomicBool::new(false)),
                 pull_thread: None,
@@ -584,6 +606,10 @@ mod linux {
             let basename_for_probe = self.clip_basename.clone();
             let eos_fire_count = Arc::new(AtomicU64::new(0));
             let eos_fire_count_for_probe = eos_fire_count.clone();
+            // Measurement infra: stamp last_concat_add_at on
+            // each EOS (= concat switch). Read by
+            // outlier_context for [frame-long] flags.
+            let concat_add_stamp = self.last_concat_add_at.clone();
             let probe_id = concat_sink.add_probe(
                 gst::PadProbeType::EVENT_DOWNSTREAM,
                 move |_pad, info| {
@@ -597,6 +623,9 @@ mod linux {
                                  serial={serial_for_probe} fire_count={n} \
                                  -> queue add+retire"
                             );
+                            if let Ok(mut g) = concat_add_stamp.lock() {
+                                *g = Some(std::time::Instant::now());
+                            }
                             let _ = tx_for_probe.send(PipelineCmd::AddNextClip);
                             let _ = tx_for_probe.send(PipelineCmd::Retire(serial_for_probe));
                         }

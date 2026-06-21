@@ -256,6 +256,8 @@ fn run(args: Args) -> Result<()> {
                     next_idx,
                     recreate_pending: false,
                     slideshow,
+                    last_retire_at: None,
+                    last_create_at: None,
                 }
             }
         }
