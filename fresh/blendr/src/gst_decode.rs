@@ -1172,6 +1172,51 @@ mod linux {
         /// the NEW clip might not be ready in time -- caller
         /// (Streams::tick) chooses when to invoke.
         pub fn switch_to_clip(&mut self, new_clip: &Path) -> Result<()> {
+            // LAZY-SWITCH REWRITE (post-91acb3f present-thread
+            // stall): the eager retire+add design called
+            // gst-pipeline state-change ops (sync_state_with_
+            // parent, set_state Null on the retire side) on
+            // the PRESENT thread inside switch_to_clip. On
+            // glass these took ~7s, blocking render -> watchdog
+            // fired -> exit(7). Even the cadence-drain cure
+            // (process_pending at start) ran the same blocking
+            // ops just queued from EOS-probes.
+            //
+            // The cure: do NOTHING on the present thread except
+            // update self.clip_path + self.clip_basename. The
+            // EXISTING EOS-probe-triggered cadence does the
+            // rest: at next natural clip-EOS (~5s for 4.75s
+            // clips), the probe sends AddNextClip via mpsc;
+            // process_pending (called from run_loop on present
+            // OUTSIDE switch_to_clip) calls add_next_clip,
+            // which reads self.clip_path = NEW and queues a
+            // NEW-clip sub-bin. After OLD-front + OLD-queued
+            // play through, concat advances to the fresh NEW
+            // sub-bin.
+            //
+            // Materialization timeline (default 4.75s clips):
+            //   t=0:  switch_to_clip mutates clip_path (~ns)
+            //   t=~5s: OLD-front EOS -> probe adds NEW
+            //   t=~10s: OLD-queued EOS -> concat advances to NEW
+            //   NEW visible from t=~10s onward
+            //
+            // Constraint: switch_to_clip must be called >=10s
+            // before the next FadingX needs this slot. With
+            // default hold_sec=20s, called at HoldingY entry,
+            // there's ~20s margin -> safe.
+            //
+            // What this AVOIDS:
+            //   - present-thread stall (no gst state ops)
+            //   - cadence-drain race (no retire-non-front)
+            //   - bus DOWNSTREAM EOS (concat queue never drops
+            //     below depth=2; existing EOS-cadence keeps it)
+            //   - EGL panic codepath (gst-gl never invoked
+            //     from switch_to_clip)
+            //
+            // What this gives up:
+            //   - immediate-visibility of the new clip on the
+            //     non-visible slot (lazy ~5-10s instead of
+            //     eager 0-5s). Not user-visible during hold.
             let old_basename = self.clip_basename.clone();
             let new_basename = new_clip
                 .file_name()
@@ -1179,79 +1224,26 @@ mod linux {
                 .unwrap_or("?")
                 .to_string();
 
-            // 0. CADENCE-DRAIN FIX (post-7066f61 glass hard
-            //    freeze): drain any pending EOS-probe messages
-            //    BEFORE touching sub_bins. Without this, if a
-            //    concat sub-bin EOSed between the previous
-            //    tick's process_pending and this tick's
-            //    switch_to_clip, the front-of-deque is a stale
-            //    just-EOSed sub-bin awaiting Retire, and the
-            //    SECOND entry is the ACTUALLY-PLAYING one. The
-            //    retire-non-front step below would then retire
-            //    the playing sub-bin -> concat loses its source
-            //    mid-stream -> bus posts DOWNSTREAM EOS
-            //    ("concat ran out of sub-bins") -> pipeline
-            //    halts -> present thread wedges in next
-            //    add_next_clip's sync_state_with_parent.
-            //
-            //    Draining first makes sub_bins reflect actual
-            //    concat state: front-of-deque == actually-
-            //    playing. The retire-non-front step is then
-            //    safe.
-            self.process_pending()?;
-
-            // 1. Update clip_path so future add_next_clip uses
-            //    the new clip. self.clip_path is only read on
-            //    the present thread (this fn + add_next_clip
-            //    via process_pending), so no synchronization
-            //    needed.
+            // Single-threaded mutation: self.clip_path is read
+            // only on present thread (in add_next_clip via
+            // process_pending); this fn also runs on present.
+            // No sync needed. M1 deep-review verified this
+            // threading model.
             self.clip_path = new_clip.to_path_buf();
-            // Update basename for log clarity; the EOS-probe
-            // closures captured the OLD basename at creation
-            // time (immutable), so older sub-bins still log
-            // under OLD's name -- intentional, lets QA see
-            // the boundary in the trace.
             self.clip_basename = new_basename.clone();
 
-            // 2. Retire all NON-FRONT sub-bins. front =
-            //    currently-playing OLD; stays. Anything queued
-            //    after front is queued OLD (from prior loop
-            //    add_next_clip); we replace those with NEW.
-            let serials_to_retire: Vec<u64> = {
-                let q = self.sub_bins.lock().unwrap();
-                q.iter().skip(1).map(|s| s.serial).collect()
-            };
-            for s in &serials_to_retire {
-                if let Err(e) = self.retire_subgraph(*s) {
-                    log::warn!(
-                        "[gst-cl] {old_basename}->{new_basename} \
-                         switch_to_clip retire serial={s} failed: {e:#}"
-                    );
-                }
-            }
             log::info!(
                 "[gst-cl] {old_basename}->{new_basename} switch_to_clip: \
-                 retired {} non-front sub-bins (OLD-front continues to \
-                 natural EOS)",
-                serials_to_retire.len()
+                 LAZY (clip_path updated; NEW takes effect at next \
+                 ~5-10s natural EOS cadence)"
             );
 
-            // 3. Queue ONE NEW-clip sub-bin behind the OLD-
-            //    front. concat picks it up at OLD's EOS.
-            self.add_next_clip().with_context(|| {
-                format!(
-                    "switch_to_clip add_next_clip for {new_basename}"
-                )
-            })?;
-
-            // Trace marker on present thread for QA correlation.
             if crate::kms::trace_enabled() {
                 crate::kms::trace_writeln(&format!(
                     "[trace-switch] ts_ms={} event=DONE \
                      old={old_basename} new={new_basename} \
-                     non_front_retired={}",
+                     mode=lazy",
                     crate::kms::trace_ts_ms(),
-                    serials_to_retire.len()
                 ));
             }
 
