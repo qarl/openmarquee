@@ -157,6 +157,23 @@ mod linux {
         pub context: egl::Context,
     }
 
+    /// Send-able bundle of the EGL handles a worker thread
+    /// needs to call eglCreateContext for a share-group
+    /// context, WITHOUT touching the present thread. The
+    /// present thread clones this from Egl via share_group_
+    /// seed() and moves it into the worker; the worker calls
+    /// ShareGroupContext::create_in_share_group(seed) on its
+    /// own thread.
+    pub struct ShareGroupSeed {
+        pub lib: std::sync::Arc<egl::DynamicInstance<egl::EGL1_5>>,
+        pub display: egl::Display,
+        pub config: egl::Config,
+        pub parent_context: egl::Context,
+    }
+
+    unsafe impl Send for ShareGroupSeed {}
+    unsafe impl Sync for ShareGroupSeed {}
+
     // SAFETY: ShareGroupContext holds EGL handles (Display +
     // Context + Surface). khronos-egl marks them !Send because
     // they wrap raw pointers, but per EGL 1.4+ spec the
@@ -169,6 +186,37 @@ mod linux {
     unsafe impl Sync for ShareGroupContext {}
 
     impl ShareGroupContext {
+        /// Create a share-group context from a Send-able seed
+        /// (Egl::share_group_seed). Designed to be called on
+        /// a WORKER THREAD so the eglCreateContext call --
+        /// which triggers vc4/Mesa share-group setup that can
+        /// disrupt currently-rendering contexts -- doesn't
+        /// happen on the present thread.
+        pub fn create_in_share_group(
+            lib: std::sync::Arc<egl::DynamicInstance<egl::EGL1_5>>,
+            display: egl::Display,
+            config: egl::Config,
+            parent_context: egl::Context,
+        ) -> Result<Self> {
+            let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
+            let t = std::time::Instant::now();
+            let context = lib
+                .create_context(
+                    display,
+                    config,
+                    Some(parent_context),
+                    &ctx_attribs,
+                )
+                .map_err(|e| anyhow!("eglCreateContext(share): {e:?}"))?;
+            let elapsed_us = t.elapsed().as_micros();
+            log::info!(
+                "[egl] share-group context created (surfaceless) on \
+                 thread '{}' in {elapsed_us}us",
+                std::thread::current().name().unwrap_or("?")
+            );
+            Ok(Self { lib, display, context })
+        }
+
         /// eglMakeCurrent THIS context on the calling thread,
         /// SURFACELESS (None for read + draw). Used by the
         /// worker thread before invoking any gst-gl APIs.
@@ -343,31 +391,28 @@ mod linux {
         /// gst-gl APIs, and for destroying the
         /// ShareGroupContext when the owning GstDecoder Drops
         /// (call Egl::destroy_share_group_context).
-        pub fn create_share_group_context(&self) -> Result<ShareGroupContext> {
-            let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
-            // share_context = Some(self.context) puts the new
-            // context in the SAME share group as the presenter.
-            // No surface created -- EGL_KHR_surfaceless_context
-            // lets the worker eglMakeCurrent with
-            // EGL_NO_SURFACE. Required because GBM exposes no
-            // pbuffer configs.
-            let context = self
-                .lib
-                .create_context(
-                    self.display,
-                    self.config,
-                    Some(self.context),
-                    &ctx_attribs,
-                )
-                .map_err(|e| anyhow!("eglCreateContext(share): {e:?}"))?;
-            log::info!(
-                "[egl] share-group context created (surfaceless)"
-            );
-            Ok(ShareGroupContext {
+        /// Get the raw bits a worker thread needs to create
+        /// its OWN ShareGroupContext (so the present thread
+        /// makes NO EGL calls during create_pending). All
+        /// returned types are Send (lib is Arc; the rest are
+        /// EGL handles wrapped in ShareGroupContext-style
+        /// unsafe-Send).
+        ///
+        /// Per QA bbf4daa A/B: eglCreateContext on the present
+        /// thread with share_context=presenter still produced
+        /// the black flash even after gst-gl was fully
+        /// isolated -- vc4/Mesa driver does GPU state sync
+        /// during share-group setup that disrupts the
+        /// currently-current context's rendering. Solution:
+        /// call eglCreateContext from the worker, not the
+        /// present thread.
+        pub fn share_group_seed(&self) -> ShareGroupSeed {
+            ShareGroupSeed {
                 lib: self.lib.clone(),
                 display: self.display,
-                context,
-            })
+                config: self.config,
+                parent_context: self.context,
+            }
         }
 
         pub fn swap_buffers(&self) -> Result<()> {

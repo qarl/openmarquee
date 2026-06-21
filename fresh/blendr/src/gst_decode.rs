@@ -313,17 +313,20 @@ mod linux {
             self.state
         }
 
-        /// Create the share-group EGL context (cheap; FFI only)
-        /// and spawn a worker thread that builds the entire
-        /// GstDecoder (pipeline + sub-bins + PAUSED + PLAYING +
-        /// pull-thread). Returns immediately with a
-        /// PendingDecoder whose poll() picks up the finished
-        /// GstDecoder via mpsc.
+        /// Spawn a worker thread that does EVERYTHING --
+        /// including the eglCreateContext for the share-group
+        /// context. Present thread does ZERO EGL/GL calls in
+        /// this function (just clones an Arc<DynamicInstance>
+        /// + 3 Copy handles into the worker).
         ///
-        /// The worker uses the share-group context so gst-gl's
-        /// GL ops never touch the presenter context or window
-        /// surface -- this kills the black flash that all
-        /// cheap fixes failed to reach.
+        /// Per QA bbf4daa diagnosis: even with gst-gl fully
+        /// isolated (own surfaceless ctx, own thread), the
+        /// black flash persisted because eglCreateContext
+        /// itself, called on the present thread with
+        /// share_context=presenter, triggered vc4/Mesa GPU
+        /// state sync that disrupted the present context's
+        /// rendering for ~160ms. The fix: call
+        /// eglCreateContext on the worker too.
         pub fn start_async(egl: &Egl, clip: &Path) -> Result<Self> {
             let clip_basename = clip
                 .file_name()
@@ -332,22 +335,18 @@ mod linux {
                 .to_string();
             let clip_path = clip.to_path_buf();
 
-            // Share-group context creation runs on the present
-            // thread (called sites are pre-frame): it's just
-            // 2 EGL FFI (eglCreateContext + eglCreatePbuffer-
-            // Surface), no GL ops. Sub-ms.
-            let share_group = egl
-                .create_share_group_context()
-                .context("create share-group context for PendingDecoder worker")?;
+            // Send-able seed for the worker to call
+            // eglCreateContext on its own thread. ZERO EGL
+            // calls on the present thread.
+            let seed = egl.share_group_seed();
 
-            // mpsc oneshot for worker -> present.
             let (tx, rx) = mpsc::channel::<Result<GstDecoder>>();
             let basename_for_worker = clip_basename.clone();
             std::thread::Builder::new()
                 .name(format!("blendr-pending-{clip_basename}"))
                 .spawn(move || {
                     let r = build_on_worker(
-                        share_group,
+                        seed,
                         clip_path,
                         basename_for_worker,
                     );
@@ -356,8 +355,8 @@ mod linux {
                 .context("spawn PendingDecoder worker")?;
 
             log::info!(
-                "[gst] [{clip_basename}] worker spawned (share-group EGL); \
-                 present thread unblocked"
+                "[gst] [{clip_basename}] worker spawned (NO present-thread \
+                 EGL calls); present thread unblocked"
             );
             Ok(PendingDecoder {
                 state: PendingState::AwaitingWorker,
@@ -438,15 +437,31 @@ mod linux {
     /// their streaming threads can take it freely (EGL
     /// single-thread-current semantics).
     fn build_on_worker(
-        share_group: crate::egl_gbm::ShareGroupContext,
+        seed: crate::egl_gbm::ShareGroupSeed,
         clip: PathBuf,
         _clip_basename: String,
     ) -> Result<GstDecoder> {
         gst::init().context("gst::init (worker)")?;
 
-        // (a) Make the share-group context current on THIS
-        //     worker thread so the GstGLContext::new_wrapped
-        //     call below sees an active context for fill_info.
+        // (a.1) Create the share-group EGL context on THIS
+        //       worker thread (NOT on present). eglCreate-
+        //       Context with share_context=presenter triggers
+        //       vc4/Mesa share-group setup that disrupts the
+        //       currently-current context's rendering -- if we
+        //       did this on present, it would black our screen
+        //       for ~160ms (QA proof at bbf4daa). On the
+        //       worker, it just disrupts the worker's nothing.
+        let share_group = crate::egl_gbm::ShareGroupContext::create_in_share_group(
+            seed.lib,
+            seed.display,
+            seed.config,
+            seed.parent_context,
+        )
+        .context("create share-group context on worker")?;
+
+        // (a.2) Make the share-group context current on THIS
+        //       worker thread so the GstGLContext::new_wrapped
+        //       call below sees an active context for fill_info.
         share_group
             .make_current_here()
             .context("share-group make_current on worker")?;
