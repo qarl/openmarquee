@@ -404,6 +404,9 @@ mod linux {
                 match streams {
                     super::Streams::None => {}
                     super::Streams::Single(g) => {
+                        if let Err(e) = g.process_pending() {
+                            log::warn!("[kms] process_pending: {e:#}");
+                        }
                         egl.make_current()
                             .context("egl.make_current pre-gst-pull(single)")?;
                         match g.latest_texture() {
@@ -426,6 +429,17 @@ mod linux {
                             .context("egl.make_current post-gst-pull(single)")?;
                     }
                     super::Streams::Blend { a, b, slideshow } => {
+                        // Phase 3 v1: drain each decoder's
+                        // pending pipeline commands (concat add-
+                        // next on EOS, etc) on the present
+                        // thread before pulling samples. Bounded
+                        // (few cmds per cycle).
+                        if let Err(e) = a.process_pending() {
+                            log::warn!("[kms] A.process_pending: {e:#}");
+                        }
+                        if let Err(e) = b.process_pending() {
+                            log::warn!("[kms] B.process_pending: {e:#}");
+                        }
                         // Phase 3: state machine drives alpha.
                         let (alpha, phase_changed) = slideshow.update();
                         if phase_changed {

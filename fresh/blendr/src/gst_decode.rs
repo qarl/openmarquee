@@ -1,57 +1,48 @@
-//! Phase 1 (single-stream) + Phase 2 (two-stream blend) keystone
-//! import: cutloop-shaped GStreamer pipeline(s) decoding H.264
-//! into GL textures that blendr samples directly.
+//! Phase 1 (single-stream) + Phase 2 (two-stream blend)
+//! + Phase 3 v1 (slideshow w/ concat add-next looping)
+//! keystone import: cutloop-shaped GStreamer pipeline(s)
+//! decoding H.264 into GL textures that blendr samples
+//! directly.
 //!
-//! Pipeline (per decoder, single sub-bin):
-//!   filesrc -> qtdemux -> h264parse -> v4l2h264dec
-//!            -> queue(leaky=downstream, cap=2)
-//!            -> glupload -> appsink
+//! Pipeline (PER decoder; dynamic sub-bins on the concat side):
 //!
-//! THE GL CONTEXT SHARE is the load-bearing piece. gst-gl creates
-//! its own GstGLDisplay/GstGLContext by default and the textures
-//! it emits are then VALID ONLY in its private context, NOT in
-//! blendr's. We MUST hand it our wrapped display + context via
-//! a SYNC bus handler responding to NEED_CONTEXT messages
-//! BEFORE the pipeline transitions out of READY. Get this wrong
-//! and the symptom is a silently-black/green --capture PPM (the
-//! #1 risk per dispatch).
+//!   filesrc(clip) ! qtdemux ! h264parse ! concat.sink_0  ┐
+//!   filesrc(clip) ! qtdemux ! h264parse ! concat.sink_1  ├── pre-queued at init
+//!   ...                                                  ┘
+//!   concat ! v4l2h264dec ! queue(leaky) ! glupload ! appsink
 //!
-//! BUG 2 SIMPLIFICATION (post-Phase-1-keystone): vc4's gst-gl
-//! always hands back GL_TEXTURE_EXTERNAL_OES textures regardless
-//! of caps. The earlier "try external-oes caps first, fall back
-//! to RGBA" dance was pointless on this hardware -- external-oes
-//! caps always failed preroll, RGBA always succeeded, and the
-//! resulting texture was always EXTERNAL anyway. This commit
-//! drops the dual-caps preroll and uses ONLY the RGBA caps path
-//! (proven-good on vc4). adopt_sample queries the GLMemory's
-//! ACTUAL texture_target and updates self.tex_target so the
-//! present-side draw routes to samplerExternalOES vs sampler2D
-//! based on RUNTIME truth, not caps-negotiation assumption.
+//! INITIAL_QUEUE_DEPTH=2 sub-bins are pre-queued at init.
+//! Each sub-bin's concat sink pad has an EVENT_DOWNSTREAM
+//! probe; when concat absorbs an intra-stream EOS at switch,
+//! the probe sends (AddNextClip, Retire(serial)) commands to
+//! the present-thread channel. The present thread drains the
+//! channel per iteration via `process_pending()` and runs the
+//! retire + add on its own thread (cutloop's GLib.idle_add
+//! pattern adapted to Rust without a GLib main loop).
 //!
-//! PHASE 2 PULL-THREAD ARCHITECTURE (the FREEZE-KILLER): each
-//! GstDecoder spawns a background thread that loops on
-//! appsink.try_pull_sample, atomically replacing a shared
-//! latest-sample slot. The present (main) thread reads the
-//! latest sample via `latest_texture()` -- non-blocking on
-//! decode/import. GL ops (the GLVideoFrame map) STAY on the
-//! main thread where blendr's EGL context is current; the
-//! pull thread only shuffles gst::Sample handles.
+//! Why concat instead of seek-to-0 (per BUG A glass):
+//! v4l2h264dec on bcm2835-codec is brittle around FLUSH-seek
+//! (memory note: "bcm2835-codec STREAMOFF + EOS — VIDIOC_TRY
+//! _DECODER_CMD for probes; CMD_STOP on empty pipe wedges").
+//! sync=true + seek-to-0 on EOS: clip plays to end, decoder
+//! freezes on last frame, no further EOS fires, seek never
+//! triggered. cutloop.py's PROVEN approach (17 clips back-to-
+//! back, real Pi soak): concat absorbs intra-stream EOS at
+//! sub-bin boundaries; v4l2h264dec stays running across the
+//! switch (handles the new SPS/PPS via h264parse config-
+//! interval=-1). Single-clip looping = same clip queued as
+//! each new sub-bin; concat handles the loop boundary as just
+//! another source-to-source switch.
 
 use anyhow::Result;
 
-/// Which texture target the negotiated caps resolved to.
-/// Read by gles_present once the first sample arrives so the
-/// right shader + glBindTexture target is picked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TexTarget {
     /// GL_TEXTURE_EXTERNAL_OES (0x8D65) -- zero-copy DMABuf
-    /// from glupload; samplerExternalOES in the shader. V3D
-    /// does YUV->RGB at sample time. This is the path vc4
-    /// always returns.
+    /// from glupload; samplerExternalOES in the shader.
     External,
-    /// GL_TEXTURE_2D -- RGBA; glupload converted NV12
-    /// internally. Sampler2D shader. Documented fallback for
-    /// non-vc4 hardware; not exercised on FYS.
+    /// GL_TEXTURE_2D -- RGBA. Documented fallback; vc4 always
+    /// returns External in practice.
     TwoD,
 }
 
@@ -77,6 +68,9 @@ mod stub {
         pub fn last_pts_ns(&self) -> Option<u64> {
             None
         }
+        pub fn process_pending(&mut self) -> Result<()> {
+            Ok(())
+        }
     }
 }
 
@@ -85,69 +79,79 @@ mod linux {
     use super::*;
     use crate::egl_gbm::Egl;
     use anyhow::{anyhow, Context};
+    use gst::glib;
     use gst::prelude::*;
     use gst_gl::prelude::*;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::collections::VecDeque;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
 
-    /// GL_TEXTURE_EXTERNAL_OES -- not in glow's enum table.
-    /// 0x8D65 per GL_OES_EGL_image_external spec; matches the
-    /// OLD renderer's use at code2/renderer/src/hdmi.rs.
     pub const GL_TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 
-    /// Pull-thread loop tick. 33ms = ~30Hz, enough to deliver
-    /// 24fps clip frames promptly without busy-spinning.
+    /// Pull-thread tick.
     const PULL_TICK_MS: u64 = 33;
-    /// First-sample wait at construction (5s). Pipeline must
-    /// reach PLAYING + decode frame 1 within this window.
+    /// First-sample wait at construction.
     const FIRST_SAMPLE_TIMEOUT_S: u64 = 5;
+    /// Always pre-queue this many sub-bins so concat never runs dry.
+    const INITIAL_QUEUE_DEPTH: usize = 2;
 
-    /// Owns the GStreamer pipeline + GL ctx share state + the
-    /// pull thread + the latest-sample slot + the currently-
-    /// mapped GLVideoFrame (held so the texture stays valid for
-    /// the present iteration that pulled it).
+    /// Tracking handle for one dynamically-added sub-bin.
+    /// The bin owns its own filesrc/qtdemux/h264parse; we keep
+    /// the metadata needed to disconnect/remove on retire.
+    struct SubBin {
+        serial: u64,
+        bin: gst::Bin,
+        qtdemux: gst::Element,
+        pad_added_id: Option<glib::SignalHandlerId>,
+        concat_sink: gst::Pad,
+        probe_id: Option<gst::PadProbeId>,
+    }
+
+    /// Commands sent from EOS probes (on gst streaming threads)
+    /// to the present thread, which processes them in
+    /// `process_pending()` per iteration. Decouples gst-side
+    /// pad-probe firing from the actual pipeline mutation
+    /// (which we want on a single thread for safety).
+    enum PipelineCmd {
+        /// Append a new sub-bin (same clip) to concat.
+        AddNextClip,
+        /// Retire the sub-bin whose serial matches.
+        Retire(u64),
+    }
+
     pub struct GstDecoder {
         pipeline: gst::Pipeline,
-        // appsink retained for Drop ordering; the pull thread
-        // owns its own clone for try_pull_sample.
+        concat: gst::Element,
         #[allow(dead_code)]
         appsink: gst_app::AppSink,
-        /// The pull thread atomically replaces this; the present
-        /// thread takes via `latest_texture()`. None until the
-        /// pull thread populates (which seeded the first sample
-        /// synchronously in `new()`).
+        /// Latest sample slot (replaced by pull thread; taken
+        /// by present thread via latest_texture()).
         latest_sample: Arc<Mutex<Option<gst::Sample>>>,
-        /// Signals the pull thread to exit.
         stop: Arc<AtomicBool>,
-        /// Joined in Drop.
         pull_thread: Option<JoinHandle<()>>,
-        /// The most-recently-mapped GLVideoFrame. Holds the
-        /// GLMemory ref alive so blendr's GL keeps a valid
-        /// texture id across iterations that don't pull a new
-        /// sample. Replaced (NEW mapped, then OLD dropped) each
-        /// time `latest_texture()` consumes a new sample.
         current_frame: Option<gst_gl::GLVideoFrame<gst_gl::gl_video_frame::Readable>>,
-        /// The texture target the LAST mapped sample reported.
-        /// Updated by adopt_sample from the GLMemory's actual
-        /// texture_target() (not the caps-negotiated label).
-        /// kms::run_loop reads this AFTER `latest_texture()` to
-        /// route the draw to the matching shader.
         pub tex_target: TexTarget,
-        /// BUG A debug: PTS (nanoseconds) of the most-recently
-        /// adopted sample. kms::run_loop reads via
-        /// `last_pts_ns()` for per-tick motion logging so QA can
-        /// confirm headlessly that a clip is ACTUALLY ADVANCING
-        /// (not just the alpha animating against a frozen frame).
         last_pts_ns: Option<u64>,
-        /// Short basename for log lines (Drop step localization
-        /// per BUG B, PTS logging per BUG A). Set once at new().
         clip_basename: String,
-        /// Held to extend lifetime past pipeline drop ordering;
-        /// pipeline holds an internal ref via set_context, but
-        /// we keep clones so the Drop order doesn't free them
-        /// before our currently-held GLVideoFrame.
+        /// Clip path; re-fed on every add_next_clip for the
+        /// single-clip looping case. (Phase 3 v2 will extend
+        /// this to a playlist at the OUTER Streams::Cycle level
+        /// by retire+recreate of the whole GstDecoder; each
+        /// GstDecoder stays single-clip internally.)
+        clip_path: PathBuf,
+        /// Live sub-bins queue (FIFO; front = active source
+        /// concat is currently consuming).
+        sub_bins: Mutex<VecDeque<SubBin>>,
+        /// Monotonic sub-bin serial for EOS-probe identification.
+        serial_counter: AtomicU64,
+        /// EOS probes send commands here from gst streaming
+        /// threads. process_pending() drains on the present
+        /// thread.
+        pipe_cmd_tx: mpsc::Sender<PipelineCmd>,
+        pipe_cmd_rx: mpsc::Receiver<PipelineCmd>,
         #[allow(dead_code)]
         gst_display: gst_gl::GLDisplay,
         #[allow(dead_code)]
@@ -155,34 +159,21 @@ mod linux {
     }
 
     impl GstDecoder {
-        /// BUG A: last sample's PTS in nanoseconds. None if no
-        /// sample seen yet or the buffer had no PTS. Read per
-        /// [kms] tick so QA can confirm motion headlessly.
         pub fn last_pts_ns(&self) -> Option<u64> {
             self.last_pts_ns
         }
-    }
 
-    impl GstDecoder {
         pub fn new(egl: &Egl, clip: &Path) -> Result<Self> {
             gst::init().context("gst::init")?;
 
-            // (a) Wrap blendr's EGLDisplay as a GstGLDisplayEGL.
-            //     The display handle from khronos-egl is a raw
-            //     EGLDisplay (pointer) -- pass as `usize` for
-            //     gst_gl's wrapper API.
+            // (a) Wrap blendr's EGLDisplay + EGLContext per
+            //     proven Phase 1 setup.
             let egl_display_ptr = egl.display.as_ptr() as usize;
             let gst_display: gst_gl::GLDisplay = unsafe {
                 gst_gl_egl::GLDisplayEGL::with_egl_display(egl_display_ptr)
                     .map_err(|e| anyhow!("GLDisplayEGL::with_egl_display: {e}"))?
             }
             .upcast();
-
-            // (b) Wrap blendr's EGLContext as a GstGLContext on
-            //     platform=EGL, api=GLES2. The wrapped handle
-            //     SHARES the EGL context group with our blendr
-            //     context -- any texture id created on it is
-            //     valid in our context.
             let egl_ctx_handle = egl.context.as_ptr() as usize;
             let gst_context: gst_gl::GLContext = unsafe {
                 gst_gl::GLContext::new_wrapped(
@@ -193,48 +184,25 @@ mod linux {
                 )
             }
             .ok_or_else(|| anyhow!("GLContext::new_wrapped returned None"))?;
-
-            // Activate + fill_info so gst-gl probes extensions
-            // against OUR context. fill_info must run from a
-            // thread with the context current (main thread; EGL
-            // is made-current after egl_gbm::Egl::bring_up).
             gst_context
                 .activate(true)
                 .map_err(|e| anyhow!("gst_context.activate(true): {e}"))?;
             gst_context
                 .fill_info()
                 .map_err(|e| anyhow!("gst_context.fill_info: {e}"))?;
-            // Release on main; gst-gl's streaming thread will
-            // make-current its own pair as needed. We re-assert
-            // make-current on the main thread before each draw
-            // (see kms::run_loop).
             gst_context
                 .activate(false)
                 .map_err(|e| anyhow!("gst_context.activate(false): {e}"))?;
 
-            // (c) Build pipeline programmatically.
-            //
-            // queue(leaky=downstream, cap=2) between dec and
-            // glupload per Phase 2 plan: gives the decoder a
-            // place to push without backpressure-stalling the
-            // V4L2 capture loop; on overflow drops oldest rather
-            // than blocking, so one stream stalling doesn't
-            // starve the other when they share a CMA pool.
+            // (b) Build the STATIC downstream half:
+            //     concat -> v4l2h264dec -> queue -> glupload
+            //              -> appsink.
+            //     Sub-bins (filesrc + qtdemux + h264parse) are
+            //     added DYNAMICALLY via add_next_clip below.
             let pipeline = gst::Pipeline::new();
-            let clip_str = clip.to_str().ok_or_else(|| {
-                anyhow!("clip path is not valid UTF-8: {}", clip.display())
-            })?;
-            let filesrc = gst::ElementFactory::make("filesrc")
-                .property("location", clip_str)
+            let concat = gst::ElementFactory::make("concat")
                 .build()
-                .context("make filesrc")?;
-            let qtdemux = gst::ElementFactory::make("qtdemux")
-                .build()
-                .context("make qtdemux")?;
-            let h264parse = gst::ElementFactory::make("h264parse")
-                .property("config-interval", -1i32)
-                .build()
-                .context("make h264parse")?;
+                .context("make concat")?;
             let v4l2dec = gst::ElementFactory::make("v4l2h264dec")
                 .build()
                 .context("make v4l2h264dec")?;
@@ -257,51 +225,14 @@ mod linux {
                 .dynamic_cast::<gst_app::AppSink>()
                 .map_err(|_| anyhow!("appsink dynamic_cast failed"))?;
             pipeline
-                .add_many([
-                    &filesrc, &qtdemux, &h264parse, &v4l2dec, &outq, &glupload, &appsink_el,
-                ])
-                .context("pipeline.add_many")?;
+                .add_many([&concat, &v4l2dec, &outq, &glupload, &appsink_el])
+                .context("pipeline.add_many (static elements)")?;
+            gst::Element::link_many([&concat, &v4l2dec, &outq, &glupload, &appsink_el])
+                .context("link concat->dec->outq->glupload->appsink")?;
 
-            // Static links (qtdemux's pad is dynamic).
-            filesrc
-                .link(&qtdemux)
-                .context("link filesrc -> qtdemux")?;
-            gst::Element::link_many([&h264parse, &v4l2dec, &outq, &glupload, &appsink_el])
-                .context("link h264parse->dec->outq->glupload->appsink")?;
-
-            // qtdemux pad-added: link video pad to h264parse
-            // sink. Mirrors cutloop.py:236-244.
-            let h264parse_for_pad = h264parse.clone();
-            qtdemux.connect_pad_added(move |_demux, pad| {
-                let caps = pad.current_caps().or_else(|| Some(pad.query_caps(None)));
-                let caps_str = caps.map(|c| c.to_string()).unwrap_or_default();
-                if !caps_str.starts_with("video/") {
-                    return;
-                }
-                let sink_pad = match h264parse_for_pad.static_pad("sink") {
-                    Some(p) => p,
-                    None => return,
-                };
-                if sink_pad.is_linked() {
-                    return;
-                }
-                if let Err(e) = pad.link(&sink_pad) {
-                    log::warn!("[gst] qtdemux pad link to h264parse failed: {e:?}");
-                }
-            });
-
-            // appsink properties + caps. BUG 2 simplification:
-            // use ONLY the RGBA GLMemory caps path. vc4's gst-gl
-            // hands back EXTERNAL_OES textures under this path
-            // anyway (queried at adopt_sample), so trying
-            // external-oes caps first was always failure-then-
-            // fallback noise.
-            //
-            // drop=true (changed from Phase 1 false): with the
-            // pull thread polling at ~30Hz and the decoder
-            // delivering at clip-fps, drop-newer would block
-            // the decoder; we want LATEST not COMPLETE for
-            // present-thread render.
+            // appsink config: RGBA GLMemory caps; sync=true for
+            // real-time pacing (BUG A fix from b5e12b5 PRESERVED);
+            // drop=true so we keep latest not complete.
             let caps_rgba = gst::Caps::builder("video/x-raw")
                 .features(["memory:GLMemory"])
                 .field("format", "RGBA")
@@ -309,41 +240,21 @@ mod linux {
             appsink.set_caps(Some(&caps_rgba));
             appsink.set_max_buffers(2);
             appsink.set_drop(true);
-            // BUG A fix: sync=TRUE paces the decoder against
-            // the pipeline clock so playback runs at the clip's
-            // native frame rate (~24fps for our content) instead
-            // of racing through at decoder-max-speed (~3.4x too
-            // fast was qarl's glass observation). With sync=true
-            // a 4.75s clip plays in 4.75s, EOS-triggered seek-
-            // to-0 fires once per natural duration, and motion
-            // is real-time.
-            //
-            // Caveat: sync=true means try_pull_sample blocks
-            // briefly waiting for the next buffer's PTS instead
-            // of returning immediately. The 33ms pull tick is
-            // larger than 1/60s (frame interval) so this is
-            // fine; samples accumulate in the slot when present
-            // misses a tick.
             appsink.set_sync(true);
             appsink.set_property("emit-signals", false);
 
-            // (d) Install SYNC bus handler for NEED_CONTEXT +
-            //     log STATE_CHANGED / ERROR / WARNING / EOS so
-            //     we see what's actually happening on the
-            //     pipeline bus. (No GLib main loop, so the
-            //     async bus would otherwise be silent.) MUST run
-            //     before set_state(PAUSED).
+            // (c) Bus SYNC handler: NEED_CONTEXT + visibility
+            //     logging. We do NOT EOS-handle on the bus
+            //     anymore -- concat absorbs intra-stream EOS at
+            //     the per-sub-bin boundary (caught by our
+            //     per-pad probes, NOT the bus). A bus EOS would
+            //     mean concat ran out of sources entirely =
+            //     bug; log it loudly.
             let bus = pipeline
                 .bus()
                 .ok_or_else(|| anyhow!("pipeline has no bus"))?;
             let display_for_bus = gst_display.clone();
             let context_for_bus = gst_context.clone();
-            // Phase 3 v1: capture pipeline ref so the EOS
-            // handler can seek_simple(FLUSH|KEY_UNIT, 0) to
-            // loop the clip when it ends. Without this a 4.75s
-            // clip dies after ~5s; Phase 3 needs continuous
-            // playback across 20s holds.
-            let pipeline_for_bus = pipeline.clone();
             bus.set_sync_handler(move |_bus, msg| {
                 use gst::MessageView;
                 let src_name = msg
@@ -384,9 +295,7 @@ mod linux {
                     MessageView::StateChanged(sc) => {
                         let reaching_playing =
                             sc.current() == gst::State::Playing;
-                        let from_pipeline = src_name == "pipeline0"
-                            || src_name == "pipeline1"
-                            || src_name.starts_with("pipeline");
+                        let from_pipeline = src_name.starts_with("pipeline");
                         if reaching_playing || from_pipeline {
                             log::info!(
                                 "[gst-bus] STATE src={src_name} {:?}->{:?} pending={:?}",
@@ -411,29 +320,14 @@ mod linux {
                         );
                     }
                     MessageView::Eos(_) => {
-                        // Phase 3 v1 per-decoder loop: clip
-                        // EOS'd -> seek to 0 + keep playing.
-                        // FLUSH causes a brief gap (~ms) at the
-                        // loop point; KEY_UNIT snaps to nearest
-                        // keyframe. The seek is async; gst
-                        // delivers more samples shortly after.
-                        //
-                        // BUG A: log the seek RESULT so we know
-                        // if it silently failed. Old code did
-                        // `let _ = pipeline_for_bus.seek_simple(...)`
-                        // which swallowed Err/Ok(false). QA's
-                        // glass showed only 2 seek events in
-                        // 60s (vs expected ~42 per stream),
-                        // meaning either EOS isn't firing OR
-                        // the seek is failing AND wedging the
-                        // decoder. The Result tells us which.
-                        let seek_res = pipeline_for_bus.seek_simple(
-                            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-                            gst::ClockTime::ZERO,
-                        );
-                        log::info!(
-                            "[gst-bus] EOS src={src_name} seek-to-0 \
-                             result={seek_res:?}"
+                        // concat ran out of sources -> bug in
+                        // our add_next_clip cadence. Should
+                        // never happen with INITIAL_QUEUE_DEPTH
+                        // + per-EOS add_next.
+                        log::error!(
+                            "[gst-bus] DOWNSTREAM EOS src={src_name} \
+                             -- concat ran out of sub-bins! add_next \
+                             cadence broken; pipeline will halt"
                         );
                     }
                     MessageView::AsyncDone(_) => {
@@ -444,19 +338,53 @@ mod linux {
                 gst::BusSyncReply::Pass
             });
 
-            // (e) State -> PAUSED with state-wait confirmation.
-            log::info!("[gst] set_state(PAUSED) RGBA-caps path");
-            let preroll_ret = pipeline
+            // (d) Build the GstDecoder struct skeleton so we can
+            //     call add_next_clip on it. The channel + state
+            //     get filled here; sub_bins starts empty.
+            let (pipe_cmd_tx, pipe_cmd_rx) = mpsc::channel::<PipelineCmd>();
+            let clip_basename = clip
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+
+            let mut me = GstDecoder {
+                pipeline,
+                concat,
+                appsink: appsink.clone(),
+                latest_sample: Arc::new(Mutex::new(None)),
+                stop: Arc::new(AtomicBool::new(false)),
+                pull_thread: None,
+                current_frame: None,
+                tex_target: TexTarget::TwoD,
+                last_pts_ns: None,
+                clip_basename: clip_basename.clone(),
+                clip_path: clip.to_path_buf(),
+                sub_bins: Mutex::new(VecDeque::new()),
+                serial_counter: AtomicU64::new(0),
+                pipe_cmd_tx,
+                pipe_cmd_rx,
+                gst_display,
+                gst_context,
+            };
+
+            // (e) Pre-queue INITIAL_QUEUE_DEPTH sub-bins. concat
+            //     plays the first; the rest are pending.
+            for _ in 0..INITIAL_QUEUE_DEPTH {
+                me.add_next_clip()?;
+            }
+
+            // (f) State -> PAUSED + wait.
+            log::info!("[gst] set_state(PAUSED) [{clip_basename}]");
+            let preroll_ret = me
+                .pipeline
                 .set_state(gst::State::Paused)
                 .map_err(|e| anyhow!("set_state(PAUSED): {e:?}"))?;
-            log::info!(
-                "[gst] set_state(PAUSED) returned {preroll_ret:?}; waiting..."
-            );
+            log::info!("[gst] set_state(PAUSED) returned {preroll_ret:?}; waiting...");
             let (wait_res, cur, pending) =
-                pipeline.state(gst::ClockTime::from_seconds(5));
+                me.pipeline.state(gst::ClockTime::from_seconds(5));
             log::info!(
-                "[gst] state-wait after PAUSED: {wait_res:?} \
-                 cur={cur:?} pending={pending:?}"
+                "[gst] state-wait after PAUSED: {wait_res:?} cur={cur:?} pending={pending:?}"
             );
             if cur != gst::State::Paused {
                 return Err(anyhow!(
@@ -464,85 +392,246 @@ mod linux {
                      (cur={cur:?}, pending={pending:?})"
                 ));
             }
-            log::info!("[gst] preroll PAUSED confirmed");
 
-            // (f) PLAYING with state-wait confirmation.
-            log::info!("[gst] set_state(PLAYING) starting");
-            let play_ret = pipeline
+            // (g) PLAYING + wait.
+            log::info!("[gst] set_state(PLAYING) [{clip_basename}]");
+            let play_ret = me
+                .pipeline
                 .set_state(gst::State::Playing)
                 .map_err(|e| anyhow!("set_state PLAYING: {e:?}"))?;
             log::info!("[gst] set_state(PLAYING) returned {play_ret:?}; waiting...");
             let (wait_res, cur, pending) =
-                pipeline.state(gst::ClockTime::from_seconds(10));
+                me.pipeline.state(gst::ClockTime::from_seconds(10));
             log::info!(
-                "[gst] state-wait after PLAYING: {wait_res:?} \
-                 cur={cur:?} pending={pending:?}"
+                "[gst] state-wait after PLAYING: {wait_res:?} cur={cur:?} pending={pending:?}"
             );
             if cur != gst::State::Playing {
                 return Err(anyhow!(
                     "pipeline did NOT reach PLAYING within 10s \
-                     (cur={cur:?} pending={pending:?}); buffers will \
-                     never flow"
+                     (cur={cur:?} pending={pending:?})"
                 ));
             }
-            log::info!("[gst] PLAYING confirmed; pipeline streaming");
+            log::info!("[gst] PLAYING confirmed; concat add-next looping armed");
 
-            // (g) Block on the first sample so caller sees a
-            //     ready decoder (no "is the pipeline ready?"
-            //     race in main / kms).
-            let first_sample = appsink
+            // (h) Block on first sample to seed the slot.
+            let first_sample = me
+                .appsink
                 .try_pull_sample(gst::ClockTime::from_seconds(FIRST_SAMPLE_TIMEOUT_S))
                 .ok_or_else(|| {
                     anyhow!(
                         "first sample timed out ({FIRST_SAMPLE_TIMEOUT_S}s); \
-                         pipeline is PLAYING but no buffer delivered"
+                         pipeline PLAYING but no buffer delivered"
                     )
                 })?;
-            log::info!("[gst] first sample seeded; spawning pull thread");
+            *me.latest_sample.lock().unwrap() = Some(first_sample);
+            log::info!("[gst] first sample seeded [{clip_basename}]; spawning pull thread");
 
-            // (h) Set up shared state + spawn pull thread.
-            let latest_sample = Arc::new(Mutex::new(Some(first_sample)));
-            let stop = Arc::new(AtomicBool::new(false));
-            let appsink_for_pull = appsink.clone();
-            let slot_for_pull = latest_sample.clone();
-            let stop_for_pull = stop.clone();
-            let clip_basename = clip
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?")
-                .to_string();
+            // (i) Spawn pull thread.
+            let appsink_for_pull = me.appsink.clone();
+            let slot_for_pull = me.latest_sample.clone();
+            let stop_for_pull = me.stop.clone();
             let thread_name = format!("blendr-gst-pull-{clip_basename}");
             let pull_thread = thread::Builder::new()
                 .name(thread_name)
                 .spawn(move || pull_loop(appsink_for_pull, slot_for_pull, stop_for_pull))
                 .context("spawn pull thread")?;
+            me.pull_thread = Some(pull_thread);
 
-            Ok(GstDecoder {
-                pipeline,
-                appsink,
-                latest_sample,
-                stop,
-                pull_thread: Some(pull_thread),
-                current_frame: None,
-                // Updated on first adopt_sample (which queries the
-                // GLMemory's actual texture_target).
-                tex_target: TexTarget::TwoD,
-                last_pts_ns: None,
-                clip_basename,
-                gst_display,
-                gst_context,
-            })
+            Ok(me)
         }
 
-        /// Take the latest sample from the slot and map it to a
-        /// GL texture id. Non-blocking: returns Ok(None) only if
-        /// no sample has ever arrived (shouldn't happen after
-        /// new() blocks on the first one). If no NEW sample is
-        /// in the slot, reuses the previously-mapped current_frame.
-        ///
-        /// MUST be called on a thread with blendr's EGL current
-        /// (the present/main thread). GLVideoFrame::from_buffer_
-        /// readable does GL work on the calling thread.
+        /// Append a new sub-bin (same clip) to concat. cutloop's
+        /// add_next_clip ported to Rust. Called at init for
+        /// pre-queue + by process_pending() on each EOS.
+        fn add_next_clip(&mut self) -> Result<()> {
+            let serial = self.serial_counter.fetch_add(1, Ordering::Relaxed);
+
+            let sub = gst::Bin::with_name(&format!("sub_{serial}"));
+            let filesrc = gst::ElementFactory::make("filesrc")
+                .property("location", self.clip_path.to_str().ok_or_else(|| {
+                    anyhow!("clip path not UTF-8: {}", self.clip_path.display())
+                })?)
+                .build()
+                .with_context(|| format!("make filesrc [{serial}]"))?;
+            let qtdemux = gst::ElementFactory::make("qtdemux")
+                .build()
+                .with_context(|| format!("make qtdemux [{serial}]"))?;
+            let h264parse = gst::ElementFactory::make("h264parse")
+                .property("config-interval", -1i32)
+                .build()
+                .with_context(|| format!("make h264parse [{serial}]"))?;
+            sub.add_many([&filesrc, &qtdemux, &h264parse])
+                .with_context(|| format!("sub.add_many [{serial}]"))?;
+            filesrc
+                .link(&qtdemux)
+                .with_context(|| format!("link filesrc->qtdemux [{serial}]"))?;
+
+            // qtdemux pad-added: link to h264parse.sink
+            // (mirrors cutloop:236-244). Store the handler id
+            // so retire can disconnect; cutloop showed without
+            // disconnect the closure leaks the sub-bin.
+            let h264parse_for_pad = h264parse.clone();
+            let pad_added_id = qtdemux.connect_pad_added(move |_demux, pad| {
+                let caps = pad.current_caps().or_else(|| Some(pad.query_caps(None)));
+                let caps_str = caps.map(|c| c.to_string()).unwrap_or_default();
+                if !caps_str.starts_with("video/") {
+                    return;
+                }
+                let sink_pad = match h264parse_for_pad.static_pad("sink") {
+                    Some(p) => p,
+                    None => return,
+                };
+                if sink_pad.is_linked() {
+                    return;
+                }
+                if let Err(e) = pad.link(&sink_pad) {
+                    log::warn!(
+                        "[gst-cl] qtdemux pad link to h264parse failed: {e:?}"
+                    );
+                }
+            });
+
+            // Ghost h264parse.src up to sub.src.
+            let h264_src = h264parse.static_pad("src").ok_or_else(|| {
+                anyhow!("h264parse has no src pad [{serial}]")
+            })?;
+            let ghost = gst::GhostPad::with_target(&h264_src)
+                .with_context(|| format!("GhostPad::with_target [{serial}]"))?;
+            sub.add_pad(&ghost)
+                .with_context(|| format!("sub.add_pad [{serial}]"))?;
+
+            self.pipeline
+                .add(&sub)
+                .with_context(|| format!("pipeline.add(sub) [{serial}]"))?;
+
+            let concat_sink = self
+                .concat
+                .request_pad_simple("sink_%u")
+                .ok_or_else(|| anyhow!("concat.request_pad_simple [{serial}]"))?;
+            ghost
+                .link(&concat_sink)
+                .map_err(|e| anyhow!("ghost->concat link [{serial}]: {e:?}"))?;
+
+            // EOS probe on the CONCAT SINK PAD (not on the sub-
+            // bin ghost; cutloop:275-303). When concat switches
+            // AWAY from this pad to the next pending sink, the
+            // absorbed EOS flows through this pad and we fire.
+            // The probe sends commands to the channel; the
+            // present thread processes via process_pending().
+            let tx_for_probe = self.pipe_cmd_tx.clone();
+            let serial_for_probe = serial;
+            let basename_for_probe = self.clip_basename.clone();
+            let probe_id = concat_sink.add_probe(
+                gst::PadProbeType::EVENT_DOWNSTREAM,
+                move |_pad, info| {
+                    if let Some(gst::PadProbeData::Event(ev)) = info.data.as_ref() {
+                        if ev.type_() == gst::EventType::Eos {
+                            log::info!(
+                                "[gst-cl] {basename_for_probe} concat-sink EOS \
+                                 serial={serial_for_probe} -> queue add+retire"
+                            );
+                            let _ = tx_for_probe.send(PipelineCmd::AddNextClip);
+                            let _ = tx_for_probe.send(PipelineCmd::Retire(serial_for_probe));
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
+
+            sub.sync_state_with_parent()
+                .with_context(|| format!("sub.sync_state [{serial}]"))?;
+
+            let depth = {
+                let mut q = self.sub_bins.lock().unwrap();
+                q.push_back(SubBin {
+                    serial,
+                    bin: sub,
+                    qtdemux,
+                    pad_added_id: Some(pad_added_id),
+                    concat_sink,
+                    // probe_id is already Option<PadProbeId> in
+                    // gst-rs 0.23 (add_probe returns Option for
+                    // failure cases).
+                    probe_id,
+                });
+                q.len()
+            };
+            log::info!(
+                "[gst-cl] {} added sub-bin serial={serial} (queue_depth={depth})",
+                self.clip_basename
+            );
+            Ok(())
+        }
+
+        /// Tear down the sub-bin with the matching serial.
+        /// Disconnect handler + remove probe FIRST (releases
+        /// closures), then NULL + remove + release concat pad
+        /// (cutloop's proven leak-safe order, :314-379).
+        fn retire_subgraph(&mut self, serial: u64) -> Result<()> {
+            // VecDeque::remove(idx) returns Option<SubBin>; unwrap to
+            // the inner struct or bail if not found.
+            let mut sub_bin: SubBin = {
+                let mut q = self.sub_bins.lock().unwrap();
+                match q.iter().position(|s| s.serial == serial) {
+                    Some(idx) => q.remove(idx).expect("position found ensures Some"),
+                    None => {
+                        log::warn!(
+                            "[gst-cl] {} retire serial={serial} not found",
+                            self.clip_basename
+                        );
+                        return Ok(());
+                    }
+                }
+            };
+            if let Some(id) = sub_bin.pad_added_id.take() {
+                sub_bin.qtdemux.disconnect(id);
+            }
+            // probe_id may already have been consumed by remove_probe
+            // returning Some; take() to be safe.
+            let probe_owned = sub_bin.probe_id.take();
+            if let Some(pid) = probe_owned {
+                sub_bin.concat_sink.remove_probe(pid);
+            }
+            let _ = sub_bin.bin.set_state(gst::State::Null);
+            let _ = self.pipeline.remove(&sub_bin.bin);
+            self.concat.release_request_pad(&sub_bin.concat_sink);
+            log::info!(
+                "[gst-cl] {} retired serial={serial}",
+                self.clip_basename
+            );
+            Ok(())
+        }
+
+        /// Drain pending pipeline commands from EOS probes.
+        /// Called by kms::run_loop per iteration on the present
+        /// thread (where pipeline mutations happen safely;
+        /// cutloop's GLib.idle_add equivalent).
+        pub fn process_pending(&mut self) -> Result<()> {
+            while let Ok(cmd) = self.pipe_cmd_rx.try_recv() {
+                match cmd {
+                    PipelineCmd::AddNextClip => {
+                        if let Err(e) = self.add_next_clip() {
+                            log::warn!(
+                                "[gst-cl] {} add_next_clip failed: {e:#}",
+                                self.clip_basename
+                            );
+                        }
+                    }
+                    PipelineCmd::Retire(serial) => {
+                        if let Err(e) = self.retire_subgraph(serial) {
+                            log::warn!(
+                                "[gst-cl] {} retire serial={serial} failed: {e:#}",
+                                self.clip_basename
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        /// Take latest sample (if any) and map to GL texture id.
+        /// If no new sample, reuse cached current_frame.
         pub fn latest_texture(&mut self) -> Result<Option<(u32, TexTarget)>> {
             let new_sample = {
                 let mut guard = self.latest_sample.lock().map_err(|p| {
@@ -554,45 +643,24 @@ mod linux {
                 let tex_id = self.adopt_sample(sample)?;
                 return Ok(Some((tex_id, self.tex_target)));
             }
-            // No new sample this tick. Reuse the cached frame
-            // (its GLMemory ref is still alive in current_frame).
             if let Some(frame) = self.current_frame.as_ref() {
                 let tex_id = frame
                     .texture_id(0)
                     .map_err(|e| anyhow!("cached texture_id: {e:?}"))?;
                 return Ok(Some((tex_id, self.tex_target)));
             }
-            // Pre-first-sample window (pull thread hasn't seeded
-            // yet AND new() didn't seed -- shouldn't happen, but
-            // defensive). Caller draws black for this frame.
             Ok(None)
         }
 
-        /// Map a sample to a GLVideoFrame + extract its texture
-        /// id. Updates self.tex_target from the queried
-        /// GLMemory target (vc4 returns ExternalOes even under
-        /// RGBA caps). Replaces self.current_frame, dropping the
-        /// previous mapping AFTER the new one is bound.
-        ///
-        /// GL ops happen here; caller must hold blendr's EGL
-        /// current.
         fn adopt_sample(&mut self, sample: gst::Sample) -> Result<u32> {
             let buffer = sample
                 .buffer_owned()
                 .ok_or_else(|| anyhow!("sample has no buffer"))?;
-            // BUG A: cache PTS BEFORE moving buffer into
-            // from_buffer_readable. Read by kms tick log so QA
-            // can confirm motion headlessly.
             self.last_pts_ns = buffer.pts().map(|t| t.nseconds());
             let caps = sample
                 .caps()
                 .ok_or_else(|| anyhow!("sample has no caps"))?;
 
-            // Query the actual GL texture target from the
-            // underlying GLMemory BEFORE moving the buffer into
-            // from_buffer_readable. On vc4 this is always
-            // ExternalOes regardless of caps; on other hardware
-            // it follows the caps-negotiated layout.
             let queried_target = buffer
                 .peek_memory(0)
                 .downcast_memory_ref::<gst_gl::GLMemory>()
@@ -604,14 +672,13 @@ mod linux {
             };
             if self.current_frame.is_none() {
                 log::info!(
-                    "[gst] tex_target query: glmemory_actual={:?} \
-                     -> routing draw path to {:?}",
-                    queried_target, real_tex_target
+                    "[gst] {} tex_target query: glmemory_actual={:?} -> {:?}",
+                    self.clip_basename, queried_target, real_tex_target
                 );
             } else if real_tex_target != self.tex_target {
                 log::warn!(
-                    "[gst] tex_target CHANGED mid-stream: was {:?} now {:?}",
-                    self.tex_target, real_tex_target
+                    "[gst] {} tex_target CHANGED mid-stream: was {:?} now {:?}",
+                    self.clip_basename, self.tex_target, real_tex_target
                 );
             }
             self.tex_target = real_tex_target;
@@ -622,23 +689,17 @@ mod linux {
                 gst_gl::GLVideoFrame::from_buffer_readable(buffer, &video_info)
                     .map_err(|_| {
                         anyhow!(
-                            "GLVideoFrame::from_buffer_readable failed \
-                             (sample is not GLMemory? caps mismatch?)"
+                            "GLVideoFrame::from_buffer_readable failed"
                         )
                     })?;
             let tex_id = new_frame.texture_id(0).map_err(|e| {
                 anyhow!("GLVideoFrame::texture_id(0): {e:?}")
             })?;
-            // Assignment drops the previous current_frame AFTER
-            // new_frame has its replacement seat -- no
-            // zero-textures-in-flight moment.
             self.current_frame = Some(new_frame);
             Ok(tex_id)
         }
     }
 
-    /// Pull thread loop. Polls appsink and atomically replaces
-    /// the shared latest-sample slot. Exits when `stop` is set.
     fn pull_loop(
         appsink: gst_app::AppSink,
         slot: Arc<Mutex<Option<gst::Sample>>>,
@@ -646,36 +707,24 @@ mod linux {
     ) {
         log::info!("[gst-pull] thread up");
         while !stop.load(Ordering::Relaxed) {
-            // Block briefly so we don't busy-spin. Sample is
-            // non-GL data (gst::Buffer ref + caps); no GL ops
-            // here.
             let sample =
                 appsink.try_pull_sample(gst::ClockTime::from_mseconds(PULL_TICK_MS));
             if let Some(s) = sample {
-                // Replace the slot. The OLD sample (if any) is
-                // dropped here -- its gst::Buffer ref + GLMemory
-                // ref drop unless another holder (current_frame
-                // on main) still references it. The mutex is
-                // held for microseconds.
                 if let Ok(mut g) = slot.lock() {
                     *g = Some(s);
                 }
             }
-            // Pull miss = no new frame this tick; keep looping.
         }
         log::info!("[gst-pull] stop flag set; exiting");
     }
 
     impl Drop for GstDecoder {
         fn drop(&mut self) {
-            // BUG B: step-by-step log so the next QA run names
-            // the EXACT blocking call when --capture wedges
-            // teardown. Old release_video_bindings fix didn't
-            // help; we need step-localization to know whether
-            // pull-thread JOIN, GLMemory unmap (slot or
-            // current_frame), set_state(NULL), state-wait, or
-            // bus unset is the actual deadlock.
-            let name = &self.clip_basename;
+            // BUG B step-localization preserved. New steps for
+            // sub-bin retire (concat path).
+            // Clone basename out so the later self.retire_subgraph
+            // calls don't borrow-conflict with the log strings.
+            let name = self.clip_basename.clone();
 
             log::info!("[gst-drop] {name} step=1 set stop flag");
             self.stop.store(true, Ordering::Relaxed);
@@ -686,9 +735,6 @@ mod linux {
             }
             log::info!("[gst-drop] {name} step=3 joined; clearing slot");
 
-            // Pipeline still PLAYING here, so the buffer's
-            // GLMemory unref + unmap are well-defined; gst-gl
-            // context tracking is still alive.
             if let Ok(mut g) = self.latest_sample.lock() {
                 *g = None;
             }
@@ -698,23 +744,34 @@ mod linux {
 
             self.current_frame = None;
             log::info!(
-                "[gst-drop] {name} step=5 current_frame cleared; set_state(NULL)"
+                "[gst-drop] {name} step=5 current_frame cleared; retiring sub-bins"
             );
 
-            // NULL the pipeline + WAIT for the transition to
-            // settle. By this point we hold ZERO GLMemory refs
-            // into the pipeline, so glupload's finalize can
-            // release its GLBufferPool cleanly.
+            // Retire all sub-bins (disconnect handlers + remove
+            // probes + NULL each + release concat pads). Drains
+            // the deque.
+            let serials: Vec<u64> = self
+                .sub_bins
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.serial)
+                .collect();
+            for s in serials {
+                let _ = self.retire_subgraph(s);
+            }
+            log::info!(
+                "[gst-drop] {name} step=6 sub-bins retired; set_state(NULL)"
+            );
+
             let _ = self.pipeline.set_state(gst::State::Null);
             log::info!(
-                "[gst-drop] {name} step=6 set_state(NULL) returned; \
-                 awaiting transition"
+                "[gst-drop] {name} step=7 set_state(NULL) returned; awaiting transition"
             );
             let (_res, cur, _pending) =
                 self.pipeline.state(gst::ClockTime::from_seconds(5));
             log::info!(
-                "[gst-drop] {name} step=7 state-wait done cur={cur:?}; \
-                 unsetting bus"
+                "[gst-drop] {name} step=8 state-wait done cur={cur:?}; unsetting bus"
             );
             if cur != gst::State::Null {
                 log::warn!(
@@ -725,7 +782,7 @@ mod linux {
             if let Some(bus) = self.pipeline.bus() {
                 bus.unset_sync_handler();
             }
-            log::info!("[gst-drop] {name} step=8 bus unset; Drop returning");
+            log::info!("[gst-drop] {name} step=9 bus unset; Drop returning");
         }
     }
 }
