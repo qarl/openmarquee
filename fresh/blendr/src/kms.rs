@@ -219,14 +219,34 @@ impl Streams {
                 };
                 let retire_slot = 1 - visible_slot;
 
-                // --- Step 2: retire (Drop the old decoder).
-                //     BUG 3 sequence runs inside GstDecoder::Drop;
-                //     state(5s)-wait IS the V4L2 STREAMOFF barrier
-                //     that prevents MMAL slot leak.
-                slots[retire_slot] = None;
+                // --- Step 2: retire (Drop the old decoder) on
+                //     a WORKER THREAD per QA #2 fix. The Drop
+                //     sequence (stop pull + join + clear refs +
+                //     FlushStart + NULL + state(5s) wait + bus
+                //     unset) takes ~50-300ms typical, ~5s worst.
+                //     Off-thread = present thread doesn't block.
+                //     Worker is short-lived; spawns once per
+                //     retire boundary (rate-limited to ~once per
+                //     hold_sec, default 20s).
+                let taken = slots[retire_slot].take();
+                if let Some(old) = taken {
+                    let label = format!("retire-slot{retire_slot}");
+                    let _ = std::thread::Builder::new()
+                        .name(label.clone())
+                        .spawn(move || {
+                            // GstDecoder::Drop runs here on the
+                            // worker. All the BUG 3/4/C
+                            // teardown machinery runs as before;
+                            // present thread doesn't wait.
+                            drop(old);
+                        });
+                    log::info!(
+                        "[cycle] retire slot={retire_slot} -> worker thread '{label}'"
+                    );
+                }
                 let retire_ms = t_retire.elapsed().as_millis();
                 log::info!(
-                    "[cycle] retire slot={retire_slot} done elapsed_ms={retire_ms}"
+                    "[cycle] retire slot={retire_slot} present-thread elapsed_ms={retire_ms} (Drop deferred to worker)"
                 );
 
                 // --- Step 3: log + create new decoder.

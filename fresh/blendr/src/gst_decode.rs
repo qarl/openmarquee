@@ -96,8 +96,9 @@ mod linux {
 
     /// Pull-thread tick.
     const PULL_TICK_MS: u64 = 33;
-    /// First-sample wait at construction.
-    const FIRST_SAMPLE_TIMEOUT_S: u64 = 5;
+    // FIRST_SAMPLE_TIMEOUT_S removed per QA #2 fix -- the first
+    // sample is no longer awaited at construction (pull thread
+    // populates latest_sample whenever it arrives).
     /// Always pre-queue this many sub-bins so concat never runs dry.
     const INITIAL_QUEUE_DEPTH: usize = 2;
 
@@ -484,18 +485,29 @@ mod linux {
             }
             log::info!("[gst] PLAYING confirmed; concat add-next looping armed");
 
-            // (h) Block on first sample to seed the slot.
-            let first_sample = me
-                .appsink
-                .try_pull_sample(gst::ClockTime::from_seconds(FIRST_SAMPLE_TIMEOUT_S))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "first sample timed out ({FIRST_SAMPLE_TIMEOUT_S}s); \
-                         pipeline PLAYING but no buffer delivered"
-                    )
-                })?;
-            *me.latest_sample.lock().unwrap() = Some(first_sample);
-            log::info!("[gst] first sample seeded [{clip_basename}]; spawning pull thread");
+            // (h) DEFERRED first-sample wait per QA #2 fix.
+            //     Old: blocking try_pull_sample(5s) here was
+            //     the dominant cost in mid-run recreate (per QA
+            //     journal: create_ms 139-771ms, mostly this
+            //     wait). Now we just spawn the pull thread; it
+            //     populates latest_sample whenever the first
+            //     sample arrives naturally.
+            //
+            //     latest_texture() returns Ok(None) until the
+            //     first sample lands; in Streams::Cycle that's
+            //     fine because recreate happens during HoldingX
+            //     when the OTHER slot is visible. By the time
+            //     the next FadingX needs this slot, samples are
+            //     flowing (~50-500ms after PLAYING typical).
+            //
+            //     For startup (main.rs's initial decoders): the
+            //     first few render-loop frames may have no
+            //     video; black-clear shown briefly. Bounded;
+            //     once per process startup.
+            log::info!(
+                "[gst] [{clip_basename}] first-sample wait DEFERRED; \
+                 spawning pull thread"
+            );
 
             // (i) Spawn pull thread.
             let appsink_for_pull = me.appsink.clone();
