@@ -371,6 +371,19 @@ pub struct FrameStats {
     /// log has begin/end markers per flash rather than one
     /// line per black frame.
     last_outcome: Option<crate::gles_present::DrawOutcome>,
+    /// Content-black detector (QA pivot 2 after the None-
+    /// detector returned 0 with qarl confirming flash still
+    /// visible). Counts frames whose sampled back-buffer
+    /// pixels were uniformly near-zero -- a "real frame whose
+    /// content is black" (e.g. V4L2/vc4 placeholder, concat
+    /// seam, program-switch artifact). Only populated when
+    /// --black-detect-content is on; in production both
+    /// counters stay 0.
+    cum_content_black_count: u64,
+    window_content_black_count: u64,
+    /// Last frame's content-black state for streak BEGIN/END
+    /// logging on transition.
+    last_content_black: bool,
     /// Wall-clock at the previous frame's end. None on first
     /// frame (no delta to compute).
     last_present_end: Option<std::time::Instant>,
@@ -396,6 +409,9 @@ impl FrameStats {
             cum_black_count: 0,
             window_black_count: 0,
             last_outcome: None,
+            cum_content_black_count: 0,
+            window_content_black_count: 0,
+            last_content_black: false,
             last_present_end: None,
             last_summary_at: now,
             run_start: now,
@@ -406,7 +422,9 @@ impl FrameStats {
     /// possibly 1 increment. Logs an outlier line if
     /// frame_ms > LONG_FRAME_MS. Logs a [black] line on
     /// streak begin/end (transition from Drew to Black or
-    /// vice versa). Maybe emits a 30s summary.
+    /// vice versa). Logs a [black-content] line on
+    /// content-black streak transitions when the flag is on.
+    /// Maybe emits a 30s summary.
     pub fn record(
         &mut self,
         frame_ms: f32,
@@ -414,6 +432,7 @@ impl FrameStats {
         frame_idx: u64,
         streams: &Streams,
         draw_outcome: crate::gles_present::DrawOutcome,
+        content_black: bool,
     ) {
         use crate::gles_present::DrawOutcome;
         self.cum_frame_ms.push(frame_ms);
@@ -474,12 +493,41 @@ impl FrameStats {
             );
         }
         self.last_outcome = Some(draw_outcome);
+        // --- Content-black detector ---
+        // content_black is only meaningful when the caller
+        // ran the glReadPixels sample (gated by
+        // --black-detect-content). In production it's always
+        // false -> zero counters, zero log lines.
+        if content_black {
+            self.cum_content_black_count += 1;
+            self.window_content_black_count += 1;
+        }
+        if content_black && !self.last_content_black {
+            let ctx = streams.outlier_context();
+            log::warn!(
+                "[black-content] BEGIN frame={frame_idx} phase={} cycle={} \
+                 flags=[{}] ms_since_last_cycle_event={:?}",
+                ctx.phase_str,
+                ctx.cycle,
+                ctx.flags,
+                ctx.ms_since_cycle_event,
+            );
+        } else if !content_black && self.last_content_black {
+            let ctx = streams.outlier_context();
+            log::warn!(
+                "[black-content] END frame={frame_idx} phase={} cycle={}",
+                ctx.phase_str,
+                ctx.cycle,
+            );
+        }
+        self.last_content_black = content_black;
         if self.last_summary_at.elapsed().as_secs() >= SUMMARY_INTERVAL_S {
             self.emit_window_summary();
             self.last_summary_at = std::time::Instant::now();
             self.window_start_idx = self.cum_frame_ms.len();
             self.window_long_count = 0;
             self.window_black_count = 0;
+            self.window_content_black_count = 0;
         }
     }
 
@@ -494,17 +542,22 @@ impl FrameStats {
         let win_sec = self.last_summary_at.elapsed().as_secs_f32().max(0.001);
         let long_per_min = (self.window_long_count as f32 / win_sec) * 60.0;
         let black_per_min = (self.window_black_count as f32 / win_sec) * 60.0;
+        let content_black_per_min =
+            (self.window_content_black_count as f32 / win_sec) * 60.0;
         log::info!(
             "[frame-stats] window={SUMMARY_INTERVAL_S}s frames={} mean={mean_f:.2}ms \
              p50={p50_f:.2} p99={p99_f:.2} p999={p999_f:.2} max={max_f:.2} \
              long(>{LONG_FRAME_MS:.0}ms)={} (K/min={:.1}) \
              black_draws={} (B/min={:.1}) \
+             content_black={} (CB/min={:.1}) \
              render_mean={mean_r:.2}ms render_max={max_r:.2}ms",
             win_frame.len(),
             self.window_long_count,
             long_per_min,
             self.window_black_count,
             black_per_min,
+            self.window_content_black_count,
+            content_black_per_min,
         );
     }
 
@@ -519,17 +572,22 @@ impl FrameStats {
         let run_sec = self.run_start.elapsed().as_secs_f32().max(0.001);
         let long_per_min = (self.cum_long_count as f32 / run_sec) * 60.0;
         let black_per_min = (self.cum_black_count as f32 / run_sec) * 60.0;
+        let content_black_per_min =
+            (self.cum_content_black_count as f32 / run_sec) * 60.0;
         log::info!(
             "[frame-stats] FINAL run={run_sec:.1}s frames={} mean={mean_f:.2}ms \
              p50={p50_f:.2} p99={p99_f:.2} p999={p999_f:.2} max={max_f:.2} \
              long(>{LONG_FRAME_MS:.0}ms)={} (K/min={:.1}) \
              black_draws={} (B/min={:.1}) \
+             content_black={} (CB/min={:.1}) \
              render_mean={mean_r:.2}ms render_max={max_r:.2}ms",
             self.cum_frame_ms.len(),
             self.cum_long_count,
             long_per_min,
             self.cum_black_count,
             black_per_min,
+            self.cum_content_black_count,
+            content_black_per_min,
         );
     }
 
@@ -724,6 +782,7 @@ mod stub {
         _: u64,
         _: Option<&std::path::Path>,
         _: u64,
+        _: bool,
         _: &std::sync::atomic::AtomicBool,
     ) -> Result<()> {
         anyhow::bail!("KMS stub: Linux only")
@@ -900,8 +959,16 @@ mod linux {
         duration_sec: u64,
         capture_path: Option<&std::path::Path>,
         capture_after_frame: u64,
+        black_detect_content: bool,
         exit_flag: &AtomicBool,
     ) -> Result<()> {
+        if black_detect_content {
+            log::warn!(
+                "[blendr] --black-detect-content ENABLED: per-frame \
+                 glReadPixels (sync) -- expect render_ms regression, \
+                 do not soak in production"
+            );
+        }
         // We have to keep the master lock alive across the whole
         // loop. acquire here (probe released its own briefly); on
         // EBUSY emit the remediation hint.
@@ -1091,6 +1158,26 @@ mod linux {
                     .draw_frame(frame_idx)
                     .with_context(|| format!("draw_frame {frame_idx}"))?;
 
+                // Content-black detector (flag-gated; sync FFI).
+                // Probe the back buffer only when the None-detector
+                // didn't already classify the frame as Black -- a
+                // None-classified frame is already a confirmed
+                // black-cause; no need to spend the readback.
+                let content_black = if black_detect_content
+                    && matches!(
+                        draw_outcome,
+                        crate::gles_present::DrawOutcome::Drew
+                    )
+                {
+                    presenter
+                        .sample_back_buffer_is_near_black()
+                        .with_context(|| {
+                            format!("sample_back_buffer {frame_idx}")
+                        })?
+                } else {
+                    false
+                };
+
                 // One-shot capture BEFORE swap_buffers so we read
                 // the just-drawn back buffer. Capture is
                 // non-destructive: render loop continues after.
@@ -1177,6 +1264,7 @@ mod linux {
                         frame_idx,
                         &*streams,
                         draw_outcome,
+                        content_black,
                     );
                 }
 

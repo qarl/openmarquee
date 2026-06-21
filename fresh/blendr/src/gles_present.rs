@@ -76,6 +76,9 @@ mod stub {
         pub fn capture_back_buffer_ppm(&self, _path: &std::path::Path) -> Result<()> {
             anyhow::bail!("capture stub: Linux only")
         }
+        pub fn sample_back_buffer_is_near_black(&self) -> Result<bool> {
+            anyhow::bail!("sample stub: Linux only")
+        }
         pub fn set_video_texture(
             &mut self,
             _tex_id: u32,
@@ -895,6 +898,83 @@ mod linux {
         /// PPM is chosen over PNG for zero new deps; QA converts
         /// with `magick foo.ppm foo.png` or
         /// `ffmpeg -i foo.ppm foo.png`.
+        /// Content-level black detector (QA pivot after the
+        /// None-detector returned 0 black_draws while qarl
+        /// reports the flash still visible). Sample a small
+        /// region of the back buffer via glReadPixels; report
+        /// whether every sampled channel is near-zero.
+        ///
+        /// Hypothesis being tested: the recreated slot's FIRST
+        /// current_frame is a black frame (V4L2/vc4 placeholder
+        /// or concat seam buffer). The None-detector sees
+        /// Some(frame); a content read sees the actual pixels
+        /// rendered.
+        ///
+        /// CALLER MUST GATE THIS BEHIND --black-detect-content:
+        /// glReadPixels is a SYNCHRONOUS GL queue flush (waits
+        /// for the GPU to finish all queued work + DMA-readback
+        /// from the back buffer); per-frame in production would
+        /// regress render_ms. Only call during diagnostic soaks.
+        ///
+        /// Sample: center NxN region of the back buffer
+        /// (default 16x16 = 256 pixels = 1024 bytes RGBA).
+        /// Tests R, G, B (alpha ignored) against
+        /// NEAR_BLACK_THRESHOLD = 8 (out of 255). Returns true
+        /// iff ALL sampled pixels' R+G+B channels are <=
+        /// threshold (i.e. uniformly near-black; a black FRAME,
+        /// not a black PIXEL in a normal image).
+        ///
+        /// CAVEAT for QA: clips with genuinely dark CENTERS
+        /// (a fade-to-black source, a letterboxed shot framed
+        /// on a dark subject) will register as content-black.
+        /// For unambiguous results, choose test clips that are
+        /// bright-in-the-middle, OR sample multiple non-center
+        /// regions and require all of them to be near-black
+        /// before flagging.
+        ///
+        /// Cost when enabled: glReadPixels of 16*16*4 = 1KB
+        /// (plus the full pipeline flush). Typical 1-5ms on
+        /// vc4 depending on queue depth.
+        pub fn sample_back_buffer_is_near_black(&self) -> Result<bool> {
+            const SAMPLE_SIDE: i32 = 16;
+            const NEAR_BLACK_THRESHOLD: u8 = 8;
+            // Center region: clamp in case the surface is
+            // smaller than SAMPLE_SIDE (degenerate; not on FYS).
+            let cx = (self.w / 2 - SAMPLE_SIDE / 2).max(0);
+            let cy = (self.h / 2 - SAMPLE_SIDE / 2).max(0);
+            let sw = SAMPLE_SIDE.min(self.w);
+            let sh = SAMPLE_SIDE.min(self.h);
+            let mut rgba = vec![0u8; (sw * sh * 4) as usize];
+            unsafe {
+                // SAFETY: GLES2 context current. Buffer sized
+                // exactly to the requested region.
+                self.gl.read_pixels(
+                    cx, cy, sw, sh,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(&mut rgba),
+                );
+                let err = self.gl.get_error();
+                if err != glow::NO_ERROR {
+                    return Err(anyhow!(
+                        "sample_back_buffer glReadPixels glGetError={err:#x}"
+                    ));
+                }
+            }
+            // All-near-black iff every R/G/B byte <= threshold.
+            // (Alpha is don't-care: our clear sets alpha=1.0 but
+            // a real-content black pixel would too; we compare
+            // luma only.)
+            let near_black = rgba
+                .chunks_exact(4)
+                .all(|px| {
+                    px[0] <= NEAR_BLACK_THRESHOLD
+                        && px[1] <= NEAR_BLACK_THRESHOLD
+                        && px[2] <= NEAR_BLACK_THRESHOLD
+                });
+            Ok(near_black)
+        }
+
         pub fn capture_back_buffer_ppm(
             &self,
             path: &std::path::Path,

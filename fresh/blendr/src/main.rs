@@ -123,6 +123,22 @@ struct Args {
     /// have settled.
     #[arg(long, default_value_t = 30)]
     capture_after_frame: u64,
+
+    /// Diagnostic content-level black-flash detector. When set,
+    /// after each draw and BEFORE swap_buffers the renderer does
+    /// a small (16x16 center) glReadPixels and tests whether
+    /// the sampled pixels are uniformly near-zero -- a "real
+    /// frame whose pixels are black" (e.g. V4L2/vc4 decoder
+    /// placeholder, concat seam buffer). Surfaces
+    /// [black-content] BEGIN/END log lines + counter in
+    /// frame-stats summary.
+    ///
+    /// PROD-OFF by default: glReadPixels is a SYNCHRONOUS GL
+    /// queue flush + DMA readback (~1-5ms on vc4). Per-frame
+    /// would regress render_ms. Only enable during diagnostic
+    /// soaks.
+    #[arg(long, default_value_t = false)]
+    black_detect_content: bool,
 }
 
 fn main() -> Result<()> {
@@ -275,6 +291,7 @@ fn run(args: Args) -> Result<()> {
         args.duration_sec,
         args.capture.as_deref(),
         args.capture_after_frame,
+        args.black_detect_content,
         &signals::EXIT_REQUESTED,
     );
 
