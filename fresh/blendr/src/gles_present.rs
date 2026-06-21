@@ -326,6 +326,22 @@ mod linux {
                     );
                 }
             }
+            // #3 fast-path uses prog_ext for constant-alpha holds
+            // (alpha ~= 0 or ~= 1). Compile it eagerly here too --
+            // on vc4 both targets are always External, and a fresh
+            // SlideshowState starts in HoldingA (alpha=0) so the
+            // very first Blend frame hits the fast-path. (Lazy-on-
+            // first-fast-path would error frame 0; #3 regression.)
+            if (a.1 == crate::gst_decode::TexTarget::External
+                || b.1 == crate::gst_decode::TexTarget::External)
+                && self.prog_ext.is_none()
+            {
+                if let Err(e) = self.compile_ext_program() {
+                    log::error!(
+                        "[gl] failed to compile external-OES program: {e:#}"
+                    );
+                }
+            }
         }
 
         fn compile_blend_program(&mut self) -> Result<()> {
