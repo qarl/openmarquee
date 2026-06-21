@@ -74,6 +74,9 @@ mod stub {
         pub fn latest_texture(&mut self) -> Result<Option<(u32, TexTarget)>> {
             anyhow::bail!("GstDecoder: Linux only")
         }
+        pub fn last_pts_ns(&self) -> Option<u64> {
+            None
+        }
     }
 }
 
@@ -132,6 +135,15 @@ mod linux {
         /// kms::run_loop reads this AFTER `latest_texture()` to
         /// route the draw to the matching shader.
         pub tex_target: TexTarget,
+        /// BUG A debug: PTS (nanoseconds) of the most-recently
+        /// adopted sample. kms::run_loop reads via
+        /// `last_pts_ns()` for per-tick motion logging so QA can
+        /// confirm headlessly that a clip is ACTUALLY ADVANCING
+        /// (not just the alpha animating against a frozen frame).
+        last_pts_ns: Option<u64>,
+        /// Short basename for log lines (Drop step localization
+        /// per BUG B, PTS logging per BUG A). Set once at new().
+        clip_basename: String,
         /// Held to extend lifetime past pipeline drop ordering;
         /// pipeline holds an internal ref via set_context, but
         /// we keep clones so the Drop order doesn't free them
@@ -140,6 +152,15 @@ mod linux {
         gst_display: gst_gl::GLDisplay,
         #[allow(dead_code)]
         gst_context: gst_gl::GLContext,
+    }
+
+    impl GstDecoder {
+        /// BUG A: last sample's PTS in nanoseconds. None if no
+        /// sample seen yet or the buffer had no PTS. Read per
+        /// [kms] tick so QA can confirm motion headlessly.
+        pub fn last_pts_ns(&self) -> Option<u64> {
+            self.last_pts_ns
+        }
     }
 
     impl GstDecoder {
@@ -288,7 +309,22 @@ mod linux {
             appsink.set_caps(Some(&caps_rgba));
             appsink.set_max_buffers(2);
             appsink.set_drop(true);
-            appsink.set_sync(false);
+            // BUG A fix: sync=TRUE paces the decoder against
+            // the pipeline clock so playback runs at the clip's
+            // native frame rate (~24fps for our content) instead
+            // of racing through at decoder-max-speed (~3.4x too
+            // fast was qarl's glass observation). With sync=true
+            // a 4.75s clip plays in 4.75s, EOS-triggered seek-
+            // to-0 fires once per natural duration, and motion
+            // is real-time.
+            //
+            // Caveat: sync=true means try_pull_sample blocks
+            // briefly waiting for the next buffer's PTS instead
+            // of returning immediately. The 33ms pull tick is
+            // larger than 1/60s (frame interval) so this is
+            // fine; samples accumulate in the slot when present
+            // misses a tick.
+            appsink.set_sync(true);
             appsink.set_property("emit-signals", false);
 
             // (d) Install SYNC bus handler for NEED_CONTEXT +
@@ -378,20 +414,26 @@ mod linux {
                         // Phase 3 v1 per-decoder loop: clip
                         // EOS'd -> seek to 0 + keep playing.
                         // FLUSH causes a brief gap (~ms) at the
-                        // loop point; acceptable per QA's gate
-                        // (steady tick cadence; small loop-
-                        // boundary hitches are not stalls).
-                        // KEY_UNIT snaps to nearest keyframe
-                        // (always frame 0 for these short
-                        // clips). The seek is async; gst
+                        // loop point; KEY_UNIT snaps to nearest
+                        // keyframe. The seek is async; gst
                         // delivers more samples shortly after.
-                        log::info!(
-                            "[gst-bus] EOS src={src_name} -- seek-to-0 \
-                             for Phase 3 loop"
-                        );
-                        let _ = pipeline_for_bus.seek_simple(
+                        //
+                        // BUG A: log the seek RESULT so we know
+                        // if it silently failed. Old code did
+                        // `let _ = pipeline_for_bus.seek_simple(...)`
+                        // which swallowed Err/Ok(false). QA's
+                        // glass showed only 2 seek events in
+                        // 60s (vs expected ~42 per stream),
+                        // meaning either EOS isn't firing OR
+                        // the seek is failing AND wedging the
+                        // decoder. The Result tells us which.
+                        let seek_res = pipeline_for_bus.seek_simple(
                             gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
                             gst::ClockTime::ZERO,
+                        );
+                        log::info!(
+                            "[gst-bus] EOS src={src_name} seek-to-0 \
+                             result={seek_res:?}"
                         );
                     }
                     MessageView::AsyncDone(_) => {
@@ -485,6 +527,8 @@ mod linux {
                 // Updated on first adopt_sample (which queries the
                 // GLMemory's actual texture_target).
                 tex_target: TexTarget::TwoD,
+                last_pts_ns: None,
+                clip_basename,
                 gst_display,
                 gst_context,
             })
@@ -536,6 +580,10 @@ mod linux {
             let buffer = sample
                 .buffer_owned()
                 .ok_or_else(|| anyhow!("sample has no buffer"))?;
+            // BUG A: cache PTS BEFORE moving buffer into
+            // from_buffer_readable. Read by kms tick log so QA
+            // can confirm motion headlessly.
+            self.last_pts_ns = buffer.pts().map(|t| t.nseconds());
             let caps = sample
                 .caps()
                 .ok_or_else(|| anyhow!("sample has no caps"))?;
@@ -620,76 +668,64 @@ mod linux {
 
     impl Drop for GstDecoder {
         fn drop(&mut self) {
-            // ORDER MATTERS. Phase 2 (2ced09a) glass surfaced a
-            // teardown SEGV after clean run_loop exit: the
-            // previous Drop did NULL-pipeline BEFORE clearing
-            // our GLMemory refs (latest_sample + current_frame).
-            // glupload's finalize during the NULL transition
-            // tears down its GstGLBufferPool + releases its
-            // GLContext refs while we still held GLMemory refs
-            // pointing into that pool -- the subsequent
-            // GLVideoFrame::drop tried to gst_gl_memory_unmap
-            // on a partly-finalized context -> use-after-free.
-            //
-            // FIX (this commit): stop + join pull thread FIRST,
-            // then DROP our GLMemory refs while the pipeline is
-            // still PLAYING + gst-gl tracking is alive, THEN
-            // NULL + state-wait the pipeline, THEN unset bus.
-            // Phase 3's clip cycling (retire + recreate
-            // decoders mid-run) will hammer this path; a clean
-            // teardown is load-bearing for that.
+            // BUG B: step-by-step log so the next QA run names
+            // the EXACT blocking call when --capture wedges
+            // teardown. Old release_video_bindings fix didn't
+            // help; we need step-localization to know whether
+            // pull-thread JOIN, GLMemory unmap (slot or
+            // current_frame), set_state(NULL), state-wait, or
+            // bus unset is the actual deadlock.
+            let name = &self.clip_basename;
 
-            // 1. Signal pull thread to stop so it doesn't put a
-            //    NEW sample into the slot while we're clearing.
+            log::info!("[gst-drop] {name} step=1 set stop flag");
             self.stop.store(true, Ordering::Relaxed);
 
-            // 2. Join the pull thread. Worst case ~PULL_TICK_MS
-            //    (33ms) for the in-flight try_pull_sample to
-            //    return + scheduling delay; bounded.
+            log::info!("[gst-drop] {name} step=2 joining pull thread");
             if let Some(h) = self.pull_thread.take() {
                 let _ = h.join();
             }
+            log::info!("[gst-drop] {name} step=3 joined; clearing slot");
 
-            // 3. Drop the latest unconsumed sample (if any).
-            //    Pipeline still PLAYING here, so the buffer's
-            //    GLMemory unref + unmap are well-defined; gst-gl
-            //    context tracking is still alive.
+            // Pipeline still PLAYING here, so the buffer's
+            // GLMemory unref + unmap are well-defined; gst-gl
+            // context tracking is still alive.
             if let Ok(mut g) = self.latest_sample.lock() {
                 *g = None;
             }
+            log::info!(
+                "[gst-drop] {name} step=4 slot cleared; clearing current_frame"
+            );
 
-            // 4. Drop the currently-mapped GLVideoFrame. Same
-            //    reason as step 3: GL ctx tracking alive, unmap
-            //    is well-defined.
             self.current_frame = None;
+            log::info!(
+                "[gst-drop] {name} step=5 current_frame cleared; set_state(NULL)"
+            );
 
-            // 5. NULL the pipeline + WAIT for the transition to
-            //    settle (sync; not the old fire-and-forget). By
-            //    this point we hold ZERO GLMemory refs into the
-            //    pipeline, so glupload's finalize can release
-            //    its GLBufferPool cleanly.
+            // NULL the pipeline + WAIT for the transition to
+            // settle. By this point we hold ZERO GLMemory refs
+            // into the pipeline, so glupload's finalize can
+            // release its GLBufferPool cleanly.
             let _ = self.pipeline.set_state(gst::State::Null);
+            log::info!(
+                "[gst-drop] {name} step=6 set_state(NULL) returned; \
+                 awaiting transition"
+            );
             let (_res, cur, _pending) =
                 self.pipeline.state(gst::ClockTime::from_seconds(5));
+            log::info!(
+                "[gst-drop] {name} step=7 state-wait done cur={cur:?}; \
+                 unsetting bus"
+            );
             if cur != gst::State::Null {
                 log::warn!(
                     "[gst] pipeline did not reach NULL on Drop (cur={cur:?})"
                 );
             }
 
-            // 6. Unset the bus sync handler. This drops the
-            //    closure that captured display_for_bus +
-            //    context_for_bus Arc clones, releasing those
-            //    refs. The wrapped GstGLDisplay / GstGLContext
-            //    fields on Self drop AFTER this method returns
-            //    (struct member drop order), at which point the
-            //    refcount on the wrapped ctx goes to zero;
-            //    gst-gl's finalize for a wrapped ctx does NOT
-            //    call eglDestroyContext / eglTerminate, so
-            //    blendr's Egl::drop still owns those.
             if let Some(bus) = self.pipeline.bus() {
                 bus.unset_sync_handler();
             }
+            log::info!("[gst-drop] {name} step=8 bus unset; Drop returning");
         }
     }
 }

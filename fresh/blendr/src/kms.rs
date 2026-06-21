@@ -563,10 +563,23 @@ mod linux {
                     // Blend mode so QA can grep the cadence + see
                     // crossfade transitions in the tick stream
                     // without needing the [slideshow] event lines.
-                    if let super::Streams::Blend { slideshow, .. } = &*streams {
+                    //
+                    // BUG A: also include per-stream PTS so motion
+                    // is verifiable headlessly. "videoA_pts=1.23s"
+                    // advancing tick-over-tick = clip is playing;
+                    // stuck PTS = decoder wedged.
+                    if let super::Streams::Blend { a, b, slideshow } = &*streams {
+                        let pts_a = a
+                            .last_pts_ns()
+                            .map(|n| n as f64 / 1e9)
+                            .unwrap_or(-1.0);
+                        let pts_b = b
+                            .last_pts_ns()
+                            .map(|n| n as f64 / 1e9)
+                            .unwrap_or(-1.0);
                         log::info!(
                             "[kms] tick frame={frame_idx} elapsed={:.1}s \
-                             phase={:?} cycle={}",
+                             phase={:?} cycle={} ptsA={pts_a:.2}s ptsB={pts_b:.2}s",
                             start.elapsed().as_secs_f32(),
                             slideshow.phase(),
                             slideshow.cycle_count(),
