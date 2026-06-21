@@ -5559,31 +5559,47 @@ pub fn paint_and_present_one_transition_frame(
         // poster (text is GL-cheap, MUST NOT be frozen into the
         // poster — poster represents only what the V4L2 decoder
         // would have produced).
-        let use_poster_a_now = use_poster_a && cached_pair_a.is_some();
-        // Snapshot-side-A Commit 2 (2026-06-21): runtime still
-        // is the same shape as a disk poster — a frozen RGBA
-        // texture sourced as side-A for the transition window.
-        // Preference order: disk poster first (pre-resolved by
-        // r110 c3.1.1 to be pixel-identical to the live first
-        // frame), then runtime still (captured tick 1 from the
-        // actual outgoing frame), then live-decode fallback.
-        // snapshot_eligible enforces plain-Video-on-A (no text
-        // composite branch needed — TextOverVideo is excluded).
-        // cached_pair_a.is_some() required to land into the
-        // stable cached FBO+tex; the legacy per-tick alloc
-        // path isn't supported for the still source.
+        // Snapshot-side-A Commit 2.2 (2026-06-21): snapshot
+        // OVERRIDES poster for the OUTGOING side. QA glass
+        // attempt #1 confirmed `[perf] snapshot_side_a_
+        // captured` never fired on the all-stock reel because
+        // r110 c3.2.2's poster fast-path preempted snapshot
+        // for every postered video.
         //
-        // When use_still_a_now is true, bake_video is NOT
-        // called for side A — the outgoing decoder sits
-        // allocated-but-parked (no next_frame, no feed) until
-        // the existing BeginSlide-path evict_other_video_state
-        // reclaims it at transition end. This is the actual
-        // 2-decoder-ceiling fix: only side B feeds /dev/video10
-        // for the rest of the fade.
-        let use_still_a_now = !use_poster_a_now
-            && snapshot_eligible
+        // Per QA's design question (c) -- the correct
+        // resolution: r110's "poster is pixel-identical to
+        // first frame" contract applies to INCOMING (side B
+        // hasn't seen any frame yet; poster ≈ first live
+        // frame ≈ what the user is about to see). For
+        // OUTGOING (side A has been playing for the entire
+        // hold; user just saw frame N of the clip), sourcing
+        // the poster JUMPS visibly to frame 0 at fade start.
+        // Snapshot captures the actual current frame, freezing
+        // at the user-visible moment -- strictly better UX.
+        //
+        // Precedence is therefore A-side-asymmetric:
+        //   - OUTGOING (A): snapshot > live-decode. Poster is
+        //     IGNORED when snapshot_eligible.
+        //   - INCOMING (B): poster > live-decode (UNCHANGED;
+        //     side-B preserves r110 c3.2.2's frozen-entry
+        //     contract verbatim).
+        //
+        // Resource cost: +1 V4L2 feed on tick 1 vs the all-
+        // poster path (live-decode of A once to produce the
+        // capture source). Ticks 2..N have zero A-side
+        // V4L2 feeds (snapshot blit). r97 deferred-preload +
+        // side-B Path B retry still active as the ceiling
+        // guard + cold-start fallback.
+        let use_still_a_now = snapshot_eligible
             && cached_pair_a.is_some()
             && session.transition_still_a_tex.is_some();
+        // Poster on A is suppressed when snapshot_eligible
+        // (snapshot is the strictly-better source for
+        // outgoing). Non-eligible cases (e.g. TextOverVideo
+        // on A) keep the existing poster path verbatim.
+        let use_poster_a_now = use_poster_a
+            && cached_pair_a.is_some()
+            && !snapshot_eligible;
         let (fbo_a, tex_a) = if use_poster_a_now {
             let (poster_tex, poster_w, poster_h) = poster_a_texture.expect("guarded above");
             let (fbo, tex) = cached_pair_a.expect("guarded above");
@@ -5676,24 +5692,24 @@ pub fn paint_and_present_one_transition_frame(
             };
             (fa, ta)
         };
-        // Snapshot-side-A Commit 2 (2026-06-21): capture the
+        // Snapshot-side-A Commit 2.2 (2026-06-21): capture the
         // freshly-baked side-A frame into transition_still_a_tex
-        // on the FIRST tick of a snapshot-eligible transition
-        // when neither poster nor still sourced this tick (i.e.
-        // we just live-decoded). Capture is one-shot per
-        // transition; ticks 2..N find still.is_some() and consume
-        // via the use_still_a_now branch above (no more
-        // bake_video on side A).
+        // on the FIRST tick of a snapshot-eligible transition.
+        // We don't need the !use_poster_a_now gate anymore --
+        // snapshot_eligible already suppresses use_poster_a_now
+        // via the precedence flip above, so when this site
+        // runs with snapshot_eligible=true, fbo_a came from
+        // live-decode (not poster). Capture is one-shot per
+        // transition; ticks 2..N find still.is_some() and
+        // consume via use_still_a_now (no more bake_video on
+        // side A).
         //
         // GLES2-safe FRAMEBUFFER bind (READ_FRAMEBUFFER is
         // GLES3-only and would silently error here).
         //
         // Frees: BeginSlide / BeginTransition / Advance-after-
         // Slide-paint hooks in ipc_main.rs handle lifecycle.
-        // No progress-threshold free (Commit 1's 0.99 gate
-        // didn't fire for short in-process transitions).
         if snapshot_eligible
-            && !use_poster_a_now
             && cached_pair_a.is_some()
             && session.transition_still_a_tex.is_none()
         {
