@@ -222,6 +222,26 @@ mod linux {
                 .map_err(|e| anyhow!("eglMakeCurrent (re-claim): {e:?}"))?;
             Ok(())
         }
+
+        /// Check whether the EGL context currently bound on
+        /// THIS thread matches our presenter context.
+        /// Returns:
+        ///   true  -- our context is bound here; make_current
+        ///            would be a no-op.
+        ///   false -- a different context is bound (or
+        ///            EGL_NO_CONTEXT) -- make_current is
+        ///            required.
+        ///
+        /// Cost: one eglGetCurrentContext FFI (~µs; ptr lookup
+        /// in TLS), no GL queue flush. Safe to call per-frame.
+        ///
+        /// Use case: detect when gst-gl's streaming threads
+        /// have stolen the binding (their own eglMakeCurrent
+        /// for upload/preroll unbinds us). Pair with
+        /// make_current() to repair + count.
+        pub fn is_current_context_ours(&self) -> bool {
+            self.lib.get_current_context() == Some(self.context)
+        }
     }
 
     impl Drop for Egl {

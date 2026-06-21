@@ -384,6 +384,16 @@ pub struct FrameStats {
     /// Last frame's content-black state for streak BEGIN/END
     /// logging on transition.
     last_content_black: bool,
+    /// EGL context-steal detector + repair: count of frames
+    /// where the pre-draw_frame is_current_context_ours()
+    /// check returned false (= a gst-gl streaming thread had
+    /// stolen the binding) and we re-claimed. Surfaced in
+    /// summary. Per-occurrence [egl-steal] BEGIN/END log is
+    /// emitted on streak transitions so QA can correlate with
+    /// [cycle] create windows.
+    cum_egl_steal_count: u64,
+    window_egl_steal_count: u64,
+    last_egl_stolen: bool,
     /// Wall-clock at the previous frame's end. None on first
     /// frame (no delta to compute).
     last_present_end: Option<std::time::Instant>,
@@ -412,6 +422,9 @@ impl FrameStats {
             cum_content_black_count: 0,
             window_content_black_count: 0,
             last_content_black: false,
+            cum_egl_steal_count: 0,
+            window_egl_steal_count: 0,
+            last_egl_stolen: false,
             last_present_end: None,
             last_summary_at: now,
             run_start: now,
@@ -433,6 +446,7 @@ impl FrameStats {
         streams: &Streams,
         draw_outcome: crate::gles_present::DrawOutcome,
         content_black: bool,
+        egl_stolen: bool,
     ) {
         use crate::gles_present::DrawOutcome;
         self.cum_frame_ms.push(frame_ms);
@@ -521,6 +535,30 @@ impl FrameStats {
             );
         }
         self.last_content_black = content_black;
+        // --- EGL context-steal detector + repair ---
+        if egl_stolen {
+            self.cum_egl_steal_count += 1;
+            self.window_egl_steal_count += 1;
+        }
+        if egl_stolen && !self.last_egl_stolen {
+            let ctx = streams.outlier_context();
+            log::warn!(
+                "[egl-steal] BEGIN frame={frame_idx} phase={} cycle={} \
+                 flags=[{}] ms_since_last_cycle_event={:?}",
+                ctx.phase_str,
+                ctx.cycle,
+                ctx.flags,
+                ctx.ms_since_cycle_event,
+            );
+        } else if !egl_stolen && self.last_egl_stolen {
+            let ctx = streams.outlier_context();
+            log::warn!(
+                "[egl-steal] END frame={frame_idx} phase={} cycle={}",
+                ctx.phase_str,
+                ctx.cycle,
+            );
+        }
+        self.last_egl_stolen = egl_stolen;
         if self.last_summary_at.elapsed().as_secs() >= SUMMARY_INTERVAL_S {
             self.emit_window_summary();
             self.last_summary_at = std::time::Instant::now();
@@ -528,6 +566,7 @@ impl FrameStats {
             self.window_long_count = 0;
             self.window_black_count = 0;
             self.window_content_black_count = 0;
+            self.window_egl_steal_count = 0;
         }
     }
 
@@ -544,12 +583,15 @@ impl FrameStats {
         let black_per_min = (self.window_black_count as f32 / win_sec) * 60.0;
         let content_black_per_min =
             (self.window_content_black_count as f32 / win_sec) * 60.0;
+        let egl_steal_per_min =
+            (self.window_egl_steal_count as f32 / win_sec) * 60.0;
         log::info!(
             "[frame-stats] window={SUMMARY_INTERVAL_S}s frames={} mean={mean_f:.2}ms \
              p50={p50_f:.2} p99={p99_f:.2} p999={p999_f:.2} max={max_f:.2} \
              long(>{LONG_FRAME_MS:.0}ms)={} (K/min={:.1}) \
              black_draws={} (B/min={:.1}) \
              content_black={} (CB/min={:.1}) \
+             egl_steals={} (S/min={:.1}) \
              render_mean={mean_r:.2}ms render_max={max_r:.2}ms",
             win_frame.len(),
             self.window_long_count,
@@ -558,6 +600,8 @@ impl FrameStats {
             black_per_min,
             self.window_content_black_count,
             content_black_per_min,
+            self.window_egl_steal_count,
+            egl_steal_per_min,
         );
     }
 
@@ -574,12 +618,15 @@ impl FrameStats {
         let black_per_min = (self.cum_black_count as f32 / run_sec) * 60.0;
         let content_black_per_min =
             (self.cum_content_black_count as f32 / run_sec) * 60.0;
+        let egl_steal_per_min =
+            (self.cum_egl_steal_count as f32 / run_sec) * 60.0;
         log::info!(
             "[frame-stats] FINAL run={run_sec:.1}s frames={} mean={mean_f:.2}ms \
              p50={p50_f:.2} p99={p99_f:.2} p999={p999_f:.2} max={max_f:.2} \
              long(>{LONG_FRAME_MS:.0}ms)={} (K/min={:.1}) \
              black_draws={} (B/min={:.1}) \
              content_black={} (CB/min={:.1}) \
+             egl_steals={} (S/min={:.1}) \
              render_mean={mean_r:.2}ms render_max={max_r:.2}ms",
             self.cum_frame_ms.len(),
             self.cum_long_count,
@@ -588,6 +635,8 @@ impl FrameStats {
             black_per_min,
             self.cum_content_black_count,
             content_black_per_min,
+            self.cum_egl_steal_count,
+            egl_steal_per_min,
         );
     }
 
@@ -1150,6 +1199,39 @@ mod linux {
                     }
                 }
 
+                // BLACK-FLASH FIX ATTEMPT: re-claim EGL right
+                // before draw_frame if gst-gl streaming threads
+                // have stolen the binding during the
+                // PendingDecoder create window.
+                //
+                // QA root-caused (PROOF: captured black frame
+                // mid-create, content_black=145 over 300s, all
+                // flagged near_create|near_retire): the async
+                // create on the present thread does not itself
+                // disrupt rendering, but the gst-gl streaming
+                // threads that run the PAUSED preroll +
+                // glupload negotiation call eglMakeCurrent on
+                // our SHARED context on THEIR threads -- which
+                // unbinds our context from the present thread.
+                // Subsequent draw_quad_X calls then run with
+                // EGL_NO_CONTEXT current -> commands no-op ->
+                // only the clear-to-black is visible.
+                //
+                // The 3 defensive make_current calls in the
+                // pull cycle close the window before/after
+                // pull, but a steal between the last one and
+                // draw_frame (or DURING set_video_textures'
+                // rare lazy-compile path) goes unrepaired.
+                //
+                // This unconditional check + repair closes the
+                // gap to zero. Counter accumulates steals so
+                // QA can confirm + see the rate.
+                let stolen = !egl.is_current_context_ours();
+                if stolen {
+                    egl.make_current()
+                        .context("egl.make_current pre-draw_frame (steal repair)")?;
+                }
+
                 // Measurement: stamp before draw to time the GL
                 // draw + swap work (render_ms), excluding the
                 // vsync drain that happens later in the iter.
@@ -1265,6 +1347,7 @@ mod linux {
                         &*streams,
                         draw_outcome,
                         content_black,
+                        stolen,
                     );
                 }
 
