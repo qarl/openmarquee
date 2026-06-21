@@ -108,6 +108,18 @@ mod linux {
         pad_added_id: Option<glib::SignalHandlerId>,
         concat_sink: gst::Pad,
         probe_id: Option<gst::PadProbeId>,
+        /// BUG A v3 diagnostic: count how many times the EOS
+        /// probe fires for THIS sub-bin. Should be exactly 1
+        /// per sub-bin in steady state. >1 indicates sticky-
+        /// EOS double-fire (QA's H2 hypothesis); the
+        /// retire-then-add cycle still acts on the first; the
+        /// extras are just log noise here but would cause
+        /// runaway adds if act-on-every-fire was the policy.
+        /// Logged each fire so QA can distinguish "premature
+        /// EOS" (each probe fires once, but at 1.5s instead of
+        /// 4.75s = back-pressure issue) from "duplicate fire"
+        /// (probe re-fires for same EOS = needs latch).
+        eos_fire_count: Arc<AtomicU64>,
     }
 
     /// Commands sent from EOS probes (on gst streaming threads)
@@ -206,8 +218,36 @@ mod linux {
             let v4l2dec = gst::ElementFactory::make("v4l2h264dec")
                 .build()
                 .context("make v4l2h264dec")?;
+            // BUG A v3: leaky=NO (NOT downstream) so the
+            // queue back-pressures the decoder when full.
+            // Combined with appsink.set_drop(false) below +
+            // appsink.set_sync(true) (which paces presentation
+            // against the pipeline clock), the chain becomes
+            // decoder → queue (blocks at 2 buffers) → glupload
+            // → appsink (paced real-time). Decoder runs at the
+            // clip's native frame rate; EOS fires when the
+            // clip's last frame is CONSUMED by appsink, not
+            // when the decoder finishes producing. Without
+            // this, decoder free-runs at ~3x real-time, EOS
+            // fires early (~1.5s for a 4.75s clip per QA glass
+            // f3c0d7c), rapid add/retire churn confuses
+            // v4l2h264dec, periodic 5-15s decoder stalls.
+            //
+            // cutloop.py uses the same non-leaky pattern with
+            // kmssink sync=true as the pacing consumer. Our
+            // appsink sync=true plays the same role.
+            //
+            // CMA: with 2-buffer cap + back-pressure, only 2
+            // decoded NV12 buffers held downstream at any
+            // moment. Decoder's V4L2 CAPTURE pool holds ~4-6
+            // more; total per-stream peak is identical to the
+            // leaky-queue setup. The DROPS we lose (leaky=down
+            // would drop oldest on overflow) weren't necessary
+            // for CMA -- only for "lossy real-time display"
+            // semantics that don't apply when the consumer
+            // (appsink) paces correctly.
             let outq = gst::ElementFactory::make("queue")
-                .property_from_str("leaky", "downstream")
+                .property_from_str("leaky", "no")
                 .property("max-size-buffers", 2u32)
                 .property("max-size-bytes", 0u32)
                 .property("max-size-time", 0u64)
@@ -239,7 +279,16 @@ mod linux {
                 .build();
             appsink.set_caps(Some(&caps_rgba));
             appsink.set_max_buffers(2);
-            appsink.set_drop(true);
+            // BUG A v3: drop=FALSE so appsink back-pressures
+            // upstream (queue) when full instead of dropping
+            // newer samples. Pair with the non-leaky queue
+            // above for end-to-end back-pressure. With
+            // sync=true pacing presentation against the clock,
+            // the decoder runs at clip framerate (not
+            // decoder-max), EOS fires at the natural end (not
+            // 3x early), and concat add/retire cadence matches
+            // wall-clock clip duration.
+            appsink.set_drop(false);
             appsink.set_sync(true);
             appsink.set_property("emit-signals", false);
 
@@ -518,17 +567,35 @@ mod linux {
             // absorbed EOS flows through this pad and we fire.
             // The probe sends commands to the channel; the
             // present thread processes via process_pending().
+            //
+            // BUG A v3 diagnostic: eos_fire_count is the per-
+            // sub-bin counter. Logged each fire. Distinguishes
+            // QA's two hypotheses:
+            //   H1 (back-pressure): each sub-bin's probe fires
+            //       EXACTLY ONCE but at wrong wall-clock time
+            //       (~1.5s instead of ~4.75s). add/retire ratio
+            //       matches sub-bin count.
+            //   H2 (duplicate fire): per-sub-bin probe fires
+            //       MULTIPLE times for the same actual EOS
+            //       event (sticky-pad replay). add/retire ratio
+            //       N:1 → runaway depth.
             let tx_for_probe = self.pipe_cmd_tx.clone();
             let serial_for_probe = serial;
             let basename_for_probe = self.clip_basename.clone();
+            let eos_fire_count = Arc::new(AtomicU64::new(0));
+            let eos_fire_count_for_probe = eos_fire_count.clone();
             let probe_id = concat_sink.add_probe(
                 gst::PadProbeType::EVENT_DOWNSTREAM,
                 move |_pad, info| {
                     if let Some(gst::PadProbeData::Event(ev)) = info.data.as_ref() {
                         if ev.type_() == gst::EventType::Eos {
+                            let n = eos_fire_count_for_probe
+                                .fetch_add(1, Ordering::Relaxed)
+                                + 1;
                             log::info!(
                                 "[gst-cl] {basename_for_probe} concat-sink EOS \
-                                 serial={serial_for_probe} -> queue add+retire"
+                                 serial={serial_for_probe} fire_count={n} \
+                                 -> queue add+retire"
                             );
                             let _ = tx_for_probe.send(PipelineCmd::AddNextClip);
                             let _ = tx_for_probe.send(PipelineCmd::Retire(serial_for_probe));
@@ -553,11 +620,12 @@ mod linux {
                     // gst-rs 0.23 (add_probe returns Option for
                     // failure cases).
                     probe_id,
+                    eos_fire_count,
                 });
                 q.len()
             };
             log::info!(
-                "[gst-cl] {} added sub-bin serial={serial} (queue_depth={depth})",
+                "[gst-cl] {} ADD sub-bin serial={serial} (queue_depth={depth})",
                 self.clip_basename
             );
             Ok(())
@@ -595,8 +663,11 @@ mod linux {
             let _ = sub_bin.bin.set_state(gst::State::Null);
             let _ = self.pipeline.remove(&sub_bin.bin);
             self.concat.release_request_pad(&sub_bin.concat_sink);
+            let depth_after = self.sub_bins.lock().unwrap().len();
+            let fired = sub_bin.eos_fire_count.load(Ordering::Relaxed);
             log::info!(
-                "[gst-cl] {} retired serial={serial}",
+                "[gst-cl] {} RETIRE serial={serial} fired={fired} \
+                 (queue_depth_after={depth_after})",
                 self.clip_basename
             );
             Ok(())
