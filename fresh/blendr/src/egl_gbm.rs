@@ -130,12 +130,12 @@ mod linux {
         pub config: egl::Config,
     }
 
-    /// Share-group EGL context + 1x1 pbuffer surface,
-    /// dedicated to ONE PendingDecoder/GstDecoder pair so
-    /// gst-gl's GL ops never touch the presenter context or
-    /// window surface. Created in Egl::create_share_group_
-    /// context; owned by the GstDecoder; self-destroyed on
-    /// Drop via the Arc<DynamicInstance> clone.
+    /// Share-group EGL context (SURFACELESS) dedicated to
+    /// ONE PendingDecoder/GstDecoder pair so gst-gl's GL ops
+    /// never touch the presenter context or window surface.
+    /// Created in Egl::create_share_group_context; owned by
+    /// the GstDecoder; self-destroyed on Drop via the
+    /// Arc<DynamicInstance> clone.
     ///
     /// Textures created on this context are visible from the
     /// presenter context via GL share-group semantics
@@ -143,14 +143,18 @@ mod linux {
     /// can write into a GLMemory texture on the worker's
     /// context, and the present thread can sample it.
     ///
-    /// The pbuffer is required because EGL_KHR_surfaceless_
-    /// context isn't guaranteed on vc4; a 1x1 pbuffer is
-    /// always cheap.
+    /// SURFACELESS rationale: GBM is a scanout/surfaceless
+    /// platform; vc4/Mesa exposes zero pbuffer-capable EGL
+    /// configs (QA proved at c871f4c). EGL_KHR_surfaceless_
+    /// context (verified at Egl::bring_up) lets us
+    /// eglMakeCurrent with EGL_NO_SURFACE so the worker
+    /// context binds without a draw surface at all. gst-gl's
+    /// glupload/convert is texture+FBO work (off-screen by
+    /// nature); no default-framebuffer draw needed.
     pub struct ShareGroupContext {
         lib: std::sync::Arc<egl::DynamicInstance<egl::EGL1_5>>,
         pub display: egl::Display,
         pub context: egl::Context,
-        pub surface: egl::Surface,
     }
 
     // SAFETY: ShareGroupContext holds EGL handles (Display +
@@ -166,18 +170,22 @@ mod linux {
 
     impl ShareGroupContext {
         /// eglMakeCurrent THIS context on the calling thread,
-        /// using the 1x1 pbuffer as read/draw surface. Used by
-        /// the worker thread before invoking any gst-gl APIs.
+        /// SURFACELESS (None for read + draw). Used by the
+        /// worker thread before invoking any gst-gl APIs.
+        /// gst-gl's upload/convert work is texture+FBO based;
+        /// no default-framebuffer draw needed. Requires
+        /// EGL_KHR_surfaceless_context (verified at
+        /// Egl::bring_up).
         pub fn make_current_here(&self) -> Result<()> {
             self.lib
                 .make_current(
                     self.display,
-                    Some(self.surface),
-                    Some(self.surface),
+                    None,
+                    None,
                     Some(self.context),
                 )
                 .map_err(|e| {
-                    anyhow!("eglMakeCurrent(share-group): {e:?}")
+                    anyhow!("eglMakeCurrent(share-group, surfaceless): {e:?}")
                 })?;
             Ok(())
         }
@@ -210,7 +218,9 @@ mod linux {
             // or the gst-gl streaming threads naturally release
             // when the pipeline goes to NULL). Best-effort
             // destroy; never panic.
-            let _ = self.lib.destroy_surface(self.display, self.surface);
+            //
+            // Surfaceless: nothing to destroy_surface (no
+            // pbuffer; eglMakeCurrent uses EGL_NO_SURFACE).
             let _ = self.lib.destroy_context(self.display, self.context);
         }
     }
@@ -235,19 +245,41 @@ mod linux {
                 .map_err(|e| anyhow!("eglInitialize: {e:?}"))?;
             log::info!("[egl] initialized EGL {vmaj}.{vmin}");
 
+            // Verify EGL_KHR_surfaceless_context BEFORE we
+            // commit to the share-group + worker architecture.
+            // GBM is scanout/surfaceless; surfaceless contexts
+            // are the only viable off-screen target for gst-gl
+            // worker. vc4/Mesa supports this extension; QA
+            // recommended verifying to avoid a third
+            // config-cycle crash.
+            let ext_str = lib
+                .query_string(Some(display), egl::EXTENSIONS)
+                .map_err(|e| anyhow!("eglQueryString(EXTENSIONS): {e:?}"))?;
+            let ext_str = ext_str.to_string_lossy();
+            log::info!("[egl] EGL_EXTENSIONS = {ext_str}");
+            if !ext_str.split_whitespace().any(|e| e == "EGL_KHR_surfaceless_context") {
+                return Err(anyhow!(
+                    "EGL_KHR_surfaceless_context not advertised by driver; \
+                     share-group worker context requires it. \
+                     Extensions: {ext_str}"
+                ));
+            }
+            log::info!("[egl] EGL_KHR_surfaceless_context: AVAILABLE");
+
             lib.bind_api(egl::OPENGL_ES_API)
                 .map_err(|e| anyhow!("eglBindAPI(GLES): {e:?}"))?;
 
             let attribs = [
-                // SURFACE_TYPE = WINDOW_BIT | PBUFFER_BIT so a
-                // SINGLE config serves both the presenter's
-                // window surface AND the share-group context's
-                // 1x1 pbuffer (per ShareGroupContext for the
-                // black-flash fix). Pure WINDOW_BIT fails
-                // eglCreatePbufferSurface with BadMatch -- QA
-                // caught at 6a275bc startup.
+                // SURFACE_TYPE = WINDOW_BIT only. GBM is a
+                // scanout/surfaceless platform -- vc4/Mesa
+                // exposes zero pbuffer-capable configs (QA
+                // proved at c871f4c: choose_first_config
+                // returned None for WINDOW|PBUFFER). The
+                // share-group context for gst-gl uses
+                // EGL_KHR_surfaceless_context instead (no
+                // pbuffer needed).
                 egl::SURFACE_TYPE,
-                egl::WINDOW_BIT | egl::PBUFFER_BIT,
+                egl::WINDOW_BIT,
                 egl::RED_SIZE,
                 8,
                 egl::GREEN_SIZE,
@@ -315,6 +347,10 @@ mod linux {
             let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
             // share_context = Some(self.context) puts the new
             // context in the SAME share group as the presenter.
+            // No surface created -- EGL_KHR_surfaceless_context
+            // lets the worker eglMakeCurrent with
+            // EGL_NO_SURFACE. Required because GBM exposes no
+            // pbuffer configs.
             let context = self
                 .lib
                 .create_context(
@@ -324,27 +360,13 @@ mod linux {
                     &ctx_attribs,
                 )
                 .map_err(|e| anyhow!("eglCreateContext(share): {e:?}"))?;
-            // 1x1 pbuffer suffices for the worker to be
-            // current somewhere; gst-gl doesn't actually draw
-            // to it.
-            let pbuf_attribs =
-                [egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE];
-            let surface = self
-                .lib
-                .create_pbuffer_surface(
-                    self.display,
-                    self.config,
-                    &pbuf_attribs,
-                )
-                .map_err(|e| anyhow!("eglCreatePbufferSurface(1x1): {e:?}"))?;
             log::info!(
-                "[egl] share-group context created (context+1x1 pbuffer)"
+                "[egl] share-group context created (surfaceless)"
             );
             Ok(ShareGroupContext {
                 lib: self.lib.clone(),
                 display: self.display,
                 context,
-                surface,
             })
         }
 
