@@ -67,6 +67,15 @@ pub enum Streams {
         /// With defaults 2000/2000, drop fires 2s after
         /// Fading->Holding, create fires 2s after drop done.
         handoff: HandoffState,
+        /// M3 [trace-first-frame] state: per-slot timestamp
+        /// of the most-recent successful switch_to_clip
+        /// call. The pull-path checks: when the slot's
+        /// last_was_new_sample transitions to true AFTER
+        /// last_switch_at[idx] was stamped, emit
+        /// [trace-first-frame] and clear the stamp. Proves
+        /// the new clip's first decoded frame actually
+        /// arrived through the persistent pipeline.
+        last_switch_at: [Option<std::time::Instant>; 2],
     },
 }
 
@@ -261,6 +270,7 @@ impl Streams {
             last_retire_at,
             last_create_at,
             handoff,
+            last_switch_at,
         } = self
         {
             // Update alpha + check for phase change.
@@ -274,9 +284,99 @@ impl Streams {
                 handoff_pre_create_ms(),
             );
 
+            // ---- M2: persistent-pipeline EOS-swap path ----
+            // When env BLENDR_PERSISTENT_PIPELINE=1, the
+            // recreate handoff becomes a live clip-swap on the
+            // already-running slot pipeline (cutloop pattern).
+            // Zero per-transition GL work -> no V3D contention
+            // -> no presenter blanking -> hold-last-frame
+            // never fires for this path.
+            //
+            // On switch_to_clip Err (QA fold-in i): fall back
+            // to the HandoffState path so the slot doesn't go
+            // dark. We FALL THROUGH to the HandoffState block
+            // below (don't set handoff != Idle here; the
+            // fall-through logic will trigger it from
+            // phase_changed naturally).
+            let mut persistent_handled = false;
+            if persistent_pipeline_enabled()
+                && phase_changed
+                && n >= 3
+            {
+                let into_holding = matches!(
+                    slideshow.phase(),
+                    BlendPhase::HoldingA | BlendPhase::HoldingB
+                );
+                if into_holding {
+                    let visible_slot = match slideshow.phase() {
+                        BlendPhase::HoldingA | BlendPhase::FadingAtoB => 0,
+                        BlendPhase::HoldingB | BlendPhase::FadingBtoA => 1,
+                    };
+                    let retire_slot = 1 - visible_slot;
+                    let next_clip = playlist[*next_idx].clone();
+                    let clip_name = next_clip
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let switch_result = match slots[retire_slot].as_mut() {
+                        Some(d) => {
+                            if trace_enabled() {
+                                trace_writeln(&format!(
+                                    "[trace-switch] ts_ms={} event=BEGIN \
+                                     slot={retire_slot} clip={clip_name} \
+                                     cycle={}",
+                                    trace_ts_ms(),
+                                    slideshow.cycle_count(),
+                                ));
+                            }
+                            d.switch_to_clip(&next_clip)
+                        }
+                        None => Err(anyhow::anyhow!(
+                            "slot {retire_slot} is None (cannot switch); \
+                             fallback to HandoffState"
+                        )),
+                    };
+                    match switch_result {
+                        Ok(()) => {
+                            *next_idx = (*next_idx + 1) % n;
+                            last_switch_at[retire_slot] =
+                                Some(std::time::Instant::now());
+                            log::info!(
+                                "[handoff] persistent-pipeline switch \
+                                 slot={retire_slot} clip={clip_name} cycle={} \
+                                 next_idx={} (EOS-swap; OLD plays to natural EOS)",
+                                slideshow.cycle_count(),
+                                *next_idx,
+                            );
+                            persistent_handled = true;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "[handoff] persistent switch failed for \
+                                 slot={retire_slot} clip={clip_name}: {e:#}; \
+                                 FALLING BACK to HandoffState path"
+                            );
+                            if trace_enabled() {
+                                trace_writeln(&format!(
+                                    "[trace-switch] ts_ms={} event=FALLBACK \
+                                     slot={retire_slot} clip={clip_name}",
+                                    trace_ts_ms(),
+                                ));
+                            }
+                            // Don't set persistent_handled =>
+                            // the HandoffState block below will
+                            // pick this up via phase_changed.
+                        }
+                    }
+                }
+            }
+
             // ---- On Fading->Holding transition (N>=3), kick
             //      off the handoff state machine ----
-            if phase_changed && n >= 3 {
+            // Skipped if persistent_pipeline path handled the
+            // transition successfully this tick.
+            if !persistent_handled && phase_changed && n >= 3 {
                 let into_holding = matches!(
                     slideshow.phase(),
                     BlendPhase::HoldingA | BlendPhase::HoldingB
@@ -1065,6 +1165,44 @@ pub fn handoff_pre_create_ms() -> u64 {
     HANDOFF_PRE_CREATE_MS.get().copied().unwrap_or(2000)
 }
 
+/// M2: BLENDR_PERSISTENT_PIPELINE=1 enables cutloop-pattern
+/// EOS-swap clip handoff (Streams::tick calls switch_to_clip
+/// instead of HandoffState/PendingDecoder). Default OFF
+/// (false) -- prod stays on fd249cb HandoffState path until
+/// QA proves M2/M3 on glass.
+static PERSISTENT_PIPELINE: std::sync::OnceLock<bool> =
+    std::sync::OnceLock::new();
+pub fn persistent_pipeline_enabled() -> bool {
+    *PERSISTENT_PIPELINE.get_or_init(|| {
+        let on = std::env::var("BLENDR_PERSISTENT_PIPELINE").as_deref() == Ok("1");
+        log::warn!(
+            "[handoff] BLENDR_PERSISTENT_PIPELINE={} \
+             (when ON: switch_to_clip EOS-swap on persistent pipelines, \
+             zero per-transition GL. When OFF: HandoffState cascade with \
+             pre_drop/pre_create spacing.)",
+            if on { "1" } else { "0" }
+        );
+        on
+    })
+}
+
+/// M3: BLENDR_FRAME_TRACE_WINDOW_MS widens the per-frame
+/// trace window after each Fading->Holding transition.
+/// Default 2000ms; QA sets 8000ms to capture late events
+/// (the +5s black surprised us when spacing was on; a fixed
+/// 2000ms window was blind there). 0 = disable per-frame
+/// trace lines (TRANSITION marker still emitted).
+static FRAME_TRACE_WINDOW_MS: std::sync::OnceLock<u64> =
+    std::sync::OnceLock::new();
+pub fn frame_trace_window_ms() -> u64 {
+    *FRAME_TRACE_WINDOW_MS.get_or_init(|| {
+        std::env::var("BLENDR_FRAME_TRACE_WINDOW_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(2000)
+    })
+}
+
 /// Initialize the global trace file from env (BLENDR_FRAME_
 /// TRACE / BLENDR_FRAME_TRACE_FILE). Called once at startup.
 /// Safe to call multiple times (OnceLock init).
@@ -1177,7 +1315,11 @@ pub struct FrameTrace {
     prev_phase: Option<BlendPhase>,
 }
 
-const TRACE_WINDOW: std::time::Duration = std::time::Duration::from_millis(2000);
+// M3: BLENDR_FRAME_TRACE_WINDOW_MS-driven (default 2000ms).
+// Read once per transition via frame_trace_window_ms().
+fn trace_window() -> std::time::Duration {
+    std::time::Duration::from_millis(frame_trace_window_ms())
+}
 
 impl FrameTrace {
     pub fn new() -> Self {
@@ -1226,12 +1368,12 @@ impl FrameTrace {
         }
         let now = std::time::Instant::now();
         self.transition_at = Some(now);
-        self.trace_window_end = Some(now + TRACE_WINDOW);
+        self.trace_window_end = Some(now + trace_window());
         trace_writeln(&format!(
             "[trace] ts_ms={} TRANSITION phase={prev_p:?}->{cur_p:?} \
              cycle={cycle} window_ms={}",
             trace_ts_ms(),
-            TRACE_WINDOW.as_millis()
+            trace_window().as_millis()
         ));
     }
 
@@ -1851,6 +1993,7 @@ mod linux {
                         last_retire_at: _,
                         last_create_at: _,
                         handoff: _,
+                        last_switch_at,
                     } => {
                         // Phase 3 v2: drain each slot decoder's
                         // pending pipeline commands (concat add-
@@ -1910,6 +2053,47 @@ mod linux {
                         };
                         egl.make_current()
                             .context("egl.make_current post-gst-pull(slot1)")?;
+
+                        // M3: [trace-first-frame] for M2
+                        // persistent-pipeline path. If a slot
+                        // had a recent switch_to_clip (stamped
+                        // last_switch_at) AND the slot just
+                        // delivered a NEW sample (last_was_new_
+                        // sample == true), the new clip's
+                        // first decoded frame has arrived
+                        // through the persistent pipeline.
+                        // Emit + clear stamp.
+                        if super::trace_enabled() {
+                            for idx in 0..2 {
+                                if let Some(stamped_at) = last_switch_at[idx] {
+                                    if let Some(d) = slots[idx].as_ref() {
+                                        if d.last_was_new_sample() {
+                                            let elapsed = stamped_at
+                                                .elapsed()
+                                                .as_millis();
+                                            let pts = d.last_pts_ns()
+                                                .map(|n| n.to_string())
+                                                .unwrap_or_else(|| "-".into());
+                                            super::trace_writeln(&format!(
+                                                "[trace-first-frame] ts_ms={} \
+                                                 slot={idx} elapsed_since_switch_ms={elapsed} \
+                                                 pts_ns={pts}",
+                                                super::trace_ts_ms(),
+                                            ));
+                                            last_switch_at[idx] = None;
+                                        }
+                                    } else {
+                                        // Slot went None for some reason
+                                        // (HandoffState fallback retire);
+                                        // clear stale stamp so we don't
+                                        // emit later when a new decoder
+                                        // happens to be there.
+                                        last_switch_at[idx] = None;
+                                    }
+                                }
+                            }
+                        }
+
                         if let (Some(a_t), Some(b_t)) = (a_pair, b_pair) {
                             presenter.set_video_textures(a_t, b_t, alpha);
                             if !first_video_tex_logged {

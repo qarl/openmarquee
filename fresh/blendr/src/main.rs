@@ -274,6 +274,7 @@ fn run(args: Args) -> Result<()> {
                     last_retire_at: None,
                     last_create_at: None,
                     handoff: kms::HandoffState::Idle,
+                    last_switch_at: [None, None],
                 }
             }
         }
