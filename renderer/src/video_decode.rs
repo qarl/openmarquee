@@ -669,6 +669,28 @@ pub fn drain_one_capture_for_preload_with_detail(
                 // (sample 1's output instead of sample 0/IDR), a
                 // ~1/30s shift at 30fps; typically imperceptible
                 // on continuous-motion content.
+                //
+                // judder-instrument (2026-06-22): qarl spotted a
+                // BACKWARD jump at the poster->live handoff. The
+                // documented forward-skip (drained=frame0, live=
+                // frame1) can't explain "backward." So fingerprint
+                // the drained frame's Y plane and log it; QA can
+                // correlate against poster_cache_loaded fp_r (does
+                // poster ≈ drained frame?) and against live_frame_fp
+                // (does poster ≈ first-displayed live? frame 0 ≠
+                // displayed frame 1 IS the docstring's claim).
+                let y_plane = frame.y_plane();
+                let stride = frame.stride() as usize;
+                let f_w = frame.width() as usize;
+                let f_h = frame.height() as usize;
+                let fp = crate::hdmi::fingerprint_9_points(
+                    y_plane, stride, f_w, f_h, 1,
+                );
+                eprintln!(
+                    "[perf] preload_drain_fp frames_decoded_pre={} \
+                     frame_dims={}x{} stride={} fp_y={:?}",
+                    dec_state.frames_decoded, f_w, f_h, stride, fp,
+                );
                 drop(frame);
                 dec_state.frames_decoded += 1;
                 drained += 1;
