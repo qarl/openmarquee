@@ -358,12 +358,21 @@ fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
 /// background_image_slide_id under a motion-bearing layer.
 ///
 /// v1-spec-delta #12 (image-bg eviction, 2026-05-08): bounded LRU
-/// per memory budget §4 (image-bg cache hard ceiling = 6 entries
-/// = 48 MB CMA cap). Without eviction, a long-running renderer
+/// per memory budget §4. Without eviction, a long-running renderer
 /// with many distinct images grows CMA without bound until OOM.
 /// Implementation lives in crate::lru as a generic LruMap so the
 /// eviction policy is host-testable on Mac (hdmi.rs is Linux-only).
-pub const IMAGE_BG_CACHE_CAPACITY: usize = 6;
+///
+/// CMA-arc 2026-06-21 C2: cap cut 6 → 3 to claw back ~25 MB
+/// of worst-case headroom (3 × ~8.3 MB at 1080p RGBA). The
+/// working set is current + next image-bg slide; 3 keeps one
+/// slot of slack for preload-mode=max scenarios. A reel that
+/// cycles >3 distinct image-bg backgrounds in flight will
+/// trip eviction churn on transition; per QA the seed image
+/// assets are currently invalid PNGs so the path is rare. If
+/// production reels grow image-bg breadth, revisit (or add
+/// time-expiry to the LRU).
+pub const IMAGE_BG_CACHE_CAPACITY: usize = 3;
 
 pub type ImageBgCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u32)>;
 
@@ -381,12 +390,41 @@ pub type ImageBgCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u
 /// evicts to disk between transitions is correct.
 pub type PosterCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u32)>;
 
-/// r110 stage 3 commit 3.1: capacity for `PosterCache`. Sized for
-/// "current + next 2 slides hot" with one slot of slack for
-/// preload-mode=max scenarios that warm further out. Each entry =
-/// ~3 MB at 1080p RGBA (1920 × 1080 × 4), so 4 entries = ~12 MB
-/// VRAM peak. Fits comfortably in our budget.
-pub const POSTER_CACHE_CAPACITY: usize = 4;
+/// r110 stage 3 commit 3.1: capacity for `PosterCache`.
+///
+/// CMA-arc 2026-06-21 C2: cap cut 4 → 2. The docstring's prior
+/// "~3 MB at 1080p RGBA" math was off by ~3× (1920 × 1080 × 4 =
+/// ~8.3 MB, not 3 MB); the actual 4-entry worst case was ~33 MB,
+/// not ~12 MB. New sizing: 2 entries = "current + next slide"
+/// (the active fade's A + B endpoints). The prior "next 2 slides
+/// hot + preload-mode=max slack" justifies 3-4 cap but each entry
+/// is a real ~8.3 MB, and the 320 MB Pi Zero 2 W CMA budget can't
+/// afford the slack. Reclaim: ~17 MB worst-case. If a future
+/// reel exercises preload-mode=max with video slides and the
+/// 2-slot cap causes poster thrash at fade boundaries, revisit
+/// (raise to 3, or add a time-expiry layer to defer eviction
+/// during active transitions).
+pub const POSTER_CACHE_CAPACITY: usize = 2;
+
+/// CMA-arc 2026-06-21 C3: bounded LRU on `slide_caches` (was an
+/// unbounded HashMap). Each entry caches per-layer text bitmaps +
+/// optionally bg_tex + first_frame_tex (potentially ~8.3 MB at
+/// 1080p RGBA each). Pre-arc the cache grew to the playlist's
+/// distinct slide count with no eviction; on long-running reels
+/// with many distinct slides the working set ballooned.
+///
+/// Cap = 6. The hot working set is current + next (during a
+/// transition) + 1 slack; 6 keeps an additional ~4 slots for
+/// recently-played slides that the reel may revisit in the next
+/// cycle (FYS reel cycles every 19 slides, so the second-pass
+/// hit-rate matters). On a reel with >6 distinct slides per
+/// active cycle the LRU evicts cold-end entries; eviction is
+/// leak-safe via `free_slide_render_cache` in the insert
+/// wrapper.
+///
+/// If production reels grow beyond 6 hot slides at once, revisit
+/// (raise the cap, or add a time-expiry layer).
+pub const SLIDE_CACHES_CAPACITY: usize = 6;
 
 pub struct EglSession<'a> {
     egl_lib: &'a egl::DynamicInstance<egl::EGL1_5>,
@@ -547,14 +585,24 @@ pub struct EglSession<'a> {
     /// reel pass touching every slide, the second pass + onward
     /// hit cache for ALL bake operations.
     ///
-    /// Keyed by slide_id (Uuid). HashMap (no LRU) — FYS reel is
-    /// 19 slides × ~1 MB cached state per slide (small text
-    /// bitmaps); 19 MB total fits trivially in CMA budget. If
-    /// future workloads need eviction, swap to LruMap.
+    /// Keyed by slide_id (Uuid).
+    ///
+    /// CMA-arc 2026-06-21 C3: swapped from HashMap to LruMap with
+    /// `SLIDE_CACHES_CAPACITY` (= 6) entries. The original
+    /// HashMap's design assumption ("19 slides × ~1 MB =
+    /// 19 MB fits trivially") was based on small text bitmaps —
+    /// but the SlideRenderCache also holds bg_tex + first_frame_tex
+    /// + per-layer textures (each potentially ~8.3 MB at 1080p).
+    /// On a reel that warms many slides without revisits, the
+    /// HashMap grew CMA without bound until session teardown.
+    /// The LruMap caps the working set; evicted entries are
+    /// fed to `free_slide_render_cache` (which deletes the
+    /// cached GL textures) so the eviction is leak-safe. See
+    /// the `slide_caches_insert` helper in this file.
     ///
     /// Cleanup at with_egl_session teardown drains all entries
     /// + delete_textures while gl context is still bound.
-    slide_caches: std::collections::HashMap<uuid::Uuid, SlideRenderCache>,
+    slide_caches: crate::lru::LruMap<uuid::Uuid, SlideRenderCache>,
     /// QA-direct (2026-05-08, post-clock_nanosleep): session-cached
     /// fullscreen-quad VBO for the SP transition path. The same
     /// 4-vert TRIANGLE_STRIP geometry is used by every transition
@@ -888,7 +936,10 @@ where
         external_frame_tex: None,
         external_nv12_tex: None,
         current_settings: crate::content::Settings::default(),
-        slide_caches: std::collections::HashMap::new(),
+        // CMA-arc 2026-06-21 C3: bounded LRU. See
+        // SLIDE_CACHES_CAPACITY doc + `slide_caches_insert` helper
+        // for the eviction-cleanup pattern.
+        slide_caches: crate::lru::LruMap::with_capacity(SLIDE_CACHES_CAPACITY),
         transition_sp_quad_vbo: None,
         scissored_bake_atlas: None,
         msdf_atlases: Vec::new(),
@@ -935,36 +986,27 @@ where
         populate_msdf_lookup(&session.msdf_atlases);
     }
 
-    // Bug 3 Slice 1 part B (2026-05-19): allocate the dynamic atlas
-    // page's GPU texture (2048×2048 RGBA8 ~ 16 MB GPU memory).
-    // Failure semantics: non-fatal — if the dynamic atlas can't
-    // initialize, Slice 2's runtime cache-miss path will just keep
-    // returning Tofu (the existing pre-Bug-3 behavior). Log + continue.
-    if let Err(e) = session.dynamic_atlas_page_msdf.allocate_texture(&gl) {
-        eprintln!(
-            "warn: dynamic MSDF atlas page texture alloc failed: {e}; \
-             runtime MSDF cache disabled this session",
-        );
-    } else if let Some(tex) = session.dynamic_atlas_page_msdf.texture() {
-        // Bug 3 Slice 2B: publish the texture handle so
-        // draw_text_layer_msdf can bind it for GlyphKind::DynamicMsdf
-        // quads. Cleared in the teardown block below before the
-        // texture is deleted.
-        populate_dynamic_atlas_lookup(tex);
-    }
-
-    // Bug 3 Slice 3B (2026-05-19): parallel allocation for the
-    // COLRv1-rasterized emoji page. Same failure semantics — if
-    // alloc fails, runtime emoji rasterization yields Tofu (Slice 1
-    // pre-cache behavior); static CBDT path keeps working.
-    if let Err(e) = session.dynamic_atlas_page_colr.allocate_texture(&gl) {
-        eprintln!(
-            "warn: dynamic COLR atlas page texture alloc failed: {e}; \
-             runtime COLRv1 emoji cache disabled this session",
-        );
-    } else if let Some(tex) = session.dynamic_atlas_page_colr.texture() {
-        populate_dynamic_atlas_colr_lookup(tex);
-    }
+    // CMA-arc 2026-06-21 (was Bug 3 Slice 1/3B 2026-05-19): the
+    // dynamic atlas pages' GPU textures (2048×2048 RGBA8 = 16 MB
+    // each = 32 MB CMA total) were UNCONDITIONALLY allocated here
+    // at session bring-up. Even a text-only reel with no dynamic
+    // glyph misses paid the 32 MB cost, leaving little headroom
+    // for a video decoder + crossfade on the Pi Zero 2 W's 320 MB
+    // CMA budget. Now lazy: AtlasPage::allocate_texture is invoked
+    // by glyph_cache::poll_completions on first Ready completion
+    // for that render_mode; the DYNAMIC_ATLAS_LOOKUP thread_local
+    // is published from poll_dynamic_glyph_completions (this file)
+    // each call. allocate_texture is idempotent (atlas_page.rs:
+    // 91-93 early-return on Some) so the per-call cost after the
+    // first allocation is one borrow_mut on a thread_local.
+    // Sample-site safety: all draw sites already gate on
+    // `if let Some(dyn_tex) = dynamic_atlas_tex()` (e.g. L2825)
+    // and skip the batch when None — the prior "alloc failed at
+    // bring-up" branch and the new "alloc not yet fired" branch
+    // both surface as the same None, both result in the same
+    // skip. delete (in cleanup_resources below) is also a no-op
+    // on a never-allocated page (atlas_page.rs:142 `take` no-ops
+    // on None).
 
     // Slice 3D (2026-05-19): the SDF-arc-C.2 CBDT atlas upload
     // (~64 MB RGBA across ~3 pages, plus the `EMOJI_ATLAS_CPU`
@@ -1741,7 +1783,7 @@ fn render_animated_slide_in_session(
             if let Some(old) = session.slide_caches.remove(&slide_id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session.slide_caches.insert(slide_id, SlideRenderCache::new(text_layers.len()));
+            slide_caches_insert(session, slide_id, SlideRenderCache::new(text_layers.len()));
         }
     }
 
@@ -1771,19 +1813,20 @@ fn render_animated_slide_in_session(
             // Mirrors paint_and_present_one_frame_for_slide's pattern
             // (hdmi.rs ~2741). FYS Boot's ● (motion=breathe routes
             // through this function) is the qarl-visible case.
-            let uploaded = session.dynamic_glyph_cache.poll_completions(
-                session.gl,
-                &mut session.dynamic_atlas_page_msdf,
-                &mut session.dynamic_atlas_page_colr,
-                4,
-            );
+            // CMA-arc 2026-06-21: wrap via
+            // poll_dynamic_glyph_completions so the lazy-allocated
+            // atlas textures are published to DYNAMIC_ATLAS_LOOKUP /
+            // DYNAMIC_ATLAS_COLR_LOOKUP after this poll.
+            let uploaded = poll_dynamic_glyph_completions(session, 4);
             if uploaded > 0 {
                 if let Some(old) = session.slide_caches.remove(&slide_id) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session
-                    .slide_caches
-                    .insert(slide_id, SlideRenderCache::new(text_layers.len()));
+                slide_caches_insert(
+                    session,
+                    slide_id,
+                    SlideRenderCache::new(text_layers.len()),
+                );
             }
             // Bug 1 fix (2026-05-09): tick_seconds is session-
             // global, NOT call-local. Motion phase stays continuous
@@ -3719,12 +3762,8 @@ pub fn paint_and_present_one_frame_for_slide(
     // slide_caches forces the next paint to re-layout; the cost is
     // bounded (uploads happen only on first encounter per codepoint
     // per session, so a few cache rebuilds per session at most).
-    let uploaded = session.dynamic_glyph_cache.poll_completions(
-        session.gl,
-        &mut session.dynamic_atlas_page_msdf,
-        &mut session.dynamic_atlas_page_colr,
-        4,
-    );
+    // CMA-arc 2026-06-21: wrap via poll_dynamic_glyph_completions.
+    let uploaded = poll_dynamic_glyph_completions(session, 4);
     if uploaded > 0 {
         let drained: Vec<_> = session.slide_caches.drain().collect();
         for (_id, entry) in drained {
@@ -3787,9 +3826,11 @@ pub fn paint_and_present_one_frame_for_slide(
             if let Some(old) = session.slide_caches.remove(&slide.id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session
-                .slide_caches
-                .insert(slide.id, SlideRenderCache::new(text_layers.len()));
+            slide_caches_insert(
+                session,
+                slide.id,
+                SlideRenderCache::new(text_layers.len()),
+            );
         }
     }
     let cache = session
@@ -4001,12 +4042,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // Same glyph-cache poll + slide-cache invalidation cascade as
     // paint_and_present_one_frame_for_slide. Keeps text-layer
     // rasterization in step with worker-pool completions.
-    let uploaded = session.dynamic_glyph_cache.poll_completions(
-        session.gl,
-        &mut session.dynamic_atlas_page_msdf,
-        &mut session.dynamic_atlas_page_colr,
-        4,
-    );
+    // CMA-arc 2026-06-21: wrap via poll_dynamic_glyph_completions.
+    let uploaded = poll_dynamic_glyph_completions(session, 4);
     if uploaded > 0 {
         let drained: Vec<_> = session.slide_caches.drain().collect();
         for (_id, entry) in drained {
@@ -4063,9 +4100,11 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             if let Some(old) = session.slide_caches.remove(&slide.id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session
-                .slide_caches
-                .insert(slide.id, SlideRenderCache::new(text_layers.len()));
+            slide_caches_insert(
+                session,
+                slide.id,
+                SlideRenderCache::new(text_layers.len()),
+            );
         }
     }
     crate::profile::record_phase(
@@ -5539,7 +5578,7 @@ pub fn paint_and_present_one_transition_frame(
                         if let Some(old) = session.slide_caches.remove(&slide_id) {
                             free_slide_render_cache(session.gl, old);
                         }
-                        session.slide_caches.insert(slide_id, SlideRenderCache::new(layers_len));
+                        slide_caches_insert(session, slide_id, SlideRenderCache::new(layers_len));
                     }
                     let runtime_glyph_ctx = Some(crate::glyph_cache::RuntimeGlyphCtx {
                         cache: &session.dynamic_glyph_cache,
@@ -5704,7 +5743,7 @@ pub fn paint_and_present_one_transition_frame(
                         if let Some(old) = session.slide_caches.remove(&slide_id) {
                             free_slide_render_cache(session.gl, old);
                         }
-                        session.slide_caches.insert(slide_id, SlideRenderCache::new(layers_len));
+                        slide_caches_insert(session, slide_id, SlideRenderCache::new(layers_len));
                     }
                     let runtime_glyph_ctx = Some(crate::glyph_cache::RuntimeGlyphCtx {
                         cache: &session.dynamic_glyph_cache,
@@ -6398,7 +6437,7 @@ pub fn capture_sb_transition_mid_to_png(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                slide_caches_insert(session, sid, SlideRenderCache::new(n));
             }
         }
 
@@ -7243,12 +7282,9 @@ pub fn capture_slide_to_png(
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_millis(800);
             while std::time::Instant::now() < deadline {
-                let _n = session.dynamic_glyph_cache.poll_completions(
-                    session.gl,
-                    &mut session.dynamic_atlas_page_msdf,
-                    &mut session.dynamic_atlas_page_colr,
-                    4,
-                );
+                // CMA-arc 2026-06-21: wrap via
+                // poll_dynamic_glyph_completions.
+                let _n = poll_dynamic_glyph_completions(session, 4);
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
@@ -7442,8 +7478,9 @@ impl<'a> EglSession<'a> {
         let freed_bg = self.image_bg_cache.len();
         let freed_slide = self.image_slide_tex_cache.len();
         // r110 stage 3 commit 3.1: also evict the poster cache
-        // on CMA pressure events. ~12 MB at 4 1080p entries —
-        // worth reclaiming alongside the image caches when the
+        // on CMA pressure events. CMA-arc 2026-06-21 C2: cap is
+        // 2 = ~17 MB worst-case at 1080p RGBA (8.3 MB/entry).
+        // Worth reclaiming alongside the image caches when the
         // r46 mitigation fires.
         let freed_poster = self.poster_cache.len();
         for (_path, (tex, _, _)) in self.image_bg_cache.drain() {
@@ -9456,9 +9493,11 @@ unsafe fn bake_slide_to_fbo(
                 if let Some(old) = session.slide_caches.remove(&slide_id) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session
-                    .slide_caches
-                    .insert(slide_id, SlideRenderCache::new(layers_len));
+                slide_caches_insert(
+                    session,
+                    slide_id,
+                    SlideRenderCache::new(layers_len),
+                );
             }
             // Bug 3 Slice 2D-fp4 (2026-05-19): construct the runtime
             // glyph cache context BEFORE the mutable borrow of
@@ -9637,9 +9676,11 @@ unsafe fn bake_slide_to_fbo(
                 if let Some(old) = session.slide_caches.remove(&slide_id) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session
-                    .slide_caches
-                    .insert(slide_id, SlideRenderCache::new(layers_len));
+                slide_caches_insert(
+                    session,
+                    slide_id,
+                    SlideRenderCache::new(layers_len),
+                );
             }
             // r102.2: reuse cached transition FBO+tex pair when
             // the caller threaded one through.
@@ -10267,7 +10308,7 @@ fn render_transition_animated_in_session(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                slide_caches_insert(session, sid, SlideRenderCache::new(n));
             }
         }
         let start = Instant::now();
@@ -10707,7 +10748,7 @@ fn render_transition_single_pass_in_session(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                slide_caches_insert(session, sid, SlideRenderCache::new(n));
             }
         }
     }
@@ -11078,7 +11119,7 @@ fn render_transition_scissored_bake_in_session(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                slide_caches_insert(session, sid, SlideRenderCache::new(n));
             }
         }
     }
@@ -11962,6 +12003,85 @@ fn clear_dynamic_atlas_colr_lookup() {
 
 fn dynamic_atlas_colr_tex() -> Option<glow::NativeTexture> {
     DYNAMIC_ATLAS_COLR_LOOKUP.with(|c| *c.borrow())
+}
+
+/// CMA-arc 2026-06-21 C3: leak-safe wrapper around the bounded
+/// `slide_caches` LruMap insert. Pre-arc `slide_caches` was an
+/// unbounded HashMap so insert never evicted; post-arc the LruMap
+/// returns the LRU entry via `InsertOutcome::evicted_lru` when at
+/// capacity and the key is new. The evicted SlideRenderCache holds
+/// GL texture handles (per-layer tex Vec + bg_tex + first_frame_tex)
+/// that MUST be released via `free_slide_render_cache` while the
+/// GL context is bound; this helper does that atomically with the
+/// insert.
+///
+/// Behavior:
+///   * If the key already existed (replace), `InsertOutcome::replaced`
+///     is Some — but every call site explicitly removes the prior
+///     entry via `slide_caches.remove(&id)` + free_slide_render_cache
+///     BEFORE inserting, so the post-remove insert sees an empty
+///     slot and `replaced` is None. (Documented + asserted in the
+///     debug build below.)
+///   * If at capacity with a new key, `evicted_lru` is Some — pass
+///     it to free_slide_render_cache.
+///   * Else no cleanup needed.
+#[cfg(target_os = "linux")]
+fn slide_caches_insert(
+    session: &mut EglSession<'_>,
+    slide_id: uuid::Uuid,
+    cache: SlideRenderCache,
+) {
+    let outcome = session.slide_caches.insert(slide_id, cache);
+    // Call sites remove-then-insert when the key existed — so on
+    // this path `replaced` must be None. If it isn't, a caller
+    // missed the remove and the GL texture in the replaced value
+    // would leak. Debug-assert; in release we still drop the
+    // texture via the LruMap to avoid the leak.
+    debug_assert!(
+        outcome.replaced.is_none(),
+        "slide_caches_insert: caller skipped the remove-before-insert pattern; \
+         slide_id={slide_id}"
+    );
+    if let Some(evicted) = outcome.evicted_lru {
+        free_slide_render_cache(session.gl, evicted);
+    }
+    // Release-mode fallback in case the debug_assert above is
+    // disabled and a future caller skips the remove: free the
+    // replaced cache to prevent the leak. Costs one extra
+    // function call on the no-replaced fast path.
+    if let Some(replaced) = outcome.replaced {
+        free_slide_render_cache(session.gl, replaced);
+    }
+}
+
+/// CMA-arc 2026-06-21: wrapper around `GlyphCache::poll_completions`
+/// that publishes the (possibly lazy-allocated) dynamic atlas
+/// textures to `DYNAMIC_ATLAS_LOOKUP` / `DYNAMIC_ATLAS_COLR_LOOKUP`
+/// after the call. Pre-arc the unconditional bring-up alloc
+/// published the textures once at session start; now the pages are
+/// lazy-allocated inside `poll_completions` (glyph_cache.rs) on
+/// first Ready completion of that mode, so the lookup must be
+/// re-checked after each poll. The publish is idempotent (a
+/// thread_local set with the same handle), so the cost after the
+/// first allocation is a single borrow_mut.
+#[cfg(target_os = "linux")]
+fn poll_dynamic_glyph_completions(
+    session: &mut EglSession<'_>,
+    max_uploads_per_call: usize,
+) -> usize {
+    let uploaded = session.dynamic_glyph_cache.poll_completions(
+        session.gl,
+        &mut session.dynamic_atlas_page_msdf,
+        &mut session.dynamic_atlas_page_colr,
+        max_uploads_per_call,
+    );
+    if let Some(tex) = session.dynamic_atlas_page_msdf.texture() {
+        populate_dynamic_atlas_lookup(tex);
+    }
+    if let Some(tex) = session.dynamic_atlas_page_colr.texture() {
+        populate_dynamic_atlas_colr_lookup(tex);
+    }
+    uploaded
 }
 
 /// Resolve a `font_family` string (schema-level) to its baked atlas
@@ -13175,12 +13295,11 @@ fn prewarm_glyph_rasterization(session: &mut EglSession) {
 
     let watchdog_deadline = t0 + PREWARM_WATCHDOG;
     loop {
-        let drained_this_call = session.dynamic_glyph_cache.poll_completions(
-            session.gl,
-            &mut session.dynamic_atlas_page_msdf,
-            &mut session.dynamic_atlas_page_colr,
-            128,
-        );
+        // CMA-arc 2026-06-21: wrap via poll_dynamic_glyph_completions
+        // so the prewarm path triggers the lazy texture allocation
+        // (the prewarm is precisely the path that pre-arc would
+        // have populated the dynamic atlas at session bring-up).
+        let drained_this_call = poll_dynamic_glyph_completions(session, 128);
         let completions_since_baseline =
             session.dynamic_glyph_cache.completion_count() - baseline_completions;
         if crate::hdmi_logic::glyph_prewarm_drain_complete(
@@ -14884,9 +15003,11 @@ fn prewarm_sp_session(
             if let Some(old) = session.slide_caches.remove(&slide_id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session
-                .slide_caches
-                .insert(slide_id, SlideRenderCache::new(n));
+            slide_caches_insert(
+                session,
+                slide_id,
+                SlideRenderCache::new(n),
+            );
         }
 
         // B.3 cleanup follow-up: prepare_layers_for_single_pass is

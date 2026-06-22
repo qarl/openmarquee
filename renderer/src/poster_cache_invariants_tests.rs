@@ -3,7 +3,9 @@
 //! `PosterCache` invariants documented in `hdmi.rs`:
 //!
 //!   * Backing store: `LruMap<PathBuf, (NativeTexture, u32, u32)>`
-//!   * Capacity: `POSTER_CACHE_CAPACITY = 4` (hdmi.rs:288)
+//!   * Capacity: `POSTER_CACHE_CAPACITY = 2` post-CMA-arc 2026-06-21
+//!     C2 cap cut (was 4). Tests below exercise LRU eviction policy
+//!     AT the production cap so a future cap change auto-flows.
 //!   * Eviction-on-insert at capacity: oldest entry is returned
 //!     via `InsertOutcome::evicted_lru`, hdmi.rs:3204 deletes the
 //!     GL texture.
@@ -40,7 +42,7 @@ type FakePosterCache = LruMap<PathBuf, (FakeTexId, u32, u32)>;
 // add a Linux-gated test below that pins the local literal
 // against the real constant. Any drift between the two surfaces
 // in CI/cross-build (which IS Linux).
-const POSTER_CAPACITY_FOR_TESTS: usize = 4;
+const POSTER_CAPACITY_FOR_TESTS: usize = 2;
 
 fn make_cache() -> FakePosterCache {
     LruMap::with_capacity(POSTER_CAPACITY_FOR_TESTS)
@@ -52,7 +54,7 @@ fn pp(id: u32) -> PathBuf {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn poster_cache_capacity_constant_is_four() {
+fn poster_cache_capacity_constant_is_two() {
     // Pin the production constant. If a future change adjusts
     // POSTER_CACHE_CAPACITY's wider implications (CMA budget,
     // multi-poster transition coverage) need a deliberate review
@@ -60,7 +62,10 @@ fn poster_cache_capacity_constant_is_four() {
     // POSTER_CAPACITY_FOR_TESTS against the real constant so the
     // policy assertions in the rest of this file remain
     // representative.
-    assert_eq!(crate::hdmi::POSTER_CACHE_CAPACITY, 4);
+    //
+    // CMA-arc 2026-06-21 C2: cap reduced 4 → 2. The test fn name
+    // was updated and the body asserts the new value.
+    assert_eq!(crate::hdmi::POSTER_CACHE_CAPACITY, 2);
     assert_eq!(POSTER_CAPACITY_FOR_TESTS, crate::hdmi::POSTER_CACHE_CAPACITY);
 }
 
@@ -68,26 +73,26 @@ fn poster_cache_capacity_constant_is_four() {
 fn insert_at_capacity_evicts_oldest_via_evicted_lru() {
     let mut cache = make_cache();
     // Fill to capacity.
-    for i in 0..4 {
+    for i in 0..2 {
         let out = cache.insert(pp(i), (100 + i, 1920, 1080));
         assert!(out.evicted_lru.is_none(), "no eviction below capacity");
         assert!(out.replaced.is_none(), "fresh key, no replacement");
     }
-    assert_eq!(cache.len(), 4);
-    // The 5th insert with a fresh key must evict the oldest.
-    let out = cache.insert(pp(4), (104, 1920, 1080));
+    assert_eq!(cache.len(), 2);
+    // The 3rd insert with a fresh key must evict the oldest.
+    let out = cache.insert(pp(2), (102, 1920, 1080));
     let (evicted_tex, _, _) = out
         .evicted_lru
-        .expect("5th distinct insert must evict the oldest entry");
+        .expect("3rd distinct insert must evict the oldest entry");
     assert_eq!(evicted_tex, 100, "oldest texture handle was id 100");
     assert!(out.replaced.is_none(), "fresh key, no replacement");
-    assert_eq!(cache.len(), 4);
+    assert_eq!(cache.len(), 2);
 }
 
 #[test]
 fn insert_replaces_existing_key_via_replaced_no_eviction() {
     let mut cache = make_cache();
-    for i in 0..4 {
+    for i in 0..2 {
         cache.insert(pp(i), (100 + i, 1920, 1080));
     }
     // Re-insert with key 1; must return the prior tex via
@@ -102,7 +107,7 @@ fn insert_replaces_existing_key_via_replaced_no_eviction() {
         out.evicted_lru.is_none(),
         "same-key replace must NOT evict another entry"
     );
-    assert_eq!(cache.len(), 4);
+    assert_eq!(cache.len(), 2);
 }
 
 #[test]
@@ -114,7 +119,7 @@ fn force_evict_drains_every_entry_exactly_once() {
     // (entries left behind), no double-free (same entry yielded
     // twice).
     let mut cache = make_cache();
-    for i in 0..4 {
+    for i in 0..2 {
         cache.insert(pp(i), (100 + i, 1920, 1080));
     }
     let mut seen: Vec<FakeTexId> = Vec::new();
@@ -122,40 +127,40 @@ fn force_evict_drains_every_entry_exactly_once() {
         seen.push(tex);
     }
     seen.sort_unstable();
-    assert_eq!(seen, vec![100, 101, 102, 103], "every cached tex must drain exactly once");
+    assert_eq!(seen, vec![100, 101], "every cached tex must drain exactly once");
     assert_eq!(cache.len(), 0, "drain leaves cache empty");
 }
 
 #[test]
 fn drain_resets_capacity_so_subsequent_inserts_work() {
     let mut cache = make_cache();
-    for i in 0..4 {
+    for i in 0..2 {
         cache.insert(pp(i), (100 + i, 1920, 1080));
     }
     let _: Vec<_> = cache.drain().collect();
     // Post-drain, a fresh fill works normally and does NOT evict
     // until capacity is reached again.
-    for i in 100..104 {
+    for i in 100..102 {
         let out = cache.insert(pp(i), (200 + i, 1920, 1080));
         assert!(out.evicted_lru.is_none());
     }
-    assert_eq!(cache.len(), 4);
+    assert_eq!(cache.len(), 2);
 }
 
 #[test]
 fn get_promotes_entry_to_most_recently_used() {
     // The hottest poster (likely the slide currently transitioning
-    // INTO) should not be evicted by a fifth distinct insert. This
+    // INTO) should not be evicted by the next distinct insert. This
     // mirrors `ImageBgCache`'s policy and prevents the active
     // transition's B-side poster from being silently dropped.
     let mut cache = make_cache();
-    for i in 0..4 {
+    for i in 0..2 {
         cache.insert(pp(i), (100 + i, 1920, 1080));
     }
     // Touch entry 0 — now it's MRU.
     let _ = cache.get(&pp(0));
-    // 5th insert evicts the NEW LRU — entry 1, not entry 0.
-    let out = cache.insert(pp(4), (104, 1920, 1080));
+    // 3rd insert evicts the NEW LRU — entry 1, not entry 0.
+    let out = cache.insert(pp(2), (102, 1920, 1080));
     let (evicted_tex, _, _) = out
         .evicted_lru
         .expect("eviction at capacity");
