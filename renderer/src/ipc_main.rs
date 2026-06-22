@@ -542,6 +542,28 @@ impl IpcPaintMetrics {
 /// resident even when intermittent BeginSlides bring in cold ones.
 const SLIDE_CACHE_CAP: usize = 32;
 
+/// CMA #3 (2026-06-22): mode flag for `SlideCache::load_with_mode`.
+///
+/// Full = open Mp4Demuxer + insert to items/video_demuxers AND
+/// synchronously prime the V4L2 decoder. The pre-CMA-#3
+/// behavior; default for ALL load callers EXCEPT
+/// ensure_bg_video_for_text_slide.
+///
+/// DemuxerOnly = open Mp4Demuxer + insert to items/video_demuxers
+/// but DEFER the ~200-600 ms V4L2 prime to first paint. The
+/// text-over-video paint dispatch detects the missing decoder
+/// + lazy-primes via prime_video_decoder. Frees CMA for slides
+/// that load+evict without painting (rapid playlist changes,
+/// preload-then-skip flows). Used only by
+/// ensure_bg_video_for_text_slide; the eager async preload
+/// (preload_in_worker) still primes upfront because the
+/// worker is off the IPC main thread + has no time pressure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadMode {
+    Full,
+    DemuxerOnly,
+}
+
 /// CMA #2 (2026-06-21): bounded LRU capacity for video_decoders +
 /// video_demuxers. Per QA's leads file (project_cma_decoder_arc):
 /// each primed V4L2 decoder holds ~16-25 MB CMA (4+4 buffers at
@@ -860,10 +882,22 @@ impl SlideCache {
             );
             return Ok(());
         }
-        if let Err(e) = self.load(content_root, bg_id) {
+        // CMA #3 (2026-06-22): DemuxerOnly mode skips the
+        // synchronous ~200-600 ms V4L2 prime. The bg-video's
+        // decoder is lazy-primed on first paint via the
+        // lazy_prime_bg_video path in the text-over-video
+        // paint dispatch. This frees CMA for slides that
+        // load+evict without ever painting (rapid playlist
+        // changes). The eager preload path is UNCHANGED --
+        // preload_in_worker still primes the bg-video off
+        // the main thread; this only affects the synchronous
+        // BeginSlide fallback when preload didn't fire (or
+        // the decoder got LRU-evicted between preload and
+        // first paint).
+        if let Err(e) = self.load_with_mode(content_root, bg_id, LoadMode::DemuxerOnly) {
             // Best-effort: log + carry on. The paint path will
-            // detect the missing demuxer/decoder + skip the video
-            // bake step (last frame stays on screen).
+            // detect the missing demuxer + skip the video bake
+            // step (last frame stays on screen).
             eprintln!(
                 "ipc: warning -- text slide {} references bg video {} but load failed: {:#}",
                 item_id, bg_id, e
@@ -883,7 +917,29 @@ impl SlideCache {
     /// without an entry; downstream paint paths fall back via
     /// the existing UnsupportedSlide wire (Python:
     /// `RustRendererUnsupportedSlideError`).
+    ///
+    /// CMA #3 (2026-06-22): delegates to load_with_mode with
+    /// LoadMode::Full. The DemuxerOnly variant skips the
+    /// synchronous ~200-600 ms V4L2 prime; called from
+    /// ensure_bg_video_for_text_slide where the bg-video decoder
+    /// can be lazy-primed on first paint instead of eagerly at
+    /// BeginSlide. This frees CMA for slides that load+evict
+    /// without ever painting (rapid playlist changes, etc.).
     fn load(&mut self, content_root: &std::path::Path, item_id: uuid::Uuid) -> Result<()> {
+        self.load_with_mode(content_root, item_id, LoadMode::Full)
+    }
+
+    /// CMA #3 (2026-06-22): mode-aware variant of `load`. See
+    /// `LoadMode` for the rationale + per-mode semantics. The
+    /// body is the pre-CMA-#3 `load` impl, with the V4L2 prime
+    /// call gated by `matches!(mode, LoadMode::Full)`.
+    fn load_with_mode(
+        &mut self,
+        content_root: &std::path::Path,
+        item_id: uuid::Uuid,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        mode: LoadMode,
+    ) -> Result<()> {
         // r110 c3.3.2 second-pass subagent BLOCKER-3 fix: if an
         // async recreate worker is in flight for this id, do NOT
         // synchronously re-prime here. Without this guard,
@@ -1043,8 +1099,20 @@ impl SlideCache {
                     // Pi-side data, so a separate (smaller) [perf]
                     // line on macOS isn't worth it -- we just skip
                     // emission there.
+                    // CMA #3 (2026-06-22): DemuxerOnly mode skips
+                    // the synchronous V4L2 prime entirely. Lazy
+                    // prime fires on first paint via the text-over-
+                    // video paint dispatch path. prime_us is 0 in
+                    // this mode (probe still emits so QA can A/B
+                    // count deferred-prime slides vs eager).
                     #[cfg(target_os = "linux")]
-                    let prime_us = {
+                    let prime_us = if matches!(mode, LoadMode::DemuxerOnly) {
+                        eprintln!(
+                            "[perf] load_demuxer_only slide_id={} reason=cma_3_lazy_bg_prime",
+                            item_id,
+                        );
+                        0u128
+                    } else {
                         let t_prime = std::time::Instant::now();
                         // r75 subagent BLOCKER-2: snapshot BEFORE the
                         // prime call. The error-path log emits both
@@ -2531,7 +2599,54 @@ fn run_paint_hook(
                         // through to the standard text paint path so
                         // the slide still renders (text on solid bg).
                         let dem_present = cache.video_demuxers.contains_key(&bg_id);
-                        let dec_present = cache.video_decoders.contains_key(&bg_id);
+                        let mut dec_present = cache.video_decoders.contains_key(&bg_id);
+                        // CMA #3 (2026-06-22): lazy-prime fallback.
+                        // ensure_bg_video_for_text_slide uses
+                        // LoadMode::DemuxerOnly, deferring the V4L2
+                        // prime to first paint. Detect dem-present-
+                        // but-dec-absent here + prime in place. This
+                        // is the FIRST PAINT of a text-over-video
+                        // slide whose bg-video wasn't already primed
+                        // by the async preload (or whose decoder got
+                        // LRU-evicted between preload and paint).
+                        // ~200-600 ms one-time cost on first paint;
+                        // subsequent paints cache-hit.
+                        //
+                        // Failures fall through to the existing
+                        // dec_present=false path (text-only paint),
+                        // preserving the best-effort contract.
+                        #[cfg(target_os = "linux")]
+                        if dem_present && !dec_present {
+                            // Borrow dem read-only first (cache.get
+                            // takes &mut self for the LRU touch);
+                            // dem is bg_id-keyed so the touch is
+                            // correct.
+                            if let Some(dem) = cache.video_demuxers.get(&bg_id) {
+                                let t_lazy = std::time::Instant::now();
+                                let prime_result = crate::video_decode::prime_video_decoder(
+                                    dem, "lazy_bg_prime",
+                                );
+                                let lazy_us = t_lazy.elapsed().as_micros();
+                                match prime_result {
+                                    Ok(dec_state) => {
+                                        cache.video_decoders.insert(bg_id, dec_state);
+                                        dec_present = true;
+                                        eprintln!(
+                                            "[perf] lazy_prime_bg_video slide_id={} bg_video_id={} \
+                                             lazy_us={} outcome=ok",
+                                            slide_id, bg_id, lazy_us,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[perf] lazy_prime_bg_video slide_id={} bg_video_id={} \
+                                             lazy_us={} outcome=err err={:#}",
+                                            slide_id, bg_id, lazy_us, e,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         if dem_present && dec_present {
                             let dem = cache.video_demuxers
                                 .get(&bg_id)
