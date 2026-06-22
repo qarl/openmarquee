@@ -358,12 +358,21 @@ fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
 /// background_image_slide_id under a motion-bearing layer.
 ///
 /// v1-spec-delta #12 (image-bg eviction, 2026-05-08): bounded LRU
-/// per memory budget §4 (image-bg cache hard ceiling = 6 entries
-/// = 48 MB CMA cap). Without eviction, a long-running renderer
+/// per memory budget §4. Without eviction, a long-running renderer
 /// with many distinct images grows CMA without bound until OOM.
 /// Implementation lives in crate::lru as a generic LruMap so the
 /// eviction policy is host-testable on Mac (hdmi.rs is Linux-only).
-pub const IMAGE_BG_CACHE_CAPACITY: usize = 6;
+///
+/// CMA-arc 2026-06-21 C2: cap cut 6 → 3 to claw back ~25 MB
+/// of worst-case headroom (3 × ~8.3 MB at 1080p RGBA). The
+/// working set is current + next image-bg slide; 3 keeps one
+/// slot of slack for preload-mode=max scenarios. A reel that
+/// cycles >3 distinct image-bg backgrounds in flight will
+/// trip eviction churn on transition; per QA the seed image
+/// assets are currently invalid PNGs so the path is rare. If
+/// production reels grow image-bg breadth, revisit (or add
+/// time-expiry to the LRU).
+pub const IMAGE_BG_CACHE_CAPACITY: usize = 3;
 
 pub type ImageBgCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u32)>;
 
@@ -381,12 +390,21 @@ pub type ImageBgCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u
 /// evicts to disk between transitions is correct.
 pub type PosterCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u32)>;
 
-/// r110 stage 3 commit 3.1: capacity for `PosterCache`. Sized for
-/// "current + next 2 slides hot" with one slot of slack for
-/// preload-mode=max scenarios that warm further out. Each entry =
-/// ~3 MB at 1080p RGBA (1920 × 1080 × 4), so 4 entries = ~12 MB
-/// VRAM peak. Fits comfortably in our budget.
-pub const POSTER_CACHE_CAPACITY: usize = 4;
+/// r110 stage 3 commit 3.1: capacity for `PosterCache`.
+///
+/// CMA-arc 2026-06-21 C2: cap cut 4 → 2. The docstring's prior
+/// "~3 MB at 1080p RGBA" math was off by ~3× (1920 × 1080 × 4 =
+/// ~8.3 MB, not 3 MB); the actual 4-entry worst case was ~33 MB,
+/// not ~12 MB. New sizing: 2 entries = "current + next slide"
+/// (the active fade's A + B endpoints). The prior "next 2 slides
+/// hot + preload-mode=max slack" justifies 3-4 cap but each entry
+/// is a real ~8.3 MB, and the 320 MB Pi Zero 2 W CMA budget can't
+/// afford the slack. Reclaim: ~17 MB worst-case. If a future
+/// reel exercises preload-mode=max with video slides and the
+/// 2-slot cap causes poster thrash at fade boundaries, revisit
+/// (raise to 3, or add a time-expiry layer to defer eviction
+/// during active transitions).
+pub const POSTER_CACHE_CAPACITY: usize = 2;
 
 pub struct EglSession<'a> {
     egl_lib: &'a egl::DynamicInstance<egl::EGL1_5>,
@@ -7421,8 +7439,9 @@ impl<'a> EglSession<'a> {
         let freed_bg = self.image_bg_cache.len();
         let freed_slide = self.image_slide_tex_cache.len();
         // r110 stage 3 commit 3.1: also evict the poster cache
-        // on CMA pressure events. ~12 MB at 4 1080p entries —
-        // worth reclaiming alongside the image caches when the
+        // on CMA pressure events. CMA-arc 2026-06-21 C2: cap is
+        // 2 = ~17 MB worst-case at 1080p RGBA (8.3 MB/entry).
+        // Worth reclaiming alongside the image caches when the
         // r46 mitigation fires.
         let freed_poster = self.poster_cache.len();
         for (_path, (tex, _, _)) in self.image_bg_cache.drain() {
