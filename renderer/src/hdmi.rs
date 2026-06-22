@@ -7936,67 +7936,141 @@ impl<'a> EglSession<'a> {
         self.live_preview.maybe_capture(self.gl, phys_w, phys_h);
     }
 
-    /// Flip-race fix A (2026-06-22): wrap `glFinish` + `eglSwapBuffers`
-    /// at every paint_and_present_* swap site.
+    /// Flip-race fix C (2026-06-22): EGL_KHR_fence_sync per-buffer
+    /// fence + eglSwapBuffers. Replaces fix A's gl.finish() body.
     ///
-    /// Race: vc4 is tile-based, so a render queued via GLES2 commands
-    /// is not COMPLETE until the kernel scans (or glFinish drains)
-    /// the tile-store. `eglSwapBuffers` does an implicit GL flush
-    /// (which issues but doesn't WAIT for completion) and advances
-    /// the GBM swap chain. Combined with:
-    ///   - GBM returning a recently-released BO from the pool as the
-    ///     new backbuffer, and
-    ///   - `commit_fb` submitting the page-flip with `PageFlipFlags::
-    ///     ASYNC` so the kernel switches scanout immediately,
-    /// the kernel can scan out a BO before its NEW content's tiles
-    /// are fully stored — exposing the BO's STALE prior content for
-    /// one frame. That stale frame is whatever the BO was last used
-    /// to scan out, i.e. a frame from a few back. Net visible
-    /// effect: forward-playing video flashes BACK to an earlier
-    /// frame for one frame, then resumes (qarl's "snap-back").
+    /// Background — fix A measured on glass: gl_finish_us p50=28ms
+    /// (transition 47ms!), ~14fps, choppy. Unshippable. Cause:
+    /// gl.finish() drains the ENTIRE pending GPU pipeline (vc4
+    /// backlog from prior frames + current frame), not just the
+    /// current frame's commands. fix C uses an EGL fence narrowly
+    /// scoped to THIS frame's commands so the wait covers only
+    /// this frame's tile-store (prior frames' work is already
+    /// complete by then, contributing ~0 to the wait).
     ///
-    /// Heisenbug check: `glReadPixels` (in the present-dump probe)
-    /// forces a tile-store flush + bus transfer (~50-100ms on Pi
-    /// Zero 2W), guaranteeing the BO is complete before the kernel
-    /// scans → snap-back disappears under the probe. QA confirmed
-    /// this exactly: 12 min of looping with the dump build, ZERO
-    /// auto-detected backwards; same reel without the probe, qarl
-    /// sees the snap-back. Cause + Heisenbug both explained by THIS
-    /// race.
+    /// The race being closed is unchanged from fix A (= what made
+    /// fix A's correctness right even though its performance was
+    /// wrong): vc4 lazy tile-store + GBM pool returning a recently-
+    /// released BO + commit_fb's PageFlipFlags::ASYNC = kernel can
+    /// scan a stale BO before the new tiles are stored. The fence
+    /// guarantees the BO is complete before lock_front_buffer.
     ///
-    /// Fix: `glFinish` BEFORE the swap so the BO that swap_buffers
-    /// promotes to front is GUARANTEED to have its tiles stored.
-    /// `lock_front_buffer` + `page_flip` then send a complete BO
-    /// to the kernel — stale-scanout race closed.
+    /// EGL 1.5 sync API (Mesa supports on vc4):
+    ///   1. `create_sync(display, SYNC_FENCE, [])` — inserts a fence
+    ///      at the current GL command stream insertion point. The
+    ///      fence signals when all commands BEFORE the insertion
+    ///      complete.
+    ///   2. `client_wait_sync(display, sync, SYNC_FLUSH_COMMANDS_BIT,
+    ///      timeout)` — blocks until the fence signals. The FLUSH
+    ///      bit triggers an implicit glFlush so the fence insertion
+    ///      point is actually submitted to the GPU (without it, a
+    ///      driver that buffers commands could wait forever).
+    ///   3. `destroy_sync` — cleanup, always called.
     ///
-    /// Cost: GPU completion stall, typically 5-15ms on Pi Zero 2W.
-    /// Strictly less than the readback's 50-100ms because we just
-    /// flush tiles to the BO; no bus transfer back to CPU. Preserves
-    /// ASYNC page_flip's vblank-skip benefit (the flip itself is
-    /// still immediate; only the GL render side waits for GPU).
+    /// Placement: fence is created AFTER eglSwapBuffers so the wait
+    /// covers both the caller's draws AND any swap-internal GPU
+    /// work. Wait runs BEFORE the caller proceeds to
+    /// lock_front_buffer + page_flip — guarantees THIS BO's content
+    /// is complete before the kernel could scan it.
     ///
-    /// Telemetry: emit `[perf] present_frame site=X gl_finish_us=A
-    /// swap_us=B total_us=C` per swap so QA can measure FPS impact
-    /// on glass (qarl is FPS-sensitive — the present-dump probe's
-    /// low FPS was noticeable to him; A's stall must be acceptable).
+    /// Fallback: if create_sync fails (driver lacks the extension —
+    /// very unlikely on Mesa+vc4), fall back to gl.finish() so
+    /// correctness is preserved (at fix A's performance cost).
+    /// Loud warn log so QA can spot the fallback if it ever fires.
+    ///
+    /// Telemetry: `[perf] present_frame site=X swap_us=A
+    /// fence_create_us=B fence_wait_us=C status=ok|timeout|err|
+    /// fallback total_us=T` per call — QA quantifies the actual
+    /// FPS cost on glass.
     fn finish_and_swap_with_timing(&mut self, site: &'static str) -> Result<()> {
-        use glow::HasContext;
-        let t_finish = std::time::Instant::now();
-        unsafe {
-            self.gl.finish();
-        }
-        let finish_us = t_finish.elapsed().as_micros();
+        // 1. Swap promotes the just-drawn backbuffer to front. swap
+        //    may issue some internal GL/EGL work; the fence below
+        //    captures it.
         let t_swap = std::time::Instant::now();
         self.egl_lib
             .swap_buffers(self.display, self.egl_surface)
             .map_err(|e| anyhow!("eglSwapBuffers ({site}) failed: {e:?}"))?;
         let swap_us = t_swap.elapsed().as_micros();
+
+        // 2. Insert a fence at the current command-stream position.
+        //    Signals when all commands queued BEFORE this point have
+        //    completed (= draws + swap-internal work).
+        let t_create = std::time::Instant::now();
+        let sync_result = unsafe {
+            self.egl_lib.create_sync(self.display, egl::SYNC_FENCE as egl::Enum, &[])
+        };
+        let create_us = t_create.elapsed().as_micros();
+
+        // 3. Wait on the fence; destroy; record status.
+        let (wait_us, status) = match sync_result {
+            Ok(sync) => {
+                let t_wait = std::time::Instant::now();
+                let wait_res = unsafe {
+                    self.egl_lib.client_wait_sync(
+                        self.display,
+                        sync,
+                        egl::SYNC_FLUSH_COMMANDS_BIT,
+                        // 500 ms timeout: ~10x the worst fix A
+                        // measurement (47ms transition). Below =
+                        // forward progress; above = suspect driver
+                        // wedge.
+                        500_000_000,
+                    )
+                };
+                let wait_us = t_wait.elapsed().as_micros();
+                if let Err(e) =
+                    unsafe { self.egl_lib.destroy_sync(self.display, sync) }
+                {
+                    eprintln!(
+                        "warn: present_frame destroy_sync failed site={}: {:?}",
+                        site, e,
+                    );
+                }
+                let status = match wait_res {
+                    Ok(s) if s == egl::CONDITION_SATISFIED => "ok",
+                    Ok(s) if s == egl::TIMEOUT_EXPIRED => {
+                        eprintln!(
+                            "warn: present_frame fence_wait TIMEOUT (500ms) site={}",
+                            site,
+                        );
+                        "timeout"
+                    }
+                    Ok(_) => "other",
+                    Err(e) => {
+                        eprintln!(
+                            "warn: present_frame client_wait_sync err site={}: {:?}",
+                            site, e,
+                        );
+                        "err"
+                    }
+                };
+                (wait_us, status)
+            }
+            Err(e) => {
+                // EGL_KHR_fence_sync absent — defensive fallback.
+                eprintln!(
+                    "warn: present_frame create_sync failed site={}: {:?} \
+                     (falling back to gl.finish — fix-A performance profile)",
+                    site, e,
+                );
+                use glow::HasContext;
+                let t_finish = std::time::Instant::now();
+                unsafe {
+                    self.gl.finish();
+                }
+                (t_finish.elapsed().as_micros(), "fallback")
+            }
+        };
+
         eprintln!(
-            "[perf] present_frame site={} gl_finish_us={} swap_us={} total_us={}",
+            "[perf] present_frame site={} swap_us={} fence_create_us={} \
+             fence_wait_us={} status={} total_us={}",
             site,
-            finish_us,
             swap_us,
-            finish_us + swap_us,
+            create_us,
+            wait_us,
+            status,
+            swap_us + create_us + wait_us,
         );
         Ok(())
     }
@@ -16686,21 +16760,52 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
         // Render frame 0 + ALLOW_MODESET commit that binds connector
         // → CRTC and primary plane → FB.
         render_frame(&gl, 0.0);
-        // Flip-race fix A (2026-06-22): atomic-CLI path has no
-        // EglSession to host the helper; inline the fix shape.
+        // Flip-race fix C (2026-06-22): inlined EGL fence sync for
+        // atomic-CLI path (no EglSession to host the helper). Same
+        // shape as EglSession::finish_and_swap_with_timing.
         {
-            use glow::HasContext;
-            let t_finish = std::time::Instant::now();
-            unsafe { gl.finish(); }
-            let finish_us = t_finish.elapsed().as_micros();
             let t_swap = std::time::Instant::now();
             egl_lib
                 .swap_buffers(display, egl_surface)
                 .map_err(|e| anyhow!("eglSwapBuffers (frame 0) failed: {e:?}"))?;
             let swap_us = t_swap.elapsed().as_micros();
+            let t_create = std::time::Instant::now();
+            let sync_result = unsafe {
+                egl_lib.create_sync(display, egl::SYNC_FENCE as egl::Enum, &[])
+            };
+            let create_us = t_create.elapsed().as_micros();
+            let (wait_us, status) = match sync_result {
+                Ok(sync) => {
+                    let t_wait = std::time::Instant::now();
+                    let wait_res = unsafe {
+                        egl_lib.client_wait_sync(
+                            display, sync,
+                            egl::SYNC_FLUSH_COMMANDS_BIT,
+                            500_000_000,
+                        )
+                    };
+                    let wait_us = t_wait.elapsed().as_micros();
+                    let _ = unsafe { egl_lib.destroy_sync(display, sync) };
+                    let status = match wait_res {
+                        Ok(s) if s == egl::CONDITION_SATISFIED => "ok",
+                        Ok(s) if s == egl::TIMEOUT_EXPIRED => "timeout",
+                        Ok(_) => "other",
+                        Err(_) => "err",
+                    };
+                    (wait_us, status)
+                }
+                Err(_) => {
+                    use glow::HasContext;
+                    let t_finish = std::time::Instant::now();
+                    unsafe { gl.finish(); }
+                    (t_finish.elapsed().as_micros(), "fallback")
+                }
+            };
             eprintln!(
-                "[perf] present_frame site=atomic_cli_init gl_finish_us={} swap_us={} total_us={}",
-                finish_us, swap_us, finish_us + swap_us,
+                "[perf] present_frame site=atomic_cli_init swap_us={} \
+                 fence_create_us={} fence_wait_us={} status={} total_us={}",
+                swap_us, create_us, wait_us, status,
+                swap_us + create_us + wait_us,
             );
         }
         let first_bo = unsafe {
@@ -16750,21 +16855,51 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
         while Instant::now() < end {
             let t = start.elapsed().as_secs_f32();
             render_frame(&gl, t);
-            // Flip-race fix A (2026-06-22): inlined for atomic-CLI
-            // path (no EglSession host).
+            // Flip-race fix C (2026-06-22): inlined EGL fence sync
+            // for atomic-CLI path (no EglSession host).
             {
-                use glow::HasContext;
-                let t_finish = std::time::Instant::now();
-                unsafe { gl.finish(); }
-                let finish_us = t_finish.elapsed().as_micros();
                 let t_swap = std::time::Instant::now();
                 egl_lib
                     .swap_buffers(display, egl_surface)
                     .map_err(|e| anyhow!("eglSwapBuffers (frame {frame_count}) failed: {e:?}"))?;
                 let swap_us = t_swap.elapsed().as_micros();
+                let t_create = std::time::Instant::now();
+                let sync_result = unsafe {
+                    egl_lib.create_sync(display, egl::SYNC_FENCE as egl::Enum, &[])
+                };
+                let create_us = t_create.elapsed().as_micros();
+                let (wait_us, status) = match sync_result {
+                    Ok(sync) => {
+                        let t_wait = std::time::Instant::now();
+                        let wait_res = unsafe {
+                            egl_lib.client_wait_sync(
+                                display, sync,
+                                egl::SYNC_FLUSH_COMMANDS_BIT,
+                                500_000_000,
+                            )
+                        };
+                        let wait_us = t_wait.elapsed().as_micros();
+                        let _ = unsafe { egl_lib.destroy_sync(display, sync) };
+                        let status = match wait_res {
+                            Ok(s) if s == egl::CONDITION_SATISFIED => "ok",
+                            Ok(s) if s == egl::TIMEOUT_EXPIRED => "timeout",
+                            Ok(_) => "other",
+                            Err(_) => "err",
+                        };
+                        (wait_us, status)
+                    }
+                    Err(_) => {
+                        use glow::HasContext;
+                        let t_finish = std::time::Instant::now();
+                        unsafe { gl.finish(); }
+                        (t_finish.elapsed().as_micros(), "fallback")
+                    }
+                };
                 eprintln!(
-                    "[perf] present_frame site=atomic_cli_loop gl_finish_us={} swap_us={} total_us={}",
-                    finish_us, swap_us, finish_us + swap_us,
+                    "[perf] present_frame site=atomic_cli_loop swap_us={} \
+                     fence_create_us={} fence_wait_us={} status={} total_us={}",
+                    swap_us, create_us, wait_us, status,
+                    swap_us + create_us + wait_us,
                 );
             }
             let bo = unsafe {
