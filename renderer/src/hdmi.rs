@@ -4110,6 +4110,11 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     decoder: &crate::v4l2::Decoder,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: same idle-FBO free as the
+    // text-only path. Wedge + video-only test reels never exercise
+    // the text-slide hold path, so this call site is load-bearing
+    // for the wedge-reel A/B.
+    unsafe { free_idle_session_fbos(session); }
     // r61 Phase B (2026-06-04): first-frame paint breakdown for the
     // text-over-video hot path. r58 + r57 shaved most of the
     // pre-transition stall; the residual gap qarl can still see is
@@ -4639,6 +4644,11 @@ pub fn paint_and_present_one_image_slide_frame(
     content_root: &Path,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: idle-free FBOs at image-slide
+    // hold entry. Image-only reels never touch the text-slide
+    // path so this is needed to actually trigger the ~40 MB
+    // reclaim on image-heavy reels.
+    unsafe { free_idle_session_fbos(session); }
     // perf-night r2 (2026-05-26): bake/compose/present sub-phase
     // wraps. Image bake = PNG decode + texture upload (cold) or
     // texture-cache hit (warm); compose = blit to FBO + present pass;
@@ -4781,6 +4791,9 @@ pub fn paint_and_present_external_frame(
     frame_h: u32,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: idle-free at external-frame hold
+    // entry (STREAM/VLC RGB push path).
+    unsafe { free_idle_session_fbos(session); }
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // Non-identity brightness/gamma routes through the scene FBO +
@@ -4888,6 +4901,9 @@ pub fn paint_and_present_external_nv12_frame(
     frame_h: u32,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: idle-free at external-NV12 hold
+    // entry (STREAM/VLC HW-decode NV12 push path).
+    unsafe { free_idle_session_fbos(session); }
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // Non-identity brightness/gamma OR non-zero rotation routes
@@ -5003,6 +5019,13 @@ pub fn paint_and_present_one_video_slide_frame(
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
 ) -> Result<()> {
+    // CMA-arc 2026-06-22 RANK 3: idle-free at video-slide hold
+    // entry. THIS IS THE WEDGE-REEL PATH (3-video crossfade
+    // reel) — per QA the wedge reel never invokes the text-slide
+    // path, so the original RANK 3 commit's free helper never
+    // fired on the wedge-reel A/B. Adding here lights the
+    // reclaim where the test reel exercises it.
+    unsafe { free_idle_session_fbos(session); }
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // V4L2 piece 4f first-frame profile gate. profile_first is
