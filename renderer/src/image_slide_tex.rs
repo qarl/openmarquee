@@ -384,13 +384,23 @@ fn load_png_rgba_for_cache(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
         ));
     }
     let (w, h) = (info.width, info.height);
-    let rgba: Vec<u8> = match info.color_type {
+    let mut rgba: Vec<u8> = match info.color_type {
         png::ColorType::Rgba => buf,
         png::ColorType::Rgb => {
-            let mut out = Vec::with_capacity((w * h) as usize * 4);
-            for px in buf.chunks_exact(3) {
-                out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+            // CMA-arc 2026-06-22 C5: mirror hdmi.rs::load_png_rgba —
+            // pre-size the RGBA Vec, explicit drop(buf) after the
+            // RGB→RGBA expansion so the intermediate frees before
+            // the flip phase.
+            let mut out = vec![0u8; (w * h) as usize * 4];
+            for (src, dst) in
+                buf.chunks_exact(3).zip(out.chunks_exact_mut(4))
+            {
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = 0xFF;
             }
+            drop(buf);
             out
         }
         other => {
@@ -400,7 +410,10 @@ fn load_png_rgba_for_cache(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
             ));
         }
     };
-    let rgba = crate::hdmi_logic::flip_rgba_rows_vertically(rgba, w, h);
+    // CMA-arc 2026-06-22 C5: in-place flip — saves the ~8.3 MB
+    // second allocation the prior consuming version paid. Matches
+    // hdmi.rs::load_png_rgba's transformation.
+    crate::hdmi_logic::flip_rgba_rows_in_place(&mut rgba, w, h);
     Ok((rgba, w, h))
 }
 

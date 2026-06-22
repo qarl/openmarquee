@@ -3283,19 +3283,50 @@ pub fn nv12_dims_ok(frame_w: u32, frame_h: u32) -> bool {
 /// the chunk math; the GL upload downstream surfaces the real
 /// error. Pure (no GL), so the flip is host-testable on the Mac
 /// dev box even though `hdmi.rs` itself is Linux-only.
-pub fn flip_rgba_rows_vertically(rgba: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+pub fn flip_rgba_rows_vertically(mut rgba: Vec<u8>, w: u32, h: u32) -> Vec<u8> {
+    // CMA-arc 2026-06-22 C5: delegate to the in-place version so the
+    // consuming API stays compatible with existing callers (host
+    // tests in this file etc.) while production paths get the
+    // ~8.3 MB heap-peak win by calling `flip_rgba_rows_in_place`
+    // directly on a buffer they already own.
+    flip_rgba_rows_in_place(&mut rgba, w, h);
+    rgba
+}
+
+/// CMA-arc 2026-06-22 C5: in-place version of
+/// `flip_rgba_rows_vertically`. Uses a single stride-sized scratch
+/// row (~7.7 KB at 1080p) for the swap instead of allocating a
+/// fresh w*h*4 buffer (~8.3 MB at 1080p) — saves ~8.3 MB heap
+/// peak per PNG decode (significant on image-class reels that
+/// load multiple 1080p assets in succession; cuts swap pressure).
+///
+/// Same input contract as the consuming version: `rgba.len()`
+/// must equal `w * h * 4`; mismatched lengths are returned
+/// untouched (caller's responsibility to surface the malformed
+/// asset).
+///
+/// Odd-height images: the middle row (y = h/2) stays in place,
+/// which is the correct semantic for an in-place vertical flip
+/// of an odd-row array.
+pub fn flip_rgba_rows_in_place(rgba: &mut [u8], w: u32, h: u32) {
     let stride = (w as usize).saturating_mul(4);
     let expected = stride.saturating_mul(h as usize);
     if stride == 0 || h == 0 || rgba.len() != expected {
-        return rgba;
+        return;
     }
-    let mut flipped = vec![0u8; expected];
-    for y in 0..h as usize {
-        let src = y * stride;
-        let dst = (h as usize - 1 - y) * stride;
-        flipped[dst..dst + stride].copy_from_slice(&rgba[src..src + stride]);
+    let mut scratch = vec![0u8; stride];
+    let half = (h as usize) / 2;
+    for y in 0..half {
+        let top = y * stride;
+        let bot = (h as usize - 1 - y) * stride;
+        // 3-step swap via stride-sized scratch row. copy_within is
+        // safe for overlapping ranges within the same slice; here
+        // top < bot, no overlap, but copy_within is the canonical
+        // intent-revealing API for "rgba[bot..] -> rgba[top..]".
+        scratch.copy_from_slice(&rgba[top..top + stride]);
+        rgba.copy_within(bot..bot + stride, top);
+        rgba[bot..bot + stride].copy_from_slice(&scratch);
     }
-    flipped
 }
 
 /// FYS bug B (2026-05-21) -- compute the COVER-fit fullscreen-quad

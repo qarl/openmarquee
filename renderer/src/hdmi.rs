@@ -3350,13 +3350,26 @@ fn load_png_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
         );
     }
     let (w, h) = (info.width, info.height);
-    let rgba: Vec<u8> = match info.color_type {
+    let mut rgba: Vec<u8> = match info.color_type {
         png::ColorType::Rgba => buf,
         png::ColorType::Rgb => {
-            let mut out = Vec::with_capacity((w * h) as usize * 4);
-            for px in buf.chunks_exact(3) {
-                out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+            // CMA-arc 2026-06-22 C5: expand RGB -> RGBA into a
+            // fresh buffer (can't avoid: 3 bytes/px -> 4
+            // bytes/px), then explicit drop(buf) so the RGB
+            // intermediate frees BEFORE the flip allocates its
+            // scratch. Prior code held buf in scope to fn end —
+            // ~6.2 MB at 1080p hot for no benefit after the
+            // expand loop.
+            let mut out = vec![0u8; (w * h) as usize * 4];
+            for (src, dst) in
+                buf.chunks_exact(3).zip(out.chunks_exact_mut(4))
+            {
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = 0xFF;
             }
+            drop(buf);
             out
         }
         other => bail!(
@@ -3366,9 +3379,13 @@ fn load_png_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
     };
     // Bug W2: flip to bottom-up row order so the GL `v` convention
     // (see the doc comment above) renders the image right-side up.
-    // The flip helper lives in hdmi_logic.rs so it is host-testable
-    // on the Mac dev box (hdmi.rs is Linux-only).
-    let rgba = crate::hdmi_logic::flip_rgba_rows_vertically(rgba, w, h);
+    // CMA-arc 2026-06-22 C5: in-place flip — saves the second
+    // ~8.3 MB allocation the prior consuming version paid (3-buffer
+    // dance: decode buf + RGBA out + flipped). Per-image peak heap
+    // drops from ~16.6 MB (RGBA path) or ~22.7 MB (RGB path) to
+    // ~8.3 MB. Uses a single stride-sized scratch row (~7.7 KB at
+    // 1080p) for the swap.
+    crate::hdmi_logic::flip_rgba_rows_in_place(&mut rgba, w, h);
     Ok((rgba, w, h))
 }
 
