@@ -5639,6 +5639,34 @@ pub fn paint_and_present_one_transition_frame(
         // call — Option D cadence per `feedback_motion_through_
         // transitions_required`, video plays through the transition
         // alongside text motion phase and image still-frames.
+        // JUDDER-PROBE v3 OUTGOING A-side (2026-06-22): snapshot A's
+        // V4L2 position BEFORE the sourcing decision below. The B
+        // probe + capture (ebb30168) proved INCOMING is clean
+        // (frozen on poster every tick, decoder untouched, no
+        // backward jump). QA's panel + memory project_snapshot_side_
+        // a_arc converge: the snap-back is the OUTGOING side,
+        // showing its frame-0 poster during fade-out instead of
+        // its actual last-played frame N. Per hdmi.rs:5786-5795 the
+        // code SAYS snapshot wins over poster when snapshot_
+        // eligible (Video→Video|TextOverVideo); this probe + a
+        // post-snapshot at the convergence point below will SHOW
+        // QA exactly which branch A took per tick + whether A's
+        // decoder advanced (delta_frames) or was untouched (poster
+        // / snapshot blit paths).
+        let (a_pre_idx, a_pre_frames): (Option<usize>, Option<usize>) = match &endpoint_a {
+            TransitionEndpoint::Video {
+                next_sample_idx,
+                frames_decoded,
+                ..
+            } => (Some(**next_sample_idx), Some(**frames_decoded)),
+            TransitionEndpoint::TextOverVideo {
+                bg_next_sample_idx,
+                bg_frames_decoded,
+                ..
+            } => (Some(**bg_next_sample_idx), Some(**bg_frames_decoded)),
+            _ => (None, None),
+        };
+
         // r110 c3.2.2: pre-compute use_poster_a HERE (shared
         // borrow on endpoint_a) BEFORE inputs_a takes &mut.
         // The matches! on a shared borrow doesn't hold across
@@ -5974,6 +6002,95 @@ pub fn paint_and_present_one_transition_frame(
                 decoder.unpin_egl_refs();
             }
         }
+
+        // JUDDER-PROBE v3 OUTGOING A-side (2026-06-22): convergence-
+        // point. Logs which branch A took this tick + how many CAPTURE
+        // frames the outgoing decoder dqbuf'd (= visible advancement).
+        //
+        // Three branches:
+        //   - "poster"   = use_poster_a_now fired (decoder untouched
+        //                  → delta=0; A shows its frame-0 disk poster).
+        //                  Per QA hypothesis, this is the snap-back
+        //                  trigger when reached for an outgoing video
+        //                  that was at frame N when fade started.
+        //   - "snapshot" = use_still_a_now fired (decoder untouched
+        //                  → delta=0; A shows the runtime-captured
+        //                  still of the prior live frame). Correct
+        //                  no-jump behavior for outgoing video.
+        //   - "live"     = fell through to bake_a (decoder DOES
+        //                  dqbuf → delta=1+; A shows live decode of
+        //                  outgoing's next sample). Tick 1 of every
+        //                  snapshot-eligible transition is "live"
+        //                  because the still tex starts None.
+        //
+        // Cross-correlate per-transition:
+        //   - All-poster across the fade = snap-back risk (jumped
+        //     from frame N to frame-0 poster).
+        //   - One "live" tick (tick 1) followed by all-"snapshot" =
+        //     correct snapshot-side-A path (no jump).
+        //   - All-"live" across the fade = (no poster, no snapshot)
+        //     A keeps live-decoding through the fade; check the
+        //     fingerprint for continuation.
+        //
+        // Also surfaces the gate inputs (snapshot_eligible, has
+        // _poster_a, has_still_a_tex) so QA can see WHY a branch
+        // was picked without re-reading the code.
+        let a_branch = if use_poster_a_now {
+            "poster"
+        } else if use_still_a_now {
+            "snapshot"
+        } else {
+            "live"
+        };
+        let (a_post_idx, a_post_frames): (Option<usize>, Option<usize>) = match &endpoint_a {
+            TransitionEndpoint::Video {
+                next_sample_idx,
+                frames_decoded,
+                ..
+            } => (Some(**next_sample_idx), Some(**frames_decoded)),
+            TransitionEndpoint::TextOverVideo {
+                bg_next_sample_idx,
+                bg_frames_decoded,
+                ..
+            } => (Some(**bg_next_sample_idx), Some(**bg_frames_decoded)),
+            _ => (None, None),
+        };
+        let a_endpoint_kind = match &endpoint_a {
+            TransitionEndpoint::Text(_) => "text",
+            TransitionEndpoint::Image(_) => "image",
+            TransitionEndpoint::Video { .. } => "video",
+            TransitionEndpoint::TextOverVideo { .. } => "text_over_video",
+        };
+        eprintln!(
+            "[perf] transition_a_tick kind={} endpoint_kind={} branch={} progress={:.3} \
+             pre_idx={:?} pre_frames={:?} post_idx={:?} post_frames={:?} \
+             delta_frames={:?} snapshot_eligible={} use_poster_a={} \
+             still_a_tex_post={}",
+            kind, a_endpoint_kind, a_branch, progress,
+            a_pre_idx, a_pre_frames, a_post_idx, a_post_frames,
+            match (a_pre_frames, a_post_frames) {
+                (Some(p), Some(q)) => Some(q.saturating_sub(p)),
+                _ => None,
+            },
+            snapshot_eligible,
+            // `use_poster_a` is the pre-decision gate value
+            // (`matches!(endpoint_a, Video|TextOverVideo) && poster
+            // _a_texture.is_some()`); captures "did A have a poster
+            // available?" without re-reading poster_a_texture
+            // (which may have been moved by the use_poster_a_now
+            // branch above via .expect()).
+            use_poster_a,
+            // POST-tick still-tex state: tick 1 of a snapshot-
+            // eligible transition is branch=live AND
+            // still_a_tex_post=true because the capture block
+            // above just populated the still tex from the
+            // freshly-baked frame. Tick 2+ is branch=snapshot
+            // AND still_a_tex_post=true. Read order: branch
+            // tells you what fired; still_a_tex_post tells you
+            // what's parked for the NEXT tick.
+            session.transition_still_a_tex.is_some(),
+        );
+
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
         //
         // r80-r92 tried to PRE-PROVIDE endpoint_b's first frame at
