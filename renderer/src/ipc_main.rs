@@ -49,7 +49,10 @@ use crate::v4l2;
 /// the linux-gated names locally for backwards-compatible references
 /// from existing call sites + tests in this file.
 #[cfg(target_os = "linux")]
-use crate::video_decode::{prime_video_decoder, VideoDecoderState, V4L2_DECODER_PATH};
+use crate::video_decode::{
+    prime_video_decoder, pre_rewind_cached_video_decoder, VideoDecoderState,
+    V4L2_DECODER_PATH,
+};
 
 /// Phase 9 Step 9a (2026-05-16) — IPC sidecar per-Advance paint
 /// metrics for soak readiness. Aggregates PaintSlide + PaintTransition
@@ -1694,6 +1697,141 @@ fn try_drain_finished_recreates(cache: &mut SlideCache) {
 #[cfg(not(target_os = "linux"))]
 fn try_drain_finished_recreates(_cache: &mut SlideCache) {}
 
+// ====================================================================
+// JUDDER-CAUSE-1 v3 (2026-06-22): pre-rewind cached video decoders
+// during pure-hold ticks so their CAPTURE pool already holds frame 0
+// by the time a transition into them fires.
+//
+// Why: a cached video decoder that previously played sits parked on
+// its last decoded frame (near clip end). On loop re-entry, the FIRST
+// `next_frame()` inside `bake_video_slide_to_current_fbo` returns
+// that stale near-end frame BEFORE the in-stream IDR-refresh can
+// surface frame 0 in CAPTURE. The viewer sees a "back-in-time" snap.
+//
+// Fix: pre-rewind cached decoders during the CURRENT slide's hold
+// (a non-transition tick), then leave frame 0 sitting in CAPTURE for
+// the next bake's instant dqbuf. By the time BeginTransition fires
+// for the re-entered slide, ZERO rewind work happens at the busy
+// moment; frame 0 is just there.
+//
+// Throttle: at most ONE pre-rewind per call. Holds are 150-450 ticks;
+// at most ~3 cached decoders typical => everything pre-rewound well
+// before the next loop. Gentle to the bcm2835 codec's 2-decoder
+// ceiling — pre-rewind operates on an EXISTING allocated slot, doesn't
+// add a 3rd decoder.
+//
+// Gate: caller invokes this only from the OpResult::PaintSlide arm of
+// `run_paint_hook` — by construction a non-transition tick (during
+// transitions, the dispatcher emits PaintTransition, not PaintSlide).
+// No explicit `state.transition.is_none()` check needed; the call site
+// IS the gate.
+//
+// NO STREAMOFF — the cfe6234 corruption mechanism is absent (see
+// video_decode::pre_rewind_cached_video_decoder).
+// ====================================================================
+
+/// JUDDER-CAUSE-1 v3 (2026-06-22): pure-fn pre-rewind candidate
+/// predicate, extracted from `maybe_pre_rewind_one_cached_decoder`
+/// so the skip logic is host-testable independent of V4L2 (the rest
+/// of that helper is Linux-only).
+///
+/// Returns `true` iff the decoder at `id` is a valid pre-rewind
+/// target during a pure-hold tick of `current_slide_id`:
+///   - Not the current on-screen slide's decoder (it's actively
+///     painting).
+///   - Has at least one prior successful paint (`last_paint_at`
+///     `Some`) — a never-played decoder is already at frame 0 from
+///     its initial prime, so no pre-rewind needed.
+///   - Not already pre-rewound (`pre_rewound_at` `None`) — idempotency
+///     gate; a decoder parked at frame 0 doesn't need re-priming.
+fn is_pre_rewind_candidate(
+    id: uuid::Uuid,
+    current_slide_id: uuid::Uuid,
+    last_paint_at: Option<std::time::Instant>,
+    pre_rewound_at: Option<std::time::Instant>,
+) -> bool {
+    id != current_slide_id
+        && last_paint_at.is_some()
+        && pre_rewound_at.is_none()
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_pre_rewind_one_cached_decoder(
+    cache: &mut SlideCache,
+    current_slide_id: uuid::Uuid,
+) {
+    // Phase 1: find the first eligible cached decoder via immutable
+    // peeks. Filter delegated to `is_pre_rewind_candidate` for
+    // host-testable skip semantics.
+    let candidate: Option<uuid::Uuid> = {
+        let ids: Vec<uuid::Uuid> = cache.video_decoders.keys().copied().collect();
+        ids.into_iter().find(|id| {
+            match cache.video_decoders.peek(id) {
+                Some(dec) => is_pre_rewind_candidate(
+                    *id,
+                    current_slide_id,
+                    dec.last_paint_at,
+                    dec.pre_rewound_at,
+                ),
+                None => false,
+            }
+        })
+    };
+    let Some(slide_id) = candidate else { return };
+
+    // Phase 2: fetch the demuxer (immutable) + decoder (mutable) via
+    // field-disjoint split-borrows on cache. `cache.video_demuxers`
+    // and `cache.video_decoders` are SEPARATE fields → Rust permits
+    // `&cache.video_demuxers` + `&mut cache.video_decoders` to coexist
+    // (the borrow checker reasons over field access, see Nomicon §6).
+    // Existing precedent in this file: transition paint dispatch
+    // (~3234-3250) does exactly this pattern across the two fields.
+    let dem = match cache.video_demuxers.peek(&slide_id) {
+        Some(d) => d,
+        None => {
+            // Demuxer evicted out from under the decoder; nothing
+            // safe to do here. Skip silently — this isn't an error
+            // for the throttle, just means this candidate isn't
+            // ready.
+            return;
+        }
+    };
+    let Some(dec_state) = cache.video_decoders.get_mut(&slide_id) else {
+        // Decoder vanished between phases — race with eviction or
+        // recreate. Skip silently.
+        return;
+    };
+
+    let t_start = std::time::Instant::now();
+    let outcome = pre_rewind_cached_video_decoder(dec_state, dem);
+    let reset_us = t_start.elapsed().as_micros();
+    match outcome {
+        Ok(drained) => {
+            eprintln!(
+                "[perf] decoder_pre_rewound slide_id={} drained={} reset_us={} outcome=ok",
+                slide_id, drained, reset_us,
+            );
+        }
+        Err(e) => {
+            // Emit the error per QA's watch-item: ANY decode error /
+            // capture underrun line MUST be greppable. `pre_rewind`
+            // failures are the corruption-precursor signal (cfe6234
+            // failure mode).
+            eprintln!(
+                "[perf] decoder_pre_rewound slide_id={} reset_us={} outcome=err err={:#}",
+                slide_id, reset_us, e,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maybe_pre_rewind_one_cached_decoder(
+    _cache: &mut SlideCache,
+    _current_slide_id: uuid::Uuid,
+) {
+}
+
 /// Emit a response to stdout as a single JSON line + flush.
 /// stdout is line-buffered by default; explicit flush ensures
 /// the caller never sees a partial line on a slow stdin read.
@@ -2673,6 +2811,17 @@ fn run_paint_hook(
         // Pass through errors unchanged.
         e @ IpcResponse::Err { .. } => return e,
     };
+
+    // JUDDER-CAUSE-1 v3 (2026-06-22): capture the on-screen slide id
+    // for the post-paint pre-rewind hook below. PaintSlide arms are
+    // non-transition ticks by construction (transitions dispatch
+    // PaintTransition); PaintTransition + other ops yield None and
+    // skip the hook.
+    let post_paint_slide_id: Option<uuid::Uuid> = match &result {
+        OpResult::PaintSlide { slide_id, .. } => Some(*slide_id),
+        _ => None,
+    };
+
     let out = match result {
         OpResult::PaintSlide { slide_id, t_in_slide_ms } => {
             // Clone the borrow shape we need so we can take a
@@ -2861,6 +3010,11 @@ fn run_paint_hook(
                                 "paint_dispatch",
                                 t_dispatch.elapsed().as_nanos() as u64,
                             );
+                            // JUDDER-CAUSE-1 v3 (2026-06-22): snapshot
+                            // frames_decoded before paint so we can
+                            // detect a successful frame this tick
+                            // (decoder may EAGAIN-bubble).
+                            let frames_decoded_before = dec_state.frames_decoded_for_log();
                             if let Err(e) = hdmi::paint_and_present_one_text_over_video_slide_frame(
                                 session,
                                 card,
@@ -2874,6 +3028,21 @@ fn run_paint_hook(
                                 &dec_state.decoder,
                             ) {
                                 return err(format!("paint_slide (text-over-video) failed: {e:#}"));
+                            }
+                            // JUDDER-CAUSE-1 v3: stamp + first-paint
+                            // probe (see pure-video dispatch for
+                            // rationale).
+                            if dec_state.frames_decoded > frames_decoded_before {
+                                if let Some(gap) = dec_state.stamp_paint_now() {
+                                    eprintln!(
+                                        "[perf] pre_rewound_first_paint slide_id={} kind=text_over_video bg_id={} \
+                                         gap_since_pre_rewind_ms={} frames_decoded={}",
+                                        slide_id,
+                                        bg_id,
+                                        gap.as_millis(),
+                                        dec_state.frames_decoded,
+                                    );
+                                }
                             }
                             return IpcResponse::Ok {
                                 result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
@@ -2996,6 +3165,22 @@ fn run_paint_hook(
                                 dec_state.next_sample_idx
                             );
                         }
+                        // JUDDER-CAUSE-1 v3 (2026-06-22): stamp
+                        // last_paint_at on every successful paint;
+                        // returns Some(gap) on the very first paint
+                        // after a pre-rewind (= re-entry into a
+                        // looped slide), in which case emit the
+                        // pre_rewound_first_paint probe to confirm
+                        // the rewind happened BEFORE this present.
+                        if let Some(gap) = dec_state.stamp_paint_now() {
+                            eprintln!(
+                                "[perf] pre_rewound_first_paint slide_id={} kind=pure_video \
+                                 gap_since_pre_rewind_ms={} frames_decoded={}",
+                                slide_id,
+                                gap.as_millis(),
+                                dec_state.frames_decoded,
+                            );
+                        }
                     }
                     IpcResponse::Ok {
                         result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
@@ -3081,6 +3266,20 @@ fn run_paint_hook(
                     ));
                 }
             }
+
+            // JUDDER-CAUSE-1 v3 (2026-06-22): snapshot frames_decoded
+            // for each side BEFORE the iter_mut block below acquires
+            // &mut on cache.video_decoders (which would conflict with
+            // immutable peek). Used post-paint to detect a successful
+            // frame this tick + stamp last_paint_at. Type is
+            // Option<usize> = Copy so the immutable peek borrow drops
+            // at end of let-statement.
+            let from_frames_before: Option<usize> = from_dec_id.and_then(|id| {
+                cache.video_decoders.peek(&id).map(|d| d.frames_decoded_for_log())
+            });
+            let to_frames_before: Option<usize> = to_dec_id.and_then(|id| {
+                cache.video_decoders.peek(&id).map(|d| d.frames_decoded_for_log())
+            });
 
             // Resolve V4L2 decoder state &muts up-front. Single
             // get_mut for single-decoder; `iter_mut` for dual-
@@ -3340,6 +3539,45 @@ fn run_paint_hook(
             ) {
                 return err(format!("paint_transition failed: {e:#}"));
             }
+            // JUDDER-CAUSE-1 v3 (2026-06-22): stamp last_paint_at on
+            // any video decoder that bumped frames_decoded during
+            // this transition tick (from-side, to-side, or both) +
+            // emit the pre_rewound_first_paint probe when a pre-
+            // rewound decoder served its first frame. Sequential
+            // get_mut calls on disjoint ids are field-disjoint-safe
+            // (the dual-decoder check above guarantees fid != tid;
+            // the endpoint structs were consumed by the paint call,
+            // releasing the prior &mut into cache.video_decoders).
+            if let (Some(id), Some(before)) = (from_dec_id, from_frames_before) {
+                if let Some(dec) = cache.video_decoders.get_mut(&id) {
+                    if dec.frames_decoded > before {
+                        if let Some(gap) = dec.stamp_paint_now() {
+                            eprintln!(
+                                "[perf] pre_rewound_first_paint slide_id={} kind=transition_from \
+                                 gap_since_pre_rewind_ms={} frames_decoded={}",
+                                id,
+                                gap.as_millis(),
+                                dec.frames_decoded,
+                            );
+                        }
+                    }
+                }
+            }
+            if let (Some(id), Some(before)) = (to_dec_id, to_frames_before) {
+                if let Some(dec) = cache.video_decoders.get_mut(&id) {
+                    if dec.frames_decoded > before {
+                        if let Some(gap) = dec.stamp_paint_now() {
+                            eprintln!(
+                                "[perf] pre_rewound_first_paint slide_id={} kind=transition_to \
+                                 gap_since_pre_rewind_ms={} frames_decoded={}",
+                                id,
+                                gap.as_millis(),
+                                dec.frames_decoded,
+                            );
+                        }
+                    }
+                }
+            }
             // Re-pack: from/to are Copy (Uuid), progress is Copy
             // (f32), kind String moves back in without a heap alloc.
             // This is the zero-clone path that motivated the
@@ -3362,6 +3600,20 @@ fn run_paint_hook(
         );
         crate::profile::frame_complete();
     }
+
+    // JUDDER-CAUSE-1 v3 (2026-06-22): post-paint pre-rewind hook.
+    // Fires only on a successful PaintSlide (a pure-hold tick of the
+    // current slide). Iterates cached video decoders, finds the first
+    // OTHER-than-current decoder that has played + isn't already
+    // pre-rewound, and rewinds it so frame 0 sits in CAPTURE for the
+    // next loop's transition. Throttled to one per call.
+    if let Some(current_id) = post_paint_slide_id {
+        if matches!(out, IpcResponse::Ok { .. }) {
+            #[cfg(target_os = "linux")]
+            maybe_pre_rewind_one_cached_decoder(cache, current_id);
+        }
+    }
+
     out
 }
 
@@ -5877,6 +6129,79 @@ mod tests {
              regression so the WHY survives a future doc cleanup. \
              Window:\n{max_doc_window}",
         );
+    }
+
+    // JUDDER-CAUSE-1 v3 (2026-06-22): pre-rewind candidate predicate
+    // tests. The full helper is V4L2-gated (Linux-only), but the
+    // skip semantics are pure logic — covered here on any host so a
+    // logic regression (e.g. predicate inversion) fails CI loudly
+    // instead of waiting for glass verification.
+    //
+    // QA's three skip cases per the design ping:
+    //   - skip-current: never pre-rewind the slide currently on
+    //     screen (its decoder is actively serving frames; an IDR
+    //     refresh here = the v2 regression).
+    //   - skip-None: a decoder with `last_paint_at` None hasn't yet
+    //     played; it's already at frame 0 from prime. No pre-rewind
+    //     needed.
+    //   - skip-pre_rewound: a decoder with `pre_rewound_at` Some is
+    //     already parked at frame 0. Idempotency gate prevents
+    //     re-arming the same decoder every tick of the hold.
+
+    #[test]
+    fn pre_rewind_candidate_skips_current_slide() {
+        let now = std::time::Instant::now();
+        let current = uuid(1);
+        // Same id as current; even though last_paint_at is set and
+        // pre_rewound_at is None (otherwise eligible) → skip.
+        assert!(!is_pre_rewind_candidate(
+            current,
+            current,
+            Some(now),
+            None,
+        ));
+    }
+
+    #[test]
+    fn pre_rewind_candidate_skips_never_played_decoder() {
+        let current = uuid(1);
+        let other = uuid(2);
+        // Different id from current + not pre-rewound, BUT
+        // last_paint_at None → never played, already at frame 0 from
+        // prime → skip.
+        assert!(!is_pre_rewind_candidate(other, current, None, None));
+    }
+
+    #[test]
+    fn pre_rewind_candidate_skips_already_pre_rewound() {
+        let now = std::time::Instant::now();
+        let current = uuid(1);
+        let other = uuid(2);
+        // Different id, has played → eligible if not pre-rewound;
+        // pre_rewound_at Some → already parked at frame 0 → skip.
+        assert!(!is_pre_rewind_candidate(
+            other,
+            current,
+            Some(now),
+            Some(now),
+        ));
+    }
+
+    #[test]
+    fn pre_rewind_candidate_accepts_stale_other_decoder() {
+        let now = std::time::Instant::now();
+        let current = uuid(1);
+        let other = uuid(2);
+        // Different id, has played, not pre-rewound → eligible.
+        // This is the canonical case the helper targets: a cached
+        // decoder from a previously-played slide that's now parked
+        // on its last decoded frame near the clip end.
+        assert!(is_pre_rewind_candidate(
+            other,
+            current,
+            Some(now),
+            None,
+        ));
     }
 
     #[test]

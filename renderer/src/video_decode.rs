@@ -53,6 +53,33 @@ pub struct VideoDecoderState {
     pub frames_decoded: usize,
     pub capture_w: u32,
     pub capture_h: u32,
+    /// JUDDER-CAUSE-1 v3 (2026-06-22): wall-clock of the most recent
+    /// successful paint (= `frames_decoded` actually incremented).
+    /// `None` after prime / pre-rewind; set by `stamp_paint_now`
+    /// invoked only from the IPC paint dispatch sites
+    /// (pure-video, text-over-video, transition) — NOT from preload
+    /// drain or other bookkeeping paths.
+    ///
+    /// Used by `maybe_pre_rewind_one_cached_decoder` to skip
+    /// just-primed / never-played decoders (which are already at
+    /// frame 0 from prime) and target only decoders that have
+    /// served frames + gone idle.
+    pub last_paint_at: Option<std::time::Instant>,
+    /// JUDDER-CAUSE-1 v3 (2026-06-22): `Some(t)` iff this decoder
+    /// has been pre-rewound at wall-clock `t` (its CAPTURE pool
+    /// holds frame 0 ready for dqbuf, indices reset). Set by
+    /// `pre_rewind_cached_video_decoder`; cleared (back to `None`)
+    /// by the first successful paint after pre-rewind.
+    ///
+    /// Two roles:
+    ///   1. Idempotency gate for the per-Advance-tick throttle:
+    ///      skip decoders with `pre_rewound_at.is_some()`
+    ///      (already pre-rewound + still parked at frame 0).
+    ///   2. Timestamp source for the `pre_rewound_first_paint`
+    ///      probe — `stamp_paint_now` returns the gap since
+    ///      pre-rewind on the first paint, proving the rewind
+    ///      happened BEFORE the present (qarl's invariant).
+    pub pre_rewound_at: Option<std::time::Instant>,
 }
 
 impl VideoDecoderState {
@@ -61,6 +88,29 @@ impl VideoDecoderState {
     /// paint helper on success).
     pub fn frames_decoded_for_log(&self) -> usize {
         self.frames_decoded
+    }
+
+    /// JUDDER-CAUSE-1 v3 (2026-06-22): stamp `last_paint_at` with
+    /// the current wall-clock. Callers: the 3 IPC paint dispatch
+    /// sites, invoked when a paint actually produced a frame
+    /// (`frames_decoded` incremented). Do NOT call from prime /
+    /// preload-drain / pre-rewind — those are bookkeeping, not
+    /// presents.
+    ///
+    /// Also clears `pre_rewound_at` if set, marking the decoder
+    /// as "now playing" (frame 0 has been consumed; the parked
+    /// state is gone). Returns `Some(gap)` when the clear
+    /// happened — caller uses this to emit the
+    /// `pre_rewound_first_paint` probe with slide_id context.
+    /// Returns `None` for steady-state (non-first) paints.
+    #[must_use = "first-paint probe relies on the returned gap"]
+    pub fn stamp_paint_now(&mut self) -> Option<std::time::Duration> {
+        let now = std::time::Instant::now();
+        self.last_paint_at = Some(now);
+        match self.pre_rewound_at.take() {
+            Some(t) => Some(now.duration_since(t)),
+            None => None,
+        }
     }
 }
 
@@ -501,7 +551,94 @@ pub fn prime_video_decoder_with_warmup(
         frames_decoded: 0,
         capture_w: cap_fmt.width,
         capture_h: cap_fmt.height,
+        // JUDDER-CAUSE-1 v3 (2026-06-22): fresh prime — no paints
+        // yet, not pre-rewound. The newly-primed decoder already
+        // has frame 0 in CAPTURE (kernel decoded the IDR primer),
+        // so functionally it IS at frame 0; we just don't mark it
+        // pre_rewound because that flag has lifecycle meaning
+        // (set by pre_rewind_cached_video_decoder, cleared by
+        // first paint). last_paint_at=None means the throttled
+        // helper will skip it (no need to pre-rewind a never-played
+        // decoder).
+        last_paint_at: None,
+        pre_rewound_at: None,
     })
+}
+
+/// JUDDER-CAUSE-1 v3 (2026-06-22): pre-rewind a cached video
+/// decoder so its next presented frame is frame 0.
+///
+/// Called from `ipc_main`'s throttled per-tick helper during a
+/// quiet (pure-hold, no transition) Advance tick on the CURRENT
+/// slide. The target decoder is a CACHED decoder OTHER than the
+/// current slide's, which previously played + sat parked on its
+/// last decoded frame near the clip end.
+///
+/// Mechanism (NO STREAMOFF — the cfe6234 corruption path):
+///   1. Drain any pending CAPTURE buffers non-blockingly, bounded
+///      to 8 iterations (longer than bcm2835's pipeline depth of 4
+///      so we don't spin but never leak stale frames). `Frame::drop`
+///      re-QBUFs each buffer to the kernel pool.
+///   2. Feed the SAME primer as the initial prime (SPS+PPS+IDR +
+///      sample 0). IDR establishes a new reference state in-stream;
+///      no STREAMOFF means existing reference frames remain valid
+///      for any in-flight decodes (none expected for a parked
+///      decoder, but defense-in-depth).
+///   3. DON'T dqbuf — leave the primer's frame 0 sitting in CAPTURE
+///      so the bake's first `next_frame()` on re-entry returns it
+///      instantly (no Ok(None) gap that could expose a stale
+///      transition_tex_b).
+///   4. Reset bookkeeping: next_sample_idx=1 (sample 0 was the
+///      primer), frames_decoded=0, last_paint_at=None,
+///      pre_rewound=true.
+///
+/// Returns the count of CAPTURE buffers drained, for the per-call
+/// telemetry line.
+///
+/// Pre-condition: caller has verified the decoder is a CACHE entry
+/// for a slide_id OTHER than the currently-painting slide (so the
+/// brief 2-decoder utilization is bcm2835-safe — we're operating
+/// on an already-allocated slot, not adding a 3rd decoder).
+pub fn pre_rewind_cached_video_decoder(
+    state: &mut VideoDecoderState,
+    dem: &Mp4Demuxer,
+) -> Result<usize> {
+    if dem.sample_count() == 0 {
+        bail!("MP4 contains zero samples (can't pre-rewind)");
+    }
+    // Step 1: drain pending CAPTURE non-blockingly. Frame::drop
+    // re-QBUFs, returning the buffer to the kernel pool. Bounded
+    // to 8 = 2x the typical bcm2835 CAPTURE pool depth.
+    let mut drained: usize = 0;
+    for _ in 0..8usize {
+        match state.decoder.next_frame() {
+            Ok(Some(f)) => {
+                drop(f);
+                drained += 1;
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    // Step 2: feed primer (SPS+PPS+IDR + sample 0). NO STREAMOFF —
+    // pure in-stream IDR refresh.
+    let first_sample = dem.sample(0).context("read sample 0 for pre-rewind primer")?;
+    let header = dem.sps_pps_annexb();
+    let mut primer: Vec<u8> = Vec::with_capacity(header.len() + first_sample.len());
+    primer.extend_from_slice(&header);
+    primer.extend_from_slice(&first_sample);
+    drop(first_sample);
+    state.decoder
+        .feed(&primer)
+        .context("feed SPS+PPS+IDR primer (pre-rewind)")?;
+    // Step 3: DON'T dqbuf. Kernel decodes primer's IDR → frame 0
+    // queued in CAPTURE awaiting bake's first next_frame() on
+    // re-entry.
+    // Step 4: reset bookkeeping.
+    state.next_sample_idx = 1;
+    state.frames_decoded = 0;
+    state.last_paint_at = None;
+    state.pre_rewound_at = Some(std::time::Instant::now());
+    Ok(drained)
 }
 
 // ====================================================================
