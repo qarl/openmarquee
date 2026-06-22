@@ -3501,6 +3501,13 @@ fn handle_inner_request(
             // present) — no synchronous re-prime cost.
             #[cfg(target_os = "linux")]
             {
+                // CMA R2-RANK1 (2026-06-22): global cap on
+                // concurrent c3.3.2 recreate workers. Mirrors
+                // MAX_CONCURRENT_PRELOADS (also =2, defined inline
+                // at the PreloadSlide handler ~line 3842). See the
+                // gate just below the contains_key dedup for the
+                // skip-at-cap log + the rationale comment.
+                const MAX_CONCURRENT_RECREATES: usize = 2;
                 let mut recreate_ids: Vec<uuid::Uuid> = Vec::with_capacity(2);
                 if pure_video_failed {
                     eprintln!(
@@ -3526,6 +3533,38 @@ fn handle_inner_request(
                         eprintln!(
                             "[perf] c3_3_2_recreate_skip_already_pending video_id={}",
                             video_id,
+                        );
+                        continue;
+                    }
+                    // CMA R2-RANK1 (2026-06-22): drain any finished
+                    // recreate workers FIRST so an idle slot is
+                    // available below if applicable. Mirrors the
+                    // drain-before-spawn pattern that pending_preloads
+                    // would use; try_drain_finished_recreates is
+                    // is_finished-gated + non-blocking (cheap when
+                    // nothing has finished).
+                    try_drain_finished_recreates(cache);
+                    // CMA R2-RANK1 (2026-06-22): global cap on
+                    // concurrent recreate workers. Pre-RANK1 this
+                    // map had NO capacity gate; a degenerate
+                    // sequence of distinct-id recreate spawns could
+                    // pin arbitrarily many ~5-13MB CMA decoders
+                    // in pending_recreates (one per in-flight
+                    // recreate, additive on top of the LRU-capped
+                    // video_decoders map). Cap=2 mirrors
+                    // MAX_CONCURRENT_PRELOADS: the natural ceiling
+                    // is 2 spawns per dispatch arm above (a pure-
+                    // video recreate + a text-over-video bg
+                    // recreate in the same BeginSlide). A 3rd
+                    // arrival would be a back-to-back transition
+                    // before either earlier worker finished -- log
+                    // + skip; the wedged decoder stays for the
+                    // c3.2.2 poster path until the next
+                    // BeginTransition can spawn.
+                    if cache.pending_recreates.len() >= MAX_CONCURRENT_RECREATES {
+                        eprintln!(
+                            "[perf] c3_3_2_recreate_skip_at_cap video_id={} len={} cap={}",
+                            video_id, cache.pending_recreates.len(), MAX_CONCURRENT_RECREATES,
                         );
                         continue;
                     }
