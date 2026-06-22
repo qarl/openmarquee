@@ -70,8 +70,42 @@ export function drawFirstFrameToCanvas(file, canvas) {
         // Seek only after `loadeddata` — guarantees at least one frame
         // exists, so the subsequent `seeked` event isn't firing on an
         // empty video texture.
+        //
+        // JUDDER-DEFECT-A (2026-06-22): seek to 0 (was
+        // `min(0.1, duration/10)`) so the thumbnail/poster is the
+        // TRUE frame 0 of the H.264 stream — pixel-identical to the
+        // renderer's first decoded frame.
+        //
+        // Pre-fix the 0.1s seek grabbed frame ~3 (at 30fps) or
+        // even later for short clips (duration/10), causing a
+        // BACKWARD JUMP at the poster→live handoff: poster shows
+        // frame 3, then live decoder starts at frame 0 → "starts
+        // before the poster... back in time" (qarl glass
+        // observation). QA confirmed via fp_y comparison on
+        // Rainbow:
+        //   poster [97,130,144,144,211,187,191,215,237]
+        //   live   [182,203,221,141,198,178,101,133,144]
+        // BRIGHT/DARK INVERSION = genuinely different frame (no
+        // monotonic scale/range transform could produce that).
+        //
+        // The original 0.1s seek was a "skip the often-black
+        // intro" heuristic. The renderer's playback starts at
+        // PTS 0 anyway; if the operator's clip has a black intro,
+        // the playback shows it too. Better to match what plays
+        // than to "skip ahead" for the thumbnail.
+        //
+        // Setting currentTime=0 on a video already at 0 (post-
+        // loadeddata default) MAY NOT fire `seeked` in all
+        // browsers (no-op seek). Fall back to a direct rAF→paint;
+        // paint()'s `drew` guard prevents double-fire if `seeked`
+        // also fires.
         video.addEventListener("loadeddata", () => {
-            video.currentTime = Math.min(0.1, video.duration / 10 || 0.1);
+            video.currentTime = 0;
+            // Defensive: direct paint trigger in case seeked
+            // doesn't fire (no-op seek to current position).
+            // paint() bails harmlessly if readyState/videoWidth
+            // aren't ready yet.
+            requestAnimationFrame(paint);
         });
         video.addEventListener("seeked", () => {
             // Some browsers fire `seeked` before the new frame is
