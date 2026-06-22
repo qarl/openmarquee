@@ -40,16 +40,37 @@
 //! `Mp4Demuxer::open(path)` extracts:
 //! - SPS / PPS NAL units from the avcC box, ready to prepend
 //!   to the H.264 byte stream the V4L2 decoder consumes.
-//! - A `Vec<Vec<u8>>` of per-sample NAL bytes already in
-//!   Annex-B format (4-byte length prefixes replaced with
-//!   `00 00 00 01` start codes).
+//! - A `Vec<SampleMeta>` of per-sample (offset, size) records.
+//!   Sample bytes are NOT loaded into RAM upfront.
 //!
-//! Caller iterates via `Mp4Demuxer::samples()` -- yields
-//! `&[u8]` borrowed from the demuxer's owned buffers; lifetime
-//! tied to the demuxer.
+//! Caller reads sample i on demand via `Mp4Demuxer::sample(i)`,
+//! which pread()s from the held file + converts AVCC to
+//! Annex-B + returns owned bytes. Caller drops the bytes
+//! after the V4L2 feed; no retained per-clip RAM cost.
+//!
+//! ## Streaming demuxer (CMA #1, 2026-06-21)
+//!
+//! Before this refactor, the demuxer pre-loaded ALL sample
+//! bytes into a `Vec<Vec<u8>>` at open(). A typical 5-10s
+//! 1080p H.264 clip held 15-50 MB resident for the entire
+//! slide hold + transition window. With multiple v2v-cached
+//! demuxers this drove vm_data + swap pressure on the Pi Zero
+//! 2 W (320 MB total RAM). The streaming refactor keeps only
+//! the ~8-byte SampleMeta record per sample (offset, size)
+//! and reads bytes on demand via `pread` (Unix
+//! `File::read_at`, lock-free + `&self`-compatible).
+//!
+//! Per-tick cost is negligible (~10-50 µs total: seek + read +
+//! avcc_to_annexb) against the 33ms 30fps frame budget. There
+//! is no in-demuxer cache: video decode is monotonic forward
+//! (one sample per tick, no replay), so a cache would have no
+//! hit. Wrap-restart (sample 0..1 re-read at end-of-clip)
+//! incurs one extra pread per wrap; trivial.
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -78,22 +99,50 @@ const TAG_VIDE: [u8; 4] = *b"vide";
 
 /// One H.264 sample's NAL units in Annex-B byte-stream format
 /// (4-byte length prefixes replaced with `00 00 00 01` start
-/// codes). Multiple NALs may be concatenated.
+/// codes). Multiple NALs may be concatenated. Returned by
+/// `Mp4Demuxer::sample(i)` as an owned `Vec<u8>` so the caller
+/// can hand it to the V4L2 feed and drop it -- no per-clip
+/// retained byte buffers.
 pub type Sample = Vec<u8>;
+
+/// Per-sample (offset, size) record for streaming. ~8 bytes per
+/// entry vs ~5-50 KB per `Sample` in the pre-CMA-#1 design.
+/// `offset` is absolute file offset (stco's offsets are already
+/// absolute, so no mdat-relative arithmetic). `size` is the
+/// AVCC frame size on disk (always == resulting Annex-B size
+/// since the 4-byte length prefixes become 4-byte start codes
+/// in-place; no length delta).
+#[derive(Clone, Copy, Debug)]
+pub struct SampleMeta {
+    pub offset: u64,
+    pub size: u32,
+}
 
 /// MP4 demuxer for the H.264 video track of an MP4. The container
 /// may carry extra traks (audio, timecode) -- they are ignored.
+///
+/// Sample bytes are NOT held in RAM. The held `File` handle
+/// services `sample(i)` calls via `pread` (Unix
+/// `File::read_at`). See module-level docs for the CMA #1
+/// motivation.
 pub struct Mp4Demuxer {
     /// SPS NAL bytes (without start code -- caller prepends one).
     pub sps: Vec<u8>,
     /// PPS NAL bytes (without start code).
     pub pps: Vec<u8>,
-    /// Per-sample Annex-B-format NAL bytes. samples[0] is the
-    /// first sample (typically an IDR); SPS+PPS are NOT prepended
-    /// by the demuxer -- caller prepends them once before the
-    /// first sample so the V4L2 decoder sees the right header
-    /// sequence.
-    pub samples: Vec<Sample>,
+    /// Per-sample metadata (offset + size). The actual NAL bytes
+    /// are NOT in RAM -- `sample(i)` pread+converts on demand.
+    /// `sample_meta[0]` is the first sample (typically an IDR).
+    /// SPS+PPS are NOT prepended by the demuxer -- caller
+    /// prepends them once before the first sample so the V4L2
+    /// decoder sees the right header sequence.
+    pub sample_meta: Vec<SampleMeta>,
+    /// Held file handle for on-demand `sample(i)` reads. Closed
+    /// on Drop. Not exposed publicly because all reads must go
+    /// through `sample(i)` to ensure the AVCC->Annex-B conversion
+    /// + the bounds-check + the per-sample size cap from
+    /// open()-time validation.
+    file: File,
     /// Video track width in pixels (from the avc1 sample entry).
     pub width: u16,
     /// Video track height in pixels.
@@ -357,8 +406,12 @@ impl Mp4Demuxer {
             );
         }
 
-        // Now walk chunks → samples, reading sample bytes from mdat.
-        let mut samples: Vec<Sample> = Vec::with_capacity(sample_count);
+        // CMA #1 (2026-06-21): walk chunks → SampleMeta records
+        // ONLY. No byte reads at open(); sample(i) pread+converts
+        // on demand. Per-sample size cap still enforced here so
+        // a malformed stsz can't sneak past sample(i)'s alloc
+        // (attacker-controlled u32, up to ~4 GiB).
+        let mut sample_meta: Vec<SampleMeta> = Vec::with_capacity(sample_count);
         let mut sample_idx = 0usize;
         let _ = mdat_off; // mdat_offset is unused in this layout; stco's offsets are absolute.
         for chunk_idx in 0..chunk_count {
@@ -366,27 +419,28 @@ impl Mp4Demuxer {
             let mut sample_off_in_chunk = chunk_off;
             for _ in 0..chunk_sample_counts[chunk_idx] {
                 let sz = sample_sizes[sample_idx] as usize;
-                // Cap per-sample size against file size to prevent
-                // a malformed stsz from forcing a huge allocation.
-                // stsz values are attacker-controlled u32 (up to
-                // ~4 GiB); a legitimate sample never exceeds the
-                // mdat extent, which is always <= file size.
                 if (sz as u64) > file_size {
                     bail!(
                         "stsz claims sample {} has size {} > file size {}",
                         sample_idx, sz, file_size
                     );
                 }
-                file.seek(SeekFrom::Start(sample_off_in_chunk))?;
-                let mut buf = vec![0u8; sz];
-                file.read_exact(&mut buf)
-                    .with_context(|| format!("read sample {} at offset {}", sample_idx, sample_off_in_chunk))?;
-                // Convert AVCC 4-byte length prefixes to Annex-B
-                // 00 00 00 01 start codes. Each sample may contain
-                // multiple NAL units concatenated; we walk them all.
-                let annexb = avcc_to_annexb(&buf)
-                    .with_context(|| format!("convert sample {} to Annex-B", sample_idx))?;
-                samples.push(annexb);
+                // Range-check the sample's footprint against the
+                // file's end. Catches a stsz/stco combination that
+                // would point a legitimate-looking size into past-
+                // EOF -- the pre-CMA-#1 code would have detected
+                // this at read_exact() time; the streaming demuxer
+                // detects it at construction to fail fast.
+                if sample_off_in_chunk.saturating_add(sz as u64) > file_size {
+                    bail!(
+                        "stsz sample {} (offset {}, size {}) extends past file size {}",
+                        sample_idx, sample_off_in_chunk, sz, file_size
+                    );
+                }
+                sample_meta.push(SampleMeta {
+                    offset: sample_off_in_chunk,
+                    size: sz as u32,
+                });
                 sample_off_in_chunk += sz as u64;
                 sample_idx += 1;
             }
@@ -395,23 +449,86 @@ impl Mp4Demuxer {
         Ok(Mp4Demuxer {
             sps: sps_units.remove(0),
             pps: pps_units.remove(0),
-            samples,
+            sample_meta,
+            file,
             width,
             height,
         })
+    }
+
+    /// Number of samples in the video track. Replaces the old
+    /// `samples.len()` for callers that need to detect end-of-clip
+    /// wrap (`next_sample_idx >= dem.sample_count()`).
+    pub fn sample_count(&self) -> usize {
+        self.sample_meta.len()
+    }
+
+    /// Read sample `i`'s NAL bytes from the held file, convert
+    /// AVCC length-prefixes to Annex-B start codes, return owned
+    /// bytes. Caller drops after feeding the V4L2 decoder.
+    ///
+    /// Lock-free + `&self`-compatible thanks to Unix `pread`
+    /// (`FileExt::read_at`) which takes its own offset and does
+    /// not touch the File's seek cursor. Multiple concurrent
+    /// sample() reads are safe (though in practice the IPC main
+    /// thread serializes all decoder work, so concurrency isn't
+    /// exercised today).
+    ///
+    /// Per-call cost on Pi Zero 2 W (rough): ~10-50 µs total
+    /// (pread ~5-30 µs for ~5-30 KB samples + ~5-20 µs for the
+    /// avcc_to_annexb conversion). At 30 fps this is well under
+    /// the 33 ms frame budget.
+    #[cfg(unix)]
+    pub fn sample(&self, i: usize) -> Result<Sample> {
+        let meta = *self.sample_meta.get(i).ok_or_else(|| {
+            anyhow!(
+                "sample index {} out of range (count={})",
+                i,
+                self.sample_meta.len()
+            )
+        })?;
+        let mut buf = vec![0u8; meta.size as usize];
+        self.file
+            .read_at(&mut buf, meta.offset)
+            .with_context(|| {
+                format!(
+                    "pread sample {} at offset {} size {}",
+                    i, meta.offset, meta.size
+                )
+            })?;
+        avcc_to_annexb(&buf)
+            .with_context(|| format!("convert sample {} to Annex-B", i))
+    }
+
+    /// Non-Unix fallback would need a `Mutex<File>` for the seek
+    /// state since `Read+Seek` is not safe across concurrent
+    /// callers. The renderer is Linux-only (see main.rs cfg
+    /// gates), so this is a placeholder.
+    #[cfg(not(unix))]
+    pub fn sample(&self, _i: usize) -> Result<Sample> {
+        bail!("Mp4Demuxer::sample requires Unix pread (non-unix build is unsupported for the renderer)");
     }
 
     /// Build the H.264 byte stream the decoder needs to see at
     /// session start: Annex-B-framed SPS, then Annex-B-framed
     /// PPS. Caller feeds this BEFORE any sample bytes.
     pub fn sps_pps_annexb(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(8 + self.sps.len() + self.pps.len());
-        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-        out.extend_from_slice(&self.sps);
-        out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-        out.extend_from_slice(&self.pps);
-        out
+        build_sps_pps_annexb(&self.sps, &self.pps)
     }
+}
+
+/// Free-function form of `Mp4Demuxer::sps_pps_annexb` so the
+/// SPS+PPS ordering can be unit-tested without constructing a
+/// full Mp4Demuxer (which now requires a held File handle for
+/// streaming sample reads -- can't be faked with an empty
+/// struct literal post-CMA-#1).
+fn build_sps_pps_annexb(sps: &[u8], pps: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + sps.len() + pps.len());
+    out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    out.extend_from_slice(sps);
+    out.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+    out.extend_from_slice(pps);
+    out
 }
 
 // ============================================================
@@ -589,10 +706,10 @@ mod tests {
         // 2-second clip at 30 fps = 60 frames; libx264 may emit
         // 60 or 61 samples (one IDR + N P-frames). Just check
         // we got a reasonable number.
-        assert!(dem.samples.len() >= 30 && dem.samples.len() <= 100,
-            "unexpected sample count: {}", dem.samples.len());
+        assert!(dem.sample_count() >= 30 && dem.sample_count() <= 100,
+            "unexpected sample count: {}", dem.sample_count());
         // First sample (IDR) should start with Annex-B start code.
-        let first = &dem.samples[0];
+        let first = dem.sample(0).expect("read sample 0");
         assert!(first.len() >= 5, "first sample too short");
         assert_eq!(&first[0..4], &[0x00, 0x00, 0x00, 0x01],
             "first sample missing start code");
@@ -640,11 +757,13 @@ mod tests {
         }
         let dem = Mp4Demuxer::open(&path).expect("demux open");
         // Every legit sample must be smaller than the file
-        // itself (this is the cap's invariant).
+        // itself (this is the cap's invariant). The streaming
+        // demuxer caps at sample_meta-construction time (open),
+        // so we re-derive sample sizes here instead of re-pread'ing.
         let file_size = std::fs::metadata(&path).unwrap().len();
-        for (i, s) in dem.samples.iter().enumerate() {
-            assert!((s.len() as u64) <= file_size,
-                "sample {} size {} > file size {}", i, s.len(), file_size);
+        for (i, meta) in dem.sample_meta.iter().enumerate() {
+            assert!((meta.size as u64) <= file_size,
+                "sample {} size {} > file size {}", i, meta.size, file_size);
         }
     }
 
@@ -652,14 +771,12 @@ mod tests {
     /// Pins the dispatch's "SPS+PPS emission order" review item.
     #[test]
     fn sps_pps_annexb_emits_sps_first() {
-        let dem = Mp4Demuxer {
-            sps: vec![0x67, 0xaa, 0xbb],
-            pps: vec![0x68, 0xcc],
-            samples: vec![],
-            width: 320,
-            height: 240,
-        };
-        let buf = dem.sps_pps_annexb();
+        // Post-CMA-#1: Mp4Demuxer requires a held File handle
+        // (streaming sample reads), so the test goes through the
+        // free-function form instead of constructing a struct
+        // literal. Mp4Demuxer::sps_pps_annexb delegates to this
+        // function so the contract is the same.
+        let buf = build_sps_pps_annexb(&[0x67, 0xaa, 0xbb], &[0x68, 0xcc]);
         assert_eq!(buf, vec![
             0x00, 0x00, 0x00, 0x01, 0x67, 0xaa, 0xbb,
             0x00, 0x00, 0x00, 0x01, 0x68, 0xcc,

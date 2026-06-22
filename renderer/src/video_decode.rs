@@ -15,7 +15,7 @@
 
 #![cfg(target_os = "linux")]
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::mp4_demux::Mp4Demuxer;
 use crate::v4l2;
@@ -167,14 +167,31 @@ fn walk_h264_nal_types(sample: &[u8]) -> (Option<u8>, bool) {
 /// r78 Phase A: emit a `[perf] preload_sample_dump` line per sample
 /// classification so QA can see whether the demuxer is delivering a
 /// decodable starting sample (one containing an IDR NAL).
-fn log_first_samples_nal_types(label: &str, slide_id: &str, samples: &[Vec<u8>], max: usize) {
-    for (i, s) in samples.iter().enumerate().take(max) {
-        let (first_nal, contains_idr) = walk_h264_nal_types(s);
-        let first_str = first_nal.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into());
-        eprintln!(
-            "[perf] preload_sample_dump label={} slide_id={} i={} size={} first_nal_type={} contains_idr={}",
-            label, slide_id, i, s.len(), first_str, contains_idr,
-        );
+///
+/// CMA #1 (2026-06-21): switched from `samples: &[Vec<u8>]` to
+/// `&Mp4Demuxer` since the demuxer no longer holds samples in RAM.
+/// Per-call cost = up to `max` pread+conversion calls (~10-50 µs
+/// each); only fires from prime / preload entry points, not the
+/// per-tick paint hot loop, so the extra cost is negligible.
+fn log_first_samples_nal_types(label: &str, slide_id: &str, demuxer: &Mp4Demuxer, max: usize) {
+    let n = demuxer.sample_count().min(max);
+    for i in 0..n {
+        match demuxer.sample(i) {
+            Ok(s) => {
+                let (first_nal, contains_idr) = walk_h264_nal_types(&s);
+                let first_str = first_nal.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into());
+                eprintln!(
+                    "[perf] preload_sample_dump label={} slide_id={} i={} size={} first_nal_type={} contains_idr={}",
+                    label, slide_id, i, s.len(), first_str, contains_idr,
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[perf] preload_sample_dump label={} slide_id={} i={} ERR={:#}",
+                    label, slide_id, i, e,
+                );
+            }
+        }
     }
 }
 
@@ -207,7 +224,7 @@ pub fn prime_video_decoder(dem: &Mp4Demuxer, caller: &'static str) -> Result<Vid
 /// stay quiet.
 pub fn log_synchronous_begin_slide_sample_dump(slide_id: uuid::Uuid, dem: &Mp4Demuxer) {
     log_first_samples_nal_types(
-        "cold_start", &slide_id.to_string(), &dem.samples, 4,
+        "cold_start", &slide_id.to_string(), dem, 4,
     );
 }
 
@@ -240,7 +257,11 @@ pub fn log_synchronous_begin_slide_sample_dump(slide_id: uuid::Uuid, dem: &Mp4De
 pub fn log_preload_decoder_config(slide_id: uuid::Uuid, dem: &Mp4Demuxer, label: &str) {
     let has_sps = !dem.sps.is_empty();
     let has_pps = !dem.pps.is_empty();
-    let sample_0_size = dem.samples.first().map(|s| s.len()).unwrap_or(0);
+    // CMA #1 (2026-06-21): sample(0) is a one-shot pread for the
+    // diagnostic line; if it errors we report 0 so the rest of the
+    // probe stays consistent (the actual prime call below will
+    // surface the error if it persists).
+    let sample_0_size = dem.sample(0).map(|s| s.len()).unwrap_or(0);
     // sps_pps_annexb() prepends `00 00 00 01` start codes before
     // each parameter set; the total wire-format size is
     // 4 + sps.len() + 4 + pps.len() per mp4_demux.rs:407-414.
@@ -251,7 +272,7 @@ pub fn log_preload_decoder_config(slide_id: uuid::Uuid, dem: &Mp4Demuxer, label:
          has_sps={} sps_len={} has_pps={} pps_len={} \
          sample_count={} sample_0_size={} primer_size={}",
         slide_id, label, has_sps, dem.sps.len(), has_pps, dem.pps.len(),
-        dem.samples.len(), sample_0_size, primer_size,
+        dem.sample_count(), sample_0_size, primer_size,
     );
 }
 
@@ -269,7 +290,7 @@ pub fn prime_video_decoder_with_warmup(
     // through the signature.
     eprintln!(
         "[perf] prime_with_warmup_entered warmup_count={} mp4_w={} mp4_h={} samples={}",
-        warmup_count_requested, dem.width, dem.height, dem.samples.len(),
+        warmup_count_requested, dem.width, dem.height, dem.sample_count(),
     );
     // r56 Phase A (2026-06-03): sub-phase timing for the prime
     // path. qarl observed per-transition stalls in a 4-video-slide
@@ -356,14 +377,19 @@ pub fn prime_video_decoder_with_warmup(
     // dequeued it). The proven-working recipe in
     // `v4l2::tests::decode_test_fixture_320x240` feeds the entire
     // Annex-B stream in one call; we mirror that.
-    let first_sample = dem
-        .samples
-        .first()
-        .ok_or_else(|| anyhow!("MP4 contains zero samples"))?;
+    // CMA #1 (2026-06-21): pread sample 0 instead of reading from
+    // a pre-loaded Vec. The owned bytes are concatenated with
+    // SPS+PPS into the primer + dropped after feed; no retained
+    // per-clip footprint.
+    if dem.sample_count() == 0 {
+        anyhow::bail!("MP4 contains zero samples");
+    }
+    let first_sample = dem.sample(0).context("read sample 0 for primer")?;
     let header = dem.sps_pps_annexb();
     let mut primer: Vec<u8> = Vec::with_capacity(header.len() + first_sample.len());
     primer.extend_from_slice(&header);
-    primer.extend_from_slice(first_sample);
+    primer.extend_from_slice(&first_sample);
+    drop(first_sample);
     let t_primer = Instant::now();
     dec.feed(&primer).context("feed SPS+PPS+IDR primer")?;
     let primer_feed_us = t_primer.elapsed().as_micros();
@@ -415,10 +441,21 @@ pub fn prime_video_decoder_with_warmup(
     // r73 (2026-06-06): cap warmup against the OUTPUT pool size minus
     // one slot for the primer that already ran. Caller-requested count
     // is the upper bound; sample availability is the lower bound.
-    let warmup_count = warmup_count_requested.min(dem.samples.len().saturating_sub(1));
+    let warmup_count = warmup_count_requested.min(dem.sample_count().saturating_sub(1));
     for _ in 0..warmup_count {
-        let s = &dem.samples[next_sample_idx];
-        match dec.feed(s) {
+        // CMA #1 (2026-06-21): pread the warmup sample; bytes
+        // dropped after feed.
+        let s = match dem.sample(next_sample_idx) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "warn: prime warmup read sample {} failed: {:#} (continuing without warmup)",
+                    next_sample_idx, e
+                );
+                break;
+            }
+        };
+        match dec.feed(&s) {
             Ok(()) => {
                 next_sample_idx += 1;
             }
@@ -453,7 +490,7 @@ pub fn prime_video_decoder_with_warmup(
         primer_feed_us,
         warmup_us,
         total_us,
-        dem.samples.len(),
+        dem.sample_count(),
         dem.width,
         dem.height,
     );
@@ -693,7 +730,7 @@ pub fn prime_video_decoder_for_preload(
         PRIME_WARMUP_FOR_PRELOAD,
     );
     log_first_samples_nal_types(
-        "preload", &slide_id.to_string(), &dem.samples, 4,
+        "preload", &slide_id.to_string(), dem, 4,
     );
     log_preload_decoder_config(slide_id, dem, "preload");
 
@@ -810,19 +847,34 @@ pub fn prime_video_decoder_for_preload(
     );
     resume_result.context("r85: resume_after_eos before re-priming SPS+PPS+IDR")?;
 
-    let first_sample = dem.samples.first()
-        .ok_or_else(|| anyhow::anyhow!("r85: MP4 contains zero samples"))?;
+    // CMA #1 (2026-06-21): pread sample 0 + warmup samples on
+    // demand instead of slicing a pre-loaded Vec.
+    if dem.sample_count() == 0 {
+        anyhow::bail!("r85: MP4 contains zero samples");
+    }
+    let first_sample = dem.sample(0).context("r85: read sample 0 for primer")?;
     let header = dem.sps_pps_annexb();
     let mut primer = Vec::with_capacity(header.len() + first_sample.len());
     primer.extend_from_slice(&header);
-    primer.extend_from_slice(first_sample);
+    primer.extend_from_slice(&first_sample);
+    drop(first_sample);
     state.decoder.feed(&primer)
         .context("r85: re-feed SPS+PPS+IDR primer after drain-resume")?;
     state.next_sample_idx = 1;
-    let warmup_count = PRIME_WARMUP_FOR_PRELOAD.min(dem.samples.len().saturating_sub(1));
+    let warmup_count = PRIME_WARMUP_FOR_PRELOAD.min(dem.sample_count().saturating_sub(1));
     for _ in 0..warmup_count {
-        let s = &dem.samples[state.next_sample_idx];
-        match state.decoder.feed(s) {
+        let s = match dem.sample(state.next_sample_idx) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "warn: r85 post-resume warmup read sample {} failed: {:#} \
+                     (continuing without full lookahead)",
+                    state.next_sample_idx, e,
+                );
+                break;
+            }
+        };
+        match state.decoder.feed(&s) {
             Ok(()) => state.next_sample_idx += 1,
             Err(e) => {
                 eprintln!(
@@ -857,7 +909,7 @@ fn prime_video_decoder_for_preload_r82_disabled(
 ) -> Result<VideoDecoderState> {
     use std::time::Instant;
     log_first_samples_nal_types(
-        "preload", &slide_id.to_string(), &dem.samples, 4,
+        "preload", &slide_id.to_string(), dem, 4,
     );
     log_preload_decoder_config(slide_id, dem, "preload");
 
@@ -1026,12 +1078,17 @@ fn prime_video_decoder_for_preload_r82_disabled(
     // QA's diagnostic landed even on failed runs.)
     // r80 WARN-3 fix preserved: re-feed warmup samples after the
     // primer to restore kernel B-frame lookahead.
-    let first_sample = dem.samples.first()
-        .ok_or_else(|| anyhow::anyhow!("r80: MP4 contains zero samples"))?;
+    // CMA #1 (2026-06-21): pread sample 0 + warmup samples on
+    // demand instead of slicing a pre-loaded Vec.
+    if dem.sample_count() == 0 {
+        anyhow::bail!("r80: MP4 contains zero samples");
+    }
+    let first_sample = dem.sample(0).context("r80: read sample 0 for primer")?;
     let header = dem.sps_pps_annexb();
     let mut primer = Vec::with_capacity(header.len() + first_sample.len());
     primer.extend_from_slice(&header);
-    primer.extend_from_slice(first_sample);
+    primer.extend_from_slice(&first_sample);
+    drop(first_sample);
     state.decoder.feed(&primer)
         .context("r80: re-feed SPS+PPS+IDR primer after drain-resume")?;
     state.next_sample_idx = 1;
@@ -1041,10 +1098,20 @@ fn prime_video_decoder_for_preload_r82_disabled(
     // samples before the kernel emits, regressing first-frame
     // latency to pre-r5 cold-start (~10s visible) when bcm2835-codec
     // needs ~3-4 input samples of lookahead.
-    let warmup_count = PRIME_WARMUP_FOR_PRELOAD.min(dem.samples.len().saturating_sub(1));
+    let warmup_count = PRIME_WARMUP_FOR_PRELOAD.min(dem.sample_count().saturating_sub(1));
     for _ in 0..warmup_count {
-        let s = &dem.samples[state.next_sample_idx];
-        match state.decoder.feed(s) {
+        let s = match dem.sample(state.next_sample_idx) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "warn: r80 post-resume warmup read sample {} failed: {:#} \
+                     (continuing without full lookahead)",
+                    state.next_sample_idx, e,
+                );
+                break;
+            }
+        };
+        match state.decoder.feed(&s) {
             Ok(()) => state.next_sample_idx += 1,
             Err(e) => {
                 eprintln!(
@@ -1211,14 +1278,17 @@ pub fn reprime_video_decoder_for_loop(
         .decoder
         .resume_after_eos()
         .context("resume_after_eos before re-priming SPS+PPS+IDR")?;
-    let first_sample = dem
-        .samples
-        .first()
-        .ok_or_else(|| anyhow!("MP4 contains zero samples"))?;
+    // CMA #1 (2026-06-21): pread sample 0 instead of slicing a
+    // pre-loaded Vec.
+    if dem.sample_count() == 0 {
+        bail!("MP4 contains zero samples");
+    }
+    let first_sample = dem.sample(0).context("read sample 0 for re-prime")?;
     let header = dem.sps_pps_annexb();
     let mut primer: Vec<u8> = Vec::with_capacity(header.len() + first_sample.len());
     primer.extend_from_slice(&header);
-    primer.extend_from_slice(first_sample);
+    primer.extend_from_slice(&first_sample);
+    drop(first_sample);
     state
         .decoder
         .feed(&primer)

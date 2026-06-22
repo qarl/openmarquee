@@ -542,6 +542,30 @@ impl IpcPaintMetrics {
 /// resident even when intermittent BeginSlides bring in cold ones.
 const SLIDE_CACHE_CAP: usize = 32;
 
+/// CMA #2 (2026-06-21): bounded LRU capacity for video_decoders +
+/// video_demuxers. Per QA's leads file (project_cma_decoder_arc):
+/// each primed V4L2 decoder holds ~16-25 MB CMA (4+4 buffers at
+/// 1080p NV12); a 7-slide cycle on a 320 MB Pi Zero 2 W watched
+/// cma_used grow 221->250 MB across BeginSlides because the
+/// previous HashMap was unbounded + the only release path was
+/// `evict_other_video_state`'s per-BeginSlide keep_ids retain,
+/// which let older unique videos' decoders persist until their
+/// id rolled out of the keep set.
+///
+/// Cap = 3 enforces a strict ceiling: 1 currently-painting slide
+/// + 1 transition partner + 1 preload lookahead = the max
+/// concurrent decoder set the runtime ever legitimately needs.
+/// An LRU insert past cap drops the least-recently-used decoder
+/// explicitly via the InsertOutcome.evicted_lru handoff —
+/// VideoDecoderState's Drop closes /dev/video10 + releases CAPTURE/
+/// OUTPUT buffer pools, freeing the CMA pages back to the kernel.
+///
+/// The companion video_demuxers map shares the same cap so the
+/// (decoder, demuxer) pair lifetimes stay in lock-step (decoder
+/// without demuxer is dead state; demuxer without decoder is
+/// harmless but wasteful File handle).
+const VIDEO_DECODER_CACHE_CAP: usize = 3;
+
 struct SlideCache {
     items: LruMap<uuid::Uuid, ContentItem>,
     /// Bug 1 (qarl 2026-05-16): item.json mtime per cached slide.
@@ -551,7 +575,12 @@ struct SlideCache {
     /// forever. Stamping the on-disk mtime here lets `load` detect drift
     /// and evict before the cached copy is reused.
     item_mtimes: LruMap<uuid::Uuid, std::time::SystemTime>,
-    video_demuxers: std::collections::HashMap<uuid::Uuid, Mp4Demuxer>,
+    /// CMA #2 (2026-06-21): bounded LRU (cap=VIDEO_DECODER_CACHE_CAP)
+    /// so demuxer entries don't accumulate across an N-slide reel.
+    /// Each Mp4Demuxer holds a File handle (no big buffer post-CMA-#1)
+    /// so the bound is mostly about closing fds + keeping memory
+    /// in lockstep with the video_decoders LRU.
+    video_demuxers: LruMap<uuid::Uuid, Mp4Demuxer>,
     /// Bug 8 / Fix A (2026-05-17): video slide ids whose cache.load
     /// could NOT register a demuxer (multi-trak MP4, malformed file,
     /// missing asset, etc.). Subsequent BeginSlide/BeginTransition
@@ -567,14 +596,18 @@ struct SlideCache {
     /// cache.load primes the decoder once on first encounter; piece
     /// 3d's paint_slide drains frames per advance tick.
     ///
-    /// TODO(piece 4+): release decoder on cache eviction. Each
-    /// primed decoder holds ~5 MB at 320x240 / ~20-25 MB at 1080p
-    /// (4+4 buffers × per-plane size). On a 512 MB Pi Zero 2 W
-    /// a ~10-slide playlist hits ~250 MB just for decoder buffers.
-    /// LRU eviction (or reactive release on slide-leave) needed
-    /// before production at scale.
+    /// CMA #2 (2026-06-21): bounded LRU (cap=VIDEO_DECODER_CACHE_CAP=3).
+    /// Closes the original TODO ("release decoder on cache eviction").
+    /// Each primed decoder holds ~16-25 MB CMA at 1080p (4+4 buffers
+    /// × per-plane size); QA measured cma_used growing 221->250 MB
+    /// across a 7-slide reel because the previous HashMap was
+    /// unbounded + evict_other_video_state's keep_ids-only retain
+    /// let older unique videos' decoders persist. LRU insert past
+    /// cap drops the least-recently-used decoder explicitly via the
+    /// InsertOutcome handoff; VideoDecoderState's Drop closes
+    /// /dev/video10 + releases the CAPTURE/OUTPUT pools, freeing CMA.
     #[cfg(target_os = "linux")]
-    video_decoders: std::collections::HashMap<uuid::Uuid, VideoDecoderState>,
+    video_decoders: LruMap<uuid::Uuid, VideoDecoderState>,
     /// r65 (2026-06-05): in-flight async preload thread handles
     /// keyed by the slide_id the worker is priming. Populated by
     /// the PreloadSlide IPC handler, drained by
@@ -660,10 +693,10 @@ impl SlideCache {
         Self {
             items: LruMap::with_capacity(SLIDE_CACHE_CAP),
             item_mtimes: LruMap::with_capacity(SLIDE_CACHE_CAP),
-            video_demuxers: std::collections::HashMap::new(),
+            video_demuxers: LruMap::with_capacity(VIDEO_DECODER_CACHE_CAP),
             video_skip: std::collections::HashSet::new(),
             #[cfg(target_os = "linux")]
-            video_decoders: std::collections::HashMap::new(),
+            video_decoders: LruMap::with_capacity(VIDEO_DECODER_CACHE_CAP),
             pending_preloads: std::collections::HashMap::new(),
             #[cfg(target_os = "linux")]
             pending_recreates: std::collections::HashMap::new(),
@@ -993,7 +1026,7 @@ impl SlideCache {
                     let mp4_open_us = t_mp4_open.elapsed().as_micros();
                     eprintln!(
                         "ipc: opened MP4 for video slide {} ({}x{}, {} samples)",
-                        item_id, dem.width, dem.height, dem.samples.len()
+                        item_id, dem.width, dem.height, dem.sample_count()
                     );
                     // V4L2 piece 3c: on Linux, also prime the
                     // hardware decoder. Failure is best-effort
@@ -1558,8 +1591,13 @@ fn format_mmal_leak_diagnostics_tail(
                 .collect();
             peer_ids.sort();
             let peer_count = peer_ids.len();
+            // CMA #2 (2026-06-21): .peek() is &self-compatible so
+            // the closure captures &SlideCache without conflict;
+            // .get() would require &mut and trigger E0596 +
+            // FnMut-escape errors. LRU touch is unnecessary for
+            // a diagnostic probe anyway.
             let peer_dims: Vec<String> = peer_ids.iter()
-                .filter_map(|id| c.video_decoders.get(id))
+                .filter_map(|id| c.video_decoders.peek(id))
                 .map(|d| format!("{}x{}", d.capture_w, d.capture_h))
                 .collect();
             (peer_count.to_string(), format!("[{}]", peer_dims.join(",")))
@@ -2522,7 +2560,7 @@ fn run_paint_hook(
                             // current_fbo's next_frame() returns Ok(None)
                             // forever; paint early-returns before
                             // swap+commit; FYS panel goes BLACK.
-                            if dec_state.next_sample_idx >= dem.samples.len() {
+                            if dec_state.next_sample_idx >= dem.sample_count() {
                                 if let Err(e) =
                                     crate::video_decode::reprime_video_decoder_for_loop(
                                         dec_state, dem,
@@ -2550,7 +2588,7 @@ fn run_paint_hook(
                                 fonts,
                                 content_root,
                                 t_in_slide_ms,
-                                &dem.samples,
+                                dem,
                                 &mut dec_state.next_sample_idx,
                                 &mut dec_state.frames_decoded,
                                 &dec_state.decoder,
@@ -2663,7 +2701,7 @@ fn run_paint_hook(
                     if let Err(e) = hdmi::paint_and_present_one_video_slide_frame(
                         session,
                         card,
-                        &dem.samples,
+                        dem,
                         &mut dec_state.next_sample_idx,
                         &mut dec_state.frames_decoded,
                         &dec_state.decoder,
@@ -2850,7 +2888,7 @@ fn run_paint_hook(
                 let dec = from_dec_state
                     .as_deref_mut()
                     .expect("from_dec_state set above for from_dec_id Some(_)");
-                if dec.next_sample_idx >= dem.samples.len() {
+                if dec.next_sample_idx >= dem.sample_count() {
                     if let Err(e) =
                         crate::video_decode::reprime_video_decoder_for_loop(dec, dem)
                     {
@@ -2870,7 +2908,7 @@ fn run_paint_hook(
                 let dec = to_dec_state
                     .as_deref_mut()
                     .expect("to_dec_state set above for to_dec_id Some(_)");
-                if dec.next_sample_idx >= dem.samples.len() {
+                if dec.next_sample_idx >= dem.sample_count() {
                     if let Err(e) =
                         crate::video_decode::reprime_video_decoder_for_loop(dec, dem)
                     {
@@ -2883,8 +2921,8 @@ fn run_paint_hook(
 
             // Build TransitionEndpoints. ContentItem refs come from a
             // shared borrow on cache.items (field-disjoint from the
-            // &mut video_decoders borrows above). Demuxer samples
-            // come from a shared borrow on cache.video_demuxers.
+            // video_decoders borrows above). Demuxer refs come from
+            // a shared borrow on cache.video_demuxers.
             //
             // Round-18: endpoint_a + endpoint_b both borrow from
             // cache.items simultaneously (held through the paint call
@@ -2897,6 +2935,13 @@ fn run_paint_hook(
             // touch) so they can coexist. Net semantic: from_id + to_id
             // each get a single LRU touch per paint frame -- same as
             // pre-r8 except now explicitly sequenced.
+            //
+            // CMA #2 (2026-06-21): video_demuxers + video_decoders
+            // now also LruMaps so the same dual-borrow pattern
+            // applies. The wrap-check above at lines 2843+ already
+            // did .get(&fid)/.get(&tid) which is the LRU touch;
+            // the endpoint construction below uses .peek() so
+            // endpoint_a + endpoint_b can coexist.
             cache.items.get(&from_id);
             cache.items.get(&to_id);
             let endpoint_a = match cache.items.peek(&from_id) {
@@ -2906,7 +2951,7 @@ fn run_paint_hook(
                         // = bg_id (the referenced VideoSlide), NOT
                         // the text slide id. Demuxer also keyed by
                         // bg_id.
-                        let demuxer = match cache.video_demuxers.get(&bg_id) {
+                        let demuxer = match cache.video_demuxers.peek(&bg_id) {
                             Some(d) => d,
                             None => return err(format!(
                                 "paint_transition: from text-over-video bg demuxer {bg_id} missing \
@@ -2918,7 +2963,7 @@ fn run_paint_hook(
                             .expect("from_dec_state set above for 'b' kind");
                         hdmi::TransitionEndpoint::TextOverVideo {
                             text_slide: s,
-                            bg_samples: demuxer.samples.as_slice(),
+                            bg_demuxer: demuxer,
                             bg_next_sample_idx: &mut dec_state.next_sample_idx,
                             bg_frames_decoded: &mut dec_state.frames_decoded,
                             bg_decoder: &dec_state.decoder,
@@ -2929,7 +2974,7 @@ fn run_paint_hook(
                 }
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
                 Some(ContentItem::Video(_)) => {
-                    let demuxer = match cache.video_demuxers.get(&from_id) {
+                    let demuxer = match cache.video_demuxers.peek(&from_id) {
                         Some(d) => d,
                         None => return err(format!(
                             "paint_transition: from video {from_id} demuxer missing",
@@ -2938,7 +2983,7 @@ fn run_paint_hook(
                     let dec_state =
                         from_dec_state.take().expect("from_dec_state set above for 'v' kind");
                     hdmi::TransitionEndpoint::Video {
-                        samples: demuxer.samples.as_slice(),
+                        demuxer,
                         next_sample_idx: &mut dec_state.next_sample_idx,
                         frames_decoded: &mut dec_state.frames_decoded,
                         decoder: &dec_state.decoder,
@@ -2949,7 +2994,7 @@ fn run_paint_hook(
             let endpoint_b = match cache.items.peek(&to_id) {
                 Some(ContentItem::Text(s)) => {
                     if let Some(bg_id) = s.background_video_slide_id {
-                        let demuxer = match cache.video_demuxers.get(&bg_id) {
+                        let demuxer = match cache.video_demuxers.peek(&bg_id) {
                             Some(d) => d,
                             None => return err(format!(
                                 "paint_transition: to text-over-video bg demuxer {bg_id} missing \
@@ -2961,7 +3006,7 @@ fn run_paint_hook(
                             .expect("to_dec_state set above for 'b' kind");
                         hdmi::TransitionEndpoint::TextOverVideo {
                             text_slide: s,
-                            bg_samples: demuxer.samples.as_slice(),
+                            bg_demuxer: demuxer,
                             bg_next_sample_idx: &mut dec_state.next_sample_idx,
                             bg_frames_decoded: &mut dec_state.frames_decoded,
                             bg_decoder: &dec_state.decoder,
@@ -2972,7 +3017,7 @@ fn run_paint_hook(
                 }
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
                 Some(ContentItem::Video(_)) => {
-                    let demuxer = match cache.video_demuxers.get(&to_id) {
+                    let demuxer = match cache.video_demuxers.peek(&to_id) {
                         Some(d) => d,
                         None => return err(format!(
                             "paint_transition: to video {to_id} demuxer missing",
@@ -2981,7 +3026,7 @@ fn run_paint_hook(
                     let dec_state =
                         to_dec_state.take().expect("to_dec_state set above for 'v' kind");
                     hdmi::TransitionEndpoint::Video {
-                        samples: demuxer.samples.as_slice(),
+                        demuxer,
                         next_sample_idx: &mut dec_state.next_sample_idx,
                         frames_decoded: &mut dec_state.frames_decoded,
                         decoder: &dec_state.decoder,
@@ -4654,7 +4699,7 @@ mod tests {
             .expect("Mp4Demuxer must be in video_demuxers when asset present");
         assert_eq!(dem.width, 320);
         assert_eq!(dem.height, 240);
-        assert!(!dem.samples.is_empty());
+        assert!(dem.sample_count() > 0);
     }
 
     /// FYS bug A (2026-05-21): after evict_other_video_state drops a
@@ -4719,7 +4764,7 @@ mod tests {
         );
         assert_eq!(dem.width, 320);
         assert_eq!(dem.height, 240);
-        assert!(!dem.samples.is_empty());
+        assert!(dem.sample_count() > 0);
     }
 
     /// r46.2 (2026-06-02): text-over-video freeze fix.
@@ -4734,18 +4779,21 @@ mod tests {
         let text_id = uuid(11);
         let bg_id = uuid(12);
         let stale_id = uuid(13);
-        // Seed three demuxers (mock dummy entries). We don't need
-        // real Mp4Demuxer state for the eviction-set test — just
-        // observe which keys retain() drops.
-        // Dummy demuxers — all fields are pub so we can construct
-        // a minimal struct without parsing an MP4 file.
-        let mk_dummy = || crate::mp4_demux::Mp4Demuxer {
-            sps: vec![],
-            pps: vec![],
-            samples: vec![],
-            width: 0,
-            height: 0,
+        // Seed three demuxers (real ones; the eviction test only
+        // observes which HashMap keys retain() drops, not any
+        // sample data). Post-CMA-#1 Mp4Demuxer requires a held
+        // File handle so a struct-literal stub no longer compiles;
+        // re-parsing the 320x240 fixture per entry is cheap
+        // (~1 ms each) and exercises the open() path under test.
+        let fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
         };
+        let mk_dummy = || crate::mp4_demux::Mp4Demuxer::open(&fixture)
+            .expect("open fixture for eviction test");
         cache.video_demuxers.insert(text_id, mk_dummy());
         cache.video_demuxers.insert(bg_id, mk_dummy());
         cache.video_demuxers.insert(stale_id, mk_dummy());

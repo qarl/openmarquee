@@ -3558,11 +3558,11 @@ pub fn render_video_slide_in_session(
         asset_path.display(),
         dem.width,
         dem.height,
-        dem.samples.len(),
+        dem.sample_count(),
     );
     for _frame in 0..total_frames {
         let frame_start = std::time::Instant::now();
-        if state.next_sample_idx >= dem.samples.len() {
+        if state.next_sample_idx >= dem.sample_count() {
             // Reached end of stream — re-feed SPS+PPS+IDR + sample[0]
             // to wrap. On failure (rare), bubble — the reel catches
             // and falls back to black-hold for remainder.
@@ -3573,7 +3573,7 @@ pub fn render_video_slide_in_session(
         paint_and_present_one_video_slide_frame(
             session,
             card,
-            &dem.samples,
+            &dem,
             &mut state.next_sample_idx,
             &mut state.frames_decoded,
             &state.decoder,
@@ -4013,7 +4013,7 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     fonts: Option<&FontCatalog>,
     content_root: Option<&Path>,
     _t_in_slide_ms: u64,
-    samples: &[crate::mp4_demux::Sample],
+    demuxer: &crate::mp4_demux::Mp4Demuxer,
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
@@ -4278,7 +4278,7 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     let painted = unsafe {
         bake_video_slide_to_current_fbo(
             session,
-            samples,
+            demuxer,
             next_sample_idx,
             frames_decoded,
             decoder,
@@ -4907,7 +4907,7 @@ pub fn paint_and_present_external_nv12_frame(
 pub fn paint_and_present_one_video_slide_frame(
     session: &mut EglSession,
     card: &Card,
-    samples: &[crate::mp4_demux::Sample],
+    demuxer: &crate::mp4_demux::Mp4Demuxer,
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
@@ -4965,7 +4965,7 @@ pub fn paint_and_present_one_video_slide_frame(
     let painted = unsafe {
         bake_video_slide_to_current_fbo(
             session,
-            samples,
+            demuxer,
             next_sample_idx,
             frames_decoded,
             decoder,
@@ -5471,19 +5471,19 @@ pub fn paint_and_present_one_transition_frame(
                 }
             }
             TransitionEndpoint::Video {
-                samples,
+                demuxer,
                 next_sample_idx,
                 frames_decoded,
                 decoder,
                 ..
             } => SlideBakeInputs::Video {
-                samples: *samples,
+                demuxer: *demuxer,
                 next_sample_idx: &mut **next_sample_idx,
                 frames_decoded: &mut **frames_decoded,
                 decoder: *decoder,
             },
             TransitionEndpoint::TextOverVideo {
-                bg_samples,
+                bg_demuxer,
                 bg_next_sample_idx,
                 bg_frames_decoded,
                 bg_decoder,
@@ -5496,7 +5496,7 @@ pub fn paint_and_present_one_transition_frame(
                     slide_id: *id,
                     text_layers: layers,
                     motion_states: Some(states),
-                    bg_samples: *bg_samples,
+                    bg_demuxer: *bg_demuxer,
                     bg_next_sample_idx: &mut **bg_next_sample_idx,
                     bg_frames_decoded: &mut **bg_frames_decoded,
                     bg_decoder: *bg_decoder,
@@ -5804,19 +5804,19 @@ pub fn paint_and_present_one_transition_frame(
                     }
                 }
                 TransitionEndpoint::Video {
-                    samples,
+                    demuxer,
                     next_sample_idx,
                     frames_decoded,
                     decoder,
                     ..
                 } => SlideBakeInputs::Video {
-                    samples: *samples,
+                    demuxer: *demuxer,
                     next_sample_idx: &mut **next_sample_idx,
                     frames_decoded: &mut **frames_decoded,
                     decoder: *decoder,
                 },
                 TransitionEndpoint::TextOverVideo {
-                    bg_samples,
+                    bg_demuxer,
                     bg_next_sample_idx,
                     bg_frames_decoded,
                     bg_decoder,
@@ -5829,7 +5829,7 @@ pub fn paint_and_present_one_transition_frame(
                         slide_id: *id,
                         text_layers: layers,
                         motion_states: Some(states),
-                        bg_samples: *bg_samples,
+                        bg_demuxer: *bg_demuxer,
                         bg_next_sample_idx: &mut **bg_next_sample_idx,
                         bg_frames_decoded: &mut **bg_frames_decoded,
                         bg_decoder: *bg_decoder,
@@ -5870,19 +5870,19 @@ pub fn paint_and_present_one_transition_frame(
                     let iter_ok = bake_b_iterations < PATH_B_MAX_ITERS;
                     let samples_remaining_ok = match &endpoint_b {
                         TransitionEndpoint::Video {
-                            samples,
+                            demuxer,
                             next_sample_idx,
                             ..
                         }
                         | TransitionEndpoint::TextOverVideo {
-                            bg_samples: samples,
+                            bg_demuxer: demuxer,
                             bg_next_sample_idx: next_sample_idx,
                             ..
                         } => {
                             // Next bake_video call advances by 1; we
-                            // need samples[idx] to exist for the
+                            // need sample(idx) to be in range for the
                             // upcoming iteration without wrap.
-                            **next_sample_idx < samples.len()
+                            **next_sample_idx < demuxer.sample_count()
                         }
                         _ => true, // Text/Image never returns None
                     };
@@ -6237,7 +6237,10 @@ pub enum TransitionEndpoint<'a> {
     /// variant — adding it back would just produce a dead-code
     /// warning.
     Video {
-        samples: &'a [crate::mp4_demux::Sample],
+        // CMA #1 (2026-06-21): demuxer ref replaces the pre-loaded
+        // samples slice. bake helpers call demuxer.sample(i) on
+        // demand (pread + owned Vec, dropped per-tick).
+        demuxer: &'a crate::mp4_demux::Mp4Demuxer,
         next_sample_idx: &'a mut usize,
         frames_decoded: &'a mut usize,
         decoder: &'a crate::v4l2::Decoder,
@@ -6256,7 +6259,9 @@ pub enum TransitionEndpoint<'a> {
     /// `background_video_slide_id`, NOT the text slide id itself).
     TextOverVideo {
         text_slide: &'a crate::content::TextSlide,
-        bg_samples: &'a [crate::mp4_demux::Sample],
+        // CMA #1 (2026-06-21): bg_demuxer ref replaces bg_samples
+        // slice. Same on-demand pread pattern as Video variant.
+        bg_demuxer: &'a crate::mp4_demux::Mp4Demuxer,
         bg_next_sample_idx: &'a mut usize,
         bg_frames_decoded: &'a mut usize,
         bg_decoder: &'a crate::v4l2::Decoder,
@@ -8731,7 +8736,7 @@ unsafe fn bake_external_nv12_to_current_fbo(
 #[cfg(target_os = "linux")]
 unsafe fn bake_video_slide_to_current_fbo(
     session: &mut EglSession,
-    samples: &[crate::mp4_demux::Sample],
+    demuxer: &crate::mp4_demux::Mp4Demuxer,
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
@@ -8765,12 +8770,13 @@ unsafe fn bake_video_slide_to_current_fbo(
     // retains the SPS/PPS fed at priming (it decoded every
     // mid-stream P/B sample off that same SPS/PPS), so a bare IDR
     // is a valid in-stream refresh point — no flush/reinit needed.
-    if samples.is_empty() {
+    let sample_count = demuxer.sample_count();
+    if sample_count == 0 {
         // Defensive: prime_video_decoder bails on a zero-sample
         // MP4, so a decoder with no samples shouldn't reach here.
         return Ok(None);
     }
-    if *next_sample_idx >= samples.len() {
+    if *next_sample_idx >= sample_count {
         *next_sample_idx = 0;
         // r46.3 (2026-06-02): the wrap-at-bake handler stays as the
         // minimal "wrap back to sample 0" pattern. The actual
@@ -8778,17 +8784,22 @@ unsafe fn bake_video_slide_to_current_fbo(
         // re-QBUF + re-feed SPS+PPS+IDR primer) lives in
         // reprime_video_decoder_for_loop and is invoked from the IPC
         // dispatcher BEFORE this bake call (when it detects the
-        // wrap condition). That separation keeps bake from needing
-        // a &Mp4Demuxer parameter; the primer requires SPS/PPS
-        // bytes which only the demuxer carries. The standalone
-        // reel path (render_video_slide_in_session at hdmi.rs:3025-
-        // 3034) already follows this pattern.
+        // wrap condition). Post-CMA-#1 bake gets the &Mp4Demuxer
+        // directly (was &[Sample]) but still defers re-prime to the
+        // dispatcher — primer call requires SPS/PPS + V4L2-state
+        // reset that crosses the bake boundary.
     }
-    let s = &samples[*next_sample_idx];
+    // CMA #1 (2026-06-21): pread the current sample from the
+    // streaming demuxer instead of indexing a pre-loaded Vec.
+    // `owned` lives until end of function (~33ms tick budget);
+    // dropped immediately after the V4L2 feed.
+    let owned = demuxer.sample(*next_sample_idx)
+        .with_context(|| format!("read sample {}", *next_sample_idx))?;
     decoder
-        .feed(s)
+        .feed(&owned)
         .with_context(|| format!("feed sample {}", *next_sample_idx))?;
     *next_sample_idx += 1;
+    drop(owned);
     if let Some(t) = t_feed_start {
         eprintln!("[firstframe] feed={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
     }
@@ -9305,7 +9316,8 @@ enum SlideBakeInputs<'a> {
     /// marker dropped here.
     #[cfg(target_os = "linux")]
     Video {
-        samples: &'a [crate::mp4_demux::Sample],
+        // CMA #1 (2026-06-21): demuxer ref replaces samples slice.
+        demuxer: &'a crate::mp4_demux::Mp4Demuxer,
         next_sample_idx: &'a mut usize,
         frames_decoded: &'a mut usize,
         decoder: &'a crate::v4l2::Decoder,
@@ -9322,7 +9334,9 @@ enum SlideBakeInputs<'a> {
         slide_id: uuid::Uuid,
         text_layers: &'a [(&'a crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
         motion_states: Option<&'a [MotionState]>,
-        bg_samples: &'a [crate::mp4_demux::Sample],
+        // CMA #1 (2026-06-21): bg_demuxer ref replaces bg_samples
+        // slice.
+        bg_demuxer: &'a crate::mp4_demux::Mp4Demuxer,
         bg_next_sample_idx: &'a mut usize,
         bg_frames_decoded: &'a mut usize,
         bg_decoder: &'a crate::v4l2::Decoder,
@@ -9573,7 +9587,7 @@ unsafe fn bake_slide_to_fbo(
         }
         #[cfg(target_os = "linux")]
         SlideBakeInputs::Video {
-            samples,
+            demuxer,
             next_sample_idx,
             frames_decoded,
             decoder,
@@ -9581,7 +9595,7 @@ unsafe fn bake_slide_to_fbo(
             let (fbo, tex) = prepare_bake_fbo_pair(session.gl, mode_w, mode_h, existing_fbo_pair)?;
             let paint_result = bake_video_slide_to_current_fbo(
                 session,
-                samples,
+                demuxer,
                 next_sample_idx,
                 frames_decoded,
                 decoder,
@@ -9632,7 +9646,7 @@ unsafe fn bake_slide_to_fbo(
             slide_id,
             text_layers,
             motion_states,
-            bg_samples,
+            bg_demuxer,
             bg_next_sample_idx,
             bg_frames_decoded,
             bg_decoder,
@@ -9689,7 +9703,7 @@ unsafe fn bake_slide_to_fbo(
             // (still bound by prepare_bake_fbo_pair).
             let video_result = bake_video_slide_to_current_fbo(
                 session,
-                bg_samples,
+                bg_demuxer,
                 bg_next_sample_idx,
                 bg_frames_decoded,
                 bg_decoder,
