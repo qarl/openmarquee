@@ -37,6 +37,7 @@ mod image_slide_tex;
 /// is host-portable so the macOS `cargo test` (renderer CI job
 /// runs on macos-latest) can exercise the unit tests.
 mod live_preview;
+mod judder_present_dump;
 mod cea861;
 mod content;
 mod hdmi_logic;

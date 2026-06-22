@@ -2985,6 +2985,7 @@ fn run_paint_hook(
                         &mut dec_state.next_sample_idx,
                         &mut dec_state.frames_decoded,
                         &dec_state.decoder,
+                        slide_id,
                     ) {
                         return err(format!("paint_slide (video) failed: {e:#}"));
                     }

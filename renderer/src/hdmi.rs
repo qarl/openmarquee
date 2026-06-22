@@ -778,6 +778,11 @@ pub struct EglSession<'a> {
     /// PNG to the configured path so QA can scp + Read it. See
     /// `live_preview` module docs for the env-var surface + cost.
     live_preview: crate::live_preview::LivePreviewState,
+    /// judder-instrument v3 (2026-06-22): PRESENT-side pixel + log
+    /// probe for the intermittent post-crossfade backward-jump.
+    /// OFF by default; OPENMARQUEE_PRESENT_DUMP=1 enables. See
+    /// `judder_present_dump` module docs.
+    pub judder_present_dump: crate::judder_present_dump::JudderPresentDumpState,
 }
 
 /// v1-spec-delta #5 (slice a) -- bring up GBM + EGL + GLES2,
@@ -1009,6 +1014,8 @@ where
         // sees `config.is_none()` and early-returns before touching
         // GL.
         live_preview: crate::live_preview::LivePreviewState::init_from_env(),
+        judder_present_dump:
+            crate::judder_present_dump::JudderPresentDumpState::init_from_env(),
     };
 
     // CMA-arc 2026-06-21 C4: pre-arc this block UNCONDITIONALLY
@@ -3712,6 +3719,11 @@ pub fn render_video_slide_in_session(
             &mut state.next_sample_idx,
             &mut state.frames_decoded,
             &state.decoder,
+            // Standalone reel has no playlist slide_id; the present-
+            // dump probe is mainly an IPC-path diagnostic. nil() is
+            // fine — the probe's per-slide-play tracking degrades
+            // gracefully (treats all reel presents as one play).
+            uuid::Uuid::nil(),
         )?;
         let elapsed = frame_start.elapsed();
         if elapsed < frame_budget {
@@ -4357,6 +4369,10 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         // QA live-preview hook (2026-06-13): no-op unless
         // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
         session.maybe_live_preview_capture();
+        // judder-instrument v3 (2026-06-22): present-side probe.
+        // slide.id = text slide id (per-play tracking key);
+        // source="live" because the bg video was bake-drained here.
+        session.maybe_present_dump(slide.id, "live", *frames_decoded as u64);
         session
             .egl_lib
             .swap_buffers(session.display, session.egl_surface)
@@ -4612,6 +4628,9 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
+    // judder-instrument v3 (2026-06-22): present-side probe
+    // (non-cached path mirror of the cached path above).
+    session.maybe_present_dump(slide.id, "live", *frames_decoded as u64);
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -5072,6 +5091,13 @@ pub fn paint_and_present_one_video_slide_frame(
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
+    // judder-instrument v3 (2026-06-22): slide_id of the on-screen
+    // slide whose present this is. Threaded through from ipc_main /
+    // standalone-reel so the present-side pixel dump can track per-
+    // slide-play state (max_frame_pos_seen reset on slide change).
+    // Caller passes the playing slide's id; `uuid::Uuid::nil()` if
+    // the call site has no slide context (currently no such site).
+    judder_slide_id: uuid::Uuid,
 ) -> Result<()> {
     // CMA-arc 2026-06-22 RANK 3: idle-free at video-slide hold
     // entry. THIS IS THE WEDGE-REEL PATH (3-video crossfade
@@ -5183,7 +5209,9 @@ pub fn paint_and_present_one_video_slide_frame(
     );
     let t_phase = std::time::Instant::now();
     let t_commit = if profile_first { Some(std::time::Instant::now()) } else { None };
-    let r = finish_video_slide_swap_and_commit(session, card);
+    let r = finish_video_slide_swap_and_commit(
+        session, card, judder_slide_id, *frames_decoded as u64,
+    );
     crate::profile::record_phase(
         "paint_present",
         t_phase.elapsed().as_nanos() as u64,
@@ -5214,10 +5242,19 @@ pub fn paint_and_present_one_video_slide_frame(
 fn finish_video_slide_swap_and_commit(
     session: &mut EglSession,
     card: &Card,
+    judder_slide_id: uuid::Uuid,
+    judder_frame_pos: u64,
 ) -> Result<()> {
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
+    // judder-instrument v3 (2026-06-22): present-side pixel + log
+    // probe. No-op unless OPENMARQUEE_PRESENT_DUMP=1. frame_pos =
+    // frames_decoded post-bump (= the index of the frame just
+    // composited into FBO 0); source = "live" (we're past the
+    // dqbuf path, the actual V4L2 dequeue happened in the bake
+    // call above).
+    session.maybe_present_dump(judder_slide_id, "live", judder_frame_pos);
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -6679,6 +6716,22 @@ pub fn paint_and_present_one_transition_frame(
             session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
             run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
         }
+        // judder-instrument v3 (2026-06-22): present-side probe at
+        // the transition path. The post-pass above wrote the final
+        // composited (A∘B-blend, brightness/gamma + rotated) frame
+        // into FBO 0 — that's what eglSwapBuffers below will commit
+        // to scanout. slide_id = poster_b_video_id (incoming
+        // video's id, where qarl's bug manifests); falls back to
+        // poster_a_video_id then nil for Text/Image-only
+        // transitions (not a target of this probe). frame_pos =
+        // b_post_frames captured at the bake_b convergence above.
+        let dump_slide_id = poster_b_video_id
+            .or(poster_a_video_id)
+            .unwrap_or(uuid::Uuid::nil());
+        let dump_frame_pos = b_post_frames.map(|n| n as u64).unwrap_or(0);
+        session.maybe_present_dump(
+            dump_slide_id, "transition_blend", dump_frame_pos,
+        );
         Ok(true)
     })();
     if !work? {
@@ -8149,6 +8202,29 @@ impl<'a> EglSession<'a> {
             (pw as u32, ph as u32)
         };
         self.live_preview.maybe_capture(self.gl, phys_w, phys_h);
+    }
+
+    /// judder-instrument v3 (2026-06-22): wrap the borrow dance for
+    /// the present-side pixel + log probe. Called from every
+    /// paint_and_present_*_frame BEFORE eglSwapBuffers.
+    ///
+    /// `source` is one of the documented `judder_present_dump::Source`
+    /// constants (poster|snapshot|live|transition_blend|text|image|
+    /// external). `frame_pos` is the decoder's frames_decoded when
+    /// known (video paints), 0 for text/image/external.
+    fn maybe_present_dump(
+        &mut self,
+        slide_id: uuid::Uuid,
+        source: crate::judder_present_dump::Source,
+        frame_pos: u64,
+    ) {
+        let (phys_w, phys_h) = {
+            let (pw, ph) = self.mode.size();
+            (pw as u32, ph as u32)
+        };
+        self.judder_present_dump.record_present(
+            self.gl, phys_w, phys_h, slide_id, source, frame_pos,
+        );
     }
 }
 
