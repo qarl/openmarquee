@@ -5564,7 +5564,17 @@ pub fn paint_and_present_one_transition_frame(
             session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
             session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
             session.gl.clear(glow::COLOR_BUFFER_BIT);
-            run_blit_pass(session.gl, poster_tex)?;
+            // poster-fit (2026-06-22): cover-fit the poster's
+            // native dims onto the panel, mirroring how
+            // bake_video_slide_to_current_fbo aspect-preserves
+            // live video frames. Pre-fix the poster used the
+            // shared fullscreen quad (STRETCH), which on glass
+            // showed a visibly-mis-sized frozen entry vs how
+            // the live video plays. Now identical fit.
+            let cover_vbo = cover_quad_vbo(
+                session.gl, poster_w, poster_h, mode_w_u32, mode_h_u32,
+            )?;
+            run_blit_pass_quad(session.gl, poster_tex, cover_vbo)?;
             // TextOverVideo: composite text live on top.
             if endpoint_a_is_text_over_video {
                 if let Some((slide_id, layers, motion_states)) = text_over_video_a.as_ref() {
@@ -5730,7 +5740,15 @@ pub fn paint_and_present_one_transition_frame(
             session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
             session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
             session.gl.clear(glow::COLOR_BUFFER_BIT);
-            run_blit_pass(session.gl, poster_tex)?;
+            // poster-fit (2026-06-22): see use_poster_a_now
+            // branch for rationale. Same cover-fit fix on the
+            // INCOMING side -- this is the path qarl directly
+            // observed mis-sized (frozen-entry placeholder
+            // before B's live decoder produces frame 0).
+            let cover_vbo = cover_quad_vbo(
+                session.gl, poster_w, poster_h, mode_w_u32, mode_h_u32,
+            )?;
+            run_blit_pass_quad(session.gl, poster_tex, cover_vbo)?;
             if matches!(&endpoint_b, TransitionEndpoint::TextOverVideo { .. }) {
                 if let Some((slide_id, layers, motion_states)) = text_over_video_b.as_ref() {
                     let slide_id = *slide_id;
