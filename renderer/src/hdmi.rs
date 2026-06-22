@@ -935,36 +935,27 @@ where
         populate_msdf_lookup(&session.msdf_atlases);
     }
 
-    // Bug 3 Slice 1 part B (2026-05-19): allocate the dynamic atlas
-    // page's GPU texture (2048×2048 RGBA8 ~ 16 MB GPU memory).
-    // Failure semantics: non-fatal — if the dynamic atlas can't
-    // initialize, Slice 2's runtime cache-miss path will just keep
-    // returning Tofu (the existing pre-Bug-3 behavior). Log + continue.
-    if let Err(e) = session.dynamic_atlas_page_msdf.allocate_texture(&gl) {
-        eprintln!(
-            "warn: dynamic MSDF atlas page texture alloc failed: {e}; \
-             runtime MSDF cache disabled this session",
-        );
-    } else if let Some(tex) = session.dynamic_atlas_page_msdf.texture() {
-        // Bug 3 Slice 2B: publish the texture handle so
-        // draw_text_layer_msdf can bind it for GlyphKind::DynamicMsdf
-        // quads. Cleared in the teardown block below before the
-        // texture is deleted.
-        populate_dynamic_atlas_lookup(tex);
-    }
-
-    // Bug 3 Slice 3B (2026-05-19): parallel allocation for the
-    // COLRv1-rasterized emoji page. Same failure semantics — if
-    // alloc fails, runtime emoji rasterization yields Tofu (Slice 1
-    // pre-cache behavior); static CBDT path keeps working.
-    if let Err(e) = session.dynamic_atlas_page_colr.allocate_texture(&gl) {
-        eprintln!(
-            "warn: dynamic COLR atlas page texture alloc failed: {e}; \
-             runtime COLRv1 emoji cache disabled this session",
-        );
-    } else if let Some(tex) = session.dynamic_atlas_page_colr.texture() {
-        populate_dynamic_atlas_colr_lookup(tex);
-    }
+    // CMA-arc 2026-06-21 (was Bug 3 Slice 1/3B 2026-05-19): the
+    // dynamic atlas pages' GPU textures (2048×2048 RGBA8 = 16 MB
+    // each = 32 MB CMA total) were UNCONDITIONALLY allocated here
+    // at session bring-up. Even a text-only reel with no dynamic
+    // glyph misses paid the 32 MB cost, leaving little headroom
+    // for a video decoder + crossfade on the Pi Zero 2 W's 320 MB
+    // CMA budget. Now lazy: AtlasPage::allocate_texture is invoked
+    // by glyph_cache::poll_completions on first Ready completion
+    // for that render_mode; the DYNAMIC_ATLAS_LOOKUP thread_local
+    // is published from poll_dynamic_glyph_completions (this file)
+    // each call. allocate_texture is idempotent (atlas_page.rs:
+    // 91-93 early-return on Some) so the per-call cost after the
+    // first allocation is one borrow_mut on a thread_local.
+    // Sample-site safety: all draw sites already gate on
+    // `if let Some(dyn_tex) = dynamic_atlas_tex()` (e.g. L2825)
+    // and skip the batch when None — the prior "alloc failed at
+    // bring-up" branch and the new "alloc not yet fired" branch
+    // both surface as the same None, both result in the same
+    // skip. delete (in cleanup_resources below) is also a no-op
+    // on a never-allocated page (atlas_page.rs:142 `take` no-ops
+    // on None).
 
     // Slice 3D (2026-05-19): the SDF-arc-C.2 CBDT atlas upload
     // (~64 MB RGBA across ~3 pages, plus the `EMOJI_ATLAS_CPU`
@@ -1771,12 +1762,11 @@ fn render_animated_slide_in_session(
             // Mirrors paint_and_present_one_frame_for_slide's pattern
             // (hdmi.rs ~2741). FYS Boot's ● (motion=breathe routes
             // through this function) is the qarl-visible case.
-            let uploaded = session.dynamic_glyph_cache.poll_completions(
-                session.gl,
-                &mut session.dynamic_atlas_page_msdf,
-                &mut session.dynamic_atlas_page_colr,
-                4,
-            );
+            // CMA-arc 2026-06-21: wrap via
+            // poll_dynamic_glyph_completions so the lazy-allocated
+            // atlas textures are published to DYNAMIC_ATLAS_LOOKUP /
+            // DYNAMIC_ATLAS_COLR_LOOKUP after this poll.
+            let uploaded = poll_dynamic_glyph_completions(session, 4);
             if uploaded > 0 {
                 if let Some(old) = session.slide_caches.remove(&slide_id) {
                     free_slide_render_cache(session.gl, old);
@@ -3719,12 +3709,8 @@ pub fn paint_and_present_one_frame_for_slide(
     // slide_caches forces the next paint to re-layout; the cost is
     // bounded (uploads happen only on first encounter per codepoint
     // per session, so a few cache rebuilds per session at most).
-    let uploaded = session.dynamic_glyph_cache.poll_completions(
-        session.gl,
-        &mut session.dynamic_atlas_page_msdf,
-        &mut session.dynamic_atlas_page_colr,
-        4,
-    );
+    // CMA-arc 2026-06-21: wrap via poll_dynamic_glyph_completions.
+    let uploaded = poll_dynamic_glyph_completions(session, 4);
     if uploaded > 0 {
         let drained: Vec<_> = session.slide_caches.drain().collect();
         for (_id, entry) in drained {
@@ -4001,12 +3987,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // Same glyph-cache poll + slide-cache invalidation cascade as
     // paint_and_present_one_frame_for_slide. Keeps text-layer
     // rasterization in step with worker-pool completions.
-    let uploaded = session.dynamic_glyph_cache.poll_completions(
-        session.gl,
-        &mut session.dynamic_atlas_page_msdf,
-        &mut session.dynamic_atlas_page_colr,
-        4,
-    );
+    // CMA-arc 2026-06-21: wrap via poll_dynamic_glyph_completions.
+    let uploaded = poll_dynamic_glyph_completions(session, 4);
     if uploaded > 0 {
         let drained: Vec<_> = session.slide_caches.drain().collect();
         for (_id, entry) in drained {
@@ -7243,12 +7225,9 @@ pub fn capture_slide_to_png(
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_millis(800);
             while std::time::Instant::now() < deadline {
-                let _n = session.dynamic_glyph_cache.poll_completions(
-                    session.gl,
-                    &mut session.dynamic_atlas_page_msdf,
-                    &mut session.dynamic_atlas_page_colr,
-                    4,
-                );
+                // CMA-arc 2026-06-21: wrap via
+                // poll_dynamic_glyph_completions.
+                let _n = poll_dynamic_glyph_completions(session, 4);
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
@@ -11964,6 +11943,36 @@ fn dynamic_atlas_colr_tex() -> Option<glow::NativeTexture> {
     DYNAMIC_ATLAS_COLR_LOOKUP.with(|c| *c.borrow())
 }
 
+/// CMA-arc 2026-06-21: wrapper around `GlyphCache::poll_completions`
+/// that publishes the (possibly lazy-allocated) dynamic atlas
+/// textures to `DYNAMIC_ATLAS_LOOKUP` / `DYNAMIC_ATLAS_COLR_LOOKUP`
+/// after the call. Pre-arc the unconditional bring-up alloc
+/// published the textures once at session start; now the pages are
+/// lazy-allocated inside `poll_completions` (glyph_cache.rs) on
+/// first Ready completion of that mode, so the lookup must be
+/// re-checked after each poll. The publish is idempotent (a
+/// thread_local set with the same handle), so the cost after the
+/// first allocation is a single borrow_mut.
+#[cfg(target_os = "linux")]
+fn poll_dynamic_glyph_completions(
+    session: &mut EglSession<'_>,
+    max_uploads_per_call: usize,
+) -> usize {
+    let uploaded = session.dynamic_glyph_cache.poll_completions(
+        session.gl,
+        &mut session.dynamic_atlas_page_msdf,
+        &mut session.dynamic_atlas_page_colr,
+        max_uploads_per_call,
+    );
+    if let Some(tex) = session.dynamic_atlas_page_msdf.texture() {
+        populate_dynamic_atlas_lookup(tex);
+    }
+    if let Some(tex) = session.dynamic_atlas_page_colr.texture() {
+        populate_dynamic_atlas_colr_lookup(tex);
+    }
+    uploaded
+}
+
 /// Resolve a `font_family` string (schema-level) to its baked atlas
 /// stem (e.g. "Anton" -> "anton"). Returns `None` for families not
 /// in the catalog (caller falls back to the default family).
@@ -13175,12 +13184,11 @@ fn prewarm_glyph_rasterization(session: &mut EglSession) {
 
     let watchdog_deadline = t0 + PREWARM_WATCHDOG;
     loop {
-        let drained_this_call = session.dynamic_glyph_cache.poll_completions(
-            session.gl,
-            &mut session.dynamic_atlas_page_msdf,
-            &mut session.dynamic_atlas_page_colr,
-            128,
-        );
+        // CMA-arc 2026-06-21: wrap via poll_dynamic_glyph_completions
+        // so the prewarm path triggers the lazy texture allocation
+        // (the prewarm is precisely the path that pre-arc would
+        // have populated the dynamic atlas at session bring-up).
+        let drained_this_call = poll_dynamic_glyph_completions(session, 128);
         let completions_since_baseline =
             session.dynamic_glyph_cache.completion_count() - baseline_completions;
         if crate::hdmi_logic::glyph_prewarm_drain_complete(
