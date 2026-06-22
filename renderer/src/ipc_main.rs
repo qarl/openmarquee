@@ -993,7 +993,7 @@ impl SlideCache {
                     let mp4_open_us = t_mp4_open.elapsed().as_micros();
                     eprintln!(
                         "ipc: opened MP4 for video slide {} ({}x{}, {} samples)",
-                        item_id, dem.width, dem.height, dem.samples.len()
+                        item_id, dem.width, dem.height, dem.sample_count()
                     );
                     // V4L2 piece 3c: on Linux, also prime the
                     // hardware decoder. Failure is best-effort
@@ -2522,7 +2522,7 @@ fn run_paint_hook(
                             // current_fbo's next_frame() returns Ok(None)
                             // forever; paint early-returns before
                             // swap+commit; FYS panel goes BLACK.
-                            if dec_state.next_sample_idx >= dem.samples.len() {
+                            if dec_state.next_sample_idx >= dem.sample_count() {
                                 if let Err(e) =
                                     crate::video_decode::reprime_video_decoder_for_loop(
                                         dec_state, dem,
@@ -2550,7 +2550,7 @@ fn run_paint_hook(
                                 fonts,
                                 content_root,
                                 t_in_slide_ms,
-                                &dem.samples,
+                                dem,
                                 &mut dec_state.next_sample_idx,
                                 &mut dec_state.frames_decoded,
                                 &dec_state.decoder,
@@ -2663,7 +2663,7 @@ fn run_paint_hook(
                     if let Err(e) = hdmi::paint_and_present_one_video_slide_frame(
                         session,
                         card,
-                        &dem.samples,
+                        dem,
                         &mut dec_state.next_sample_idx,
                         &mut dec_state.frames_decoded,
                         &dec_state.decoder,
@@ -2850,7 +2850,7 @@ fn run_paint_hook(
                 let dec = from_dec_state
                     .as_deref_mut()
                     .expect("from_dec_state set above for from_dec_id Some(_)");
-                if dec.next_sample_idx >= dem.samples.len() {
+                if dec.next_sample_idx >= dem.sample_count() {
                     if let Err(e) =
                         crate::video_decode::reprime_video_decoder_for_loop(dec, dem)
                     {
@@ -2870,7 +2870,7 @@ fn run_paint_hook(
                 let dec = to_dec_state
                     .as_deref_mut()
                     .expect("to_dec_state set above for to_dec_id Some(_)");
-                if dec.next_sample_idx >= dem.samples.len() {
+                if dec.next_sample_idx >= dem.sample_count() {
                     if let Err(e) =
                         crate::video_decode::reprime_video_decoder_for_loop(dec, dem)
                     {
@@ -2918,7 +2918,7 @@ fn run_paint_hook(
                             .expect("from_dec_state set above for 'b' kind");
                         hdmi::TransitionEndpoint::TextOverVideo {
                             text_slide: s,
-                            bg_samples: demuxer.samples.as_slice(),
+                            bg_demuxer: demuxer,
                             bg_next_sample_idx: &mut dec_state.next_sample_idx,
                             bg_frames_decoded: &mut dec_state.frames_decoded,
                             bg_decoder: &dec_state.decoder,
@@ -2938,7 +2938,7 @@ fn run_paint_hook(
                     let dec_state =
                         from_dec_state.take().expect("from_dec_state set above for 'v' kind");
                     hdmi::TransitionEndpoint::Video {
-                        samples: demuxer.samples.as_slice(),
+                        demuxer,
                         next_sample_idx: &mut dec_state.next_sample_idx,
                         frames_decoded: &mut dec_state.frames_decoded,
                         decoder: &dec_state.decoder,
@@ -2961,7 +2961,7 @@ fn run_paint_hook(
                             .expect("to_dec_state set above for 'b' kind");
                         hdmi::TransitionEndpoint::TextOverVideo {
                             text_slide: s,
-                            bg_samples: demuxer.samples.as_slice(),
+                            bg_demuxer: demuxer,
                             bg_next_sample_idx: &mut dec_state.next_sample_idx,
                             bg_frames_decoded: &mut dec_state.frames_decoded,
                             bg_decoder: &dec_state.decoder,
@@ -2981,7 +2981,7 @@ fn run_paint_hook(
                     let dec_state =
                         to_dec_state.take().expect("to_dec_state set above for 'v' kind");
                     hdmi::TransitionEndpoint::Video {
-                        samples: demuxer.samples.as_slice(),
+                        demuxer,
                         next_sample_idx: &mut dec_state.next_sample_idx,
                         frames_decoded: &mut dec_state.frames_decoded,
                         decoder: &dec_state.decoder,
@@ -4654,7 +4654,7 @@ mod tests {
             .expect("Mp4Demuxer must be in video_demuxers when asset present");
         assert_eq!(dem.width, 320);
         assert_eq!(dem.height, 240);
-        assert!(!dem.samples.is_empty());
+        assert!(dem.sample_count() > 0);
     }
 
     /// FYS bug A (2026-05-21): after evict_other_video_state drops a
@@ -4719,7 +4719,7 @@ mod tests {
         );
         assert_eq!(dem.width, 320);
         assert_eq!(dem.height, 240);
-        assert!(!dem.samples.is_empty());
+        assert!(dem.sample_count() > 0);
     }
 
     /// r46.2 (2026-06-02): text-over-video freeze fix.
@@ -4734,18 +4734,21 @@ mod tests {
         let text_id = uuid(11);
         let bg_id = uuid(12);
         let stale_id = uuid(13);
-        // Seed three demuxers (mock dummy entries). We don't need
-        // real Mp4Demuxer state for the eviction-set test — just
-        // observe which keys retain() drops.
-        // Dummy demuxers — all fields are pub so we can construct
-        // a minimal struct without parsing an MP4 file.
-        let mk_dummy = || crate::mp4_demux::Mp4Demuxer {
-            sps: vec![],
-            pps: vec![],
-            samples: vec![],
-            width: 0,
-            height: 0,
+        // Seed three demuxers (real ones; the eviction test only
+        // observes which HashMap keys retain() drops, not any
+        // sample data). Post-CMA-#1 Mp4Demuxer requires a held
+        // File handle so a struct-literal stub no longer compiles;
+        // re-parsing the 320x240 fixture per entry is cheap
+        // (~1 ms each) and exercises the open() path under test.
+        let fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
         };
+        let mk_dummy = || crate::mp4_demux::Mp4Demuxer::open(&fixture)
+            .expect("open fixture for eviction test");
         cache.video_demuxers.insert(text_id, mk_dummy());
         cache.video_demuxers.insert(bg_id, mk_dummy());
         cache.video_demuxers.insert(stale_id, mk_dummy());
