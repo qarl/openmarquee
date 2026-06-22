@@ -4980,7 +4980,23 @@ mod tests {
     /// pressure spike. This test pins the multi-keep semantics.
     #[test]
     fn evict_other_video_state_preserves_multiple_keep_ids() {
+        // CMA R2-RANK4 (2026-06-22): test seeds 3 demuxers
+        // (text + bg + stale) to exercise the multi-keep
+        // retain semantic. RANK4 default cap is 2, which
+        // would LRU-evict text_id on the stale insert before
+        // evict_other_video_state even runs. Override to cap=3
+        // for this test so the 3-entry setup fits the LruMap.
+        // SAFETY: cargo test serializes within a process; the
+        // env var read happens in SlideCache::new() below.
+        unsafe {
+            std::env::set_var("OPENMARQUEE_VIDEO_DECODER_CACHE_CAP", "3");
+        }
         let mut cache = SlideCache::new();
+        // Clear the env override so subsequent tests' caches
+        // get the default cap=2.
+        unsafe {
+            std::env::remove_var("OPENMARQUEE_VIDEO_DECODER_CACHE_CAP");
+        }
         let text_id = uuid(11);
         let bg_id = uuid(12);
         let stale_id = uuid(13);
