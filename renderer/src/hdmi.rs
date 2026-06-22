@@ -3515,11 +3515,65 @@ pub unsafe fn ensure_poster_cached(
     if let Some((replaced, _, _)) = outcome.replaced {
         gl.delete_texture(replaced);
     }
+    // judder-instrument (2026-06-22): visual fingerprint to
+    // correlate the poster against the first-displayed live
+    // incoming frame. qarl spotted a START-OF-INCOMING judder
+    // where the live video appears to start BEFORE the poster
+    // ("like it goes back in time"). His hypothesis is that
+    // the poster is NOT actually frame 0 (the safest backend
+    // assumption was ffmpeg -ss 0 = IDR), but rather a later
+    // or LAST frame -> backward jump. The fingerprint is 9
+    // pixel R-channel values sampled in a 3x3 grid. Cheap
+    // (~9 sample loads + log); compared against the Y-plane
+    // fingerprint logged from drain_one_capture_for_preload
+    // (frame 0, drained during preload) and from the first
+    // 2 live frames in bake_video_slide_to_current_fbo.
+    let fp = fingerprint_9_points(&rgba, w as usize * 4, w as usize, h as usize, 4);
     eprintln!(
-        "[perf] poster_cache_loaded slide_id={} dims={}x{} cache_len={}",
-        slide_id, w, h, session.poster_cache.len(),
+        "[perf] poster_cache_loaded slide_id={} dims={}x{} cache_len={} fp_r={:?}",
+        slide_id, w, h, session.poster_cache.len(), fp,
     );
     Ok(Some((tex, w, h)))
+}
+
+/// judder-instrument (2026-06-22): 9-sample pixel fingerprint for
+/// cross-frame visual identity. Samples 9 points in a 3x3 grid
+/// inset 16 px from each edge; returns the first byte of each
+/// sampled pixel (R channel for RGBA buffers, Y for NV12 Y planes).
+///
+/// `byte_stride` = bytes per row (e.g. w*4 for tightly-packed RGBA,
+/// kernel-reported stride for V4L2 Y planes).
+/// `bytes_per_pixel` = 4 for RGBA, 1 for Y plane.
+///
+/// Returns all-zeros if dims are too small or the buffer is too
+/// short. Intentionally cheap (~9 byte loads).
+pub fn fingerprint_9_points(
+    buf: &[u8],
+    byte_stride: usize,
+    w: usize,
+    h: usize,
+    bytes_per_pixel: usize,
+) -> [u8; 9] {
+    let mut out = [0u8; 9];
+    if w < 48 || h < 48 || byte_stride < w * bytes_per_pixel {
+        return out;
+    }
+    let inset = 16usize;
+    let cx = w / 2;
+    let cy = h / 2;
+    let xs = [inset, cx, w - inset - 1];
+    let ys = [inset, cy, h - inset - 1];
+    let mut idx = 0;
+    for &y in &ys {
+        for &x in &xs {
+            let byte_off = y * byte_stride + x * bytes_per_pixel;
+            if byte_off < buf.len() {
+                out[idx] = buf[byte_off];
+            }
+            idx += 1;
+        }
+    }
+    out
 }
 
 /// v1-spec-delta #8 (slice a, 2026-05-08) -- render an ImageSlide
@@ -9296,6 +9350,32 @@ unsafe fn bake_video_slide_to_current_fbo(
     let t_phase = std::time::Instant::now();
     let f_w = frame.width();
     let f_h = frame.height();
+    // judder-instrument (2026-06-22): fingerprint the FIRST 2 live
+    // frames so QA can correlate against poster_cache_loaded fp_r
+    // + drain_one_capture_for_preload fp_y. qarl observed a
+    // BACKWARD jump at the poster->live handoff (live appears
+    // earlier than poster). This probe answers:
+    //   (i) is poster_b actually frame 0 (matches drained
+    //       fingerprint)?
+    //   (ii) what frame does the first-displayed live show
+    //        (matches drained+1's fingerprint? matches poster's
+    //        fingerprint? something else)?
+    // *frames_decoded is the pre-increment count (still pre-bump
+    // here). Logs gated at < 2 so we get cold-start first +
+    // preload first AND first-after-cold-start = 2 lines max
+    // per slide play instance.
+    if *frames_decoded < 2 {
+        let y_plane = frame.y_plane();
+        let stride = frame.stride() as usize;
+        let fp = fingerprint_9_points(
+            y_plane, stride, f_w as usize, f_h as usize, 1,
+        );
+        eprintln!(
+            "[perf] live_frame_fp frames_decoded_pre={} next_sample_idx_post={} \
+             frame_dims={}x{} stride={} fp_y={:?}",
+            *frames_decoded, *next_sample_idx, f_w, f_h, stride, fp,
+        );
+    }
     // FYS bug B (2026-05-21): a regular uploaded MP4 video must be
     // shown aspect-preserving, not stretched to fill the panel.
     // cover_quad_vbo gives a quad whose positions overflow +/-1 NDC
