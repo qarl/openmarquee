@@ -559,6 +559,25 @@ pub struct EglSession<'a> {
     /// (HDMI hot-plug, rotation flip). `None` while the cache
     /// is empty.
     transition_fbo_dims: Option<(u32, u32)>,
+    /// CMA-arc 2026-06-22 RANK 3: timestamp of the most recent
+    /// `ensure_transition_fbo_pair` call. The transition FBO
+    /// pair (~16.6 MB CMA at 1080p ARGB8888) is alloc-once-and-
+    /// reuse — pre-RANK-3 it was held through every static-slide
+    /// hold + only freed at session teardown. `free_idle_session_fbos`
+    /// (called at the top of paint_and_present_one_frame_for_slide)
+    /// frees the pair when this stamp is older than
+    /// `IDLE_FBO_THRESHOLD` (so consecutive transition ticks
+    /// never trigger a free, but a long-running hold after a
+    /// transition reclaims the CMA). `None` while the pair has
+    /// never been allocated this session.
+    last_transition_fbo_use: Option<std::time::Instant>,
+    /// CMA-arc 2026-06-22 RANK 3: timestamp of the most recent
+    /// `ensure_bake_atlas` call. The scissored-bake atlas
+    /// (2048×2048 RGBA = ~16 MB CMA) is alloc-once-and-reuse —
+    /// pre-RANK-3 held through every hold + only freed at
+    /// teardown. Same idle-free pattern as
+    /// `last_transition_fbo_use`.
+    last_scissored_bake_use: Option<std::time::Instant>,
     /// STREAM/VLC slice-9 follow-up: persistent texture for the
     /// external-frame push-paint path. Allocated once with
     /// glTexImage2D and thereafter updated in place with
@@ -947,6 +966,11 @@ where
         transition_tex_b: None,
         transition_still_a_tex: None,
         transition_fbo_dims: None,
+        // CMA-arc 2026-06-22 RANK 3: idle-free timestamps. Stamped
+        // by ensure_transition_fbo_pair + ensure_bake_atlas; read
+        // by free_idle_session_fbos.
+        last_transition_fbo_use: None,
+        last_scissored_bake_use: None,
         external_frame_tex: None,
         external_nv12_tex: None,
         current_settings: crate::content::Settings::default(),
@@ -3790,6 +3814,16 @@ pub fn paint_and_present_one_frame_for_slide(
     _t_in_slide_ms: u64,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: free session-lifetime FBOs that
+    // aren't currently in use (scene_fbo when settings are
+    // identity, transition pair + scissored-bake atlas when idle
+    // > 5s). Reclaims ~24-40 MB CMA on long static-hold periods
+    // that previously held the FBOs through session teardown.
+    // Each FBO group is lazy-ensure (re-allocates on next use),
+    // so freeing is safe; the idle thresholds prevent churn.
+    // NOT called from paint_and_present_one_transition_frame —
+    // transition ticks stamp last_transition_fbo_use themselves.
+    unsafe { free_idle_session_fbos(session); }
     // QA-direct (2026-05-14 slide-boundary characterization slice):
     // OPENMARQUEE_BOUNDARY_TRACE=1 emits one JSON line per painted
     // frame to stderr with per-phase Instant deltas in microseconds.
@@ -4076,6 +4110,11 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     decoder: &crate::v4l2::Decoder,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: same idle-FBO free as the
+    // text-only path. Wedge + video-only test reels never exercise
+    // the text-slide hold path, so this call site is load-bearing
+    // for the wedge-reel A/B.
+    unsafe { free_idle_session_fbos(session); }
     // r61 Phase B (2026-06-04): first-frame paint breakdown for the
     // text-over-video hot path. r58 + r57 shaved most of the
     // pre-transition stall; the residual gap qarl can still see is
@@ -4605,6 +4644,11 @@ pub fn paint_and_present_one_image_slide_frame(
     content_root: &Path,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: idle-free FBOs at image-slide
+    // hold entry. Image-only reels never touch the text-slide
+    // path so this is needed to actually trigger the ~40 MB
+    // reclaim on image-heavy reels.
+    unsafe { free_idle_session_fbos(session); }
     // perf-night r2 (2026-05-26): bake/compose/present sub-phase
     // wraps. Image bake = PNG decode + texture upload (cold) or
     // texture-cache hit (warm); compose = blit to FBO + present pass;
@@ -4747,6 +4791,9 @@ pub fn paint_and_present_external_frame(
     frame_h: u32,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: idle-free at external-frame hold
+    // entry (STREAM/VLC RGB push path).
+    unsafe { free_idle_session_fbos(session); }
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // Non-identity brightness/gamma routes through the scene FBO +
@@ -4854,6 +4901,9 @@ pub fn paint_and_present_external_nv12_frame(
     frame_h: u32,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: idle-free at external-NV12 hold
+    // entry (STREAM/VLC HW-decode NV12 push path).
+    unsafe { free_idle_session_fbos(session); }
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // Non-identity brightness/gamma OR non-zero rotation routes
@@ -4969,6 +5019,13 @@ pub fn paint_and_present_one_video_slide_frame(
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
 ) -> Result<()> {
+    // CMA-arc 2026-06-22 RANK 3: idle-free at video-slide hold
+    // entry. THIS IS THE WEDGE-REEL PATH (3-video crossfade
+    // reel) — per QA the wedge reel never invokes the text-slide
+    // path, so the original RANK 3 commit's free helper never
+    // fired on the wedge-reel A/B. Adding here lights the
+    // reclaim where the test reel exercises it.
+    unsafe { free_idle_session_fbos(session); }
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // V4L2 piece 4f first-frame profile gate. profile_first is
@@ -7862,6 +7919,103 @@ unsafe fn ensure_scene_fbo(session: &mut EglSession, w: u32, h: u32) -> Result<(
     Ok((fbo, tex))
 }
 
+/// CMA-arc 2026-06-22 RANK 3: free session-lifetime FBO state
+/// that's not currently in use. Pre-RANK-3 these were allocated
+/// on first need + held through every static-slide hold + only
+/// freed at session teardown — so a reel that briefly hit a
+/// non-identity setting OR did one scissored-bake transition
+/// would pin ~24-40 MB CMA for the rest of the session.
+///
+/// All three FBO groups are lazy-ensure (re-allocate automatically
+/// on next use), so freeing them is safe. The transition pair +
+/// scissored-bake atlas are gated on an idle threshold to avoid
+/// freeing-and-realloc churn during active transitions; the
+/// scene_fbo is freed immediately when settings return to identity
+/// + rotation==0 (the precondition that made scene_fbo unnecessary
+/// in the first place per its docstring).
+///
+/// Called at the top of `paint_and_present_one_frame_for_slide`
+/// (static-hold path). NOT called from
+/// `paint_and_present_one_transition_frame` — transition ticks
+/// stamp `last_transition_fbo_use` themselves; freeing at the top
+/// of a transition tick would just immediately re-allocate.
+#[cfg(target_os = "linux")]
+unsafe fn free_idle_session_fbos(session: &mut EglSession<'_>) {
+    use glow::HasContext;
+    // Settings returned to identity + rotation==0 → scene_fbo is
+    // no longer wired into the render path. Free immediately.
+    // The next non-identity frame re-allocates lazily via
+    // ensure_scene_fbo. Settings + rotation churn between identity
+    // and non-identity per frame would cause alloc/free churn —
+    // unrealistic for operator-driven settings; documented assumption.
+    if session.current_settings.is_color_identity() && session.rotation == 0 {
+        if let Some(fbo) = session.scene_fbo.take() {
+            session.gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.scene_tex.take() {
+            session.gl.delete_texture(tex);
+        }
+    }
+
+    // 5 seconds gives reels with back-to-back transitions a wide
+    // margin against churn; a reel that's actively crossfading
+    // re-stamps `last_transition_fbo_use` every tick well within
+    // this window. A reel that goes back to a long static hold
+    // reclaims after 5s.
+    const IDLE_FBO_THRESHOLD: std::time::Duration =
+        std::time::Duration::from_secs(5);
+    let now = std::time::Instant::now();
+
+    // Transition pair (a+b FBOs + textures) + the snapshot-side-A
+    // captured still texture. The pair shares dims via
+    // transition_fbo_dims; reset that sentinel alongside the
+    // free so the next ensure_transition_fbo_pair sees a fresh
+    // cache.
+    let transition_idle = session
+        .last_transition_fbo_use
+        .map_or(true, |t| now.duration_since(t) > IDLE_FBO_THRESHOLD);
+    let transition_holds_state =
+        session.transition_fbo_a.is_some()
+            || session.transition_fbo_b.is_some()
+            || session.transition_still_a_tex.is_some();
+    if transition_idle && transition_holds_state {
+        if let Some(fbo) = session.transition_fbo_a.take() {
+            session.gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.transition_tex_a.take() {
+            session.gl.delete_texture(tex);
+        }
+        if let Some(fbo) = session.transition_fbo_b.take() {
+            session.gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.transition_tex_b.take() {
+            session.gl.delete_texture(tex);
+        }
+        if let Some(tex) = session.transition_still_a_tex.take() {
+            session.gl.delete_texture(tex);
+        }
+        session.transition_fbo_dims = None;
+        // Don't clear `last_transition_fbo_use` — the next ensure
+        // call will re-stamp; leaving the stale stamp is fine
+        // because the gate above is "older than threshold," not
+        // an is_some / is_none check.
+    }
+
+    // Scissored-bake atlas (2048×2048 RGBA = ~16 MB CMA). Only
+    // exercised by `transition_eligible_for_scissored_bake`
+    // transitions (text-heavy paths). Hold-only or non-eligible-
+    // transition reels reclaim after the idle threshold.
+    let bake_idle = session
+        .last_scissored_bake_use
+        .map_or(true, |t| now.duration_since(t) > IDLE_FBO_THRESHOLD);
+    if bake_idle {
+        if let Some((fbo, tex)) = session.scissored_bake_atlas.take() {
+            session.gl.delete_framebuffer(fbo);
+            session.gl.delete_texture(tex);
+        }
+    }
+}
+
 /// r102.2 (2026-06-09): per-side identifier for the cached
 /// transition FBO+tex pair. The transition shader samples both
 /// endpoints simultaneously, so the cache holds two slots --
@@ -7893,6 +8047,12 @@ unsafe fn ensure_transition_fbo_pair(
     h: u32,
 ) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: stamp every transition-tick use so
+    // free_idle_session_fbos knows the pair is currently active.
+    // Stamping at the TOP (before the dims-change-rebuild branch
+    // and the cache-hit return) covers both fresh allocs and warm
+    // re-uses.
+    session.last_transition_fbo_use = Some(std::time::Instant::now());
     let dims_changed = match session.transition_fbo_dims {
         Some((cw, ch)) => cw != w || ch != h,
         None => false,
@@ -13915,6 +14075,9 @@ unsafe fn ensure_bake_atlas(
     session: &mut EglSession,
 ) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: stamp every scissored-bake use so
+    // free_idle_session_fbos knows the atlas is currently active.
+    session.last_scissored_bake_use = Some(std::time::Instant::now());
     if let Some(pair) = session.scissored_bake_atlas {
         return Ok(pair);
     }
