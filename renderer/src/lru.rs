@@ -99,6 +99,46 @@ where
         self.map.get(key)
     }
 
+    /// Mutable lookup with LRU touch — symmetric to `get` but
+    /// returns `&mut V`. Same O(capacity) cost: a hit moves the
+    /// key to back-of-order (so a subsequent insert evicts colder
+    /// entries first), then `HashMap::get_mut` lands the mutable
+    /// borrow.
+    ///
+    /// Added 2026-06-21 (CMA-arc C3) so `hdmi::session.slide_caches`
+    /// can swap from `HashMap` to `LruMap` without changing call
+    /// sites — `slide_caches.get_mut(&slide_id).expect(...)` is the
+    /// canonical pattern at hdmi.rs:1809 etc.
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if !self.map.contains_key(key) {
+            return None;
+        }
+        if let Some(pos) = self.order.iter().position(|k| k.borrow() == key) {
+            if let Some(k) = self.order.remove(pos) {
+                self.order.push_back(k);
+            }
+        }
+        self.map.get_mut(key)
+    }
+
+    /// Existence check WITHOUT touching the LRU order. Cheap
+    /// HashMap lookup; the symmetric `&self` API delegate. Added
+    /// 2026-06-21 (CMA-arc C3) so callers that only need to know
+    /// "is this slide cached?" don't have to take the `get` /
+    /// `get_mut` &mut self path (which would promote LRU recency
+    /// and require &mut access).
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.contains_key(key)
+    }
+
     /// Lookup WITHOUT touching the LRU order. Takes `&self` so
     /// multiple peeks (or a peek under a `&SlideCache` borrow) can
     /// coexist. The trade-off vs `get`: an entry only ever surfaced
