@@ -3529,11 +3529,69 @@ pub unsafe fn ensure_poster_cached(
     // (frame 0, drained during preload) and from the first
     // 2 live frames in bake_video_slide_to_current_fbo.
     let fp = fingerprint_9_points(&rgba, w as usize * 4, w as usize, h as usize, 4);
+    // judder-instrument v2 (2026-06-22): QA's same-channel
+    // follow-up. The previous fp_r vs live fp_y comparison was
+    // cross-channel (R vs Y) and inconclusive on colorful
+    // content (dark posters falsely matched, colorful posters
+    // falsely differed). Add a poster-luma fingerprint via
+    // BT.709 RGB→Y at the same 9 sample points; apples-to-
+    // apples with the live/drained fp_y NV12 Y-plane samples.
+    // QA's drain-skip finding refuted the "1-frame skip is the
+    // judder" hypothesis (drained ≈ first-live); the remaining
+    // question is whether poster matches frame 0 at all.
+    //   - poster_fp_y ≈ live first-frame fp_y → poster IS
+    //     frame 0; judder is subtler (handoff timing / color).
+    //   - poster_fp_y differs from live fp_y → qarl's "wrong
+    //     poster frame" hypothesis confirmed.
+    let fp_y = fingerprint_9_points_luma_from_rgba(&rgba, w as usize, h as usize);
     eprintln!(
-        "[perf] poster_cache_loaded slide_id={} dims={}x{} cache_len={} fp_r={:?}",
-        slide_id, w, h, session.poster_cache.len(), fp,
+        "[perf] poster_cache_loaded slide_id={} dims={}x{} cache_len={} fp_r={:?} fp_y={:?}",
+        slide_id, w, h, session.poster_cache.len(), fp, fp_y,
     );
     Ok(Some((tex, w, h)))
+}
+
+/// judder-instrument v2 (2026-06-22): poster-luma fingerprint via
+/// BT.709 RGB→Y. Reads R/G/B at the same 9 sample points as
+/// `fingerprint_9_points`, applies BT.709 (Y' = 0.2126R +
+/// 0.7152G + 0.0722B), returns Y quantized to u8. Output is
+/// directly comparable to the fp_y values emitted by
+/// drain_one_capture_for_preload + bake_video_slide_to_
+/// current_fbo (which read the NV12 Y plane).
+///
+/// Same bounds-check pattern as fingerprint_9_points: all-zeros
+/// fallback on too-small / overflowing buffer. Cheap (~9 × 3
+/// byte reads + 9 small math ops). Integer math (scale 10000)
+/// for determinism + no float dependency.
+pub fn fingerprint_9_points_luma_from_rgba(
+    rgba: &[u8],
+    w: usize,
+    h: usize,
+) -> [u8; 9] {
+    let mut out = [0u8; 9];
+    let byte_stride = w * 4;
+    if w < 48 || h < 48 || rgba.len() < byte_stride * h {
+        return out;
+    }
+    let inset = 16usize;
+    let cx = w / 2;
+    let cy = h / 2;
+    let xs = [inset, cx, w - inset - 1];
+    let ys = [inset, cy, h - inset - 1];
+    let mut idx = 0;
+    for &y in &ys {
+        for &x in &xs {
+            let off = y * byte_stride + x * 4;
+            // BT.709: Y' = 0.2126R + 0.7152G + 0.0722B.
+            let r = rgba[off] as u32;
+            let g = rgba[off + 1] as u32;
+            let b = rgba[off + 2] as u32;
+            let y_scaled = (2126 * r + 7152 * g + 722 * b) / 10000;
+            out[idx] = y_scaled.min(255) as u8;
+            idx += 1;
+        }
+    }
+    out
 }
 
 /// judder-instrument (2026-06-22): 9-sample pixel fingerprint for
