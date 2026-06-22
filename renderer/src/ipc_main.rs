@@ -1402,6 +1402,14 @@ fn preload_in_worker(
 /// leak in pending_preloads forever. Called opportunistically
 /// from the BeginSlide and BeginTransition handlers (which run
 /// at most once every few seconds), so the walk cost is amortized.
+///
+/// CMA R2-RANK2 (2026-06-22): blocking variant; reduced max_age
+/// 10s -> 5s at call sites (keep >= 3s so a slow legitimate prime
+/// isn't reaped early). Paired with the new non-blocking
+/// `drain_finished_preloads_nonblocking` that fires per IPC main
+/// loop iteration to catch quickly-finished orphans without
+/// waiting for the next BeginSlide. ~13MB CMA win on a paused
+/// playlist with a held 1080p preload.
 fn drain_stale_preloads(
     cache: &mut SlideCache,
     max_age: std::time::Duration,
@@ -1436,6 +1444,63 @@ fn drain_stale_preloads(
                 ),
                 Err(_) => eprintln!(
                     "[perf] preload_stale_drained slide_id={} age_ms={} thread_panicked",
+                    id,
+                    age.as_millis(),
+                ),
+            }
+        }
+    }
+}
+
+/// CMA R2-RANK2 (2026-06-22): non-blocking sibling of
+/// `drain_stale_preloads`. Walks pending_preloads + joins ONLY
+/// the handles whose worker thread has already finished
+/// (JoinHandle::is_finished -> join is guaranteed not to block).
+/// Handles that haven't finished yet are LEFT IN PLACE; the
+/// existing blocking drain_stale_preloads at BeginSlide
+/// (max_age=5s post-RANK2) catches anything that lingers past
+/// the worker's expected lifetime.
+///
+/// Called from the IPC main loop's opportunistic poll site
+/// every iteration. Cost: ~one is_finished check per pending
+/// preload (typically <=2 entries; cap is 2 per
+/// MAX_CONCURRENT_PRELOADS). Effectively free when the map is
+/// empty (most ticks).
+///
+/// The win: a successful preload whose BeginSlide never arrives
+/// (operator changed playlist) gets reaped within ONE IPC tick
+/// of the worker finishing, freeing the ~13MB CMA the primed
+/// 1080p decoder pins -- vs the pre-RANK2 worst-case of 10s
+/// (now 5s post-RANK2 max_age cut).
+fn drain_finished_preloads_nonblocking(cache: &mut SlideCache) {
+    let finished_ids: Vec<uuid::Uuid> = cache
+        .pending_preloads
+        .iter()
+        .filter(|(_, h)| h.thread.is_finished())
+        .map(|(id, _)| *id)
+        .collect();
+    if finished_ids.is_empty() {
+        return;
+    }
+    for id in finished_ids {
+        if let Some(handle) = cache.pending_preloads.remove(&id) {
+            let age = handle.enqueued_at.elapsed();
+            // join() here is guaranteed non-blocking because
+            // is_finished() returned true above.
+            match handle.thread.join() {
+                Ok(Ok(_)) => eprintln!(
+                    "[perf] preload_finished_drained_idle slide_id={} age_ms={}",
+                    id,
+                    age.as_millis(),
+                ),
+                Ok(Err(e)) => eprintln!(
+                    "[perf] preload_finished_drained_idle slide_id={} age_ms={} err={:#}",
+                    id,
+                    age.as_millis(),
+                    e,
+                ),
+                Err(_) => eprintln!(
+                    "[perf] preload_finished_drained_idle slide_id={} age_ms={} thread_panicked",
                     id,
                     age.as_millis(),
                 ),
@@ -2124,6 +2189,16 @@ where
                     crate::image_slide_tex::IMAGE_SLIDE_TEX_CACHE_CAPACITY,
                 );
             }
+            // CMA R2-RANK2 (2026-06-22): opportunistic non-
+            // blocking preload reaper. Joins any pending preload
+            // whose worker has finished (is_finished returns
+            // true); leaves still-running workers untouched.
+            // Cost: 1 is_finished check per pending preload
+            // (typically 0-2 entries). Catches orphaned preloads
+            // within ~1 IPC tick of completion, freeing ~13MB
+            // CMA per primed 1080p decoder.
+            drain_finished_preloads_nonblocking(&mut cache);
+
             // Opportunistic settings poll. Cheap stat() call
             // per iteration; the watcher returns None when
             // mtime is unchanged.
@@ -3269,7 +3344,13 @@ fn handle_inner_request(
             // lead -- any handle older than 10 s reflects a
             // never-arriving BeginSlide. Walk is O(pending_preloads)
             // ≤ MAX_CONCURRENT_PRELOADS = 2.
-            drain_stale_preloads(cache, std::time::Duration::from_secs(10));
+            // CMA R2-RANK2 (2026-06-22): max_age 10s -> 5s.
+            // Tightens the blocking-drain envelope so a stale
+            // orphaned preload pins ~13MB CMA for at most 5s
+            // vs 10s. 5s is still well above the worst-case
+            // ~600ms prime time, so a slow legitimate prime
+            // won't be reaped early.
+            drain_stale_preloads(cache, std::time::Duration::from_secs(5));
             // r65 (2026-06-05): if an async preload for this
             // slide_id is still in flight, join it now + install
             // the artifacts BEFORE the existing eviction +
