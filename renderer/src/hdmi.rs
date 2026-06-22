@@ -1640,10 +1640,8 @@ where
         // QA live-preview hook (2026-06-13): no-op unless
         // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
         session.maybe_live_preview_capture();
-        session
-            .egl_lib
-            .swap_buffers(session.display, session.egl_surface)
-            .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+        // Flip-race fix A (2026-06-22): finish + swap with timing.
+        session.finish_and_swap_with_timing("one_frame_in_session")?;
         let bo = unsafe {
             session
                 .gbm_surface
@@ -1939,10 +1937,8 @@ fn render_animated_slide_in_session(
             // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
             session.maybe_live_preview_capture();
             let t_swap = std::time::Instant::now();
-            session
-                .egl_lib
-                .swap_buffers(session.display, session.egl_surface)
-                .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+            // Flip-race fix A (2026-06-22).
+            session.finish_and_swap_with_timing("animated_text")?;
             crate::profile::record_phase("swap", t_swap.elapsed().as_nanos() as u64);
             let t_lockfb = std::time::Instant::now();
             let bo = unsafe {
@@ -4045,10 +4041,8 @@ pub fn paint_and_present_one_frame_for_slide(
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
-    session
-        .egl_lib
-        .swap_buffers(session.display, session.egl_surface)
-        .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+    // Flip-race fix A (2026-06-22).
+    session.finish_and_swap_with_timing("text")?;
     let t_after_swap = if trace { Some(std::time::Instant::now()) } else { None };
     let new_bo = unsafe {
         session
@@ -4357,10 +4351,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         // QA live-preview hook (2026-06-13): no-op unless
         // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
         session.maybe_live_preview_capture();
-        session
-            .egl_lib
-            .swap_buffers(session.display, session.egl_surface)
-            .map_err(|e| anyhow!("eglSwapBuffers (text-over-video cached) failed: {e:?}"))?;
+        // Flip-race fix A (2026-06-22).
+        session.finish_and_swap_with_timing("text_over_video_cached")?;
         let new_bo = unsafe {
             session
                 .gbm_surface
@@ -4612,10 +4604,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
-    session
-        .egl_lib
-        .swap_buffers(session.display, session.egl_surface)
-        .map_err(|e| anyhow!("eglSwapBuffers (text-over-video) failed: {e:?}"))?;
+    // Flip-race fix A (2026-06-22).
+    session.finish_and_swap_with_timing("text_over_video")?;
     let new_bo = unsafe {
         session
             .gbm_surface
@@ -4783,10 +4773,8 @@ pub fn paint_and_present_one_image_slide_frame(
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
-    session
-        .egl_lib
-        .swap_buffers(session.display, session.egl_surface)
-        .map_err(|e| anyhow!("eglSwapBuffers (image_slide) failed: {e:?}"))?;
+    // Flip-race fix A (2026-06-22).
+    session.finish_and_swap_with_timing("image")?;
     let new_bo = unsafe {
         session
             .gbm_surface
@@ -4894,10 +4882,8 @@ pub fn paint_and_present_external_frame(
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
-    session
-        .egl_lib
-        .swap_buffers(session.display, session.egl_surface)
-        .map_err(|e| anyhow!("eglSwapBuffers (external_frame) failed: {e:?}"))?;
+    // Flip-race fix A (2026-06-22).
+    session.finish_and_swap_with_timing("external")?;
     let new_bo = unsafe {
         session
             .gbm_surface
@@ -5003,10 +4989,8 @@ pub fn paint_and_present_external_nv12_frame(
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
-    session
-        .egl_lib
-        .swap_buffers(session.display, session.egl_surface)
-        .map_err(|e| anyhow!("eglSwapBuffers (external_nv12) failed: {e:?}"))?;
+    // Flip-race fix A (2026-06-22).
+    session.finish_and_swap_with_timing("external_nv12")?;
     let new_bo = unsafe {
         session
             .gbm_surface
@@ -5218,10 +5202,8 @@ fn finish_video_slide_swap_and_commit(
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
-    session
-        .egl_lib
-        .swap_buffers(session.display, session.egl_surface)
-        .map_err(|e| anyhow!("eglSwapBuffers (video_slide) failed: {e:?}"))?;
+    // Flip-race fix A (2026-06-22).
+    session.finish_and_swap_with_timing("video")?;
     let new_bo = unsafe {
         session
             .gbm_surface
@@ -6505,10 +6487,8 @@ pub fn paint_and_present_one_transition_frame(
     // capture today (kmsgrab hangs on the page-flipping scanout
     // plane). No-op unless OPENMARQUEE_LIVE_PREVIEW_PATH is set.
     session.maybe_live_preview_capture();
-    session
-        .egl_lib
-        .swap_buffers(session.display, session.egl_surface)
-        .map_err(|e| anyhow!("eglSwapBuffers failed: {e:?}"))?;
+    // Flip-race fix A (2026-06-22).
+    session.finish_and_swap_with_timing("transition")?;
     let new_bo = unsafe {
         session
             .gbm_surface
@@ -7954,6 +7934,71 @@ impl<'a> EglSession<'a> {
             (pw as u32, ph as u32)
         };
         self.live_preview.maybe_capture(self.gl, phys_w, phys_h);
+    }
+
+    /// Flip-race fix A (2026-06-22): wrap `glFinish` + `eglSwapBuffers`
+    /// at every paint_and_present_* swap site.
+    ///
+    /// Race: vc4 is tile-based, so a render queued via GLES2 commands
+    /// is not COMPLETE until the kernel scans (or glFinish drains)
+    /// the tile-store. `eglSwapBuffers` does an implicit GL flush
+    /// (which issues but doesn't WAIT for completion) and advances
+    /// the GBM swap chain. Combined with:
+    ///   - GBM returning a recently-released BO from the pool as the
+    ///     new backbuffer, and
+    ///   - `commit_fb` submitting the page-flip with `PageFlipFlags::
+    ///     ASYNC` so the kernel switches scanout immediately,
+    /// the kernel can scan out a BO before its NEW content's tiles
+    /// are fully stored — exposing the BO's STALE prior content for
+    /// one frame. That stale frame is whatever the BO was last used
+    /// to scan out, i.e. a frame from a few back. Net visible
+    /// effect: forward-playing video flashes BACK to an earlier
+    /// frame for one frame, then resumes (qarl's "snap-back").
+    ///
+    /// Heisenbug check: `glReadPixels` (in the present-dump probe)
+    /// forces a tile-store flush + bus transfer (~50-100ms on Pi
+    /// Zero 2W), guaranteeing the BO is complete before the kernel
+    /// scans → snap-back disappears under the probe. QA confirmed
+    /// this exactly: 12 min of looping with the dump build, ZERO
+    /// auto-detected backwards; same reel without the probe, qarl
+    /// sees the snap-back. Cause + Heisenbug both explained by THIS
+    /// race.
+    ///
+    /// Fix: `glFinish` BEFORE the swap so the BO that swap_buffers
+    /// promotes to front is GUARANTEED to have its tiles stored.
+    /// `lock_front_buffer` + `page_flip` then send a complete BO
+    /// to the kernel — stale-scanout race closed.
+    ///
+    /// Cost: GPU completion stall, typically 5-15ms on Pi Zero 2W.
+    /// Strictly less than the readback's 50-100ms because we just
+    /// flush tiles to the BO; no bus transfer back to CPU. Preserves
+    /// ASYNC page_flip's vblank-skip benefit (the flip itself is
+    /// still immediate; only the GL render side waits for GPU).
+    ///
+    /// Telemetry: emit `[perf] present_frame site=X gl_finish_us=A
+    /// swap_us=B total_us=C` per swap so QA can measure FPS impact
+    /// on glass (qarl is FPS-sensitive — the present-dump probe's
+    /// low FPS was noticeable to him; A's stall must be acceptable).
+    fn finish_and_swap_with_timing(&mut self, site: &'static str) -> Result<()> {
+        use glow::HasContext;
+        let t_finish = std::time::Instant::now();
+        unsafe {
+            self.gl.finish();
+        }
+        let finish_us = t_finish.elapsed().as_micros();
+        let t_swap = std::time::Instant::now();
+        self.egl_lib
+            .swap_buffers(self.display, self.egl_surface)
+            .map_err(|e| anyhow!("eglSwapBuffers ({site}) failed: {e:?}"))?;
+        let swap_us = t_swap.elapsed().as_micros();
+        eprintln!(
+            "[perf] present_frame site={} gl_finish_us={} swap_us={} total_us={}",
+            site,
+            finish_us,
+            swap_us,
+            finish_us + swap_us,
+        );
+        Ok(())
     }
 }
 
@@ -10961,10 +11006,8 @@ fn render_transition_animated_in_session(
 
             // -- Push to scanout.
             let t_swap_t = std::time::Instant::now();
-            session
-                .egl_lib
-                .swap_buffers(session.display, session.egl_surface)
-                .map_err(|e| anyhow!("eglSwapBuffers (frame {frame}) failed: {e:?}"))?;
+            // Flip-race fix A (2026-06-22).
+            session.finish_and_swap_with_timing("transition_animated_cli")?;
             crate::profile::record_phase("swap", t_swap_t.elapsed().as_nanos() as u64);
             let t_lockfb_t = std::time::Instant::now();
             let bo = unsafe {
@@ -11446,10 +11489,8 @@ fn render_transition_single_pass_in_session(
                 );
 
                 let t_swap_t = Instant::now();
-                session
-                    .egl_lib
-                    .swap_buffers(session.display, session.egl_surface)
-                    .map_err(|e| anyhow!("eglSwapBuffers (frame {frame}) failed: {e:?}"))?;
+                // Flip-race fix A (2026-06-22).
+                session.finish_and_swap_with_timing("legacy_3pass_cli")?;
                 crate::profile::record_phase("swap", t_swap_t.elapsed().as_nanos() as u64);
                 let t_lockfb_t = Instant::now();
                 let bo = unsafe {
@@ -11993,10 +12034,8 @@ fn render_transition_scissored_bake_in_session(
                 // that used to be here forced an extra tile-store on vc4
                 // (cold-scout #2 P6, 2026-05-09).
                 let t_swap = Instant::now();
-                session
-                    .egl_lib
-                    .swap_buffers(session.display, session.egl_surface)
-                    .map_err(|e| anyhow!("eglSwapBuffers (frame {frame}) failed: {e:?}"))?;
+                // Flip-race fix A (2026-06-22).
+                session.finish_and_swap_with_timing("sp_cli")?;
                 crate::profile::record_phase("swap", t_swap.elapsed().as_nanos() as u64);
                 let t_lockfb = Instant::now();
                 let bo = unsafe {
@@ -16647,9 +16686,23 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
         // Render frame 0 + ALLOW_MODESET commit that binds connector
         // → CRTC and primary plane → FB.
         render_frame(&gl, 0.0);
-        egl_lib
-            .swap_buffers(display, egl_surface)
-            .map_err(|e| anyhow!("eglSwapBuffers (frame 0) failed: {e:?}"))?;
+        // Flip-race fix A (2026-06-22): atomic-CLI path has no
+        // EglSession to host the helper; inline the fix shape.
+        {
+            use glow::HasContext;
+            let t_finish = std::time::Instant::now();
+            unsafe { gl.finish(); }
+            let finish_us = t_finish.elapsed().as_micros();
+            let t_swap = std::time::Instant::now();
+            egl_lib
+                .swap_buffers(display, egl_surface)
+                .map_err(|e| anyhow!("eglSwapBuffers (frame 0) failed: {e:?}"))?;
+            let swap_us = t_swap.elapsed().as_micros();
+            eprintln!(
+                "[perf] present_frame site=atomic_cli_init gl_finish_us={} swap_us={} total_us={}",
+                finish_us, swap_us, finish_us + swap_us,
+            );
+        }
         let first_bo = unsafe {
             gbm_surface
                 .lock_front_buffer()
@@ -16697,9 +16750,23 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
         while Instant::now() < end {
             let t = start.elapsed().as_secs_f32();
             render_frame(&gl, t);
-            egl_lib
-                .swap_buffers(display, egl_surface)
-                .map_err(|e| anyhow!("eglSwapBuffers (frame {frame_count}) failed: {e:?}"))?;
+            // Flip-race fix A (2026-06-22): inlined for atomic-CLI
+            // path (no EglSession host).
+            {
+                use glow::HasContext;
+                let t_finish = std::time::Instant::now();
+                unsafe { gl.finish(); }
+                let finish_us = t_finish.elapsed().as_micros();
+                let t_swap = std::time::Instant::now();
+                egl_lib
+                    .swap_buffers(display, egl_surface)
+                    .map_err(|e| anyhow!("eglSwapBuffers (frame {frame_count}) failed: {e:?}"))?;
+                let swap_us = t_swap.elapsed().as_micros();
+                eprintln!(
+                    "[perf] present_frame site=atomic_cli_loop gl_finish_us={} swap_us={} total_us={}",
+                    finish_us, swap_us, finish_us + swap_us,
+                );
+            }
             let bo = unsafe {
                 gbm_surface
                     .lock_front_buffer()
