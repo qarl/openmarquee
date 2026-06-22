@@ -586,7 +586,51 @@ enum LoadMode {
 /// (decoder, demuxer) pair lifetimes stay in lock-step (decoder
 /// without demuxer is dead state; demuxer without decoder is
 /// harmless but wasteful File handle).
-const VIDEO_DECODER_CACHE_CAP: usize = 3;
+/// CMA R2-RANK4 (2026-06-22): default reduced 3 -> 2. The CMA #2
+/// rationale ("1 currently-painting + 1 transition partner + 1
+/// preload lookahead = 3") was an upper bound; in practice r97
+/// codec-contention defer-preload keeps the 3rd slot empty
+/// during transitions anyway, so cap=2 reclaims ~11MB CMA on
+/// steady-state single-video reels (the idle 3rd LRU slot was
+/// pinning a recently-evicted decoder until it was finally
+/// flushed by a 3rd-distinct-id insert).
+///
+/// Env override `OPENMARQUEE_VIDEO_DECODER_CACHE_CAP=3` returns
+/// to the pre-RANK4 default for QA A/B (single-video vs
+/// multi-video-preload reels). Clamped to [2, 4] to keep the
+/// architectural invariants (>=2 so v2v fades always fit;
+/// <=4 to bound the CMA worst-case). Read once at SlideCache::
+/// new() so the cap is stable for the SlideCache's lifetime.
+const VIDEO_DECODER_CACHE_CAP_DEFAULT: usize = 2;
+
+fn resolve_video_decoder_cache_cap() -> usize {
+    match std::env::var("OPENMARQUEE_VIDEO_DECODER_CACHE_CAP").ok() {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if (2..=4).contains(&n) => {
+                eprintln!(
+                    "[perf] video_decoder_cache_cap_override raw={} resolved={}",
+                    raw, n,
+                );
+                n
+            }
+            Ok(n) => {
+                eprintln!(
+                    "warn: OPENMARQUEE_VIDEO_DECODER_CACHE_CAP={} out of range [2,4]; using default {}",
+                    n, VIDEO_DECODER_CACHE_CAP_DEFAULT,
+                );
+                VIDEO_DECODER_CACHE_CAP_DEFAULT
+            }
+            Err(e) => {
+                eprintln!(
+                    "warn: OPENMARQUEE_VIDEO_DECODER_CACHE_CAP={:?} parse err={}; using default {}",
+                    raw, e, VIDEO_DECODER_CACHE_CAP_DEFAULT,
+                );
+                VIDEO_DECODER_CACHE_CAP_DEFAULT
+            }
+        },
+        None => VIDEO_DECODER_CACHE_CAP_DEFAULT,
+    }
+}
 
 struct SlideCache {
     items: LruMap<uuid::Uuid, ContentItem>,
@@ -597,7 +641,9 @@ struct SlideCache {
     /// forever. Stamping the on-disk mtime here lets `load` detect drift
     /// and evict before the cached copy is reused.
     item_mtimes: LruMap<uuid::Uuid, std::time::SystemTime>,
-    /// CMA #2 (2026-06-21): bounded LRU (cap=VIDEO_DECODER_CACHE_CAP)
+    /// CMA #2 (2026-06-21): bounded LRU (cap resolved at
+    /// SlideCache::new() via resolve_video_decoder_cache_cap;
+    /// default VIDEO_DECODER_CACHE_CAP_DEFAULT=2 post-R2-RANK4)
     /// so demuxer entries don't accumulate across an N-slide reel.
     /// Each Mp4Demuxer holds a File handle (no big buffer post-CMA-#1)
     /// so the bound is mostly about closing fds + keeping memory
@@ -618,7 +664,10 @@ struct SlideCache {
     /// cache.load primes the decoder once on first encounter; piece
     /// 3d's paint_slide drains frames per advance tick.
     ///
-    /// CMA #2 (2026-06-21): bounded LRU (cap=VIDEO_DECODER_CACHE_CAP=3).
+    /// CMA #2 (2026-06-21): bounded LRU; cap resolved via
+    /// resolve_video_decoder_cache_cap (default 2 post-R2-RANK4,
+    /// was 3 pre-RANK4; env override
+    /// OPENMARQUEE_VIDEO_DECODER_CACHE_CAP=N clamps to [2,4]).
     /// Closes the original TODO ("release decoder on cache eviction").
     /// Each primed decoder holds ~16-25 MB CMA at 1080p (4+4 buffers
     /// × per-plane size); QA measured cma_used growing 221->250 MB
@@ -712,13 +761,18 @@ type PreloadResult = anyhow::Result<PreloadArtifacts>;
 
 impl SlideCache {
     fn new() -> Self {
+        // CMA R2-RANK4 (2026-06-22): resolve cap once at
+        // construction so both LruMaps stay in lock-step (decoder
+        // + demuxer pair lifetimes) and the env override (if any)
+        // is read exactly once. Default 2; clamp [2,4].
+        let video_cache_cap = resolve_video_decoder_cache_cap();
         Self {
             items: LruMap::with_capacity(SLIDE_CACHE_CAP),
             item_mtimes: LruMap::with_capacity(SLIDE_CACHE_CAP),
-            video_demuxers: LruMap::with_capacity(VIDEO_DECODER_CACHE_CAP),
+            video_demuxers: LruMap::with_capacity(video_cache_cap),
             video_skip: std::collections::HashSet::new(),
             #[cfg(target_os = "linux")]
-            video_decoders: LruMap::with_capacity(VIDEO_DECODER_CACHE_CAP),
+            video_decoders: LruMap::with_capacity(video_cache_cap),
             pending_preloads: std::collections::HashMap::new(),
             #[cfg(target_os = "linux")]
             pending_recreates: std::collections::HashMap::new(),
@@ -5046,7 +5100,23 @@ mod tests {
     /// pressure spike. This test pins the multi-keep semantics.
     #[test]
     fn evict_other_video_state_preserves_multiple_keep_ids() {
+        // CMA R2-RANK4 (2026-06-22): test seeds 3 demuxers
+        // (text + bg + stale) to exercise the multi-keep
+        // retain semantic. RANK4 default cap is 2, which
+        // would LRU-evict text_id on the stale insert before
+        // evict_other_video_state even runs. Override to cap=3
+        // for this test so the 3-entry setup fits the LruMap.
+        // SAFETY: cargo test serializes within a process; the
+        // env var read happens in SlideCache::new() below.
+        unsafe {
+            std::env::set_var("OPENMARQUEE_VIDEO_DECODER_CACHE_CAP", "3");
+        }
         let mut cache = SlideCache::new();
+        // Clear the env override so subsequent tests' caches
+        // get the default cap=2.
+        unsafe {
+            std::env::remove_var("OPENMARQUEE_VIDEO_DECODER_CACHE_CAP");
+        }
         let text_id = uuid(11);
         let bg_id = uuid(12);
         let stale_id = uuid(13);
