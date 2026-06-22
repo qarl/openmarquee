@@ -22,8 +22,8 @@ pub struct MsdfAtlasGl {
     pub tex: glow::NativeTexture,
 }
 
-/// Upload every parsed atlas as a GL_RGB texture. Returns the
-/// per-atlas GL handles + manifests for runtime use.
+/// Upload a single parsed atlas as a GL_RGB texture. Returns the
+/// uploaded handle + manifest.
 ///
 /// `gl.tex_image_2d` with internal_format = GL_RGB, format = GL_RGB,
 /// type = GL_UNSIGNED_BYTE; the slice A atlas blob is exactly
@@ -39,6 +39,90 @@ pub struct MsdfAtlasGl {
 /// 4-byte aligned at arbitrary atlas widths; restore to default
 /// (4) after the upload so other textures stay on the GL default
 /// fast path.
+///
+/// CMA-arc 2026-06-21 C4: extracted from `upload_all` so the
+/// lazy-per-family path (`hdmi.rs::ensure_msdf_atlas_uploaded`)
+/// can pay the ~1.3 MB CMA cost only on first text draw of each
+/// family rather than ~30 MB up front for all 23 atlases at
+/// session bring-up. Failure semantics preserved: cleans up the
+/// half-allocated texture on per-step error so callers don't
+/// leak GL handles.
+pub fn upload_one(
+    gl: &glow::Context,
+    atlas: &MsdfAtlas,
+) -> Result<MsdfAtlasGl> {
+    use glow::HasContext;
+    unsafe {
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        let tex = match gl.create_texture() {
+            Ok(t) => t,
+            Err(e) => {
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                return Err(anyhow!(
+                    "glGenTextures(msdf {}): {e}",
+                    atlas.manifest.font
+                ));
+            }
+        };
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGB as i32,
+            atlas.manifest.atlas_w as i32,
+            atlas.manifest.atlas_h as i32,
+            0,
+            glow::RGB,
+            glow::UNSIGNED_BYTE,
+            Some(atlas.atlas_rgb),
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            glow::LINEAR as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            glow::CLAMP_TO_EDGE as i32,
+        );
+        let err = gl.get_error();
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        if err != 0 {
+            gl.delete_texture(tex);
+            return Err(anyhow!(
+                "msdf atlas {} upload failed: GL error 0x{err:x}",
+                atlas.manifest.font
+            ));
+        }
+        Ok(MsdfAtlasGl {
+            stem: atlas.manifest.font.clone(),
+            manifest: atlas.manifest.clone(),
+            tex,
+        })
+    }
+}
+
+/// Upload every parsed atlas as a GL_RGB texture. Returns the
+/// per-atlas GL handles + manifests for runtime use.
+///
+/// CMA-arc 2026-06-21 C4: still exists for callers that need the
+/// eager-all path (host tests, etc.). The hdmi.rs bring-up no
+/// longer calls this; per-family lazy upload happens via
+/// `ensure_msdf_atlas_uploaded` in hdmi.rs which delegates to
+/// `upload_one`. Failure semantics preserved (cleanup on partial).
 pub fn upload_all(
     gl: &glow::Context,
     atlases: &[MsdfAtlas],
@@ -51,84 +135,23 @@ pub fn upload_all(
     // a u32 alias, no Drop semantics. delete_all() only runs at
     // session teardown via the success path; an Err from
     // upload_all means the caller never receives `out`, so its
-    // textures live until the GL context dies. Wrap both bubble
-    // sites + the success path's pixel_store restore so a partial
-    // upload doesn't leak prior textures or leave GL state on
-    // UNPACK_ALIGNMENT=1. Session-startup is fatal-on-fail today,
-    // but the canonical pattern survives future refactors that
-    // might want to retry / continue. See qa/r41-capture-startup-
-    // cleanup-2026-06-02.md.
+    // textures live until the GL context dies. See qa/r41-capture-
+    // startup-cleanup-2026-06-02.md.
     let cleanup_partial = |gl: &glow::Context, out: &mut Vec<MsdfAtlasGl>| unsafe {
         for entry in out.drain(..) {
             gl.delete_texture(entry.tex);
         }
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-        gl.bind_texture(glow::TEXTURE_2D, None);
     };
 
     let mut out = Vec::with_capacity(atlases.len());
-    unsafe {
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-        for atlas in atlases {
-            let tex = match gl.create_texture() {
-                Ok(t) => t,
-                Err(e) => {
-                    cleanup_partial(gl, &mut out);
-                    return Err(anyhow!(
-                        "glGenTextures(msdf {}): {e}",
-                        atlas.manifest.font
-                    ));
-                }
-            };
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGB as i32,
-                atlas.manifest.atlas_w as i32,
-                atlas.manifest.atlas_h as i32,
-                0,
-                glow::RGB,
-                glow::UNSIGNED_BYTE,
-                Some(atlas.atlas_rgb),
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MIN_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_MAG_FILTER,
-                glow::LINEAR as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_S,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-            gl.tex_parameter_i32(
-                glow::TEXTURE_2D,
-                glow::TEXTURE_WRAP_T,
-                glow::CLAMP_TO_EDGE as i32,
-            );
-            let err = gl.get_error();
-            if err != 0 {
-                gl.delete_texture(tex);
+    for atlas in atlases {
+        match upload_one(gl, atlas) {
+            Ok(uploaded) => out.push(uploaded),
+            Err(e) => {
                 cleanup_partial(gl, &mut out);
-                return Err(anyhow!(
-                    "msdf atlas {} upload failed: GL error 0x{err:x}",
-                    atlas.manifest.font
-                ));
+                return Err(e);
             }
-            out.push(MsdfAtlasGl {
-                stem: atlas.manifest.font.clone(),
-                manifest: atlas.manifest.clone(),
-                tex,
-            });
         }
-        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-        gl.bind_texture(glow::TEXTURE_2D, None);
     }
     eprintln!(
         "msdf: uploaded {} atlases ({} MB total)",

@@ -624,15 +624,18 @@ pub struct EglSession<'a> {
     /// See ATLAS_FBO_W / ATLAS_FBO_H / ATLAS_REGION_W /
     /// ATLAS_REGION_H in hdmi_logic.rs for the geometry.
     scissored_bake_atlas: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
-    /// SDF arc slice B.2 -- session-wide MSDF atlases. 23 RGB888
-    /// textures uploaded once at session bring-up (immediately
-    /// after `make_current`), bound per-layer at draw time keyed
-    /// on the layer's font stem. Freed at session teardown while
-    /// the GL context is still bound. The CPU-side parsed
-    /// manifests live in the `manifest` field of each entry so the
-    /// quad-layout pass + atlas-lookup don't re-parse JSON per
-    /// draw.
-    msdf_atlases: Vec<crate::sdf_atlas_gl::MsdfAtlasGl>,
+    // CMA-arc 2026-06-21 C4: the prior `msdf_atlases: Vec<MsdfAtlasGl>`
+    // session field is retired. Owned MsdfAtlasGl entries now live
+    // in the `MSDF_ATLAS_OWNED` thread_local Vec (see further down
+    // in this file). The migration was necessary because lazy
+    // upload now happens from `ensure_msdf_atlas_uploaded` called
+    // from paint_slide_with_viewport, which receives `&gl` (not
+    // `&mut session`); plumbing &mut session through the paint
+    // stack would have been a far larger refactor. The
+    // thread_local approach matches the sibling LOOKUP pattern
+    // already in use for MSDF_ATLAS_LOOKUP /
+    // DYNAMIC_ATLAS_LOOKUP. Teardown drains via
+    // `delete_owned_msdf_atlases` in `cleanup_resources`.
     /// Bug 3 Slice 1 part B (2026-05-19): dynamic runtime glyph
     /// cache for codepoints not in the static build-time-baked
     /// MSDF atlas (e.g. ●, ∞). Cache + atlas page created at session
@@ -942,7 +945,10 @@ where
         slide_caches: crate::lru::LruMap::with_capacity(SLIDE_CACHES_CAPACITY),
         transition_sp_quad_vbo: None,
         scissored_bake_atlas: None,
-        msdf_atlases: Vec::new(),
+        // CMA-arc 2026-06-21 C4: `msdf_atlases` field retired;
+        // owned MsdfAtlasGl entries now in the MSDF_ATLAS_OWNED
+        // thread_local. No init needed (RefCell::new(Vec::new())
+        // at thread_local decl).
         // Bug 3 Slice 1 part B (2026-05-19): construct the dynamic
         // glyph cache + its backing atlas page upfront. GlyphCache
         // spawns 4 std::thread workers via crossbeam-channel mpsc;
@@ -970,21 +976,37 @@ where
         live_preview: crate::live_preview::LivePreviewState::init_from_env(),
     };
 
-    // SDF arc slice B.2 -- one-shot atlas upload after the GL
-    // context is current. 23 atlases x ~1.3 MB each = ~30 MB GPU
-    // memory, all RGB8. The Vec is freed at session teardown.
+    // CMA-arc 2026-06-21 C4: pre-arc this block UNCONDITIONALLY
+    // uploaded ALL 23 SDF atlases at session bring-up (~30 MB
+    // CMA, RGB8 textures). Even a reel that only uses one or two
+    // font families paid the full 30 MB at session start —
+    // load-bearing on the 320 MB Pi Zero 2 W budget. The 3-video
+    // wedge reel (post-C1-C3 + code2's #1-#2 combined) saw the
+    // crossfade peak drop CmaFree to ~6.6 MB — razor-thin. Lazy-
+    // loading frees ~30 MB upfront and pays ~1.3 MB per family
+    // ONLY on first text draw of that family. Typical reels use
+    // 1-3 distinct families → ~26-28 MB stays reclaimed at
+    // steady state.
     //
-    // Failure semantics: if atlas loading fails, the session
-    // CAN'T render MSDF text (which is now the only text path).
-    // Bubble up the error -- the operator will see the failure
-    // immediately rather than getting silently-broken text on
-    // every slide.
-    {
-        let parsed = crate::sdf_atlas::load_all_atlases()
-            .map_err(|e| anyhow!("msdf atlas load failed: {e}"))?;
-        session.msdf_atlases = crate::sdf_atlas_gl::upload_all(&gl, &parsed)?;
-        populate_msdf_lookup(&session.msdf_atlases);
-    }
+    // The lazy path lives in `ensure_msdf_atlas_uploaded` (this
+    // file) and is invoked at each `msdf_atlas_for_family` call
+    // site before the (read-only) lookup runs. MSDF_ATLASES_CPU
+    // (the CPU-side parsed atlas Vec) is still process-singleton
+    // OnceLock — `load_all_atlases` is parse-only over
+    // `include_bytes!`-backed slices, so the CPU work is cheap +
+    // happens once on first lazy upload. The GPU side
+    // (session.msdf_atlases + MSDF_ATLAS_LOOKUP thread_local)
+    // grows as families are touched.
+    //
+    // Failure semantics preserved: per-family upload failure is
+    // logged + the family falls back to Inter (via the existing
+    // `or_else(|| msdf_atlas_for_family("Inter"))` chains at the
+    // call sites). If Inter ALSO fails, the same anyhow! error
+    // surfaces as before — the operator sees the failure
+    // immediately rather than getting silently-broken text. The
+    // pre-arc bring-up path was fatal-on-fail for ANY atlas;
+    // post-arc only Inter is load-bearing (the others can fail
+    // safely with a visual fallback to Inter glyph metrics).
 
     // CMA-arc 2026-06-21 (was Bug 3 Slice 1/3B 2026-05-19): the
     // dynamic atlas pages' GPU textures (2048×2048 RGBA8 = 16 MB
@@ -1091,7 +1113,11 @@ where
     // is still bound. Clear the lookup table first so a paint after
     // teardown can't dereference dead texture handles.
     clear_msdf_lookup();
-    crate::sdf_atlas_gl::delete_all(&gl, &mut session.msdf_atlases);
+    // CMA-arc 2026-06-21 C4: ownership of uploaded MsdfAtlasGl
+    // moved from session.msdf_atlases (pre-arc field, now removed)
+    // to the MSDF_ATLAS_OWNED thread_local Vec. Drain + delete
+    // here so the GL handles release while the context is bound.
+    delete_owned_msdf_atlases(&gl);
     // Slice 3D (2026-05-19): the CBDT-side `clear_emoji_lookup()` +
     // `delete_all` of session.emoji_atlases are gone alongside the
     // atlas itself. Only the dynamic-COLR teardown below remains.
@@ -11922,11 +11948,13 @@ fn cached_emoji_program(gl: &glow::Context) -> Result<CachedEmojiProgram> {
 
 /// SDF arc slice B.2 -- session-scoped MSDF atlas lookup table.
 ///
-/// Populated by `populate_msdf_lookup` after `upload_all` lands the
-/// 23 atlas textures on the GL context; cleared by
-/// `clear_msdf_lookup` at session teardown BEFORE
-/// `sdf_atlas_gl::delete_all` so a stale lookup can't outlive the
-/// underlying NativeTexture handles.
+/// CMA-arc 2026-06-21 C4: populated incrementally by
+/// `ensure_msdf_atlas_uploaded` (lazy-per-family upload). Cleared
+/// by `clear_msdf_lookup` at session teardown BEFORE
+/// `delete_owned_msdf_atlases` so a stale lookup can't outlive
+/// the underlying NativeTexture handles. The pre-arc bring-up
+/// upload (`upload_all` + `populate_msdf_lookup`) was retired
+/// to free ~30 MB CMA upfront.
 ///
 /// Why a thread_local instead of threading `&[MsdfAtlasGl]` through
 /// paint_slide's signature: ~14 call sites would each need a new
@@ -11943,6 +11971,19 @@ fn cached_emoji_program(gl: &glow::Context) -> Result<CachedEmojiProgram> {
 std::thread_local! {
     static MSDF_ATLAS_LOOKUP: std::cell::RefCell<Vec<(String, glow::NativeTexture)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// CMA-arc 2026-06-21 C4: per-thread OWNED MsdfAtlasGl store.
+    /// Pre-arc the owned MsdfAtlasGl entries lived on
+    /// `session.msdf_atlases` (a Vec<MsdfAtlasGl> field). Lazy-
+    /// upload via `ensure_msdf_atlas_uploaded` happens from
+    /// paint_slide_with_viewport which receives only `&gl` (not
+    /// `&mut session`), so the owned Vec moved to a thread_local
+    /// to match. Teardown helper `delete_owned_msdf_atlases` drains
+    /// + calls `sdf_atlas_gl::delete_all` on the contents while
+    /// the GL context is still bound (`with_egl_session` cleanup
+    /// runs both this AND clear_msdf_lookup before the GL
+    /// context tears down).
+    static MSDF_ATLAS_OWNED: std::cell::RefCell<Vec<crate::sdf_atlas_gl::MsdfAtlasGl>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Process-wide parsed atlas set (CPU-side; `atlas_rgb` is 'static
@@ -11953,20 +11994,12 @@ std::thread_local! {
 static MSDF_ATLASES_CPU: std::sync::OnceLock<Vec<crate::sdf_atlas::MsdfAtlas>> =
     std::sync::OnceLock::new();
 
-fn populate_msdf_lookup(atlases: &[crate::sdf_atlas_gl::MsdfAtlasGl]) {
-    MSDF_ATLAS_LOOKUP.with(|c| {
-        let mut v = c.borrow_mut();
-        v.clear();
-        for a in atlases {
-            v.push((a.stem.clone(), a.tex));
-        }
-    });
-    // First session populates the CPU-side cache; subsequent
-    // sessions skip (OnceLock semantics).
-    let _ = MSDF_ATLASES_CPU.get_or_init(|| {
-        crate::sdf_atlas::load_all_atlases().unwrap_or_default()
-    });
-}
+// CMA-arc 2026-06-21 C4: `populate_msdf_lookup` (eager bring-up
+// publish of all 23 atlas textures) retired. The thread_local is
+// now populated incrementally by `ensure_msdf_atlas_uploaded` on
+// first text draw of each font family. MSDF_ATLASES_CPU's
+// OnceLock get_or_init is mirrored inside `ensure_msdf_atlas_uploaded`
+// so the CPU-side parse fires on first lazy upload.
 
 fn clear_msdf_lookup() {
     MSDF_ATLAS_LOOKUP.with(|c| c.borrow_mut().clear());
@@ -12112,6 +12145,13 @@ fn font_family_to_atlas_stem(family: &str) -> Option<&'static str> {
 /// host tests that bypass `with_egl_session`). Production paths
 /// fall back to the catalog's default family ("Inter") when the
 /// requested family is missing.
+///
+/// CMA-arc 2026-06-21 C4: pure lookup (no `&mut` / no GL work).
+/// The caller MUST have invoked `ensure_msdf_atlas_uploaded` (or
+/// `ensure_msdf_atlas_for_family_or_default`) earlier in the same
+/// frame for any family it queries — otherwise this returns
+/// `None` for never-touched families and the call site's
+/// `or_else(|| msdf_atlas_for_family("Inter"))` fallback fires.
 fn msdf_atlas_for_family(
     family: &str,
 ) -> Option<(glow::NativeTexture, &'static crate::sdf_atlas::MsdfAtlas)> {
@@ -12125,6 +12165,98 @@ fn msdf_atlas_for_family(
             .map(|(_, t)| *t)
     })?;
     Some((tex, atlas))
+}
+
+/// CMA-arc 2026-06-21 C4: lazy-upload the static MSDF atlas for
+/// `family` if it isn't already uploaded. Returns `Some(tex)` on
+/// success (already-uploaded OR newly-uploaded), `None` if the
+/// family isn't in the catalog OR the on-the-fly upload failed.
+/// Idempotent.
+///
+/// MSDF_ATLASES_CPU (the CPU-side parsed atlas Vec backed by
+/// `include_bytes!` slices) is initialized on first call via the
+/// OnceLock's get_or_init — cheap, parse-only, no I/O.
+///
+/// Per-family GPU upload pays the ~1.3 MB CMA cost only on first
+/// touch + transfers ownership of the new MsdfAtlasGl to the
+/// `MSDF_ATLAS_OWNED` thread_local Vec so the existing teardown
+/// path (`delete_owned_msdf_atlases` in cleanup_resources) cleans
+/// up the texture handles symmetrically. The MSDF_ATLAS_LOOKUP
+/// thread_local is appended in lock-step so `msdf_atlas_for_family`
+/// finds the new entry.
+///
+/// Takes `&glow::Context` (not `&mut session`) so all 3 paint-
+/// site callers — which receive `gl` as a parameter but not
+/// `session` — can invoke without a refactor.
+#[cfg(target_os = "linux")]
+fn ensure_msdf_atlas_uploaded(
+    gl: &glow::Context,
+    family: &str,
+) -> Option<glow::NativeTexture> {
+    let stem = font_family_to_atlas_stem(family)?;
+    let cpu = MSDF_ATLASES_CPU.get_or_init(|| {
+        crate::sdf_atlas::load_all_atlases().unwrap_or_default()
+    });
+    let atlas = crate::sdf_atlas::atlas_for_stem(cpu, stem)?;
+    // Fast path: already uploaded.
+    if let Some(tex) = MSDF_ATLAS_LOOKUP.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(s, _)| s == stem)
+            .map(|(_, t)| *t)
+    }) {
+        return Some(tex);
+    }
+    // Slow path: lazy upload. Per-family ~1.3 MB CMA.
+    match crate::sdf_atlas_gl::upload_one(gl, atlas) {
+        Ok(gl_atlas) => {
+            let tex = gl_atlas.tex;
+            let stem_str = gl_atlas.stem.clone();
+            MSDF_ATLAS_LOOKUP.with(|c| {
+                c.borrow_mut().push((stem_str, tex))
+            });
+            MSDF_ATLAS_OWNED.with(|c| {
+                c.borrow_mut().push(gl_atlas)
+            });
+            eprintln!("msdf: lazy-uploaded atlas {stem} (family={family:?})");
+            Some(tex)
+        }
+        Err(e) => {
+            eprintln!("msdf: lazy upload {stem} failed: {e}");
+            None
+        }
+    }
+}
+
+/// CMA-arc 2026-06-21 C4: ensure the per-family atlas is uploaded;
+/// if the requested family isn't in the catalog OR upload failed,
+/// ensure the "Inter" fallback is uploaded so the call site's
+/// `msdf_atlas_for_family("Inter")` or_else chain has a target.
+#[cfg(target_os = "linux")]
+fn ensure_msdf_atlas_for_family_or_default(
+    gl: &glow::Context,
+    family: &str,
+) {
+    if ensure_msdf_atlas_uploaded(gl, family).is_some() {
+        return;
+    }
+    // Family-specific upload didn't succeed — pre-warm Inter for
+    // the fallback. If family already IS "Inter", the inner
+    // is_some() check above short-circuits + we don't reach this.
+    let _ = ensure_msdf_atlas_uploaded(gl, "Inter");
+}
+
+/// CMA-arc 2026-06-21 C4: drain the per-thread MSDF_ATLAS_OWNED
+/// Vec and delete every uploaded texture via
+/// `sdf_atlas_gl::delete_all`. Called from `cleanup_resources` at
+/// session teardown while the GL context is still bound, after
+/// `clear_msdf_lookup` has cleared the thread_local lookup.
+#[cfg(target_os = "linux")]
+fn delete_owned_msdf_atlases(gl: &glow::Context) {
+    MSDF_ATLAS_OWNED.with(|c| {
+        let mut owned = c.borrow_mut();
+        crate::sdf_atlas_gl::delete_all(gl, &mut owned);
+    });
 }
 
 // =====================================================================
@@ -14139,6 +14271,10 @@ fn paint_slide_with_viewport(
                 let wrapped =
                     wrap_text_to_width(font.as_ref(), resolved_text, size_px, max_width_px);
                 let family = layer.font_family.as_deref().unwrap_or("Inter");
+                // CMA-arc 2026-06-21 C4: lazy-upload this family
+                // (and the Inter fallback if family fails) before
+                // the read-only msdf_atlas_for_family lookup.
+                ensure_msdf_atlas_for_family_or_default(gl, family);
                 let group = msdf_atlas_for_family(family)
                     .or_else(|| msdf_atlas_for_family("Inter"))
                     .and_then(|(_atlas_tex, atlas)| {
@@ -14284,6 +14420,9 @@ fn paint_slide_with_viewport(
                     continue;
                 };
                 let family = layer.font_family.as_deref().unwrap_or("Inter");
+                // CMA-arc 2026-06-21 C4: lazy-upload before the
+                // read-only lookup.
+                ensure_msdf_atlas_for_family_or_default(gl, family);
                 let (atlas_tex, _) = msdf_atlas_for_family(family)
                     .or_else(|| msdf_atlas_for_family("Inter"))
                     .ok_or_else(|| {
@@ -14431,6 +14570,9 @@ fn paint_layers_via_overlay_route(
                 continue;
             };
             let family = layer.font_family.as_deref().unwrap_or("Inter");
+            // CMA-arc 2026-06-21 C4: lazy-upload before the
+            // read-only lookup (overlay route).
+            ensure_msdf_atlas_for_family_or_default(gl, family);
             let (atlas_tex, _) = msdf_atlas_for_family(family)
                 .or_else(|| msdf_atlas_for_family("Inter"))
                 .ok_or_else(|| {
