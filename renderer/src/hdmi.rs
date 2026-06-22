@@ -877,6 +877,17 @@ where
         .initialize(display)
         .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
     eprintln!("EGL {}.{}", egl_major, egl_minor);
+    // Flip-race fix C v2 (2026-06-22): startup log of advertised EGL
+    // extensions so QA can confirm EGL_KHR_fence_sync is present
+    // (the flip-race fix uses it; if absent the present_frame helper
+    // falls back to gl.finish + fix-A performance profile).
+    match egl_lib.query_string(Some(display), egl::EXTENSIONS) {
+        Ok(cs) => eprintln!(
+            "EGL_EXTENSIONS: {}",
+            cs.to_str().unwrap_or("<non-utf8>"),
+        ),
+        Err(e) => eprintln!("warn: eglQueryString(EGL_EXTENSIONS) failed: {e:?}"),
+    }
 
     egl_lib
         .bind_api(egl::OPENGL_ES_API)
@@ -7997,7 +8008,7 @@ impl<'a> EglSession<'a> {
         //    completed (= draws + swap-internal work).
         let t_create = std::time::Instant::now();
         let sync_result = unsafe {
-            self.egl_lib.create_sync(self.display, egl::SYNC_FENCE as egl::Enum, &[])
+            self.egl_lib.create_sync(self.display, egl::SYNC_FENCE as egl::Enum, &[egl::ATTRIB_NONE])
         };
         let create_us = t_create.elapsed().as_micros();
 
@@ -16771,7 +16782,7 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
             let swap_us = t_swap.elapsed().as_micros();
             let t_create = std::time::Instant::now();
             let sync_result = unsafe {
-                egl_lib.create_sync(display, egl::SYNC_FENCE as egl::Enum, &[])
+                egl_lib.create_sync(display, egl::SYNC_FENCE as egl::Enum, &[egl::ATTRIB_NONE])
             };
             let create_us = t_create.elapsed().as_micros();
             let (wait_us, status) = match sync_result {
@@ -16865,7 +16876,7 @@ pub fn render_animated_atomic(card: &Card, duration_secs: u64, fps: u32) -> Resu
                 let swap_us = t_swap.elapsed().as_micros();
                 let t_create = std::time::Instant::now();
                 let sync_result = unsafe {
-                    egl_lib.create_sync(display, egl::SYNC_FENCE as egl::Enum, &[])
+                    egl_lib.create_sync(display, egl::SYNC_FENCE as egl::Enum, &[egl::ATTRIB_NONE])
                 };
                 let create_us = t_create.elapsed().as_micros();
                 let (wait_us, status) = match sync_result {
