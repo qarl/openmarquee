@@ -2211,6 +2211,91 @@ impl Decoder {
         Ok((handle, true))
     }
 
+    /// CMA R2-RANK5 (2026-06-22): proactively destroy all cached
+    /// EGLImages without dropping the Decoder. Mirrors the destroy
+    /// loop in `DecoderInner::Drop` but DOES NOT touch capture_
+    /// dmabuf_fds, mapped_*, the V4L2 file, or any other Decoder
+    /// state -- the decoder stays alive + serviceable. The next
+    /// `next_frame()` that produces a CAPTURE buffer needing an
+    /// EGLImage will lazy-recreate via `get_or_init_egl_image`
+    /// (the cache is a Vec<Option<Handle>>, draining empties the
+    /// Option slots; subsequent get_or_init_egl_image misses
+    /// trigger create+cache as usual).
+    ///
+    /// Caller use case (r2-rank5): at transition entry, when a
+    /// PRIOR slide's decoder is about to be parked (snapshot-
+    /// side-A) or LRU-evicted, its 1-4 pinned DMABUF EGLImages
+    /// (~3MB each via Mesa+vc4) free immediately instead of
+    /// waiting for Arc refcount to hit 0 + DecoderInner::Drop to
+    /// fire. ~12MB worst-case CMA peak reduction during
+    /// transition + improves cma_used floor.
+    ///
+    /// Lock semantics: takes inner.lock() once, drains the cache
+    /// + calls destroy_fn on each handle under the lock. Same
+    /// thread-safety as DecoderInner::Drop (same Mutex). The
+    /// destroy_fn calls are the same EGL eglDestroyImageKHR
+    /// pointers stored per-handle at lazy-create time; same
+    /// lifetime + same display.
+    ///
+    /// Probe: `[perf] egl_image_destroy_loop_summary ...
+    /// drop_path=unpin_egl_refs` distinguishes proactive unpins
+    /// from Drop-driven destroys for QA A/B.
+    pub fn unpin_egl_refs(&self) {
+        use std::io::Write as _;
+        let mut inner = self.inner.lock().unwrap();
+        let loop_start = std::time::Instant::now();
+        let mut destroyed = 0usize;
+        let mut failed = 0usize;
+        let mut visited = 0usize;
+        // Replace the cache vec with a fresh empty one of the
+        // same length so the slot indices stay valid for
+        // get_or_init_egl_image lazy-recreate calls after this
+        // unpin returns. Pre-fix DRAIN would shrink the vec to
+        // 0; subsequent get_or_init_egl_image at idx >= 0 would
+        // hit the out-of-range path + destroy the freshly-
+        // created image inline (the loud-leak-at-misuse path),
+        // defeating the lazy-recreate intent.
+        let prior_len = inner.capture_egl_images.len();
+        let prior = std::mem::replace(
+            &mut inner.capture_egl_images,
+            vec![None; prior_len],
+        );
+        for slot in prior {
+            if let Some(h) = slot {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[perf] egl_image_destroy_entry idx={} drop_path=unpin_egl_refs",
+                    visited,
+                );
+                let t_entry = std::time::Instant::now();
+                // SAFETY: same contract as DecoderInner::Drop's
+                // destroy loop -- destroy_fn + display + image
+                // came from EGL at lazy-create time; this is
+                // the matched teardown.
+                let r = unsafe { (h.destroy_fn)(h.display, h.image) };
+                let elapsed_us = t_entry.elapsed().as_micros();
+                let result = if r == 0 { "fail" } else { "ok" };
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[perf] egl_image_destroy_exit idx={} elapsed_us={} result={} drop_path=unpin_egl_refs",
+                    visited, elapsed_us, result,
+                );
+                if r == 0 {
+                    failed += 1;
+                } else {
+                    destroyed += 1;
+                }
+            }
+            visited += 1;
+        }
+        let loop_elapsed_us = loop_start.elapsed().as_micros();
+        let _ = writeln!(
+            std::io::stderr(),
+            "[perf] egl_image_destroy_loop_summary visited={} destroyed={} failed={} loop_elapsed_us={} drop_path=unpin_egl_refs",
+            visited, destroyed, failed, loop_elapsed_us,
+        );
+    }
+
     /// r101 (2026-06-09): cached EGLImage lookup for CAPTURE buffer
     /// index. Returns `Some(handle)` if a prior paint already
     /// imported that buffer; `None` if not yet cached (paint helper

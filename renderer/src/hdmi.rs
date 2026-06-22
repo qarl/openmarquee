@@ -5836,6 +5836,32 @@ pub fn paint_and_present_one_transition_frame(
                 "[perf] snapshot_side_a_captured progress={:.3} dims={}x{}",
                 progress, mode_w_u32, mode_h_u32,
             );
+            // CMA R2-RANK5 (2026-06-22): with the snapshot
+            // committed, endpoint_a's decoder will sit allocated-
+            // but-parked for the rest of the fade (snapshot-side-A
+            // contract: no more bake_video on side A). Its 1-4
+            // cached DMABUF EGLImages (~3MB each via Mesa+vc4)
+            // are now dead weight pinning kernel dmabuf refs.
+            // Proactively destroy them; the decoder stays alive
+            // (LRU may keep it primed for a same-clip wrap
+            // around, or a future transition-cancel could
+            // resume feeding). If we ever DO need EGLImages
+            // again, get_or_init_egl_image lazy-recreates on
+            // demand. Per QA RANK 5 framing: "free before bake_b
+            // instead of waiting on Arc refcount" -- timing
+            // arrives ~bake_b boundary, exactly the CMA-peak
+            // moment.
+            //
+            // snapshot_eligible guarantees endpoint_a is plain
+            // Video, so a Video destructure is total. Subagent
+            // BLOCKER avoidance: borrow endpoint_a IMMUTABLY
+            // (`&endpoint_a`) — the prior `&mut endpoint_a`
+            // borrow ended at the inputs_a match (the bake call
+            // released the inner reborrows), so a fresh `&`
+            // borrow is fine here.
+            if let TransitionEndpoint::Video { decoder, .. } = &endpoint_a {
+                decoder.unpin_egl_refs();
+            }
         }
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
         //
