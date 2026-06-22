@@ -1563,6 +1563,82 @@ fn drain_finished_preloads_nonblocking(cache: &mut SlideCache) {
     }
 }
 
+/// JUDDER-CAUSE-1 (2026-06-22): drain CAPTURE buffers + re-prime
+/// a reused video decoder on slide re-entry. When the LRU
+/// cache retains a decoder across other slides + the slide
+/// comes back around, the cached decoder may hold leftover
+/// decoded frames in its CAPTURE buffer pool from the PRIOR
+/// play. cache.load short-circuits on (items+demuxer+decoder)
+/// presence + does NOT reset the decoder; the first present
+/// of the new play would flash the stale frames before the
+/// new clip's frame 0 reaches the panel -- qarl-observed
+/// judder Cause 1 (confirmed ~50% kill via "reuse off" glass
+/// test).
+///
+/// Detection: video_decoders.contains_key(slide_id) AND
+/// dec_state.frames_decoded > 0 (= prior play happened). On
+/// first-ever load (cache miss path), prime_video_decoder
+/// just primed with frames_decoded=0 -> no drain needed.
+///
+/// Mechanism: reprime_video_decoder_for_loop does the
+/// canonical drain (STREAMOFF clears CAPTURE) + STREAMON +
+/// re-feed SPS+PPS+IDR. Resets state.next_sample_idx = 1
+/// (already does this). We additionally reset
+/// state.frames_decoded = 0 so the next paint correctly
+/// identifies as the new play's first frame (telemetry +
+/// the live_frame_fp gate at bake_video_slide_to_current_fbo
+/// stays correct).
+///
+/// Failure path: log + carry on. The paint path's wrap-detect
+/// can catch lingering staleness on the next tick if reprime
+/// didn't take. Slide will still render -- just with one
+/// stale-flash tick if reprime errored (no worse than pre-fix
+/// pattern).
+///
+/// Probe: `[perf] reused_decoder_drained slide_id=X
+/// prior_frames=N` per drain. QA can A/B count via grep.
+#[cfg(target_os = "linux")]
+fn drain_reused_video_decoder_if_needed(cache: &mut SlideCache, slide_id: uuid::Uuid) {
+    // Snapshot frames_decoded under a read-only peek so we
+    // don't take an LRU touch on the wrong path. peek = &self
+    // doesn't conflict with get_mut/peek calls below.
+    let prior_frames = match cache.video_decoders.peek(&slide_id) {
+        Some(dec_state) => dec_state.frames_decoded,
+        None => return, // not cached -> fresh prime path, no drain needed
+    };
+    if prior_frames == 0 {
+        return; // just-primed (or already-drained), nothing to flush
+    }
+    // Split-borrow: video_demuxers (peek = &self.video_demuxers)
+    // + video_decoders.get_mut (&mut self.video_decoders) live
+    // on different SlideCache fields; Rust's field-level
+    // disjoint-borrow splitting allows them to coexist when
+    // accessed directly through the cache.<field> syntax.
+    let dem = match cache.video_demuxers.peek(&slide_id) {
+        Some(d) => d,
+        None => return, // pair-broken; shouldn't happen
+    };
+    let dec_state = match cache.video_decoders.get_mut(&slide_id) {
+        Some(d) => d,
+        None => return,
+    };
+    match crate::video_decode::reprime_video_decoder_for_loop(dec_state, dem) {
+        Ok(()) => {
+            dec_state.frames_decoded = 0;
+            eprintln!(
+                "[perf] reused_decoder_drained slide_id={} prior_frames={}",
+                slide_id, prior_frames,
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "[perf] reused_decoder_drain_failed slide_id={} prior_frames={} err={:#}",
+                slide_id, prior_frames, e,
+            );
+        }
+    }
+}
+
 /// r65: if `slide_id` has a pending preload thread, join it and
 /// install the artifacts into the main thread's `cache`. Called
 /// from the BeginSlide and BeginTransition IPC handlers at the
@@ -3710,6 +3786,22 @@ fn handle_inner_request(
                 "[perf] begin_slide_load slide_id={} load_us={}",
                 p.slide_id, load_us,
             );
+            // JUDDER-CAUSE-1 (2026-06-22): drain reused video
+            // decoder if it had a prior play. See
+            // drain_reused_video_decoder_if_needed for the full
+            // rationale (~50% of qarl-observed v2v judders).
+            // Linux-gated since video_decoders only exists on
+            // Linux. Also handles text-over-video bg_video re-
+            // entry.
+            #[cfg(target_os = "linux")]
+            {
+                drain_reused_video_decoder_if_needed(cache, p.slide_id);
+                if let Some(bg_id) = bg_video_id {
+                    if bg_id != p.slide_id {
+                        drain_reused_video_decoder_if_needed(cache, bg_id);
+                    }
+                }
+            }
             // Bug 8 / Fix A (2026-05-17): cache.load succeeded
             // populating ContentItem::Video, but the underlying
             // MP4 demuxer failed (asset.mp4 missing, malformed, or
