@@ -544,6 +544,16 @@ pub struct EglSession<'a> {
     /// must be distinct textures.
     transition_fbo_b: Option<glow::NativeFramebuffer>,
     transition_tex_b: Option<glow::NativeTexture>,
+    /// Snapshot-side-A (2026-06-21): captured outgoing video
+    /// frame for an in-flight video→video transition. Populated
+    /// on the FIRST tick of a v2v fade (after bake_a succeeds);
+    /// freed at progress>=0.99, on entry to a non-v2v transition
+    /// (defensive), and at session teardown. Commit 1 captures
+    /// but does not consume — verifies the GLES2 copy path
+    /// doesn't regress baseline. Commit 2 wires the side-A
+    /// bypass that reads this texture instead of re-feeding the
+    /// outgoing decoder.
+    transition_still_a_tex: Option<glow::NativeTexture>,
     /// r102.2: dims the cached transition_fbo_a/b were
     /// allocated against. Invalidates the cache on mode change
     /// (HDMI hot-plug, rotation flip). `None` while the cache
@@ -935,6 +945,7 @@ where
         transition_tex_a: None,
         transition_fbo_b: None,
         transition_tex_b: None,
+        transition_still_a_tex: None,
         transition_fbo_dims: None,
         external_frame_tex: None,
         external_nv12_tex: None,
@@ -1208,6 +1219,9 @@ where
             gl.delete_framebuffer(fbo);
         }
         if let Some(tex) = session.transition_tex_b.take() {
+            gl.delete_texture(tex);
+        }
+        if let Some(tex) = session.transition_still_a_tex.take() {
             gl.delete_texture(tex);
         }
         session.transition_fbo_dims = None;
@@ -5472,6 +5486,35 @@ pub fn paint_and_present_one_transition_frame(
         }
     }
 
+    // Snapshot-side-A Commit 2 (2026-06-21): tighter eligibility
+    // than C1's is_dual_video. Endpoint A must be PLAIN Video --
+    // TextOverVideo on side A would freeze text into the still
+    // (the existing poster fast-path's "text is GL-cheap, MUST
+    // NOT be frozen into the poster" contract; we honor the same
+    // rule for the runtime snapshot). Endpoint B can be any
+    // video-bearing kind (the bypass only frees side A's HW
+    // decoder; side B is unaffected). Single-decoder transitions
+    // (text<->video, image<->video) take other arms entirely.
+    //
+    // Defensive entry free belt-and-suspenders: ipc_main hooks
+    // (BeginSlide / BeginTransition / Advance-after-Slide-paint)
+    // are the authoritative free sites. This catches the rare
+    // case where a non-snapshot-eligible transition fires
+    // without an intervening Advance-Slide-paint to clear a
+    // stale still (e.g. back-to-back BeginTransition without an
+    // intervening Slide hold -- BeginTransition handler frees
+    // anyway, so this is theoretically dead, but cheap).
+    let snapshot_eligible = matches!(
+        &endpoint_a,
+        TransitionEndpoint::Video { .. }
+    ) && matches!(
+        &endpoint_b,
+        TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
+    );
+    if !snapshot_eligible {
+        free_transition_still_a_tex(session);
+    }
+
     // Ok(true) = transition frame painted + ready to present;
     // Ok(false) = FYS bug C skip (a video endpoint had no frame
     // ready this tick) — caller skips the swap+commit.
@@ -5598,7 +5641,47 @@ pub fn paint_and_present_one_transition_frame(
         // poster (text is GL-cheap, MUST NOT be frozen into the
         // poster — poster represents only what the V4L2 decoder
         // would have produced).
-        let use_poster_a_now = use_poster_a && cached_pair_a.is_some();
+        // Snapshot-side-A Commit 2.2 (2026-06-21): snapshot
+        // OVERRIDES poster for the OUTGOING side. QA glass
+        // attempt #1 confirmed `[perf] snapshot_side_a_
+        // captured` never fired on the all-stock reel because
+        // r110 c3.2.2's poster fast-path preempted snapshot
+        // for every postered video.
+        //
+        // Per QA's design question (c) -- the correct
+        // resolution: r110's "poster is pixel-identical to
+        // first frame" contract applies to INCOMING (side B
+        // hasn't seen any frame yet; poster ≈ first live
+        // frame ≈ what the user is about to see). For
+        // OUTGOING (side A has been playing for the entire
+        // hold; user just saw frame N of the clip), sourcing
+        // the poster JUMPS visibly to frame 0 at fade start.
+        // Snapshot captures the actual current frame, freezing
+        // at the user-visible moment -- strictly better UX.
+        //
+        // Precedence is therefore A-side-asymmetric:
+        //   - OUTGOING (A): snapshot > live-decode. Poster is
+        //     IGNORED when snapshot_eligible.
+        //   - INCOMING (B): poster > live-decode (UNCHANGED;
+        //     side-B preserves r110 c3.2.2's frozen-entry
+        //     contract verbatim).
+        //
+        // Resource cost: +1 V4L2 feed on tick 1 vs the all-
+        // poster path (live-decode of A once to produce the
+        // capture source). Ticks 2..N have zero A-side
+        // V4L2 feeds (snapshot blit). r97 deferred-preload +
+        // side-B Path B retry still active as the ceiling
+        // guard + cold-start fallback.
+        let use_still_a_now = snapshot_eligible
+            && cached_pair_a.is_some()
+            && session.transition_still_a_tex.is_some();
+        // Poster on A is suppressed when snapshot_eligible
+        // (snapshot is the strictly-better source for
+        // outgoing). Non-eligible cases (e.g. TextOverVideo
+        // on A) keep the existing poster path verbatim.
+        let use_poster_a_now = use_poster_a
+            && cached_pair_a.is_some()
+            && !snapshot_eligible;
         let (fbo_a, tex_a) = if use_poster_a_now {
             let (poster_tex, poster_w, poster_h) = poster_a_texture.expect("guarded above");
             let (fbo, tex) = cached_pair_a.expect("guarded above");
@@ -5667,6 +5750,20 @@ pub fn paint_and_present_one_transition_frame(
                 poster_w >= 1920 || poster_h >= 1080,
             );
             (fbo, tex)
+        } else if use_still_a_now {
+            // Snapshot-side-A Commit 2 (2026-06-21): runtime-
+            // captured still bypass. fbo_a is the cached side-A
+            // pair filled by blitting the still tex. Outgoing
+            // decoder is NOT fed this tick — that's the fix.
+            let still_tex = session.transition_still_a_tex.expect("guarded above");
+            let (fbo, tex) = cached_pair_a.expect("guarded above");
+            use glow::HasContext;
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
+            session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            session.gl.clear(glow::COLOR_BUFFER_BIT);
+            run_blit_pass(session.gl, still_tex)?;
+            (fbo, tex)
         } else {
             let Some((fa, ta)) = bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, cached_pair_a, inputs_a)?
             else {
@@ -5677,6 +5774,59 @@ pub fn paint_and_present_one_transition_frame(
             };
             (fa, ta)
         };
+        // Snapshot-side-A Commit 2.2 (2026-06-21): capture the
+        // freshly-baked side-A frame into transition_still_a_tex
+        // on the FIRST tick of a snapshot-eligible transition.
+        // We don't need the !use_poster_a_now gate anymore --
+        // snapshot_eligible already suppresses use_poster_a_now
+        // via the precedence flip above, so when this site
+        // runs with snapshot_eligible=true, fbo_a came from
+        // live-decode (not poster). Capture is one-shot per
+        // transition; ticks 2..N find still.is_some() and
+        // consume via use_still_a_now (no more bake_video on
+        // side A).
+        //
+        // GLES2-safe FRAMEBUFFER bind (READ_FRAMEBUFFER is
+        // GLES3-only and would silently error here).
+        //
+        // Frees: BeginSlide / BeginTransition / Advance-after-
+        // Slide-paint hooks in ipc_main.rs handle lifecycle.
+        if snapshot_eligible
+            && cached_pair_a.is_some()
+            && session.transition_still_a_tex.is_none()
+        {
+            let dest_tex = session.gl.create_texture()
+                .map_err(|e| anyhow!("snapshot-side-A create_texture: {e}"))?;
+            session.gl.bind_texture(glow::TEXTURE_2D, Some(dest_tex));
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
+            );
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32,
+            );
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32,
+            );
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32,
+            );
+            // Explicit bind: bake_slide_to_fbo's inner helpers
+            // may leave the binding at default. GLES2 uses
+            // FRAMEBUFFER as the single bind point (READ_/DRAW_
+            // are GLES3-only).
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a));
+            session.gl.copy_tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA,
+                0, 0, mode_w_u32 as i32, mode_h_u32 as i32, 0,
+            );
+            session.gl.bind_texture(glow::TEXTURE_2D, None);
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.transition_still_a_tex = Some(dest_tex);
+            eprintln!(
+                "[perf] snapshot_side_a_captured progress={:.3} dims={}x{}",
+                progress, mode_w_u32, mode_h_u32,
+            );
+        }
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
         //
         // r80-r92 tried to PRE-PROVIDE endpoint_b's first frame at
@@ -7719,6 +7869,20 @@ unsafe fn ensure_transition_fbo_pair(
         if let Some(tex) = session.transition_tex_b.take() {
             session.gl.delete_texture(tex);
         }
+        // Snapshot-side-A Commit 2.1 (2026-06-21): invalidate
+        // the captured still on mid-fade dims change too. A
+        // stale-dims still would blit at old dims into the new-
+        // dims fbo_a via run_blit_pass -> stretched frozen
+        // frame + orphaned-tex leak until the next free hook.
+        // Rare (mode change during ~1s fade -- HDMI hot-plug
+        // or rotation flip) + cosmetic but a correctness gap
+        // QA flagged on independent review. Inline take +
+        // delete mirrors the fbo/tex pattern above; can't call
+        // the free helper because we already hold &mut to
+        // session.gl via the surrounding context.
+        if let Some(tex) = session.transition_still_a_tex.take() {
+            session.gl.delete_texture(tex);
+        }
         session.transition_fbo_dims = None;
     }
     let (slot_fbo, slot_tex) = match side {
@@ -7741,6 +7905,26 @@ unsafe fn ensure_transition_fbo_pair(
     *slot_fbo = Some(fbo);
     *slot_tex = Some(tex);
     Ok((fbo, tex))
+}
+
+/// Snapshot-side-A Commit 2 (2026-06-21): free the captured
+/// outgoing-video still texture. Called from the ipc_main.rs
+/// BeginSlide handler, BeginTransition handler, and the
+/// Advance dispatcher when paint_kind != Transition (i.e. a
+/// transition just ended or no transition is in flight).
+///
+/// Idempotent: a None.take() is a no-op, so the per-Advance
+/// call costs ~1ns in steady state outside transitions.
+///
+/// Caller must hold the EGL context current (true for all 3
+/// callsites — IPC main thread owns the context).
+pub fn free_transition_still_a_tex(session: &mut EglSession) {
+    if let Some(tex) = session.transition_still_a_tex.take() {
+        unsafe {
+            use glow::HasContext;
+            session.gl.delete_texture(tex);
+        }
+    }
 }
 
 /// r102.2 (2026-06-09): branch-level "reuse or allocate" helper
