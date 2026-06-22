@@ -6051,6 +6051,34 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
+        // JUDDER-PROBE v3 (2026-06-22): snapshot the B-side V4L2
+        // position BEFORE the poster-vs-live-bake decision below.
+        // QA's panel converged on a "BACKWARD jump at the poster->
+        // live handoff" symptom (already documented at hdmi.rs:9356
+        // and video_decode.rs:811) but couldn't statically resolve
+        // whether INCOMING side B (i) freezes on the poster during
+        // the fade or (ii) live-decodes + advances through it. This
+        // probe captures B's position pre-tick + the branch taken,
+        // logged at the convergence point below. Across consecutive
+        // Advance ticks the position delta tells QA: if monotonic
+        // bumps → B advances (case ii); if static → B is on poster
+        // (case i). For the live-bake case, the existing
+        // live_frame_fp probe (widened below) captures the actual
+        // Y-plane fingerprint per dqbuf'd frame.
+        let (b_pre_idx, b_pre_frames): (Option<usize>, Option<usize>) = match &endpoint_b {
+            TransitionEndpoint::Video {
+                next_sample_idx,
+                frames_decoded,
+                ..
+            } => (Some(**next_sample_idx), Some(**frames_decoded)),
+            TransitionEndpoint::TextOverVideo {
+                bg_next_sample_idx,
+                bg_frames_decoded,
+                ..
+            } => (Some(**bg_next_sample_idx), Some(**bg_frames_decoded)),
+            _ => (None, None),
+        };
+
         // r110 stage 3 commit 3.2.2: poster fast-path for bake_b
         // (mirrors bake_a's poster fast-path above; same FROZEN
         // ENTRY contract). When endpoint_b is video-bearing AND
@@ -6269,6 +6297,56 @@ pub fn paint_and_present_one_transition_frame(
             }
         }
         };  // r110 c3.2.2: closes else-block of `if use_poster_b`
+
+        // JUDDER-PROBE v3 (2026-06-22): convergence-point B-side
+        // outcome. branch="poster" (use_poster_b path; decoder
+        // untouched → post == pre) or branch="live" (bake_b loop;
+        // post_idx may bump by 1-4 = PATH_B_MAX_ITERS samples
+        // consumed this tick). delta_frames = how many CAPTURE
+        // frames B actually dqbuf'd this tick (the visible
+        // advancement).
+        //
+        // Cross-correlation across consecutive Advance ticks:
+        //   - branch=live + post_frames monotonically increasing →
+        //     B is live-decoding through the fade. Then the steady
+        //     paint_slide should continue from B's last position,
+        //     NOT reset to 0. If live_frame_fp on the first steady
+        //     frame shows frames_decoded_pre << post_frames_last
+        //     → ADVANCE-THEN-RESET = the backward-jump root cause.
+        //   - branch=poster every tick + post == pre →
+        //     B is frozen on poster. Then the backward jump is
+        //     elsewhere and we need a different probe.
+        let (b_post_idx, b_post_frames): (Option<usize>, Option<usize>) = match &endpoint_b {
+            TransitionEndpoint::Video {
+                next_sample_idx,
+                frames_decoded,
+                ..
+            } => (Some(**next_sample_idx), Some(**frames_decoded)),
+            TransitionEndpoint::TextOverVideo {
+                bg_next_sample_idx,
+                bg_frames_decoded,
+                ..
+            } => (Some(**bg_next_sample_idx), Some(**bg_frames_decoded)),
+            _ => (None, None),
+        };
+        let b_branch = if use_poster_b { "poster" } else { "live" };
+        let endpoint_kind = match &endpoint_b {
+            TransitionEndpoint::Text(_) => "text",
+            TransitionEndpoint::Image(_) => "image",
+            TransitionEndpoint::Video { .. } => "video",
+            TransitionEndpoint::TextOverVideo { .. } => "text_over_video",
+        };
+        eprintln!(
+            "[perf] transition_b_tick kind={} endpoint_kind={} branch={} progress={:.3} \
+             pre_idx={:?} pre_frames={:?} post_idx={:?} post_frames={:?} \
+             delta_frames={:?}",
+            kind, endpoint_kind, b_branch, progress,
+            b_pre_idx, b_pre_frames, b_post_idx, b_post_frames,
+            match (b_pre_frames, b_post_frames) {
+                (Some(p), Some(q)) => Some(q.saturating_sub(p)),
+                _ => None,
+            },
+        );
         // r102.2: only delete the FBO+tex handles when the cache
         // is disabled (we allocated fresh this tick). When the
         // cache is enabled, session::cleanup_resources owns the
@@ -9361,10 +9439,21 @@ unsafe fn bake_video_slide_to_current_fbo(
     //        (matches drained+1's fingerprint? matches poster's
     //        fingerprint? something else)?
     // *frames_decoded is the pre-increment count (still pre-bump
-    // here). Logs gated at < 2 so we get cold-start first +
-    // preload first AND first-after-cold-start = 2 lines max
-    // per slide play instance.
-    if *frames_decoded < 2 {
+    // here).
+    //
+    // judder-instrument v3 (2026-06-22): gate widened from < 2 to
+    // < 60 so QA can also see:
+    //   - Per-tick live fingerprints during the transition's B-side
+    //     bake (lets the new transition_b_tick probe correlate
+    //     branch=live ticks with the actual baked frame).
+    //   - The first ~2s of steady-state paint_slide after a
+    //     transition ends, so the post-transition handoff is
+    //     visible (continuation vs reset). The "frames_decoded
+    //     << post_frames_last" cross-check from QA's plan needs
+    //     this — at < 2 the gate fires only on first 2 frames of
+    //     a slide play instance; if a transition consumed N>2
+    //     frames before steady paint starts, the gate would miss.
+    if *frames_decoded < 60 {
         let y_plane = frame.y_plane();
         let stride = frame.stride() as usize;
         let fp = fingerprint_9_points(
