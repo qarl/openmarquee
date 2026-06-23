@@ -1505,24 +1505,45 @@ fn commit_fb(
         return Ok(());
     }
 
-    // QA-direct (2026-05-08): use DRM_MODE_PAGE_FLIP_ASYNC so the
-    // kernel performs the flip immediately rather than waiting
-    // for vblank. EVENT is still set so the page-flip event fires
-    // (right after the flip, not at vblank) -- our drain reads it
-    // promptly on the next commit_fb. Drops the per-frame
-    // commit_drain_poll wait (~8ms p50 at 60Hz) to ~0 ms.
+    // Flip-race fix D2 (2026-06-22): DROP DRM_MODE_PAGE_FLIP_ASYNC.
     //
-    // Tradeoff: tearing during the half-vblank window between the
-    // flip and the next vblank. Acceptable for the FYS reel
-    // because (a) transitions are short and visually busy, (b)
-    // static slides only flip once at scene-change, (c) vc4 vblank
-    // period at 60Hz = 16.7 ms means worst-case tear width is one
-    // half-screen for one frame.
+    // Why: fix D (triple-buffer + per-slot fence) reduced the snap-
+    // back visibility but qarl still sees it (QA glass: "much less
+    // visible than before"). Triple-buffer protects against reusing
+    // a buffer too early, but ASYNC bypasses dma-buf implicit fence
+    // → kernel can scan the just-flipped BO BEFORE the GPU finishes
+    // writing it (vc4 tile-store ~28ms; vblank ~16ms; ASYNC kicks
+    // in instantly = scan starts before GPU done).
+    //
+    // Dropping ASYNC restores vblank-synchronized flip. The kernel
+    // waits for vblank AND honors the BO's implicit dma-buf fence
+    // before scanning. Per the Mesa-vc4 implicit-sync contract,
+    // GL writes attach a fence on the BO; vsync page_flip respects
+    // it. Net: kernel never scans a still-being-written BO.
+    //
+    // Cost: vsync caps frame rate at vblank (60Hz). With
+    // triple-buffer + pipelined render (~28ms), effective rate
+    // settles ~30fps (every-other-vblank). Per QA prediction this
+    // "likely only reduces further, not fully closes" — if so we
+    // escalate to the atomic-in-fence fix (the kernel-side wait
+    // that doesn't sacrifice vblank but does the same job
+    // explicitly via plane IN_FENCE_FD prop).
+    //
+    // PRIOR ASYNC RATIONALE (QA-direct 2026-05-08): "use ASYNC so
+    // the kernel performs the flip immediately rather than waiting
+    // for vblank. Drops the per-frame commit_drain_poll wait
+    // (~8ms p50 at 60Hz) to ~0 ms. Tradeoff: tearing during the
+    // half-vblank window."
+    // → That rationale predates the snap-back arc. The "tearing"
+    //   tradeoff turned out to be a full-frame stale scanout under
+    //   GBM pool cycling (qarl's snap-back). Fix D2 reverses this
+    //   decision; the original 8ms vblank wait is the lesser evil
+    //   vs the stale-frame race.
     let t_pageflip = std::time::Instant::now();
     card.page_flip(
         session.crtc_handle,
         fb,
-        PageFlipFlags::EVENT | PageFlipFlags::ASYNC,
+        PageFlipFlags::EVENT,
         None,
     )
     .context("drmModePageFlip failed")?;
