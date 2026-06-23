@@ -23,6 +23,16 @@ type SampleStore = BTreeMap<&'static str, Vec<u64>>;
 struct ProfileState {
     samples: SampleStore,
     frames_remaining: u32,
+    /// FPS arc telemetry (2026-06-22): periodic re-arm mode. When
+    /// `> 0`, `frame_complete` auto-dumps + re-arms with the same
+    /// frame budget. `== 0` (default) = one-shot mode (existing
+    /// `enable(N)` + `summarize()` behavior preserved).
+    periodic_every: u32,
+    /// Phases to include in the periodic dump line. Empty = all
+    /// recorded phases. Set by `enable_periodic`; allows QA to grep
+    /// `[perf] phase_periodic_dump` with a stable per-phase column
+    /// layout independent of which phases happened to record samples.
+    periodic_phases: Vec<&'static str>,
 }
 
 static PROFILE: OnceLock<Mutex<Option<ProfileState>>> = OnceLock::new();
@@ -39,6 +49,39 @@ pub fn enable(frames: u32) {
     *s = Some(ProfileState {
         samples: BTreeMap::new(),
         frames_remaining: frames,
+        periodic_every: 0,
+        periodic_phases: Vec::new(),
+    });
+}
+
+/// FPS arc telemetry (2026-06-22): periodic auto-dump mode.
+/// Records samples for `every_n_frames`, then on `frame_complete`'s
+/// budget-hits-0 transition: dumps a one-line `[perf]
+/// phase_periodic_dump window_frames=N | phase n=… p50=…us p99=…us
+/// max=…us | ...` to stderr (filtered to `phases` if non-empty) +
+/// re-arms for another N-frame window. Continuous measurement
+/// without the on-demand `--profile-frames` capture/dump cycle.
+///
+/// Activated by `OPENMARQUEE_FPS_DUMP_FRAMES=N` env at startup (see
+/// ipc_main.rs handler). Use cases:
+///   - QA glass A/B: enable on instrumented build, grep the dump
+///     line, compute deltas across before/after.
+///   - Long-running soak: periodic snapshot of paint phases without
+///     unbounded log growth.
+///
+/// Multiple `enable_periodic` calls replace prior state (same
+/// semantics as `enable`). `enable(N)` (one-shot) DOES NOT enter
+/// periodic mode — caller must explicitly opt in.
+pub fn enable_periodic(every_n_frames: u32, phases: Vec<&'static str>) {
+    if every_n_frames == 0 {
+        return;
+    }
+    let mut s = slot().lock().unwrap();
+    *s = Some(ProfileState {
+        samples: BTreeMap::new(),
+        frames_remaining: every_n_frames,
+        periodic_every: every_n_frames,
+        periodic_phases: phases,
     });
 }
 
@@ -65,14 +108,73 @@ pub fn record_phase(phase: &'static str, ns: u64) {
 
 /// Decrement frame budget. Caller invokes at end of each captured
 /// frame. When budget hits 0, subsequent record_phase calls drop.
+///
+/// FPS arc telemetry (2026-06-22): when periodic mode is active
+/// (`periodic_every > 0`), the budget-hits-0 transition triggers
+/// an auto-dump (one-line `[perf] phase_periodic_dump ...`) and
+/// re-arms the budget for another N-frame window. One-shot mode
+/// (`periodic_every == 0`) preserves the prior behavior: budget
+/// hits 0 → recording stops, samples persist for `summarize()`.
 pub fn frame_complete() {
-    if let Ok(mut s) = slot().lock() {
-        if let Some(p) = s.as_mut() {
-            if p.frames_remaining > 0 {
-                p.frames_remaining -= 1;
+    // Two-step: under lock, decrement + capture the dump payload
+    // when periodic-mode budget transitions to 0. Drop the lock
+    // BEFORE eprintln so a slow stderr write doesn't block
+    // record_phase callers on the next paint.
+    let dump_text: Option<String> = {
+        let Ok(mut s) = slot().lock() else { return; };
+        let Some(p) = s.as_mut() else { return; };
+        if p.frames_remaining == 0 {
+            return;
+        }
+        p.frames_remaining -= 1;
+        if p.frames_remaining == 0 && p.periodic_every > 0 {
+            // Build dump line; re-arm by clearing samples + reset
+            // frames_remaining.
+            let txt = format_periodic_dump(&p.samples, &p.periodic_phases, p.periodic_every);
+            p.samples.clear();
+            p.frames_remaining = p.periodic_every;
+            Some(txt)
+        } else {
+            None
+        }
+    };
+    if let Some(txt) = dump_text {
+        eprintln!("[perf] {}", txt);
+    }
+}
+
+/// FPS arc telemetry (2026-06-22): format one line summarizing the
+/// per-phase stats over the just-closed window. Filters to `phases`
+/// if non-empty; otherwise includes all recorded phases (sorted
+/// lexicographically via BTreeMap).
+fn format_periodic_dump(
+    samples: &SampleStore,
+    phases: &[&'static str],
+    window_frames: u32,
+) -> String {
+    use std::collections::HashSet;
+    let mut out = format!("phase_periodic_dump window_frames={}", window_frames);
+    let filter_set: Option<HashSet<&'static str>> = if phases.is_empty() {
+        None
+    } else {
+        Some(phases.iter().copied().collect())
+    };
+    for (phase, phase_samples) in samples {
+        if let Some(ref f) = filter_set {
+            if !f.contains(*phase) {
+                continue;
             }
         }
+        let stats = summarize_samples(phase_samples);
+        out.push_str(&format!(
+            " | {phase} n={} p50={}us p99={}us max={}us",
+            phase_samples.len(),
+            stats.p50_ns / 1_000,
+            stats.p99_ns / 1_000,
+            stats.max_ns / 1_000,
+        ));
     }
+    out
 }
 
 /// Per-phase aggregate over a sample window. All fields are

@@ -8735,9 +8735,17 @@ unsafe fn cover_quad_vbo(
 /// FYS bug 5 -- the rotation-aware present pass. Blits the logical
 /// scene FBO texture to the bound (panel-native) framebuffer,
 /// applying brightness/gamma AND the display rotation in a single
-/// fullscreen blit. Reuses the FS_BRIGHT_GAMMA program (so identity
-/// brightness/gamma is still correct); the rotation is baked into
-/// the quad's vertex positions (see `present_quad_verts`).
+/// fullscreen blit. Rotation is baked into the quad's vertex
+/// positions (see `present_quad_verts`).
+///
+/// FPS arc cheap win #1 (2026-06-22): dispatches to FS_BLIT (pure
+/// passthrough) when brightness == 1.0 AND gamma == 1.0 — the
+/// common production case (default settings + video path's
+/// hardcoded 1.0,1.0). Avoids the per-pixel clamp+pow in
+/// FS_BRIGHT_GAMMA which produces identical pixels for identity
+/// transforms. Non-identity callers (operator-applied brightness/
+/// gamma) still go through FS_BRIGHT_GAMMA with the real
+/// tonemapping. Pixel-bit-identical for the fast path.
 ///
 /// Caller is responsible for binding the default framebuffer and
 /// setting the viewport to the PHYSICAL panel dims before calling.
@@ -8751,8 +8759,49 @@ unsafe fn run_present_pass(
     rotation: i32,
 ) -> Result<()> {
     use glow::HasContext;
-    let cgp = cached_bright_gamma_program(gl)?;
+    // FPS arc cheap win #1 (2026-06-22): bypass FS_BRIGHT_GAMMA's
+    // per-pixel clamp+pow when brightness=gamma=1.0 (identity color
+    // settings AND identity gamma). The video present path passes
+    // hardcoded (1.0, 1.0) — every pixel every frame ran the pow
+    // for zero visual difference. Prod gamma is also 1.0 by
+    // default. Switching to FS_BLIT (cached_blit_program) removes
+    // the pow + clamp from the per-pixel inner loop.
+    //
+    // Rotation is encoded in present_quad_vbo's vertex positions,
+    // not the fragment shader, so the blit shader preserves it
+    // verbatim. Zero visual change for the identity case; biggest
+    // FPS win per QA's profiling read (Pass2 of every video frame).
+    //
+    // Non-identity (settings panel applied a tint or gamma): fall
+    // through to FS_BRIGHT_GAMMA which has the actual tonemapping.
+    // `is_color_identity()` lives on the settings type; here we
+    // approximate with float-equality on the canonical "no
+    // transform" values (1.0, 1.0). Tolerance is intentional: the
+    // settings API stores brightness as u8 percentage, gamma as
+    // float; both are explicit values, not computed, so float-eq
+    // is correct here. A future regression where someone passes
+    // 1.000001 would fall through to FS_BRIGHT_GAMMA (= the
+    // pre-fix path, no functional regression).
+    let identity = brightness == 1.0 && gamma == 1.0;
     let vbo = present_quad_vbo(gl, rotation)?;
+    if identity {
+        let cbp = cached_blit_program(gl)?;
+        gl.use_program(Some(cbp.program));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
+        gl.uniform_1_i32(cbp.u_src.as_ref(), 0);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.enable_vertex_attrib_array(cbp.a_pos);
+        gl.vertex_attrib_pointer_f32(cbp.a_pos, 2, glow::FLOAT, false, 16, 0);
+        gl.enable_vertex_attrib_array(cbp.a_uv);
+        gl.vertex_attrib_pointer_f32(cbp.a_uv, 2, glow::FLOAT, false, 16, 8);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.disable_vertex_attrib_array(cbp.a_pos);
+        gl.disable_vertex_attrib_array(cbp.a_uv);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        return Ok(());
+    }
+    let cgp = cached_bright_gamma_program(gl)?;
     gl.use_program(Some(cgp.program));
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));

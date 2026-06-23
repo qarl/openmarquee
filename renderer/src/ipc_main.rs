@@ -2136,6 +2136,41 @@ where
     use crate::hdmi;
     use crate::Card;
 
+    // FPS arc telemetry (2026-06-22): startup activation of the
+    // periodic phase dump. OPENMARQUEE_FPS_DUMP_FRAMES=N (default
+    // unset = no periodic dump). Records samples for N frames,
+    // emits `[perf] phase_periodic_dump window_frames=N | <phase>
+    // n=… p50=…us p99=…us max=…us | ...` to stderr, re-arms for
+    // another N-frame window. Continuous measurement without the
+    // on-demand --profile-frames capture/dump cycle.
+    //
+    // QA's FPS arc target phases: paint_bake_video_shader (Pass 1
+    // NV12->RGB) + paint_compose (Pass 2 brightness/gamma OR
+    // bright-fast blit post fix #1) — that's where the FPS spend
+    // lives per QA's profiling read. Other paint_* phases included
+    // for completeness; QA can grep the specific columns.
+    if let Ok(s) = std::env::var("OPENMARQUEE_FPS_DUMP_FRAMES") {
+        if let Ok(n) = s.parse::<u32>() {
+            if n > 0 {
+                crate::profile::enable_periodic(
+                    n,
+                    vec![
+                        "paint_bake_video_shader",
+                        "paint_compose",
+                        "paint_bake_video_dqbuf",
+                        "paint_present",
+                        "paint_dispatch",
+                        "ipc_paint_total",
+                    ],
+                );
+                eprintln!(
+                    "[perf] periodic_phase_dump_enabled every_n_frames={}",
+                    n,
+                );
+            }
+        }
+    }
+
     let card_path = match params.drm_card.as_deref() {
         Some(p) => Path::new(p).to_path_buf(),
         None => {
