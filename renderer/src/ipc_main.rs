@@ -2265,6 +2265,29 @@ where
         // message and stays there.
         let mut line = String::with_capacity(2048);
         loop {
+            // Stability arc Layer 4 (2026-06-23): poll the
+            // SIGTERM/SIGINT flag at the top of each iteration.
+            // On first observed `true`, break out of the loop
+            // cleanly + fall through to main()'s normal exit.
+            // Drop chain (EglSession, SlideCache, all cached
+            // DecoderInners) then runs in declaration order →
+            // DecoderInner::Drop = stop_streaming_quiet's
+            // STREAMOFF on OUTPUT + CAPTURE → mapped_capture
+            // munmaps → capture_dmabuf_fds closes → File close
+            // of /dev/video10. Cumulatively: the codec is
+            // released cleanly so the NEXT renderer start can't
+            // EBUSY on open or EINVAL on REQBUFS due to stale
+            // kernel state.
+            //
+            // is_shutdown_requested() is a single atomic load
+            // (~1 ns); cheap to poll every iteration.
+            if crate::sigterm::is_shutdown_requested() {
+                eprintln!(
+                    "[stability] shutdown_requested at IPC loop head; \
+                     breaking + running Drop chain",
+                );
+                break;
+            }
             // r38d: drain a pending SIGUSR1 by emitting one
             // [cache-dump] line to stderr. take_pending() is a
             // single atomic swap (cheap, ~5 ns) -- safe to call

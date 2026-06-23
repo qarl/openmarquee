@@ -67,6 +67,12 @@ mod profile;
 /// operator sends `pkill -USR1 -f openmarquee-render`. See
 /// qa/r38d-sigusr1-cache-dump-2026-06-02.md.
 mod sigusr1;
+/// Stability arc Layer 4 (2026-06-23) — SIGTERM/SIGINT clean
+/// shutdown handler. Sets an atomic flag; the IPC inner loop
+/// polls + breaks cleanly so DecoderInner::Drop fires + releases
+/// /dev/video10 (STREAMOFF + REQBUFS(0) + close). Prevents stale-
+/// kernel-state EBUSY/EINVAL on the next renderer start.
+mod sigterm;
 /// `[perf]` r1 (2026-05-26) — host-testable predicate for the
 /// 30fps deadline-miss counter wired into `commit_fb`. Pure data;
 /// cross-platform so the boundary tests (0/35/36/37/100ms) run on
@@ -1384,6 +1390,26 @@ fn resolve_capture_endpoint_slide(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Stability arc Layer 4 (2026-06-23): install SIGTERM/SIGINT
+    // handler at the top of main so a graceful shutdown anywhere
+    // in the renderer's lifecycle flips the atomic flag → IPC
+    // inner loop breaks → DecoderInner::Drop runs → /dev/video10
+    // released cleanly. Without this, default SIGTERM kills the
+    // process mid-stride; DecoderInner::Drop never fires; the
+    // next renderer start can EBUSY on /dev/video10 open.
+    //
+    // Best-effort: install failure logs + we continue (signal
+    // handling unavailable is not fatal to rendering). The
+    // common cause of a libc::signal failure is sandboxing
+    // (seccomp restrictions); we don't currently sandbox the
+    // renderer that aggressively.
+    if let Err(e) = sigterm::install_handler() {
+        eprintln!(
+            "warn: SIGTERM/SIGINT handler install failed: {e}; \
+             ungraceful shutdown will not release /dev/video10 cleanly",
+        );
+    }
 
     // r87 (2026-06-09) startup env-var banner per QA r87 dispatch
     // ask. r86 telemetry showed EOS_FLUSH=1 systemd drop-in
