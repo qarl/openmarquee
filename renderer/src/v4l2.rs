@@ -1746,6 +1746,64 @@ impl HeldCapture {
     pub fn plane_lengths(&self) -> [usize; 2] { self.plane_lengths }
 }
 
+/// Stability arc Layer 1 (2026-06-23): EBUSY backoff on V4L2 device
+/// open. Up to 3 retries with 1s backoff between. Other errors bubble
+/// immediately.
+///
+/// Why: under heavy churn (cap=0 reuse-OFF, ~334 cycles in QA's repro)
+/// a fresh open() can race the kernel's release of the prior File +
+/// return EBUSY. The device IS releasable; the kernel-side release
+/// just isn't fully visible yet. Retry-with-backoff usually succeeds
+/// within 1-2 iterations.
+///
+/// Bounded so a TRULY held device (e.g., mini still has the codec
+/// from boot) still surfaces as Err for the caller's normal error
+/// path — no risk of hiding a real conflict behind unbounded retry.
+#[cfg(target_os = "linux")]
+fn open_with_ebusy_backoff(path: &Path) -> std::io::Result<File> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(f) => {
+                if attempt > 1 {
+                    eprintln!(
+                        "[stability] v4l2_open_ebusy_recovered attempts={} path={}",
+                        attempt, path.display(),
+                    );
+                }
+                return Ok(f);
+            }
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY)
+                && attempt < MAX_ATTEMPTS =>
+            {
+                eprintln!(
+                    "[stability] v4l2_open_ebusy_retry attempt={}/{} path={} \
+                     sleep_ms={}",
+                    attempt, MAX_ATTEMPTS, path.display(), BACKOFF.as_millis(),
+                );
+                std::thread::sleep(BACKOFF);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // Loop falls through here only if MAX_ATTEMPTS all returned EBUSY.
+    // Final attempt's error is captured separately so we return a
+    // properly-typed io::Error rather than a sentinel.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
 /// V4L2 M2M H.264 decoder client.
 #[cfg(target_os = "linux")]
 pub struct Decoder {
@@ -1756,11 +1814,25 @@ pub struct Decoder {
 impl Decoder {
     /// Open + sanity-check the V4L2 device.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
+        // Stability arc Layer 1 (2026-06-23): EBUSY backoff on
+        // /dev/video10 open. Symptom QA hit during the prime-
+        // freeze investigation: under heavy churn (cap=0 reuse-OFF)
+        // a fresh open() can race the kernel's release of a
+        // just-closed file table entry and return EBUSY. The
+        // device IS releasable in this case — the prior holder
+        // has called close(), just the kernel-side release isn't
+        // fully visible yet. Backoff + retry usually succeeds
+        // within 1-2 iterations. Without this, the BeginSlide
+        // handler would propagate the EBUSY → cache.video_skip
+        // marks the slide → user sees a skipped slide for a
+        // condition that self-heals in <1s.
+        //
+        // Retries are bounded (3 × 1s = 3s max) so a TRULY held
+        // device (e.g. another process actually using /dev/video10
+        // — historically mini-vs-backend) still surfaces as Err
+        // for the caller's normal error path. Non-EBUSY errors
+        // (e.g., ENOENT, EACCES) bubble immediately, no backoff.
+        let file = open_with_ebusy_backoff(path)
             .with_context(|| format!("open {}", path.display()))?;
         let decoder_seq_for_inner = next_decoder_open_seq();
         let inner = DecoderInner {
@@ -2420,7 +2492,28 @@ impl Decoder {
             ..Default::default()
         };
         // SAFETY: _IOWR; kernel writes rb.count + rb.capabilities back.
+        // Stability arc Layer 1 (2026-06-23): wrap with wall-clock
+        // timing for slow-ioctl telemetry. Log-only; if elapsed > 5s
+        // emit `[stability] prime_ioctl_slow` (the same threshold
+        // qarl flagged as the "stalls before any frame" window).
+        // The ioctl itself can't be interrupted from userspace if
+        // it goes D-state; this is observation-only. Layer 2's
+        // systemd watchdog covers the actual unstick.
+        let t_reqbufs = std::time::Instant::now();
         let reqbufs_result = unsafe { vidioc_reqbufs(inner.fd(), &mut rb) };
+        let reqbufs_elapsed = t_reqbufs.elapsed();
+        if reqbufs_elapsed.as_secs() >= 5 {
+            eprintln!(
+                "[stability] prime_ioctl_slow op=REQBUFS queue={} count={} \
+                 elapsed_ms={} result={}",
+                match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+                count, reqbufs_elapsed.as_millis(),
+                match &reqbufs_result {
+                    Ok(_) => "ok".to_string(),
+                    Err(e) => format!("errno_{:?}", e),
+                },
+            );
+        }
         // r84 ioctl trace: log every REQBUFS call so QA can pin
         // EINVAL (or any other failure) to the exact queue + count.
         eprintln!(
@@ -2432,6 +2525,66 @@ impl Decoder {
                 Err(e) => format!("errno_{:?}", e),
             },
         );
+
+        // Stability arc Layer 1 (2026-06-23): EINVAL recovery on
+        // REQBUFS OUTPUT. Symptom QA hit after heavy churn (~334
+        // decoder cycles): REQBUFS OUTPUT returns EINVAL because
+        // the kernel believes prior buffers from a previous open
+        // are still in some state we don't track. Recovery:
+        //   1. REQBUFS(count=0) on the same queue → kernel frees
+        //      every tracked buffer for this queue, resets state.
+        //   2. Retry the original REQBUFS(count=N) ONCE.
+        // If retry also fails: bubble the second error normally
+        // (the existing format_reqbufs_failure_context path
+        // surfaces full diagnostics).
+        //
+        // EINVAL recovery is scoped to OUTPUT-side per QA's
+        // observed symptom; CAPTURE-side EINVAL is rare + not
+        // historically observed. Limiting the recovery surface
+        // reduces risk of masking a genuine CAPTURE-side bug.
+        let reqbufs_result = match (dir, &reqbufs_result) {
+            (QueueDirection::Output, Err(nix::errno::Errno::EINVAL)) => {
+                eprintln!(
+                    "[stability] reqbufs_einval_recovery_start queue=output \
+                     count={} attempting REQBUFS(0) cleanup + retry",
+                    count,
+                );
+                let mut rb_free = V4l2Requestbuffers {
+                    count: 0,
+                    buf_type: dir.buf_type(),
+                    memory: memory_type,
+                    ..Default::default()
+                };
+                // SAFETY: same shape as the original REQBUFS call.
+                let free_result = unsafe { vidioc_reqbufs(inner.fd(), &mut rb_free) };
+                eprintln!(
+                    "[stability] reqbufs_einval_recovery_cleanup queue=output \
+                     result={}",
+                    match &free_result {
+                        Ok(_) => "ok".to_string(),
+                        Err(e) => format!("errno_{:?}", e),
+                    },
+                );
+                // Retry the original count, regardless of cleanup
+                // outcome — if cleanup failed we still try the
+                // retry once (worst case: same EINVAL bubbles).
+                rb.count = count;
+                let retry_result = unsafe { vidioc_reqbufs(inner.fd(), &mut rb) };
+                let recovered = retry_result.is_ok();
+                eprintln!(
+                    "[stability] reqbufs_einval_recovery_retry queue=output \
+                     count={} result={} recovered={}",
+                    count,
+                    match &retry_result {
+                        Ok(_) => format!("ok_allocated_{}", rb.count),
+                        Err(e) => format!("errno_{:?}", e),
+                    },
+                    recovered,
+                );
+                retry_result
+            }
+            _ => reqbufs_result,
+        };
         // r99 (2026-06-09): on REQBUFS failure, embed errno + buffer
         // params into the with_context message so the parent's
         // [mmal_leak_suspect] log line surfaces the actual ioctl
