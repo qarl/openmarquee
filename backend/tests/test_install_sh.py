@@ -411,22 +411,40 @@ def test_dry_run_enables_hostapd_and_dnsmasq(dry_output: str) -> None:
         )
 
 
-def test_dry_run_ap_mask_precedes_backend_enable(dry_output: str) -> None:
+def test_dry_run_ap_mask_precedes_backend_enablement(dry_output: str) -> None:
     """r60 ordering: the AP-side mask (openmarquee-ap0 + hostapd +
-    dnsmasq) must land BEFORE the backend.service enable. The
-    `systemctl enable` runs under `set -e`; pinning the relative
-    order keeps a future edit (e.g. someone re-inserting an enable
-    for hostapd between these two calls) from silently swapping the
-    safety order. The mask is on the AP-side units; the enable here
-    is on the unrelated backend.service — the two operate on
-    DIFFERENT units, this is a pure relative-order assertion."""
+    dnsmasq) must land BEFORE the backend.service enablement
+    decision. The systemctl calls run under `set -e`; pinning the
+    relative order keeps a future edit (e.g. someone re-inserting
+    an enable for hostapd between these two calls) from silently
+    swapping the safety order. The mask is on the AP-side units;
+    the enable/disable here is on the unrelated backend.service —
+    the two operate on DIFFERENT units, this is a pure relative-
+    order assertion.
+
+    Stability arc Layer 3 post-review (2026-06-23): renamed from
+    _precedes_backend_enable to _precedes_backend_enablement
+    because L3's scenario-B design DISABLES backend-on-boot (the
+    promoter is the SOLE backend starter post-reboot). The
+    relative ordering vs the AP mask is unchanged; only the
+    backend enablement verb flipped from enable → disable. Test
+    accepts either marker (whichever install.sh currently uses)
+    so a future flip back doesn't false-fail.
+    """
     enable_idx = dry_output.find("systemctl enable openmarquee-backend.service")
+    disable_idx = dry_output.find("systemctl disable openmarquee-backend.service")
+    enablement_idx = enable_idx if enable_idx != -1 else disable_idx
     mask_idx = dry_output.find(
         "systemctl mask openmarquee-ap0.service hostapd.service dnsmasq.service"
     )
-    assert enable_idx != -1, "enable marker missing"
+    assert enablement_idx != -1, (
+        "neither `systemctl enable openmarquee-backend.service` nor "
+        "`systemctl disable openmarquee-backend.service` marker present"
+    )
     assert mask_idx != -1, "AP-side mask marker missing"
-    assert mask_idx < enable_idx, f"AP mask must precede backend enable: {mask_idx=} {enable_idx=}"
+    assert mask_idx < enablement_idx, (
+        f"AP mask must precede backend enablement decision: {mask_idx=} {enablement_idx=}"
+    )
 
 
 def test_ap0_service_orders_before_networkmanager() -> None:

@@ -1209,7 +1209,43 @@ run systemctl daemon-reload
 say "Mask AP-side units (r60: AP off by default; field-provisioning is unmask-then-start)"
 run systemctl mask openmarquee-ap0.service hostapd.service dnsmasq.service || true
 
-run systemctl enable openmarquee-backend.service
+# Stability arc Layer 3 boot-wiring fix (2026-06-23 post-review):
+# DO NOT enable openmarquee-backend.service at boot — the L3
+# promoter is the SOLE thing that starts backend (after stopping
+# mini). Pre-fix this line was `systemctl enable openmarquee-
+# backend.service` which would have caused backend AND mini to
+# both auto-start at boot → fight over /dev/video10 → exactly
+# the wedge L3 exists to prevent.
+#
+# `systemctl disable` is idempotent on an already-disabled unit
+# (no-op). On FYS (current state per QA: backend already
+# disabled, mini enabled), this is a no-op. On a fresh-install
+# or post-rollback box where backend somehow ended up enabled,
+# this enforces the scenario-B boot config.
+run systemctl disable openmarquee-backend.service || true
+
+# Stability arc Layer 3 (2026-06-23 post-review): ensure mini
+# is enabled-at-boot so the cap "stay on stable mini" rest-state
+# is guaranteed. mini's unit (openmarquee-mini.service) is not
+# in THIS build tree (it ships separately, exists on FYS from a
+# prior install). If the unit file isn't present, log loudly +
+# continue — the promoter's `systemctl stop openmarquee-mini.
+# service` will then no-op (no unit to stop), and the cap
+# rest-state will be empty scanout = DARK sign + alert via
+# journal. Operator must restore mini's unit file from the
+# rollback source.
+if systemctl list-unit-files openmarquee-mini.service >/dev/null 2>&1 \
+    && [ "$(systemctl is-enabled openmarquee-mini.service 2>/dev/null || echo missing)" != "missing" ]; then
+    say "Ensure openmarquee-mini.service enabled-at-boot (boot-default + cap rest-state)"
+    run systemctl enable openmarquee-mini.service || true
+else
+    say "WARNING: openmarquee-mini.service not installed on this system."
+    say "  The L3 cap rest-state requires mini as the safe fallback."
+    say "  Without it: a capped sign goes DARK + journal logs"
+    say "  [stability] reboot_loop_cap_reached but no mini takes over."
+    say "  Action: restore openmarquee-mini.service from rollback or"
+    say "  re-add to /etc/systemd/system + systemctl enable + reboot."
+fi
 
 # Stability arc Layer 3 (2026-06-23): enable the post-reboot
 # promoter. Runs once at boot (Type=oneshot), reads the
