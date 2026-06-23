@@ -307,7 +307,8 @@ for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tail
             openmarquee-cma-watchdog.service openmarquee-cma-watchdog.timer \
             openmarquee-best-wifi.service openmarquee-best-wifi.timer \
             openmarquee-wifi-powersave-off.service \
-            openmarquee-backend-failure-handler.service; do
+            openmarquee-backend-failure-handler.service \
+            openmarquee-stability-promoter.service; do
     SRC="${OPT_DIR}/system/${unit}"
     DST="${SYSTEMD_DIR}/${unit}"
     if already_done -f "$DST" && already_done "$SRC" -nt "$DST"; then
@@ -331,7 +332,8 @@ done
 say "Ensure +x on system/*.sh helpers"
 for sh_helper in openmarquee-ap0-setup.sh openmarquee-firstboot.sh openmarquee-tailscale.sh \
                  openmarquee-cma-watchdog.sh openmarquee-best-wifi.sh \
-                 openmarquee-wifi-powersave-off.sh; do
+                 openmarquee-wifi-powersave-off.sh \
+                 stability-promoter.sh; do
     SH_PATH="${OPT_DIR}/system/${sh_helper}"
     if [ "$DRY_RUN" -eq 1 ] || [ -f "$SH_PATH" ]; then
         run chmod +x "$SH_PATH"
@@ -1208,6 +1210,18 @@ say "Mask AP-side units (r60: AP off by default; field-provisioning is unmask-th
 run systemctl mask openmarquee-ap0.service hostapd.service dnsmasq.service || true
 
 run systemctl enable openmarquee-backend.service
+
+# Stability arc Layer 3 (2026-06-23): enable the post-reboot
+# promoter. Runs once at boot (Type=oneshot), reads the
+# backend-failure marker + reboot counter, decides whether
+# to stop mini + start backend (normal path) or stay on mini
+# under the reboot-loop cap. NOT gated on network-online (the
+# recovery target IS wifi flakiness, so the promoter must
+# run regardless of wifi state — backend's own After= deps
+# handle network ordering at backend-start time). Hard
+# ordering of mini-stop-then-backend-start is enforced inside
+# the script so the systemd dep graph stays simple.
+run systemctl enable openmarquee-stability-promoter.service
 
 # r60: best-known-WiFi scanner + roam timer. Boot oneshot picks the
 # strongest visible known SSID; 5-min recurring timer roams to a
