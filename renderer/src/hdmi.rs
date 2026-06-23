@@ -1725,12 +1725,38 @@ fn rotate_scanout_3_deep(
     session.scanout_current_bo = Some(new_bo);
     session.scanout_current_fb = Some(new_fb);
 
-    eprintln!(
-        "[perf] scanout_rotate site={} prev2_wait_us={} \
-         new_sync_create_us={} elapsed_us={}",
-        site, prev2_wait_us, new_sync_create_us,
-        t_recycle.elapsed().as_micros(),
-    );
+    // Flip-race fix D2 finalize (2026-06-22): gate the per-rotation
+    // perf line behind OPENMARQUEE_SCANOUT_ROTATE_LOG=1 so production
+    // doesn't emit ~22 lines/sec to stderr. Default OFF. QA enables
+    // env on instrumented builds when measuring; prod stays silent.
+    // The gate is cached once via OnceLock (env-var read is the
+    // first call's overhead; every subsequent call is an atomic
+    // load).
+    if scanout_rotate_log_enabled() {
+        eprintln!(
+            "[perf] scanout_rotate site={} prev2_wait_us={} \
+             new_sync_create_us={} elapsed_us={}",
+            site, prev2_wait_us, new_sync_create_us,
+            t_recycle.elapsed().as_micros(),
+        );
+    }
+}
+
+/// Flip-race fix D2 finalize (2026-06-22): env gate for the
+/// per-rotation scanout_rotate perf line. OnceLock-cached so the
+/// env var is read exactly once per process. Default OFF: prod
+/// stays silent (the line fires ~22 times/sec at full reel rate;
+/// cumulative log volume across days of uptime is non-trivial).
+/// QA enables via `OPENMARQUEE_SCANOUT_ROTATE_LOG=1` (or "true")
+/// when measuring on glass.
+fn scanout_rotate_log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("OPENMARQUEE_SCANOUT_ROTATE_LOG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 /// Bug 2 (qarl-flag 2026-05-09): cleanup at end of an in-session
