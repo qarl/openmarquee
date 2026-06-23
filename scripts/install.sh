@@ -306,7 +306,8 @@ run mkdir -p "$SYSTEMD_DIR"
 for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tailscale.service \
             openmarquee-cma-watchdog.service openmarquee-cma-watchdog.timer \
             openmarquee-best-wifi.service openmarquee-best-wifi.timer \
-            openmarquee-wifi-powersave-off.service; do
+            openmarquee-wifi-powersave-off.service \
+            openmarquee-backend-failure-handler.service; do
     SRC="${OPT_DIR}/system/${unit}"
     DST="${SYSTEMD_DIR}/${unit}"
     if already_done -f "$DST" && already_done "$SRC" -nt "$DST"; then

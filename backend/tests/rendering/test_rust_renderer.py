@@ -1289,13 +1289,21 @@ def test_real_sidecar_open_close_roundtrip(tmp_path):
 # ============================================================
 
 
-def test_r74_response_timeout_default_is_ten_seconds(make_renderer):
+def test_r74_response_timeout_default_is_eight_seconds(make_renderer):
     """Pin the compiled default so a future change has to be
-    deliberate. 10s comfortably covers begin_slide cold-prime
-    (~600ms) without falsing."""
+    deliberate.
+
+    Stability arc Layer 2 (2026-06-23): tuned 10s -> 8s per QA.
+    A legit slow cold-prime has been observed up to ~3.3s (QA's
+    EINVAL wedge prime_us); 8s gives ~2.5x headroom over that
+    worst observed while catching infinite wedges fast. A true
+    D-state hang never returns, so the lower 8s still catches it
+    + lowers the IPC-timeout-to-respawn latency by 2s when a
+    real wedge fires.
+    """
     r = make_renderer()
     try:
-        assert r._response_timeout_s == r.DEFAULT_RESPONSE_TIMEOUT_S == 10.0
+        assert r._response_timeout_s == r.DEFAULT_RESPONSE_TIMEOUT_S == 8.0
     finally:
         r.close()
 

@@ -21,7 +21,15 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-Type=simple
+# Stability arc Layer 2 (2026-06-23): Type=notify so systemd
+# enforces the WatchdogSec= liveness contract via sd_notify.
+# Backend sends READY=1 once playback loop is live (app.py
+# lifespan) + WATCHDOG=1 per painted frame (throttled 1Hz via
+# sd_notify.py). If pings stop for WatchdogSec, systemd kills
+# the unit; FailureAction handler escalates to reboot if
+# StartLimitBurst is exhausted.
+Type=notify
+WatchdogSec=60s
 User=openmarquee
 Group=openmarquee
 WorkingDirectory=/opt/openmarquee/backend
@@ -103,6 +111,16 @@ ExecStart=/opt/openmarquee/venv/bin/uvicorn openmarquee.app:app \
 # is persistently wrong (config error, missing asset, etc).
 Restart=on-failure
 RestartSec=2s
+
+# Stability arc Layer 2 (2026-06-23): when StartLimitBurst exhausts
+# (5 failed restarts in 5min), escalate via OnFailure to a oneshot
+# handler that marks the reboot cause + reboots. Layer 3's promoter
+# reads the marker to distinguish RENDERER/BACKEND-failure reboots
+# from other reboot causes (wifi watchdog, operator) so the
+# reboot-loop cap (3/hour → stay on stable mini + alert) ONLY counts
+# backend failures. Without the marker, a flaky-wifi stretch would
+# falsely trip the cap.
+OnFailure=openmarquee-backend-failure-handler.service
 
 # Let uvicorn bind to port 80 without running as root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE

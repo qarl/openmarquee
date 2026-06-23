@@ -199,6 +199,15 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             log.exception("startup playback autostart failed")
 
+    # Stability arc Layer 2 (2026-06-23): systemd Type=notify handshake.
+    # Send READY=1 once the playback loop is live + the backend is
+    # serving requests. Without this, Type=notify hangs the unit on
+    # startup waiting for the handshake. No-op if $NOTIFY_SOCKET is
+    # unset (= not running under systemd Type=notify; e.g., dev/CI).
+    from openmarquee import sd_notify as _sd_notify
+
+    _sd_notify.notify_ready()
+
     # Flock pull worker — periodic reliability backstop that reconciles
     # against sync=True peers even when pushes get dropped. Tests can
     # opt out via OPENMARQUEE_DISABLE_PULL_WORKER=1 so fixtures that

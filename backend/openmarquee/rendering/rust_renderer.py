@@ -422,12 +422,19 @@ class RustRenderer:
     # a blocking `readline()` while holding `_lock`; if the renderer
     # wedged in a kernel V4L2 ioctl (D-state observed), readline never
     # returned and every other asyncio executor thread piled up on the
-    # lock. 10s comfortably covers the slowest expected response
-    # (begin_slide cold-start V4L2 prime ~600ms; preload completion
-    # ~100ms; everything else sub-100ms) without falsing on the
-    # genuine slow path. Configurable via OPENMARQUEE_RENDERER_RESPONSE_
+    # lock.
+    #
+    # Stability arc Layer 2 (2026-06-23): tuned 10s → 8s per QA. A
+    # legit slow cold-prime has been observed up to ~3.3s (the prime_us
+    # in QA's EINVAL wedge); a normal Advance is ~33ms. 8s sits
+    # comfortably above any legit operation (~2.5x headroom over the
+    # worst observed prime, ~240x over normal advance) while still
+    # catching an infinite wedge fast. A true D-state hang never
+    # returns, so even 8s catches it; lowering further risks false-
+    # killing a legit slow prime mid-flight (which would churn the
+    # decoder). Configurable via OPENMARQUEE_RENDERER_RESPONSE_
     # TIMEOUT_S env var so QA can hot-tune.
-    DEFAULT_RESPONSE_TIMEOUT_S = 10.0
+    DEFAULT_RESPONSE_TIMEOUT_S = 8.0
 
     def __init__(
         self,

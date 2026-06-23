@@ -1,0 +1,51 @@
+[Unit]
+Description=openMarquee backend-failure handler: mark + reboot
+Documentation=https://github.com/qarl/openmarquee
+# Stability arc Layer 2 (2026-06-23): triggered by openmarquee-
+# backend.service's OnFailure= when StartLimitBurst exhausts
+# (5 backend restarts in 5min). Marks the reboot cause for
+# Layer 3's reboot-loop counter (so a wifi-watchdog reboot
+# doesn't falsely count as a backend failure), then issues
+# systemctl reboot.
+#
+# Why this exists vs `FailureAction=reboot` on the backend
+# unit: FailureAction can't run a script first. We need to
+# write the marker file BEFORE rebooting so Layer 3's promoter
+# (in the next boot) can distinguish "rebooted because of
+# backend failure" from "rebooted for some other reason" (wifi
+# watchdog, operator, kernel panic recovery).
+#
+# Reboot-loop cap (Layer 3): if more than 3 backend-failure
+# reboots happen within 1 hour, Layer 3's promoter doesn't
+# auto-start the backend after reboot; sign stays on stable
+# mini + a [stability] reboot_loop_cap_reached marker logs.
+# Manual recovery: rm /var/lib/openmarquee/reboot-count +
+# systemctl start openmarquee-backend.
+
+[Service]
+Type=oneshot
+# Write the marker file FIRST, then reboot. The marker is
+# Layer 3's signal that the upcoming reboot was caused by
+# backend failure. Failure to write the marker is logged but
+# doesn't block the reboot — better to reboot uncounted than
+# to wedge with the backend failed and no recovery.
+#
+# `+` prefix on ExecStart runs with full privileges (root
+# bypass of User=/Group= sandboxing). Required because:
+#  1. /var/lib/openmarquee/ may need to be created with the
+#     right permissions.
+#  2. systemctl reboot requires root.
+ExecStart=+/bin/sh -c 'mkdir -p /var/lib/openmarquee && \
+    date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ > /var/lib/openmarquee/backend-failure-reboot && \
+    echo "[stability] backend_failure_reboot_marker_written; rebooting" \
+        >&2 && \
+    systemctl reboot'
+
+# Don't restart this handler itself if it fails — the reboot
+# is fire-and-forget.
+RemainAfterExit=no
+
+# NO [Install] section: this unit is triggered exclusively by
+# `OnFailure=` on openmarquee-backend.service. `systemctl enable`
+# on it would be a no-op (no WantedBy=/RequiredBy=); install.sh's
+# copy step is the only thing needed to make it loadable.
