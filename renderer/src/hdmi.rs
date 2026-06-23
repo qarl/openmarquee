@@ -479,6 +479,50 @@ pub struct EglSession<'a> {
     scanout_prev_fb: Option<framebuffer::Handle>,
     scanout_current_bo: Option<BufferObject<()>>,
     scanout_current_fb: Option<framebuffer::Handle>,
+    /// Flip-race fix D (2026-06-22): 3rd scanout slot for triple-
+    /// buffering. Fix A (gl.finish) + C (EGL fence) both closed the
+    /// race correctness-wise but cost ~28ms per present stall =
+    /// halved FPS (single-frame vc4 1080p render time, not
+    /// pipeline-backlog). Pivot per QA: HOLD an extra scanout slot
+    /// so GBM's pool grows to 3 BOs. When GBM recycles a BO into
+    /// the next swap, that BO was last drawn ~2 frames ago = GPU
+    /// long done = no stale-tile race + no current-frame stall.
+    ///
+    /// Rotation depth = 3:
+    ///   prev2 (oldest, just released by recent page_flip) → recycled
+    ///   prev  (penultimate)
+    ///   current (just page-flipped, kernel scanning)
+    ///
+    /// Per-tick: destroy prev2 → shift prev→prev2 → shift current→
+    /// prev → set new→current. Destroy of prev2 is preceded by a
+    /// fence wait on prev2's sync (created when this slot WAS
+    /// current; by the time it reaches prev2 ~2 frames later, the
+    /// fence is signaled → wait ≈0us). Cheap completion barrier on
+    /// a known-done buffer, vs fix A/C's full-pipeline stall on the
+    /// current.
+    ///
+    /// Resource cost: +1 1080p ARGB8888 BO ≈ 8 MB CMA. Headroom
+    /// verified on Pi Zero 2 W.
+    scanout_prev2_bo: Option<BufferObject<()>>,
+    scanout_prev2_fb: Option<framebuffer::Handle>,
+    /// Flip-race fix D (2026-06-22): per-slot EGL fence sync for the
+    /// 3-deep scanout rotation. Created when a BO enters `current`
+    /// (= just rendered + page-flipped). Shifts through `prev` →
+    /// `prev2`. When the slot reaches `prev2` and is about to be
+    /// recycled, the rotation helper waits the fence (~0us for a
+    /// 2-frames-old fence) + destroys it before dropping the BO.
+    /// The wait guarantees the GPU is done with this BO's PRIOR
+    /// draw — necessary because the BO returns to GBM's pool on
+    /// drop, and a subsequent swap may pick it as the backbuffer.
+    ///
+    /// `None` when sync creation failed (driver lacks EGL_KHR_
+    /// fence_sync or attrib check failed — both should be impossible
+    /// on Mesa+vc4 with the ATTRIB_NONE-terminated list, but
+    /// defensive None handling preserves correctness via the GBM
+    /// implicit-sync fallback path).
+    scanout_current_sync: Option<egl::Sync>,
+    scanout_prev_sync: Option<egl::Sync>,
+    scanout_prev2_sync: Option<egl::Sync>,
     /// Bug 2 (qarl-flag 2026-05-09): the in-session render paths
     /// (render_one_frame_in_session, render_animated_slide_in_
     /// session, render_transition_*_in_session) used to destroy
@@ -877,6 +921,18 @@ where
         .initialize(display)
         .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
     eprintln!("EGL {}.{}", egl_major, egl_minor);
+    // Flip-race fix D (2026-06-22): startup log of advertised EGL
+    // extensions so QA can confirm EGL_KHR_fence_sync is present
+    // (rotate_scanout_3_deep uses it for the per-slot per-buffer
+    // sync; if absent the rotation degenerates to no-sync and the
+    // snap-back race may reappear).
+    match egl_lib.query_string(Some(display), egl::EXTENSIONS) {
+        Ok(cs) => eprintln!(
+            "EGL_EXTENSIONS: {}",
+            cs.to_str().unwrap_or("<non-utf8>"),
+        ),
+        Err(e) => eprintln!("warn: eglQueryString(EGL_EXTENSIONS) failed: {e:?}"),
+    }
 
     egl_lib
         .bind_api(egl::OPENGL_ES_API)
@@ -955,6 +1011,12 @@ where
         scanout_prev_fb: None,
         scanout_current_bo: None,
         scanout_current_fb: None,
+        // Flip-race fix D (2026-06-22).
+        scanout_prev2_bo: None,
+        scanout_prev2_fb: None,
+        scanout_current_sync: None,
+        scanout_prev_sync: None,
+        scanout_prev2_sync: None,
         held_scanout_fb: None,
         held_scanout_bo: None,
         session_start: std::time::Instant::now(),
@@ -1204,6 +1266,28 @@ where
     }
     if let Some(bo) = session.scanout_prev_bo.take() {
         drop(bo);
+    }
+    // Flip-race fix D (2026-06-22): free the 3rd scanout slot
+    // (prev2) + the per-slot EGL fence syncs. The kernel switched
+    // away from prev2 multiple frames ago — safe to destroy.
+    if let Some(fb) = session.scanout_prev2_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_prev2): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_prev2_bo.take() {
+        drop(bo);
+    }
+    for sync_slot in [
+        session.scanout_current_sync.take(),
+        session.scanout_prev_sync.take(),
+        session.scanout_prev2_sync.take(),
+    ] {
+        if let Some(sync) = sync_slot {
+            let _ = unsafe {
+                session.egl_lib.destroy_sync(session.display, sync)
+            };
+        }
     }
     // Bug 2 (2026-05-09): drain in-session held scanout. The
     // standalone render paths (animated slide + transition + one-
@@ -1502,6 +1586,130 @@ fn drain_pending_flip(session: &mut EglSession, card: &Card) {
         }
     }
     session.flip_pending = false;
+}
+
+/// Flip-race fix D (2026-06-22): 3-deep scanout buffer rotation.
+///
+/// Replaces the 9-line inlined rotation pattern previously at every
+/// paint_and_present_*_frame tail (destroy scanout_prev + shift
+/// current → prev + set new → current). Adds a third generation
+/// (prev2) so the GBM surface pool grows to 3 BOs: when GBM
+/// recycles a BO for the next backbuffer, that BO was last drawn
+/// ~2 frames ago, giving the GPU enough lead time that its prior
+/// content is COMPLETE before the next render starts — closing the
+/// snap-back race (kernel scanning a still-being-drawn BO) without
+/// the ~28ms current-frame stall fix A (gl.finish) and fix C (EGL
+/// fence wait) both incurred.
+///
+/// Per-tick:
+///   1. Wait on prev2's fence (created when this BO was current ~2
+///      frames ago; by now signaled — wait ≈0us). Confirms the
+///      GPU is done with the recycled BO before we hand it back to
+///      GBM. Destroys the fence after.
+///   2. Destroy prev2's DRM FB + drop prev2's BO (drop returns BO
+///      to GBM pool for re-use as a future backbuffer).
+///   3. Shift prev → prev2 (incl. fence). Shift current → prev.
+///   4. New BO/FB becomes current. Create a fresh fence at this
+///      point — it will be waited on ~2 frames hence when this
+///      slot reaches prev2.
+///
+/// Telemetry: `[perf] scanout_rotate site=X prev2_wait_us=N
+/// new_sync_create_us=M elapsed_us=T`. prev2_wait_us is the key
+/// number — should be ~0us once the rotation is steady-state
+/// (after the first 2 frames). If it climbs to ~28ms, the fence
+/// strategy degenerated to fix A/C's cost — debug.
+///
+/// Held-scanout interaction: `end_of_in_session_render_call`
+/// continues to operate on `scanout_current` for cross-call
+/// preservation. prev2 + prev are released at end-of-call along
+/// with current's rotation into held_scanout. See that function
+/// for details.
+#[allow(clippy::too_many_arguments)]
+fn rotate_scanout_3_deep(
+    session: &mut EglSession,
+    card: &Card,
+    new_bo: BufferObject<()>,
+    new_fb: framebuffer::Handle,
+    site: &'static str,
+) {
+    let t_recycle = std::time::Instant::now();
+
+    // Step 1: wait + destroy prev2's fence (it's been signaled for ~2
+    // frames, so the wait is essentially a no-op). If fence creation
+    // failed back when this slot was current, sync is None — skip.
+    let mut prev2_wait_us: u128 = 0;
+    if let Some(sync) = session.scanout_prev2_sync.take() {
+        let t_wait = std::time::Instant::now();
+        let _ = unsafe {
+            session.egl_lib.client_wait_sync(
+                session.display,
+                sync,
+                egl::SYNC_FLUSH_COMMANDS_BIT,
+                500_000_000,
+            )
+        };
+        prev2_wait_us = t_wait.elapsed().as_micros();
+        let _ = unsafe { session.egl_lib.destroy_sync(session.display, sync) };
+    }
+
+    // Step 2: destroy prev2's FB; drop prev2's BO (releases to GBM
+    // pool — GBM may hand it back as the next backbuffer).
+    if let Some(fb) = session.scanout_prev2_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!(
+                "warn: destroy_framebuffer(scanout_prev2, {site}): {e}",
+            );
+        }
+    }
+    if let Some(bo) = session.scanout_prev2_bo.take() {
+        drop(bo);
+    }
+
+    // Step 3: shift prev → prev2; current → prev. Sync travels with
+    // its BO so the fence is always tied to the correct frame's
+    // GPU completion.
+    session.scanout_prev2_sync = session.scanout_prev_sync.take();
+    session.scanout_prev2_fb = session.scanout_prev_fb.take();
+    session.scanout_prev2_bo = session.scanout_prev_bo.take();
+    session.scanout_prev_sync = session.scanout_current_sync.take();
+    session.scanout_prev_fb = session.scanout_current_fb.take();
+    session.scanout_prev_bo = session.scanout_current_bo.take();
+
+    // Step 4: new becomes current. Create a fresh fence to track
+    // this draw's GPU completion (consumed when this slot reaches
+    // prev2 ~2 ticks hence). Defensive: if create_sync fails, the
+    // slot's sync stays None; future recycle skips the wait + relies
+    // on natural GBM/Mesa implicit sync. Snap-back may reappear in
+    // that path — log loudly.
+    let t_create = std::time::Instant::now();
+    let new_sync = match unsafe {
+        session.egl_lib.create_sync(
+            session.display,
+            egl::SYNC_FENCE as egl::Enum,
+            &[egl::ATTRIB_NONE],
+        )
+    } {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "warn: scanout_rotate create_sync failed site={}: {:?} \
+                 (next recycle's fence wait will be skipped)",
+                site, e,
+            );
+            None
+        }
+    };
+    let new_sync_create_us = t_create.elapsed().as_micros();
+    session.scanout_current_sync = new_sync;
+    session.scanout_current_bo = Some(new_bo);
+    session.scanout_current_fb = Some(new_fb);
+
+    eprintln!(
+        "[perf] scanout_rotate site={} prev2_wait_us={} \
+         new_sync_create_us={} elapsed_us={}",
+        site, prev2_wait_us, new_sync_create_us,
+        t_recycle.elapsed().as_micros(),
+    );
 }
 
 /// Bug 2 (qarl-flag 2026-05-09): cleanup at end of an in-session
@@ -4074,22 +4282,8 @@ pub fn paint_and_present_one_frame_for_slide(
         return Err(e);
     }
 
-    // commit_fb's drain confirmed kernel switched to scanout_
-    // current (the previous frame's commit). scanout_prev (the
-    // frame before that) is now safe to free.
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    // Shift: current → prev. Then store new as current.
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "text");
     let t_end = if trace { Some(std::time::Instant::now()) } else { None };
     crate::profile::record_phase(
         "paint_present",
@@ -4381,18 +4575,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             drop(new_bo);
             return Err(e);
         }
-        if let Some(fb) = session.scanout_prev_fb.take() {
-            if let Err(e) = card.destroy_framebuffer(fb) {
-                eprintln!("warn: destroy_framebuffer(scanout_prev, text-over-video cached): {e}");
-            }
-        }
-        if let Some(bo) = session.scanout_prev_bo.take() {
-            drop(bo);
-        }
-        session.scanout_prev_fb = session.scanout_current_fb.take();
-        session.scanout_prev_bo = session.scanout_current_bo.take();
-        session.scanout_current_bo = Some(new_bo);
-        session.scanout_current_fb = Some(new_fb);
+        // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+        rotate_scanout_3_deep(session, card, new_bo, new_fb, "text_over_video_cached");
         let scanout_us = t_scanout.elapsed().as_micros();
 
         // Mark frame so subsequent ticks use live path.
@@ -4636,18 +4820,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev, text-over-video): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "text_over_video");
     // r61 Phase B: scanout_us = wall time of the swap+lock+addFB+
     // commit sequence (the canonical 11-step release contract per
     // qa/r38b §2). On a busy CMA pool the lock_front_buffer +
@@ -4806,18 +4980,8 @@ pub fn paint_and_present_one_image_slide_frame(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev, image_slide): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "image");
     crate::profile::record_phase(
         "paint_present",
         t_phase.elapsed().as_nanos() as u64,
@@ -4918,18 +5082,8 @@ pub fn paint_and_present_external_frame(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev, external_frame): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "external");
     Ok(())
 }
 
@@ -5027,18 +5181,8 @@ pub fn paint_and_present_external_nv12_frame(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev, external_nv12): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "external_nv12");
     Ok(())
 }
 
@@ -5241,18 +5385,8 @@ fn finish_video_slide_swap_and_commit(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev, video_slide): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "video");
     Ok(())
 }
 
@@ -6526,18 +6660,8 @@ pub fn paint_and_present_one_transition_frame(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "transition");
     // r102.1: last-tick probe. progress > 0.95 catches the final
     // 2-3 ticks; QA sums the entry/exit delta across N transitions
     // to confirm or refute candidate #1.
