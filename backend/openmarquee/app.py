@@ -46,7 +46,15 @@ from openmarquee.dependencies import (
 from openmarquee.dev import router as dev_router
 from openmarquee.fqdn_redirect_middleware import FqdnRedirectMiddleware
 from openmarquee.perf_middleware import PerfMiddleware
-from openmarquee.seed import seed_if_needed
+
+# LEVER 2 lazy-imports (2026-06-24): defer openmarquee.seed to first
+# lifespan invocation. The seed module pulls in PIL (Image, ImageDraw,
+# ImageFont) at top level to generate the first-boot starter slides;
+# Pillow is ~5-8 MB RSS at import time and the seed path runs at most
+# once per device. On every boot after the first, seed_if_needed
+# logs + stamps a marker so the lifespan call is a fast no-op — but
+# the PIL import would still fire if seed.py loaded at module level.
+# The deferred import keeps Pillow out of the steady-state RSS.
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +101,25 @@ _configure_logging()
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Startup: first-boot seed + auto-start playback. Shutdown: stop."""
+    # LEVER 2 (2026-06-24): env-gated tracemalloc capture. Start as
+    # early in the lifespan as possible so the snapshot includes
+    # later startup allocations (seeded content, playlist load,
+    # renderer Open, etc.). The /api/system/memory-snapshot endpoint
+    # dumps the top allocators by size for QA to attribute the
+    # ~140 MB Python footprint by source-line area.
+    #
+    # tracemalloc itself costs ~10-15% memory + CPU when active, so
+    # it's strictly opt-in via the env var. Leave it OFF on prod
+    # unless actively diagnosing.
+    if os.environ.get("OPENMARQUEE_MEMORY_TRACE") == "1":
+        try:
+            import tracemalloc
+
+            tracemalloc.start(25)  # 25-frame stacks; deep enough for FastAPI / Pydantic chains
+            log.info("memory-trace: tracemalloc.start(25) — /api/system/memory-snapshot enabled")
+        except Exception:
+            log.exception("memory-trace: tracemalloc.start failed; /api/system/memory-snapshot will return 503")
+
     # r67 (2026-06-05): runtime asset verification. Logs CRITICAL if
     # the COLRv1 emoji font is absent / 0-byte at the canonical
     # /opt/openmarquee/ui/fonts/ path — otherwise the renderer's COLR
@@ -120,6 +147,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # a test-fixture's tmp_path with surprise content.
     if os.environ.get("OPENMARQUEE_DISABLE_SEED") != "1":
         try:
+            # LEVER 2 lazy-import (2026-06-24): defer seed → PIL chain.
+            from openmarquee.seed import seed_if_needed
+
             settings = get_settings_storage().load()
             seed_if_needed(
                 storage=get_content_storage(),

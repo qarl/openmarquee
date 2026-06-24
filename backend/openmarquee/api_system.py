@@ -23,10 +23,18 @@ import subprocess
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
-from openmarquee import auto_render, identity, tailscale
+from openmarquee import identity, tailscale
+
+# LEVER 2 lazy-imports (2026-06-24): auto_render + text_raster pull in
+# Pillow (~5-8 MB RSS) at import time. The two are only referenced in
+# the /perf-stats endpoint below; deferring their import to the
+# handler keeps the backend's startup footprint free of Pillow on
+# prod devices that never hit the dev-side perf endpoint. font_cache_
+# info() returns counters tracked at module import time, so the first
+# /perf-stats call IS what materializes the counters too.
 from openmarquee.api import cors_headers_for_origin
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import get_flock_storage, get_settings_storage
@@ -35,7 +43,6 @@ from openmarquee.perf_middleware import recent_requests
 from openmarquee.playlist import PlaylistStorage
 from openmarquee.schedule import ScheduleStorage
 from openmarquee.settings import SettingsStorage
-from openmarquee.text_raster import font_cache_info
 
 log = logging.getLogger(__name__)
 
@@ -575,6 +582,13 @@ class PerfStats(BaseModel):
 @router.get("/perf-stats", response_model=PerfStats)
 async def perf_stats() -> PerfStats:
     """Aggregate the per-storage class counters + font cache info."""
+    # LEVER 2 lazy-imports (2026-06-24): defer the Pillow-bringing
+    # modules to the first /perf-stats call. Prod devices with
+    # OPENMARQUEE_DISABLE_DEV=1 (and any device that simply doesn't
+    # hit this endpoint) keep Pillow out of process RSS entirely.
+    from openmarquee import auto_render
+    from openmarquee.text_raster import font_cache_info
+
     cache = font_cache_info()
     return PerfStats(
         content_storage=ContentStorage.stats_snapshot(),
@@ -637,3 +651,77 @@ async def csp_report(request: Request) -> Response:
         text = text[:1024] + "...(truncated)"
     log.warning("csp-report: %s", text)
     return Response(status_code=204)
+
+
+# LEVER 2 (2026-06-24): env-gated memory snapshot for QA's
+# top-allocator attribution of the ~140 MB Python footprint.
+#
+# Enabled when OPENMARQUEE_MEMORY_TRACE=1 was set at process start
+# (app.py lifespan starts tracemalloc early so the snapshot covers
+# startup allocations). 503 if not enabled — tracemalloc costs
+# ~10-15% memory + CPU when active, so it's strictly opt-in.
+#
+# Returns the top N (default 20) allocation sites by current size,
+# each carrying the source file:lineno + per-site cumulative bytes
+# and block count. The output format is whatever pip-friendly QA
+# needs to grep — a flat JSON array under `top` plus a summary
+# `total_traced_kb` so QA can sanity-check the snapshot against
+# /proc/<pid>/status's VmData.
+class MemorySnapshotEntry(BaseModel):
+    """One allocation site in the tracemalloc snapshot."""
+
+    source: str
+    size_kb: float
+    count: int
+
+
+class MemorySnapshot(BaseModel):
+    """tracemalloc snapshot summary + top allocators."""
+
+    enabled: bool
+    total_traced_kb: float
+    top: list[MemorySnapshotEntry]
+
+
+@router.get("/memory-snapshot", response_model=MemorySnapshot)
+async def memory_snapshot(limit: int = 20) -> MemorySnapshot:
+    """Return the top-N tracemalloc allocators by current size.
+
+    Requires OPENMARQUEE_MEMORY_TRACE=1 at process start — app.py's
+    lifespan starts tracemalloc early so this snapshot covers
+    startup allocations. Otherwise 503.
+
+    `limit` is the row count cap; default 20, max 200 to keep
+    responses bounded if QA forgets a small value mid-debug.
+    """
+    import tracemalloc
+
+    if not tracemalloc.is_tracing():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "memory_trace_disabled",
+                "hint": "set OPENMARQUEE_MEMORY_TRACE=1 in the systemd drop-in "
+                "and restart the backend; tracemalloc starts in lifespan",
+            },
+        )
+
+    capped_limit = max(1, min(int(limit), 200))
+    snapshot = tracemalloc.take_snapshot()
+    # Group by source file:lineno so QA sees one row per source
+    # site (default tracemalloc grouping). Top-N by current size.
+    stats = snapshot.statistics("lineno")[:capped_limit]
+
+    total_bytes = sum(s.size for s in snapshot.statistics("filename"))
+    return MemorySnapshot(
+        enabled=True,
+        total_traced_kb=total_bytes / 1024.0,
+        top=[
+            MemorySnapshotEntry(
+                source=str(stat.traceback),
+                size_kb=stat.size / 1024.0,
+                count=stat.count,
+            )
+            for stat in stats
+        ],
+    )

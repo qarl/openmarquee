@@ -34,11 +34,28 @@ from datetime import UTC, datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
-from aiortc import RTCPeerConnection, RTCSessionDescription
 from pydantic import BaseModel
 
+# LEVER 2 lazy-imports (2026-06-24): aiortc + its transitive deps
+# (aioice, pylibsrtp, av/ffmpeg) plus PIL (via stream_source) sum to
+# ~10-20 MB of RSS that previously loaded at backend startup just to
+# satisfy these module-level imports. Live takeover is operator-
+# triggered, so on a prod device (DISABLE_DEV=1 + no Live use) those
+# bytes paid no rent.
+#
+# We use PEP 562 module-level `__getattr__` (see bottom of file) to
+# lazy-resolve the heavy symbols on FIRST access AT MODULE LEVEL.
+# That preserves test seams (every test patches
+# `openmarquee.live.RTCPeerConnection`) — on first patch lookup the
+# attr is resolved + cached; subsequent accesses go straight to the
+# module dict. start_webrtc() / start_stream() reference the
+# names as bare globals, so they pick up either the lazy-resolved
+# real class OR a mock injected by tests, transparently.
+#
+# Module-load-time symbols (LiveAlreadyActive, LiveNotActive, LiveManager,
+# LiveStartBody, LiveSession) stay top-level for api_live.py's import.
+
 from openmarquee.playback import PlaybackLoop
-from openmarquee.stream_source import FfmpegStreamSource, WebRtcStreamSource
 
 log = logging.getLogger(__name__)
 
@@ -216,6 +233,18 @@ class LiveSession:
         for v1 per §5.11). The caller hands this back to the phone in the
         same /api/live/start response.
         """
+        # LEVER 2 lazy-imports (2026-06-24): pull the lazy module
+        # attrs in as locals. The module-attribute access triggers
+        # __getattr__ (PEP 562) on first call, lazy-loading
+        # aiortc + stream_source (~10-20 MB RSS) only on the first
+        # WebRTC takeover. Tests patch `openmarquee.live.RTC...`
+        # directly in the module dict; that mock wins because the
+        # dict is checked before __getattr__.
+        import openmarquee.live as _self
+        RTCPeerConnection = _self.RTCPeerConnection
+        RTCSessionDescription = _self.RTCSessionDescription
+        WebRtcStreamSource = _self.WebRtcStreamSource
+
         self._pc = RTCPeerConnection()
         source = WebRtcStreamSource(self._playback.renderer)
         self._source = source
@@ -307,6 +336,13 @@ class LiveSession:
         catch-all, which returns a 400 — so the operator-takeover
         path is covered without a separate check here.
         """
+        # LEVER 2 lazy-imports (2026-06-24): resolve FfmpegStreamSource
+        # via module attribute access — see the __getattr__ at the
+        # bottom of the file. Tests can patch
+        # openmarquee.live.FfmpegStreamSource and the mock wins.
+        import openmarquee.live as _self
+        FfmpegStreamSource = _self.FfmpegStreamSource
+
         self._source = FfmpegStreamSource(self._playback.renderer, stream_url)
         await self._playback.pause()
         self._pump_task = asyncio.create_task(self._pump())
@@ -713,3 +749,42 @@ class LiveManager:
             await self._session.close()
         finally:
             self._session = None
+
+
+# LEVER 2 lazy-imports (2026-06-24): PEP 562 module-level __getattr__.
+#
+# Lazy-resolves the heavy WebRTC / stream symbols on FIRST module-
+# attribute access. Caches the resolved value in `globals()` so
+# subsequent accesses go straight to the module dict (no second
+# __getattr__ call). Tests that `patch("openmarquee.live.RTC...")`
+# write into the module dict directly, which Python checks BEFORE
+# falling through to __getattr__ — so a patched mock wins over the
+# lazy resolver, and the original on patch exit is restored.
+#
+# Import cost (per the dispatch):
+#   - aiortc + aioice + pylibsrtp + av/ffmpeg ≈ ~10-15 MB RSS
+#   - Pillow (via stream_source) ≈ ~5-8 MB RSS
+#
+# Both shifts to the first /api/live/start call instead of every
+# backend boot. Prod devices that never go live save the entire cost.
+_LAZY_NAMES = {
+    "RTCPeerConnection",
+    "RTCSessionDescription",
+    "WebRtcStreamSource",
+    "FfmpegStreamSource",
+}
+
+
+def __getattr__(name: str):
+    if name not in _LAZY_NAMES:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if name in ("RTCPeerConnection", "RTCSessionDescription"):
+        import aiortc
+
+        value = getattr(aiortc, name)
+    else:
+        import openmarquee.stream_source as _stream_source
+
+        value = getattr(_stream_source, name)
+    globals()[name] = value
+    return value

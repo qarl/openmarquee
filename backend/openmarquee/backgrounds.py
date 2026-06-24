@@ -34,7 +34,13 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import httpx
-from PIL import Image
+
+# LEVER 2 lazy-imports (2026-06-24): PIL is only referenced inside
+# downscale_to_panel below — an admin-side path that runs once per
+# AI-generated background. Deferring keeps Pillow (~5-8 MB RSS) out
+# of the import chain that fires when this module's public API
+# (PROVIDERS / BackgroundGenError / resolve_provider) is pulled in
+# at backend startup.
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +130,11 @@ def downscale_to_panel(image_bytes: bytes, width: int, height: int) -> bytes:
     so the shipped asset matches how any other ImageSlide would be scaled
     client-side before upload.
     """
+    # LEVER 2 lazy-imports (2026-06-24): defer PIL to the first
+    # background download. Keeps Pillow out of process RSS on prod
+    # devices that never use AI background generation.
+    from PIL import Image
+
     src = Image.open(io.BytesIO(image_bytes))
     src.load()
     canvas = Image.new("RGB", (width, height), (0, 0, 0))
