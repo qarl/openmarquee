@@ -2331,10 +2331,50 @@ where
             let req: IpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(e) => {
+                    // Text-paint zero-frames probe (2026-06-24): log
+                    // every JSON parse failure with a truncated body
+                    // so QA can see if backend is somehow sending a
+                    // malformed BeginSlide for text-only items.
+                    let preview = if line.len() > 200 {
+                        format!("{}...({} bytes total)", &line[..200], line.len())
+                    } else {
+                        line.clone()
+                    };
+                    eprintln!(
+                        "[text-paint-probe] ipc_parse_err err={} preview={:?}",
+                        e, preview,
+                    );
                     emit_response(stdout, &err(format!("invalid request: {e}")))?;
                     continue;
                 }
             };
+            // Text-paint zero-frames probe (2026-06-24): log EVERY
+            // IPC request the renderer receives, with kind +
+            // slide_id (when applicable). Lets QA distinguish:
+            //   - backend never sends BeginSlide  → no probe line for BeginSlide
+            //   - backend sends BeginSlide but renderer rejects → probe present + Err response
+            //   - backend sends Advance without BeginSlide → probe shows Advance only
+            // Cheap (one eprintln per IPC); gates behind no env
+            // (this is a diagnostic build, expected to be replaced
+            // by the fix once root cause is identified).
+            let req_kind = match &req {
+                IpcRequest::Open(_) => "Open".to_string(),
+                IpcRequest::BeginSlide(p) => format!("BeginSlide slide_id={}", p.slide_id),
+                IpcRequest::PreloadSlide(p) => format!("PreloadSlide slide_id={}", p.slide_id),
+                IpcRequest::Advance(p) => format!("Advance t_ms={}", p.t_ms),
+                IpcRequest::BeginTransition(p) => format!(
+                    "BeginTransition to={} kind={}",
+                    p.to_slide_id, p.kind,
+                ),
+                IpcRequest::Capture(_) => "Capture".to_string(),
+                IpcRequest::Reconfigure(_) => "Reconfigure".to_string(),
+                IpcRequest::BeginExternalFrames(_) => "BeginExternalFrames".to_string(),
+                IpcRequest::ProfileStart(_) => "ProfileStart".to_string(),
+                IpcRequest::ProfileDump => "ProfileDump".to_string(),
+                IpcRequest::Close => "Close".to_string(),
+            };
+            eprintln!("[text-paint-probe] ipc_request {}", req_kind);
+
             let is_close = matches!(req, IpcRequest::Close);
             let is_begin_slide = matches!(req, IpcRequest::BeginSlide(_));
 
@@ -2951,14 +2991,34 @@ fn run_paint_hook(
                         "paint_dispatch",
                         t_dispatch.elapsed().as_nanos() as u64,
                     );
-                    if let Err(e) = hdmi::paint_and_present_one_frame_for_slide(
+                    // Text-paint zero-frames probe (2026-06-24).
+                    eprintln!(
+                        "[text-paint-probe] paint_text_entry slide_id={} \
+                         t_in_slide_ms={} layers={} bg={}",
+                        slide_id, t_in_slide_ms,
+                        slide.text_layers.len(),
+                        slide.background_color,
+                    );
+                    let t_paint_text = std::time::Instant::now();
+                    let paint_result = hdmi::paint_and_present_one_frame_for_slide(
                         session,
                         card,
                         slide,
                         fonts,
                         content_root,
                         t_in_slide_ms,
-                    ) {
+                    );
+                    eprintln!(
+                        "[text-paint-probe] paint_text_exit slide_id={} \
+                         elapsed_us={} outcome={}",
+                        slide_id,
+                        t_paint_text.elapsed().as_micros(),
+                        match &paint_result {
+                            Ok(_) => "ok".to_string(),
+                            Err(e) => format!("err({:#})", e),
+                        },
+                    );
+                    if let Err(e) = paint_result {
                         return err(format!("paint_slide failed: {e:#}"));
                     }
                     IpcResponse::Ok {
@@ -3760,10 +3820,32 @@ fn handle_inner_request(
             // landed); a large us (~70-270 ms range) means cold
             // load (pre-warm missed or wasn't sent).
             let t_load = std::time::Instant::now();
-            if let Err(e) = cache.load(content_root, p.slide_id) {
+            let load_result = cache.load(content_root, p.slide_id);
+            let load_us = t_load.elapsed().as_micros();
+            // Text-paint zero-frames probe (2026-06-24): log the
+            // resolved item kind + load outcome so QA can see what
+            // the renderer thinks this slide is (a backend-side
+            // skip of pure-text slides would never reach here; a
+            // renderer-side cache.load reject for text would show
+            // outcome=err).
+            let resolved_kind = match cache.items.peek(&p.slide_id) {
+                Some(ContentItem::Text(_)) => "text",
+                Some(ContentItem::Image(_)) => "image",
+                Some(ContentItem::Video(_)) => "video",
+                None => "not_in_cache",
+            };
+            eprintln!(
+                "[text-paint-probe] begin_slide_load_result slide_id={} \
+                 kind={} load_us={} outcome={}",
+                p.slide_id, resolved_kind, load_us,
+                match &load_result {
+                    Ok(_) => "ok".to_string(),
+                    Err(e) => format!("err({:#})", e),
+                },
+            );
+            if let Err(e) = load_result {
                 return err(format!("begin_slide load failed: {e:#}"));
             }
-            let load_us = t_load.elapsed().as_micros();
             eprintln!(
                 "[perf] begin_slide_load slide_id={} load_us={}",
                 p.slide_id, load_us,
