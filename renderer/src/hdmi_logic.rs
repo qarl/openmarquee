@@ -5304,6 +5304,65 @@ pub fn glyph_prewarm_drain_complete(
     completions_since_baseline >= requested && last_drained_count == 0
 }
 
+/// LEVER 1 (2026-06-24): active-reel-scoped glyph prewarm.
+///
+/// Pure scoping function — extracts the (font_stem, codepoint) set
+/// that the prewarm should enqueue from a list of text-slide
+/// (font_family, text) pairs. Pulled out of the fs-touching wrapper
+/// in hdmi.rs so the set-building logic stays host-testable.
+///
+/// `font_family_lookup` maps a TextLayer's `font_family` field
+/// (e.g. `Some("Anton")`) to an on-disk stem (e.g. `"anton"`) via
+/// the canonical `font_family_to_filename`. Layers without a
+/// `font_family` use the catalog default (the `default_stem`
+/// argument; mirrors hdmi.rs's runtime fallback).
+///
+/// Layers whose font isn't in the catalog get dropped silently
+/// (no prewarm — the runtime path will Tofu them; the prewarm
+/// is best-effort, not a contract).
+///
+/// Returns a sorted, deduplicated Vec<(stem, codepoint)>. Sorted
+/// so the enumeration order is stable across runs (helps log
+/// diffing during QA debug), and so a fixed-N truncation of a
+/// pathologically-large set deterministically picks the same
+/// truncation each boot.
+pub fn build_prewarm_scope_from_text_layers<'a, I>(
+    layers: I,
+    default_stem: &str,
+) -> Vec<(String, u32)>
+where
+    I: IntoIterator<Item = (Option<&'a str>, &'a str)>,
+{
+    use std::collections::HashSet;
+
+    let mut set: HashSet<(String, u32)> = HashSet::new();
+    for (font_family, text) in layers {
+        let stem = match font_family {
+            Some(name) => {
+                match font_family_to_filename(name) {
+                    Some(f) => f.trim_end_matches(".ttf").to_string(),
+                    None => continue, // unknown family → no prewarm; runtime tofus
+                }
+            }
+            None => default_stem.to_string(),
+        };
+        for ch in text.chars() {
+            // Codepoint can be anything Unicode; the renderer
+            // only successfully rasterizes what msdfgen + the
+            // font support, but enqueueing an unsupported one
+            // is harmless (worker returns Ok(None) → SlotState::
+            // FontMissing → never sampled). Keep the set
+            // permissive so wide-ranging text content still
+            // gets prewarmed for the BMP chars its font does
+            // support.
+            set.insert((stem.clone(), ch as u32));
+        }
+    }
+    let mut out: Vec<(String, u32)> = set.into_iter().collect();
+    out.sort();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11293,5 +11352,118 @@ mod tests {
         // Truly idle: nothing enqueued, nothing in flight. Return
         // immediately.
         assert!(glyph_prewarm_drain_complete(0, 0, 0));
+    }
+
+    // LEVER 1 (2026-06-24): active-reel-scoped prewarm scope-builder
+    // tests. Verify build_prewarm_scope_from_text_layers extracts
+    // unique (stem, codepoint) pairs across multiple TextLayers,
+    // routes unknown fonts to drop, and produces a stable sort.
+
+    #[test]
+    fn build_prewarm_scope_single_layer_extracts_codepoints() {
+        // One layer, one font, simple ASCII text → one pair per
+        // distinct codepoint, sorted by codepoint within the same
+        // stem.
+        let layers = vec![(Some("Anton"), "Hi!")];
+        let scope = build_prewarm_scope_from_text_layers(layers, "anton");
+        assert_eq!(
+            scope,
+            vec![
+                ("anton".to_string(), '!' as u32),  // 0x21
+                ("anton".to_string(), 'H' as u32),  // 0x48
+                ("anton".to_string(), 'i' as u32),  // 0x69
+            ]
+        );
+    }
+
+    #[test]
+    fn build_prewarm_scope_dedupes_repeated_codepoints() {
+        // "Hello" has two 'l's; the set must collapse them to one
+        // prewarm entry — the runtime atlas slot is per-codepoint,
+        // not per-occurrence.
+        let layers = vec![(Some("Anton"), "Hello")];
+        let scope = build_prewarm_scope_from_text_layers(layers, "anton");
+        // 'H' 'e' 'l' 'o' = 4 distinct codepoints.
+        assert_eq!(scope.len(), 4);
+        let codepoints: Vec<u32> = scope.iter().map(|(_, c)| *c).collect();
+        assert_eq!(codepoints, vec!['H' as u32, 'e' as u32, 'l' as u32, 'o' as u32]);
+    }
+
+    #[test]
+    fn build_prewarm_scope_dedupes_across_layers_same_font() {
+        // Two layers, same font — codepoints union, not duplicate.
+        let layers = vec![
+            (Some("Anton"), "ABC"),
+            (Some("Anton"), "BCD"),
+        ];
+        let scope = build_prewarm_scope_from_text_layers(layers, "anton");
+        // Union {A, B, C, D} = 4 entries; both layers picked anton.
+        assert_eq!(scope.len(), 4);
+        assert!(scope.iter().all(|(stem, _)| stem == "anton"));
+    }
+
+    #[test]
+    fn build_prewarm_scope_two_fonts_keeps_both_distinct() {
+        // Different fonts → different stems → both prewarmed
+        // independently. 'A' appears for BOTH stems = 2 entries.
+        let layers = vec![
+            (Some("Anton"), "A"),
+            (Some("VT323"), "A"),
+        ];
+        let scope = build_prewarm_scope_from_text_layers(layers, "anton");
+        assert_eq!(scope.len(), 2);
+        let stems: Vec<&str> = scope.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(stems.contains(&"anton"));
+        assert!(stems.contains(&"vt323"));
+    }
+
+    #[test]
+    fn build_prewarm_scope_unknown_font_silently_drops() {
+        // A font name with no on-disk mapping (operator typo /
+        // legacy reel referencing a font we removed) should NOT
+        // crash and NOT poison the rest of the scope. The runtime
+        // path tofus those codepoints anyway; the prewarm just
+        // doesn't pay rent for them.
+        let layers = vec![
+            (Some("Anton"), "A"),
+            (Some("ThisFontDoesNotExist"), "ZZZZ"),
+            (Some("VT323"), "B"),
+        ];
+        let scope = build_prewarm_scope_from_text_layers(layers, "anton");
+        assert_eq!(scope.len(), 2); // Anton:A + VT323:B; Z dropped
+        assert!(!scope.iter().any(|(_, c)| *c == 'Z' as u32));
+    }
+
+    #[test]
+    fn build_prewarm_scope_missing_font_family_uses_default() {
+        // TextLayer.font_family is Optional — None means "use the
+        // catalog default". Mirrors hdmi.rs's runtime fallback.
+        let layers = vec![(None, "X")];
+        let scope = build_prewarm_scope_from_text_layers(layers, "anton");
+        assert_eq!(scope, vec![("anton".to_string(), 'X' as u32)]);
+    }
+
+    #[test]
+    fn build_prewarm_scope_empty_text_yields_empty_scope() {
+        // A layer with no text content adds nothing.
+        let layers = vec![(Some("Anton"), "")];
+        let scope = build_prewarm_scope_from_text_layers(layers, "anton");
+        assert!(scope.is_empty());
+    }
+
+    #[test]
+    fn build_prewarm_scope_is_sorted_deterministically() {
+        // Sort order = (stem ascending, codepoint ascending) so
+        // log diffs across runs stay stable.
+        let layers = vec![(Some("VT323"), "B"), (Some("Anton"), "Z"), (Some("Anton"), "A")];
+        let scope = build_prewarm_scope_from_text_layers(layers, "anton");
+        assert_eq!(
+            scope,
+            vec![
+                ("anton".to_string(), 'A' as u32),
+                ("anton".to_string(), 'Z' as u32),
+                ("vt323".to_string(), 'B' as u32),
+            ]
+        );
     }
 }
