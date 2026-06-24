@@ -15,7 +15,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from fastapi.responses import FileResponse
-from PIL import Image, UnidentifiedImageError
+
+# LEVER 2 lazy-imports (2026-06-24): Pillow (~5-8 MB RSS) is only
+# referenced inside the two _decode_*_payload helpers below. Both
+# are on the admin-upload path, not the per-tick playback path, so
+# the cost belongs at first-upload not at module import.
 from pydantic import BaseModel, Field, ValidationError
 
 from openmarquee.content import (
@@ -176,6 +180,11 @@ def _decode_image_payload(b64: str) -> bytes:
     except ValueError as exc:
         # 11.2: don't reflect exception string into response.
         raise HTTPException(status_code=400, detail="image_base64 is not valid base64") from exc
+    # LEVER 2 lazy-imports (2026-06-24): defer Pillow. Image upload is
+    # admin-only + bursty; no rent paid for the steady-state playback
+    # loop that never hits this code path.
+    from PIL import Image, UnidentifiedImageError
+
     try:
         # 11.1 / sweep #5 #5: use .load() not .verify() at the upload
         # boundary. verify() only walks structural metadata; load()
@@ -227,6 +236,10 @@ def _decode_png_payload(b64: str) -> bytes:
     except ValueError as exc:  # binascii.Error subclasses ValueError
         # 11.2: don't reflect exception string into response.
         raise HTTPException(status_code=400, detail="png_base64 is not valid base64") from exc
+
+    # LEVER 2 lazy-imports (2026-06-24): defer Pillow. PNG upload is
+    # admin-only; same rationale as _decode_image_payload above.
+    from PIL import Image, UnidentifiedImageError
 
     try:
         # 11.1 / sweep #5 #5: .load() not .verify() -- runs the
