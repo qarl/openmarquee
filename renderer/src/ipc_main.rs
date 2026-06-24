@@ -542,6 +542,96 @@ impl IpcPaintMetrics {
 /// resident even when intermittent BeginSlides bring in cold ones.
 const SLIDE_CACHE_CAP: usize = 32;
 
+/// CMA #3 (2026-06-22): mode flag for `SlideCache::load_with_mode`.
+///
+/// Full = open Mp4Demuxer + insert to items/video_demuxers AND
+/// synchronously prime the V4L2 decoder. The pre-CMA-#3
+/// behavior; default for ALL load callers EXCEPT
+/// ensure_bg_video_for_text_slide.
+///
+/// DemuxerOnly = open Mp4Demuxer + insert to items/video_demuxers
+/// but DEFER the ~200-600 ms V4L2 prime to first paint. The
+/// text-over-video paint dispatch detects the missing decoder
+/// + lazy-primes via prime_video_decoder. Frees CMA for slides
+/// that load+evict without painting (rapid playlist changes,
+/// preload-then-skip flows). Used only by
+/// ensure_bg_video_for_text_slide; the eager async preload
+/// (preload_in_worker) still primes upfront because the
+/// worker is off the IPC main thread + has no time pressure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoadMode {
+    Full,
+    DemuxerOnly,
+}
+
+/// CMA #2 (2026-06-21): bounded LRU capacity for video_decoders +
+/// video_demuxers. Per QA's leads file (project_cma_decoder_arc):
+/// each primed V4L2 decoder holds ~16-25 MB CMA (4+4 buffers at
+/// 1080p NV12); a 7-slide cycle on a 320 MB Pi Zero 2 W watched
+/// cma_used grow 221->250 MB across BeginSlides because the
+/// previous HashMap was unbounded + the only release path was
+/// `evict_other_video_state`'s per-BeginSlide keep_ids retain,
+/// which let older unique videos' decoders persist until their
+/// id rolled out of the keep set.
+///
+/// Cap = 3 enforces a strict ceiling: 1 currently-painting slide
+/// + 1 transition partner + 1 preload lookahead = the max
+/// concurrent decoder set the runtime ever legitimately needs.
+/// An LRU insert past cap drops the least-recently-used decoder
+/// explicitly via the InsertOutcome.evicted_lru handoff —
+/// VideoDecoderState's Drop closes /dev/video10 + releases CAPTURE/
+/// OUTPUT buffer pools, freeing the CMA pages back to the kernel.
+///
+/// The companion video_demuxers map shares the same cap so the
+/// (decoder, demuxer) pair lifetimes stay in lock-step (decoder
+/// without demuxer is dead state; demuxer without decoder is
+/// harmless but wasteful File handle).
+/// CMA R2-RANK4 (2026-06-22): default reduced 3 -> 2. The CMA #2
+/// rationale ("1 currently-painting + 1 transition partner + 1
+/// preload lookahead = 3") was an upper bound; in practice r97
+/// codec-contention defer-preload keeps the 3rd slot empty
+/// during transitions anyway, so cap=2 reclaims ~11MB CMA on
+/// steady-state single-video reels (the idle 3rd LRU slot was
+/// pinning a recently-evicted decoder until it was finally
+/// flushed by a 3rd-distinct-id insert).
+///
+/// Env override `OPENMARQUEE_VIDEO_DECODER_CACHE_CAP=3` returns
+/// to the pre-RANK4 default for QA A/B (single-video vs
+/// multi-video-preload reels). Clamped to [2, 4] to keep the
+/// architectural invariants (>=2 so v2v fades always fit;
+/// <=4 to bound the CMA worst-case). Read once at SlideCache::
+/// new() so the cap is stable for the SlideCache's lifetime.
+const VIDEO_DECODER_CACHE_CAP_DEFAULT: usize = 2;
+
+fn resolve_video_decoder_cache_cap() -> usize {
+    match std::env::var("OPENMARQUEE_VIDEO_DECODER_CACHE_CAP").ok() {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) if (2..=4).contains(&n) => {
+                eprintln!(
+                    "[perf] video_decoder_cache_cap_override raw={} resolved={}",
+                    raw, n,
+                );
+                n
+            }
+            Ok(n) => {
+                eprintln!(
+                    "warn: OPENMARQUEE_VIDEO_DECODER_CACHE_CAP={} out of range [2,4]; using default {}",
+                    n, VIDEO_DECODER_CACHE_CAP_DEFAULT,
+                );
+                VIDEO_DECODER_CACHE_CAP_DEFAULT
+            }
+            Err(e) => {
+                eprintln!(
+                    "warn: OPENMARQUEE_VIDEO_DECODER_CACHE_CAP={:?} parse err={}; using default {}",
+                    raw, e, VIDEO_DECODER_CACHE_CAP_DEFAULT,
+                );
+                VIDEO_DECODER_CACHE_CAP_DEFAULT
+            }
+        },
+        None => VIDEO_DECODER_CACHE_CAP_DEFAULT,
+    }
+}
+
 struct SlideCache {
     items: LruMap<uuid::Uuid, ContentItem>,
     /// Bug 1 (qarl 2026-05-16): item.json mtime per cached slide.
@@ -551,7 +641,14 @@ struct SlideCache {
     /// forever. Stamping the on-disk mtime here lets `load` detect drift
     /// and evict before the cached copy is reused.
     item_mtimes: LruMap<uuid::Uuid, std::time::SystemTime>,
-    video_demuxers: std::collections::HashMap<uuid::Uuid, Mp4Demuxer>,
+    /// CMA #2 (2026-06-21): bounded LRU (cap resolved at
+    /// SlideCache::new() via resolve_video_decoder_cache_cap;
+    /// default VIDEO_DECODER_CACHE_CAP_DEFAULT=2 post-R2-RANK4)
+    /// so demuxer entries don't accumulate across an N-slide reel.
+    /// Each Mp4Demuxer holds a File handle (no big buffer post-CMA-#1)
+    /// so the bound is mostly about closing fds + keeping memory
+    /// in lockstep with the video_decoders LRU.
+    video_demuxers: LruMap<uuid::Uuid, Mp4Demuxer>,
     /// Bug 8 / Fix A (2026-05-17): video slide ids whose cache.load
     /// could NOT register a demuxer (multi-trak MP4, malformed file,
     /// missing asset, etc.). Subsequent BeginSlide/BeginTransition
@@ -567,14 +664,21 @@ struct SlideCache {
     /// cache.load primes the decoder once on first encounter; piece
     /// 3d's paint_slide drains frames per advance tick.
     ///
-    /// TODO(piece 4+): release decoder on cache eviction. Each
-    /// primed decoder holds ~5 MB at 320x240 / ~20-25 MB at 1080p
-    /// (4+4 buffers × per-plane size). On a 512 MB Pi Zero 2 W
-    /// a ~10-slide playlist hits ~250 MB just for decoder buffers.
-    /// LRU eviction (or reactive release on slide-leave) needed
-    /// before production at scale.
+    /// CMA #2 (2026-06-21): bounded LRU; cap resolved via
+    /// resolve_video_decoder_cache_cap (default 2 post-R2-RANK4,
+    /// was 3 pre-RANK4; env override
+    /// OPENMARQUEE_VIDEO_DECODER_CACHE_CAP=N clamps to [2,4]).
+    /// Closes the original TODO ("release decoder on cache eviction").
+    /// Each primed decoder holds ~16-25 MB CMA at 1080p (4+4 buffers
+    /// × per-plane size); QA measured cma_used growing 221->250 MB
+    /// across a 7-slide reel because the previous HashMap was
+    /// unbounded + evict_other_video_state's keep_ids-only retain
+    /// let older unique videos' decoders persist. LRU insert past
+    /// cap drops the least-recently-used decoder explicitly via the
+    /// InsertOutcome handoff; VideoDecoderState's Drop closes
+    /// /dev/video10 + releases the CAPTURE/OUTPUT pools, freeing CMA.
     #[cfg(target_os = "linux")]
-    video_decoders: std::collections::HashMap<uuid::Uuid, VideoDecoderState>,
+    video_decoders: LruMap<uuid::Uuid, VideoDecoderState>,
     /// r65 (2026-06-05): in-flight async preload thread handles
     /// keyed by the slide_id the worker is priming. Populated by
     /// the PreloadSlide IPC handler, drained by
@@ -657,13 +761,18 @@ type PreloadResult = anyhow::Result<PreloadArtifacts>;
 
 impl SlideCache {
     fn new() -> Self {
+        // CMA R2-RANK4 (2026-06-22): resolve cap once at
+        // construction so both LruMaps stay in lock-step (decoder
+        // + demuxer pair lifetimes) and the env override (if any)
+        // is read exactly once. Default 2; clamp [2,4].
+        let video_cache_cap = resolve_video_decoder_cache_cap();
         Self {
             items: LruMap::with_capacity(SLIDE_CACHE_CAP),
             item_mtimes: LruMap::with_capacity(SLIDE_CACHE_CAP),
-            video_demuxers: std::collections::HashMap::new(),
+            video_demuxers: LruMap::with_capacity(video_cache_cap),
             video_skip: std::collections::HashSet::new(),
             #[cfg(target_os = "linux")]
-            video_decoders: std::collections::HashMap::new(),
+            video_decoders: LruMap::with_capacity(video_cache_cap),
             pending_preloads: std::collections::HashMap::new(),
             #[cfg(target_os = "linux")]
             pending_recreates: std::collections::HashMap::new(),
@@ -827,10 +936,22 @@ impl SlideCache {
             );
             return Ok(());
         }
-        if let Err(e) = self.load(content_root, bg_id) {
+        // CMA #3 (2026-06-22): DemuxerOnly mode skips the
+        // synchronous ~200-600 ms V4L2 prime. The bg-video's
+        // decoder is lazy-primed on first paint via the
+        // lazy_prime_bg_video path in the text-over-video
+        // paint dispatch. This frees CMA for slides that
+        // load+evict without ever painting (rapid playlist
+        // changes). The eager preload path is UNCHANGED --
+        // preload_in_worker still primes the bg-video off
+        // the main thread; this only affects the synchronous
+        // BeginSlide fallback when preload didn't fire (or
+        // the decoder got LRU-evicted between preload and
+        // first paint).
+        if let Err(e) = self.load_with_mode(content_root, bg_id, LoadMode::DemuxerOnly) {
             // Best-effort: log + carry on. The paint path will
-            // detect the missing demuxer/decoder + skip the video
-            // bake step (last frame stays on screen).
+            // detect the missing demuxer + skip the video bake
+            // step (last frame stays on screen).
             eprintln!(
                 "ipc: warning -- text slide {} references bg video {} but load failed: {:#}",
                 item_id, bg_id, e
@@ -850,7 +971,29 @@ impl SlideCache {
     /// without an entry; downstream paint paths fall back via
     /// the existing UnsupportedSlide wire (Python:
     /// `RustRendererUnsupportedSlideError`).
+    ///
+    /// CMA #3 (2026-06-22): delegates to load_with_mode with
+    /// LoadMode::Full. The DemuxerOnly variant skips the
+    /// synchronous ~200-600 ms V4L2 prime; called from
+    /// ensure_bg_video_for_text_slide where the bg-video decoder
+    /// can be lazy-primed on first paint instead of eagerly at
+    /// BeginSlide. This frees CMA for slides that load+evict
+    /// without ever painting (rapid playlist changes, etc.).
     fn load(&mut self, content_root: &std::path::Path, item_id: uuid::Uuid) -> Result<()> {
+        self.load_with_mode(content_root, item_id, LoadMode::Full)
+    }
+
+    /// CMA #3 (2026-06-22): mode-aware variant of `load`. See
+    /// `LoadMode` for the rationale + per-mode semantics. The
+    /// body is the pre-CMA-#3 `load` impl, with the V4L2 prime
+    /// call gated by `matches!(mode, LoadMode::Full)`.
+    fn load_with_mode(
+        &mut self,
+        content_root: &std::path::Path,
+        item_id: uuid::Uuid,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+        mode: LoadMode,
+    ) -> Result<()> {
         // r110 c3.3.2 second-pass subagent BLOCKER-3 fix: if an
         // async recreate worker is in flight for this id, do NOT
         // synchronously re-prime here. Without this guard,
@@ -993,7 +1136,7 @@ impl SlideCache {
                     let mp4_open_us = t_mp4_open.elapsed().as_micros();
                     eprintln!(
                         "ipc: opened MP4 for video slide {} ({}x{}, {} samples)",
-                        item_id, dem.width, dem.height, dem.samples.len()
+                        item_id, dem.width, dem.height, dem.sample_count()
                     );
                     // V4L2 piece 3c: on Linux, also prime the
                     // hardware decoder. Failure is best-effort
@@ -1010,8 +1153,20 @@ impl SlideCache {
                     // Pi-side data, so a separate (smaller) [perf]
                     // line on macOS isn't worth it -- we just skip
                     // emission there.
+                    // CMA #3 (2026-06-22): DemuxerOnly mode skips
+                    // the synchronous V4L2 prime entirely. Lazy
+                    // prime fires on first paint via the text-over-
+                    // video paint dispatch path. prime_us is 0 in
+                    // this mode (probe still emits so QA can A/B
+                    // count deferred-prime slides vs eager).
                     #[cfg(target_os = "linux")]
-                    let prime_us = {
+                    let prime_us = if matches!(mode, LoadMode::DemuxerOnly) {
+                        eprintln!(
+                            "[perf] load_demuxer_only slide_id={} reason=cma_3_lazy_bg_prime",
+                            item_id,
+                        );
+                        0u128
+                    } else {
                         let t_prime = std::time::Instant::now();
                         // r75 subagent BLOCKER-2: snapshot BEFORE the
                         // prime call. The error-path log emits both
@@ -1301,6 +1456,14 @@ fn preload_in_worker(
 /// leak in pending_preloads forever. Called opportunistically
 /// from the BeginSlide and BeginTransition handlers (which run
 /// at most once every few seconds), so the walk cost is amortized.
+///
+/// CMA R2-RANK2 (2026-06-22): blocking variant; reduced max_age
+/// 10s -> 5s at call sites (keep >= 3s so a slow legitimate prime
+/// isn't reaped early). Paired with the new non-blocking
+/// `drain_finished_preloads_nonblocking` that fires per IPC main
+/// loop iteration to catch quickly-finished orphans without
+/// waiting for the next BeginSlide. ~13MB CMA win on a paused
+/// playlist with a held 1080p preload.
 fn drain_stale_preloads(
     cache: &mut SlideCache,
     max_age: std::time::Duration,
@@ -1335,6 +1498,63 @@ fn drain_stale_preloads(
                 ),
                 Err(_) => eprintln!(
                     "[perf] preload_stale_drained slide_id={} age_ms={} thread_panicked",
+                    id,
+                    age.as_millis(),
+                ),
+            }
+        }
+    }
+}
+
+/// CMA R2-RANK2 (2026-06-22): non-blocking sibling of
+/// `drain_stale_preloads`. Walks pending_preloads + joins ONLY
+/// the handles whose worker thread has already finished
+/// (JoinHandle::is_finished -> join is guaranteed not to block).
+/// Handles that haven't finished yet are LEFT IN PLACE; the
+/// existing blocking drain_stale_preloads at BeginSlide
+/// (max_age=5s post-RANK2) catches anything that lingers past
+/// the worker's expected lifetime.
+///
+/// Called from the IPC main loop's opportunistic poll site
+/// every iteration. Cost: ~one is_finished check per pending
+/// preload (typically <=2 entries; cap is 2 per
+/// MAX_CONCURRENT_PRELOADS). Effectively free when the map is
+/// empty (most ticks).
+///
+/// The win: a successful preload whose BeginSlide never arrives
+/// (operator changed playlist) gets reaped within ONE IPC tick
+/// of the worker finishing, freeing the ~13MB CMA the primed
+/// 1080p decoder pins -- vs the pre-RANK2 worst-case of 10s
+/// (now 5s post-RANK2 max_age cut).
+fn drain_finished_preloads_nonblocking(cache: &mut SlideCache) {
+    let finished_ids: Vec<uuid::Uuid> = cache
+        .pending_preloads
+        .iter()
+        .filter(|(_, h)| h.thread.is_finished())
+        .map(|(id, _)| *id)
+        .collect();
+    if finished_ids.is_empty() {
+        return;
+    }
+    for id in finished_ids {
+        if let Some(handle) = cache.pending_preloads.remove(&id) {
+            let age = handle.enqueued_at.elapsed();
+            // join() here is guaranteed non-blocking because
+            // is_finished() returned true above.
+            match handle.thread.join() {
+                Ok(Ok(_)) => eprintln!(
+                    "[perf] preload_finished_drained_idle slide_id={} age_ms={}",
+                    id,
+                    age.as_millis(),
+                ),
+                Ok(Err(e)) => eprintln!(
+                    "[perf] preload_finished_drained_idle slide_id={} age_ms={} err={:#}",
+                    id,
+                    age.as_millis(),
+                    e,
+                ),
+                Err(_) => eprintln!(
+                    "[perf] preload_finished_drained_idle slide_id={} age_ms={} thread_panicked",
                     id,
                     age.as_millis(),
                 ),
@@ -1558,8 +1778,13 @@ fn format_mmal_leak_diagnostics_tail(
                 .collect();
             peer_ids.sort();
             let peer_count = peer_ids.len();
+            // CMA #2 (2026-06-21): .peek() is &self-compatible so
+            // the closure captures &SlideCache without conflict;
+            // .get() would require &mut and trigger E0596 +
+            // FnMut-escape errors. LRU touch is unnecessary for
+            // a diagnostic probe anyway.
             let peer_dims: Vec<String> = peer_ids.iter()
-                .filter_map(|id| c.video_decoders.get(id))
+                .filter_map(|id| c.video_decoders.peek(id))
                 .map(|d| format!("{}x{}", d.capture_w, d.capture_h))
                 .collect();
             (peer_count.to_string(), format!("[{}]", peer_dims.join(",")))
@@ -1911,6 +2136,41 @@ where
     use crate::hdmi;
     use crate::Card;
 
+    // FPS arc telemetry (2026-06-22): startup activation of the
+    // periodic phase dump. OPENMARQUEE_FPS_DUMP_FRAMES=N (default
+    // unset = no periodic dump). Records samples for N frames,
+    // emits `[perf] phase_periodic_dump window_frames=N | <phase>
+    // n=… p50=…us p99=…us max=…us | ...` to stderr, re-arms for
+    // another N-frame window. Continuous measurement without the
+    // on-demand --profile-frames capture/dump cycle.
+    //
+    // QA's FPS arc target phases: paint_bake_video_shader (Pass 1
+    // NV12->RGB) + paint_compose (Pass 2 brightness/gamma OR
+    // bright-fast blit post fix #1) — that's where the FPS spend
+    // lives per QA's profiling read. Other paint_* phases included
+    // for completeness; QA can grep the specific columns.
+    if let Ok(s) = std::env::var("OPENMARQUEE_FPS_DUMP_FRAMES") {
+        if let Ok(n) = s.parse::<u32>() {
+            if n > 0 {
+                crate::profile::enable_periodic(
+                    n,
+                    vec![
+                        "paint_bake_video_shader",
+                        "paint_compose",
+                        "paint_bake_video_dqbuf",
+                        "paint_present",
+                        "paint_dispatch",
+                        "ipc_paint_total",
+                    ],
+                );
+                eprintln!(
+                    "[perf] periodic_phase_dump_enabled every_n_frames={}",
+                    n,
+                );
+            }
+        }
+    }
+
     let card_path = match params.drm_card.as_deref() {
         Some(p) => Path::new(p).to_path_buf(),
         None => {
@@ -2005,6 +2265,29 @@ where
         // message and stays there.
         let mut line = String::with_capacity(2048);
         loop {
+            // Stability arc Layer 4 (2026-06-23): poll the
+            // SIGTERM/SIGINT flag at the top of each iteration.
+            // On first observed `true`, break out of the loop
+            // cleanly + fall through to main()'s normal exit.
+            // Drop chain (EglSession, SlideCache, all cached
+            // DecoderInners) then runs in declaration order →
+            // DecoderInner::Drop = stop_streaming_quiet's
+            // STREAMOFF on OUTPUT + CAPTURE → mapped_capture
+            // munmaps → capture_dmabuf_fds closes → File close
+            // of /dev/video10. Cumulatively: the codec is
+            // released cleanly so the NEXT renderer start can't
+            // EBUSY on open or EINVAL on REQBUFS due to stale
+            // kernel state.
+            //
+            // is_shutdown_requested() is a single atomic load
+            // (~1 ns); cheap to poll every iteration.
+            if crate::sigterm::is_shutdown_requested() {
+                eprintln!(
+                    "[stability] shutdown_requested at IPC loop head; \
+                     breaking + running Drop chain",
+                );
+                break;
+            }
             // r38d: drain a pending SIGUSR1 by emitting one
             // [cache-dump] line to stderr. take_pending() is a
             // single atomic swap (cheap, ~5 ns) -- safe to call
@@ -2018,6 +2301,16 @@ where
                     crate::image_slide_tex::IMAGE_SLIDE_TEX_CACHE_CAPACITY,
                 );
             }
+            // CMA R2-RANK2 (2026-06-22): opportunistic non-
+            // blocking preload reaper. Joins any pending preload
+            // whose worker has finished (is_finished returns
+            // true); leaves still-running workers untouched.
+            // Cost: 1 is_finished check per pending preload
+            // (typically 0-2 entries). Catches orphaned preloads
+            // within ~1 IPC tick of completion, freeing ~13MB
+            // CMA per primed 1080p decoder.
+            drain_finished_preloads_nonblocking(&mut cache);
+
             // Opportunistic settings poll. Cheap stat() call
             // per iteration; the watcher returns None when
             // mtime is unchanged.
@@ -2116,6 +2409,21 @@ where
                 continue;
             }
 
+            // Snapshot-side-A Commit 2 (2026-06-21): free any
+            // captured outgoing-video still on slide-boundary IPC
+            // ops. BeginSlide covers mid-fade operator cut +
+            // transition-end-to-new-slide setup; BeginTransition
+            // covers superseding a still-in-flight fade. Both fire
+            // BEFORE the standard handler runs the actual load /
+            // dispatch, so the next paint sees a clean slate.
+            // Idempotent (None.take() is a no-op).
+            if matches!(
+                &req,
+                IpcRequest::BeginSlide(_) | IpcRequest::BeginTransition(_)
+            ) {
+                crate::hdmi::free_transition_still_a_tex(session);
+            }
+
             let resp = handle_inner_request(req, &mut state, &mut cache, content_root);
 
             // Phase 9 Step 9a: tag the paint kind (if any) BEFORE
@@ -2165,6 +2473,15 @@ where
                 Some(content_root),
             );
 
+            // Snapshot-side-A Commit 2 (2026-06-21): capture the
+            // "was this a transition paint" bit before paint_kind
+            // is moved into the metrics destructure below. Used
+            // by the after-paint free hook AFTER the destructure.
+            let was_transition_paint = matches!(
+                paint_kind,
+                Some(IpcPaintKind::Transition),
+            );
+
             // Phase 9 Step 9a: record per-Advance paint timing on
             // successful paint. Skipping failures keeps avg/max from
             // being skewed by error-path early returns (which carry
@@ -2174,6 +2491,18 @@ where
                     let elapsed_us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
                     paint_metrics.record(kind, elapsed_us);
                 }
+            }
+
+            // Snapshot-side-A Commit 2 (2026-06-21): free the
+            // captured still on any non-Transition paint. This is
+            // the natural end-of-transition signal: state machine
+            // returns PaintSlide for the new current slide, which
+            // means the just-completed fade's still is no longer
+            // useful. Idempotent (None.take() is a no-op) so
+            // cheap on steady-state slide ticks where no still
+            // was ever captured.
+            if !was_transition_paint {
+                crate::hdmi::free_transition_still_a_tex(session);
             }
 
             emit_response(stdout, &resp)?;
@@ -2493,7 +2822,54 @@ fn run_paint_hook(
                         // through to the standard text paint path so
                         // the slide still renders (text on solid bg).
                         let dem_present = cache.video_demuxers.contains_key(&bg_id);
-                        let dec_present = cache.video_decoders.contains_key(&bg_id);
+                        let mut dec_present = cache.video_decoders.contains_key(&bg_id);
+                        // CMA #3 (2026-06-22): lazy-prime fallback.
+                        // ensure_bg_video_for_text_slide uses
+                        // LoadMode::DemuxerOnly, deferring the V4L2
+                        // prime to first paint. Detect dem-present-
+                        // but-dec-absent here + prime in place. This
+                        // is the FIRST PAINT of a text-over-video
+                        // slide whose bg-video wasn't already primed
+                        // by the async preload (or whose decoder got
+                        // LRU-evicted between preload and paint).
+                        // ~200-600 ms one-time cost on first paint;
+                        // subsequent paints cache-hit.
+                        //
+                        // Failures fall through to the existing
+                        // dec_present=false path (text-only paint),
+                        // preserving the best-effort contract.
+                        #[cfg(target_os = "linux")]
+                        if dem_present && !dec_present {
+                            // Borrow dem read-only first (cache.get
+                            // takes &mut self for the LRU touch);
+                            // dem is bg_id-keyed so the touch is
+                            // correct.
+                            if let Some(dem) = cache.video_demuxers.get(&bg_id) {
+                                let t_lazy = std::time::Instant::now();
+                                let prime_result = crate::video_decode::prime_video_decoder(
+                                    dem, "lazy_bg_prime",
+                                );
+                                let lazy_us = t_lazy.elapsed().as_micros();
+                                match prime_result {
+                                    Ok(dec_state) => {
+                                        cache.video_decoders.insert(bg_id, dec_state);
+                                        dec_present = true;
+                                        eprintln!(
+                                            "[perf] lazy_prime_bg_video slide_id={} bg_video_id={} \
+                                             lazy_us={} outcome=ok",
+                                            slide_id, bg_id, lazy_us,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[perf] lazy_prime_bg_video slide_id={} bg_video_id={} \
+                                             lazy_us={} outcome=err err={:#}",
+                                            slide_id, bg_id, lazy_us, e,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         if dem_present && dec_present {
                             let dem = cache.video_demuxers
                                 .get(&bg_id)
@@ -2522,7 +2898,7 @@ fn run_paint_hook(
                             // current_fbo's next_frame() returns Ok(None)
                             // forever; paint early-returns before
                             // swap+commit; FYS panel goes BLACK.
-                            if dec_state.next_sample_idx >= dem.samples.len() {
+                            if dec_state.next_sample_idx >= dem.sample_count() {
                                 if let Err(e) =
                                     crate::video_decode::reprime_video_decoder_for_loop(
                                         dec_state, dem,
@@ -2550,7 +2926,7 @@ fn run_paint_hook(
                                 fonts,
                                 content_root,
                                 t_in_slide_ms,
-                                &dem.samples,
+                                dem,
                                 &mut dec_state.next_sample_idx,
                                 &mut dec_state.frames_decoded,
                                 &dec_state.decoder,
@@ -2663,7 +3039,7 @@ fn run_paint_hook(
                     if let Err(e) = hdmi::paint_and_present_one_video_slide_frame(
                         session,
                         card,
-                        &dem.samples,
+                        dem,
                         &mut dec_state.next_sample_idx,
                         &mut dec_state.frames_decoded,
                         &dec_state.decoder,
@@ -2850,7 +3226,7 @@ fn run_paint_hook(
                 let dec = from_dec_state
                     .as_deref_mut()
                     .expect("from_dec_state set above for from_dec_id Some(_)");
-                if dec.next_sample_idx >= dem.samples.len() {
+                if dec.next_sample_idx >= dem.sample_count() {
                     if let Err(e) =
                         crate::video_decode::reprime_video_decoder_for_loop(dec, dem)
                     {
@@ -2870,7 +3246,7 @@ fn run_paint_hook(
                 let dec = to_dec_state
                     .as_deref_mut()
                     .expect("to_dec_state set above for to_dec_id Some(_)");
-                if dec.next_sample_idx >= dem.samples.len() {
+                if dec.next_sample_idx >= dem.sample_count() {
                     if let Err(e) =
                         crate::video_decode::reprime_video_decoder_for_loop(dec, dem)
                     {
@@ -2883,8 +3259,8 @@ fn run_paint_hook(
 
             // Build TransitionEndpoints. ContentItem refs come from a
             // shared borrow on cache.items (field-disjoint from the
-            // &mut video_decoders borrows above). Demuxer samples
-            // come from a shared borrow on cache.video_demuxers.
+            // video_decoders borrows above). Demuxer refs come from
+            // a shared borrow on cache.video_demuxers.
             //
             // Round-18: endpoint_a + endpoint_b both borrow from
             // cache.items simultaneously (held through the paint call
@@ -2897,6 +3273,13 @@ fn run_paint_hook(
             // touch) so they can coexist. Net semantic: from_id + to_id
             // each get a single LRU touch per paint frame -- same as
             // pre-r8 except now explicitly sequenced.
+            //
+            // CMA #2 (2026-06-21): video_demuxers + video_decoders
+            // now also LruMaps so the same dual-borrow pattern
+            // applies. The wrap-check above at lines 2843+ already
+            // did .get(&fid)/.get(&tid) which is the LRU touch;
+            // the endpoint construction below uses .peek() so
+            // endpoint_a + endpoint_b can coexist.
             cache.items.get(&from_id);
             cache.items.get(&to_id);
             let endpoint_a = match cache.items.peek(&from_id) {
@@ -2906,7 +3289,7 @@ fn run_paint_hook(
                         // = bg_id (the referenced VideoSlide), NOT
                         // the text slide id. Demuxer also keyed by
                         // bg_id.
-                        let demuxer = match cache.video_demuxers.get(&bg_id) {
+                        let demuxer = match cache.video_demuxers.peek(&bg_id) {
                             Some(d) => d,
                             None => return err(format!(
                                 "paint_transition: from text-over-video bg demuxer {bg_id} missing \
@@ -2918,7 +3301,7 @@ fn run_paint_hook(
                             .expect("from_dec_state set above for 'b' kind");
                         hdmi::TransitionEndpoint::TextOverVideo {
                             text_slide: s,
-                            bg_samples: demuxer.samples.as_slice(),
+                            bg_demuxer: demuxer,
                             bg_next_sample_idx: &mut dec_state.next_sample_idx,
                             bg_frames_decoded: &mut dec_state.frames_decoded,
                             bg_decoder: &dec_state.decoder,
@@ -2929,7 +3312,7 @@ fn run_paint_hook(
                 }
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
                 Some(ContentItem::Video(_)) => {
-                    let demuxer = match cache.video_demuxers.get(&from_id) {
+                    let demuxer = match cache.video_demuxers.peek(&from_id) {
                         Some(d) => d,
                         None => return err(format!(
                             "paint_transition: from video {from_id} demuxer missing",
@@ -2938,7 +3321,7 @@ fn run_paint_hook(
                     let dec_state =
                         from_dec_state.take().expect("from_dec_state set above for 'v' kind");
                     hdmi::TransitionEndpoint::Video {
-                        samples: demuxer.samples.as_slice(),
+                        demuxer,
                         next_sample_idx: &mut dec_state.next_sample_idx,
                         frames_decoded: &mut dec_state.frames_decoded,
                         decoder: &dec_state.decoder,
@@ -2949,7 +3332,7 @@ fn run_paint_hook(
             let endpoint_b = match cache.items.peek(&to_id) {
                 Some(ContentItem::Text(s)) => {
                     if let Some(bg_id) = s.background_video_slide_id {
-                        let demuxer = match cache.video_demuxers.get(&bg_id) {
+                        let demuxer = match cache.video_demuxers.peek(&bg_id) {
                             Some(d) => d,
                             None => return err(format!(
                                 "paint_transition: to text-over-video bg demuxer {bg_id} missing \
@@ -2961,7 +3344,7 @@ fn run_paint_hook(
                             .expect("to_dec_state set above for 'b' kind");
                         hdmi::TransitionEndpoint::TextOverVideo {
                             text_slide: s,
-                            bg_samples: demuxer.samples.as_slice(),
+                            bg_demuxer: demuxer,
                             bg_next_sample_idx: &mut dec_state.next_sample_idx,
                             bg_frames_decoded: &mut dec_state.frames_decoded,
                             bg_decoder: &dec_state.decoder,
@@ -2972,7 +3355,7 @@ fn run_paint_hook(
                 }
                 Some(ContentItem::Image(s)) => hdmi::TransitionEndpoint::Image(s),
                 Some(ContentItem::Video(_)) => {
-                    let demuxer = match cache.video_demuxers.get(&to_id) {
+                    let demuxer = match cache.video_demuxers.peek(&to_id) {
                         Some(d) => d,
                         None => return err(format!(
                             "paint_transition: to video {to_id} demuxer missing",
@@ -2981,7 +3364,7 @@ fn run_paint_hook(
                     let dec_state =
                         to_dec_state.take().expect("to_dec_state set above for 'v' kind");
                     hdmi::TransitionEndpoint::Video {
-                        samples: demuxer.samples.as_slice(),
+                        demuxer,
                         next_sample_idx: &mut dec_state.next_sample_idx,
                         frames_decoded: &mut dec_state.frames_decoded,
                         decoder: &dec_state.decoder,
@@ -3073,7 +3456,13 @@ fn handle_inner_request(
             // lead -- any handle older than 10 s reflects a
             // never-arriving BeginSlide. Walk is O(pending_preloads)
             // ≤ MAX_CONCURRENT_PRELOADS = 2.
-            drain_stale_preloads(cache, std::time::Duration::from_secs(10));
+            // CMA R2-RANK2 (2026-06-22): max_age 10s -> 5s.
+            // Tightens the blocking-drain envelope so a stale
+            // orphaned preload pins ~13MB CMA for at most 5s
+            // vs 10s. 5s is still well above the worst-case
+            // ~600ms prime time, so a slow legitimate prime
+            // won't be reaped early.
+            drain_stale_preloads(cache, std::time::Duration::from_secs(5));
             // r65 (2026-06-05): if an async preload for this
             // slide_id is still in flight, join it now + install
             // the artifacts BEFORE the existing eviction +
@@ -3224,6 +3613,13 @@ fn handle_inner_request(
             // present) — no synchronous re-prime cost.
             #[cfg(target_os = "linux")]
             {
+                // CMA R2-RANK1 (2026-06-22): global cap on
+                // concurrent c3.3.2 recreate workers. Mirrors
+                // MAX_CONCURRENT_PRELOADS (also =2, defined inline
+                // at the PreloadSlide handler ~line 3842). See the
+                // gate just below the contains_key dedup for the
+                // skip-at-cap log + the rationale comment.
+                const MAX_CONCURRENT_RECREATES: usize = 2;
                 let mut recreate_ids: Vec<uuid::Uuid> = Vec::with_capacity(2);
                 if pure_video_failed {
                     eprintln!(
@@ -3249,6 +3645,38 @@ fn handle_inner_request(
                         eprintln!(
                             "[perf] c3_3_2_recreate_skip_already_pending video_id={}",
                             video_id,
+                        );
+                        continue;
+                    }
+                    // CMA R2-RANK1 (2026-06-22): drain any finished
+                    // recreate workers FIRST so an idle slot is
+                    // available below if applicable. Mirrors the
+                    // drain-before-spawn pattern that pending_preloads
+                    // would use; try_drain_finished_recreates is
+                    // is_finished-gated + non-blocking (cheap when
+                    // nothing has finished).
+                    try_drain_finished_recreates(cache);
+                    // CMA R2-RANK1 (2026-06-22): global cap on
+                    // concurrent recreate workers. Pre-RANK1 this
+                    // map had NO capacity gate; a degenerate
+                    // sequence of distinct-id recreate spawns could
+                    // pin arbitrarily many ~5-13MB CMA decoders
+                    // in pending_recreates (one per in-flight
+                    // recreate, additive on top of the LRU-capped
+                    // video_decoders map). Cap=2 mirrors
+                    // MAX_CONCURRENT_PRELOADS: the natural ceiling
+                    // is 2 spawns per dispatch arm above (a pure-
+                    // video recreate + a text-over-video bg
+                    // recreate in the same BeginSlide). A 3rd
+                    // arrival would be a back-to-back transition
+                    // before either earlier worker finished -- log
+                    // + skip; the wedged decoder stays for the
+                    // c3.2.2 poster path until the next
+                    // BeginTransition can spawn.
+                    if cache.pending_recreates.len() >= MAX_CONCURRENT_RECREATES {
+                        eprintln!(
+                            "[perf] c3_3_2_recreate_skip_at_cap video_id={} len={} cap={}",
+                            video_id, cache.pending_recreates.len(), MAX_CONCURRENT_RECREATES,
                         );
                         continue;
                     }
@@ -4654,7 +5082,7 @@ mod tests {
             .expect("Mp4Demuxer must be in video_demuxers when asset present");
         assert_eq!(dem.width, 320);
         assert_eq!(dem.height, 240);
-        assert!(!dem.samples.is_empty());
+        assert!(dem.sample_count() > 0);
     }
 
     /// FYS bug A (2026-05-21): after evict_other_video_state drops a
@@ -4719,7 +5147,7 @@ mod tests {
         );
         assert_eq!(dem.width, 320);
         assert_eq!(dem.height, 240);
-        assert!(!dem.samples.is_empty());
+        assert!(dem.sample_count() > 0);
     }
 
     /// r46.2 (2026-06-02): text-over-video freeze fix.
@@ -4730,22 +5158,41 @@ mod tests {
     /// pressure spike. This test pins the multi-keep semantics.
     #[test]
     fn evict_other_video_state_preserves_multiple_keep_ids() {
+        // CMA R2-RANK4 (2026-06-22): test seeds 3 demuxers
+        // (text + bg + stale) to exercise the multi-keep
+        // retain semantic. RANK4 default cap is 2, which
+        // would LRU-evict text_id on the stale insert before
+        // evict_other_video_state even runs. Override to cap=3
+        // for this test so the 3-entry setup fits the LruMap.
+        // SAFETY: cargo test serializes within a process; the
+        // env var read happens in SlideCache::new() below.
+        unsafe {
+            std::env::set_var("OPENMARQUEE_VIDEO_DECODER_CACHE_CAP", "3");
+        }
         let mut cache = SlideCache::new();
+        // Clear the env override so subsequent tests' caches
+        // get the default cap=2.
+        unsafe {
+            std::env::remove_var("OPENMARQUEE_VIDEO_DECODER_CACHE_CAP");
+        }
         let text_id = uuid(11);
         let bg_id = uuid(12);
         let stale_id = uuid(13);
-        // Seed three demuxers (mock dummy entries). We don't need
-        // real Mp4Demuxer state for the eviction-set test — just
-        // observe which keys retain() drops.
-        // Dummy demuxers — all fields are pub so we can construct
-        // a minimal struct without parsing an MP4 file.
-        let mk_dummy = || crate::mp4_demux::Mp4Demuxer {
-            sps: vec![],
-            pps: vec![],
-            samples: vec![],
-            width: 0,
-            height: 0,
+        // Seed three demuxers (real ones; the eviction test only
+        // observes which HashMap keys retain() drops, not any
+        // sample data). Post-CMA-#1 Mp4Demuxer requires a held
+        // File handle so a struct-literal stub no longer compiles;
+        // re-parsing the 320x240 fixture per entry is cheap
+        // (~1 ms each) and exercises the open() path under test.
+        let fixture = {
+            let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            p.push("tests");
+            p.push("fixtures");
+            p.push("test_320x240.mp4");
+            p
         };
+        let mk_dummy = || crate::mp4_demux::Mp4Demuxer::open(&fixture)
+            .expect("open fixture for eviction test");
         cache.video_demuxers.insert(text_id, mk_dummy());
         cache.video_demuxers.insert(bg_id, mk_dummy());
         cache.video_demuxers.insert(stale_id, mk_dummy());

@@ -99,6 +99,88 @@ where
         self.map.get(key)
     }
 
+    /// Mutable lookup with LRU touch. Mirrors `get` but returns
+    /// `&mut V` so callers can mutate the value in place. Same
+    /// `Borrow<Q>` flexibility + same O(capacity) order-touch
+    /// cost as `get`.
+    ///
+    /// Added 2026-06-21 across two parallel CMA arcs that landed
+    /// the same body for the same reason: `slide_caches` (atlas
+    /// arc C3) + `video_decoders` / `video_demuxers` (decoder arc
+    /// #2) both swapped HashMap -> LruMap and needed the &mut V
+    /// path so `cache.get_mut(&slide_id).expect(...)` patterns
+    /// continued to compile + advance per-frame state. The CMA
+    /// integration merge deduped the two identical-body adds.
+    pub fn get_mut<Q>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        if !self.map.contains_key(key) {
+            return None;
+        }
+        if let Some(pos) = self.order.iter().position(|k| k.borrow() == key) {
+            if let Some(k) = self.order.remove(pos) {
+                self.order.push_back(k);
+            }
+        }
+        self.map.get_mut(key)
+    }
+
+    /// Existence check WITHOUT touching the LRU order. Cheaper
+    /// than `peek(...).is_some()` at call sites where the value
+    /// isn't needed. Symmetric `&self` API so callers don't have
+    /// to take the `&mut self` LRU-promoting path just to ask
+    /// "is this slide cached?".
+    ///
+    /// Added 2026-06-21 across both CMA arcs (C3 slide_caches +
+    /// #2 decoder/demuxer LruMaps); CMA integration merge deduped
+    /// the two identical adds.
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.map.contains_key(key)
+    }
+
+    /// HashMap-style retain: drops entries whose predicate returns
+    /// false. Keeps the `order` deque in sync so subsequent LRU
+    /// eviction targets remain correct.
+    ///
+    /// CMA #2 (2026-06-21): added for evict_other_video_state which
+    /// drops decoder/demuxer entries not in a keep-id set.
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&K, &mut V) -> bool,
+    {
+        self.map.retain(|k, v| f(k, v));
+        // After map.retain, `order` still holds the dropped keys.
+        // Build a kept-set from the surviving map keys (can't
+        // borrow `map` AND mutate `order` in the same closure),
+        // then filter `order` down to keep only present keys.
+        let kept: std::collections::HashSet<K> = self.map.keys().cloned().collect();
+        self.order.retain(|k| kept.contains(k));
+    }
+
+    /// HashMap-style mutable iteration over all entries. Does NOT
+    /// touch the LRU order — caller is expected to iterate all
+    /// entries, so per-element order updates would be misleading.
+    ///
+    /// CMA #2 (2026-06-21): added for the v2v dual-decoder
+    /// disjoint-borrow polyfill in ipc_main.rs (gets &mut to two
+    /// distinct entries by id in one iter).
+    pub fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<'_, K, V> {
+        self.map.iter_mut()
+    }
+
+    /// HashMap-style keys iteration. Does NOT touch the LRU order.
+    /// CMA #2 (2026-06-21): added for diagnostic probes (active
+    /// decoder id list) that just want the current key set.
+    pub fn keys(&self) -> std::collections::hash_map::Keys<'_, K, V> {
+        self.map.keys()
+    }
+
     /// Lookup WITHOUT touching the LRU order. Takes `&self` so
     /// multiple peeks (or a peek under a `&SlideCache` borrow) can
     /// coexist. The trade-off vs `get`: an entry only ever surfaced

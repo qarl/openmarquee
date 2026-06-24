@@ -358,12 +358,21 @@ fn gl_error_sweep(_gl: &glow::Context, _label: &str) {}
 /// background_image_slide_id under a motion-bearing layer.
 ///
 /// v1-spec-delta #12 (image-bg eviction, 2026-05-08): bounded LRU
-/// per memory budget §4 (image-bg cache hard ceiling = 6 entries
-/// = 48 MB CMA cap). Without eviction, a long-running renderer
+/// per memory budget §4. Without eviction, a long-running renderer
 /// with many distinct images grows CMA without bound until OOM.
 /// Implementation lives in crate::lru as a generic LruMap so the
 /// eviction policy is host-testable on Mac (hdmi.rs is Linux-only).
-pub const IMAGE_BG_CACHE_CAPACITY: usize = 6;
+///
+/// CMA-arc 2026-06-21 C2: cap cut 6 → 3 to claw back ~25 MB
+/// of worst-case headroom (3 × ~8.3 MB at 1080p RGBA). The
+/// working set is current + next image-bg slide; 3 keeps one
+/// slot of slack for preload-mode=max scenarios. A reel that
+/// cycles >3 distinct image-bg backgrounds in flight will
+/// trip eviction churn on transition; per QA the seed image
+/// assets are currently invalid PNGs so the path is rare. If
+/// production reels grow image-bg breadth, revisit (or add
+/// time-expiry to the LRU).
+pub const IMAGE_BG_CACHE_CAPACITY: usize = 3;
 
 pub type ImageBgCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u32)>;
 
@@ -381,12 +390,41 @@ pub type ImageBgCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u
 /// evicts to disk between transitions is correct.
 pub type PosterCache = crate::lru::LruMap<PathBuf, (glow::NativeTexture, u32, u32)>;
 
-/// r110 stage 3 commit 3.1: capacity for `PosterCache`. Sized for
-/// "current + next 2 slides hot" with one slot of slack for
-/// preload-mode=max scenarios that warm further out. Each entry =
-/// ~3 MB at 1080p RGBA (1920 × 1080 × 4), so 4 entries = ~12 MB
-/// VRAM peak. Fits comfortably in our budget.
-pub const POSTER_CACHE_CAPACITY: usize = 4;
+/// r110 stage 3 commit 3.1: capacity for `PosterCache`.
+///
+/// CMA-arc 2026-06-21 C2: cap cut 4 → 2. The docstring's prior
+/// "~3 MB at 1080p RGBA" math was off by ~3× (1920 × 1080 × 4 =
+/// ~8.3 MB, not 3 MB); the actual 4-entry worst case was ~33 MB,
+/// not ~12 MB. New sizing: 2 entries = "current + next slide"
+/// (the active fade's A + B endpoints). The prior "next 2 slides
+/// hot + preload-mode=max slack" justifies 3-4 cap but each entry
+/// is a real ~8.3 MB, and the 320 MB Pi Zero 2 W CMA budget can't
+/// afford the slack. Reclaim: ~17 MB worst-case. If a future
+/// reel exercises preload-mode=max with video slides and the
+/// 2-slot cap causes poster thrash at fade boundaries, revisit
+/// (raise to 3, or add a time-expiry layer to defer eviction
+/// during active transitions).
+pub const POSTER_CACHE_CAPACITY: usize = 2;
+
+/// CMA-arc 2026-06-21 C3: bounded LRU on `slide_caches` (was an
+/// unbounded HashMap). Each entry caches per-layer text bitmaps +
+/// optionally bg_tex + first_frame_tex (potentially ~8.3 MB at
+/// 1080p RGBA each). Pre-arc the cache grew to the playlist's
+/// distinct slide count with no eviction; on long-running reels
+/// with many distinct slides the working set ballooned.
+///
+/// Cap = 6. The hot working set is current + next (during a
+/// transition) + 1 slack; 6 keeps an additional ~4 slots for
+/// recently-played slides that the reel may revisit in the next
+/// cycle (FYS reel cycles every 19 slides, so the second-pass
+/// hit-rate matters). On a reel with >6 distinct slides per
+/// active cycle the LRU evicts cold-end entries; eviction is
+/// leak-safe via `free_slide_render_cache` in the insert
+/// wrapper.
+///
+/// If production reels grow beyond 6 hot slides at once, revisit
+/// (raise the cap, or add a time-expiry layer).
+pub const SLIDE_CACHES_CAPACITY: usize = 6;
 
 pub struct EglSession<'a> {
     egl_lib: &'a egl::DynamicInstance<egl::EGL1_5>,
@@ -441,6 +479,50 @@ pub struct EglSession<'a> {
     scanout_prev_fb: Option<framebuffer::Handle>,
     scanout_current_bo: Option<BufferObject<()>>,
     scanout_current_fb: Option<framebuffer::Handle>,
+    /// Flip-race fix D (2026-06-22): 3rd scanout slot for triple-
+    /// buffering. Fix A (gl.finish) + C (EGL fence) both closed the
+    /// race correctness-wise but cost ~28ms per present stall =
+    /// halved FPS (single-frame vc4 1080p render time, not
+    /// pipeline-backlog). Pivot per QA: HOLD an extra scanout slot
+    /// so GBM's pool grows to 3 BOs. When GBM recycles a BO into
+    /// the next swap, that BO was last drawn ~2 frames ago = GPU
+    /// long done = no stale-tile race + no current-frame stall.
+    ///
+    /// Rotation depth = 3:
+    ///   prev2 (oldest, just released by recent page_flip) → recycled
+    ///   prev  (penultimate)
+    ///   current (just page-flipped, kernel scanning)
+    ///
+    /// Per-tick: destroy prev2 → shift prev→prev2 → shift current→
+    /// prev → set new→current. Destroy of prev2 is preceded by a
+    /// fence wait on prev2's sync (created when this slot WAS
+    /// current; by the time it reaches prev2 ~2 frames later, the
+    /// fence is signaled → wait ≈0us). Cheap completion barrier on
+    /// a known-done buffer, vs fix A/C's full-pipeline stall on the
+    /// current.
+    ///
+    /// Resource cost: +1 1080p ARGB8888 BO ≈ 8 MB CMA. Headroom
+    /// verified on Pi Zero 2 W.
+    scanout_prev2_bo: Option<BufferObject<()>>,
+    scanout_prev2_fb: Option<framebuffer::Handle>,
+    /// Flip-race fix D (2026-06-22): per-slot EGL fence sync for the
+    /// 3-deep scanout rotation. Created when a BO enters `current`
+    /// (= just rendered + page-flipped). Shifts through `prev` →
+    /// `prev2`. When the slot reaches `prev2` and is about to be
+    /// recycled, the rotation helper waits the fence (~0us for a
+    /// 2-frames-old fence) + destroys it before dropping the BO.
+    /// The wait guarantees the GPU is done with this BO's PRIOR
+    /// draw — necessary because the BO returns to GBM's pool on
+    /// drop, and a subsequent swap may pick it as the backbuffer.
+    ///
+    /// `None` when sync creation failed (driver lacks EGL_KHR_
+    /// fence_sync or attrib check failed — both should be impossible
+    /// on Mesa+vc4 with the ATTRIB_NONE-terminated list, but
+    /// defensive None handling preserves correctness via the GBM
+    /// implicit-sync fallback path).
+    scanout_current_sync: Option<egl::Sync>,
+    scanout_prev_sync: Option<egl::Sync>,
+    scanout_prev2_sync: Option<egl::Sync>,
     /// Bug 2 (qarl-flag 2026-05-09): the in-session render paths
     /// (render_one_frame_in_session, render_animated_slide_in_
     /// session, render_transition_*_in_session) used to destroy
@@ -506,11 +588,40 @@ pub struct EglSession<'a> {
     /// must be distinct textures.
     transition_fbo_b: Option<glow::NativeFramebuffer>,
     transition_tex_b: Option<glow::NativeTexture>,
+    /// Snapshot-side-A (2026-06-21): captured outgoing video
+    /// frame for an in-flight video→video transition. Populated
+    /// on the FIRST tick of a v2v fade (after bake_a succeeds);
+    /// freed at progress>=0.99, on entry to a non-v2v transition
+    /// (defensive), and at session teardown. Commit 1 captures
+    /// but does not consume — verifies the GLES2 copy path
+    /// doesn't regress baseline. Commit 2 wires the side-A
+    /// bypass that reads this texture instead of re-feeding the
+    /// outgoing decoder.
+    transition_still_a_tex: Option<glow::NativeTexture>,
     /// r102.2: dims the cached transition_fbo_a/b were
     /// allocated against. Invalidates the cache on mode change
     /// (HDMI hot-plug, rotation flip). `None` while the cache
     /// is empty.
     transition_fbo_dims: Option<(u32, u32)>,
+    /// CMA-arc 2026-06-22 RANK 3: timestamp of the most recent
+    /// `ensure_transition_fbo_pair` call. The transition FBO
+    /// pair (~16.6 MB CMA at 1080p ARGB8888) is alloc-once-and-
+    /// reuse — pre-RANK-3 it was held through every static-slide
+    /// hold + only freed at session teardown. `free_idle_session_fbos`
+    /// (called at the top of paint_and_present_one_frame_for_slide)
+    /// frees the pair when this stamp is older than
+    /// `IDLE_FBO_THRESHOLD` (so consecutive transition ticks
+    /// never trigger a free, but a long-running hold after a
+    /// transition reclaims the CMA). `None` while the pair has
+    /// never been allocated this session.
+    last_transition_fbo_use: Option<std::time::Instant>,
+    /// CMA-arc 2026-06-22 RANK 3: timestamp of the most recent
+    /// `ensure_bake_atlas` call. The scissored-bake atlas
+    /// (2048×2048 RGBA = ~16 MB CMA) is alloc-once-and-reuse —
+    /// pre-RANK-3 held through every hold + only freed at
+    /// teardown. Same idle-free pattern as
+    /// `last_transition_fbo_use`.
+    last_scissored_bake_use: Option<std::time::Instant>,
     /// STREAM/VLC slice-9 follow-up: persistent texture for the
     /// external-frame push-paint path. Allocated once with
     /// glTexImage2D and thereafter updated in place with
@@ -547,14 +658,24 @@ pub struct EglSession<'a> {
     /// reel pass touching every slide, the second pass + onward
     /// hit cache for ALL bake operations.
     ///
-    /// Keyed by slide_id (Uuid). HashMap (no LRU) — FYS reel is
-    /// 19 slides × ~1 MB cached state per slide (small text
-    /// bitmaps); 19 MB total fits trivially in CMA budget. If
-    /// future workloads need eviction, swap to LruMap.
+    /// Keyed by slide_id (Uuid).
+    ///
+    /// CMA-arc 2026-06-21 C3: swapped from HashMap to LruMap with
+    /// `SLIDE_CACHES_CAPACITY` (= 6) entries. The original
+    /// HashMap's design assumption ("19 slides × ~1 MB =
+    /// 19 MB fits trivially") was based on small text bitmaps —
+    /// but the SlideRenderCache also holds bg_tex + first_frame_tex
+    /// + per-layer textures (each potentially ~8.3 MB at 1080p).
+    /// On a reel that warms many slides without revisits, the
+    /// HashMap grew CMA without bound until session teardown.
+    /// The LruMap caps the working set; evicted entries are
+    /// fed to `free_slide_render_cache` (which deletes the
+    /// cached GL textures) so the eviction is leak-safe. See
+    /// the `slide_caches_insert` helper in this file.
     ///
     /// Cleanup at with_egl_session teardown drains all entries
     /// + delete_textures while gl context is still bound.
-    slide_caches: std::collections::HashMap<uuid::Uuid, SlideRenderCache>,
+    slide_caches: crate::lru::LruMap<uuid::Uuid, SlideRenderCache>,
     /// QA-direct (2026-05-08, post-clock_nanosleep): session-cached
     /// fullscreen-quad VBO for the SP transition path. The same
     /// 4-vert TRIANGLE_STRIP geometry is used by every transition
@@ -576,15 +697,18 @@ pub struct EglSession<'a> {
     /// See ATLAS_FBO_W / ATLAS_FBO_H / ATLAS_REGION_W /
     /// ATLAS_REGION_H in hdmi_logic.rs for the geometry.
     scissored_bake_atlas: Option<(glow::NativeFramebuffer, glow::NativeTexture)>,
-    /// SDF arc slice B.2 -- session-wide MSDF atlases. 23 RGB888
-    /// textures uploaded once at session bring-up (immediately
-    /// after `make_current`), bound per-layer at draw time keyed
-    /// on the layer's font stem. Freed at session teardown while
-    /// the GL context is still bound. The CPU-side parsed
-    /// manifests live in the `manifest` field of each entry so the
-    /// quad-layout pass + atlas-lookup don't re-parse JSON per
-    /// draw.
-    msdf_atlases: Vec<crate::sdf_atlas_gl::MsdfAtlasGl>,
+    // CMA-arc 2026-06-21 C4: the prior `msdf_atlases: Vec<MsdfAtlasGl>`
+    // session field is retired. Owned MsdfAtlasGl entries now live
+    // in the `MSDF_ATLAS_OWNED` thread_local Vec (see further down
+    // in this file). The migration was necessary because lazy
+    // upload now happens from `ensure_msdf_atlas_uploaded` called
+    // from paint_slide_with_viewport, which receives `&gl` (not
+    // `&mut session`); plumbing &mut session through the paint
+    // stack would have been a far larger refactor. The
+    // thread_local approach matches the sibling LOOKUP pattern
+    // already in use for MSDF_ATLAS_LOOKUP /
+    // DYNAMIC_ATLAS_LOOKUP. Teardown drains via
+    // `delete_owned_msdf_atlases` in `cleanup_resources`.
     /// Bug 3 Slice 1 part B (2026-05-19): dynamic runtime glyph
     /// cache for codepoints not in the static build-time-baked
     /// MSDF atlas (e.g. ●, ∞). Cache + atlas page created at session
@@ -797,6 +921,18 @@ where
         .initialize(display)
         .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
     eprintln!("EGL {}.{}", egl_major, egl_minor);
+    // Flip-race fix D (2026-06-22): startup log of advertised EGL
+    // extensions so QA can confirm EGL_KHR_fence_sync is present
+    // (rotate_scanout_3_deep uses it for the per-slot per-buffer
+    // sync; if absent the rotation degenerates to no-sync and the
+    // snap-back race may reappear).
+    match egl_lib.query_string(Some(display), egl::EXTENSIONS) {
+        Ok(cs) => eprintln!(
+            "EGL_EXTENSIONS: {}",
+            cs.to_str().unwrap_or("<non-utf8>"),
+        ),
+        Err(e) => eprintln!("warn: eglQueryString(EGL_EXTENSIONS) failed: {e:?}"),
+    }
 
     egl_lib
         .bind_api(egl::OPENGL_ES_API)
@@ -875,6 +1011,12 @@ where
         scanout_prev_fb: None,
         scanout_current_bo: None,
         scanout_current_fb: None,
+        // Flip-race fix D (2026-06-22).
+        scanout_prev2_bo: None,
+        scanout_prev2_fb: None,
+        scanout_current_sync: None,
+        scanout_prev_sync: None,
+        scanout_prev2_sync: None,
         held_scanout_fb: None,
         held_scanout_bo: None,
         session_start: std::time::Instant::now(),
@@ -884,14 +1026,26 @@ where
         transition_tex_a: None,
         transition_fbo_b: None,
         transition_tex_b: None,
+        transition_still_a_tex: None,
         transition_fbo_dims: None,
+        // CMA-arc 2026-06-22 RANK 3: idle-free timestamps. Stamped
+        // by ensure_transition_fbo_pair + ensure_bake_atlas; read
+        // by free_idle_session_fbos.
+        last_transition_fbo_use: None,
+        last_scissored_bake_use: None,
         external_frame_tex: None,
         external_nv12_tex: None,
         current_settings: crate::content::Settings::default(),
-        slide_caches: std::collections::HashMap::new(),
+        // CMA-arc 2026-06-21 C3: bounded LRU. See
+        // SLIDE_CACHES_CAPACITY doc + `slide_caches_insert` helper
+        // for the eviction-cleanup pattern.
+        slide_caches: crate::lru::LruMap::with_capacity(SLIDE_CACHES_CAPACITY),
         transition_sp_quad_vbo: None,
         scissored_bake_atlas: None,
-        msdf_atlases: Vec::new(),
+        // CMA-arc 2026-06-21 C4: `msdf_atlases` field retired;
+        // owned MsdfAtlasGl entries now in the MSDF_ATLAS_OWNED
+        // thread_local. No init needed (RefCell::new(Vec::new())
+        // at thread_local decl).
         // Bug 3 Slice 1 part B (2026-05-19): construct the dynamic
         // glyph cache + its backing atlas page upfront. GlyphCache
         // spawns 4 std::thread workers via crossbeam-channel mpsc;
@@ -919,52 +1073,59 @@ where
         live_preview: crate::live_preview::LivePreviewState::init_from_env(),
     };
 
-    // SDF arc slice B.2 -- one-shot atlas upload after the GL
-    // context is current. 23 atlases x ~1.3 MB each = ~30 MB GPU
-    // memory, all RGB8. The Vec is freed at session teardown.
+    // CMA-arc 2026-06-21 C4: pre-arc this block UNCONDITIONALLY
+    // uploaded ALL 23 SDF atlases at session bring-up (~30 MB
+    // CMA, RGB8 textures). Even a reel that only uses one or two
+    // font families paid the full 30 MB at session start —
+    // load-bearing on the 320 MB Pi Zero 2 W budget. The 3-video
+    // wedge reel (post-C1-C3 + code2's #1-#2 combined) saw the
+    // crossfade peak drop CmaFree to ~6.6 MB — razor-thin. Lazy-
+    // loading frees ~30 MB upfront and pays ~1.3 MB per family
+    // ONLY on first text draw of that family. Typical reels use
+    // 1-3 distinct families → ~26-28 MB stays reclaimed at
+    // steady state.
     //
-    // Failure semantics: if atlas loading fails, the session
-    // CAN'T render MSDF text (which is now the only text path).
-    // Bubble up the error -- the operator will see the failure
-    // immediately rather than getting silently-broken text on
-    // every slide.
-    {
-        let parsed = crate::sdf_atlas::load_all_atlases()
-            .map_err(|e| anyhow!("msdf atlas load failed: {e}"))?;
-        session.msdf_atlases = crate::sdf_atlas_gl::upload_all(&gl, &parsed)?;
-        populate_msdf_lookup(&session.msdf_atlases);
-    }
+    // The lazy path lives in `ensure_msdf_atlas_uploaded` (this
+    // file) and is invoked at each `msdf_atlas_for_family` call
+    // site before the (read-only) lookup runs. MSDF_ATLASES_CPU
+    // (the CPU-side parsed atlas Vec) is still process-singleton
+    // OnceLock — `load_all_atlases` is parse-only over
+    // `include_bytes!`-backed slices, so the CPU work is cheap +
+    // happens once on first lazy upload. The GPU side
+    // (session.msdf_atlases + MSDF_ATLAS_LOOKUP thread_local)
+    // grows as families are touched.
+    //
+    // Failure semantics preserved: per-family upload failure is
+    // logged + the family falls back to Inter (via the existing
+    // `or_else(|| msdf_atlas_for_family("Inter"))` chains at the
+    // call sites). If Inter ALSO fails, the same anyhow! error
+    // surfaces as before — the operator sees the failure
+    // immediately rather than getting silently-broken text. The
+    // pre-arc bring-up path was fatal-on-fail for ANY atlas;
+    // post-arc only Inter is load-bearing (the others can fail
+    // safely with a visual fallback to Inter glyph metrics).
 
-    // Bug 3 Slice 1 part B (2026-05-19): allocate the dynamic atlas
-    // page's GPU texture (2048×2048 RGBA8 ~ 16 MB GPU memory).
-    // Failure semantics: non-fatal — if the dynamic atlas can't
-    // initialize, Slice 2's runtime cache-miss path will just keep
-    // returning Tofu (the existing pre-Bug-3 behavior). Log + continue.
-    if let Err(e) = session.dynamic_atlas_page_msdf.allocate_texture(&gl) {
-        eprintln!(
-            "warn: dynamic MSDF atlas page texture alloc failed: {e}; \
-             runtime MSDF cache disabled this session",
-        );
-    } else if let Some(tex) = session.dynamic_atlas_page_msdf.texture() {
-        // Bug 3 Slice 2B: publish the texture handle so
-        // draw_text_layer_msdf can bind it for GlyphKind::DynamicMsdf
-        // quads. Cleared in the teardown block below before the
-        // texture is deleted.
-        populate_dynamic_atlas_lookup(tex);
-    }
-
-    // Bug 3 Slice 3B (2026-05-19): parallel allocation for the
-    // COLRv1-rasterized emoji page. Same failure semantics — if
-    // alloc fails, runtime emoji rasterization yields Tofu (Slice 1
-    // pre-cache behavior); static CBDT path keeps working.
-    if let Err(e) = session.dynamic_atlas_page_colr.allocate_texture(&gl) {
-        eprintln!(
-            "warn: dynamic COLR atlas page texture alloc failed: {e}; \
-             runtime COLRv1 emoji cache disabled this session",
-        );
-    } else if let Some(tex) = session.dynamic_atlas_page_colr.texture() {
-        populate_dynamic_atlas_colr_lookup(tex);
-    }
+    // CMA-arc 2026-06-21 (was Bug 3 Slice 1/3B 2026-05-19): the
+    // dynamic atlas pages' GPU textures (2048×2048 RGBA8 = 16 MB
+    // each = 32 MB CMA total) were UNCONDITIONALLY allocated here
+    // at session bring-up. Even a text-only reel with no dynamic
+    // glyph misses paid the 32 MB cost, leaving little headroom
+    // for a video decoder + crossfade on the Pi Zero 2 W's 320 MB
+    // CMA budget. Now lazy: AtlasPage::allocate_texture is invoked
+    // by glyph_cache::poll_completions on first Ready completion
+    // for that render_mode; the DYNAMIC_ATLAS_LOOKUP thread_local
+    // is published from poll_dynamic_glyph_completions (this file)
+    // each call. allocate_texture is idempotent (atlas_page.rs:
+    // 91-93 early-return on Some) so the per-call cost after the
+    // first allocation is one borrow_mut on a thread_local.
+    // Sample-site safety: all draw sites already gate on
+    // `if let Some(dyn_tex) = dynamic_atlas_tex()` (e.g. L2825)
+    // and skip the batch when None — the prior "alloc failed at
+    // bring-up" branch and the new "alloc not yet fired" branch
+    // both surface as the same None, both result in the same
+    // skip. delete (in cleanup_resources below) is also a no-op
+    // on a never-allocated page (atlas_page.rs:142 `take` no-ops
+    // on None).
 
     // Slice 3D (2026-05-19): the SDF-arc-C.2 CBDT atlas upload
     // (~64 MB RGBA across ~3 pages, plus the `EMOJI_ATLAS_CPU`
@@ -1049,7 +1210,11 @@ where
     // is still bound. Clear the lookup table first so a paint after
     // teardown can't dereference dead texture handles.
     clear_msdf_lookup();
-    crate::sdf_atlas_gl::delete_all(&gl, &mut session.msdf_atlases);
+    // CMA-arc 2026-06-21 C4: ownership of uploaded MsdfAtlasGl
+    // moved from session.msdf_atlases (pre-arc field, now removed)
+    // to the MSDF_ATLAS_OWNED thread_local Vec. Drain + delete
+    // here so the GL handles release while the context is bound.
+    delete_owned_msdf_atlases(&gl);
     // Slice 3D (2026-05-19): the CBDT-side `clear_emoji_lookup()` +
     // `delete_all` of session.emoji_atlases are gone alongside the
     // atlas itself. Only the dynamic-COLR teardown below remains.
@@ -1102,6 +1267,28 @@ where
     if let Some(bo) = session.scanout_prev_bo.take() {
         drop(bo);
     }
+    // Flip-race fix D (2026-06-22): free the 3rd scanout slot
+    // (prev2) + the per-slot EGL fence syncs. The kernel switched
+    // away from prev2 multiple frames ago — safe to destroy.
+    if let Some(fb) = session.scanout_prev2_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!("warn: destroy_framebuffer(scanout_prev2): {e}");
+        }
+    }
+    if let Some(bo) = session.scanout_prev2_bo.take() {
+        drop(bo);
+    }
+    for sync_slot in [
+        session.scanout_current_sync.take(),
+        session.scanout_prev_sync.take(),
+        session.scanout_prev2_sync.take(),
+    ] {
+        if let Some(sync) = sync_slot {
+            let _ = unsafe {
+                session.egl_lib.destroy_sync(session.display, sync)
+            };
+        }
+    }
     // Bug 2 (2026-05-09): drain in-session held scanout. The
     // standalone render paths (animated slide + transition + one-
     // frame) stash their last scanout (fb, bo) here at end-of-
@@ -1140,6 +1327,9 @@ where
             gl.delete_framebuffer(fbo);
         }
         if let Some(tex) = session.transition_tex_b.take() {
+            gl.delete_texture(tex);
+        }
+        if let Some(tex) = session.transition_still_a_tex.take() {
             gl.delete_texture(tex);
         }
         session.transition_fbo_dims = None;
@@ -1315,24 +1505,45 @@ fn commit_fb(
         return Ok(());
     }
 
-    // QA-direct (2026-05-08): use DRM_MODE_PAGE_FLIP_ASYNC so the
-    // kernel performs the flip immediately rather than waiting
-    // for vblank. EVENT is still set so the page-flip event fires
-    // (right after the flip, not at vblank) -- our drain reads it
-    // promptly on the next commit_fb. Drops the per-frame
-    // commit_drain_poll wait (~8ms p50 at 60Hz) to ~0 ms.
+    // Flip-race fix D2 (2026-06-22): DROP DRM_MODE_PAGE_FLIP_ASYNC.
     //
-    // Tradeoff: tearing during the half-vblank window between the
-    // flip and the next vblank. Acceptable for the FYS reel
-    // because (a) transitions are short and visually busy, (b)
-    // static slides only flip once at scene-change, (c) vc4 vblank
-    // period at 60Hz = 16.7 ms means worst-case tear width is one
-    // half-screen for one frame.
+    // Why: fix D (triple-buffer + per-slot fence) reduced the snap-
+    // back visibility but qarl still sees it (QA glass: "much less
+    // visible than before"). Triple-buffer protects against reusing
+    // a buffer too early, but ASYNC bypasses dma-buf implicit fence
+    // → kernel can scan the just-flipped BO BEFORE the GPU finishes
+    // writing it (vc4 tile-store ~28ms; vblank ~16ms; ASYNC kicks
+    // in instantly = scan starts before GPU done).
+    //
+    // Dropping ASYNC restores vblank-synchronized flip. The kernel
+    // waits for vblank AND honors the BO's implicit dma-buf fence
+    // before scanning. Per the Mesa-vc4 implicit-sync contract,
+    // GL writes attach a fence on the BO; vsync page_flip respects
+    // it. Net: kernel never scans a still-being-written BO.
+    //
+    // Cost: vsync caps frame rate at vblank (60Hz). With
+    // triple-buffer + pipelined render (~28ms), effective rate
+    // settles ~30fps (every-other-vblank). Per QA prediction this
+    // "likely only reduces further, not fully closes" — if so we
+    // escalate to the atomic-in-fence fix (the kernel-side wait
+    // that doesn't sacrifice vblank but does the same job
+    // explicitly via plane IN_FENCE_FD prop).
+    //
+    // PRIOR ASYNC RATIONALE (QA-direct 2026-05-08): "use ASYNC so
+    // the kernel performs the flip immediately rather than waiting
+    // for vblank. Drops the per-frame commit_drain_poll wait
+    // (~8ms p50 at 60Hz) to ~0 ms. Tradeoff: tearing during the
+    // half-vblank window."
+    // → That rationale predates the snap-back arc. The "tearing"
+    //   tradeoff turned out to be a full-frame stale scanout under
+    //   GBM pool cycling (qarl's snap-back). Fix D2 reverses this
+    //   decision; the original 8ms vblank wait is the lesser evil
+    //   vs the stale-frame race.
     let t_pageflip = std::time::Instant::now();
     card.page_flip(
         session.crtc_handle,
         fb,
-        PageFlipFlags::EVENT | PageFlipFlags::ASYNC,
+        PageFlipFlags::EVENT,
         None,
     )
     .context("drmModePageFlip failed")?;
@@ -1396,6 +1607,156 @@ fn drain_pending_flip(session: &mut EglSession, card: &Card) {
         }
     }
     session.flip_pending = false;
+}
+
+/// Flip-race fix D (2026-06-22): 3-deep scanout buffer rotation.
+///
+/// Replaces the 9-line inlined rotation pattern previously at every
+/// paint_and_present_*_frame tail (destroy scanout_prev + shift
+/// current → prev + set new → current). Adds a third generation
+/// (prev2) so the GBM surface pool grows to 3 BOs: when GBM
+/// recycles a BO for the next backbuffer, that BO was last drawn
+/// ~2 frames ago, giving the GPU enough lead time that its prior
+/// content is COMPLETE before the next render starts — closing the
+/// snap-back race (kernel scanning a still-being-drawn BO) without
+/// the ~28ms current-frame stall fix A (gl.finish) and fix C (EGL
+/// fence wait) both incurred.
+///
+/// Per-tick:
+///   1. Wait on prev2's fence (created when this BO was current ~2
+///      frames ago; by now signaled — wait ≈0us). Confirms the
+///      GPU is done with the recycled BO before we hand it back to
+///      GBM. Destroys the fence after.
+///   2. Destroy prev2's DRM FB + drop prev2's BO (drop returns BO
+///      to GBM pool for re-use as a future backbuffer).
+///   3. Shift prev → prev2 (incl. fence). Shift current → prev.
+///   4. New BO/FB becomes current. Create a fresh fence at this
+///      point — it will be waited on ~2 frames hence when this
+///      slot reaches prev2.
+///
+/// Telemetry: `[perf] scanout_rotate site=X prev2_wait_us=N
+/// new_sync_create_us=M elapsed_us=T`. prev2_wait_us is the key
+/// number — should be ~0us once the rotation is steady-state
+/// (after the first 2 frames). If it climbs to ~28ms, the fence
+/// strategy degenerated to fix A/C's cost — debug.
+///
+/// Held-scanout interaction: `end_of_in_session_render_call`
+/// continues to operate on `scanout_current` for cross-call
+/// preservation. prev2 + prev are released at end-of-call along
+/// with current's rotation into held_scanout. See that function
+/// for details.
+#[allow(clippy::too_many_arguments)]
+fn rotate_scanout_3_deep(
+    session: &mut EglSession,
+    card: &Card,
+    new_bo: BufferObject<()>,
+    new_fb: framebuffer::Handle,
+    site: &'static str,
+) {
+    let t_recycle = std::time::Instant::now();
+
+    // Step 1: wait + destroy prev2's fence (it's been signaled for ~2
+    // frames, so the wait is essentially a no-op). If fence creation
+    // failed back when this slot was current, sync is None — skip.
+    let mut prev2_wait_us: u128 = 0;
+    if let Some(sync) = session.scanout_prev2_sync.take() {
+        let t_wait = std::time::Instant::now();
+        let _ = unsafe {
+            session.egl_lib.client_wait_sync(
+                session.display,
+                sync,
+                egl::SYNC_FLUSH_COMMANDS_BIT,
+                500_000_000,
+            )
+        };
+        prev2_wait_us = t_wait.elapsed().as_micros();
+        let _ = unsafe { session.egl_lib.destroy_sync(session.display, sync) };
+    }
+
+    // Step 2: destroy prev2's FB; drop prev2's BO (releases to GBM
+    // pool — GBM may hand it back as the next backbuffer).
+    if let Some(fb) = session.scanout_prev2_fb.take() {
+        if let Err(e) = card.destroy_framebuffer(fb) {
+            eprintln!(
+                "warn: destroy_framebuffer(scanout_prev2, {site}): {e}",
+            );
+        }
+    }
+    if let Some(bo) = session.scanout_prev2_bo.take() {
+        drop(bo);
+    }
+
+    // Step 3: shift prev → prev2; current → prev. Sync travels with
+    // its BO so the fence is always tied to the correct frame's
+    // GPU completion.
+    session.scanout_prev2_sync = session.scanout_prev_sync.take();
+    session.scanout_prev2_fb = session.scanout_prev_fb.take();
+    session.scanout_prev2_bo = session.scanout_prev_bo.take();
+    session.scanout_prev_sync = session.scanout_current_sync.take();
+    session.scanout_prev_fb = session.scanout_current_fb.take();
+    session.scanout_prev_bo = session.scanout_current_bo.take();
+
+    // Step 4: new becomes current. Create a fresh fence to track
+    // this draw's GPU completion (consumed when this slot reaches
+    // prev2 ~2 ticks hence). Defensive: if create_sync fails, the
+    // slot's sync stays None; future recycle skips the wait + relies
+    // on natural GBM/Mesa implicit sync. Snap-back may reappear in
+    // that path — log loudly.
+    let t_create = std::time::Instant::now();
+    let new_sync = match unsafe {
+        session.egl_lib.create_sync(
+            session.display,
+            egl::SYNC_FENCE as egl::Enum,
+            &[egl::ATTRIB_NONE],
+        )
+    } {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!(
+                "warn: scanout_rotate create_sync failed site={}: {:?} \
+                 (next recycle's fence wait will be skipped)",
+                site, e,
+            );
+            None
+        }
+    };
+    let new_sync_create_us = t_create.elapsed().as_micros();
+    session.scanout_current_sync = new_sync;
+    session.scanout_current_bo = Some(new_bo);
+    session.scanout_current_fb = Some(new_fb);
+
+    // Flip-race fix D2 finalize (2026-06-22): gate the per-rotation
+    // perf line behind OPENMARQUEE_SCANOUT_ROTATE_LOG=1 so production
+    // doesn't emit ~22 lines/sec to stderr. Default OFF. QA enables
+    // env on instrumented builds when measuring; prod stays silent.
+    // The gate is cached once via OnceLock (env-var read is the
+    // first call's overhead; every subsequent call is an atomic
+    // load).
+    if scanout_rotate_log_enabled() {
+        eprintln!(
+            "[perf] scanout_rotate site={} prev2_wait_us={} \
+             new_sync_create_us={} elapsed_us={}",
+            site, prev2_wait_us, new_sync_create_us,
+            t_recycle.elapsed().as_micros(),
+        );
+    }
+}
+
+/// Flip-race fix D2 finalize (2026-06-22): env gate for the
+/// per-rotation scanout_rotate perf line. OnceLock-cached so the
+/// env var is read exactly once per process. Default OFF: prod
+/// stays silent (the line fires ~22 times/sec at full reel rate;
+/// cumulative log volume across days of uptime is non-trivial).
+/// QA enables via `OPENMARQUEE_SCANOUT_ROTATE_LOG=1` (or "true")
+/// when measuring on glass.
+fn scanout_rotate_log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("OPENMARQUEE_SCANOUT_ROTATE_LOG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 /// Bug 2 (qarl-flag 2026-05-09): cleanup at end of an in-session
@@ -1741,7 +2102,7 @@ fn render_animated_slide_in_session(
             if let Some(old) = session.slide_caches.remove(&slide_id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session.slide_caches.insert(slide_id, SlideRenderCache::new(text_layers.len()));
+            slide_caches_insert(session, slide_id, SlideRenderCache::new(text_layers.len()));
         }
     }
 
@@ -1771,19 +2132,20 @@ fn render_animated_slide_in_session(
             // Mirrors paint_and_present_one_frame_for_slide's pattern
             // (hdmi.rs ~2741). FYS Boot's ● (motion=breathe routes
             // through this function) is the qarl-visible case.
-            let uploaded = session.dynamic_glyph_cache.poll_completions(
-                session.gl,
-                &mut session.dynamic_atlas_page_msdf,
-                &mut session.dynamic_atlas_page_colr,
-                4,
-            );
+            // CMA-arc 2026-06-21: wrap via
+            // poll_dynamic_glyph_completions so the lazy-allocated
+            // atlas textures are published to DYNAMIC_ATLAS_LOOKUP /
+            // DYNAMIC_ATLAS_COLR_LOOKUP after this poll.
+            let uploaded = poll_dynamic_glyph_completions(session, 4);
             if uploaded > 0 {
                 if let Some(old) = session.slide_caches.remove(&slide_id) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session
-                    .slide_caches
-                    .insert(slide_id, SlideRenderCache::new(text_layers.len()));
+                slide_caches_insert(
+                    session,
+                    slide_id,
+                    SlideRenderCache::new(text_layers.len()),
+                );
             }
             // Bug 1 fix (2026-05-09): tick_seconds is session-
             // global, NOT call-local. Motion phase stays continuous
@@ -3281,13 +3643,26 @@ fn load_png_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
         );
     }
     let (w, h) = (info.width, info.height);
-    let rgba: Vec<u8> = match info.color_type {
+    let mut rgba: Vec<u8> = match info.color_type {
         png::ColorType::Rgba => buf,
         png::ColorType::Rgb => {
-            let mut out = Vec::with_capacity((w * h) as usize * 4);
-            for px in buf.chunks_exact(3) {
-                out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+            // CMA-arc 2026-06-22 C5: expand RGB -> RGBA into a
+            // fresh buffer (can't avoid: 3 bytes/px -> 4
+            // bytes/px), then explicit drop(buf) so the RGB
+            // intermediate frees BEFORE the flip allocates its
+            // scratch. Prior code held buf in scope to fn end —
+            // ~6.2 MB at 1080p hot for no benefit after the
+            // expand loop.
+            let mut out = vec![0u8; (w * h) as usize * 4];
+            for (src, dst) in
+                buf.chunks_exact(3).zip(out.chunks_exact_mut(4))
+            {
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = 0xFF;
             }
+            drop(buf);
             out
         }
         other => bail!(
@@ -3297,9 +3672,13 @@ fn load_png_rgba(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
     };
     // Bug W2: flip to bottom-up row order so the GL `v` convention
     // (see the doc comment above) renders the image right-side up.
-    // The flip helper lives in hdmi_logic.rs so it is host-testable
-    // on the Mac dev box (hdmi.rs is Linux-only).
-    let rgba = crate::hdmi_logic::flip_rgba_rows_vertically(rgba, w, h);
+    // CMA-arc 2026-06-22 C5: in-place flip — saves the second
+    // ~8.3 MB allocation the prior consuming version paid (3-buffer
+    // dance: decode buf + RGBA out + flipped). Per-image peak heap
+    // drops from ~16.6 MB (RGBA path) or ~22.7 MB (RGB path) to
+    // ~8.3 MB. Uses a single stride-sized scratch row (~7.7 KB at
+    // 1080p) for the swap.
+    crate::hdmi_logic::flip_rgba_rows_in_place(&mut rgba, w, h);
     Ok((rgba, w, h))
 }
 
@@ -3391,11 +3770,65 @@ pub unsafe fn ensure_poster_cached(
     if let Some((replaced, _, _)) = outcome.replaced {
         gl.delete_texture(replaced);
     }
+    // judder-instrument (2026-06-22): visual fingerprint to
+    // correlate the poster against the first-displayed live
+    // incoming frame. qarl spotted a START-OF-INCOMING judder
+    // where the live video appears to start BEFORE the poster
+    // ("like it goes back in time"). His hypothesis is that
+    // the poster is NOT actually frame 0 (the safest backend
+    // assumption was ffmpeg -ss 0 = IDR), but rather a later
+    // or LAST frame -> backward jump. The fingerprint is 9
+    // pixel R-channel values sampled in a 3x3 grid. Cheap
+    // (~9 sample loads + log); compared against the Y-plane
+    // fingerprint logged from drain_one_capture_for_preload
+    // (frame 0, drained during preload) and from the first
+    // 2 live frames in bake_video_slide_to_current_fbo.
+    let fp = fingerprint_9_points(&rgba, w as usize * 4, w as usize, h as usize, 4);
     eprintln!(
-        "[perf] poster_cache_loaded slide_id={} dims={}x{} cache_len={}",
-        slide_id, w, h, session.poster_cache.len(),
+        "[perf] poster_cache_loaded slide_id={} dims={}x{} cache_len={} fp_r={:?}",
+        slide_id, w, h, session.poster_cache.len(), fp,
     );
     Ok(Some((tex, w, h)))
+}
+
+/// judder-instrument (2026-06-22): 9-sample pixel fingerprint for
+/// cross-frame visual identity. Samples 9 points in a 3x3 grid
+/// inset 16 px from each edge; returns the first byte of each
+/// sampled pixel (R channel for RGBA buffers, Y for NV12 Y planes).
+///
+/// `byte_stride` = bytes per row (e.g. w*4 for tightly-packed RGBA,
+/// kernel-reported stride for V4L2 Y planes).
+/// `bytes_per_pixel` = 4 for RGBA, 1 for Y plane.
+///
+/// Returns all-zeros if dims are too small or the buffer is too
+/// short. Intentionally cheap (~9 byte loads).
+pub fn fingerprint_9_points(
+    buf: &[u8],
+    byte_stride: usize,
+    w: usize,
+    h: usize,
+    bytes_per_pixel: usize,
+) -> [u8; 9] {
+    let mut out = [0u8; 9];
+    if w < 48 || h < 48 || byte_stride < w * bytes_per_pixel {
+        return out;
+    }
+    let inset = 16usize;
+    let cx = w / 2;
+    let cy = h / 2;
+    let xs = [inset, cx, w - inset - 1];
+    let ys = [inset, cy, h - inset - 1];
+    let mut idx = 0;
+    for &y in &ys {
+        for &x in &xs {
+            let byte_off = y * byte_stride + x * bytes_per_pixel;
+            if byte_off < buf.len() {
+                out[idx] = buf[byte_off];
+            }
+            idx += 1;
+        }
+    }
+    out
 }
 
 /// v1-spec-delta #8 (slice a, 2026-05-08) -- render an ImageSlide
@@ -3515,11 +3948,11 @@ pub fn render_video_slide_in_session(
         asset_path.display(),
         dem.width,
         dem.height,
-        dem.samples.len(),
+        dem.sample_count(),
     );
     for _frame in 0..total_frames {
         let frame_start = std::time::Instant::now();
-        if state.next_sample_idx >= dem.samples.len() {
+        if state.next_sample_idx >= dem.sample_count() {
             // Reached end of stream — re-feed SPS+PPS+IDR + sample[0]
             // to wrap. On failure (rare), bubble — the reel catches
             // and falls back to black-hold for remainder.
@@ -3530,7 +3963,7 @@ pub fn render_video_slide_in_session(
         paint_and_present_one_video_slide_frame(
             session,
             card,
-            &dem.samples,
+            &dem,
             &mut state.next_sample_idx,
             &mut state.frames_decoded,
             &state.decoder,
@@ -3690,6 +4123,16 @@ pub fn paint_and_present_one_frame_for_slide(
     _t_in_slide_ms: u64,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: free session-lifetime FBOs that
+    // aren't currently in use (scene_fbo when settings are
+    // identity, transition pair + scissored-bake atlas when idle
+    // > 5s). Reclaims ~24-40 MB CMA on long static-hold periods
+    // that previously held the FBOs through session teardown.
+    // Each FBO group is lazy-ensure (re-allocates on next use),
+    // so freeing is safe; the idle thresholds prevent churn.
+    // NOT called from paint_and_present_one_transition_frame —
+    // transition ticks stamp last_transition_fbo_use themselves.
+    unsafe { free_idle_session_fbos(session); }
     // QA-direct (2026-05-14 slide-boundary characterization slice):
     // OPENMARQUEE_BOUNDARY_TRACE=1 emits one JSON line per painted
     // frame to stderr with per-phase Instant deltas in microseconds.
@@ -3719,12 +4162,8 @@ pub fn paint_and_present_one_frame_for_slide(
     // slide_caches forces the next paint to re-layout; the cost is
     // bounded (uploads happen only on first encounter per codepoint
     // per session, so a few cache rebuilds per session at most).
-    let uploaded = session.dynamic_glyph_cache.poll_completions(
-        session.gl,
-        &mut session.dynamic_atlas_page_msdf,
-        &mut session.dynamic_atlas_page_colr,
-        4,
-    );
+    // CMA-arc 2026-06-21: wrap via poll_dynamic_glyph_completions.
+    let uploaded = poll_dynamic_glyph_completions(session, 4);
     if uploaded > 0 {
         let drained: Vec<_> = session.slide_caches.drain().collect();
         for (_id, entry) in drained {
@@ -3787,9 +4226,11 @@ pub fn paint_and_present_one_frame_for_slide(
             if let Some(old) = session.slide_caches.remove(&slide.id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session
-                .slide_caches
-                .insert(slide.id, SlideRenderCache::new(text_layers.len()));
+            slide_caches_insert(
+                session,
+                slide.id,
+                SlideRenderCache::new(text_layers.len()),
+            );
         }
     }
     let cache = session
@@ -3888,22 +4329,8 @@ pub fn paint_and_present_one_frame_for_slide(
         return Err(e);
     }
 
-    // commit_fb's drain confirmed kernel switched to scanout_
-    // current (the previous frame's commit). scanout_prev (the
-    // frame before that) is now safe to free.
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    // Shift: current → prev. Then store new as current.
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "text");
     let t_end = if trace { Some(std::time::Instant::now()) } else { None };
     crate::profile::record_phase(
         "paint_present",
@@ -3972,12 +4399,17 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     fonts: Option<&FontCatalog>,
     content_root: Option<&Path>,
     _t_in_slide_ms: u64,
-    samples: &[crate::mp4_demux::Sample],
+    demuxer: &crate::mp4_demux::Mp4Demuxer,
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: same idle-FBO free as the
+    // text-only path. Wedge + video-only test reels never exercise
+    // the text-slide hold path, so this call site is load-bearing
+    // for the wedge-reel A/B.
+    unsafe { free_idle_session_fbos(session); }
     // r61 Phase B (2026-06-04): first-frame paint breakdown for the
     // text-over-video hot path. r58 + r57 shaved most of the
     // pre-transition stall; the residual gap qarl can still see is
@@ -4001,12 +4433,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // Same glyph-cache poll + slide-cache invalidation cascade as
     // paint_and_present_one_frame_for_slide. Keeps text-layer
     // rasterization in step with worker-pool completions.
-    let uploaded = session.dynamic_glyph_cache.poll_completions(
-        session.gl,
-        &mut session.dynamic_atlas_page_msdf,
-        &mut session.dynamic_atlas_page_colr,
-        4,
-    );
+    // CMA-arc 2026-06-21: wrap via poll_dynamic_glyph_completions.
+    let uploaded = poll_dynamic_glyph_completions(session, 4);
     if uploaded > 0 {
         let drained: Vec<_> = session.slide_caches.drain().collect();
         for (_id, entry) in drained {
@@ -4063,9 +4491,11 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             if let Some(old) = session.slide_caches.remove(&slide.id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session
-                .slide_caches
-                .insert(slide.id, SlideRenderCache::new(text_layers.len()));
+            slide_caches_insert(
+                session,
+                slide.id,
+                SlideRenderCache::new(text_layers.len()),
+            );
         }
     }
     crate::profile::record_phase(
@@ -4192,18 +4622,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
             drop(new_bo);
             return Err(e);
         }
-        if let Some(fb) = session.scanout_prev_fb.take() {
-            if let Err(e) = card.destroy_framebuffer(fb) {
-                eprintln!("warn: destroy_framebuffer(scanout_prev, text-over-video cached): {e}");
-            }
-        }
-        if let Some(bo) = session.scanout_prev_bo.take() {
-            drop(bo);
-        }
-        session.scanout_prev_fb = session.scanout_current_fb.take();
-        session.scanout_prev_bo = session.scanout_current_bo.take();
-        session.scanout_current_bo = Some(new_bo);
-        session.scanout_current_fb = Some(new_fb);
+        // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+        rotate_scanout_3_deep(session, card, new_bo, new_fb, "text_over_video_cached");
         let scanout_us = t_scanout.elapsed().as_micros();
 
         // Mark frame so subsequent ticks use live path.
@@ -4239,7 +4659,7 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     let painted = unsafe {
         bake_video_slide_to_current_fbo(
             session,
-            samples,
+            demuxer,
             next_sample_idx,
             frames_decoded,
             decoder,
@@ -4447,18 +4867,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev, text-over-video): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "text_over_video");
     // r61 Phase B: scanout_us = wall time of the swap+lock+addFB+
     // commit sequence (the canonical 11-step release contract per
     // qa/r38b §2). On a busy CMA pool the lock_front_buffer +
@@ -4509,6 +4919,11 @@ pub fn paint_and_present_one_image_slide_frame(
     content_root: &Path,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: idle-free FBOs at image-slide
+    // hold entry. Image-only reels never touch the text-slide
+    // path so this is needed to actually trigger the ~40 MB
+    // reclaim on image-heavy reels.
+    unsafe { free_idle_session_fbos(session); }
     // perf-night r2 (2026-05-26): bake/compose/present sub-phase
     // wraps. Image bake = PNG decode + texture upload (cold) or
     // texture-cache hit (warm); compose = blit to FBO + present pass;
@@ -4612,18 +5027,8 @@ pub fn paint_and_present_one_image_slide_frame(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev, image_slide): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "image");
     crate::profile::record_phase(
         "paint_present",
         t_phase.elapsed().as_nanos() as u64,
@@ -4651,6 +5056,9 @@ pub fn paint_and_present_external_frame(
     frame_h: u32,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: idle-free at external-frame hold
+    // entry (STREAM/VLC RGB push path).
+    unsafe { free_idle_session_fbos(session); }
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // Non-identity brightness/gamma routes through the scene FBO +
@@ -4721,18 +5129,8 @@ pub fn paint_and_present_external_frame(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev, external_frame): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "external");
     Ok(())
 }
 
@@ -4758,6 +5156,9 @@ pub fn paint_and_present_external_nv12_frame(
     frame_h: u32,
 ) -> Result<()> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: idle-free at external-NV12 hold
+    // entry (STREAM/VLC HW-decode NV12 push path).
+    unsafe { free_idle_session_fbos(session); }
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // Non-identity brightness/gamma OR non-zero rotation routes
@@ -4827,18 +5228,8 @@ pub fn paint_and_present_external_nv12_frame(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev, external_nv12): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "external_nv12");
     Ok(())
 }
 
@@ -4868,11 +5259,18 @@ pub fn paint_and_present_external_nv12_frame(
 pub fn paint_and_present_one_video_slide_frame(
     session: &mut EglSession,
     card: &Card,
-    samples: &[crate::mp4_demux::Sample],
+    demuxer: &crate::mp4_demux::Mp4Demuxer,
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
 ) -> Result<()> {
+    // CMA-arc 2026-06-22 RANK 3: idle-free at video-slide hold
+    // entry. THIS IS THE WEDGE-REEL PATH (3-video crossfade
+    // reel) — per QA the wedge reel never invokes the text-slide
+    // path, so the original RANK 3 commit's free helper never
+    // fired on the wedge-reel A/B. Adding here lights the
+    // reclaim where the test reel exercises it.
+    unsafe { free_idle_session_fbos(session); }
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // V4L2 piece 4f first-frame profile gate. profile_first is
@@ -4926,7 +5324,7 @@ pub fn paint_and_present_one_video_slide_frame(
     let painted = unsafe {
         bake_video_slide_to_current_fbo(
             session,
-            samples,
+            demuxer,
             next_sample_idx,
             frames_decoded,
             decoder,
@@ -5034,18 +5432,8 @@ fn finish_video_slide_swap_and_commit(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev, video_slide): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "video");
     Ok(())
 }
 
@@ -5390,6 +5778,35 @@ pub fn paint_and_present_one_transition_frame(
         }
     }
 
+    // Snapshot-side-A Commit 2 (2026-06-21): tighter eligibility
+    // than C1's is_dual_video. Endpoint A must be PLAIN Video --
+    // TextOverVideo on side A would freeze text into the still
+    // (the existing poster fast-path's "text is GL-cheap, MUST
+    // NOT be frozen into the poster" contract; we honor the same
+    // rule for the runtime snapshot). Endpoint B can be any
+    // video-bearing kind (the bypass only frees side A's HW
+    // decoder; side B is unaffected). Single-decoder transitions
+    // (text<->video, image<->video) take other arms entirely.
+    //
+    // Defensive entry free belt-and-suspenders: ipc_main hooks
+    // (BeginSlide / BeginTransition / Advance-after-Slide-paint)
+    // are the authoritative free sites. This catches the rare
+    // case where a non-snapshot-eligible transition fires
+    // without an intervening Advance-Slide-paint to clear a
+    // stale still (e.g. back-to-back BeginTransition without an
+    // intervening Slide hold -- BeginTransition handler frees
+    // anyway, so this is theoretically dead, but cheap).
+    let snapshot_eligible = matches!(
+        &endpoint_a,
+        TransitionEndpoint::Video { .. }
+    ) && matches!(
+        &endpoint_b,
+        TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
+    );
+    if !snapshot_eligible {
+        free_transition_still_a_tex(session);
+    }
+
     // Ok(true) = transition frame painted + ready to present;
     // Ok(false) = FYS bug C skip (a video endpoint had no frame
     // ready this tick) — caller skips the swap+commit.
@@ -5432,19 +5849,19 @@ pub fn paint_and_present_one_transition_frame(
                 }
             }
             TransitionEndpoint::Video {
-                samples,
+                demuxer,
                 next_sample_idx,
                 frames_decoded,
                 decoder,
                 ..
             } => SlideBakeInputs::Video {
-                samples: *samples,
+                demuxer: *demuxer,
                 next_sample_idx: &mut **next_sample_idx,
                 frames_decoded: &mut **frames_decoded,
                 decoder: *decoder,
             },
             TransitionEndpoint::TextOverVideo {
-                bg_samples,
+                bg_demuxer,
                 bg_next_sample_idx,
                 bg_frames_decoded,
                 bg_decoder,
@@ -5457,7 +5874,7 @@ pub fn paint_and_present_one_transition_frame(
                     slide_id: *id,
                     text_layers: layers,
                     motion_states: Some(states),
-                    bg_samples: *bg_samples,
+                    bg_demuxer: *bg_demuxer,
                     bg_next_sample_idx: &mut **bg_next_sample_idx,
                     bg_frames_decoded: &mut **bg_frames_decoded,
                     bg_decoder: *bg_decoder,
@@ -5516,7 +5933,47 @@ pub fn paint_and_present_one_transition_frame(
         // poster (text is GL-cheap, MUST NOT be frozen into the
         // poster — poster represents only what the V4L2 decoder
         // would have produced).
-        let use_poster_a_now = use_poster_a && cached_pair_a.is_some();
+        // Snapshot-side-A Commit 2.2 (2026-06-21): snapshot
+        // OVERRIDES poster for the OUTGOING side. QA glass
+        // attempt #1 confirmed `[perf] snapshot_side_a_
+        // captured` never fired on the all-stock reel because
+        // r110 c3.2.2's poster fast-path preempted snapshot
+        // for every postered video.
+        //
+        // Per QA's design question (c) -- the correct
+        // resolution: r110's "poster is pixel-identical to
+        // first frame" contract applies to INCOMING (side B
+        // hasn't seen any frame yet; poster ≈ first live
+        // frame ≈ what the user is about to see). For
+        // OUTGOING (side A has been playing for the entire
+        // hold; user just saw frame N of the clip), sourcing
+        // the poster JUMPS visibly to frame 0 at fade start.
+        // Snapshot captures the actual current frame, freezing
+        // at the user-visible moment -- strictly better UX.
+        //
+        // Precedence is therefore A-side-asymmetric:
+        //   - OUTGOING (A): snapshot > live-decode. Poster is
+        //     IGNORED when snapshot_eligible.
+        //   - INCOMING (B): poster > live-decode (UNCHANGED;
+        //     side-B preserves r110 c3.2.2's frozen-entry
+        //     contract verbatim).
+        //
+        // Resource cost: +1 V4L2 feed on tick 1 vs the all-
+        // poster path (live-decode of A once to produce the
+        // capture source). Ticks 2..N have zero A-side
+        // V4L2 feeds (snapshot blit). r97 deferred-preload +
+        // side-B Path B retry still active as the ceiling
+        // guard + cold-start fallback.
+        let use_still_a_now = snapshot_eligible
+            && cached_pair_a.is_some()
+            && session.transition_still_a_tex.is_some();
+        // Poster on A is suppressed when snapshot_eligible
+        // (snapshot is the strictly-better source for
+        // outgoing). Non-eligible cases (e.g. TextOverVideo
+        // on A) keep the existing poster path verbatim.
+        let use_poster_a_now = use_poster_a
+            && cached_pair_a.is_some()
+            && !snapshot_eligible;
         let (fbo_a, tex_a) = if use_poster_a_now {
             let (poster_tex, poster_w, poster_h) = poster_a_texture.expect("guarded above");
             let (fbo, tex) = cached_pair_a.expect("guarded above");
@@ -5525,7 +5982,17 @@ pub fn paint_and_present_one_transition_frame(
             session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
             session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
             session.gl.clear(glow::COLOR_BUFFER_BIT);
-            run_blit_pass(session.gl, poster_tex)?;
+            // poster-fit (2026-06-22): cover-fit the poster's
+            // native dims onto the panel, mirroring how
+            // bake_video_slide_to_current_fbo aspect-preserves
+            // live video frames. Pre-fix the poster used the
+            // shared fullscreen quad (STRETCH), which on glass
+            // showed a visibly-mis-sized frozen entry vs how
+            // the live video plays. Now identical fit.
+            let cover_vbo = cover_quad_vbo(
+                session.gl, poster_w, poster_h, mode_w_u32, mode_h_u32,
+            )?;
+            run_blit_pass_quad(session.gl, poster_tex, cover_vbo)?;
             // TextOverVideo: composite text live on top.
             if endpoint_a_is_text_over_video {
                 if let Some((slide_id, layers, motion_states)) = text_over_video_a.as_ref() {
@@ -5539,7 +6006,7 @@ pub fn paint_and_present_one_transition_frame(
                         if let Some(old) = session.slide_caches.remove(&slide_id) {
                             free_slide_render_cache(session.gl, old);
                         }
-                        session.slide_caches.insert(slide_id, SlideRenderCache::new(layers_len));
+                        slide_caches_insert(session, slide_id, SlideRenderCache::new(layers_len));
                     }
                     let runtime_glyph_ctx = Some(crate::glyph_cache::RuntimeGlyphCtx {
                         cache: &session.dynamic_glyph_cache,
@@ -5585,6 +6052,20 @@ pub fn paint_and_present_one_transition_frame(
                 poster_w >= 1920 || poster_h >= 1080,
             );
             (fbo, tex)
+        } else if use_still_a_now {
+            // Snapshot-side-A Commit 2 (2026-06-21): runtime-
+            // captured still bypass. fbo_a is the cached side-A
+            // pair filled by blitting the still tex. Outgoing
+            // decoder is NOT fed this tick — that's the fix.
+            let still_tex = session.transition_still_a_tex.expect("guarded above");
+            let (fbo, tex) = cached_pair_a.expect("guarded above");
+            use glow::HasContext;
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
+            session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            session.gl.clear(glow::COLOR_BUFFER_BIT);
+            run_blit_pass(session.gl, still_tex)?;
+            (fbo, tex)
         } else {
             let Some((fa, ta)) = bake_slide_to_fbo(session, mode_w_u32, mode_h_u32, cached_pair_a, inputs_a)?
             else {
@@ -5595,6 +6076,85 @@ pub fn paint_and_present_one_transition_frame(
             };
             (fa, ta)
         };
+        // Snapshot-side-A Commit 2.2 (2026-06-21): capture the
+        // freshly-baked side-A frame into transition_still_a_tex
+        // on the FIRST tick of a snapshot-eligible transition.
+        // We don't need the !use_poster_a_now gate anymore --
+        // snapshot_eligible already suppresses use_poster_a_now
+        // via the precedence flip above, so when this site
+        // runs with snapshot_eligible=true, fbo_a came from
+        // live-decode (not poster). Capture is one-shot per
+        // transition; ticks 2..N find still.is_some() and
+        // consume via use_still_a_now (no more bake_video on
+        // side A).
+        //
+        // GLES2-safe FRAMEBUFFER bind (READ_FRAMEBUFFER is
+        // GLES3-only and would silently error here).
+        //
+        // Frees: BeginSlide / BeginTransition / Advance-after-
+        // Slide-paint hooks in ipc_main.rs handle lifecycle.
+        if snapshot_eligible
+            && cached_pair_a.is_some()
+            && session.transition_still_a_tex.is_none()
+        {
+            let dest_tex = session.gl.create_texture()
+                .map_err(|e| anyhow!("snapshot-side-A create_texture: {e}"))?;
+            session.gl.bind_texture(glow::TEXTURE_2D, Some(dest_tex));
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
+            );
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32,
+            );
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32,
+            );
+            session.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32,
+            );
+            // Explicit bind: bake_slide_to_fbo's inner helpers
+            // may leave the binding at default. GLES2 uses
+            // FRAMEBUFFER as the single bind point (READ_/DRAW_
+            // are GLES3-only).
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo_a));
+            session.gl.copy_tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA,
+                0, 0, mode_w_u32 as i32, mode_h_u32 as i32, 0,
+            );
+            session.gl.bind_texture(glow::TEXTURE_2D, None);
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.transition_still_a_tex = Some(dest_tex);
+            eprintln!(
+                "[perf] snapshot_side_a_captured progress={:.3} dims={}x{}",
+                progress, mode_w_u32, mode_h_u32,
+            );
+            // CMA R2-RANK5 (2026-06-22): with the snapshot
+            // committed, endpoint_a's decoder will sit allocated-
+            // but-parked for the rest of the fade (snapshot-side-A
+            // contract: no more bake_video on side A). Its 1-4
+            // cached DMABUF EGLImages (~3MB each via Mesa+vc4)
+            // are now dead weight pinning kernel dmabuf refs.
+            // Proactively destroy them; the decoder stays alive
+            // (LRU may keep it primed for a same-clip wrap
+            // around, or a future transition-cancel could
+            // resume feeding). If we ever DO need EGLImages
+            // again, get_or_init_egl_image lazy-recreates on
+            // demand. Per QA RANK 5 framing: "free before bake_b
+            // instead of waiting on Arc refcount" -- timing
+            // arrives ~bake_b boundary, exactly the CMA-peak
+            // moment.
+            //
+            // snapshot_eligible guarantees endpoint_a is plain
+            // Video, so a Video destructure is total. Subagent
+            // BLOCKER avoidance: borrow endpoint_a IMMUTABLY
+            // (`&endpoint_a`) — the prior `&mut endpoint_a`
+            // borrow ended at the inputs_a match (the bake call
+            // released the inner reborrows), so a fresh `&`
+            // borrow is fine here.
+            if let TransitionEndpoint::Video { decoder, .. } = &endpoint_a {
+                decoder.unpin_egl_refs();
+            }
+        }
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
         //
         // r80-r92 tried to PRE-PROVIDE endpoint_b's first frame at
@@ -5691,7 +6251,15 @@ pub fn paint_and_present_one_transition_frame(
             session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
             session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
             session.gl.clear(glow::COLOR_BUFFER_BIT);
-            run_blit_pass(session.gl, poster_tex)?;
+            // poster-fit (2026-06-22): see use_poster_a_now
+            // branch for rationale. Same cover-fit fix on the
+            // INCOMING side -- this is the path qarl directly
+            // observed mis-sized (frozen-entry placeholder
+            // before B's live decoder produces frame 0).
+            let cover_vbo = cover_quad_vbo(
+                session.gl, poster_w, poster_h, mode_w_u32, mode_h_u32,
+            )?;
+            run_blit_pass_quad(session.gl, poster_tex, cover_vbo)?;
             if matches!(&endpoint_b, TransitionEndpoint::TextOverVideo { .. }) {
                 if let Some((slide_id, layers, motion_states)) = text_over_video_b.as_ref() {
                     let slide_id = *slide_id;
@@ -5704,7 +6272,7 @@ pub fn paint_and_present_one_transition_frame(
                         if let Some(old) = session.slide_caches.remove(&slide_id) {
                             free_slide_render_cache(session.gl, old);
                         }
-                        session.slide_caches.insert(slide_id, SlideRenderCache::new(layers_len));
+                        slide_caches_insert(session, slide_id, SlideRenderCache::new(layers_len));
                     }
                     let runtime_glyph_ctx = Some(crate::glyph_cache::RuntimeGlyphCtx {
                         cache: &session.dynamic_glyph_cache,
@@ -5765,19 +6333,19 @@ pub fn paint_and_present_one_transition_frame(
                     }
                 }
                 TransitionEndpoint::Video {
-                    samples,
+                    demuxer,
                     next_sample_idx,
                     frames_decoded,
                     decoder,
                     ..
                 } => SlideBakeInputs::Video {
-                    samples: *samples,
+                    demuxer: *demuxer,
                     next_sample_idx: &mut **next_sample_idx,
                     frames_decoded: &mut **frames_decoded,
                     decoder: *decoder,
                 },
                 TransitionEndpoint::TextOverVideo {
-                    bg_samples,
+                    bg_demuxer,
                     bg_next_sample_idx,
                     bg_frames_decoded,
                     bg_decoder,
@@ -5790,7 +6358,7 @@ pub fn paint_and_present_one_transition_frame(
                         slide_id: *id,
                         text_layers: layers,
                         motion_states: Some(states),
-                        bg_samples: *bg_samples,
+                        bg_demuxer: *bg_demuxer,
                         bg_next_sample_idx: &mut **bg_next_sample_idx,
                         bg_frames_decoded: &mut **bg_frames_decoded,
                         bg_decoder: *bg_decoder,
@@ -5831,19 +6399,19 @@ pub fn paint_and_present_one_transition_frame(
                     let iter_ok = bake_b_iterations < PATH_B_MAX_ITERS;
                     let samples_remaining_ok = match &endpoint_b {
                         TransitionEndpoint::Video {
-                            samples,
+                            demuxer,
                             next_sample_idx,
                             ..
                         }
                         | TransitionEndpoint::TextOverVideo {
-                            bg_samples: samples,
+                            bg_demuxer: demuxer,
                             bg_next_sample_idx: next_sample_idx,
                             ..
                         } => {
                             // Next bake_video call advances by 1; we
-                            // need samples[idx] to exist for the
+                            // need sample(idx) to be in range for the
                             // upcoming iteration without wrap.
-                            **next_sample_idx < samples.len()
+                            **next_sample_idx < demuxer.sample_count()
                         }
                         _ => true, // Text/Image never returns None
                     };
@@ -6139,18 +6707,8 @@ pub fn paint_and_present_one_transition_frame(
         drop(new_bo);
         return Err(e);
     }
-    if let Some(fb) = session.scanout_prev_fb.take() {
-        if let Err(e) = card.destroy_framebuffer(fb) {
-            eprintln!("warn: destroy_framebuffer(scanout_prev): {e}");
-        }
-    }
-    if let Some(bo) = session.scanout_prev_bo.take() {
-        drop(bo);
-    }
-    session.scanout_prev_fb = session.scanout_current_fb.take();
-    session.scanout_prev_bo = session.scanout_current_bo.take();
-    session.scanout_current_bo = Some(new_bo);
-    session.scanout_current_fb = Some(new_fb);
+    // Flip-race fix D (2026-06-22): 3-deep scanout rotation.
+    rotate_scanout_3_deep(session, card, new_bo, new_fb, "transition");
     // r102.1: last-tick probe. progress > 0.95 catches the final
     // 2-3 ticks; QA sums the entry/exit delta across N transitions
     // to confirm or refute candidate #1.
@@ -6198,7 +6756,10 @@ pub enum TransitionEndpoint<'a> {
     /// variant — adding it back would just produce a dead-code
     /// warning.
     Video {
-        samples: &'a [crate::mp4_demux::Sample],
+        // CMA #1 (2026-06-21): demuxer ref replaces the pre-loaded
+        // samples slice. bake helpers call demuxer.sample(i) on
+        // demand (pread + owned Vec, dropped per-tick).
+        demuxer: &'a crate::mp4_demux::Mp4Demuxer,
         next_sample_idx: &'a mut usize,
         frames_decoded: &'a mut usize,
         decoder: &'a crate::v4l2::Decoder,
@@ -6217,7 +6778,9 @@ pub enum TransitionEndpoint<'a> {
     /// `background_video_slide_id`, NOT the text slide id itself).
     TextOverVideo {
         text_slide: &'a crate::content::TextSlide,
-        bg_samples: &'a [crate::mp4_demux::Sample],
+        // CMA #1 (2026-06-21): bg_demuxer ref replaces bg_samples
+        // slice. Same on-demand pread pattern as Video variant.
+        bg_demuxer: &'a crate::mp4_demux::Mp4Demuxer,
         bg_next_sample_idx: &'a mut usize,
         bg_frames_decoded: &'a mut usize,
         bg_decoder: &'a crate::v4l2::Decoder,
@@ -6398,7 +6961,7 @@ pub fn capture_sb_transition_mid_to_png(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                slide_caches_insert(session, sid, SlideRenderCache::new(n));
             }
         }
 
@@ -7243,12 +7806,9 @@ pub fn capture_slide_to_png(
             let deadline = std::time::Instant::now()
                 + std::time::Duration::from_millis(800);
             while std::time::Instant::now() < deadline {
-                let _n = session.dynamic_glyph_cache.poll_completions(
-                    session.gl,
-                    &mut session.dynamic_atlas_page_msdf,
-                    &mut session.dynamic_atlas_page_colr,
-                    4,
-                );
+                // CMA-arc 2026-06-21: wrap via
+                // poll_dynamic_glyph_completions.
+                let _n = poll_dynamic_glyph_completions(session, 4);
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
@@ -7442,8 +8002,9 @@ impl<'a> EglSession<'a> {
         let freed_bg = self.image_bg_cache.len();
         let freed_slide = self.image_slide_tex_cache.len();
         // r110 stage 3 commit 3.1: also evict the poster cache
-        // on CMA pressure events. ~12 MB at 4 1080p entries —
-        // worth reclaiming alongside the image caches when the
+        // on CMA pressure events. CMA-arc 2026-06-21 C2: cap is
+        // 2 = ~17 MB worst-case at 1080p RGBA (8.3 MB/entry).
+        // Worth reclaiming alongside the image caches when the
         // r46 mitigation fires.
         let freed_poster = self.poster_cache.len();
         for (_path, (tex, _, _)) in self.image_bg_cache.drain() {
@@ -7583,6 +8144,103 @@ unsafe fn ensure_scene_fbo(session: &mut EglSession, w: u32, h: u32) -> Result<(
     Ok((fbo, tex))
 }
 
+/// CMA-arc 2026-06-22 RANK 3: free session-lifetime FBO state
+/// that's not currently in use. Pre-RANK-3 these were allocated
+/// on first need + held through every static-slide hold + only
+/// freed at session teardown — so a reel that briefly hit a
+/// non-identity setting OR did one scissored-bake transition
+/// would pin ~24-40 MB CMA for the rest of the session.
+///
+/// All three FBO groups are lazy-ensure (re-allocate automatically
+/// on next use), so freeing them is safe. The transition pair +
+/// scissored-bake atlas are gated on an idle threshold to avoid
+/// freeing-and-realloc churn during active transitions; the
+/// scene_fbo is freed immediately when settings return to identity
+/// + rotation==0 (the precondition that made scene_fbo unnecessary
+/// in the first place per its docstring).
+///
+/// Called at the top of `paint_and_present_one_frame_for_slide`
+/// (static-hold path). NOT called from
+/// `paint_and_present_one_transition_frame` — transition ticks
+/// stamp `last_transition_fbo_use` themselves; freeing at the top
+/// of a transition tick would just immediately re-allocate.
+#[cfg(target_os = "linux")]
+unsafe fn free_idle_session_fbos(session: &mut EglSession<'_>) {
+    use glow::HasContext;
+    // Settings returned to identity + rotation==0 → scene_fbo is
+    // no longer wired into the render path. Free immediately.
+    // The next non-identity frame re-allocates lazily via
+    // ensure_scene_fbo. Settings + rotation churn between identity
+    // and non-identity per frame would cause alloc/free churn —
+    // unrealistic for operator-driven settings; documented assumption.
+    if session.current_settings.is_color_identity() && session.rotation == 0 {
+        if let Some(fbo) = session.scene_fbo.take() {
+            session.gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.scene_tex.take() {
+            session.gl.delete_texture(tex);
+        }
+    }
+
+    // 5 seconds gives reels with back-to-back transitions a wide
+    // margin against churn; a reel that's actively crossfading
+    // re-stamps `last_transition_fbo_use` every tick well within
+    // this window. A reel that goes back to a long static hold
+    // reclaims after 5s.
+    const IDLE_FBO_THRESHOLD: std::time::Duration =
+        std::time::Duration::from_secs(5);
+    let now = std::time::Instant::now();
+
+    // Transition pair (a+b FBOs + textures) + the snapshot-side-A
+    // captured still texture. The pair shares dims via
+    // transition_fbo_dims; reset that sentinel alongside the
+    // free so the next ensure_transition_fbo_pair sees a fresh
+    // cache.
+    let transition_idle = session
+        .last_transition_fbo_use
+        .map_or(true, |t| now.duration_since(t) > IDLE_FBO_THRESHOLD);
+    let transition_holds_state =
+        session.transition_fbo_a.is_some()
+            || session.transition_fbo_b.is_some()
+            || session.transition_still_a_tex.is_some();
+    if transition_idle && transition_holds_state {
+        if let Some(fbo) = session.transition_fbo_a.take() {
+            session.gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.transition_tex_a.take() {
+            session.gl.delete_texture(tex);
+        }
+        if let Some(fbo) = session.transition_fbo_b.take() {
+            session.gl.delete_framebuffer(fbo);
+        }
+        if let Some(tex) = session.transition_tex_b.take() {
+            session.gl.delete_texture(tex);
+        }
+        if let Some(tex) = session.transition_still_a_tex.take() {
+            session.gl.delete_texture(tex);
+        }
+        session.transition_fbo_dims = None;
+        // Don't clear `last_transition_fbo_use` — the next ensure
+        // call will re-stamp; leaving the stale stamp is fine
+        // because the gate above is "older than threshold," not
+        // an is_some / is_none check.
+    }
+
+    // Scissored-bake atlas (2048×2048 RGBA = ~16 MB CMA). Only
+    // exercised by `transition_eligible_for_scissored_bake`
+    // transitions (text-heavy paths). Hold-only or non-eligible-
+    // transition reels reclaim after the idle threshold.
+    let bake_idle = session
+        .last_scissored_bake_use
+        .map_or(true, |t| now.duration_since(t) > IDLE_FBO_THRESHOLD);
+    if bake_idle {
+        if let Some((fbo, tex)) = session.scissored_bake_atlas.take() {
+            session.gl.delete_framebuffer(fbo);
+            session.gl.delete_texture(tex);
+        }
+    }
+}
+
 /// r102.2 (2026-06-09): per-side identifier for the cached
 /// transition FBO+tex pair. The transition shader samples both
 /// endpoints simultaneously, so the cache holds two slots --
@@ -7614,6 +8272,12 @@ unsafe fn ensure_transition_fbo_pair(
     h: u32,
 ) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: stamp every transition-tick use so
+    // free_idle_session_fbos knows the pair is currently active.
+    // Stamping at the TOP (before the dims-change-rebuild branch
+    // and the cache-hit return) covers both fresh allocs and warm
+    // re-uses.
+    session.last_transition_fbo_use = Some(std::time::Instant::now());
     let dims_changed = match session.transition_fbo_dims {
         Some((cw, ch)) => cw != w || ch != h,
         None => false,
@@ -7632,6 +8296,20 @@ unsafe fn ensure_transition_fbo_pair(
             session.gl.delete_framebuffer(fbo);
         }
         if let Some(tex) = session.transition_tex_b.take() {
+            session.gl.delete_texture(tex);
+        }
+        // Snapshot-side-A Commit 2.1 (2026-06-21): invalidate
+        // the captured still on mid-fade dims change too. A
+        // stale-dims still would blit at old dims into the new-
+        // dims fbo_a via run_blit_pass -> stretched frozen
+        // frame + orphaned-tex leak until the next free hook.
+        // Rare (mode change during ~1s fade -- HDMI hot-plug
+        // or rotation flip) + cosmetic but a correctness gap
+        // QA flagged on independent review. Inline take +
+        // delete mirrors the fbo/tex pattern above; can't call
+        // the free helper because we already hold &mut to
+        // session.gl via the surrounding context.
+        if let Some(tex) = session.transition_still_a_tex.take() {
             session.gl.delete_texture(tex);
         }
         session.transition_fbo_dims = None;
@@ -7656,6 +8334,26 @@ unsafe fn ensure_transition_fbo_pair(
     *slot_fbo = Some(fbo);
     *slot_tex = Some(tex);
     Ok((fbo, tex))
+}
+
+/// Snapshot-side-A Commit 2 (2026-06-21): free the captured
+/// outgoing-video still texture. Called from the ipc_main.rs
+/// BeginSlide handler, BeginTransition handler, and the
+/// Advance dispatcher when paint_kind != Transition (i.e. a
+/// transition just ended or no transition is in flight).
+///
+/// Idempotent: a None.take() is a no-op, so the per-Advance
+/// call costs ~1ns in steady state outside transitions.
+///
+/// Caller must hold the EGL context current (true for all 3
+/// callsites — IPC main thread owns the context).
+pub fn free_transition_still_a_tex(session: &mut EglSession) {
+    if let Some(tex) = session.transition_still_a_tex.take() {
+        unsafe {
+            use glow::HasContext;
+            session.gl.delete_texture(tex);
+        }
+    }
 }
 
 /// r102.2 (2026-06-09): branch-level "reuse or allocate" helper
@@ -8037,9 +8735,17 @@ unsafe fn cover_quad_vbo(
 /// FYS bug 5 -- the rotation-aware present pass. Blits the logical
 /// scene FBO texture to the bound (panel-native) framebuffer,
 /// applying brightness/gamma AND the display rotation in a single
-/// fullscreen blit. Reuses the FS_BRIGHT_GAMMA program (so identity
-/// brightness/gamma is still correct); the rotation is baked into
-/// the quad's vertex positions (see `present_quad_verts`).
+/// fullscreen blit. Rotation is baked into the quad's vertex
+/// positions (see `present_quad_verts`).
+///
+/// FPS arc cheap win #1 (2026-06-22): dispatches to FS_BLIT (pure
+/// passthrough) when brightness == 1.0 AND gamma == 1.0 — the
+/// common production case (default settings + video path's
+/// hardcoded 1.0,1.0). Avoids the per-pixel clamp+pow in
+/// FS_BRIGHT_GAMMA which produces identical pixels for identity
+/// transforms. Non-identity callers (operator-applied brightness/
+/// gamma) still go through FS_BRIGHT_GAMMA with the real
+/// tonemapping. Pixel-bit-identical for the fast path.
 ///
 /// Caller is responsible for binding the default framebuffer and
 /// setting the viewport to the PHYSICAL panel dims before calling.
@@ -8053,8 +8759,49 @@ unsafe fn run_present_pass(
     rotation: i32,
 ) -> Result<()> {
     use glow::HasContext;
-    let cgp = cached_bright_gamma_program(gl)?;
+    // FPS arc cheap win #1 (2026-06-22): bypass FS_BRIGHT_GAMMA's
+    // per-pixel clamp+pow when brightness=gamma=1.0 (identity color
+    // settings AND identity gamma). The video present path passes
+    // hardcoded (1.0, 1.0) — every pixel every frame ran the pow
+    // for zero visual difference. Prod gamma is also 1.0 by
+    // default. Switching to FS_BLIT (cached_blit_program) removes
+    // the pow + clamp from the per-pixel inner loop.
+    //
+    // Rotation is encoded in present_quad_vbo's vertex positions,
+    // not the fragment shader, so the blit shader preserves it
+    // verbatim. Zero visual change for the identity case; biggest
+    // FPS win per QA's profiling read (Pass2 of every video frame).
+    //
+    // Non-identity (settings panel applied a tint or gamma): fall
+    // through to FS_BRIGHT_GAMMA which has the actual tonemapping.
+    // `is_color_identity()` lives on the settings type; here we
+    // approximate with float-equality on the canonical "no
+    // transform" values (1.0, 1.0). Tolerance is intentional: the
+    // settings API stores brightness as u8 percentage, gamma as
+    // float; both are explicit values, not computed, so float-eq
+    // is correct here. A future regression where someone passes
+    // 1.000001 would fall through to FS_BRIGHT_GAMMA (= the
+    // pre-fix path, no functional regression).
+    let identity = brightness == 1.0 && gamma == 1.0;
     let vbo = present_quad_vbo(gl, rotation)?;
+    if identity {
+        let cbp = cached_blit_program(gl)?;
+        gl.use_program(Some(cbp.program));
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
+        gl.uniform_1_i32(cbp.u_src.as_ref(), 0);
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.enable_vertex_attrib_array(cbp.a_pos);
+        gl.vertex_attrib_pointer_f32(cbp.a_pos, 2, glow::FLOAT, false, 16, 0);
+        gl.enable_vertex_attrib_array(cbp.a_uv);
+        gl.vertex_attrib_pointer_f32(cbp.a_uv, 2, glow::FLOAT, false, 16, 8);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.disable_vertex_attrib_array(cbp.a_pos);
+        gl.disable_vertex_attrib_array(cbp.a_uv);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        return Ok(());
+    }
+    let cgp = cached_bright_gamma_program(gl)?;
     gl.use_program(Some(cgp.program));
     gl.active_texture(glow::TEXTURE0);
     gl.bind_texture(glow::TEXTURE_2D, Some(src_tex));
@@ -8694,7 +9441,7 @@ unsafe fn bake_external_nv12_to_current_fbo(
 #[cfg(target_os = "linux")]
 unsafe fn bake_video_slide_to_current_fbo(
     session: &mut EglSession,
-    samples: &[crate::mp4_demux::Sample],
+    demuxer: &crate::mp4_demux::Mp4Demuxer,
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
@@ -8728,12 +9475,13 @@ unsafe fn bake_video_slide_to_current_fbo(
     // retains the SPS/PPS fed at priming (it decoded every
     // mid-stream P/B sample off that same SPS/PPS), so a bare IDR
     // is a valid in-stream refresh point — no flush/reinit needed.
-    if samples.is_empty() {
+    let sample_count = demuxer.sample_count();
+    if sample_count == 0 {
         // Defensive: prime_video_decoder bails on a zero-sample
         // MP4, so a decoder with no samples shouldn't reach here.
         return Ok(None);
     }
-    if *next_sample_idx >= samples.len() {
+    if *next_sample_idx >= sample_count {
         *next_sample_idx = 0;
         // r46.3 (2026-06-02): the wrap-at-bake handler stays as the
         // minimal "wrap back to sample 0" pattern. The actual
@@ -8741,17 +9489,22 @@ unsafe fn bake_video_slide_to_current_fbo(
         // re-QBUF + re-feed SPS+PPS+IDR primer) lives in
         // reprime_video_decoder_for_loop and is invoked from the IPC
         // dispatcher BEFORE this bake call (when it detects the
-        // wrap condition). That separation keeps bake from needing
-        // a &Mp4Demuxer parameter; the primer requires SPS/PPS
-        // bytes which only the demuxer carries. The standalone
-        // reel path (render_video_slide_in_session at hdmi.rs:3025-
-        // 3034) already follows this pattern.
+        // wrap condition). Post-CMA-#1 bake gets the &Mp4Demuxer
+        // directly (was &[Sample]) but still defers re-prime to the
+        // dispatcher — primer call requires SPS/PPS + V4L2-state
+        // reset that crosses the bake boundary.
     }
-    let s = &samples[*next_sample_idx];
+    // CMA #1 (2026-06-21): pread the current sample from the
+    // streaming demuxer instead of indexing a pre-loaded Vec.
+    // `owned` lives until end of function (~33ms tick budget);
+    // dropped immediately after the V4L2 feed.
+    let owned = demuxer.sample(*next_sample_idx)
+        .with_context(|| format!("read sample {}", *next_sample_idx))?;
     decoder
-        .feed(s)
+        .feed(&owned)
         .with_context(|| format!("feed sample {}", *next_sample_idx))?;
     *next_sample_idx += 1;
+    drop(owned);
     if let Some(t) = t_feed_start {
         eprintln!("[firstframe] feed={:.2}ms", t.elapsed().as_secs_f64() * 1000.0);
     }
@@ -8817,6 +9570,32 @@ unsafe fn bake_video_slide_to_current_fbo(
     let t_phase = std::time::Instant::now();
     let f_w = frame.width();
     let f_h = frame.height();
+    // judder-instrument (2026-06-22): fingerprint the FIRST 2 live
+    // frames so QA can correlate against poster_cache_loaded fp_r
+    // + drain_one_capture_for_preload fp_y. qarl observed a
+    // BACKWARD jump at the poster->live handoff (live appears
+    // earlier than poster). This probe answers:
+    //   (i) is poster_b actually frame 0 (matches drained
+    //       fingerprint)?
+    //   (ii) what frame does the first-displayed live show
+    //        (matches drained+1's fingerprint? matches poster's
+    //        fingerprint? something else)?
+    // *frames_decoded is the pre-increment count (still pre-bump
+    // here). Logs gated at < 2 so we get cold-start first +
+    // preload first AND first-after-cold-start = 2 lines max
+    // per slide play instance.
+    if *frames_decoded < 2 {
+        let y_plane = frame.y_plane();
+        let stride = frame.stride() as usize;
+        let fp = fingerprint_9_points(
+            y_plane, stride, f_w as usize, f_h as usize, 1,
+        );
+        eprintln!(
+            "[perf] live_frame_fp frames_decoded_pre={} next_sample_idx_post={} \
+             frame_dims={}x{} stride={} fp_y={:?}",
+            *frames_decoded, *next_sample_idx, f_w, f_h, stride, fp,
+        );
+    }
     // FYS bug B (2026-05-21): a regular uploaded MP4 video must be
     // shown aspect-preserving, not stretched to fill the panel.
     // cover_quad_vbo gives a quad whose positions overflow +/-1 NDC
@@ -9268,7 +10047,8 @@ enum SlideBakeInputs<'a> {
     /// marker dropped here.
     #[cfg(target_os = "linux")]
     Video {
-        samples: &'a [crate::mp4_demux::Sample],
+        // CMA #1 (2026-06-21): demuxer ref replaces samples slice.
+        demuxer: &'a crate::mp4_demux::Mp4Demuxer,
         next_sample_idx: &'a mut usize,
         frames_decoded: &'a mut usize,
         decoder: &'a crate::v4l2::Decoder,
@@ -9285,7 +10065,9 @@ enum SlideBakeInputs<'a> {
         slide_id: uuid::Uuid,
         text_layers: &'a [(&'a crate::content::TextLayer, [f32; 4], Rc<fontdue::Font>)],
         motion_states: Option<&'a [MotionState]>,
-        bg_samples: &'a [crate::mp4_demux::Sample],
+        // CMA #1 (2026-06-21): bg_demuxer ref replaces bg_samples
+        // slice.
+        bg_demuxer: &'a crate::mp4_demux::Mp4Demuxer,
         bg_next_sample_idx: &'a mut usize,
         bg_frames_decoded: &'a mut usize,
         bg_decoder: &'a crate::v4l2::Decoder,
@@ -9456,9 +10238,11 @@ unsafe fn bake_slide_to_fbo(
                 if let Some(old) = session.slide_caches.remove(&slide_id) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session
-                    .slide_caches
-                    .insert(slide_id, SlideRenderCache::new(layers_len));
+                slide_caches_insert(
+                    session,
+                    slide_id,
+                    SlideRenderCache::new(layers_len),
+                );
             }
             // Bug 3 Slice 2D-fp4 (2026-05-19): construct the runtime
             // glyph cache context BEFORE the mutable borrow of
@@ -9534,7 +10318,7 @@ unsafe fn bake_slide_to_fbo(
         }
         #[cfg(target_os = "linux")]
         SlideBakeInputs::Video {
-            samples,
+            demuxer,
             next_sample_idx,
             frames_decoded,
             decoder,
@@ -9542,7 +10326,7 @@ unsafe fn bake_slide_to_fbo(
             let (fbo, tex) = prepare_bake_fbo_pair(session.gl, mode_w, mode_h, existing_fbo_pair)?;
             let paint_result = bake_video_slide_to_current_fbo(
                 session,
-                samples,
+                demuxer,
                 next_sample_idx,
                 frames_decoded,
                 decoder,
@@ -9593,7 +10377,7 @@ unsafe fn bake_slide_to_fbo(
             slide_id,
             text_layers,
             motion_states,
-            bg_samples,
+            bg_demuxer,
             bg_next_sample_idx,
             bg_frames_decoded,
             bg_decoder,
@@ -9637,9 +10421,11 @@ unsafe fn bake_slide_to_fbo(
                 if let Some(old) = session.slide_caches.remove(&slide_id) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session
-                    .slide_caches
-                    .insert(slide_id, SlideRenderCache::new(layers_len));
+                slide_caches_insert(
+                    session,
+                    slide_id,
+                    SlideRenderCache::new(layers_len),
+                );
             }
             // r102.2: reuse cached transition FBO+tex pair when
             // the caller threaded one through.
@@ -9648,7 +10434,7 @@ unsafe fn bake_slide_to_fbo(
             // (still bound by prepare_bake_fbo_pair).
             let video_result = bake_video_slide_to_current_fbo(
                 session,
-                bg_samples,
+                bg_demuxer,
                 bg_next_sample_idx,
                 bg_frames_decoded,
                 bg_decoder,
@@ -10267,7 +11053,7 @@ fn render_transition_animated_in_session(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                slide_caches_insert(session, sid, SlideRenderCache::new(n));
             }
         }
         let start = Instant::now();
@@ -10707,7 +11493,7 @@ fn render_transition_single_pass_in_session(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                slide_caches_insert(session, sid, SlideRenderCache::new(n));
             }
         }
     }
@@ -11078,7 +11864,7 @@ fn render_transition_scissored_bake_in_session(
                 if let Some(old) = session.slide_caches.remove(&sid) {
                     free_slide_render_cache(session.gl, old);
                 }
-                session.slide_caches.insert(sid, SlideRenderCache::new(n));
+                slide_caches_insert(session, sid, SlideRenderCache::new(n));
             }
         }
     }
@@ -11867,11 +12653,13 @@ fn cached_emoji_program(gl: &glow::Context) -> Result<CachedEmojiProgram> {
 
 /// SDF arc slice B.2 -- session-scoped MSDF atlas lookup table.
 ///
-/// Populated by `populate_msdf_lookup` after `upload_all` lands the
-/// 23 atlas textures on the GL context; cleared by
-/// `clear_msdf_lookup` at session teardown BEFORE
-/// `sdf_atlas_gl::delete_all` so a stale lookup can't outlive the
-/// underlying NativeTexture handles.
+/// CMA-arc 2026-06-21 C4: populated incrementally by
+/// `ensure_msdf_atlas_uploaded` (lazy-per-family upload). Cleared
+/// by `clear_msdf_lookup` at session teardown BEFORE
+/// `delete_owned_msdf_atlases` so a stale lookup can't outlive
+/// the underlying NativeTexture handles. The pre-arc bring-up
+/// upload (`upload_all` + `populate_msdf_lookup`) was retired
+/// to free ~30 MB CMA upfront.
 ///
 /// Why a thread_local instead of threading `&[MsdfAtlasGl]` through
 /// paint_slide's signature: ~14 call sites would each need a new
@@ -11888,6 +12676,19 @@ fn cached_emoji_program(gl: &glow::Context) -> Result<CachedEmojiProgram> {
 std::thread_local! {
     static MSDF_ATLAS_LOOKUP: std::cell::RefCell<Vec<(String, glow::NativeTexture)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// CMA-arc 2026-06-21 C4: per-thread OWNED MsdfAtlasGl store.
+    /// Pre-arc the owned MsdfAtlasGl entries lived on
+    /// `session.msdf_atlases` (a Vec<MsdfAtlasGl> field). Lazy-
+    /// upload via `ensure_msdf_atlas_uploaded` happens from
+    /// paint_slide_with_viewport which receives only `&gl` (not
+    /// `&mut session`), so the owned Vec moved to a thread_local
+    /// to match. Teardown helper `delete_owned_msdf_atlases` drains
+    /// + calls `sdf_atlas_gl::delete_all` on the contents while
+    /// the GL context is still bound (`with_egl_session` cleanup
+    /// runs both this AND clear_msdf_lookup before the GL
+    /// context tears down).
+    static MSDF_ATLAS_OWNED: std::cell::RefCell<Vec<crate::sdf_atlas_gl::MsdfAtlasGl>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Process-wide parsed atlas set (CPU-side; `atlas_rgb` is 'static
@@ -11898,20 +12699,12 @@ std::thread_local! {
 static MSDF_ATLASES_CPU: std::sync::OnceLock<Vec<crate::sdf_atlas::MsdfAtlas>> =
     std::sync::OnceLock::new();
 
-fn populate_msdf_lookup(atlases: &[crate::sdf_atlas_gl::MsdfAtlasGl]) {
-    MSDF_ATLAS_LOOKUP.with(|c| {
-        let mut v = c.borrow_mut();
-        v.clear();
-        for a in atlases {
-            v.push((a.stem.clone(), a.tex));
-        }
-    });
-    // First session populates the CPU-side cache; subsequent
-    // sessions skip (OnceLock semantics).
-    let _ = MSDF_ATLASES_CPU.get_or_init(|| {
-        crate::sdf_atlas::load_all_atlases().unwrap_or_default()
-    });
-}
+// CMA-arc 2026-06-21 C4: `populate_msdf_lookup` (eager bring-up
+// publish of all 23 atlas textures) retired. The thread_local is
+// now populated incrementally by `ensure_msdf_atlas_uploaded` on
+// first text draw of each font family. MSDF_ATLASES_CPU's
+// OnceLock get_or_init is mirrored inside `ensure_msdf_atlas_uploaded`
+// so the CPU-side parse fires on first lazy upload.
 
 fn clear_msdf_lookup() {
     MSDF_ATLAS_LOOKUP.with(|c| c.borrow_mut().clear());
@@ -11964,6 +12757,85 @@ fn dynamic_atlas_colr_tex() -> Option<glow::NativeTexture> {
     DYNAMIC_ATLAS_COLR_LOOKUP.with(|c| *c.borrow())
 }
 
+/// CMA-arc 2026-06-21 C3: leak-safe wrapper around the bounded
+/// `slide_caches` LruMap insert. Pre-arc `slide_caches` was an
+/// unbounded HashMap so insert never evicted; post-arc the LruMap
+/// returns the LRU entry via `InsertOutcome::evicted_lru` when at
+/// capacity and the key is new. The evicted SlideRenderCache holds
+/// GL texture handles (per-layer tex Vec + bg_tex + first_frame_tex)
+/// that MUST be released via `free_slide_render_cache` while the
+/// GL context is bound; this helper does that atomically with the
+/// insert.
+///
+/// Behavior:
+///   * If the key already existed (replace), `InsertOutcome::replaced`
+///     is Some — but every call site explicitly removes the prior
+///     entry via `slide_caches.remove(&id)` + free_slide_render_cache
+///     BEFORE inserting, so the post-remove insert sees an empty
+///     slot and `replaced` is None. (Documented + asserted in the
+///     debug build below.)
+///   * If at capacity with a new key, `evicted_lru` is Some — pass
+///     it to free_slide_render_cache.
+///   * Else no cleanup needed.
+#[cfg(target_os = "linux")]
+fn slide_caches_insert(
+    session: &mut EglSession<'_>,
+    slide_id: uuid::Uuid,
+    cache: SlideRenderCache,
+) {
+    let outcome = session.slide_caches.insert(slide_id, cache);
+    // Call sites remove-then-insert when the key existed — so on
+    // this path `replaced` must be None. If it isn't, a caller
+    // missed the remove and the GL texture in the replaced value
+    // would leak. Debug-assert; in release we still drop the
+    // texture via the LruMap to avoid the leak.
+    debug_assert!(
+        outcome.replaced.is_none(),
+        "slide_caches_insert: caller skipped the remove-before-insert pattern; \
+         slide_id={slide_id}"
+    );
+    if let Some(evicted) = outcome.evicted_lru {
+        free_slide_render_cache(session.gl, evicted);
+    }
+    // Release-mode fallback in case the debug_assert above is
+    // disabled and a future caller skips the remove: free the
+    // replaced cache to prevent the leak. Costs one extra
+    // function call on the no-replaced fast path.
+    if let Some(replaced) = outcome.replaced {
+        free_slide_render_cache(session.gl, replaced);
+    }
+}
+
+/// CMA-arc 2026-06-21: wrapper around `GlyphCache::poll_completions`
+/// that publishes the (possibly lazy-allocated) dynamic atlas
+/// textures to `DYNAMIC_ATLAS_LOOKUP` / `DYNAMIC_ATLAS_COLR_LOOKUP`
+/// after the call. Pre-arc the unconditional bring-up alloc
+/// published the textures once at session start; now the pages are
+/// lazy-allocated inside `poll_completions` (glyph_cache.rs) on
+/// first Ready completion of that mode, so the lookup must be
+/// re-checked after each poll. The publish is idempotent (a
+/// thread_local set with the same handle), so the cost after the
+/// first allocation is a single borrow_mut.
+#[cfg(target_os = "linux")]
+fn poll_dynamic_glyph_completions(
+    session: &mut EglSession<'_>,
+    max_uploads_per_call: usize,
+) -> usize {
+    let uploaded = session.dynamic_glyph_cache.poll_completions(
+        session.gl,
+        &mut session.dynamic_atlas_page_msdf,
+        &mut session.dynamic_atlas_page_colr,
+        max_uploads_per_call,
+    );
+    if let Some(tex) = session.dynamic_atlas_page_msdf.texture() {
+        populate_dynamic_atlas_lookup(tex);
+    }
+    if let Some(tex) = session.dynamic_atlas_page_colr.texture() {
+        populate_dynamic_atlas_colr_lookup(tex);
+    }
+    uploaded
+}
+
 /// Resolve a `font_family` string (schema-level) to its baked atlas
 /// stem (e.g. "Anton" -> "anton"). Returns `None` for families not
 /// in the catalog (caller falls back to the default family).
@@ -11978,6 +12850,13 @@ fn font_family_to_atlas_stem(family: &str) -> Option<&'static str> {
 /// host tests that bypass `with_egl_session`). Production paths
 /// fall back to the catalog's default family ("Inter") when the
 /// requested family is missing.
+///
+/// CMA-arc 2026-06-21 C4: pure lookup (no `&mut` / no GL work).
+/// The caller MUST have invoked `ensure_msdf_atlas_uploaded` (or
+/// `ensure_msdf_atlas_for_family_or_default`) earlier in the same
+/// frame for any family it queries — otherwise this returns
+/// `None` for never-touched families and the call site's
+/// `or_else(|| msdf_atlas_for_family("Inter"))` fallback fires.
 fn msdf_atlas_for_family(
     family: &str,
 ) -> Option<(glow::NativeTexture, &'static crate::sdf_atlas::MsdfAtlas)> {
@@ -11991,6 +12870,98 @@ fn msdf_atlas_for_family(
             .map(|(_, t)| *t)
     })?;
     Some((tex, atlas))
+}
+
+/// CMA-arc 2026-06-21 C4: lazy-upload the static MSDF atlas for
+/// `family` if it isn't already uploaded. Returns `Some(tex)` on
+/// success (already-uploaded OR newly-uploaded), `None` if the
+/// family isn't in the catalog OR the on-the-fly upload failed.
+/// Idempotent.
+///
+/// MSDF_ATLASES_CPU (the CPU-side parsed atlas Vec backed by
+/// `include_bytes!` slices) is initialized on first call via the
+/// OnceLock's get_or_init — cheap, parse-only, no I/O.
+///
+/// Per-family GPU upload pays the ~1.3 MB CMA cost only on first
+/// touch + transfers ownership of the new MsdfAtlasGl to the
+/// `MSDF_ATLAS_OWNED` thread_local Vec so the existing teardown
+/// path (`delete_owned_msdf_atlases` in cleanup_resources) cleans
+/// up the texture handles symmetrically. The MSDF_ATLAS_LOOKUP
+/// thread_local is appended in lock-step so `msdf_atlas_for_family`
+/// finds the new entry.
+///
+/// Takes `&glow::Context` (not `&mut session`) so all 3 paint-
+/// site callers — which receive `gl` as a parameter but not
+/// `session` — can invoke without a refactor.
+#[cfg(target_os = "linux")]
+fn ensure_msdf_atlas_uploaded(
+    gl: &glow::Context,
+    family: &str,
+) -> Option<glow::NativeTexture> {
+    let stem = font_family_to_atlas_stem(family)?;
+    let cpu = MSDF_ATLASES_CPU.get_or_init(|| {
+        crate::sdf_atlas::load_all_atlases().unwrap_or_default()
+    });
+    let atlas = crate::sdf_atlas::atlas_for_stem(cpu, stem)?;
+    // Fast path: already uploaded.
+    if let Some(tex) = MSDF_ATLAS_LOOKUP.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(s, _)| s == stem)
+            .map(|(_, t)| *t)
+    }) {
+        return Some(tex);
+    }
+    // Slow path: lazy upload. Per-family ~1.3 MB CMA.
+    match crate::sdf_atlas_gl::upload_one(gl, atlas) {
+        Ok(gl_atlas) => {
+            let tex = gl_atlas.tex;
+            let stem_str = gl_atlas.stem.clone();
+            MSDF_ATLAS_LOOKUP.with(|c| {
+                c.borrow_mut().push((stem_str, tex))
+            });
+            MSDF_ATLAS_OWNED.with(|c| {
+                c.borrow_mut().push(gl_atlas)
+            });
+            eprintln!("msdf: lazy-uploaded atlas {stem} (family={family:?})");
+            Some(tex)
+        }
+        Err(e) => {
+            eprintln!("msdf: lazy upload {stem} failed: {e}");
+            None
+        }
+    }
+}
+
+/// CMA-arc 2026-06-21 C4: ensure the per-family atlas is uploaded;
+/// if the requested family isn't in the catalog OR upload failed,
+/// ensure the "Inter" fallback is uploaded so the call site's
+/// `msdf_atlas_for_family("Inter")` or_else chain has a target.
+#[cfg(target_os = "linux")]
+fn ensure_msdf_atlas_for_family_or_default(
+    gl: &glow::Context,
+    family: &str,
+) {
+    if ensure_msdf_atlas_uploaded(gl, family).is_some() {
+        return;
+    }
+    // Family-specific upload didn't succeed — pre-warm Inter for
+    // the fallback. If family already IS "Inter", the inner
+    // is_some() check above short-circuits + we don't reach this.
+    let _ = ensure_msdf_atlas_uploaded(gl, "Inter");
+}
+
+/// CMA-arc 2026-06-21 C4: drain the per-thread MSDF_ATLAS_OWNED
+/// Vec and delete every uploaded texture via
+/// `sdf_atlas_gl::delete_all`. Called from `cleanup_resources` at
+/// session teardown while the GL context is still bound, after
+/// `clear_msdf_lookup` has cleared the thread_local lookup.
+#[cfg(target_os = "linux")]
+fn delete_owned_msdf_atlases(gl: &glow::Context) {
+    MSDF_ATLAS_OWNED.with(|c| {
+        let mut owned = c.borrow_mut();
+        crate::sdf_atlas_gl::delete_all(gl, &mut owned);
+    });
 }
 
 // =====================================================================
@@ -13175,12 +14146,11 @@ fn prewarm_glyph_rasterization(session: &mut EglSession) {
 
     let watchdog_deadline = t0 + PREWARM_WATCHDOG;
     loop {
-        let drained_this_call = session.dynamic_glyph_cache.poll_completions(
-            session.gl,
-            &mut session.dynamic_atlas_page_msdf,
-            &mut session.dynamic_atlas_page_colr,
-            128,
-        );
+        // CMA-arc 2026-06-21: wrap via poll_dynamic_glyph_completions
+        // so the prewarm path triggers the lazy texture allocation
+        // (the prewarm is precisely the path that pre-arc would
+        // have populated the dynamic atlas at session bring-up).
+        let drained_this_call = poll_dynamic_glyph_completions(session, 128);
         let completions_since_baseline =
             session.dynamic_glyph_cache.completion_count() - baseline_completions;
         if crate::hdmi_logic::glyph_prewarm_drain_complete(
@@ -13405,6 +14375,9 @@ unsafe fn ensure_bake_atlas(
     session: &mut EglSession,
 ) -> Result<(glow::NativeFramebuffer, glow::NativeTexture)> {
     use glow::HasContext;
+    // CMA-arc 2026-06-22 RANK 3: stamp every scissored-bake use so
+    // free_idle_session_fbos knows the atlas is currently active.
+    session.last_scissored_bake_use = Some(std::time::Instant::now());
     if let Some(pair) = session.scissored_bake_atlas {
         return Ok(pair);
     }
@@ -14006,6 +14979,10 @@ fn paint_slide_with_viewport(
                 let wrapped =
                     wrap_text_to_width(font.as_ref(), resolved_text, size_px, max_width_px);
                 let family = layer.font_family.as_deref().unwrap_or("Inter");
+                // CMA-arc 2026-06-21 C4: lazy-upload this family
+                // (and the Inter fallback if family fails) before
+                // the read-only msdf_atlas_for_family lookup.
+                ensure_msdf_atlas_for_family_or_default(gl, family);
                 let group = msdf_atlas_for_family(family)
                     .or_else(|| msdf_atlas_for_family("Inter"))
                     .and_then(|(_atlas_tex, atlas)| {
@@ -14151,6 +15128,9 @@ fn paint_slide_with_viewport(
                     continue;
                 };
                 let family = layer.font_family.as_deref().unwrap_or("Inter");
+                // CMA-arc 2026-06-21 C4: lazy-upload before the
+                // read-only lookup.
+                ensure_msdf_atlas_for_family_or_default(gl, family);
                 let (atlas_tex, _) = msdf_atlas_for_family(family)
                     .or_else(|| msdf_atlas_for_family("Inter"))
                     .ok_or_else(|| {
@@ -14298,6 +15278,9 @@ fn paint_layers_via_overlay_route(
                 continue;
             };
             let family = layer.font_family.as_deref().unwrap_or("Inter");
+            // CMA-arc 2026-06-21 C4: lazy-upload before the
+            // read-only lookup (overlay route).
+            ensure_msdf_atlas_for_family_or_default(gl, family);
             let (atlas_tex, _) = msdf_atlas_for_family(family)
                 .or_else(|| msdf_atlas_for_family("Inter"))
                 .ok_or_else(|| {
@@ -14884,9 +15867,11 @@ fn prewarm_sp_session(
             if let Some(old) = session.slide_caches.remove(&slide_id) {
                 free_slide_render_cache(session.gl, old);
             }
-            session
-                .slide_caches
-                .insert(slide_id, SlideRenderCache::new(n));
+            slide_caches_insert(
+                session,
+                slide_id,
+                SlideRenderCache::new(n),
+            );
         }
 
         // B.3 cleanup follow-up: prepare_layers_for_single_pass is

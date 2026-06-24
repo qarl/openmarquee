@@ -193,11 +193,43 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # parallel client-side simulator, not a control surface for the loop.
     # Tests can opt out via OPENMARQUEE_DISABLE_AUTOSTART=1 so fixtures
     # that spin a backend don't have an extra asyncio task running.
+    #
+    # Stability arc Layer 3 post-review hardening (2026-06-23): gate
+    # the sd_notify READY=1 on autostart success. Pre-fix, READY=1
+    # fired unconditionally even when get_playback_loop().start()
+    # raised — systemd would mark the unit healthy while the backend
+    # was "started but not painting", with detection deferred to the
+    # WatchdogSec=120s window. Post-fix, a failed start does NOT send
+    # READY → systemd's TimeoutStartSec=90s fires → unit marked
+    # failed → Restart=on-failure kicks in (5x in 300s, then
+    # OnFailure handler → reboot per L2 escalation chain).
+    #
+    # The DISABLE_AUTOSTART test fixture path still sends READY (test
+    # backends aren't running under systemd Type=notify; no-op).
+    autostart_ok = True
     if os.environ.get("OPENMARQUEE_DISABLE_AUTOSTART") != "1":
         try:
             await get_playback_loop().start()
         except Exception:
             log.exception("startup playback autostart failed")
+            autostart_ok = False
+
+    # Stability arc Layer 2 (2026-06-23): systemd Type=notify handshake.
+    # Send READY=1 once the playback loop is live + the backend is
+    # serving requests. Without this, Type=notify hangs the unit on
+    # startup waiting for the handshake. No-op if $NOTIFY_SOCKET is
+    # unset (= not running under systemd Type=notify; e.g., dev/CI).
+    from openmarquee import sd_notify as _sd_notify
+
+    if autostart_ok:
+        _sd_notify.notify_ready()
+    else:
+        log.error(
+            "stability: autostart failed; NOT sending sd_notify READY=1. "
+            "systemd's TimeoutStartSec will fire + Restart=on-failure cycle "
+            "will retry. After StartLimitBurst exhaust, OnFailure handler "
+            "writes marker + reboots."
+        )
 
     # Flock pull worker — periodic reliability backstop that reconciles
     # against sync=True peers even when pushes get dropped. Tests can

@@ -45,13 +45,22 @@ use uuid::Uuid;
 use glow::HasContext;
 
 /// Per-process cap on cached image-slide textures. Sized to mirror
-/// `hdmi::IMAGE_BG_CACHE_CAPACITY` (6) — both caches hold ~RGBA8
-/// 1080p textures (~8 MB each) and live in the same 48 MB CMA
-/// budget on the Pi Zero 2 W. A reel transitioning between two
-/// image-class slides needs only 2 entries cached at once; 6
-/// covers the FYS playlist's image + Web mix with headroom and
-/// keeps total image-class texture memory bounded at ~48 MB.
-pub const IMAGE_SLIDE_TEX_CACHE_CAPACITY: usize = 6;
+/// `hdmi::IMAGE_BG_CACHE_CAPACITY` — both caches hold ~RGBA8 1080p
+/// textures (~8.3 MB each) and live in the same CMA budget on the
+/// Pi Zero 2 W.
+///
+/// CMA-arc 2026-06-21 C2: cap cut 6 → 3 in lock-step with
+/// IMAGE_BG_CACHE_CAPACITY. The working set is current + next
+/// image-class slide; 3 keeps one slot of slack for the
+/// transition's B-side preload. Cycling >3 distinct image-class
+/// slides in flight triggers eviction churn on transition. The
+/// docstring's prior "FYS playlist's image + Web mix with
+/// headroom" sized for ~48 MB; the new sizing trims to ~25 MB
+/// worst-case = ~23 MB reclaim. If production image-class reels
+/// grow beyond 3 slides hot at once, revisit (raise to 4, or
+/// add a time-expiry layer that defers eviction during active
+/// transitions).
+pub const IMAGE_SLIDE_TEX_CACHE_CAPACITY: usize = 3;
 
 /// Result delivered from a decode worker to the render thread.
 /// `Ok((rgba_rows_bottom_up, width, height))` matches `load_png_rgba`
@@ -375,13 +384,23 @@ fn load_png_rgba_for_cache(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
         ));
     }
     let (w, h) = (info.width, info.height);
-    let rgba: Vec<u8> = match info.color_type {
+    let mut rgba: Vec<u8> = match info.color_type {
         png::ColorType::Rgba => buf,
         png::ColorType::Rgb => {
-            let mut out = Vec::with_capacity((w * h) as usize * 4);
-            for px in buf.chunks_exact(3) {
-                out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+            // CMA-arc 2026-06-22 C5: mirror hdmi.rs::load_png_rgba —
+            // pre-size the RGBA Vec, explicit drop(buf) after the
+            // RGB→RGBA expansion so the intermediate frees before
+            // the flip phase.
+            let mut out = vec![0u8; (w * h) as usize * 4];
+            for (src, dst) in
+                buf.chunks_exact(3).zip(out.chunks_exact_mut(4))
+            {
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = 0xFF;
             }
+            drop(buf);
             out
         }
         other => {
@@ -391,7 +410,10 @@ fn load_png_rgba_for_cache(path: &Path) -> Result<(Vec<u8>, u32, u32)> {
             ));
         }
     };
-    let rgba = crate::hdmi_logic::flip_rgba_rows_vertically(rgba, w, h);
+    // CMA-arc 2026-06-22 C5: in-place flip — saves the ~8.3 MB
+    // second allocation the prior consuming version paid. Matches
+    // hdmi.rs::load_png_rgba's transformation.
+    crate::hdmi_logic::flip_rgba_rows_in_place(&mut rgba, w, h);
     Ok((rgba, w, h))
 }
 

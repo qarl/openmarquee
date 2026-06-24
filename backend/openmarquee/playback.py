@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from openmarquee import sd_notify
 from openmarquee.content import ContentItem, StreamSlide, WebSlide
 from openmarquee.perf_stats import STATS as _PERF_STATS
 from openmarquee.rendering import Renderer
@@ -1324,6 +1325,16 @@ class PlaybackLoop:
             t_ms = t0_ms + int(elapsed * 1000)
             try:
                 result = await asyncio.to_thread(self._renderer.advance, t_ms)
+                # Stability arc Layer 2 (2026-06-23): per-painted-
+                # frame WATCHDOG=1 ping to systemd. Throttled to
+                # 1Hz inside sd_notify (we call here on every
+                # advance success at ~30Hz). If the renderer
+                # wedges, advance() either raises or never returns
+                # (in which case the to_thread call blocks), the
+                # ping stops firing, systemd's WatchdogSec=60s
+                # fires + escalates to FailureAction=reboot. See
+                # `system/openmarquee-backend.service`.
+                sd_notify.notify_watchdog()
             except RustRendererUnsupportedSlideError as e:
                 # Begin_slide accepted the slide but advance hit the
                 # unsupported-kind rail (happens for video on the very
@@ -1546,6 +1557,10 @@ class PlaybackLoop:
                     # (now resolved per r4-r6 sweep). Same rationale as
                     # the slide-window advance above.
                     result = await asyncio.to_thread(self._renderer.advance, t_ms)
+                    # Stability arc Layer 2 (2026-06-23): WATCHDOG ping
+                    # on the transition-window advance too (mirrors the
+                    # slide-window advance above).
+                    sd_notify.notify_watchdog()
                 except RustRendererUnsupportedTransitionError as e:
                     # Mid-transition error -- shouldn't happen (begin_
                     # transition already succeeded), but if it does

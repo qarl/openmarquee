@@ -1,0 +1,62 @@
+[Unit]
+Description=openMarquee stability promoter: start backend after boot if reboot-cap not reached
+Documentation=https://github.com/qarl/openmarquee
+# Stability arc Layer 3 (2026-06-23). Reads the backend-failure
+# marker (Layer 2's OnFailure handler writes it before reboot) +
+# the per-hour reboot counter. Decisions:
+#   - marker present → counter++, then check cap.
+#   - count > CAP (3/hour) → STAY on mini, log
+#     [stability] reboot_loop_cap_reached, exit 0.
+#   - count <= CAP (or no marker) → systemctl stop mini, then
+#     systemctl start backend.
+# Wifi-watchdog reboots write NO marker → counter unchanged →
+# backend promoted normally. So wifi flakiness can't false-trip
+# the cap.
+#
+# CRITICAL: NOT gated on network-online.target (per QA L3
+# review). The backend renders LOCAL content and the recovery
+# target is exactly "wifi was flaky at reboot" — gating on
+# network would self-defeat. The promoter runs as early as
+# local-fs.target so it fires regardless of wifi state. The
+# `systemctl start openmarquee-backend.service` it issues
+# resolves backend's own After= deps (network-online + ap0 +
+# hostapd + dnsmasq) at backend-start time; if those aren't
+# ready yet, backend just queues until they are. The PROMOTER
+# itself doesn't wait.
+#
+# After=local-fs.target is sufficient: we just need /var/lib +
+# the script available + systemctl reachable. basic.target
+# would also work; local-fs is more specific and slightly
+# earlier.
+After=local-fs.target
+# Sequence with openmarquee-mini: NOT After=. We explicitly
+# `systemctl stop openmarquee-mini.service` (blocking) inside
+# the script before starting backend, so the ordering is
+# enforced procedurally, not by systemd-graph. Race-free.
+
+[Service]
+Type=oneshot
+# Run as root so we can systemctl stop/start + write
+# /var/lib/openmarquee. The script handles its own privilege-
+# scoped operations.
+ExecStart=/opt/openmarquee/system/stability-promoter.sh
+RemainAfterExit=no
+
+# Don't infinite-loop on script failure. If promoter itself
+# crashes (e.g., missing /opt path on a half-deployed system),
+# log + leave mini up. Operator intervenes via journalctl.
+# Restart=no is the systemd default for oneshot but explicit
+# for clarity.
+Restart=no
+
+# StandardOutput=journal so the script's `echo` lines land in
+# `journalctl -u openmarquee-stability-promoter.service` without
+# needing every line to go through `logger -t`. Per-decision
+# `[stability] ...` lines in the script still use `logger` so
+# they survive a `journalctl -t openmarquee-stability` filter
+# alongside Layer 2's OnFailure-handler stability lines.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

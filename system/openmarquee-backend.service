@@ -21,10 +21,50 @@ StartLimitIntervalSec=300
 StartLimitBurst=5
 
 [Service]
-Type=simple
+# Stability arc Layer 2 (2026-06-23): Type=notify so systemd
+# enforces the WatchdogSec= liveness contract via sd_notify.
+# Backend sends READY=1 once playback loop is live (app.py
+# lifespan) + WATCHDOG=1 per painted frame (throttled 1Hz via
+# sd_notify.py). If pings stop for WatchdogSec, systemd kills
+# the unit; FailureAction handler escalates to reboot if
+# StartLimitBurst is exhausted.
+#
+# L3 post-review hardening (2026-06-23):
+#   - TimeoutStartSec=90s: explicit (don't rely on systemd default).
+#     READY=1 must arrive within this budget; if backend's lifespan
+#     hangs on its own dependencies (DB init, demo seed, etc.),
+#     fail fast rather than silently waiting for systemd-default.
+#   - WatchdogSec 60s -> 120s: covers worst-case retry chain
+#     comfortably. Worst retry cycle = 8s IPC timeout + 5s SIGTERM
+#     wait + 3s SIGKILL wait + 3s ABANDON + ~3s respawn cold-prime
+#     = ~22s/cycle. 120s = ~5x margin (5 successive failed cycles
+#     before reboot). Reduces false-positive risk from a burst of
+#     consecutive slow-but-recovering renderer cycles (QA L3
+#     review concern #4). True D-state hangs still trip the
+#     watchdog within 2 cycles; just slower than 60s.
+Type=notify
+TimeoutStartSec=90s
+WatchdogSec=120s
 User=openmarquee
 Group=openmarquee
 WorkingDirectory=/opt/openmarquee/backend
+
+# L3 post-review hardening (2026-06-23): ExecStartPre ensures
+# mini is stopped + /dev/video10 freed BEFORE backend starts.
+# Centralizes codec ownership at the unit level so ANY backend-
+# start path (the L3 promoter at boot, the L3 OnFailure
+# handler's reboot/restart cycle, the cma-watchdog restart, the
+# daily-restart cron, manual `systemctl restart`) is race-safe.
+#
+# `-` prefix: ignore failure (mini wasn't running → no-op). Otherwise
+# a "no such unit" or "already stopped" return non-zero kills our
+# start.
+#
+# systemctl stop blocks until mini exits → L4 SIGTERM teardown
+# fires inside mini's renderer (if mini holds the codec via its
+# own /dev/video10 path), then the device is released and we
+# proceed to backend's main ExecStart.
+ExecStartPre=-/bin/systemctl stop openmarquee-mini.service
 
 # Content + playlist + schedule live under /var per Linux FHS (variable
 # state). The systemd unit sets explicit paths so the app doesn't depend on
@@ -103,6 +143,16 @@ ExecStart=/opt/openmarquee/venv/bin/uvicorn openmarquee.app:app \
 # is persistently wrong (config error, missing asset, etc).
 Restart=on-failure
 RestartSec=2s
+
+# Stability arc Layer 2 (2026-06-23): when StartLimitBurst exhausts
+# (5 failed restarts in 5min), escalate via OnFailure to a oneshot
+# handler that marks the reboot cause + reboots. Layer 3's promoter
+# reads the marker to distinguish RENDERER/BACKEND-failure reboots
+# from other reboot causes (wifi watchdog, operator) so the
+# reboot-loop cap (3/hour → stay on stable mini + alert) ONLY counts
+# backend failures. Without the marker, a flaky-wifi stretch would
+# falsely trip the cap.
+OnFailure=openmarquee-backend-failure-handler.service
 
 # Let uvicorn bind to port 80 without running as root.
 AmbientCapabilities=CAP_NET_BIND_SERVICE

@@ -631,6 +631,25 @@ impl GlyphCache {
                         RenderMode::Msdf => &mut *msdf_page,
                         RenderMode::Colr => &mut *colr_page,
                     };
+                    // CMA-arc 2026-06-21: lazy-allocate the page's
+                    // GPU texture on first Ready completion of this
+                    // mode. Pre-arc the texture was unconditionally
+                    // allocated at session bring-up (16 MB per page
+                    // x 2 pages = 32 MB CMA on every session, even
+                    // text-only with no dynamic glyphs). Now the
+                    // page stays at zero CMA until the worker pool
+                    // produces a Ready completion that needs to be
+                    // uploaded. allocate_texture is idempotent
+                    // (atlas_page.rs:91-93 early-return on Some) so
+                    // subsequent completions are a no-op cost.
+                    if let Err(e) = page.allocate_texture(gl) {
+                        eprintln!(
+                            "glyph_cache: AtlasPage texture lazy-alloc \
+                             failed ({:?}): {e}; dropping completion for {:?}",
+                            key.render_mode, key,
+                        );
+                        continue;
+                    }
                     // Slice 3C: on a full page, evict the LRU Ready
                     // slot of this render_mode and retry. A free
                     // immediately follows a successful eviction so
