@@ -1052,9 +1052,12 @@ where
         // for Slice 1 those workers are stubs that drain + discard
         // MissRequest. AtlasPage::allocate_texture is called below
         // (after GL context is current) to set up the GPU-resident
-        // 2048×2048 RGBA8 backing texture.
+        // Backing texture format: MSDF page = RGB8 (12 MB; alpha
+        // unused — all four MSDF shaders sample .rgb only), COLR
+        // page = RGBA8 (16 MB; premultiplied alpha load-bearing
+        // for color glyphs). 4 MB CMA win on the MSDF side.
         dynamic_glyph_cache: crate::glyph_cache::GlyphCache::new(4),
-        dynamic_atlas_page_msdf: crate::atlas_page::AtlasPage::new(
+        dynamic_atlas_page_msdf: crate::atlas_page::AtlasPage::new_rgb8(
             crate::glyph_cache::CELL_PX,
         ),
         // Bug 3 Slice 3B: 96 px matches both CBDT (build.rs

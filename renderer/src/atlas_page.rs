@@ -34,6 +34,37 @@ pub struct SlotPos {
     pub y: u32,
 }
 
+/// GL pixel format for the page's backing texture. RGBA8 = the
+/// historical default (kept for color glyphs / COLR); Rgb8 drops the
+/// alpha byte and matches what the static slice-B MSDF atlases
+/// already use (sdf_atlas_gl.rs:67-79 uploads GL_RGB / RGB888;
+/// hdmi_logic.rs:1276-1278 documents the .rgb-only sampling).
+///
+/// MSDF (Chlumsky-style multi-channel SDF) samples only the RGB
+/// channels — the alpha byte was always padding. Dropping it saves
+/// 25% CMA per page (4 MB at 2048×2048).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AtlasFormat {
+    /// 4 bytes/pixel — color glyphs (COLR/CBDT). Premultiplied alpha
+    /// is load-bearing here; the COLR rasterizer emits genuine RGBA.
+    Rgba8,
+    /// 3 bytes/pixel — MSDF only. Saves 4 MB CMA vs Rgba8 at
+    /// 2048×2048. All four MSDF shaders sample `.rgb`; the alpha
+    /// byte was a no-op pad.
+    Rgb8,
+}
+
+impl AtlasFormat {
+    /// Bytes per pixel for this format. Used by `upload_slot` for
+    /// the byte-slice length check + the implicit row stride.
+    pub const fn bytes_per_pixel(self) -> u32 {
+        match self {
+            AtlasFormat::Rgba8 => 4,
+            AtlasFormat::Rgb8 => 3,
+        }
+    }
+}
+
 /// A single GPU-resident atlas page. Lifetime tied to the EGL session
 /// that created it; AtlasPage::delete must run BEFORE the GL context
 /// tears down.
@@ -53,14 +84,39 @@ pub struct AtlasPage {
     /// before bumping the cursor; free_slot pushes here. Drained
     /// LIFO — order doesn't matter, every free index is equivalent.
     free_list: Vec<u32>,
+    /// GL pixel format for the backing texture. Selected at
+    /// construction so `allocate_texture` + `upload_slot` know
+    /// whether each cell carries 3 or 4 bytes per pixel. The
+    /// default `new(cell_px)` constructor picks Rgba8 for back-
+    /// compat with color-glyph callers; MSDF callers pick Rgb8
+    /// explicitly via `new_rgb8`.
+    format: AtlasFormat,
 }
 
 impl AtlasPage {
-    /// Construct an empty page with the given cell size. Does NOT
-    /// touch GL state; call allocate_texture once the GL context is
-    /// current to upload an empty (transparent-black) backing
-    /// texture.
+    /// Construct an empty RGBA8 page with the given cell size. Does
+    /// NOT touch GL state; call allocate_texture once the GL context
+    /// is current to upload an empty backing texture.
+    ///
+    /// RGBA8 is the historical default and stays the right choice
+    /// for color-glyph pages (COLR / CBDT). MSDF callers should use
+    /// `new_rgb8` instead — the alpha byte was always unused and
+    /// dropping it saves 4 MB CMA per page.
     pub fn new(cell_px: u32) -> Self {
+        Self::with_format(cell_px, AtlasFormat::Rgba8)
+    }
+
+    /// Construct an empty RGB8 page. Use for MSDF dynamic-glyph
+    /// pages: all four MSDF shaders sample `.rgb` only, so the
+    /// alpha byte was always padding. 2048×2048 → 12 MB CMA
+    /// (vs 16 MB for RGBA8). The static slice-B MSDF atlases
+    /// already use RGB888 on this vc4 GPU (sdf_atlas_gl.rs:67-79),
+    /// so the format is empirically proven.
+    pub fn new_rgb8(cell_px: u32) -> Self {
+        Self::with_format(cell_px, AtlasFormat::Rgb8)
+    }
+
+    fn with_format(cell_px: u32, format: AtlasFormat) -> Self {
         let cols = ATLAS_DIM / cell_px;
         let rows = ATLAS_DIM / cell_px;
         Self {
@@ -71,7 +127,15 @@ impl AtlasPage {
             rows,
             next_slot_idx: 0,
             free_list: Vec::new(),
+            format,
         }
+    }
+
+    /// The page's GL pixel format. Test-visible so cross-module
+    /// tests can assert the MSDF page is RGB8 and the COLR page
+    /// stays RGBA8.
+    pub fn format(&self) -> AtlasFormat {
+        self.format
     }
 
     /// Index → (x, y) top-left in atlas pixels, row-major.
@@ -82,10 +146,11 @@ impl AtlasPage {
         }
     }
 
-    /// Create the underlying GL texture (RGBA8, 2048×2048, GL_LINEAR
-    /// sampling, GL_CLAMP_TO_EDGE wrap) and clear it to fully
-    /// transparent. Idempotent: re-calling on an already-allocated
-    /// page is a no-op.
+    /// Create the underlying GL texture (2048×2048, GL_LINEAR
+    /// sampling, GL_CLAMP_TO_EDGE wrap, format determined by
+    /// `self.format`: RGBA8 for color glyphs, RGB8 for MSDF).
+    /// Idempotent: re-calling on an already-allocated page is a
+    /// no-op.
     #[cfg(target_os = "linux")]
     pub fn allocate_texture(&mut self, gl: &glow::Context) -> Result<()> {
         if self.texture.is_some() {
@@ -105,13 +170,36 @@ impl AtlasPage {
             // dynamic slot is written via glTexSubImage2D before
             // it's sampled, and unwritten slots are never sampled
             // (allocate_slot tracks the high-water mark).
+            //
+            // 2026-06-24 RGB8 drop: format is now selected at
+            // construction. RGB8 saves 4 MB CMA at 2048×2048 vs
+            // RGBA8; vc4 supports both equivalently for MSDF
+            // sampling (the static slice-B atlases have used RGB8
+            // since the SDF arc shipped).
+            let gl_fmt = match self.format {
+                AtlasFormat::Rgba8 => glow::RGBA,
+                AtlasFormat::Rgb8 => glow::RGB,
+            };
+            // Row alignment for the NULL upload: GLES2's
+            // UNPACK_ALIGNMENT default is 4. The texture
+            // allocation itself doesn't read pixels (None), but a
+            // few drivers still consult the alignment to size
+            // their internal padding. Set it to 1 for RGB8 so the
+            // driver doesn't reserve a wider row stride than we'll
+            // upload via upload_slot. Restore after.
+            if self.format == AtlasFormat::Rgb8 {
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            }
             gl.tex_image_2d(
                 glow::TEXTURE_2D, 0,
-                glow::RGBA as i32,
+                gl_fmt as i32,
                 ATLAS_DIM as i32, ATLAS_DIM as i32, 0,
-                glow::RGBA, glow::UNSIGNED_BYTE,
+                gl_fmt, glow::UNSIGNED_BYTE,
                 None,
             );
+            if self.format == AtlasFormat::Rgb8 {
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+            }
             gl.tex_parameter_i32(
                 glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
             );
@@ -177,10 +265,12 @@ impl AtlasPage {
         self.free_list.push(idx);
     }
 
-    /// Upload `rgba_bytes` (width*height*4 bytes, top-left origin) into
-    /// the texture region at (x, y). Caller is responsible for matching
-    /// width/height to the slot's cell_px. Returns error if the GL
-    /// texture isn't allocated yet OR if glTexSubImage2D errored.
+    /// Upload `pixels` (width*height*bpp bytes, top-left origin)
+    /// into the texture region at (x, y), where bpp is 4 for RGBA8
+    /// pages and 3 for RGB8 pages. Caller is responsible for
+    /// matching width/height to the slot's cell_px. Returns error
+    /// if the GL texture isn't allocated yet OR if glTexSubImage2D
+    /// errored.
     ///
     /// Sub-texture upload semantics validated on vc4 by
     /// gl_subtexture_smoke (commit d99834d).
@@ -192,16 +282,17 @@ impl AtlasPage {
         y: u32,
         width: u32,
         height: u32,
-        rgba_bytes: &[u8],
+        pixels: &[u8],
     ) -> Result<()> {
         let tex = self.texture.ok_or_else(|| {
             anyhow!("upload_slot: AtlasPage has no texture (allocate_texture first)")
         })?;
-        let expected = (width * height * 4) as usize;
-        if rgba_bytes.len() != expected {
+        let bpp = self.format.bytes_per_pixel();
+        let expected = (width * height * bpp) as usize;
+        if pixels.len() != expected {
             return Err(anyhow!(
-                "upload_slot: byte slice len {} != width*height*4 = {}",
-                rgba_bytes.len(), expected,
+                "upload_slot: byte slice len {} != width*height*{bpp} = {} (format={:?})",
+                pixels.len(), expected, self.format,
             ));
         }
         if x + width > ATLAS_DIM || y + height > ATLAS_DIM {
@@ -209,18 +300,24 @@ impl AtlasPage {
                 "upload_slot: ({x}, {y}, {width}, {height}) exceeds {ATLAS_DIM}x{ATLAS_DIM}",
             ));
         }
+        let gl_fmt = match self.format {
+            AtlasFormat::Rgba8 => glow::RGBA,
+            AtlasFormat::Rgb8 => glow::RGB,
+        };
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(tex));
             // UNPACK_ALIGNMENT=1 to accept arbitrary row widths
-            // (validated by smoke for 47-wide sub-regions). Restore
-            // after.
+            // (validated by smoke for 47-wide sub-regions; RGB8
+            // cells have stride width*3 which is rarely 4-aligned
+            // so the explicit 1 is mandatory for the new format).
+            // Restore after.
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
             gl.tex_sub_image_2d(
                 glow::TEXTURE_2D, 0,
                 x as i32, y as i32,
                 width as i32, height as i32,
-                glow::RGBA, glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(rgba_bytes),
+                gl_fmt, glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(pixels),
             );
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
             let err = gl.get_error();
@@ -272,6 +369,30 @@ mod tests {
         assert!(!page.is_full());
         #[cfg(target_os = "linux")]
         assert!(page.texture().is_none());
+    }
+
+    #[test]
+    fn default_constructor_picks_rgba8_format() {
+        // Back-compat: existing callers expect RGBA8 (COLR /
+        // CBDT). Switching that silently to RGB8 would break the
+        // alpha channel that color glyphs depend on.
+        assert_eq!(AtlasPage::new(48).format(), AtlasFormat::Rgba8);
+        assert_eq!(AtlasPage::new(96).format(), AtlasFormat::Rgba8);
+    }
+
+    #[test]
+    fn new_rgb8_constructor_picks_rgb8_format() {
+        // MSDF dynamic page selects RGB8 explicitly; the alpha
+        // byte was unused (all four MSDF shaders sample .rgb).
+        assert_eq!(AtlasPage::new_rgb8(48).format(), AtlasFormat::Rgb8);
+    }
+
+    #[test]
+    fn rgb8_format_bytes_per_pixel_is_three() {
+        // Headline saving: 25% per-cell vs Rgba8. At 2048×2048
+        // that's 16 MB → 12 MB.
+        assert_eq!(AtlasFormat::Rgba8.bytes_per_pixel(), 4);
+        assert_eq!(AtlasFormat::Rgb8.bytes_per_pixel(), 3);
     }
 
     #[test]
