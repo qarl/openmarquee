@@ -436,6 +436,31 @@ class RustRenderer:
     # TIMEOUT_S env var so QA can hot-tune.
     DEFAULT_RESPONSE_TIMEOUT_S = 8.0
 
+    # FYS seed-stability ship-gate (2026-06-24): Open has its own
+    # budget because it's the only op that includes session bring-up
+    # (EGL/GBM init, DRM connector setup, GLES program cache build —
+    # ~18s on Pi Zero 2 W cold; warmer/faster targets stay well under
+    # this ceiling). Every other op runs against a live session and
+    # is bound by DEFAULT_RESPONSE_TIMEOUT_S above.
+    #
+    # 60s is ~3x the empirical EGL bringup on the slowest target with
+    # plenty of headroom for kernel-side slowness during station-mode
+    # WiFi negotiation, SD-card pressure, etc. It's also a clean
+    # ceiling: anything past 60s is genuinely wedged, not slow.
+    #
+    # Pre-fix the Open op shared DEFAULT_RESPONSE_TIMEOUT_S=8s. Any
+    # device with text content cold-started past it because the
+    # glyph-prewarm was synchronously gating Open behind a ~28s
+    # raster drain — the prewarm has since been decoupled (renderer
+    # signal-Open-ready before drain; lazy/background drain via the
+    # IPC inner-loop's per-Advance poll), but the Open-specific
+    # ceiling stays generous so future cold-path additions don't
+    # silently regress past it.
+    #
+    # Configurable via OPENMARQUEE_RENDERER_OPEN_TIMEOUT_S so QA can
+    # tune per-device (e.g. the existing 120s drop-in on FYS).
+    DEFAULT_OPEN_TIMEOUT_S = 60.0
+
     def __init__(
         self,
         *,
@@ -453,6 +478,7 @@ class RustRenderer:
         watchdog_enabled: bool = True,
         watchdog_interval_s: float = DEFAULT_WATCHDOG_INTERVAL_S,
         response_timeout_s: float | None = None,
+        open_timeout_s: float | None = None,
     ):
         # Renderer Protocol attrs. Refreshed from the sidecar's
         # OpenOk response after open() so the negotiated mode wins
@@ -536,6 +562,28 @@ class RustRenderer:
                     self._response_timeout_s = self.DEFAULT_RESPONSE_TIMEOUT_S
             else:
                 self._response_timeout_s = self.DEFAULT_RESPONSE_TIMEOUT_S
+
+        # FYS seed-stability ship-gate (2026-06-24): Open-specific
+        # timeout. Same resolution order as the general response
+        # timeout above. Op-level dispatch in _send_op_locked picks
+        # this for the "open" op only.
+        if open_timeout_s is not None:
+            self._open_timeout_s = float(open_timeout_s)
+        else:
+            env_val = os.environ.get("OPENMARQUEE_RENDERER_OPEN_TIMEOUT_S")
+            if env_val:
+                try:
+                    self._open_timeout_s = float(env_val)
+                except ValueError:
+                    log.warning(
+                        "ignoring invalid OPENMARQUEE_RENDERER_OPEN_TIMEOUT_S=%r; "
+                        "using default %.1fs",
+                        env_val,
+                        self.DEFAULT_OPEN_TIMEOUT_S,
+                    )
+                    self._open_timeout_s = self.DEFAULT_OPEN_TIMEOUT_S
+            else:
+                self._open_timeout_s = self.DEFAULT_OPEN_TIMEOUT_S
 
     # ------------------------------------------------------------------
     # Lifecycle.
@@ -1107,10 +1155,13 @@ class RustRenderer:
 
         try:
             assert self._proc.stdout is not None
-            response_line = self._readline_with_timeout(
-                op,
-                self._response_timeout_s,
-            )
+            # FYS seed-stability ship-gate (2026-06-24): the open op
+            # carries session bring-up (EGL + DRM + GLES program
+            # cache; ~18s on Pi Zero 2 W cold) so it uses its own
+            # generous budget. Every other op runs against a live
+            # session and is bound by the general response timeout.
+            op_timeout_s = self._open_timeout_s if op == "open" else self._response_timeout_s
+            response_line = self._readline_with_timeout(op, op_timeout_s)
         except (BrokenPipeError, OSError) as e:
             raise RustRendererSubprocessError(f"Failed to read response to op {op!r}: {e}") from e
         if not response_line:

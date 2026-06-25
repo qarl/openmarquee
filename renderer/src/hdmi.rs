@@ -14107,15 +14107,37 @@ fn prewarm_glyph_rasterization(session: &mut EglSession) {
     ];
     const PRINTABLE_ASCII_START: u32 = 0x20;
     const PRINTABLE_ASCII_END: u32 = 0x7E;
-    const PREWARM_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
 
+    // FYS seed-stability ship-gate 2026-06-24: enqueue-only prewarm.
+    //
+    // Pre-fix this function blocked run_in_egl_session for ~28s while
+    // it drained 855 raster jobs to zero. Combined with the ~18s EGL
+    // bringup, the sidecar's Open response landed ~46s after launch —
+    // past every reasonable Open timeout on the backend side, so any
+    // device with text content cold-started into a restart loop
+    // (DEFAULT_OPEN_TIMEOUT_S=45s → backend kills the "wedged"
+    // renderer → TimeoutStartSec=90s → reboot via stability stack).
+    //
+    // The fix: keep the enqueue (it's ~1ms total for 855 work-queue
+    // sends and primes the worker pool so glyphs start rasterizing
+    // immediately), but DROP the synchronous drain wait. The IPC
+    // inner loop's existing `poll_dynamic_glyph_completions(session,
+    // 4)` per-Advance call drains the queue concurrent to playback.
+    // A glyph requested before its prewarm has completed populates
+    // via the existing lazy-per-glyph path (paint_text_layer's
+    // get_or_request returns Requested → Tofu placeholder until the
+    // worker finishes → slide_caches drop when the completion lands
+    // → next paint re-lays-out with the real glyph). Steady state
+    // is unchanged because every glyph still ends up in the atlas;
+    // we just don't BLOCK Open on draining first.
+    //
+    // Result: Open response lands ~18s after launch instead of
+    // ~46s — comfortably inside any plausible Open timeout, and
+    // closes the §13 "~15s within power-on" boot target. The
+    // ~28s prewarm continues to run in the background but
+    // overlaps with the first reel slot's playback rather than
+    // gating it.
     let t0 = std::time::Instant::now();
-    // Capture pre-prewarm completion count so we can measure
-    // "completions due to MY enqueues only" -- defensive in case
-    // some other code path bumps completion_count before this
-    // function runs (it doesn't today, but the diff-against-
-    // baseline shape is sound either way).
-    let baseline_completions = session.dynamic_glyph_cache.completion_count();
     let mut requested: u64 = 0;
     let mut skipped_fonts: u32 = 0;
 
@@ -14142,45 +14164,11 @@ fn prewarm_glyph_rasterization(session: &mut EglSession) {
         }
     }
 
+    let enqueue_us = t0.elapsed().as_micros();
     eprintln!(
-        "glyph-prewarm: enqueued {requested} glyphs across {} fonts ({skipped_fonts} skipped); draining to zero...",
+        "glyph-prewarm: enqueued {requested} glyphs across {} fonts ({skipped_fonts} skipped) in {enqueue_us}us; \
+         draining IN BACKGROUND via IPC poll_dynamic_glyph_completions (sidecar boot gate clearing now)",
         DEMO_REEL_STEMS.len() - skipped_fonts as usize,
-    );
-
-    let watchdog_deadline = t0 + PREWARM_WATCHDOG;
-    loop {
-        // CMA-arc 2026-06-21: wrap via poll_dynamic_glyph_completions
-        // so the prewarm path triggers the lazy texture allocation
-        // (the prewarm is precisely the path that pre-arc would
-        // have populated the dynamic atlas at session bring-up).
-        let drained_this_call = poll_dynamic_glyph_completions(session, 128);
-        let completions_since_baseline =
-            session.dynamic_glyph_cache.completion_count() - baseline_completions;
-        if crate::hdmi_logic::glyph_prewarm_drain_complete(
-            requested,
-            completions_since_baseline,
-            drained_this_call,
-        ) {
-            break;
-        }
-        if std::time::Instant::now() > watchdog_deadline {
-            eprintln!(
-                "glyph-prewarm: WATCHDOG tripped after {:.1}s -- enqueued {requested}, drained {completions_since_baseline}. \
-                 Continuing to boot; uncached glyphs populate lazily (slide_caches-drain cost bounded to residual queue).",
-                t0.elapsed().as_secs_f64()
-            );
-            break;
-        }
-        if drained_this_call == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    let ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let completions_since_baseline =
-        session.dynamic_glyph_cache.completion_count() - baseline_completions;
-    eprintln!(
-        "glyph-prewarm: drained {completions_since_baseline}/{requested} glyphs in {ms:.1}ms (sidecar boot gate cleared)"
     );
 }
 
