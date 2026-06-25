@@ -343,6 +343,15 @@ class PlaybackLoop:
         # id logs INFO, subsequent log DEBUG. Reset on playlist
         # change by _stamp_playlist_id.
         self._skipped_slide_ids: set[UUID] = set()
+        # Stability arc Layer 2.1 (2026-06-23, post-glass-bug-fix):
+        # one-shot tracker for the sd_notify READY=1 send. The
+        # original L2 sent READY from app.py's lifespan, which fired
+        # BEFORE the renderer was even opened (PlaybackLoop.start
+        # only spawns _loop; opens happen later inside _loop). L2.1
+        # moves the send to `_maybe_notify_ready()` below, called
+        # after each successful renderer.advance(). This flag makes
+        # the send idempotent so we don't spam READY at ~30Hz.
+        self._ready_sent: bool = False
         # True while the active playlist has zero playable slides —
         # gates the zero-playable warning to one line per stuck
         # episode (then DEBUG), and a recovery INFO when it clears.
@@ -959,6 +968,47 @@ class PlaybackLoop:
         rails as production)."""
         return hasattr(self._renderer, "begin_slide") and hasattr(self._renderer, "advance")
 
+    def _maybe_notify_ready(self) -> None:
+        """Stability arc Layer 2.1 (2026-06-23): one-shot sd_notify
+        READY=1 after the first successful renderer.advance(), gated
+        on `renderer.is_in_fallback`.
+
+        Called from the `_loop` advance-success branches (slide-window
+        + transition-window). Short-circuits after the first send via
+        `self._ready_sent`, so the per-frame call cost is one bool
+        check + one attribute read at steady state.
+
+        The original L2 sent READY from app.py's lifespan right after
+        `await get_playback_loop().start()` — but start() spawns the
+        _loop task and returns immediately; the renderer is opened
+        LATER inside _loop (begin_slide → AutoFallbackRenderer.open
+        → RustRenderer.open). On glass (FYS 2026-06-23) a cold-start
+        Open timeout swapped to Mock ~76ms AFTER lifespan sent READY
+        → systemd thought the unit was healthy on the mock for the
+        full 120s WatchdogSec window. Moving the send to here makes
+        READY mean "actually painting from the real renderer."
+
+        Introspection guard: AutoFallbackRenderer.is_in_fallback is a
+        property; getattr default + a try/except treats introspection
+        failures as healthy (don't wedge the gate on a transient
+        attribute-access error). MockRenderer doesn't expose the
+        property, so getattr default `False` lets dev/CI through
+        cleanly (which is fine — they're not running under systemd
+        Type=notify; sd_notify.notify_ready() is a no-op without
+        $NOTIFY_SOCKET set).
+        """
+        if self._ready_sent:
+            return
+        try:
+            in_fallback = bool(getattr(self._renderer, "is_in_fallback", False))
+        except Exception:
+            log.debug("could not introspect renderer fallback state; treating as healthy")
+            in_fallback = False
+        if in_fallback:
+            return
+        sd_notify.notify_ready()
+        self._ready_sent = True
+
     def _maybe_kick_web_refresh(self, slide: WebSlide) -> None:
         """Fire-and-forget a screenshot refresh for `slide` if one is
         due — NON-BLOCKING.
@@ -1335,6 +1385,9 @@ class PlaybackLoop:
                 # fires + escalates to FailureAction=reboot. See
                 # `system/openmarquee-backend.service`.
                 sd_notify.notify_watchdog()
+                # L2.1: one-shot READY=1 after the first real
+                # advance (idempotent via self._ready_sent).
+                self._maybe_notify_ready()
             except RustRendererUnsupportedSlideError as e:
                 # Begin_slide accepted the slide but advance hit the
                 # unsupported-kind rail (happens for video on the very
@@ -1561,6 +1614,10 @@ class PlaybackLoop:
                     # on the transition-window advance too (mirrors the
                     # slide-window advance above).
                     sd_notify.notify_watchdog()
+                    # L2.1: one-shot READY=1 mirrors the slide-window
+                    # call above; in case the very first advance is
+                    # the transition's (unusual but possible).
+                    self._maybe_notify_ready()
                 except RustRendererUnsupportedTransitionError as e:
                     # Mid-transition error -- shouldn't happen (begin_
                     # transition already succeeded), but if it does
