@@ -1346,6 +1346,52 @@ impl DecoderInner {
             );
             self.capture_streaming = false;
         }
+        // [p1080-probe v4 / fix-A] 2026-06-25: force-release the
+        // V4L2 buffer pool back to CMA via REQBUFS(count=0) on
+        // both queues. Without this, the kernel-side buffer pool
+        // (~12 MB / buf * 4 bufs * 2 queues = ~96 MB at 1080p
+        // NV12, ~32 MB at 720p) persists until self.file closes,
+        // which can be delayed if a Frame still holds an
+        // Arc<DecoderInner>. Per the v3 capture (2026-06-25):
+        // "primed without paint" drops show egl_destroyed=0 +
+        // cma_delta_mb=0 because the EGL cache was never
+        // populated AND the V4L2 pool's CMA isn't released by
+        // STREAMOFF alone. REQBUFS(0) makes that release
+        // synchronous + deterministic.
+        //
+        // Per V4L2 spec: REQBUFS with count=0 frees all buffers
+        // on the queue, provided streaming is OFF (just did
+        // STREAMOFF above) and userspace isn't holding refs.
+        // mmap views in self.mapped_* don't block this -- the
+        // kernel can free the buffer slot even with active
+        // mmaps; the mmaps become invalid + return SIGBUS on
+        // access, which is fine because Drop's field-order
+        // munmap fires immediately after stop_streaming_quiet
+        // returns.
+        //
+        // Safe on 720p: REQBUFS(0) is a no-op on the buffer
+        // budget when the pool was already small; it just
+        // releases the same way it would when the file closes.
+        // Best-effort: swallow errors so Drop doesn't panic.
+        for (dir, bt) in [
+            (QueueDirection::Output, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE),
+            (QueueDirection::Capture, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE),
+        ] {
+            let mut rb = V4l2Requestbuffers {
+                count: 0,
+                buf_type: bt,
+                memory: V4L2_MEMORY_MMAP,
+                ..Default::default()
+            };
+            // SAFETY: _IOWR; kernel writes rb.count + capabilities
+            // back. Both pointers live until the ioctl returns.
+            let r = unsafe { vidioc_reqbufs(self.fd(), &mut rb) };
+            eprintln!(
+                "[p1080-probe] reqbufs_zero queue={} result={}",
+                match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+                match &r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+            );
+        }
     }
 }
 
