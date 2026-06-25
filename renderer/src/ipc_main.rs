@@ -3168,6 +3168,80 @@ fn run_paint_hook(
                 }
             }
 
+            // 2026-06-25 BUG A fix (TextOverVideo transitions): the
+            // decoder-state lookups below assume a registered entry
+            // in `cache.video_decoders` for every video-bearing
+            // endpoint, but `ensure_bg_video_for_text_slide` uses
+            // `LoadMode::DemuxerOnly` (CMA #3, 2026-06-22). For a
+            // 'b' (TextOverVideo) endpoint the bg-video's demuxer
+            // gets registered + opened at cache.load time, but the
+            // V4L2 decoder is deferred to first paint. paint_slide's
+            // text-over-video branch already lazy-primes in place
+            // (search "lazy_prime_bg_video"); paint_transition was
+            // missing the symmetric path, so a non-cut transition
+            // INTO a TextOverVideo slide errored with "to decoder
+            // ... state missing" on tick 1 + the backend's
+            // UnsupportedSlide rail skipped the slide entirely.
+            //
+            // Fix: for each present dec_id, if the demuxer exists
+            // but the decoder doesn't, prime in place using the same
+            // `video_decode::prime_video_decoder` call paint_slide
+            // uses. Failures fall through to the existing "state
+            // missing" error — the slide will still be skipped, but
+            // it now requires a real prime failure (CMA exhausted,
+            // codec wedged) rather than the mere "DemuxerOnly didn't
+            // pre-register the decoder" state. ~200-600 ms one-time
+            // cost on the first paint_transition tick for a
+            // TextOverVideo endpoint; subsequent ticks cache-hit.
+            //
+            // Pure Video endpoints don't hit this path because
+            // `LoadMode::Full` (cache.load's default) primes the
+            // decoder up-front for them. The lazy-prime is a no-op
+            // when the decoder is already registered.
+            #[cfg(target_os = "linux")]
+            {
+                let mut maybe_prime = |dec_id: uuid::Uuid, side: &str| -> Result<()> {
+                    if cache.video_decoders.contains_key(&dec_id) {
+                        return Ok(());
+                    }
+                    if !cache.video_demuxers.contains_key(&dec_id) {
+                        return Ok(());
+                    }
+                    let dem = cache.video_demuxers.get(&dec_id)
+                        .expect("contains_key checked");
+                    let t_lazy = std::time::Instant::now();
+                    let dec_state = crate::video_decode::prime_video_decoder(
+                        dem, "lazy_bg_prime_transition",
+                    )?;
+                    let lazy_us = t_lazy.elapsed().as_micros();
+                    eprintln!(
+                        "[perf] lazy_prime_bg_video_transition side={} bg_video_id={} \
+                         lazy_us={} outcome=ok",
+                        side, dec_id, lazy_us,
+                    );
+                    cache.video_decoders.insert(dec_id, dec_state);
+                    Ok(())
+                };
+                if let Some(fid) = from_dec_id {
+                    if let Err(e) = maybe_prime(fid, "a") {
+                        eprintln!(
+                            "[perf] lazy_prime_bg_video_transition side=a bg_video_id={} \
+                             outcome=err err={:#}",
+                            fid, e,
+                        );
+                    }
+                }
+                if let Some(tid) = to_dec_id {
+                    if let Err(e) = maybe_prime(tid, "b") {
+                        eprintln!(
+                            "[perf] lazy_prime_bg_video_transition side=b bg_video_id={} \
+                             outcome=err err={:#}",
+                            tid, e,
+                        );
+                    }
+                }
+            }
+
             // Resolve V4L2 decoder state &muts up-front. Single
             // get_mut for single-decoder; `iter_mut` for dual-
             // decoder (Rust 1.85 lacks `HashMap::get_disjoint_mut`
