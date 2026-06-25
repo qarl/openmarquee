@@ -225,6 +225,16 @@ pub struct EglImageHandle {
         dpy: *mut std::ffi::c_void,
         image: *mut std::ffi::c_void,
     ) -> u32,
+    /// [p1080-probe v3] 2026-06-25: resolved eglGetError fn ptr.
+    /// QA's v2 capture showed destroy returning 0 (EGL_FALSE) on
+    /// most drops with egl_destroyed=0 -- a DIFFERENT failure
+    /// class than r101's documented "returns EGL_TRUE but leaks
+    /// the ref." On destroy failure the loop calls this fn to
+    /// pull the EGL error code (EGL_BAD_DISPLAY, EGL_BAD_
+    /// PARAMETER, etc.) which pins the root cause before we
+    /// commit to a fix shape. `Option` so existing tests / unit
+    /// builds without the eglGetError ptr stay green.
+    pub get_error_fn: Option<unsafe extern "C" fn() -> i32>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1437,10 +1447,27 @@ impl Drop for DecoderInner {
                 let r = unsafe { (h.destroy_fn)(h.display, h.image) };
                 let elapsed_us = t_entry.elapsed().as_micros();
                 let result = if r == 0 { "fail" } else { "ok" };
+                // [p1080-probe v3] 2026-06-25: on destroy failure,
+                // call eglGetError to pin which EGL error fired
+                // (EGL_BAD_DISPLAY=0x3008 / EGL_BAD_PARAMETER=0x300C
+                // / EGL_NOT_INITIALIZED=0x3001 / etc). The error
+                // distinguishes display-state issues (initialization
+                // gone, context-not-current quirks) from image-
+                // state issues (already destroyed, stale handle).
+                // Calling get_error after success would clear an
+                // unrelated sticky error; only on the failure path.
+                let egl_err_hex = if r == 0 {
+                    match h.get_error_fn {
+                        Some(f) => format!("{:#x}", unsafe { (f)() }),
+                        None => "no_fn".to_string(),
+                    }
+                } else {
+                    "n/a".to_string()
+                };
                 let _ = writeln!(
                     std::io::stderr(),
-                    "[perf] egl_image_destroy_exit idx={} elapsed_us={} result={} drop_path=DecoderInner",
-                    visited, elapsed_us, result,
+                    "[perf] egl_image_destroy_exit idx={} elapsed_us={} result={} drop_path=DecoderInner egl_err={}",
+                    visited, elapsed_us, result, egl_err_hex,
                 );
                 if r == 0 {
                     failed += 1;
@@ -2410,10 +2437,18 @@ impl Decoder {
                 let r = unsafe { (h.destroy_fn)(h.display, h.image) };
                 let elapsed_us = t_entry.elapsed().as_micros();
                 let result = if r == 0 { "fail" } else { "ok" };
+                let egl_err_hex = if r == 0 {
+                    match h.get_error_fn {
+                        Some(f) => format!("{:#x}", unsafe { (f)() }),
+                        None => "no_fn".to_string(),
+                    }
+                } else {
+                    "n/a".to_string()
+                };
                 let _ = writeln!(
                     std::io::stderr(),
-                    "[perf] egl_image_destroy_exit idx={} elapsed_us={} result={} drop_path=unpin_egl_refs",
-                    visited, elapsed_us, result,
+                    "[perf] egl_image_destroy_exit idx={} elapsed_us={} result={} drop_path=unpin_egl_refs egl_err={}",
+                    visited, elapsed_us, result, egl_err_hex,
                 );
                 if r == 0 {
                     failed += 1;

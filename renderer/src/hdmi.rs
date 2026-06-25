@@ -13516,6 +13516,14 @@ struct DmaBufEglEntryPoints {
     /// `glEGLImageTargetTexture2DOES(GLenum target, GLeglImageOES image)`
     image_target_texture_2d:
         unsafe extern "C" fn(target: u32, image: *mut std::ffi::c_void),
+    /// [p1080-probe v3] 2026-06-25: resolved `eglGetError()` fn
+    /// ptr (core EGL function, not extension). Copied into each
+    /// `EglImageHandle` at create time so DecoderInner::Drop
+    /// (which has no EglSession access) can pull the EGL error
+    /// code when destroy returns 0. `Option` because the resolve
+    /// may fail in degenerate Mesa builds; cache + handles tolerate
+    /// `None` and log "no_fn".
+    get_error: Option<unsafe extern "C" fn() -> i32>,
 }
 
 /// Tri-state cache:
@@ -13574,6 +13582,11 @@ fn dma_buf_egl_entry_points(
         let create_ptr = egl_lib.get_proc_address("eglCreateImageKHR");
         let destroy_ptr = egl_lib.get_proc_address("eglDestroyImageKHR");
         let target_ptr = egl_lib.get_proc_address("glEGLImageTargetTexture2DOES");
+        // [p1080-probe v3] eglGetError is core EGL but resolved
+        // via get_proc_address for consistency with destroy_image.
+        // Treated as optional: a Mesa build that fails to resolve
+        // it still gives us destroy + create.
+        let get_error_ptr = egl_lib.get_proc_address("eglGetError");
         let (Some(create_ptr), Some(destroy_ptr), Some(target_ptr)) =
             (create_ptr, destroy_ptr, target_ptr)
         else {
@@ -13611,6 +13624,10 @@ fn dma_buf_egl_entry_points(
                     extern "system" fn(),
                     unsafe extern "C" fn(u32, *mut std::ffi::c_void),
                 >(target_ptr),
+                get_error: get_error_ptr.map(|p| std::mem::transmute::<
+                    extern "system" fn(),
+                    unsafe extern "C" fn() -> i32,
+                >(p)),
             }
         };
         cell.set(Some(Some(eps)));
@@ -13797,6 +13814,10 @@ pub unsafe fn run_nv12_dmabuf_blit_pass(
                 image: img,
                 display: display.as_ptr(),
                 destroy_fn: eps.destroy_image,
+                // [p1080-probe v3] copy the resolved eglGetError
+                // ptr so DecoderInner::Drop can diagnose destroy
+                // failures without an EglSession handle.
+                get_error_fn: eps.get_error,
             })
         };
         let (handle, _created) = decoder.get_or_init_egl_image(idx, create_one)?;
