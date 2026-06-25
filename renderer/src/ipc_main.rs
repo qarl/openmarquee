@@ -132,6 +132,13 @@ const PAINT_SAMPLE_CAP: usize = 2048;
 /// content to the UI perf overlay.
 const PERF_STATS_JSON_PATH: &str = "/var/openmarquee/perf-stats.json";
 
+/// LEVER 1 (2026-06-24): canonical playlist.json path on the device.
+/// Matches the OPENMARQUEE_PLAYLIST_PATH env default in
+/// system/openmarquee-backend.service and the standalone-reel
+/// fallback in main.rs. Used by the scoped glyph prewarm to derive
+/// the (font_stem, codepoint) set the operator's reels actually use.
+const PLAYLIST_JSON_PATH: &str = "/var/openmarquee/playlist.json";
+
 /// `[perf]` r2: shape of the perf-stats sidecar written by
 /// `maybe_emit_summary`. Mirrors the keys of the `ipc.soak` eprintln
 /// line for parity (operator can grep journalctl for the same field
@@ -2227,6 +2234,27 @@ where
                 result: OpResult::OpenOk { mode_w: mw, mode_h: mh },
             },
         )?;
+        // LEVER 1 (2026-06-24): scoped glyph prewarm fires AFTER
+        // OpenOk so the response latency stays unaffected. The
+        // scope-from-playlists pass reads /var/openmarquee/playlist.json
+        // + per-item content.json under content_root and enqueues
+        // ONLY the codepoints the operator's reels actually use
+        // (FYS 19-slide reel = ~50 codepoints × 3-4 fonts ≈
+        // ~150-200 enqueues vs the pre-LEVER-1 hardcoded 855).
+        // Falls back to the previous DEMO_REEL × ASCII set if the
+        // playlist read fails so the prewarm is never empty.
+        // Enqueue-only (Issue-1 contract): drain happens in the
+        // IPC loop's per-Advance poll_dynamic_glyph_completions.
+        //
+        // Playlist path: see PLAYLIST_JSON_PATH near the top of
+        // this file — matches the OPENMARQUEE_PLAYLIST_PATH
+        // backend env default + the standalone-reel fallback in
+        // main.rs.
+        hdmi::prewarm_glyph_rasterization_scoped(
+            session,
+            content_root,
+            std::path::Path::new(PLAYLIST_JSON_PATH),
+        );
         // v1-spec-delta #12 (slice b-3): IPC sidecar [mem]
         // emission. Mirrors the standalone reel's session=
         // open / per-N / session=close cadence using

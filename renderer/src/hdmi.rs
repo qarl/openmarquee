@@ -6802,20 +6802,18 @@ pub fn run_in_egl_session<F, R>(card: &Card, rotation: i32, work: F) -> Result<R
 where
     F: FnOnce(&mut EglSession) -> Result<R>,
 {
-    // r25 (2026-05-31): glyph rasterization prewarm lives at the
-    // long-lived-sidecar entrypoint, NOT inside with_egl_session
-    // itself. The 16s drain-to-zero cost is only worth paying when
-    // the session outlives the prewarm by many minutes-to-hours
-    // (the IPC sidecar). All other with_egl_session callers
-    // (--play-slide, --capture-*, --solid-color, --fade-*, the
-    // standalone reel driver, the QA visual-verdict snapshot
-    // paths) construct + tear down a session for one or a few
-    // paints; the 16s prewarm tax would dominate their wall-clock
-    // and force-cache glyphs they never render.
-    with_egl_session(card, rotation, |session| {
-        prewarm_glyph_rasterization(session);
-        work(session)
-    })
+    // LEVER 1 (2026-06-24): glyph prewarm moved to the IPC sidecar
+    // caller (ipc_main.rs's run_open_and_inner_loop_linux) where the
+    // content_root + playlist_path are in scope and the prewarm can
+    // be scoped to actually-used codepoints. Pre-LEVER-1 the prewarm
+    // ran here unconditionally over a hardcoded DEMO_REEL × ASCII set
+    // (~855 glyphs) regardless of what the device actually played.
+    //
+    // Non-IPC `with_egl_session` callers (the standalone --play-slide,
+    // --capture-*, --solid-color, --fade-*, QA visual-verdict snapshots,
+    // host-side smoke tests) keep the same zero-prewarm-tax behavior
+    // they had before because they never went through this path.
+    with_egl_session(card, rotation, work)
 }
 
 /// v1-spec-delta #11 (slice a, 2026-05-08) -- read back the
@@ -14085,91 +14083,238 @@ fn prewarm_shader_programs(session: &EglSession) {
 /// slot 2048×2048 page vs 855-glyph budget). The watchdog floor
 /// is the failsafe; bumping completion_count in those branches
 /// is a glyph_cache.rs follow-up, out of r25 scope.
+/// Hardcoded fallback prewarm set. Used when the active-playlist
+/// scoping pass fails (missing playlist.json, parse error, etc.) so
+/// the prewarm still primes a reasonable subset rather than running
+/// nothing. Mirrors the previous (pre-LEVER-1) hardcoded behavior:
+/// all printable ASCII × the seed demo reel's 9 fonts.
+///
+/// Stems match hdmi_logic::font_family_to_filename's basename-
+/// minus-extension. Keep in sync with seed.py _DEMO_REEL's
+/// font_family set + FALLBACK_FONT_STEMS if either changes.
 #[cfg(target_os = "linux")]
-fn prewarm_glyph_rasterization(session: &mut EglSession) {
+const DEMO_REEL_FALLBACK_STEMS: &[&str] = &[
+    "anton",
+    "alfa-slab-one",
+    "bowlby-one-sc",
+    "playfair-display",
+    "vt323",
+    "permanent-marker",
+    "caveat-brush",
+    "jetbrains-mono",
+    "dejavu-sans",
+];
+
+#[cfg(target_os = "linux")]
+const FALLBACK_PRINTABLE_ASCII_START: u32 = 0x20;
+#[cfg(target_os = "linux")]
+const FALLBACK_PRINTABLE_ASCII_END: u32 = 0x7E;
+
+/// LEVER 1 (2026-06-24): build the (stem, codepoint) prewarm set
+/// from the live playlist + content dir. On any fs / parse failure,
+/// returns None so the caller can fall back to the hardcoded demo-
+/// reel scope. The scoping pass is best-effort — if any part fails,
+/// we'd rather over-prewarm (fallback) than under-prewarm (empty).
+///
+/// Iterates EVERY playlist in playlist.json (not just the actively-
+/// scheduled one). Reason: the active playlist switches on
+/// schedules without renderer restart, and we don't want a schedule
+/// switch to find the next playlist's codepoints un-prewarmed and
+/// trip the per-slide SD-thrash QA's localizing. Iterating all
+/// playlists bounds the scope to "what the operator built" instead
+/// of "every printable ASCII × every installed font" — still a big
+/// reduction on most real reels (e.g. the FYS 19-slide reel uses
+/// ~50 distinct codepoints across 3-4 fonts vs the hardcoded 855).
+#[cfg(target_os = "linux")]
+fn build_prewarm_scope_from_playlists(
+    content_root: &std::path::Path,
+    playlist_path: &std::path::Path,
+) -> Option<Vec<(String, u32)>> {
+    let env = match crate::content::load_playlist(playlist_path) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!(
+                "glyph-prewarm: scope-from-playlists FAILED to load {} ({e:#}); falling back to demo-reel ASCII",
+                playlist_path.display(),
+            );
+            return None;
+        }
+    };
+
+    // Collect every (Option<font_family>, text) pair across all
+    // text layers across all referenced TextSlides. Non-text items
+    // are skipped silently (find_text_slide returns Ok(None) for
+    // image/video/etc.). Items that fail to load (rare: race with
+    // operator-delete) are skipped — first such per call logs
+    // once for the journal breadcrumb so a silent
+    // under-prewarm doesn't go un-explained.
+    let mut pairs: Vec<(Option<String>, String)> = Vec::new();
+    let mut item_err_logged = false;
+    let mut item_err_count: u32 = 0;
+    for playlist in &env.playlists {
+        for item_ref in &playlist.items {
+            match crate::content::find_text_slide(content_root, item_ref.item_id) {
+                Ok(Some(slide)) => {
+                    for layer in &slide.text_layers {
+                        pairs.push((layer.font_family.clone(), layer.text.clone()));
+                    }
+                }
+                Ok(None) => {} // not a TextSlide (image/video/etc.)
+                Err(e) => {
+                    item_err_count += 1;
+                    if !item_err_logged {
+                        item_err_logged = true;
+                        eprintln!(
+                            "glyph-prewarm: scope-from-playlists skipped item {} (first item err; subsequent errs counted): {e:#}",
+                            item_ref.item_id,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if item_err_count > 0 {
+        eprintln!(
+            "glyph-prewarm: scope-from-playlists total skipped_items_with_err={item_err_count} (under-prewarm bounded; runtime tofus those codepoints)",
+        );
+    }
+
+    if pairs.is_empty() {
+        eprintln!(
+            "glyph-prewarm: scope-from-playlists found ZERO TextSlide layers across {} playlists; falling back to demo-reel ASCII",
+            env.playlists.len(),
+        );
+        return None;
+    }
+
+    // Borrow the (Option<&str>, &str) view the pure scope-builder
+    // wants. Owned strings stay alive in `pairs` until the function
+    // returns.
+    let layer_views = pairs
+        .iter()
+        .map(|(family, text)| (family.as_deref(), text.as_str()));
+    Some(crate::hdmi_logic::build_prewarm_scope_from_text_layers(
+        layer_views,
+        "anton", // catalog default (mirrors FontCatalog::new in ipc_main.rs)
+    ))
+}
+
+/// LEVER 1 (2026-06-24): enqueue a prewarm set into the dynamic
+/// glyph cache. Pure enqueue — does NOT drain. The IPC inner loop's
+/// per-Advance `poll_dynamic_glyph_completions(session, 4)` drains
+/// the queue concurrently with playback (preserves the Issue-1
+/// enqueue-only model from the c9f391b → 63d9bef stability arc).
+///
+/// `scope_label` is a short, log-friendly tag identifying the
+/// source ("playlist-scoped" / "demo-reel-fallback") so QA can
+/// grep journals to confirm which path fired.
+#[cfg(target_os = "linux")]
+fn enqueue_prewarm_scope(
+    session: &mut EglSession,
+    scope: &[(String, u32)],
+    scope_label: &str,
+) {
     use crate::glyph_cache::{font_family_id_from_stem, GlyphKey, RenderMode};
 
-    // Demo-reel font set per backend/openmarquee/seed.py _DEMO_REEL
-    // + FALLBACK_FONT_STEMS. Stems match
-    // hdmi_logic::font_family_to_filename's basename-minus-extension.
-    // Keep in sync with seed.py _DEMO_REEL's font_family= set +
-    // FALLBACK_FONT_STEMS if either changes.
-    const DEMO_REEL_STEMS: &[&str] = &[
-        "anton",
-        "alfa-slab-one",
-        "bowlby-one-sc",
-        "playfair-display",
-        "vt323",
-        "permanent-marker",
-        "caveat-brush",
-        "jetbrains-mono",
-        "dejavu-sans",
-    ];
-    const PRINTABLE_ASCII_START: u32 = 0x20;
-    const PRINTABLE_ASCII_END: u32 = 0x7E;
-
-    // FYS seed-stability ship-gate 2026-06-24: enqueue-only prewarm.
-    //
-    // Pre-fix this function blocked run_in_egl_session for ~28s while
-    // it drained 855 raster jobs to zero. Combined with the ~18s EGL
-    // bringup, the sidecar's Open response landed ~46s after launch —
-    // past every reasonable Open timeout on the backend side, so any
-    // device with text content cold-started into a restart loop
-    // (DEFAULT_OPEN_TIMEOUT_S=45s → backend kills the "wedged"
-    // renderer → TimeoutStartSec=90s → reboot via stability stack).
-    //
-    // The fix: keep the enqueue (it's ~1ms total for 855 work-queue
-    // sends and primes the worker pool so glyphs start rasterizing
-    // immediately), but DROP the synchronous drain wait. The IPC
-    // inner loop's existing `poll_dynamic_glyph_completions(session,
-    // 4)` per-Advance call drains the queue concurrent to playback.
-    // A glyph requested before its prewarm has completed populates
-    // via the existing lazy-per-glyph path (paint_text_layer's
-    // get_or_request returns Requested → Tofu placeholder until the
-    // worker finishes → slide_caches drop when the completion lands
-    // → next paint re-lays-out with the real glyph). Steady state
-    // is unchanged because every glyph still ends up in the atlas;
-    // we just don't BLOCK Open on draining first.
-    //
-    // Result: Open response lands ~18s after launch instead of
-    // ~46s — comfortably inside any plausible Open timeout, and
-    // closes the §13 "~15s within power-on" boot target. The
-    // ~28s prewarm continues to run in the background but
-    // overlaps with the first reel slot's playback rather than
-    // gating it.
     let t0 = std::time::Instant::now();
     let mut requested: u64 = 0;
-    let mut skipped_fonts: u32 = 0;
+    let mut skipped_missing_font: u32 = 0;
+    let mut unique_fonts: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
-    for stem in DEMO_REEL_STEMS {
-        let fid = font_family_id_from_stem(stem);
+    for (stem, codepoint) in scope {
         let font_path = session.dynamic_fonts_dir.join(format!("{stem}.ttf"));
         if !font_path.exists() {
-            eprintln!(
-                "glyph-prewarm: skip {stem} -- font file not found at {font_path:?}"
-            );
-            skipped_fonts += 1;
+            // First miss per stem logs; subsequent codepoints of
+            // the same missing stem stay quiet (avoid 95-line log
+            // spam for a single missing font).
+            if unique_fonts.insert(stem.as_str()) {
+                eprintln!(
+                    "glyph-prewarm: skip {stem} -- font file not found at {font_path:?}"
+                );
+            }
+            skipped_missing_font += 1;
             continue;
         }
-        for cp in PRINTABLE_ASCII_START..=PRINTABLE_ASCII_END {
-            let key = GlyphKey {
-                font_family_id: fid,
-                codepoint: cp,
-                render_mode: RenderMode::Msdf,
-            };
-            let _ = session
-                .dynamic_glyph_cache
-                .get_or_request(key, || font_path.clone());
-            requested += 1;
-        }
+        unique_fonts.insert(stem.as_str());
+        let fid = font_family_id_from_stem(stem);
+        let key = GlyphKey {
+            font_family_id: fid,
+            codepoint: *codepoint,
+            render_mode: RenderMode::Msdf,
+        };
+        let _ = session
+            .dynamic_glyph_cache
+            .get_or_request(key, || font_path.clone());
+        requested += 1;
     }
 
     let enqueue_us = t0.elapsed().as_micros();
     eprintln!(
-        "glyph-prewarm: enqueued {requested} glyphs across {} fonts ({skipped_fonts} skipped) in {enqueue_us}us; \
+        "glyph-prewarm: enqueued {requested} glyphs across {} fonts (scope={scope_label}, skipped_missing_codepoints={skipped_missing_font}) in {enqueue_us}us; \
          draining IN BACKGROUND via IPC poll_dynamic_glyph_completions (sidecar boot gate clearing now)",
-        DEMO_REEL_STEMS.len() - skipped_fonts as usize,
+        unique_fonts.len(),
     );
+}
+
+/// Build the hardcoded DEMO_REEL × printable-ASCII fallback scope.
+/// Used when the playlist-derived scoping pass fails. Same total
+/// size as the pre-LEVER-1 prewarm (~855 = 9 fonts × 95 ASCII).
+#[cfg(target_os = "linux")]
+fn build_demo_reel_fallback_scope() -> Vec<(String, u32)> {
+    let mut scope = Vec::with_capacity(
+        DEMO_REEL_FALLBACK_STEMS.len()
+            * ((FALLBACK_PRINTABLE_ASCII_END - FALLBACK_PRINTABLE_ASCII_START + 1) as usize),
+    );
+    for stem in DEMO_REEL_FALLBACK_STEMS {
+        for cp in FALLBACK_PRINTABLE_ASCII_START..=FALLBACK_PRINTABLE_ASCII_END {
+            scope.push((stem.to_string(), cp));
+        }
+    }
+    scope
+}
+
+/// LEVER 1 (2026-06-24): active-reel-scoped glyph rasterization
+/// prewarm. Replaces the pre-LEVER-1 unconditional 855-glyph
+/// (9 fonts × 95 ASCII) enqueue with a scope derived from the
+/// playlist's actual TextSlide content.
+///
+/// Two-stage prewarm pipeline:
+///   1. Try `build_prewarm_scope_from_playlists` (reads
+///      playlist.json + per-item content). On the FYS 19-slide
+///      reel the scope is ~50 codepoints across 3-4 fonts =
+///      ~150-200 enqueues. On a small text reel it can drop
+///      below 100.
+///   2. On any failure (no playlist.json, all items non-text,
+///      parse error), fall back to the hardcoded demo-reel
+///      scope so the prewarm never silently does nothing.
+///
+/// Pre-LEVER-1 boot-burst pressure was ~5.9 MB of in-flight
+/// rgba_bytes Completion::Ready messages on the worker channel
+/// (855 × 6912 B per RGB8 48² MSDF cell). Scoped to ~150
+/// enqueues that's ~1 MB peak — about an 80% reduction on the
+/// boot working-set spike that QA's text-reel SD-thrash
+/// localization pointed at. LEVER 2 (Python lazy-imports) has
+/// already removed the steady-state thrash; LEVER 1 closes
+/// the boot-burst delta + buys headroom for the full 19-slide
+/// FYS reel to fit without re-thrashing.
+///
+/// Preserves the Issue-1 enqueue-only behavior: the IPC inner
+/// loop's existing per-Advance `poll_dynamic_glyph_completions
+/// (session, 4)` drains the queue concurrently with playback.
+/// Open-response latency is unaffected.
+#[cfg(target_os = "linux")]
+pub fn prewarm_glyph_rasterization_scoped(
+    session: &mut EglSession,
+    content_root: &std::path::Path,
+    playlist_path: &std::path::Path,
+) {
+    match build_prewarm_scope_from_playlists(content_root, playlist_path) {
+        Some(scope) => enqueue_prewarm_scope(session, &scope, "playlist-scoped"),
+        None => {
+            let scope = build_demo_reel_fallback_scope();
+            enqueue_prewarm_scope(session, &scope, "demo-reel-fallback");
+        }
+    }
 }
 
 /// Populate `slide_caches[slide_id].bg_tex` for non-solid bgs
