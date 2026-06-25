@@ -24,15 +24,29 @@ receiving our content preserves this stamp verbatim, while a local
 edit bumps it.
 """
 
+from __future__ import annotations
+
 import json
 import shutil
 import threading
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID
 
-from PIL import Image, ImageDraw, ImageFont
+# LEVER 2 lazy-imports (2026-06-24): Pillow is only used by the
+# render_*_placeholder_png helpers below, which are admin-side
+# slide-creation paths. content/storage.py is imported by ContentStorage
+# at app.py startup so a top-level `from PIL import ...` loads
+# Pillow into every backend's RSS even when the device never
+# touches the placeholder-render path. Deferring it shaves ~5-8 MB
+# off the prod-mode footprint. `from __future__ import annotations`
+# above + the TYPE_CHECKING-guarded import below preserve the
+# signature types for tooling without runtime cost.
+if TYPE_CHECKING:
+    from PIL import ImageDraw, ImageFont
+
 from pydantic import TypeAdapter, ValidationError
 
 from openmarquee._atomic import atomic_write_bytes, atomic_write_text
@@ -116,6 +130,11 @@ def _placeholder_font(size: int) -> ImageFont.ImageFont:
     """A scalable font for the stream placeholder card. Pillow's bundled
     default font is used at the requested size; the bare-default
     fallback covers any Pillow too old for the size argument."""
+    # LEVER 2 lazy-imports (2026-06-24): defer PIL.ImageFont. This
+    # helper is only called from the render_*_placeholder_png
+    # functions below, which are admin-side slide-creation paths.
+    from PIL import ImageFont
+
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
@@ -131,6 +150,10 @@ def _draw_centered(
     fill: tuple[int, int, int],
 ) -> None:
     """Draw `text` horizontally centred within `width` at vertical `y`."""
+    # Annotations on draw/font are `from __future__ import annotations`-
+    # deferred strings, so PIL doesn't need to be imported just to
+    # define this function. The caller has already created the
+    # ImageDraw + Font via PIL.
     bbox = draw.textbbox((0, 0), text, font=font)
     text_w = bbox[2] - bbox[0]
     draw.text(((width - text_w) / 2, y), text, font=font, fill=fill)
@@ -144,6 +167,10 @@ def render_stream_placeholder_png(slide: StreamSlide) -> bytes:
     tile something to render; the device renderer never paints it.
     Per docs/STREAM_VLC_PROPOSAL.md §6 recommendation (b).
     """
+    # LEVER 2 lazy-imports (2026-06-24): defer PIL until the first
+    # placeholder render. Admin-side path only.
+    from PIL import Image, ImageDraw
+
     width, height = _STREAM_PLACEHOLDER_SIZE
     img = Image.new("RGB", (width, height), (24, 24, 28))
     draw = ImageDraw.Draw(img)
@@ -193,6 +220,9 @@ def render_web_placeholder_png(slide: WebSlide) -> bytes:
     to show. The periodic-render producer overwrites it with a real
     screenshot.
     """
+    # LEVER 2 lazy-imports (2026-06-24): defer PIL — admin-side only.
+    from PIL import Image, ImageDraw
+
     width, height = _WEB_PLACEHOLDER_SIZE
     img = Image.new("RGB", (width, height), (24, 24, 28))
     draw = ImageDraw.Draw(img)
