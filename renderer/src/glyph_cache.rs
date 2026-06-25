@@ -847,20 +847,23 @@ fn rasterize_msdf_cell(
     shape.correct_sign(&mut bitmap, &framing, FillRule::default());
     shape.correct_msdf_error(&mut bitmap, &framing, &cfg);
 
-    // Pack RGB888 -> RGBA8 with Y-flip. msdfgen's bitmap origin is
-    // bottom-left (C++ convention); the dynamic atlas (like the
-    // static atlases) uses top-left origin to match GL texture
-    // upload semantics. A=255 since FS_MSDF_FIXED samples .rgb only.
-    let mut rgba = vec![0u8; (CELL_PX * CELL_PX * 4) as usize];
+    // Pack RGB888 with Y-flip. msdfgen's bitmap origin is bottom-
+    // left (C++ convention); the dynamic atlas (like the static
+    // slice-B atlases) uses top-left origin to match GL texture
+    // upload semantics. All four MSDF shaders sample `.rgb`
+    // (hdmi_logic.rs:1281-1366) so we don't emit the alpha byte
+    // at all — the dynamic MSDF page is RGB8, matching what
+    // sdf_atlas_gl.rs:67-79 has uploaded for the static atlases
+    // since the SDF arc shipped. Saves 4 MB CMA at 2048×2048.
+    let mut rgb = vec![0u8; (CELL_PX * CELL_PX * 3) as usize];
     for y in 0..CELL_PX {
         for x in 0..CELL_PX {
             let src_y = CELL_PX - 1 - y;
             let px = bitmap.pixel(x, src_y);
-            let dst = ((y * CELL_PX + x) * 4) as usize;
-            rgba[dst] = unorm8(px.r);
-            rgba[dst + 1] = unorm8(px.g);
-            rgba[dst + 2] = unorm8(px.b);
-            rgba[dst + 3] = 255;
+            let dst = ((y * CELL_PX + x) * 3) as usize;
+            rgb[dst] = unorm8(px.r);
+            rgb[dst + 1] = unorm8(px.g);
+            rgb[dst + 2] = unorm8(px.b);
         }
     }
 
@@ -882,7 +885,11 @@ fn rasterize_msdf_cell(
     let advance_em = face.glyph_hor_advance(gid).unwrap_or(0) as f32 / upem_f;
 
     Ok(Some(RasterOutput {
-        rgba_bytes: rgba,
+        // Field name kept as `rgba_bytes` so the upload-side glue
+        // is uniform across MSDF (RGB888 from here) + COLR
+        // (RGBA8 from glyph_cache_colr). The receiving AtlasPage
+        // knows its own format and dispatches accordingly.
+        rgba_bytes: rgb,
         cell_px: CELL_PX,
         advance_em,
         plane_bounds: PlaneBounds {
@@ -1084,10 +1091,11 @@ mod tests {
                 plane_bounds,
             } => {
                 assert_eq!(cell_px, 48);
-                assert_eq!(rgba_bytes.len(), 48 * 48 * 4);
-                for i in (0..rgba_bytes.len()).step_by(4) {
-                    assert_eq!(rgba_bytes[i + 3], 255, "alpha not 255 at byte {i}");
-                }
+                // 2026-06-24: dynamic MSDF dropped from RGBA8 to
+                // RGB8 (16 MB → 12 MB CMA per page). Rasterizer
+                // emits 3 bytes per pixel; the alpha pad byte is
+                // gone (all four MSDF shaders sample .rgb only).
+                assert_eq!(rgba_bytes.len(), 48 * 48 * 3);
                 assert!(advance_em > 0.0, "advance_em should be positive for 'A'");
                 assert!(
                     plane_bounds.pl_right > plane_bounds.pl_left,
@@ -1262,10 +1270,8 @@ mod tests {
                 plane_bounds,
             } => {
                 assert_eq!(cell_px, 48);
-                assert_eq!(rgba_bytes.len(), 48 * 48 * 4);
-                for i in (0..rgba_bytes.len()).step_by(4) {
-                    assert_eq!(rgba_bytes[i + 3], 255);
-                }
+                // RGB8 dynamic MSDF: 3 bytes/px, no alpha pad.
+                assert_eq!(rgba_bytes.len(), 48 * 48 * 3);
                 assert!(advance_em > 0.0);
                 assert!(
                     plane_bounds.pl_right > plane_bounds.pl_left,
