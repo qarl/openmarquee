@@ -2053,6 +2053,24 @@ impl Decoder {
             quantization: neg_pix_mp.quantization,
             plane_fmt: neg_pix_mp.plane_fmt,
         };
+        // [p1080-probe] 2026-06-25: log NEGOTIATED dims + sizeimage
+        // alongside the existing requested-dims line. For 1080p
+        // streams we want to see (a) whether the kernel accepts
+        // 1920x1080 or clamps/rounds it (e.g. 1920x1088 macroblock
+        // padding), and (b) the per-buffer sizeimage the kernel
+        // decided on -- that drives REQBUFS's CMA pressure.
+        let neg_sizeimage = neg.plane_fmt.first().map(|p| p.sizeimage).unwrap_or(0);
+        let neg_bytesperline = neg.plane_fmt.first().map(|p| p.bytesperline).unwrap_or(0);
+        eprintln!(
+            "[p1080-probe] s_fmt_negotiated queue={} requested_w={} requested_h={} \
+             negotiated_w={} negotiated_h={} num_planes={} sizeimage={} bytesperline={} \
+             quantization={}",
+            match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+            width, height,
+            neg.width, neg.height, neg.num_planes,
+            neg_sizeimage, neg_bytesperline,
+            neg.quantization,
+        );
         drop(inner);
         let mut inner = self.inner.lock().unwrap();
         match dir {
@@ -2615,6 +2633,26 @@ impl Decoder {
                 "VIDIOC_REQBUFS({:?}): kernel allocated 0 buffers", dir
             ));
         }
+        // [p1080-probe] 2026-06-25: REQBUFS success: requested vs
+        // allocated count + per-buffer sizeimage + total CMA ask
+        // for this queue + CMA snapshot. At 1080p NV12 the
+        // capture-queue sizeimage is ~3.2 MB Y + ~1.6 MB UV per
+        // plane (kernel rounds height to 1088 macroblock boundary),
+        // and 4 buffers x both queues = ~38 MB CMA ask per decoder.
+        // With per-slide decoder churn (decoder_open/drop each slide)
+        // and 17 slides cycling, the CMA budget shape we capture
+        // here is the load-bearing diagnostic.
+        let cma_now = read_cma_snapshot_mb();
+        eprintln!(
+            "[p1080-probe] reqbufs_ok queue={} memory={:?} requested_count={} \
+             allocated_count={} sizeimage={} total_alloc_kb={} \
+             cma_total_mb={} cma_free_mb={} cma_used_mb={}",
+            match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+            memory_type, count, allocated_count, sizeimage, total_alloc_kb,
+            cma_now.map(|c| c.total.to_string()).unwrap_or_else(|| "?".to_string()),
+            cma_now.map(|c| c.free.to_string()).unwrap_or_else(|| "?".to_string()),
+            cma_now.map(|c| c.used.to_string()).unwrap_or_else(|| "?".to_string()),
+        );
         let num_planes = fmt.num_planes as usize;
 
         // MMAP path (always).

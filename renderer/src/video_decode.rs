@@ -337,6 +337,23 @@ pub fn prime_video_decoder_with_warmup(
     }
     let w = dem.width as u32;
     let h = dem.height as u32;
+    // [p1080-probe] 2026-06-25: log entry-time CMA + the dims this
+    // prime will configure. Pairs with the s_fmt_negotiated +
+    // reqbufs_ok probes downstream so a grep on this prime's
+    // device_open_seq (logged in v4l2.rs `[mem] decoder_open seq=N`)
+    // gives a full waterfall: open -> s_fmt -> reqbufs -> streamon
+    // -> warmup, each with the CMA snapshot at that point.
+    {
+        let cma_entry = crate::v4l2::read_cma_snapshot_mb();
+        eprintln!(
+            "[p1080-probe] prime_entry mp4_w={} mp4_h={} samples={} \
+             cma_total_mb={} cma_free_mb={} cma_used_mb={}",
+            w, h, dem.sample_count(),
+            cma_entry.map(|c| c.total.to_string()).unwrap_or_else(|| "?".to_string()),
+            cma_entry.map(|c| c.free.to_string()).unwrap_or_else(|| "?".to_string()),
+            cma_entry.map(|c| c.used.to_string()).unwrap_or_else(|| "?".to_string()),
+        );
+    }
     let t_s_fmt = Instant::now();
     let _out_fmt = dec
         .set_output_format(v4l2::V4L2_PIX_FMT_H264, w, h)
@@ -494,6 +511,25 @@ pub fn prime_video_decoder_with_warmup(
         dem.width,
         dem.height,
     );
+    // [p1080-probe] 2026-06-25: prime-end CMA snapshot. Subtract
+    // prime_entry's used_mb from this to get the net CMA delta this
+    // prime allocated. For a 1080p prime that should be a big bump
+    // (~38 MB+ for OUTPUT+CAPTURE buffer pools); for 720p closer to
+    // ~17 MB. If the prime succeeds (this line fires) but the
+    // delta is well below those expectations, the kernel rounded
+    // down or the prime is reusing pool space.
+    {
+        let cma_end = crate::v4l2::read_cma_snapshot_mb();
+        eprintln!(
+            "[p1080-probe] prime_end cap_w={} cap_h={} cap_sizeimage={} \
+             cma_total_mb={} cma_free_mb={} cma_used_mb={}",
+            cap_fmt.width, cap_fmt.height,
+            cap_fmt.plane_fmt.first().map(|p| p.sizeimage).unwrap_or(0),
+            cma_end.map(|c| c.total.to_string()).unwrap_or_else(|| "?".to_string()),
+            cma_end.map(|c| c.free.to_string()).unwrap_or_else(|| "?".to_string()),
+            cma_end.map(|c| c.used.to_string()).unwrap_or_else(|| "?".to_string()),
+        );
+    }
 
     Ok(VideoDecoderState {
         decoder: dec,
