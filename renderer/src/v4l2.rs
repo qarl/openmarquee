@@ -2734,7 +2734,68 @@ impl Decoder {
                     },
                     recovered,
                 );
-                retry_result
+                // [p1080 fix-C] 2026-06-25: bounded wait+retry on
+                // persistent EINVAL. QA's 3x1080p verify (post
+                // fix-B, CMA bounded) hit the wedge here:
+                // reqbufs_einval_recovery_retry result=errno_EINVAL
+                // recovered=false. Hypothesis: bcm2835-codec's
+                // MMAL component release on fd-close is firmware-
+                // async; at 1080p the latency between a prior
+                // decoder's fd-close and the next REQBUFS exceeds
+                // the firmware release window, so the new prime
+                // sees the slot still busy. The same-fd cleanup+
+                // retry above doesn't help because the conflict
+                // is on the FIRMWARE-side slot, not on this fd's
+                // userspace state.
+                //
+                // Bounded wait+retry: sleep 100ms, retry; up to
+                // 3 additional attempts (worst case 300ms added
+                // latency on this prime). Per attempt:
+                //   [stability] reqbufs_einval_recovery_wait_retry
+                //               queue=output attempt=N/3
+                //               sleep_ms=100 result={ok|errno_X}
+                //               total_recovery_us=N
+                //
+                // Diagnosis from the logs:
+                //   - any wait_retry result=ok => firmware-release
+                //     latency confirmed, fixed. The N value tells
+                //     us how long the release actually took
+                //     (1*100ms is normal, 3*100ms is a slow path).
+                //   - all 3 still EINVAL => firmware HARD limit
+                //     (concurrent-1080p-decoder cap, not latent
+                //     state). Different fix shape needed
+                //     (serialize decoder opens, fights snapshot-
+                //     side-A mmal=2 -- qarl design call).
+                //
+                // Only fires if the L1 cleanup+retry above already
+                // failed. Bounded; errors still bubble normally
+                // if all attempts exhaust.
+                let mut final_result = retry_result;
+                if matches!(&final_result, Err(nix::errno::Errno::EINVAL)) {
+                    let t_recovery_start = std::time::Instant::now();
+                    for attempt in 1..=3u32 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        rb.count = count;
+                        let r = unsafe { vidioc_reqbufs(inner.fd(), &mut rb) };
+                        let total_us = t_recovery_start.elapsed().as_micros();
+                        let result_str = match &r {
+                            Ok(_) => format!("ok_allocated_{}", rb.count),
+                            Err(e) => format!("errno_{:?}", e),
+                        };
+                        eprintln!(
+                            "[stability] reqbufs_einval_recovery_wait_retry \
+                             queue=output attempt={}/3 sleep_ms=100 \
+                             result={} total_recovery_us={}",
+                            attempt, result_str, total_us,
+                        );
+                        if r.is_ok() {
+                            final_result = r;
+                            break;
+                        }
+                        final_result = r;
+                    }
+                }
+                final_result
             }
             _ => reqbufs_result,
         };
