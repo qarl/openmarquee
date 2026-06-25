@@ -1342,7 +1342,20 @@ impl DecoderInner {
 #[cfg(target_os = "linux")]
 impl Drop for DecoderInner {
     fn drop(&mut self) {
+        // [p1080-probe v2] 2026-06-25: total-drop timing envelope.
+        // QA saw single egl_image_destroy calls take 71ms during
+        // 1080p reel transitions -- this captures the WHOLE drop
+        // duration (stop_streaming + egl destroy loop + dmabuf
+        // close + munmap field-order + file close), so the
+        // "decoder teardown blocks next prime" hypothesis can be
+        // checked against the next prime_entry CMA snapshot. Also
+        // CMA snapshot at drop entry + exit so QA can verify the
+        // expected ~24MB CMA release per 1080p decoder drop.
+        let t_drop_total = std::time::Instant::now();
+        let cma_drop_entry = read_cma_snapshot_mb();
+        let t_stop_streaming = std::time::Instant::now();
         self.stop_streaming_quiet();
+        let stop_streaming_us = t_stop_streaming.elapsed().as_micros();
         // Close exported DMA-BUF fds. The underlying kernel buffer
         // memory remains alive if any EGLImage / GL texture still
         // references it (the dmabuf is reference-counted in the
@@ -1493,6 +1506,38 @@ impl Drop for DecoderInner {
             std::io::stderr(),
             "[mem] decoder_drop seq={} mmal_live={} path={}",
             self.decoder_seq, after, self.path.display(),
+        );
+        // [p1080-probe v2] 2026-06-25: drop-timing envelope. Breaks
+        // out where the drop spends its time so QA can pin which
+        // teardown step actually blocks the next prime. CMA entry
+        // vs exit shows how much this drop released; if exit
+        // matches entry the buffers DIDN'T free (kernel dmabuf
+        // refs still pinned -- r101 phantom-ref bug class) and
+        // that's the smoking gun for the in-reel CMA accumulation.
+        // dmabuf_close_us not separately captured here because
+        // close(2) is microseconds; subtract (stop_streaming +
+        // egl_destroy_loop) from drop_total to get the close+
+        // munmap+file-close residual.
+        let drop_total_us = t_drop_total.elapsed().as_micros();
+        let cma_drop_exit = read_cma_snapshot_mb();
+        let cma_delta_mb: i64 = match (cma_drop_entry, cma_drop_exit) {
+            (Some(e), Some(x)) => (x.used as i64) - (e.used as i64),
+            _ => 0,
+        };
+        let _ = writeln!(
+            std::io::stderr(),
+            "[p1080-probe] decoder_drop_timing seq={} drop_total_us={} \
+             stop_streaming_us={} egl_destroy_loop_us={} \
+             egl_visited={} egl_destroyed={} egl_failed={} \
+             cma_entry_used_mb={} cma_exit_used_mb={} cma_delta_mb={} \
+             cma_exit_free_mb={}",
+            self.decoder_seq, drop_total_us,
+            stop_streaming_us, loop_elapsed_us,
+            visited, destroyed, failed,
+            cma_drop_entry.map(|c| c.used.to_string()).unwrap_or_else(|| "?".to_string()),
+            cma_drop_exit.map(|c| c.used.to_string()).unwrap_or_else(|| "?".to_string()),
+            cma_delta_mb,
+            cma_drop_exit.map(|c| c.free.to_string()).unwrap_or_else(|| "?".to_string()),
         );
     }
 }

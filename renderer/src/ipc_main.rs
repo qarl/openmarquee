@@ -3907,6 +3907,30 @@ fn handle_inner_request(
             // begin->paint_entry->paint_exit deltas across
             // a single transition.
             crate::v4l2::log_v3d_bos_at_phase("begin_transition_load_entry", Some(p.to_slide_id));
+            // [p1080-probe v2] 2026-06-25: CMA waterfall through
+            // BeginTransition. Pairs with the existing [mem]
+            // decoder_open/decoder_drop seq=N mmal_live=M lines so
+            // QA can correlate the CMA peak with the 2-decoder
+            // window (mmal_live=2). For the 2-slide 1080p reel
+            // wedge: this should show CMA climbing through
+            // post_load_to (incoming primes, +~12MB CAPTURE pool
+            // + ~12MB OUTPUT pool), post_load_from_reprime (no-op
+            // if FROM still primed), post_lazy_prime_to (BUG-A
+            // fix; +~24MB if TextOverVideo bg-video primes here).
+            // The 316MB used_mb peak QA saw earlier should fire on
+            // one of these lines.
+            #[cfg(target_os = "linux")]
+            {
+                let cma = crate::v4l2::read_cma_snapshot_mb();
+                eprintln!(
+                    "[p1080-probe] transition_cma phase=begin_entry to_slide_id={} \
+                     cma_total_mb={} cma_free_mb={} cma_used_mb={}",
+                    p.to_slide_id,
+                    cma.map(|c| c.total.to_string()).unwrap_or_else(|| "?".to_string()),
+                    cma.map(|c| c.free.to_string()).unwrap_or_else(|| "?".to_string()),
+                    cma.map(|c| c.used.to_string()).unwrap_or_else(|| "?".to_string()),
+                );
+            }
             // r76 Phase A (2026-06-07): record the begin_transition
             // timestamp so the FIRST successful endpoint_b bake
             // inside paint_and_present_one_transition_frame can
@@ -3939,6 +3963,18 @@ fn handle_inner_request(
                 "[perf] begin_transition_load slide_id={} load_us={}",
                 p.to_slide_id, load_us,
             );
+            #[cfg(target_os = "linux")]
+            {
+                let cma = crate::v4l2::read_cma_snapshot_mb();
+                eprintln!(
+                    "[p1080-probe] transition_cma phase=post_load_to to_slide_id={} \
+                     load_us={} cma_total_mb={} cma_free_mb={} cma_used_mb={}",
+                    p.to_slide_id, load_us,
+                    cma.map(|c| c.total.to_string()).unwrap_or_else(|| "?".to_string()),
+                    cma.map(|c| c.free.to_string()).unwrap_or_else(|| "?".to_string()),
+                    cma.map(|c| c.used.to_string()).unwrap_or_else(|| "?".to_string()),
+                );
+            }
             // Hardening C3 / M1 (2026-05-21): also re-prime the
             // FROM-slide. The transition paint path fetches the
             // from-endpoint demuxer / decoder with a HARD ERROR if
@@ -3955,6 +3991,19 @@ fn handle_inner_request(
                 if let Err(e) = cache.load(content_root, from_id) {
                     return err(format!("begin_transition load failed: {e:#}"));
                 }
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let cma = crate::v4l2::read_cma_snapshot_mb();
+                let from_id = state.current.as_ref().map(|c| c.slide_id);
+                eprintln!(
+                    "[p1080-probe] transition_cma phase=post_load_from_reprime to_slide_id={} from_slide_id={:?} \
+                     cma_total_mb={} cma_free_mb={} cma_used_mb={}",
+                    p.to_slide_id, from_id,
+                    cma.map(|c| c.total.to_string()).unwrap_or_else(|| "?".to_string()),
+                    cma.map(|c| c.free.to_string()).unwrap_or_else(|| "?".to_string()),
+                    cma.map(|c| c.used.to_string()).unwrap_or_else(|| "?".to_string()),
+                );
             }
             // Bug 8 / Fix A: same skip-marker check as BeginSlide,
             // applied to the to-slide of a transition.
