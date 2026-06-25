@@ -1346,52 +1346,6 @@ impl DecoderInner {
             );
             self.capture_streaming = false;
         }
-        // [p1080-probe v4 / fix-A] 2026-06-25: force-release the
-        // V4L2 buffer pool back to CMA via REQBUFS(count=0) on
-        // both queues. Without this, the kernel-side buffer pool
-        // (~12 MB / buf * 4 bufs * 2 queues = ~96 MB at 1080p
-        // NV12, ~32 MB at 720p) persists until self.file closes,
-        // which can be delayed if a Frame still holds an
-        // Arc<DecoderInner>. Per the v3 capture (2026-06-25):
-        // "primed without paint" drops show egl_destroyed=0 +
-        // cma_delta_mb=0 because the EGL cache was never
-        // populated AND the V4L2 pool's CMA isn't released by
-        // STREAMOFF alone. REQBUFS(0) makes that release
-        // synchronous + deterministic.
-        //
-        // Per V4L2 spec: REQBUFS with count=0 frees all buffers
-        // on the queue, provided streaming is OFF (just did
-        // STREAMOFF above) and userspace isn't holding refs.
-        // mmap views in self.mapped_* don't block this -- the
-        // kernel can free the buffer slot even with active
-        // mmaps; the mmaps become invalid + return SIGBUS on
-        // access, which is fine because Drop's field-order
-        // munmap fires immediately after stop_streaming_quiet
-        // returns.
-        //
-        // Safe on 720p: REQBUFS(0) is a no-op on the buffer
-        // budget when the pool was already small; it just
-        // releases the same way it would when the file closes.
-        // Best-effort: swallow errors so Drop doesn't panic.
-        for (dir, bt) in [
-            (QueueDirection::Output, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE),
-            (QueueDirection::Capture, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE),
-        ] {
-            let mut rb = V4l2Requestbuffers {
-                count: 0,
-                buf_type: bt,
-                memory: V4L2_MEMORY_MMAP,
-                ..Default::default()
-            };
-            // SAFETY: _IOWR; kernel writes rb.count + capabilities
-            // back. Both pointers live until the ioctl returns.
-            let r = unsafe { vidioc_reqbufs(self.fd(), &mut rb) };
-            eprintln!(
-                "[p1080-probe] reqbufs_zero queue={} result={}",
-                match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
-                match &r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
-            );
-        }
     }
 }
 
@@ -1542,9 +1496,64 @@ impl Drop for DecoderInner {
             // self until now; close(2) is the matched teardown.
             unsafe { libc::close(fd); }
         }
-        // mapped_output + mapped_capture drop via field-order
-        // semantics here, calling munmap. file drops last,
-        // closing the fd. No leaks.
+        // [p1080-probe v4 / fix-B] 2026-06-25: explicit munmap
+        // BEFORE REQBUFS(0) so the kernel actually frees CMA.
+        //
+        // Fix-A (commit 4074102) added REQBUFS(0) inside
+        // stop_streaming_quiet at Drop entry. QA's verify
+        // showed all reqbufs_zero=ok but cma_delta=0 on
+        // immediate-drops -- the kernel ACCEPTED REQBUFS(0)
+        // but DEFERRED the actual CMA release because the
+        // V4L2 buffers still had outstanding refs (mmap views
+        // in self.mapped_* and the now-closed-just-above
+        // dmabuf fds). Per V4L2 semantics, the per-buffer
+        // refcount must reach 0 (no queued + no mapped + no
+        // exported) before the kernel returns the pages to
+        // CMA.
+        //
+        // Fix-B reorders: by the time REQBUFS(0) fires, ALL
+        // refs are released:
+        //   1. STREAMOFF (in stop_streaming_quiet)         -> queued=0
+        //   2. EGL destroy loop (above, no-op if cache None) -> EGL refs=0
+        //   3. dmabuf fd close (above)                      -> exported=0
+        //   4. **explicit drop of mapped_output/capture**   -> mapped=0
+        //   5. **REQBUFS(0) on both queues**                -> kernel
+        //                                                       frees CMA now
+        //
+        // mapped_output / mapped_capture would munmap via
+        // field-order Drop at the end of this fn, but that's
+        // AFTER the new REQBUFS(0) site. Force them via
+        // explicit take() so the Vec drops here.
+        let _ = std::mem::take(&mut self.mapped_output);
+        let _ = std::mem::take(&mut self.mapped_capture);
+        for (dir, bt) in [
+            (QueueDirection::Output, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE),
+            (QueueDirection::Capture, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE),
+        ] {
+            let mut rb = V4l2Requestbuffers {
+                count: 0,
+                buf_type: bt,
+                memory: V4L2_MEMORY_MMAP,
+                ..Default::default()
+            };
+            // SAFETY: _IOWR; kernel writes rb.count + capabilities
+            // back. Both pointers live until the ioctl returns.
+            let cma_pre = read_cma_snapshot_mb();
+            let r = unsafe { vidioc_reqbufs(self.fd(), &mut rb) };
+            let cma_post = read_cma_snapshot_mb();
+            let cma_delta_mb: i64 = match (cma_pre, cma_post) {
+                (Some(p), Some(q)) => (q.used as i64) - (p.used as i64),
+                _ => 0,
+            };
+            let _ = writeln!(
+                std::io::stderr(),
+                "[p1080-probe] reqbufs_zero queue={} result={} cma_delta_mb={}",
+                match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+                match &r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+                cma_delta_mb,
+            );
+        }
+        // file drops last, closing the fd. No leaks.
 
         // r75 (2026-06-07): decrement the live-Decoder counter on
         // every scope exit (clean playlist progression, prime-failure
