@@ -3985,6 +3985,72 @@ fn handle_inner_request(
             crate::hdmi_logic::record_transition_begin_for_endpoint_b_metric(
                 from_id_for_metric, p.to_slide_id,
             );
+            // [fix-D-1 part B] 2026-06-26: evict 1080p from-slide
+            // BEFORE cache.load(to_slide_id). bcm2835-codec firmware
+            // can't allocate a 2nd 1080p OUTPUT buffer pool while a
+            // 1st 1080p decoder is alive (v6 capture: REQBUFS(output)
+            // hangs ~14s + backend OnFailure reboots). For 720p the
+            // firmware handles 2 concurrent fine; for 1080p the
+            // motion-through-transitions design must be replaced
+            // with freeze-outgoing (per qarl v2v spec). This is the
+            // FUNCTIONAL half (drop outgoing decoder); fix-D-2 will
+            // add the visual half (poster_a_texture wired into bake_a
+            // for smooth crossfade). Until then 1080p transitions
+            // will show black/last-frame for the outgoing side --
+            // acceptable per QA since 1080p is NOT in production.
+            //
+            // Detection: from-slide is the currently-playing video
+            // slide (or text-over-video bg-video) AND its demuxer
+            // reports height >= 1080.
+            //
+            // Eviction: drop video_demuxers + video_decoders entries
+            // for from_id. Don't touch items/item_mtimes (we still
+            // need the slide metadata for paint_transition).
+            //
+            // The from-slide reprime below (line 4009 area) is
+            // SKIPPED when fix-D evicted: re-priming would
+            // immediately restore the 2-concurrent state we just
+            // worked around.
+            let fix_d_evicted_from_id: Option<uuid::Uuid> = {
+                let from_id_opt = state.current.as_ref().map(|c| c.slide_id);
+                if let Some(from_id) = from_id_opt {
+                    let from_height = match cache.items.peek(&from_id) {
+                        Some(ContentItem::Video(_)) => {
+                            cache.video_demuxers.get(&from_id).map(|d| d.height)
+                        }
+                        Some(ContentItem::Text(t)) => {
+                            t.background_video_slide_id.and_then(|bg| {
+                                cache.video_demuxers.get(&bg).map(|d| d.height)
+                            })
+                        }
+                        _ => None,
+                    };
+                    if from_height.unwrap_or(0) >= 1080 {
+                        eprintln!(
+                            "[mmal-fixD] evict_outgoing_1080p from_slide_id={} \
+                             from_height={} to_slide_id={} reason=concurrent_1080p_prevention",
+                            from_id, from_height.unwrap_or(0), p.to_slide_id,
+                        );
+                        // Drop the 1080p video's V4L2 state. For
+                        // TextOverVideo the evicted id is the
+                        // bg-video's id, not the text-slide's id.
+                        let evict_target = match cache.items.peek(&from_id) {
+                            Some(ContentItem::Text(t)) => {
+                                t.background_video_slide_id.unwrap_or(from_id)
+                            }
+                            _ => from_id,
+                        };
+                        cache.video_demuxers.remove(&evict_target);
+                        #[cfg(target_os = "linux")]
+                        cache.video_decoders.remove(&evict_target);
+                        Some(evict_target)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
             // r65 (2026-06-05): join any in-flight async preload
             // for the to-slide BEFORE cache.load so the load
             // short-circuits on the artifacts the worker
@@ -4029,7 +4095,17 @@ fn handle_inner_request(
             // (begin_transition itself derives it the same way and
             // errors below if there's no current slide).
             if let Some(from_id) = state.current.as_ref().map(|c| c.slide_id) {
-                if let Err(e) = cache.load(content_root, from_id) {
+                // [fix-D-1 part B] SKIP the from-slide reprime when
+                // we just evicted it for the 1080p concurrency
+                // prevention -- re-priming would immediately restore
+                // the mmal=2 state and the REQBUFS(output) hang.
+                if fix_d_evicted_from_id.is_some() {
+                    eprintln!(
+                        "[mmal-fixD] from_reprime_skipped from_slide_id={} \
+                         reason=evicted_for_concurrent_1080p_prevention",
+                        from_id,
+                    );
+                } else if let Err(e) = cache.load(content_root, from_id) {
                     return err(format!("begin_transition load failed: {e:#}"));
                 }
             }
