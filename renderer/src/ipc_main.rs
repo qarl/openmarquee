@@ -4020,24 +4020,41 @@ fn handle_inner_request(
                 // lookup returns None, or the resolved height is wrong.
                 let (from_kind, bg_id_for_text, height_via_from, height_via_bg) =
                     if let Some(from_id) = from_id_opt {
-                        match cache.items.peek(&from_id) {
-                            Some(ContentItem::Text(t)) => (
+                        // [fix-D-1 v4 Part B] 2026-06-26: disk fallback
+                        // on cache miss for the from-slide type/bg
+                        // resolution. By BeginTransition time the
+                        // from-slide is the currently-playing slide
+                        // and SHOULD be in cache.items (BeginSlide
+                        // populated it). This disk fallback is
+                        // defensive consistency with the r97 fix --
+                        // if for any reason items.peek misses, we
+                        // still resolve the TextOverVideo bg-video.
+                        let cache_kind = match cache.items.peek(&from_id) {
+                            Some(ContentItem::Text(t)) => Some((
                                 "text",
                                 t.background_video_slide_id,
-                                None,
-                                t.background_video_slide_id.and_then(|bg| {
-                                    cache.video_demuxers.get(&bg).map(|d| d.height)
-                                }),
-                            ),
-                            Some(ContentItem::Video(_)) => (
-                                "video",
-                                None,
-                                cache.video_demuxers.get(&from_id).map(|d| d.height),
-                                None,
-                            ),
-                            Some(ContentItem::Image(_)) => ("image", None, None, None),
-                            None => ("not_in_cache", None, None, None),
-                        }
+                            )),
+                            Some(ContentItem::Video(_)) => Some(("video", None)),
+                            Some(ContentItem::Image(_)) => Some(("image", None)),
+                            None => None,
+                        };
+                        let (resolved_kind, resolved_bg) = match cache_kind {
+                            Some((k, bg)) => (k, bg),
+                            None => match crate::content::find_text_slide(content_root, from_id) {
+                                Ok(Some(t)) => ("text_disk", t.background_video_slide_id),
+                                _ => match crate::content::find_video_slide(content_root, from_id) {
+                                    Ok(Some(_)) => ("video_disk", None),
+                                    _ => ("not_in_cache", None),
+                                },
+                            },
+                        };
+                        let h_from = if resolved_kind == "video" || resolved_kind == "video_disk" {
+                            cache.video_demuxers.get(&from_id).map(|d| d.height)
+                        } else { None };
+                        let h_bg = resolved_bg.and_then(|bg| {
+                            cache.video_demuxers.get(&bg).map(|d| d.height)
+                        });
+                        (resolved_kind, resolved_bg, h_from, h_bg)
                     } else {
                         ("no_current_state", None, None, None)
                     };
@@ -4062,13 +4079,10 @@ fn handle_inner_request(
                         );
                         // Drop the 1080p video's V4L2 state. For
                         // TextOverVideo the evicted id is the
-                        // bg-video's id, not the text-slide's id.
-                        let evict_target = match cache.items.peek(&from_id) {
-                            Some(ContentItem::Text(t)) => {
-                                t.background_video_slide_id.unwrap_or(from_id)
-                            }
-                            _ => from_id,
-                        };
+                        // bg-video's id (carried in `bg_id_for_text`
+                        // resolved above with disk fallback); plain
+                        // Video evicts from_id itself.
+                        let evict_target = bg_id_for_text.unwrap_or(from_id);
                         cache.video_demuxers.remove(&evict_target);
                         #[cfg(target_os = "linux")]
                         cache.video_decoders.remove(&evict_target);
@@ -4435,13 +4449,48 @@ fn handle_inner_request(
             #[cfg(target_os = "linux")]
             {
                 let active_decoder_count = cache.video_decoders.len();
+                // [fix-D-1 v4 / r97 defer-bg detection] 2026-06-26:
+                // v7 capture pinned the real defer-skip cause: NOT a
+                // count race (count was correctly 1) -- the bug is
+                // cache.items.peek(preload_id) returns None at the
+                // FIRST PreloadSlide for an id (which is every
+                // PreloadSlide -- that's the whole point: load early).
+                // The match's `None => false` branch then makes
+                // bg_is_video=false -> r97 never defers -> the 1080p
+                // bg-video preload primes concurrently with the live
+                // 1080p decoder -> REQBUFS EINVAL/hang -> stall.
+                //
+                // Fix: when the cache misses, fall back to a cheap
+                // single-file probe of the slide's item.json on disk
+                // to see if it's a Text-with-bg_video or a plain
+                // Video. find_text_slide / find_video_slide are the
+                // same disk-walk helpers preload_in_worker uses; for
+                // TextOverVideo + Video they're a single small JSON
+                // read. The contained "conservative for the bug at
+                // hand" comment was actually backwards: cache-miss
+                // defaulting to false is anti-conservative, it
+                // allows the concurrent prime that's the bug.
                 let bg_is_video = match cache.items.peek(&preload_id) {
                     Some(crate::content::ContentItem::Video(_)) => true,
                     Some(crate::content::ContentItem::Text(s)) => {
                         s.background_video_slide_id.is_some()
                     }
                     Some(crate::content::ContentItem::Image(_)) => false,
-                    None => false,
+                    None => {
+                        // Cache miss: fall back to on-disk probe.
+                        // find_text_slide returns Ok(Some(TextSlide))
+                        // for Text/TextOverVideo (check bg_video);
+                        // returns Ok(None) for non-text slides.
+                        // find_video_slide returns Ok(Some(_)) for
+                        // plain Video slides.
+                        match crate::content::find_text_slide(content_root, preload_id) {
+                            Ok(Some(t)) => t.background_video_slide_id.is_some(),
+                            _ => match crate::content::find_video_slide(content_root, preload_id) {
+                                Ok(Some(_)) => true,
+                                _ => false,
+                            },
+                        }
+                    }
                 };
                 // r98 (2026-06-09): preload-mode gate. The r97 defer
                 // logic runs only when OPENMARQUEE_PRELOAD_MODE is
