@@ -1456,9 +1456,78 @@ impl Drop for DecoderInner {
             // self until now; close(2) is the matched teardown.
             unsafe { libc::close(fd); }
         }
-        // mapped_output + mapped_capture drop via field-order
-        // semantics here, calling munmap. file drops last,
-        // closing the fd. No leaks.
+        // 1080p-fix (2026-06-25): force V4L2 buffer-pool release
+        // back to CMA at Drop-entry rather than waiting on the
+        // implicit file close at fn exit. Investigation arc
+        // (QA-instrumented, see branch
+        // task/1080p-instrument-2026-06-25 for the diagnostic
+        // chain): a decoder cycle that primes + drops without
+        // ever painting (e.g. a transition that cancels before
+        // first paint, or a brief mmal_live=2 window during
+        // transition) leaves the V4L2 OUTPUT + CAPTURE buffer
+        // pools allocated. Per V4L2 semantics the per-buffer
+        // refcount = queued + mapped + exported; the kernel won't
+        // free the pool back to CMA until all three are 0. Field-
+        // order Drop munmaps mapped_* at the END of this fn, AFTER
+        // the implicit file close releases the fd's tracking,
+        // which means the CMA pages can take >1 reel cycle to
+        // actually return. At 720p (~5 MB per buffer) the lag is
+        // tolerable; at 1080p (~12 MB per buffer) it accumulates
+        // and exhausts the 320 MB CMA carveout -> codec wedge.
+        //
+        // Fix: synchronously clear the three blocking refs HERE,
+        // THEN call REQBUFS(count=0) to flush the kernel pool.
+        //   1. STREAMOFF (in stop_streaming_quiet above) -> queued=0
+        //   2. EGL destroy loop (above)                  -> EGL refs=0
+        //   3. dmabuf fd close (above)                   -> exported=0
+        //   4. take(mapped_*) -> Vec drops -> MmapRegion::drop
+        //      calls munmap                              -> mapped=0
+        //   5. REQBUFS(0) on both queues                 -> kernel
+        //                                                  frees CMA
+        //
+        // The field-order Drop at fn exit sees empty Vecs (no-op)
+        // and closes self.file last. No double-munmap.
+        //
+        // Glass-verified by QA on fireplacesign 2026-06-25
+        // (instrument branch md5 e4b236914fde52651c239dfdc133012b):
+        // single-1080p clean, CmaFree bounded 51-124 MB even under
+        // 1080p churn (vs the prior 316 MB spike that wedged the
+        // codec). Decoder-lifecycle stability win that also
+        // benefits 720p (faster per-drop CMA reclaim).
+        //
+        // Not in scope: a separate MMAL-decoder-slot leak (3x
+        // 1080p preload churn over a full reel cycle); investigated
+        // on the instrument branch, parked for next-layer
+        // (MMAL-component-release timing vs serialize-decoders
+        // design call). fix-B does not regress that case relative
+        // to today; it just doesn't fix it either.
+        let _ = std::mem::take(&mut self.mapped_output);
+        let _ = std::mem::take(&mut self.mapped_capture);
+        for (dir, bt) in [
+            (QueueDirection::Output, V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE),
+            (QueueDirection::Capture, V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE),
+        ] {
+            let mut rb = V4l2Requestbuffers {
+                count: 0,
+                buf_type: bt,
+                memory: V4L2_MEMORY_MMAP,
+                ..Default::default()
+            };
+            // SAFETY: _IOWR; kernel writes rb.count + capabilities
+            // back. Both pointers live until the ioctl returns.
+            // Best-effort: swallow errors so Drop doesn't panic;
+            // file close (field-order) is the backstop.
+            let r = unsafe { vidioc_reqbufs(self.fd(), &mut rb) };
+            let _ = writeln!(
+                std::io::stderr(),
+                "[mem] v4l2_drop_reqbufs_zero queue={} result={}",
+                match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+                match &r { Ok(_) => "ok".to_string(), Err(e) => format!("errno_{:?}", e) },
+            );
+        }
+        // file drops last via field-order, closing the fd. Empty
+        // mapped_* Vecs from the take()s above are no-ops there.
+        // No leaks.
 
         // r75 (2026-06-07): decrement the live-Decoder counter on
         // every scope exit (clean playlist progression, prime-failure
