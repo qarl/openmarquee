@@ -4038,6 +4038,16 @@ impl Decoder {
         Ok(())
     }
 
+    /// [mmal-probe v5] 2026-06-26: per-Decoder seq accessor used
+    /// by the bake_video next_frame instrumentation in hdmi.rs.
+    /// Holds the same monotonic per-process Decoder-open sequence
+    /// QA already greps for in [mem] decoder_open/_drop lines, so
+    /// v5's bake_video_next_frame lines can be correlated with
+    /// the existing [mem] timeline by seq.
+    pub fn decoder_seq(&self) -> usize {
+        self.inner.lock().unwrap().decoder_seq
+    }
+
     /// VIDIOC_DQBUF on CAPTURE -> wrap as `Frame`. Returns
     /// `Ok(None)` on EOF.
     pub fn next_frame(&self) -> Result<Option<Frame>> {

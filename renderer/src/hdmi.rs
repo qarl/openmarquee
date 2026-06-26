@@ -9526,7 +9526,28 @@ unsafe fn bake_video_slide_to_current_fbo(
     // Ok(None)) from EAGAIN-exhausted (10x3ms loop ran out) so
     // the Ok(None) counters below can attribute correctly.
     let mut eos_seen = false;
+    // [mmal-probe v5] 2026-06-26: instrument the next_frame
+    // retry loop to characterize the "held decoder for 14s"
+    // wedge case. QA's revised root cause (after option-B v2
+    // disproved the open-vs-drop race): 2 concurrent 1080p
+    // MMAL components -- firmware starves one. The held-
+    // decoder seq=3 13.98s symptom IS the bake_video tick path
+    // repeatedly hitting Ok(None)/EAGAIN-exhausted across many
+    // paint ticks because the firmware can't service this
+    // decoder while the OTHER 1080p decoder is also live.
+    //
+    // Probe captures per-tick: decoder_seq, mmal_live AT entry,
+    // iter_count, eagain_count, outcome, elapsed_us. Logged
+    // ONCE per bake_video call (one line per paint tick that
+    // tries to decode), tagged [mmal] bake_video_next_frame
+    // for clean grep.
+    let t_nextframe = std::time::Instant::now();
+    let nextframe_mmal_live = crate::v4l2::mmal_components_live();
+    let nextframe_decoder_seq = decoder.decoder_seq();
+    let mut nextframe_iters: u32 = 0;
+    let mut nextframe_eagain: u32 = 0;
     for _ in 0..10 {
+        nextframe_iters += 1;
         match decoder.next_frame() {
             Ok(Some(f)) => {
                 frame_opt = Some(f);
@@ -9537,9 +9558,33 @@ unsafe fn bake_video_slide_to_current_fbo(
                 break;
             }
             Err(e) if e.to_string().contains("EAGAIN") => {
+                nextframe_eagain += 1;
                 std::thread::sleep(std::time::Duration::from_millis(3));
             }
             Err(e) => return Err(e).context("next_frame"),
+        }
+    }
+    {
+        // GATE: only log if any EAGAIN OR not a frame outcome.
+        // Steady-state (frame on first call, no eagain) is
+        // ~30 fps per decoder = too noisy at per-tick. The
+        // wedge case ALWAYS hits eagain_exhausted, which is
+        // exactly what we want to capture.
+        if nextframe_eagain > 0 || frame_opt.is_none() {
+            let nextframe_elapsed_us = t_nextframe.elapsed().as_micros();
+            let outcome = if frame_opt.is_some() {
+                "frame_after_eagain"
+            } else if eos_seen {
+                "eos"
+            } else {
+                "eagain_exhausted"
+            };
+            eprintln!(
+                "[mmal] bake_video_next_frame decoder_seq={} mmal_live={} \
+                 iters={} eagain={} outcome={} elapsed_us={}",
+                nextframe_decoder_seq, nextframe_mmal_live,
+                nextframe_iters, nextframe_eagain, outcome, nextframe_elapsed_us,
+            );
         }
     }
     if let Some(t) = t_dqbuf_start {
