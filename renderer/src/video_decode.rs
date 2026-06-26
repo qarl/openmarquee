@@ -871,39 +871,25 @@ pub fn prime_video_decoder_for_preload(
     slide_id: uuid::Uuid,
 ) -> Result<VideoDecoderState> {
     use std::time::Instant;
-    // [fix-D-1 part A] 2026-06-26: skip preload for 1080p streams.
-    // bcm2835-codec firmware can't allocate a 2nd 1080p OUTPUT
-    // buffer pool while a 1st 1080p decoder is alive (v6 capture:
-    // REQBUFS(output) hangs ~14s + backend OnFailure reboots).
-    // Preload's whole purpose is to overlap N+1 prime with slide N
-    // playback, which deliberately creates mmal=2 -- safe at 720p
-    // (firmware handles 2 concurrent) but lethal at 1080p.
+    // [fix-D-1 v3] 2026-06-26: PART A REMOVED per QA pivot.
+    // Earlier fix-D-1 v1/v2 added a height>=1080 bail here. That
+    // was redundant with the existing r97 should_defer_preload_
+    // for_codec_contention mechanism at the PreloadSlide IPC layer
+    // (ipc_main.rs ~line 4431), which short-circuits with ok_empty
+    // BEFORE the worker spawns when an active decoder is alive and
+    // the incoming bg is video. r97's clean ok_empty lets the
+    // backend playback loop accept "preload deferred, done" and
+    // advance to BeginTransition; Part A's bail!() returned Err
+    // from inside the spawned worker, which the advance treated
+    // as a FAILED preload + stalled BEFORE BeginTransition. QA
+    // confirmed in fix-D-1 v2 boot: r97 defer fired 1x AND Part A
+    // fired 1x, yet BeginTransition never fired. v6 (no Part A)
+    // showed r97 defer fired + BeginTransition fired (cache.load
+    // then hung on REQBUFS at BeginTransition -- the real bug,
+    // addressed by Part B in ipc_main.rs::BeginTransition handler).
     //
-    // Skip: return Err early so the worker logs + carries on; the
-    // BeginSlide handler will synchronously prime later, AFTER
-    // evict_other_video_state has dropped the outgoing decoder
-    // (mmal=0 -> 1, no concurrent state). Combined with fix-D-1
-    // part B (BeginTransition evicts 1080p outgoing before incoming
-    // cache.load), this guarantees mmal_live<=1 across the entire
-    // 1080p transition cycle.
-    //
-    // The 1080 threshold is height-based: bcm2835-codec's
-    // documented 1080p30 ceiling is shared with the OUTPUT pool
-    // allocator; anything >= 1080 hits the firmware ceiling.
-    // Sub-1080p (720p, 480p, etc.) preloads stay unchanged.
-    if dem.height >= 1080 {
-        eprintln!(
-            "[mmal-fixD] preload_skip_1080p slide_id={} mp4_w={} mp4_h={} \
-             reason=concurrent_1080p_prevention",
-            slide_id, dem.width, dem.height,
-        );
-        anyhow::bail!(
-            "preload skipped for 1080p slide {} (mp4 {}x{}): firmware can't \
-             allocate concurrent 1080p OUTPUT pools; BeginSlide will prime \
-             synchronously after outgoing eviction",
-            slide_id, dem.width, dem.height,
-        );
-    }
+    // Net: r97 handles preload-overlap correctly; Part B alone
+    // handles the BeginTransition-deferred-prime hang.
     // [mmal option-B] 2026-06-26: preload barrier. fix-B-clean
     // (production, 90f221c) solved the per-drop CMA leak. v4 probe
     // captures (instrument branch) confirmed the next-layer wedge
