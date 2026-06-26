@@ -792,10 +792,44 @@ pub fn drain_one_capture_for_preload_with_detail(
 /// the firmware has time to actually free the slot before we open
 /// the next decoder + REQBUFS into it.
 fn wait_for_decoder_slot_clear(max_wait_ms: u64, caller: &str) -> u128 {
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     let t_start = Instant::now();
     let max_wait = Duration::from_millis(max_wait_ms);
     let initial = crate::v4l2::mmal_components_live();
+    // [mmal option-B v2] 2026-06-26: UNCONDITIONAL last-drop-grace
+    // BEFORE the counter poll. QA's v4 option-B glass capture
+    // (a9ac47d) proved the Rust mmal_components_live counter is
+    // an UNRELIABLE signal -- 100% of barrier samples saw the
+    // counter clear (sleeps=0), the barrier never grace'd, but
+    // the firmware MMAL teardown was still in flight and the
+    // 14s stall fired anyway. The counter ticks down in
+    // DecoderInner::drop BEFORE the field-order file close
+    // completes, so polling it alone is wrong.
+    //
+    // Fix: gate on TIME-SINCE-LAST-DROP regardless of counter.
+    // Default min grace 100ms (heuristic; QA noted the REQBUFS
+    // baseline floor of ~50ms suggests N~50-100ms for firmware
+    // teardown). If the prior drop was longer ago than this,
+    // skip the grace; otherwise sleep the remainder.
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let last_drop_ns = crate::v4l2::last_decoder_drop_wallclock_ns();
+    let since_last_drop_ms = if last_drop_ns == 0 || now_ns <= last_drop_ns {
+        // First decoder ever (or clock skew); no grace needed.
+        u64::MAX
+    } else {
+        (now_ns - last_drop_ns) / 1_000_000
+    };
+    const MIN_LAST_DROP_GRACE_MS: u64 = 100;
+    let unconditional_grace_ms = if since_last_drop_ms < MIN_LAST_DROP_GRACE_MS {
+        let remaining = MIN_LAST_DROP_GRACE_MS - since_last_drop_ms;
+        std::thread::sleep(Duration::from_millis(remaining));
+        remaining
+    } else {
+        0
+    };
     let mut sleeps = 0u32;
     let (final_live, outcome) = loop {
         let live = crate::v4l2::mmal_components_live();
@@ -808,20 +842,26 @@ fn wait_for_decoder_slot_clear(max_wait_ms: u64, caller: &str) -> u128 {
         std::thread::sleep(Duration::from_millis(20));
         sleeps += 1;
     };
-    // Grace period only if we actually waited. The Rust counter
-    // ticks BEFORE the kernel fd close completes, so even after
-    // live<=1 the kernel may still be releasing the MMAL slot.
-    // 30ms heuristic; the post-fix v4 capture will tell us
-    // whether it's enough.
-    let grace_ms = if sleeps > 0 { 30 } else { 0 };
-    if grace_ms > 0 {
-        std::thread::sleep(Duration::from_millis(grace_ms));
+    // Counter-poll grace ONLY fires when we actually waited the
+    // counter (legacy v2 grace; handles the multi-drop-in-flight
+    // case the unconditional last-drop-grace doesn't cover).
+    let counter_grace_ms = if sleeps > 0 { 30 } else { 0 };
+    if counter_grace_ms > 0 {
+        std::thread::sleep(Duration::from_millis(counter_grace_ms));
     }
     let elapsed_us = t_start.elapsed().as_micros();
+    let since_label = if since_last_drop_ms == u64::MAX {
+        "first".to_string()
+    } else {
+        since_last_drop_ms.to_string()
+    };
     eprintln!(
         "[mmal] preload_barrier caller={} initial_live={} final_live={} \
-         sleeps={} grace_ms={} elapsed_us={} outcome={}",
-        caller, initial, final_live, sleeps, grace_ms, elapsed_us, outcome,
+         since_last_drop_ms={} unconditional_grace_ms={} sleeps={} \
+         counter_grace_ms={} elapsed_us={} outcome={}",
+        caller, initial, final_live, since_label,
+        unconditional_grace_ms, sleeps, counter_grace_ms,
+        elapsed_us, outcome,
     );
     elapsed_us
 }

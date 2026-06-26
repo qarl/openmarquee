@@ -199,6 +199,34 @@ pub fn mmal_components_live() -> usize {
     MMAL_COMPONENTS_LIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// [mmal option-B v2] 2026-06-26: wall-clock nanoseconds of the
+/// most-recent DecoderInner::drop completion (stored AFTER the
+/// existing teardown work but BEFORE the field-order file close
+/// fires). Used by the preload barrier to enforce an unconditional
+/// minimum grace since the prior drop, regardless of what the
+/// mmal_components_live counter reads. The v4l2.rs Rust counter
+/// is decremented BEFORE the kernel fd close completes, so a
+/// barrier that ONLY polls the counter can read "clear" while
+/// the firmware MMAL teardown is still in flight (v4 option-B
+/// glass capture confirmed: 100% of barrier samples saw the
+/// counter clear, never waited, never grace'd; the 14s stall
+/// still fired).
+///
+/// Source of timestamp = SystemTime UNIX_EPOCH ns; matches the
+/// existing [mmal] decoder_drop_thread.wallclock_us format
+/// (microseconds vs nanoseconds; arithmetic uses ns internally
+/// for the grace math, log displays ms).
+///
+/// Initial value 0 means "no decoder has ever dropped" -- the
+/// first preload barrier sees (now - 0) = huge elapsed -> no
+/// grace -> proceeds immediately. Correct.
+pub static LAST_DECODER_DROP_WALLCLOCK_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn last_decoder_drop_wallclock_ns() -> u64 {
+    LAST_DECODER_DROP_WALLCLOCK_NS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// r101 (2026-06-09): per-Decoder cached EGLImage handle. One per
 /// CAPTURE buffer index; the paint helper looks it up on every
 /// frame, lazy-creates if None, and DecoderInner::Drop tears each
@@ -1614,6 +1642,25 @@ impl Drop for DecoderInner {
                 std::io::stderr(),
                 "[mmal] decoder_drop_thread seq={} thread_id={} wallclock_us={}",
                 self.decoder_seq, thread_id, wallclock_us,
+            );
+            // [mmal option-B v2] 2026-06-26: record this drop's
+            // wallclock-ns into the process-global atomic for the
+            // preload barrier's last-drop-grace check. Stored as
+            // ns (not us) so the barrier's arithmetic stays in
+            // a single unit. Stored at the end of the existing
+            // teardown work but BEFORE the field-order self.file
+            // close fires -- so the barrier's elapsed-since-drop
+            // measures "how long since teardown ENDED (Rust side)
+            // and the next thread asked to open a new decoder",
+            // which is when the firmware actually needs the grace
+            // window to finish.
+            let wallclock_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            LAST_DECODER_DROP_WALLCLOCK_NS.store(
+                wallclock_ns,
+                std::sync::atomic::Ordering::Relaxed,
             );
         }
         // [p1080-probe v2] 2026-06-25: drop-timing envelope. Breaks
