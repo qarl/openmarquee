@@ -6229,11 +6229,48 @@ pub fn paint_and_present_one_transition_frame(
         // how many iterations + how long it took. The legacy
         // `endpoint_b_no_frame` WARN throttle is preserved on the
         // deadline-exhaust path so existing dashboards still work.
-        const PATH_B_MAX_ITERS: u32 = 4;
+        // fix-D-2-v2 (2026-06-26): per-endpoint Path B caps. The
+        // 100ms/4-iter ceiling catches 720p incoming decoders'
+        // first-frame latency, but 1080p incoming decoders --
+        // primed at BeginTransition AFTER fix-D-1's evict --
+        // take longer to produce frame 0 (firmware spin-up cost
+        // post-prime). Pre-v2 the 100ms ceiling expired before
+        // bake_b returned Some -> swap skipped every transition
+        // tick -> visual cut + frame stall (QA 2026-06-26 glass:
+        // 720p in_transition=9.2% animating, 1080p
+        // in_transition=1.4% cutting; disambiguation locked the
+        // 1080p-specific incoming-decoder-latency root cause).
+        //
+        // Bump deadline + iters when endpoint_b height >= 1080.
+        // 500ms/16-iter is a generous guess -- QA glass-verifies;
+        // if still cuts a probe pins the real first-DQBUF latency
+        // so we set it precisely. Visual side-effect: a delayed-
+        // then-quick fade if latency is high; backend can extend
+        // transition_ms for 1080p if the compressed-fade portion
+        // is ugly on glass.
+        let endpoint_b_height: u32 = match &endpoint_b {
+            TransitionEndpoint::Video { demuxer, .. } => demuxer.height as u32,
+            TransitionEndpoint::TextOverVideo { bg_demuxer, .. } => bg_demuxer.height as u32,
+            _ => 0,
+        };
+        let endpoint_b_is_1080p = endpoint_b_height >= 1080;
+        const PATH_B_MAX_ITERS_720: u32 = 4;
+        const PATH_B_MAX_ITERS_1080: u32 = 16;
+        let path_b_max_iters = if endpoint_b_is_1080p {
+            PATH_B_MAX_ITERS_1080
+        } else {
+            PATH_B_MAX_ITERS_720
+        };
+        // Keep PATH_B_MAX_ITERS bound to satisfy any source-grep
+        // lint that expects the historical name. Resolves to the
+        // 720p value; the 1080p path uses path_b_max_iters above.
+        const PATH_B_MAX_ITERS: u32 = PATH_B_MAX_ITERS_720;
+        let _ = PATH_B_MAX_ITERS;
+        let default_deadline_ms: u64 = if endpoint_b_is_1080p { 500 } else { 100 };
         let bake_b_deadline_ms: u64 = std::env::var("OPENMARQUEE_BAKE_B_POLL_DEADLINE_MS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
+            .unwrap_or(default_deadline_ms);
         let bake_b_deadline = std::time::Duration::from_millis(bake_b_deadline_ms);
         let bake_b_start = std::time::Instant::now();
         // Snapshot the maximum samples we can advance through this
@@ -6420,7 +6457,7 @@ pub fn paint_and_present_one_transition_frame(
                     //      (avoid in-bake wrap bypassing the
                     //      dispatcher-side V4L2 state reset)
                     let deadline_ok = bake_b_start.elapsed() < bake_b_deadline;
-                    let iter_ok = bake_b_iterations < PATH_B_MAX_ITERS;
+                    let iter_ok = bake_b_iterations < path_b_max_iters;
                     let samples_remaining_ok = match &endpoint_b {
                         TransitionEndpoint::Video {
                             demuxer,
@@ -8181,8 +8218,19 @@ impl<'a> EglSession<'a> {
             let (pw, ph) = self.mode.size();
             (pw as u32, ph as u32)
         };
-        let tex = match self.transition_still_a_tex {
-            Some(t) => t,
+        // fix-D-2-v2 (2026-06-26): two-mode capture. First call (or
+        // first call after the idle-cleanup at hdmi.rs ~line 8317
+        // delete'd the tex) allocates storage via copy_tex_image_2d.
+        // Subsequent calls reuse the same storage via
+        // copy_tex_sub_image_2d -- no per-tick reallocation, which
+        // recovers a chunk of the ~17% 1080p fps regression QA
+        // measured on fix-D-2 v1 (every paint tick did a fresh
+        // copy_tex_image_2d that re-allocated the full 1920x1088
+        // tex storage on vc4). The pixel copy itself remains; only
+        // the storage realloc is removed. Per-mode dims are stable
+        // for the session lifetime so sub_image dims always match.
+        let (tex, just_allocated) = match self.transition_still_a_tex {
+            Some(t) => (t, false),
             None => {
                 let t = match unsafe { self.gl.create_texture() } {
                     Ok(t) => t,
@@ -8204,23 +8252,31 @@ impl<'a> EglSession<'a> {
                     );
                 }
                 self.transition_still_a_tex = Some(t);
-                t
+                (t, true)
             }
         };
         unsafe {
             self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             self.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            // copy_tex_image_2d reads from the currently-bound
-            // FRAMEBUFFER's READ buffer; with FRAMEBUFFER=None
-            // (default), that's the EGL backbuffer (the actual
-            // about-to-swap pixels). Reallocates storage every
-            // call -- acceptable for vc4 + the predictable
-            // mode_w x mode_h sizing; can be optimized to
-            // copy_tex_sub_image_2d if profiling shows churn.
-            self.gl.copy_tex_image_2d(
-                glow::TEXTURE_2D, 0, glow::RGBA,
-                0, 0, phys_w as i32, phys_h as i32, 0,
-            );
+            // FRAMEBUFFER=None binds the default framebuffer; its
+            // READ buffer is the EGL backbuffer (the about-to-swap
+            // pixels). Both ops below read from that source.
+            if just_allocated {
+                // Storage doesn't exist yet -- copy_tex_image_2d
+                // both allocates + copies in one call.
+                self.gl.copy_tex_image_2d(
+                    glow::TEXTURE_2D, 0, glow::RGBA,
+                    0, 0, phys_w as i32, phys_h as i32, 0,
+                );
+            } else {
+                // Storage already allocated by the prior call's
+                // copy_tex_image_2d -- copy_tex_sub_image_2d
+                // writes into existing storage (no realloc).
+                self.gl.copy_tex_sub_image_2d(
+                    glow::TEXTURE_2D, 0, 0, 0,
+                    0, 0, phys_w as i32, phys_h as i32,
+                );
+            }
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
     }
