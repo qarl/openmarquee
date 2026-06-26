@@ -776,11 +776,89 @@ pub fn drain_one_capture_for_preload_with_detail(
 ///
 /// `slide_id` is just for the log; the function doesn't use it for
 /// any V4L2 logic.
+///
+/// [mmal option-B] 2026-06-26: preload-barrier helper. Polls the
+/// Rust-side mmal_components_live counter until it reads <=1 (the
+/// currently-playing decoder is permitted; no other slot may be
+/// in mid-drop/teardown) OR the max-wait expires. Returns elapsed
+/// micros. Logs `[mmal] preload_barrier` with the trajectory so QA
+/// can see whether the barrier waited + for how long + whether it
+/// timed out.
+///
+/// Rationale: the Rust counter ticks down in DecoderInner::drop
+/// BEFORE the field-order file close fires the kernel-side MMAL
+/// release. Even after live<=1, the kernel may still be settling.
+/// If we waited at all (sleeps > 0), add a brief grace sleep so
+/// the firmware has time to actually free the slot before we open
+/// the next decoder + REQBUFS into it.
+fn wait_for_decoder_slot_clear(max_wait_ms: u64, caller: &str) -> u128 {
+    use std::time::{Duration, Instant};
+    let t_start = Instant::now();
+    let max_wait = Duration::from_millis(max_wait_ms);
+    let initial = crate::v4l2::mmal_components_live();
+    let mut sleeps = 0u32;
+    let (final_live, outcome) = loop {
+        let live = crate::v4l2::mmal_components_live();
+        if live <= 1 {
+            break (live, "clear");
+        }
+        if t_start.elapsed() >= max_wait {
+            break (live, "timeout");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        sleeps += 1;
+    };
+    // Grace period only if we actually waited. The Rust counter
+    // ticks BEFORE the kernel fd close completes, so even after
+    // live<=1 the kernel may still be releasing the MMAL slot.
+    // 30ms heuristic; the post-fix v4 capture will tell us
+    // whether it's enough.
+    let grace_ms = if sleeps > 0 { 30 } else { 0 };
+    if grace_ms > 0 {
+        std::thread::sleep(Duration::from_millis(grace_ms));
+    }
+    let elapsed_us = t_start.elapsed().as_micros();
+    eprintln!(
+        "[mmal] preload_barrier caller={} initial_live={} final_live={} \
+         sleeps={} grace_ms={} elapsed_us={} outcome={}",
+        caller, initial, final_live, sleeps, grace_ms, elapsed_us, outcome,
+    );
+    elapsed_us
+}
+
 pub fn prime_video_decoder_for_preload(
     dem: &Mp4Demuxer,
     slide_id: uuid::Uuid,
 ) -> Result<VideoDecoderState> {
     use std::time::Instant;
+    // [mmal option-B] 2026-06-26: preload barrier. fix-B-clean
+    // (production, 90f221c) solved the per-drop CMA leak. v4 probe
+    // captures (instrument branch) confirmed the next-layer wedge
+    // is the cross-thread race: preload-worker Decoder::open for
+    // slide N+1 fires BEFORE main-thread Decoder::drop for slide N
+    // completes its kernel-side MMAL release, causing
+    // intermittent 14s firmware stalls (seq=3 open at ...836165
+    // -> drop at ...850145 = 13.98s; backend L2 8s IPC timeout
+    // fires + falls back to Mock + OnFailure reboot).
+    //
+    // Fix shape B (QA-approved): preload waits for the prior
+    // decoder's full-drop before firing its own Decoder::open.
+    // Polls the Rust-side mmal_components_live counter; expects
+    // <=1 (the currently-playing decoder is the only live slot
+    // permitted before preload primes its own). Backoff 20ms;
+    // max wait ~1s then fire anyway (avoid hard-hanging preload
+    // if the counter never clears for some other reason). Brief
+    // grace after the counter clears, because the Rust counter
+    // ticks BEFORE the kernel fd close completes; ~30ms gives
+    // the firmware a chance to actually finish releasing.
+    //
+    // Preserves snapshot-side-A v2v transitions (paint-time
+    // mmal=2 is unaffected; this barrier only gates
+    // preload-time Decoder::open). Cost: slight decoder-swap
+    // lag under 1080p churn where the barrier actually waits;
+    // zero cost on 720p production (the counter is almost
+    // always already <=1 on entry).
+    wait_for_decoder_slot_clear(1000, "preload_worker");
     // r91 (2026-06-08) probe per QA dispatch: caller-tagged
     // prime_entry. Fires regardless of EOS_FLUSH gate.
     eprintln!(
