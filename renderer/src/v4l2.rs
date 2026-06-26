@@ -1589,6 +1589,33 @@ impl Drop for DecoderInner {
             "[mem] decoder_drop seq={} mmal_live={} path={}",
             self.decoder_seq, after, self.path.display(),
         );
+        // [mmal-probe v4] 2026-06-25: thread_id + wallclock_us for
+        // cross-thread correlation with decoder_open_thread (see
+        // matching probe in Decoder::open). Lets QA pin whether
+        // preload's Decoder::open for slide N+1 RACES this drop
+        // (open_thread.wallclock_us < drop_thread.wallclock_us
+        // + close-latency window = race; well-separated = no race).
+        //
+        // NOTE: this log fires BEFORE the field-order drop closes
+        // self.file -- the actual kernel fd close happens after
+        // this line. The close gap is bounded by the time between
+        // this log and Decoder::open's matching wallclock_us on
+        // the next open. If a fd-close-vs-open race surfaces from
+        // the data we'll add an explicit file-close-timing probe
+        // in v5; for now the journal timeline + thread_id should
+        // be enough to confirm or refute the race hypothesis.
+        {
+            let thread_id = format!("{:?}", std::thread::current().id());
+            let wallclock_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros())
+                .unwrap_or(0);
+            let _ = writeln!(
+                std::io::stderr(),
+                "[mmal] decoder_drop_thread seq={} thread_id={} wallclock_us={}",
+                self.decoder_seq, thread_id, wallclock_us,
+            );
+        }
         // [p1080-probe v2] 2026-06-25: drop-timing envelope. Breaks
         // out where the drop spends its time so QA can pin which
         // teardown step actually blocks the next prime. CMA entry
@@ -2009,6 +2036,28 @@ impl Decoder {
             "[mem] decoder_open seq={} mmal_live={} path={}",
             decoder_seq_for_inner, n_after_inc, path.display(),
         );
+        // [mmal-probe v4] 2026-06-25: thread_id + wallclock_us so
+        // QA can correlate decoder_open events across threads
+        // (preload worker vs IPC main). The MMAL-decoder-slot leak
+        // investigation needs to know whether preload's Decoder::open
+        // for slide N+1 RACES the prior Decoder::drop for slide N
+        // on the main thread -- the existing [mem] decoder_open
+        // line is journalctl-timestamped but doesn't carry the
+        // calling thread id or a sub-ms wallclock for cross-thread
+        // ordering. Pairs with the matching mmal_thread_wallclock
+        // line in DecoderInner::drop.
+        {
+            let thread_id = format!("{:?}", std::thread::current().id());
+            let wallclock_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros())
+                .unwrap_or(0);
+            let _ = writeln!(
+                std::io::stderr(),
+                "[mmal] decoder_open_thread seq={} thread_id={} wallclock_us={}",
+                decoder_seq_for_inner, thread_id, wallclock_us,
+            );
+        }
         let dec = Self { inner: Arc::new(Mutex::new(inner)) };
         let caps = dec.query_capabilities()
             .context("VIDIOC_QUERYCAP at open time")?;
@@ -2667,6 +2716,23 @@ impl Decoder {
                 },
             );
         }
+        // [mmal-probe v4] 2026-06-25: per-REQBUFS elapsed_us
+        // (sub-5s, complements L1's >=5s slow-ioctl threshold).
+        // fix-C verify saw a 6.1s hang ON THE WAIT-RETRY REQBUFS
+        // path; we want to see if "fast" REQBUFS calls under
+        // 1080p churn also creep up (e.g. 100-500ms vs <10ms
+        // baseline) -- that'd hint at firmware-side slot
+        // contention even before the hard EINVAL hits. Per-call
+        // log on success + failure; cheap.
+        eprintln!(
+            "[mmal] reqbufs_elapsed queue={} count={} elapsed_us={} result={}",
+            match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+            count, reqbufs_elapsed.as_micros(),
+            match &reqbufs_result {
+                Ok(_) => "ok".to_string(),
+                Err(e) => format!("errno_{:?}", e),
+            },
+        );
         // r84 ioctl trace: log every REQBUFS call so QA can pin
         // EINVAL (or any other failure) to the exact queue + count.
         eprintln!(
