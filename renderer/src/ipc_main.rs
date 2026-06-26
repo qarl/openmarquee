@@ -4013,18 +4013,47 @@ fn handle_inner_request(
             // worked around.
             let fix_d_evicted_from_id: Option<uuid::Uuid> = {
                 let from_id_opt = state.current.as_ref().map(|c| c.slide_id);
-                if let Some(from_id) = from_id_opt {
-                    let from_height = match cache.items.peek(&from_id) {
-                        Some(ContentItem::Video(_)) => {
-                            cache.video_demuxers.get(&from_id).map(|d| d.height)
+                // [mmal-fixD v2] DEBUG: per QA's ask, log the condition
+                // states so we can see why eviction didn't engage. v1
+                // verify: only preload_skip fired; evict_outgoing never.
+                // Possible: items.peek returns None, video_demuxers
+                // lookup returns None, or the resolved height is wrong.
+                let (from_kind, bg_id_for_text, height_via_from, height_via_bg) =
+                    if let Some(from_id) = from_id_opt {
+                        match cache.items.peek(&from_id) {
+                            Some(ContentItem::Text(t)) => (
+                                "text",
+                                t.background_video_slide_id,
+                                None,
+                                t.background_video_slide_id.and_then(|bg| {
+                                    cache.video_demuxers.get(&bg).map(|d| d.height)
+                                }),
+                            ),
+                            Some(ContentItem::Video(_)) => (
+                                "video",
+                                None,
+                                cache.video_demuxers.get(&from_id).map(|d| d.height),
+                                None,
+                            ),
+                            Some(ContentItem::Image(_)) => ("image", None, None, None),
+                            None => ("not_in_cache", None, None, None),
                         }
-                        Some(ContentItem::Text(t)) => {
-                            t.background_video_slide_id.and_then(|bg| {
-                                cache.video_demuxers.get(&bg).map(|d| d.height)
-                            })
-                        }
-                        _ => None,
+                    } else {
+                        ("no_current_state", None, None, None)
                     };
+                let resolved_height = height_via_from.or(height_via_bg);
+                eprintln!(
+                    "[mmal-fixD] begin_transition_evict_check from_id={:?} \
+                     from_kind={} bg_id_for_text={:?} \
+                     height_via_from={:?} height_via_bg={:?} \
+                     resolved_height={:?} threshold=1080 \
+                     would_evict={}",
+                    from_id_opt, from_kind, bg_id_for_text,
+                    height_via_from, height_via_bg, resolved_height,
+                    resolved_height.unwrap_or(0) >= 1080,
+                );
+                if let Some(from_id) = from_id_opt {
+                    let from_height = resolved_height;
                     if from_height.unwrap_or(0) >= 1080 {
                         eprintln!(
                             "[mmal-fixD] evict_outgoing_1080p from_slide_id={} \
