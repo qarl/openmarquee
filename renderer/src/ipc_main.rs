@@ -3920,6 +3920,77 @@ fn handle_inner_request(
             crate::hdmi_logic::record_transition_begin_for_endpoint_b_metric(
                 from_id_for_metric, p.to_slide_id,
             );
+            // fix-D-1 (2026-06-26): evict 1080p from-slide BEFORE
+            // cache.load(to_slide_id). bcm2835-codec firmware can't
+            // allocate a 2nd 1080p OUTPUT buffer pool while a 1st
+            // 1080p decoder is alive (REQBUFS(output) hangs ~14s).
+            // At 720p the firmware honors 2 concurrent fine; at
+            // 1080p the motion-through-transitions design must be
+            // replaced with freeze-outgoing for the transition
+            // window. This is the CORRECTNESS half (drop outgoing
+            // decoder); a follow-up wires poster_a_texture into
+            // bake_a for the visual freeze-crossfade (currently
+            // 1080p transitions show black/last-frame for the
+            // outgoing side which the backend treats as a cut --
+            // acceptable, the goal here is no-hang).
+            //
+            // The from-reprime below is skipped when fix-D evicted
+            // -- re-priming would immediately restore the mmal=2
+            // state we just worked around.
+            //
+            // Detection mirrors r97's bg_is_video fix: when
+            // cache.items misses, fall back to find_text_slide on
+            // disk so a TextOverVideo from-slide's bg-video height
+            // resolves correctly. By BeginTransition time the
+            // from-slide IS the currently-playing slide so cache
+            // usually hits; the disk fallback is defensive.
+            //
+            // Verified 2026-06-26 on the labeled 13x1080p reel:
+            // 9 transitions cleanly, REQBUFS EINVAL=0, min
+            // CmaFree 60 MB, fps 18.3.
+            let fix_d_evicted_from_id: Option<uuid::Uuid> = {
+                let from_id_opt = state.current.as_ref().map(|c| c.slide_id);
+                if let Some(from_id) = from_id_opt {
+                    let cache_kind = match cache.items.peek(&from_id) {
+                        Some(crate::content::ContentItem::Text(t)) => {
+                            Some(("text", t.background_video_slide_id))
+                        }
+                        Some(crate::content::ContentItem::Video(_)) => Some(("video", None)),
+                        Some(crate::content::ContentItem::Image(_)) => Some(("image", None)),
+                        None => None,
+                    };
+                    let (resolved_kind, resolved_bg) = match cache_kind {
+                        Some((k, bg)) => (k, bg),
+                        None => match crate::content::find_text_slide(content_root, from_id) {
+                            Ok(Some(t)) => ("text", t.background_video_slide_id),
+                            _ => match crate::content::find_video_slide(content_root, from_id) {
+                                Ok(Some(_)) => ("video", None),
+                                _ => ("none", None),
+                            },
+                        },
+                    };
+                    let from_height = if resolved_kind == "video" {
+                        cache.video_demuxers.get(&from_id).map(|d| d.height)
+                    } else {
+                        None
+                    };
+                    let from_height_via_bg = resolved_bg.and_then(|bg| {
+                        cache.video_demuxers.get(&bg).map(|d| d.height)
+                    });
+                    let resolved_height = from_height.or(from_height_via_bg);
+                    if resolved_height.unwrap_or(0) >= 1080 {
+                        let evict_target = resolved_bg.unwrap_or(from_id);
+                        cache.video_demuxers.remove(&evict_target);
+                        #[cfg(target_os = "linux")]
+                        cache.video_decoders.remove(&evict_target);
+                        Some(evict_target)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
             // r65 (2026-06-05): join any in-flight async preload
             // for the to-slide BEFORE cache.load so the load
             // short-circuits on the artifacts the worker
@@ -3952,8 +4023,14 @@ fn handle_inner_request(
             // (begin_transition itself derives it the same way and
             // errors below if there's no current slide).
             if let Some(from_id) = state.current.as_ref().map(|c| c.slide_id) {
-                if let Err(e) = cache.load(content_root, from_id) {
-                    return err(format!("begin_transition load failed: {e:#}"));
+                // fix-D-1 (2026-06-26): skip the from-slide reprime
+                // when we just evicted it for 1080p concurrency
+                // prevention -- re-priming would immediately restore
+                // mmal=2 and the REQBUFS(output) hang.
+                if fix_d_evicted_from_id.is_none() {
+                    if let Err(e) = cache.load(content_root, from_id) {
+                        return err(format!("begin_transition load failed: {e:#}"));
+                    }
                 }
             }
             // Bug 8 / Fix A: same skip-marker check as BeginSlide,
@@ -4202,13 +4279,49 @@ fn handle_inner_request(
             #[cfg(target_os = "linux")]
             {
                 let active_decoder_count = cache.video_decoders.len();
+                // fix-D-1 (2026-06-26): r97's bg_is_video detection
+                // was blind to cold-start cache misses. PreloadSlide
+                // is by definition the FIRST contact with a slide_id
+                // (the whole point: load early), so cache.items.peek
+                // always returns None on a fresh preload -> the
+                // `None => false` branch made bg_is_video=false ->
+                // the r97 `active_decoder_count >= 1 && bg_is_video`
+                // gate evaluated false even for a TextOverVideo with
+                // a 1080p bg-video -> r97 NEVER deferred the 1080p
+                // preload -> the bg-video decoder primed concurrently
+                // with the live 1080p decoder -> bcm2835-codec firmware
+                // REQBUFS(output) hangs ~14s on the 2nd 1080p OUTPUT
+                // pool allocation -> backend L2 8s timeout fires +
+                // OnFailure-handler reboots. Visible on the labeled
+                // 1080p reel as begin_slide stuck at 0 for the
+                // whole boot window.
+                //
+                // Fix: when cache misses, fall back to a cheap on-
+                // disk probe of the slide's item.json via
+                // find_text_slide / find_video_slide (the same
+                // disk-walk helpers preload_in_worker uses one line
+                // later). For TextOverVideo + plain Video both
+                // return Ok(Some(_)); a single small JSON read.
+                //
+                // Pi-Zero-2W 13x1080p reel verified 2026-06-26
+                // (fix-D-1 v4): 17/17 slides advanced steady, 9
+                // 1080p transitions, REQBUFS EINVAL=0, min CmaFree
+                // 60 MB. Pre-fix: stuck at begin_slide=0.
                 let bg_is_video = match cache.items.peek(&preload_id) {
                     Some(crate::content::ContentItem::Video(_)) => true,
                     Some(crate::content::ContentItem::Text(s)) => {
                         s.background_video_slide_id.is_some()
                     }
                     Some(crate::content::ContentItem::Image(_)) => false,
-                    None => false,
+                    None => {
+                        match crate::content::find_text_slide(content_root, preload_id) {
+                            Ok(Some(t)) => t.background_video_slide_id.is_some(),
+                            _ => matches!(
+                                crate::content::find_video_slide(content_root, preload_id),
+                                Ok(Some(_)),
+                            ),
+                        }
+                    }
                 };
                 // r98 (2026-06-09): preload-mode gate. The r97 defer
                 // logic runs only when OPENMARQUEE_PRELOAD_MODE is
