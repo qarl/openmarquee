@@ -4303,6 +4303,10 @@ pub fn paint_and_present_one_frame_for_slide(
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
+    // fix-D-2: continuous-capture the just-rendered composite
+    // into transition_still_a_tex so paint_transition has a
+    // freeze-source when fix-D-1 evicted the outgoing decoder.
+    session.capture_scanout_to_transition_still_a();
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -4601,6 +4605,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         // QA live-preview hook (2026-06-13): no-op unless
         // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
         session.maybe_live_preview_capture();
+        // fix-D-2: continuous-capture composite for v2v freeze.
+        session.capture_scanout_to_transition_still_a();
         session
             .egl_lib
             .swap_buffers(session.display, session.egl_surface)
@@ -4846,6 +4852,8 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
+    // fix-D-2: continuous-capture composite for v2v freeze.
+    session.capture_scanout_to_transition_still_a();
     session
         .egl_lib
         .swap_buffers(session.display, session.egl_surface)
@@ -5799,9 +5807,22 @@ pub fn paint_and_present_one_transition_frame(
     // stale still (e.g. back-to-back BeginTransition without an
     // intervening Slide hold -- BeginTransition handler frees
     // anyway, so this is theoretically dead, but cheap).
+    // fix-D-2 (2026-06-26): include TextOverVideo on side A.
+    // The continuous-capture-to-still pattern (in
+    // EglSession::capture_scanout_to_transition_still_a) populates
+    // transition_still_a_tex every paint tick during slide play,
+    // so by the time we land in paint_transition the still slot
+    // holds the last-rendered frame of the outgoing slide -- a
+    // freeze source for the v2v crossfade that survives fix-D-1's
+    // BeginTransition evict of the outgoing decoder. Pre-widening
+    // this gate, TextOverVideo on A fell through to bake_video
+    // which returned Ok(None) (decoder gone), the swap was
+    // skipped, and the user saw the prior scanout held = visual
+    // "cut" instead of an actual fade animation. The B-side gate
+    // is unchanged.
     let snapshot_eligible = matches!(
         &endpoint_a,
-        TransitionEndpoint::Video { .. }
+        TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
     ) && matches!(
         &endpoint_b,
         TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
@@ -8126,6 +8147,82 @@ impl<'a> EglSession<'a> {
             (pw as u32, ph as u32)
         };
         self.live_preview.maybe_capture(self.gl, phys_w, phys_h);
+    }
+
+    /// fix-D-2 (2026-06-26): continuous-capture-to-still for v2v
+    /// freeze-crossfade. After fix-D-1 evicts the outgoing 1080p
+    /// decoder at BeginTransition, paint_transition's bake_a has no
+    /// live source -> Ok(None) -> swap+commit skipped -> prior
+    /// scanout held = visual "cut". This helper captures the
+    /// just-rendered default framebuffer (the actual pixels about
+    /// to be presented) into `transition_still_a_tex` every paint
+    /// tick during normal slide play. By BeginTransition time the
+    /// still slot holds the last frame of the outgoing slide.
+    /// paint_transition's snapshot-side-A path (widened to include
+    /// TextOverVideo on side A by the matching edit below) then
+    /// uses this still in place of the missing live decoder ->
+    /// bake_a returns Some(frame) -> swap+commit happens -> the
+    /// transition actually animates (fade/wipe/etc rather than
+    /// looking like a hard cut).
+    ///
+    /// Called from `paint_and_present_one_frame_for_slide` and
+    /// `paint_and_present_one_text_over_video_slide_frame` right
+    /// after `maybe_live_preview_capture` (same default-FB-bound
+    /// timing) and BEFORE `swap_buffers` so the back buffer still
+    /// holds the rendered composite.
+    ///
+    /// Cost: one copy_tex_image_2d per paint tick. On vc4 this is
+    /// a GPU sync. Capture dims = phys_w x phys_h (whatever the
+    /// default FB is sized to). The use-side blit handles any
+    /// resize via cover_quad_vbo scaling.
+    fn capture_scanout_to_transition_still_a(&mut self) {
+        use glow::HasContext;
+        let (phys_w, phys_h) = {
+            let (pw, ph) = self.mode.size();
+            (pw as u32, ph as u32)
+        };
+        let tex = match self.transition_still_a_tex {
+            Some(t) => t,
+            None => {
+                let t = match unsafe { self.gl.create_texture() } {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                unsafe {
+                    self.gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                    self.gl.tex_parameter_i32(
+                        glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
+                    );
+                    self.gl.tex_parameter_i32(
+                        glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32,
+                    );
+                    self.gl.tex_parameter_i32(
+                        glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32,
+                    );
+                    self.gl.tex_parameter_i32(
+                        glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32,
+                    );
+                }
+                self.transition_still_a_tex = Some(t);
+                t
+            }
+        };
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            // copy_tex_image_2d reads from the currently-bound
+            // FRAMEBUFFER's READ buffer; with FRAMEBUFFER=None
+            // (default), that's the EGL backbuffer (the actual
+            // about-to-swap pixels). Reallocates storage every
+            // call -- acceptable for vc4 + the predictable
+            // mode_w x mode_h sizing; can be optimized to
+            // copy_tex_sub_image_2d if profiling shows churn.
+            self.gl.copy_tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA,
+                0, 0, phys_w as i32, phys_h as i32, 0,
+            );
+            self.gl.bind_texture(glow::TEXTURE_2D, None);
+        }
     }
 }
 
