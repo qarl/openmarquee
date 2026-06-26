@@ -2,7 +2,9 @@
 //
 // Consumer:
 //   - Production video uploader (ui/src/video-upload.js) — transcodes
-//     operator uploads to H.264 MP4 at the Pi's 1080p decoder cap.
+//     operator uploads to H.264 MP4 at the production 720p cap
+//     (see video-upload.js header for why 720p vs the 1080p decoder
+//     ceiling).
 //
 // (The maintainer-facing /spike.html dev probe was retired alongside
 // simulator.js; if you need to exercise the pipeline end-to-end again,

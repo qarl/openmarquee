@@ -157,7 +157,7 @@ describe("transcodeToH264", () => {
         const { transcodeToH264 } = await import("./ffmpeg-pipelines.js");
         const fakeFile = new Blob(["fake mp4"], { type: "video/mp4" });
         const bytes = await transcodeToH264({
-            file: fakeFile, width: 1920, height: 1080,
+            file: fakeFile, width: 1280, height: 720,
         });
 
         expect(bytes).toBeInstanceOf(Uint8Array);
@@ -177,7 +177,7 @@ describe("transcodeToH264", () => {
         expect(args).toContain("-pix_fmt");
         expect(args[args.indexOf("-pix_fmt") + 1]).toBe("yuv420p");
         expect(args).toContain("-an");  // no audio
-        expect(args.find(a => a.startsWith("scale=1920:1080"))).toBeTruthy();
+        expect(args.find(a => a.startsWith("scale=1280:720"))).toBeTruthy();
     });
 
     // Perf-night r4 (2026-05-26): VPU-friendly preset pin. Each flag
@@ -188,8 +188,8 @@ describe("transcodeToH264", () => {
         const { transcodeToH264 } = await import("./ffmpeg-pipelines.js");
         await transcodeToH264({
             file: new Blob(["fake mp4"], { type: "video/mp4" }),
-            width: 1920,
-            height: 1080,
+            width: 1280,
+            height: 720,
         });
         const args = ffmpegState.instance.calls.exec[0];
 
@@ -198,13 +198,17 @@ describe("transcodeToH264", () => {
         expect(args).toContain("-profile:v");
         expect(args[args.indexOf("-profile:v") + 1]).toBe("baseline");
 
-        // Level 4.0 — caps the decoder's per-frame budget at the
-        // documented Pi Zero 2 W ceiling for 1080p30.
+        // Level 4.0 — caps the decoder's per-frame budget. Level 4.0
+        // supports 1080p30 (fix-D-1 in main proves the decoder
+        // handles it); production cap is 720p (uploads clamp via
+        // pickTranscodeTarget) but the encoder level stays at 4.0
+        // so a future 1080p experiment doesn't have to re-encode.
         expect(args).toContain("-level");
         expect(args[args.indexOf("-level") + 1]).toBe("4.0");
 
         // No B-frames — VC4's reference-frame buffer pool stalls
-        // under bframes>=1 at 1080p (libx264 default is 3).
+        // under bframes>=1 (libx264 default is 3). Required by
+        // mp4_demux.rs's baseline-only assumption.
         expect(args).toContain("-bf");
         expect(args[args.indexOf("-bf") + 1]).toBe("0");
 
@@ -212,8 +216,9 @@ describe("transcodeToH264", () => {
         expect(args).toContain("-g");
         expect(args[args.indexOf("-g") + 1]).toBe("30");
 
-        // 30fps cap — VC4 sustains 1080p30 cleanly; 1080p60 from
-        // phone uploads is at the edge of the budget.
+        // 30fps cap — VC4 sustains 720p30 well under load; the
+        // matching r=30 caps over-spec source uploads (60fps phone
+        // captures) to the production rate.
         expect(args).toContain("-r");
         expect(args[args.indexOf("-r") + 1]).toBe("30");
 

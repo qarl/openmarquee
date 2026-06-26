@@ -1,12 +1,20 @@
 // Video upload: pick a video (any FFmpeg-decodable format), transcode
-// client-side via ffmpeg.wasm to H.264 MP4 at min(source, 1920×1080),
+// client-side via ffmpeg.wasm to H.264 MP4 at min(source, 1280×720),
 // upload the MP4 bytes + a first-frame thumbnail PNG.
 //
-// The 1080p cap is hardware-driven: the Pi Zero 2 W's H.264 decoder
-// tops out at 1080p30; anything larger falls to software decode and
-// stutters. The playback engine scales further down to the current
-// panel dims via ffmpeg's filter graph at decode time, so the stored
-// MP4 is resolution-independent below that cap.
+// The 720p cap is operationally driven (2026-06-26 follow-up to the
+// 1080p decoder-unlock arc). The Pi Zero 2 W's bcm2835-codec CAN
+// decode 1080p (fix-D-1 merged at main 5b5f36a, PR #15), but 1080p
+// TRANSITIONS hard-cut because the incoming decoder's first-frame
+// latency post-prime exceeds Path B's ~100ms ceiling (see
+// project_1080p_decoder_unlock_arc_2026_06_26 + the fix-D-2-v3
+// non-blocking-poll backlog item). qarl's 2026-06-26 production
+// call: ship 720p strong (sharp + smooth ~18-20fps + transitions
+// animate) rather than chase the 1080p crossfade fix. Uploads
+// therefore clamp to 720p so the operator UI matches production.
+// The playback engine still scales further down to the current
+// panel dims via ffmpeg's filter graph at decode time, so the
+// stored MP4 is resolution-independent below the cap.
 //
 // Processing happens on file-pick (not Save) so the operator sees the
 // real thumbnail + real duration before committing.
@@ -77,10 +85,14 @@ export {
 const PLACEHOLDER_MP4_B64 =
     "AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAANCbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAAhYAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAm10cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAAhYAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAIAAAABgAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAIWAAAAAAABAAAAAAHlbWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAA8AAAAIABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRlb0hhbmRsZXIAAAABkG1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAAAQAAAVBzdGJsAAAAuHN0c2QAAAAAAAAAAQAAAKhhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAIAAYABIAAAASAAAAAAAAAABFUxhdmM2MS4xOS4xMDEgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAALmF2Y0MBQsAK/+EAF2dCwAraCDbARAAAAwAEAAADAHg8SJqAAQAEaM4PyAAAABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAACo/AAAAAAAAABhzdHRzAAAAAAAAAAEAAAAIAAAEAAAAABRzdHNzAAAAAAAAAAEAAAABAAAAHHN0c2MAAAAAAAAAAQAAAAEAAAAIAAAAAQAAADRzdHN6AAAAAAAAAAAAAAAIAAACiwAAAAoAAAAKAAAACgAAAAoAAAAKAAAACgAAAAoAAAAUc3RjbwAAAAAAAAABAAADcgAAAGF1ZHRhAAAAWW1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALGlsc3QAAAAkqXRvbwAAABxkYXRhAAAAAQAAAABMYXZmNjEuNy4xMDAAAAAIZnJlZQAAAtltZGF0AAACVAYF//9Q3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NCByMzEwOCAzMWUxOWY5IC0gSC4yNjQvTVBFRy00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyMyAtIGh0dHA6Ly93d3cudmlkZW9sYW4ub3JnL3gyNjQuaHRtbCAtIG9wdGlvbnM6IGNhYmFjPTAgcmVmPTEgZGVibG9jaz0wOjA6MCBhbmFseXNlPTA6MCBtZT1kaWEgc3VibWU9MCBwc3k9MSBwc3lfcmQ9MS4wMDowLjAwIG1peGVkX3JlZj0wIG1lX3JhbmdlPTE2IGNocm9tYV9tZT0xIHRyZWxsaXM9MCA4eDhkY3Q9MCBjcW09MCBkZWFkem9uZT0yMSwxMSBmYXN0X3Bza2lwPTEgY2hyb21hX3FwX29mZnNldD0wIHRocmVhZHM9MyBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNpbWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTAgd2VpZ2h0cD0wIGtleWludD0yNTAga2V5aW50X21pbj0xNSBzY2VuZWN1dD0wIGludHJhX3JlZnJlc2g9MCByYz1jcmYgbWJ0cmVlPTAgY3JmPTIzLjAgcWNvbXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlvPTEuNDAgYXE9MACAAAAAL2WIhDomKAAJAsnJycnJycnXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXgAAAABkGaIDaBjAAAAAZBmkA6gYwAAAAGQZpgOoGMAAAABkGagDqBjAAAAAZBmqA6gYwAAAAGQZrAPoGMAAAABkGa4D6BjA==";
 
-// Hardware cap for the Pi Zero 2 W's H.264 decoder. 1080p30 is the
-// documented maximum; anything larger falls back to software decode.
-const MAX_VIDEO_W = 1920;
-const MAX_VIDEO_H = 1080;
+// Operational cap for the Pi Zero 2 W production reel. The
+// bcm2835-codec decoder handles 1080p (fix-D-1, main 5b5f36a),
+// but 1080p transitions hard-cut due to incoming first-frame
+// latency exceeding Path B (see file header for full context).
+// qarl's 2026-06-26 production call: ship 720p strong. Operators
+// upload to 720p so what they preview matches what plays.
+const MAX_VIDEO_W = 1280;
+const MAX_VIDEO_H = 720;
 
 /** Compute the transcode target: source dims clamped to the hardware cap,
  * keeping aspect ratio and forcing even numbers (yuv420p hates odd). */
@@ -239,7 +251,8 @@ export function mountVideoUploader(
     async function processVideo(file) {
         setStatus("inspecting source…");
         // Source dims drive the transcode target — we keep the source
-        // resolution verbatim up to the Pi's 1080p H.264 decoder cap.
+        // resolution verbatim up to the Pi production 720p cap (see
+        // file header for why 720p vs the 1080p decoder ceiling).
         const { width: srcW, height: srcH } = await peekVideoDims(file);
         const target = pickTranscodeTarget(srcW, srcH);
 
