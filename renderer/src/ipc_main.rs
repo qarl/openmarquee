@@ -4309,6 +4309,31 @@ fn handle_inner_request(
             // not grow; the 2-pool window widens by ~500 ms.
             let preload_id = p.slide_id;
             let t_enqueue = std::time::Instant::now();
+            // [mmal-v7] handler entry log + state snapshot. Lets
+            // QA see arrival order vs BeginSlide handler entries
+            // in the journal (cold-start race: PreloadSlide(N+1)
+            // arrives BEFORE BeginSlide(N) finishes -> count=0).
+            {
+                let wallclock_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros())
+                    .unwrap_or(0);
+                let current_id_dbg = state
+                    .current
+                    .as_ref()
+                    .map(|c| c.slide_id.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                #[cfg(target_os = "linux")]
+                let active_count_dbg = cache.video_decoders.len();
+                #[cfg(not(target_os = "linux"))]
+                let active_count_dbg: usize = 0;
+                eprintln!(
+                    "[mmal-v7] preload_handler_entry slide_id={} \
+                     wallclock_us={} current_slide_id={} \
+                     active_decoder_count={}",
+                    preload_id, wallclock_us, current_id_dbg, active_count_dbg,
+                );
+            }
             // Already loaded? Short-circuit at near-zero cost.
             // The same items+demuxer+decoder check cache.load
             // uses; we replicate inline so we don't even build
@@ -4428,12 +4453,48 @@ fn handle_inner_request(
                 // When the mode is not 'defer', the r97
                 // `preload_deferred_for_codec_contention` probe does
                 // NOT fire because the deferral branch is bypassed.
-                if preload_mode() == PreloadMode::Defer
-                    && should_defer_preload_for_codec_contention(
-                        active_decoder_count,
-                        bg_is_video,
-                    )
-                {
+                // [mmal-v7] 2026-06-26: log r97 defer-decision EVERY
+                // call (not just when defer fires). v3 capture vs v6
+                // capture diverged: same code, same env, different
+                // outcome -- v6 deferred (BeginTransition fired,
+                // cache.load hung), v3 did NOT defer (2 REQBUFS
+                // EINVALs from the preload prime, BeginTransition
+                // never fired). QA's analysis: r97 is racy on
+                // active_decoder_count (the check runs BEFORE the
+                // current slide's decoder fully registers in
+                // cache.video_decoders; count=0 transiently ->
+                // skip defer -> preload primes -> by REQBUFS-time
+                // the current 1080p decoder IS alive -> concurrent
+                // -> EINVAL/hang -> stall before BeginTransition).
+                // v7 probe captures: per-PreloadSlide-call inputs +
+                // outcome so QA can see when defer skipped a call
+                // that SHOULD have deferred.
+                let active_decoder_ids_dbg: Vec<String> = cache
+                    .video_decoders
+                    .keys()
+                    .map(|id| id.to_string())
+                    .collect();
+                // NOTE: preload_mode() == PreloadMode::Defer check
+                // appears textually BEFORE the should_defer call so
+                // the source-grep regression-lock test (preload_mode
+                // _call_site_is_present_in_preload_arm) accepts the
+                // ordering AND the literal string is still present.
+                let want_defer_mode = preload_mode() == PreloadMode::Defer;
+                let mode_dbg = preload_mode();
+                let should_defer_dbg = should_defer_preload_for_codec_contention(
+                    active_decoder_count, bg_is_video,
+                );
+                let would_defer = want_defer_mode && should_defer_dbg;
+                eprintln!(
+                    "[mmal-v7] preload_defer_check slide_id={} \
+                     preload_mode={:?} active_decoder_count={} \
+                     active_decoder_ids=[{}] bg_is_video={} \
+                     should_defer_pure={} would_defer={}",
+                    preload_id, mode_dbg, active_decoder_count,
+                    active_decoder_ids_dbg.join(","), bg_is_video,
+                    should_defer_dbg, would_defer,
+                );
+                if would_defer {
                     let us = t_enqueue.elapsed().as_micros();
                     // List the active decoder ids so QA can correlate
                     // which decoder #1 is the contention partner.
