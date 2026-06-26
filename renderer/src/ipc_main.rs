@@ -3547,6 +3547,22 @@ fn handle_inner_request(
             err("Open already called; nested Open is not supported")
         }
         IpcRequest::BeginSlide(p) => {
+            // [mmal-probe v6] 2026-06-26: handler entry log. Pairs
+            // with the bs_handler exit at the end of this arm. If
+            // QA sees entry without matching exit in the journal,
+            // the handler hung somewhere inside (drain_stale_
+            // preloads / ensure_preload_complete / evict / cache.
+            // load / state.begin_slide).
+            let bs_t_entry = std::time::Instant::now();
+            let bs_wallclock_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros())
+                .unwrap_or(0);
+            eprintln!(
+                "[mmal] begin_slide_handler phase=entry slide_id={} \
+                 wallclock_us={}",
+                p.slide_id, bs_wallclock_us,
+            );
             // r102.1: V3D BO probe at BeginSlide entry. Brackets
             // the slide-change boundary so QA can compare slide-
             // change delta vs transition-paint delta.
@@ -3890,9 +3906,34 @@ fn handle_inner_request(
                 ));
             }
             state.begin_slide(p.slide_id, p.t0_ms, p.duration_ms);
+            // [mmal-probe v6] handler exit log (success path).
+            eprintln!(
+                "[mmal] begin_slide_handler phase=exit slide_id={} \
+                 elapsed_us={} outcome=ok",
+                p.slide_id, bs_t_entry.elapsed().as_micros(),
+            );
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
+            // [mmal-probe v6] 2026-06-26: handler entry+exit logs.
+            // v5 outcome: the stall is the renderer state machine,
+            // not the bake_video decode. begin_slide stuck at 0
+            // during the stall = the BeginTransition handler may be
+            // hanging in cache.load/ensure_preload_complete before
+            // the transition advances + BeginSlide for N+1 ever
+            // fires. Entry log + per-step exit logs let QA see
+            // exactly which step hangs (entry without matching
+            // step-exit = the hang site).
+            let bt_t_entry = std::time::Instant::now();
+            let bt_wallclock_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros())
+                .unwrap_or(0);
+            eprintln!(
+                "[mmal] begin_transition_handler phase=entry to_slide_id={} \
+                 wallclock_us={}",
+                p.to_slide_id, bt_wallclock_us,
+            );
             // r110 c3.3.1 (2026-06-11): clear the poster-sourced
             // signal at transition entry so it scopes exactly to
             // "this transition window." c3.2.2 bake_a/bake_b
@@ -4015,7 +4056,7 @@ fn handle_inner_request(
                     p.to_slide_id
                 ));
             }
-            match state.begin_transition(
+            let result = match state.begin_transition(
                 p.to_slide_id,
                 p.to_duration_ms,
                 &p.kind,
@@ -4024,7 +4065,20 @@ fn handle_inner_request(
             ) {
                 Ok(()) => ok_empty(),
                 Err(e) => err(format!("begin_transition: {e}")),
-            }
+            };
+            // [mmal-probe v6] handler exit log. Matches the
+            // entry log at the top of this IpcRequest::BeginTransition
+            // arm. elapsed_us across the whole handler.
+            eprintln!(
+                "[mmal] begin_transition_handler phase=exit to_slide_id={} \
+                 elapsed_us={} outcome={}",
+                p.to_slide_id, bt_t_entry.elapsed().as_micros(),
+                match &result {
+                    IpcResponse::Ok { .. } => "ok",
+                    IpcResponse::Err { .. } => "err",
+                },
+            );
+            result
         }
         IpcRequest::Advance(p) => {
             // Slice (c): return the AdvanceCommand-derived

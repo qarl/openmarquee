@@ -2249,6 +2249,17 @@ impl Decoder {
                 std::mem::size_of::<V4l2PixFormatMplane>(),
             );
         }
+        // [mmal-probe v6] 2026-06-26: per-ioctl entry log. v5
+        // outcome refuted 2-concurrent; new hypothesis is the
+        // incoming-decoder PRIME hangs partway through. Entry log
+        // BEFORE each long-ish ioctl + the existing exit log AFTER
+        // gives QA the "entered but never exited" signature for
+        // whichever phase hangs.
+        eprintln!(
+            "[mmal] ioctl_enter op=S_FMT queue={} requested_w={} requested_h={}",
+            match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+            width, height,
+        );
         // SAFETY: VIDIOC_S_FMT is _IOWR. Caller's fmt struct is
         // written by the kernel with the negotiated format on Ok.
         let sfmt_result = unsafe { vidioc_s_fmt(inner.fd(), &mut fmt) };
@@ -2748,6 +2759,15 @@ impl Decoder {
         // The ioctl itself can't be interrupted from userspace if
         // it goes D-state; this is observation-only. Layer 2's
         // systemd watchdog covers the actual unstick.
+        // [mmal-probe v6] 2026-06-26: per-ioctl entry log (see
+        // the matching note at S_FMT). REQBUFS already has exit
+        // timing via reqbufs_elapsed; entry log lets QA spot a
+        // REQBUFS that started but never returned.
+        eprintln!(
+            "[mmal] ioctl_enter op=REQBUFS queue={} count={}",
+            match dir { QueueDirection::Output => "output", QueueDirection::Capture => "capture" },
+            count,
+        );
         let t_reqbufs = std::time::Instant::now();
         let reqbufs_result = unsafe { vidioc_reqbufs(inner.fd(), &mut rb) };
         let reqbufs_elapsed = t_reqbufs.elapsed();
@@ -3195,6 +3215,9 @@ impl Decoder {
         // *const c_int. Kernel reads 4 bytes from the pointer.
         // Pointers live until the ioctl returns (their stack
         // slots outlive the unsafe scope).
+        // [mmal-probe v6] per-ioctl entry log so a hung STREAMON
+        // is visible as "entered but never exited" in the journal.
+        eprintln!("[mmal] ioctl_enter op=STREAMON queue=output");
         let r_out = unsafe { vidioc_streamon(inner.fd(), &bt_out) };
         eprintln!(
             "[perf] v4l2_ioctl op=STREAMON queue=output result={}",
@@ -3202,6 +3225,7 @@ impl Decoder {
         );
         r_out.with_context(|| "VIDIOC_STREAMON OUTPUT")?;
         inner.output_streaming = true;
+        eprintln!("[mmal] ioctl_enter op=STREAMON queue=capture");
         let r_cap = unsafe { vidioc_streamon(inner.fd(), &bt_cap) };
         eprintln!(
             "[perf] v4l2_ioctl op=STREAMON queue=capture result={}",
