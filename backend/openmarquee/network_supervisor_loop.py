@@ -332,6 +332,18 @@ async def supervisor_observe_loop(
                     )
                     has_logged_missing_iw = True
 
+            # 4. P2 (2026-06-27) LINGER timer poll. The supervisor's
+            # transition-effect dispatch arms `_linger_entered_at` on
+            # entry into LINGER; we ask each tick whether the grace
+            # window has elapsed and fire LINGER_TIMER_EXPIRED if so.
+            # check_linger_timeout is idempotent: it returns False
+            # once the state has transitioned out of LINGER, so we
+            # can't double-fire.
+            from openmarquee.network_supervisor import SupervisorEvent as _SE
+
+            if supervisor.check_linger_timeout():
+                supervisor.apply_event(_SE.LINGER_TIMER_EXPIRED)
+
             await asyncio.sleep(wpa_poll_interval_s)
     except asyncio.CancelledError:
         log.info("network-supervisor: observe-only loop cancelled; shutting down")

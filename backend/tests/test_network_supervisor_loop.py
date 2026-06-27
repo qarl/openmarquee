@@ -486,6 +486,51 @@ async def test_observe_loop_emits_iw_list_diag_at_start(tmp_path: Path, monkeypa
     assert "#{ AP } <= 1" in line
 
 
+# ============================================================
+# P2 (2026-06-27) observe loop drives LINGER timer
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_observe_loop_fires_linger_timer_expired_when_window_elapses(
+    tmp_path: Path, monkeypatch
+):
+    """The observe loop polls supervisor.check_linger_timeout() each
+    tick + fires LINGER_TIMER_EXPIRED when it returns True. Verified
+    by forcing the supervisor into LINGER + setting linger_seconds
+    tiny so the first tick after entry sees the window elapsed.
+    """
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "iw")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    config = SupervisorConfig(
+        state_file=tmp_path / "network-state.json",
+        wpa_ctrl_path=tmp_path / "absent.sock",
+        linger_seconds=0.01,
+    )
+    sup = NetworkSupervisor(config=config)
+    sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+    sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+    assert sup.current_state == SupervisorState.LINGER
+
+    task = asyncio.create_task(
+        supervisor_observe_loop(
+            sup,
+            wpa_poll_interval_s=0.005,
+            sta_freq_poll_interval_s=0.02,
+        )
+    )
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sup.current_state == SupervisorState.ONLINE
+
+
 @pytest.mark.asyncio
 async def test_observe_loop_emits_unavailable_diag_when_iw_missing(tmp_path: Path, monkeypatch):
     """On Mac dev (no iw binary) the boot diagnostic still emits a

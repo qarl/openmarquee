@@ -21,6 +21,7 @@ from openmarquee.api_backgrounds import router as backgrounds_router
 from openmarquee.api_flock import router as flock_router
 from openmarquee.api_live import router as live_router
 from openmarquee.api_network_supervisor import router as network_supervisor_router
+from openmarquee.api_onboarding import router as onboarding_router
 from openmarquee.api_perf import router as perf_router
 from openmarquee.api_playback import router as playback_router
 from openmarquee.api_playlist import router as playlist_router
@@ -456,7 +457,7 @@ app.add_middleware(BodyCapMiddleware)
 
 @app.exception_handler(RequestValidationError)
 async def _request_validation_handler(
-    _request: Request, exc: RequestValidationError
+    request: Request, exc: RequestValidationError
 ) -> JSONResponse:
     """Override FastAPI's default 422 handler to drop the echoed input.
 
@@ -476,8 +477,22 @@ async def _request_validation_handler(
     through `jsonable_encoder` for the same JSON-safety guarantees
     the default handler gives (UUIDs in `input` paths, exceptions in
     `ctx`).
+
+    QA cross-lane review PR2 BLOCKER B1 (2026-06-27): for the unauth
+    captive-portal onboarding routes, even the field-by-field 422
+    shape is too rich — pydantic's `ctx` carries validator
+    parameters that aren't sensitive today but could regress, and
+    on an unauth surface that posts a password we want defense-in-
+    depth. Return ONLY (type, loc, msg) for /api/onboarding/* with
+    `input` + `ctx` + `url` stripped; no encoder pass on the input
+    means there's nowhere for the password to land.
     """
-    sanitised = [{k: v for k, v in err.items() if k != "input"} for err in exc.errors()]
+    is_onboarding = request.url.path.startswith("/api/onboarding/")
+    if is_onboarding:
+        kept = ("type", "loc", "msg")
+        sanitised = [{k: err[k] for k in kept if k in err} for err in exc.errors()]
+    else:
+        sanitised = [{k: v for k, v in err.items() if k != "input"} for err in exc.errors()]
     return JSONResponse(
         status_code=422,
         content={"detail": jsonable_encoder(sanitised)},
@@ -508,6 +523,11 @@ app.include_router(flock_router)
 # QA observability during the observe-only soak. No mutations from this
 # surface in P1.2-A.
 app.include_router(network_supervisor_router)
+# P2 (2026-06-27) captive-portal onboarding: POST /api/onboarding/submit-credentials
+# + GET /api/onboarding/status give the portal user a POST-then-associate
+# flow per spec §"Captive portal plumbing". Both endpoints are unauth
+# (proximity-PIN auth model lives in the portal UI, not the API layer).
+app.include_router(onboarding_router)
 
 # Dev tooling (preview page, manual play endpoint) is mounted by default
 # because the device is its own captive-portal AP with no inbound internet.
