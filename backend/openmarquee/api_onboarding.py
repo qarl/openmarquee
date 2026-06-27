@@ -112,13 +112,22 @@ async def submit_credentials(
     # QA cross-lane review (PR2 NIT N2): reject submit-credentials
     # outside the states where the captive portal is the legitimate
     # surface. SETUP and DEGRADED are the only states where the AP
-    # is up + the user is plausibly on the portal interface. LINGER
-    # and ONLINE imply the device is on home wifi; an unauth
-    # submit-credentials there comes from a LAN attacker, not the
-    # portal, and accepting it lets anyone on the home network
-    # overwrite wifi creds + kick a reassoc. Proper fix is
-    # interface-scoping to ap0 (follow-up PR); this state-gate is
-    # the interim defense.
+    # is up + the user is plausibly on the portal interface. The
+    # other three states are all blocked:
+    #
+    #   * CONNECTING — a previous nmcli apply is in flight; accepting
+    #     a new submit would race the previous one + leave the
+    #     supervisor in an inconsistent state. CONNECTING is brief
+    #     (advances to LINGER on success, or back to SETUP on
+    #     STA_AUTH_FAILED ~5s later); the user can re-submit then.
+    #   * LINGER — STA is up + device is reachable on home wifi.
+    #     Unauth submit-credentials would let a LAN attacker
+    #     overwrite creds.
+    #   * ONLINE — AP torn down; portal not reachable. Any unauth
+    #     submit comes from home LAN, not the portal.
+    #
+    # Proper fix for the LAN-attack vector is interface-scoping to
+    # ap0 (follow-up PR); this state-gate is the interim defense.
     if supervisor.current_state not in (
         SupervisorState.SETUP,
         SupervisorState.DEGRADED,

@@ -170,21 +170,70 @@ def test_status_does_not_leak_wifi_station_detail(client: TestClient):
 # ============================================================
 
 
-def test_submit_credentials_422_does_not_echo_password(client: TestClient):
+def test_submit_credentials_422_does_not_echo_password_ssid_side(client: TestClient):
     """QA cross-lane review (PR2 BLOCKER B1): the submitted password
-    MUST NOT appear anywhere in the 422 response body. We trigger an
-    ssid-side validation failure (so the request body still contains
-    a unique canary password) and assert the canary is absent from
-    the response.
+    MUST NOT appear anywhere in the 422 response body. SSID-side
+    failure exercises the request-model path with a valid password
+    in the body — guards the sanitisation of OTHER fields' errors
+    that may carry the password through `ctx`.
     """
-    canary = "leak-canary-zzqqww-abc-7331-unique"
+    canary = "ssid-side-leak-canary-zzqqww-abc-7331-unique"
     response = client.post(
         "/api/onboarding/submit-credentials",
-        json={"ssid": "x" * 33, "password": canary},  # ssid too long
+        json={"ssid": "x" * 33, "password": canary},
     )
     assert response.status_code == 422, response.text
     assert canary not in response.text, (
         "422 must not echo the submitted password (got body: " + response.text + ")"
+    )
+
+
+def test_submit_credentials_422_does_not_echo_password_password_field_oversize(
+    client: TestClient,
+):
+    """QA re-review follow-up #1: the request-model 422 path itself
+    (path A) MUST also strip the offending password value when it's
+    the password field that fails. Without the path-aware handler in
+    app.py, FastAPI's default would emit input=<password> in the
+    error dict; with our handler, the (type, loc, msg) shape excludes
+    input. Strengthens the security pin so a regression of path A
+    fails this test loudly.
+    """
+    canary = "password-field-leak-canary-yyqqww-7332-unique-" + "Z" * 30
+    response = client.post(
+        "/api/onboarding/submit-credentials",
+        json={"ssid": "home-wifi", "password": canary},  # >63 chars
+    )
+    assert response.status_code == 422, response.text
+    assert canary not in response.text, (
+        "422 must not echo the submitted password on a password-field "
+        "validation failure (got body: " + response.text + ")"
+    )
+
+
+def test_submit_credentials_422_does_not_echo_password_settings_side(
+    client: TestClient,
+):
+    """QA re-review follow-up #1: the settings-side manual validation
+    path (path B — the manual `model_validate` call) MUST also not
+    leak the password. Non-ASCII characters in the password trip the
+    SystemSettings `wifi_station_password` validator which requires
+    'printable ASCII chars' — that path goes through our manual
+    raise HTTPException, not the request-model handler, so the
+    fixed-string detail is the load-bearing fix here.
+    """
+    # Non-ASCII canary trips SystemSettings.wifi_station_password's
+    # printable-ASCII validator (settings.py). Avoid characters that
+    # could appear in pydantic's own error messages.
+    canary = "settings-side-leak-canary-7333-unique-héllo-wörld"
+    response = client.post(
+        "/api/onboarding/submit-credentials",
+        json={"ssid": "home-wifi", "password": canary},
+    )
+    assert response.status_code == 422, response.text
+    assert canary not in response.text, (
+        "422 must not echo the submitted password on a settings-side "
+        "validation failure (got body: " + response.text + ")"
     )
 
 
@@ -231,14 +280,34 @@ def test_submit_credentials_rejected_in_online_state(client: TestClient):
 
 
 def test_submit_credentials_rejected_in_linger_state(client: TestClient):
-    """LINGER also implies STA is up + the device is reachable on
-    home wifi. Reject unauth submit-credentials here per QA N2."""
+    """LINGER implies STA is up + the device is reachable on home
+    wifi. Reject unauth submit-credentials here per QA N2."""
     from openmarquee.dependencies import get_network_supervisor
     from openmarquee.network_supervisor import SupervisorEvent
 
     sup = get_network_supervisor()
     sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
     sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+    response = client.post(
+        "/api/onboarding/submit-credentials",
+        json={"ssid": "leak-rig", "password": "evil-pass-1234"},
+    )
+    assert response.status_code == 409
+
+
+def test_submit_credentials_rejected_in_connecting_state(client: TestClient):
+    """QA re-review follow-up #2: CONNECTING is also blocked — a
+    previous nmcli apply is in flight; accepting a new submit would
+    race it. CONNECTING resolves within ~5s (LINGER on success, back
+    to SETUP on STA_AUTH_FAILED); the user re-submits then. The code
+    rejects via the (state not in {SETUP, DEGRADED}) gate; this test
+    pins the contract so a future relaxation is intentional.
+    """
+    from openmarquee.dependencies import get_network_supervisor
+    from openmarquee.network_supervisor import SupervisorEvent
+
+    sup = get_network_supervisor()
+    sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
     response = client.post(
         "/api/onboarding/submit-credentials",
         json={"ssid": "leak-rig", "password": "evil-pass-1234"},
