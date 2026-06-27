@@ -947,13 +947,24 @@ def get_live_manager():
 @lru_cache
 def _network_supervisor_singleton():
     from openmarquee.network_supervisor import NetworkSupervisor, SupervisorConfig
+    from openmarquee.network_supervisor_actuator import WifiPowerSaveActuator
 
     storage = _settings_storage_singleton()
     settings = storage.load()
     config = SupervisorConfig(
         fallback_mutex_mode=settings.network_fallback_mutex_mode,
     )
-    return NetworkSupervisor(config=config)
+    # P1.3 (2026-06-27): wire the netctl-driven power-save-off
+    # actuator as the singleton's default. The actuator is fail-soft:
+    # FileNotFoundError on dev hosts without the netctl socket is
+    # caught by the supervisor's _fire_power_save_on_assoc and
+    # downgraded to a warn diagnostic, so this is safe to install
+    # unconditionally. Tests that construct NetworkSupervisor
+    # directly (not via the singleton) get the observe-only stub.
+    return NetworkSupervisor(
+        config=config,
+        power_save_actuator=WifiPowerSaveActuator(),
+    )
 
 
 def get_network_supervisor():

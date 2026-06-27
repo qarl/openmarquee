@@ -1,12 +1,17 @@
-"""P1.2-B HostapdChannelActuator tests.
+"""P1.2-B HostapdChannelActuator + P1.3 WifiPowerSaveActuator tests.
 
 Cover the pure helpers (channel-substitute, iw output parse) +
-the actuator's flow with subprocess hops monkeypatched.
+the actuators' flows with subprocess + socket hops monkeypatched,
+plus one real-socket protocol smoke for the shared `_netctl_send`.
 """
 
 from __future__ import annotations
 
+import contextlib
+import socket
 import subprocess
+import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -15,7 +20,11 @@ from openmarquee.network_supervisor import ChannelFollowDecision
 from openmarquee.network_supervisor_actuator import (
     HostapdActuationError,
     HostapdChannelActuator,
+    WifiPowerSaveActuationError,
+    WifiPowerSaveActuator,
+    _netctl_send,
     _parse_iw_dev_info_channel,
+    _run_netctl_wifi_powersave_off,
     _substitute_channel,
 )
 
@@ -274,3 +283,286 @@ def test_actuator_passes_new_conf_as_netctl_payload(hostapd_conf_file, monkeypat
     # encode-and-send) and contains the substituted channel.
     assert "channel=11" in payloads[0]
     assert "channel=6" not in payloads[0]
+
+
+# ============================================================
+# P1.3 (2026-06-27) WifiPowerSaveActuator + _run_netctl_wifi_powersave_off
+# + shared _netctl_send core
+# ============================================================
+
+
+def _netctl_wps_ok_recorder(monkeypatch) -> list[tuple[str, bytes]]:
+    """Capture invocations of the shared netctl core for the
+    WifiPowerSaveActuator path. Returns the list of (subcommand,
+    payload) tuples passed."""
+    captured: list[tuple[str, bytes]] = []
+
+    def _stub(subcommand, payload, *, timeout_s, error_cls):
+        captured.append((subcommand, payload))
+
+    monkeypatch.setattr(
+        "openmarquee.network_supervisor_actuator._netctl_send",
+        _stub,
+    )
+    return captured
+
+
+class TestNetctlSendShared:
+    """Pins the shared `_netctl_send` contract used by both
+    hostapd-write-and-restart and wifi-powersave-off wrappers. The
+    happy path uses a real Unix-domain server in a thread so the
+    actual wire protocol is exercised (not just the function shape).
+    """
+
+    @pytest.fixture
+    def fake_server(self):
+        """Spin up a one-shot Unix-domain server that captures the
+        client's first line + remaining payload, replies with a
+        configurable response, and closes.
+
+        Uses a short-prefix tempdir directly (not pytest.tmp_path)
+        because AF_UNIX paths are capped at ~104 chars on macOS
+        and pytest's nested tmp_path easily blows past that.
+        """
+        # Short prefix; sun_path on macOS caps at 104.
+        sock_dir = Path(tempfile.mkdtemp(prefix="nm-"))
+        sock_path = sock_dir / "s"
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(str(sock_path))
+        srv.listen(1)
+        srv.settimeout(5.0)
+
+        received: dict = {"subcommand": None, "payload": None}
+        responses = {"reply": b"OK\n"}
+
+        def _serve():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            with conn:
+                data = b""
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                first, _, rest = data.partition(b"\n")
+                received["subcommand"] = first.decode("ascii", errors="replace")
+                received["payload"] = rest
+                conn.sendall(responses["reply"])
+
+        thread = threading.Thread(target=_serve, daemon=True)
+        thread.start()
+        try:
+            yield sock_path, received, responses, thread
+        finally:
+            with contextlib.suppress(OSError):
+                srv.close()
+            thread.join(timeout=2.0)
+            with contextlib.suppress(OSError):
+                sock_path.unlink()
+            with contextlib.suppress(OSError):
+                sock_dir.rmdir()
+
+    def test_happy_path_sends_subcommand_and_payload(self, fake_server, monkeypatch):
+        sock_path, received, _responses, _thread = fake_server
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator.NETCTL_SOCKET_PATH",
+            str(sock_path),
+        )
+        _netctl_send(
+            "wifi-powersave-off",
+            b"",
+            timeout_s=5.0,
+            error_cls=WifiPowerSaveActuationError,
+        )
+        assert received["subcommand"] == "wifi-powersave-off"
+        assert received["payload"] == b""
+
+    def test_payload_is_forwarded_after_subcommand_line(self, fake_server, monkeypatch):
+        sock_path, received, _responses, _thread = fake_server
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator.NETCTL_SOCKET_PATH",
+            str(sock_path),
+        )
+        _netctl_send(
+            "hostapd-write-and-restart",
+            b"channel=11\nssid=test\n",
+            timeout_s=5.0,
+            error_cls=HostapdActuationError,
+        )
+        assert received["subcommand"] == "hostapd-write-and-restart"
+        assert received["payload"] == b"channel=11\nssid=test\n"
+
+    def test_err_response_raises_typed_error(self, fake_server, monkeypatch):
+        sock_path, _received, responses, _thread = fake_server
+        responses["reply"] = b"ERR daemon-side-failure\n"
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator.NETCTL_SOCKET_PATH",
+            str(sock_path),
+        )
+        with pytest.raises(WifiPowerSaveActuationError, match="daemon-side-failure"):
+            _netctl_send(
+                "wifi-powersave-off",
+                b"",
+                timeout_s=5.0,
+                error_cls=WifiPowerSaveActuationError,
+            )
+
+    def test_unexpected_response_raises_typed_error(self, fake_server, monkeypatch):
+        sock_path, _received, responses, _thread = fake_server
+        responses["reply"] = b"NOTOK weird\n"
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator.NETCTL_SOCKET_PATH",
+            str(sock_path),
+        )
+        with pytest.raises(HostapdActuationError, match="unexpected response"):
+            _netctl_send(
+                "hostapd-write-and-restart",
+                b"x",
+                timeout_s=5.0,
+                error_cls=HostapdActuationError,
+            )
+
+    def test_missing_socket_raises_typed_error(self, monkeypatch):
+        """FileNotFoundError on connect is mapped through error_cls.
+
+        Short-prefix tempdir for the same AF_UNIX path-length reason
+        as `fake_server` — even the ABSENT path must fit in sun_path.
+        """
+        sock_dir = Path(tempfile.mkdtemp(prefix="nm-"))
+        missing = sock_dir / "nope"
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator.NETCTL_SOCKET_PATH",
+            str(missing),
+        )
+        try:
+            with pytest.raises(WifiPowerSaveActuationError, match="netctl socket not found"):
+                _netctl_send(
+                    "wifi-powersave-off",
+                    b"",
+                    timeout_s=1.0,
+                    error_cls=WifiPowerSaveActuationError,
+                )
+        finally:
+            with contextlib.suppress(OSError):
+                sock_dir.rmdir()
+
+
+class TestRunNetctlWifiPowersaveOff:
+    """The thin wrapper around _netctl_send for the
+    wifi-powersave-off subcommand. Pins the call shape so the
+    privileged-side ALLOWLIST entry + this wrapper stay in
+    lock-step."""
+
+    def test_passes_subcommand_and_empty_payload(self, monkeypatch):
+        captured = _netctl_wps_ok_recorder(monkeypatch)
+        _run_netctl_wifi_powersave_off()
+        assert len(captured) == 1
+        subcommand, payload = captured[0]
+        assert subcommand == "wifi-powersave-off"
+        assert payload == b""
+
+    def test_raises_wifi_power_save_error_on_failure(self, monkeypatch):
+        def _stub(subcommand, payload, *, timeout_s, error_cls):
+            raise error_cls("simulated daemon failure")
+
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator._netctl_send",
+            _stub,
+        )
+        with pytest.raises(WifiPowerSaveActuationError, match="simulated daemon failure"):
+            _run_netctl_wifi_powersave_off()
+
+
+class TestWifiPowerSaveActuator:
+    """Wraps `_run_netctl_wifi_powersave_off` as a callable so the
+    supervisor's `power_save_actuator` slot accepts it directly."""
+
+    def test_is_callable_no_args(self, monkeypatch):
+        captured = _netctl_wps_ok_recorder(monkeypatch)
+        actuator = WifiPowerSaveActuator()
+        actuator()
+        assert len(captured) == 1
+        assert captured[0][0] == "wifi-powersave-off"
+
+    def test_propagates_netctl_error(self, monkeypatch):
+        def _stub(subcommand, payload, *, timeout_s, error_cls):
+            raise error_cls("netctl wifi-powersave-off: helper rc=1: oops")
+
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator._netctl_send",
+            _stub,
+        )
+        actuator = WifiPowerSaveActuator()
+        with pytest.raises(WifiPowerSaveActuationError, match="helper rc=1"):
+            actuator()
+
+    def test_timeout_s_override_threads_through(self, monkeypatch):
+        captured: list[float] = []
+
+        def _stub(subcommand, payload, *, timeout_s, error_cls):
+            captured.append(timeout_s)
+
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator._netctl_send",
+            _stub,
+        )
+        actuator = WifiPowerSaveActuator(timeout_s=3.5)
+        actuator()
+        assert captured == [3.5]
+
+
+# ============================================================
+# P1.3: the renamed hostapd-actuator log line MUST start with
+# `[network-supervisor]` so QA's grep pattern catches it (spec
+# §Diagnostics smoking-gun divergence).
+# ============================================================
+
+
+def _decision_channel(channel: int) -> ChannelFollowDecision:
+    return ChannelFollowDecision(
+        target_channel=channel,
+        regenerate_needed=True,
+        reason="follow_sta",
+    )
+
+
+def test_hostapd_actuator_emits_supervisor_tagged_log_line(tmp_path, monkeypatch, caplog):
+    """P1.3 spec §Diagnostics: the hostapd-started channel log line
+    MUST match `[network-supervisor]`-prefixed format so any
+    divergence between the STA channel (logged by apply_sta_freq)
+    and the AP channel (logged here) is visible in a single grep."""
+    conf = tmp_path / "hostapd.conf"
+    conf.write_text("interface=ap0\ndriver=nl80211\nchannel=6\nssid=test\n")
+
+    def _stub_netctl(subcommand, payload, *, timeout_s, error_cls):
+        return None
+
+    monkeypatch.setattr(
+        "openmarquee.network_supervisor_actuator._netctl_send",
+        _stub_netctl,
+    )
+
+    def _iw_dispatch(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=b"\tchannel 11 (2462 MHz), width: 20 MHz\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(subprocess, "run", _iw_dispatch)
+    actuator = HostapdChannelActuator(hostapd_conf_path=conf)
+    with caplog.at_level("INFO", logger="openmarquee.network_supervisor_actuator"):
+        actuator(_decision_channel(11))
+
+    matched = [rec.getMessage() for rec in caplog.records if "hostapd-started" in rec.getMessage()]
+    assert len(matched) == 1, f"expected one hostapd-started line, got: {matched}"
+    line = matched[0]
+    assert line.startswith("[network-supervisor]"), line
+    assert "source=channel_follow" in line
+    assert "channel=11" in line
+    assert "iface=ap0" in line
+    assert "verified=true" in line

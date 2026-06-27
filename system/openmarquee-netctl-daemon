@@ -56,6 +56,11 @@ ALLOWLIST = frozenset(
         "wpa-enable-wlan0",
         "wpa-stop-wlan0",
         "hostapd-write-and-restart",
+        # P1.3 (2026-06-27): supervisor re-fires the boot-oneshot
+        # power-save-off logic on every STA reassociation. Spec
+        # §A#2: brcmfmac resets power_save on reassoc, so the boot
+        # one-shot alone is insufficient.
+        "wifi-powersave-off",
     }
 )
 

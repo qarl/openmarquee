@@ -71,6 +71,89 @@ def parse_iw_freq_mhz(iw_output: str) -> int | None:
         return None
 
 
+def parse_iw_list_valid_combinations(iw_list_output: str) -> str | None:
+    """P1.3 (2026-06-27) extract the `valid interface combinations:`
+    block from `iw list` output. Spec §Diagnostics:
+    "should show `#{ managed } <= 1, #{ AP } <= 1` (combined). If a
+    firmware update changed this, everything above is moot."
+
+    Canonical block (one or more indented lines beginning with `* `):
+
+        valid interface combinations:
+                 * #{ managed } <= 1, #{ AP } <= 1, ...,
+                   total <= 4, #channels <= 1
+
+    Returns the joined block (stripped of trailing whitespace per
+    line, joined with spaces so the journal line is one-row) or
+    None if the section is absent.
+
+    Pure function; testable without `iw`.
+    """
+    lines = iw_list_output.splitlines()
+    header_idx: int | None = None
+    for i, line in enumerate(lines):
+        if "valid interface combinations:" in line:
+            header_idx = i
+            break
+    if header_idx is None:
+        return None
+    # Capture indented continuation lines until we hit a line whose
+    # leading indent is shallower than the first continuation line.
+    body: list[str] = []
+    first_indent: int | None = None
+    for line in lines[header_idx + 1 :]:
+        if not line.strip():
+            # Blank lines inside the block are tolerated by iw's
+            # formatter but rare; treat them as terminators if we
+            # haven't captured anything yet, otherwise end the block.
+            if body:
+                break
+            continue
+        stripped = line.lstrip()
+        indent = len(line) - len(stripped)
+        if first_indent is None:
+            first_indent = indent
+        elif indent < first_indent:
+            break
+        body.append(stripped)
+    if not body:
+        return None
+    return " ".join(body)
+
+
+async def poll_iw_list_combos() -> str | None:
+    """Best-effort: shell out to `iw list`, parse the valid-
+    combinations block. Cross-platform: FileNotFoundError on Mac
+    dev returns None.
+
+    Note: `iw list` is heavy (PHY enumeration on every call) but
+    we only run it ONCE at supervisor-loop startup so the cost is
+    fine.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "iw",
+            "list",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except TimeoutError:
+            log.debug("network-supervisor: iw list timed out")
+            with contextlib.suppress(Exception):
+                proc.kill()
+            return None
+        if proc.returncode != 0:
+            return None
+        return parse_iw_list_valid_combinations(stdout.decode("utf-8", errors="replace"))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        log.debug("network-supervisor: iw list failed", exc_info=True)
+        return None
+
+
 async def poll_sta_freq_mhz() -> int | None:
     """Best-effort: shell out to `iw dev wlan0 info`, parse the freq
     field, return MHz or None. Cross-platform: FileNotFoundError on
@@ -140,6 +223,26 @@ async def supervisor_observe_loop(
         wpa_poll_interval_s,
         sta_freq_poll_interval_s,
     )
+
+    # P1.3 (2026-06-27) one-shot boot-time diagnostic: dump the
+    # firmware's valid interface combinations so a regression in
+    # `#{ managed } <= 1, #{ AP } <= 1` is visible in the journal
+    # the moment the supervisor wakes up. Spec §Diagnostics: "If
+    # a firmware update changed this, everything above is moot."
+    combos = await poll_iw_list_combos()
+    if combos is not None:
+        supervisor.diagnostics.push("hostapd", "info", f"iw_list_combos={combos}")
+        log.info(
+            "[network-supervisor] source=hostapd severity=info message=iw_list_combos %s",
+            combos,
+        )
+    else:
+        supervisor.diagnostics.push(
+            "hostapd",
+            "info",
+            "iw_list_combos=unavailable (iw missing or returned no combos)",
+        )
+
     try:
         while True:
             now = loop.time()
