@@ -25,6 +25,16 @@ design (proximity PIN via QR is the auth model — see spec §"The
 display is the onboarding UI"). A future PR may scope these to the
 ap0 interface only; for now the allowlist matches the existing
 welcome/login carve-outs.
+
+QA cross-lane review (PR2 BLOCKER B1) — 422 responses on this
+unauth surface MUST NOT echo the submitted password. FastAPI's
+default RequestValidationError handler embeds `input` verbatim;
+pydantic's `str(ValidationError)` embeds `input_value`. We register
+a route-specific exception handler at the app level (see
+`app.py`'s onboarding_validation_exception_handler) that strips
+input fields for any 422 hitting the onboarding prefix, and the
+manual model-validate path here raises a fixed-string detail (no
+input echo).
 """
 
 from __future__ import annotations
@@ -36,7 +46,7 @@ from pydantic import BaseModel, Field
 
 from openmarquee import wifi_station
 from openmarquee.dependencies import get_network_supervisor, get_settings_storage
-from openmarquee.network_supervisor import NetworkSupervisor, SupervisorEvent
+from openmarquee.network_supervisor import NetworkSupervisor, SupervisorEvent, SupervisorState
 from openmarquee.settings import SettingsStorage
 
 router = APIRouter(prefix="/api/onboarding", tags=["onboarding"])
@@ -99,6 +109,28 @@ async def submit_credentials(
     POST first with a 'connecting' page that polls a status
     endpoint, then kick off association."
     """
+    # QA cross-lane review (PR2 NIT N2): reject submit-credentials
+    # outside the states where the captive portal is the legitimate
+    # surface. SETUP and DEGRADED are the only states where the AP
+    # is up + the user is plausibly on the portal interface. LINGER
+    # and ONLINE imply the device is on home wifi; an unauth
+    # submit-credentials there comes from a LAN attacker, not the
+    # portal, and accepting it lets anyone on the home network
+    # overwrite wifi creds + kick a reassoc. Proper fix is
+    # interface-scoping to ap0 (follow-up PR); this state-gate is
+    # the interim defense.
+    if supervisor.current_state not in (
+        SupervisorState.SETUP,
+        SupervisorState.DEGRADED,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "onboarding submit-credentials only valid in SETUP or "
+                "DEGRADED state; current state forbids it"
+            ),
+        )
+
     settings = storage.load()
     updated = settings.model_copy(
         update={
@@ -109,11 +141,20 @@ async def submit_credentials(
     )
     try:
         # The settings model's own validators run here (ssid /
-        # password format checks). Re-raise as HTTP 422 if
-        # anything trips.
+        # password format checks). Re-raise as HTTP 422 with a
+        # FIXED-STRING detail — QA cross-lane review BLOCKER B1:
+        # `str(pydantic.ValidationError)` embeds `input_value` which
+        # on this unauth surface would echo the submitted password.
+        # The body's own field validators ran before this (FastAPI
+        # request-model validation), so the only validators that
+        # can trip here are cross-field validators on SystemSettings
+        # — and those don't reference the password.
         updated.model_validate(updated.model_dump())
     except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+        raise HTTPException(
+            status_code=422,
+            detail="onboarding submit-credentials failed settings validation",
+        ) from e
     storage.save(updated)
 
     # Kick the nmcli apply in a background thread (matches the

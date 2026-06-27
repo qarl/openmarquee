@@ -164,6 +164,106 @@ def test_status_does_not_leak_wifi_station_detail(client: TestClient):
     assert "wifi_station_detail" not in body
 
 
+# ============================================================
+# QA cross-lane review (PR2 BLOCKER B1): the unauth POST surface
+# MUST NOT echo the submitted password in 422 response bodies.
+# ============================================================
+
+
+def test_submit_credentials_422_does_not_echo_password(client: TestClient):
+    """QA cross-lane review (PR2 BLOCKER B1): the submitted password
+    MUST NOT appear anywhere in the 422 response body. We trigger an
+    ssid-side validation failure (so the request body still contains
+    a unique canary password) and assert the canary is absent from
+    the response.
+    """
+    canary = "leak-canary-zzqqww-abc-7331-unique"
+    response = client.post(
+        "/api/onboarding/submit-credentials",
+        json={"ssid": "x" * 33, "password": canary},  # ssid too long
+    )
+    assert response.status_code == 422, response.text
+    assert canary not in response.text, (
+        "422 must not echo the submitted password (got body: " + response.text + ")"
+    )
+
+
+def test_submit_credentials_422_keeps_useful_field_info(client: TestClient):
+    """Defensive 422 sanitisation must still tell the portal WHICH
+    field tripped + WHAT was wrong — just not echo the value."""
+    response = client.post(
+        "/api/onboarding/submit-credentials",
+        json={"ssid": "", "password": "open-sesame"},
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert "detail" in body
+    # The error MUST identify the field by name so the portal can
+    # highlight it.
+    errs = body["detail"]
+    assert any("ssid" in str(err.get("loc", "")) for err in errs)
+    assert any(err.get("msg") for err in errs)
+
+
+# ============================================================
+# QA cross-lane review (PR2 NIT N2): state-gate submit-credentials
+# so LAN-side unauth attackers cannot overwrite credentials once
+# the device is online.
+# ============================================================
+
+
+def test_submit_credentials_rejected_in_online_state(client: TestClient):
+    """ONLINE means the AP is torn down — the legitimate portal
+    surface no longer exists. Any unauth POST from the home LAN is
+    not the portal user; reject it."""
+    from openmarquee.dependencies import get_network_supervisor
+    from openmarquee.network_supervisor import SupervisorEvent
+
+    sup = get_network_supervisor()
+    sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+    sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+    sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+    response = client.post(
+        "/api/onboarding/submit-credentials",
+        json={"ssid": "leak-rig", "password": "evil-pass-1234"},
+    )
+    assert response.status_code == 409
+
+
+def test_submit_credentials_rejected_in_linger_state(client: TestClient):
+    """LINGER also implies STA is up + the device is reachable on
+    home wifi. Reject unauth submit-credentials here per QA N2."""
+    from openmarquee.dependencies import get_network_supervisor
+    from openmarquee.network_supervisor import SupervisorEvent
+
+    sup = get_network_supervisor()
+    sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+    sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+    response = client.post(
+        "/api/onboarding/submit-credentials",
+        json={"ssid": "leak-rig", "password": "evil-pass-1234"},
+    )
+    assert response.status_code == 409
+
+
+def test_submit_credentials_accepted_in_degraded_state(client: TestClient):
+    """DEGRADED brings the AP back up (recovery path) — the
+    legitimate portal user is back. Accept it."""
+    from openmarquee.dependencies import get_network_supervisor
+    from openmarquee.network_supervisor import SupervisorEvent
+
+    sup = get_network_supervisor()
+    sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+    sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+    sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)
+    sup.apply_event(SupervisorEvent.STA_DISCONNECTED)  # → DEGRADED
+    response = client.post(
+        "/api/onboarding/submit-credentials",
+        json={"ssid": "home-wifi", "password": "open-sesame"},
+    )
+    assert response.status_code == 200
+
+
 def test_status_is_unauth(client: TestClient):
     response = client.get("/api/onboarding/status")
     assert response.status_code != 401

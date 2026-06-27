@@ -457,7 +457,7 @@ app.add_middleware(BodyCapMiddleware)
 
 @app.exception_handler(RequestValidationError)
 async def _request_validation_handler(
-    _request: Request, exc: RequestValidationError
+    request: Request, exc: RequestValidationError
 ) -> JSONResponse:
     """Override FastAPI's default 422 handler to drop the echoed input.
 
@@ -477,8 +477,22 @@ async def _request_validation_handler(
     through `jsonable_encoder` for the same JSON-safety guarantees
     the default handler gives (UUIDs in `input` paths, exceptions in
     `ctx`).
+
+    QA cross-lane review PR2 BLOCKER B1 (2026-06-27): for the unauth
+    captive-portal onboarding routes, even the field-by-field 422
+    shape is too rich — pydantic's `ctx` carries validator
+    parameters that aren't sensitive today but could regress, and
+    on an unauth surface that posts a password we want defense-in-
+    depth. Return ONLY (type, loc, msg) for /api/onboarding/* with
+    `input` + `ctx` + `url` stripped; no encoder pass on the input
+    means there's nowhere for the password to land.
     """
-    sanitised = [{k: v for k, v in err.items() if k != "input"} for err in exc.errors()]
+    is_onboarding = request.url.path.startswith("/api/onboarding/")
+    if is_onboarding:
+        kept = ("type", "loc", "msg")
+        sanitised = [{k: err[k] for k in kept if k in err} for err in exc.errors()]
+    else:
+        sanitised = [{k: v for k, v in err.items() if k != "input"} for err in exc.errors()]
     return JSONResponse(
         status_code=422,
         content={"detail": jsonable_encoder(sanitised)},

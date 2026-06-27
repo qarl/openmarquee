@@ -772,6 +772,22 @@ class TestApLifecycleTransitions:
         sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → ONLINE (mutex)
         assert actuator.calls == ["stop"]
 
+    def test_setup_to_online_does_not_fire_teardown(self, tmp_path: Path):
+        """QA cross-lane review (PR2 NIT N1): SETUP_MODE_TIMER_EXPIRED
+        edge (SETUP -> ONLINE) is currently unwired but WILL be wired
+        in a follow-up PR. When it fires, STA is NOT associated — the
+        AP must NOT be torn down or the user is stranded. Lock the
+        contract NOW so the future timer wiring is safe by
+        construction.
+        """
+        actuator = _RecordingApActuator()
+        sup = self._make(tmp_path, actuator=actuator)
+        assert sup.current_state == SupervisorState.SETUP
+        sup.apply_event(SupervisorEvent.SETUP_MODE_TIMER_EXPIRED)
+        assert sup.current_state == SupervisorState.ONLINE
+        # No teardown — STA was not associated.
+        assert actuator.calls == []
+
     def test_stop_actuator_failure_warn_diag_and_state_advances(self, tmp_path: Path):
         """A netctl outage must NOT wedge the state machine. The
         supervisor catches the failure + emits a warn diagnostic

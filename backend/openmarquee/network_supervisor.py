@@ -1148,8 +1148,24 @@ class NetworkSupervisor:
         diagnostic; the state machine never wedges on a netctl
         outage.
         """
-        # AP lifecycle.
-        if new == SupervisorState.ONLINE and prev != SupervisorState.ONLINE:
+        # AP lifecycle. QA cross-lane review (PR2 NIT N1): the
+        # entering-ONLINE branch must be gated on STA actually being
+        # associated, otherwise the unwired SETUP_MODE_TIMER_EXPIRED
+        # edge (SETUP -> ONLINE) would tear down the AP without an
+        # STA association = user stranded. The two edges where STA
+        # is definitely up are LINGER->ONLINE (concurrent regime,
+        # STA just associated + grace expired) and CONNECTING/
+        # DEGRADED->ONLINE in the mutex regime (STA just
+        # associated). SETUP->ONLINE is the explicit non-STA edge —
+        # the auto-off timer brings the user back from manual setup
+        # mode but the radio hasn't reassociated; the supervisor
+        # must NOT tear down the AP.
+        sta_up_into_online = new == SupervisorState.ONLINE and prev in (
+            SupervisorState.LINGER,
+            SupervisorState.CONNECTING,
+            SupervisorState.DEGRADED,
+        )
+        if sta_up_into_online:
             self._fire_ap_teardown(prev=prev)
         elif prev == SupervisorState.ONLINE and new != SupervisorState.ONLINE:
             self._fire_ap_reup(new=new)
