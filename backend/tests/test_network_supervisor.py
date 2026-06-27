@@ -553,3 +553,136 @@ class TestNetworkSupervisor:
         assert d["fallback_mutex_mode"] is False
         assert "diagnostics" in d
         assert isinstance(d["diagnostics"], list)
+
+
+# ============================================================
+# P1.3 (2026-06-27) STA_ASSOCIATED -> power_save_actuator re-fire
+# ============================================================
+
+
+class TestPowerSaveRefireOnAssoc:
+    """The supervisor fires the configured power_save_actuator on
+    every STA_ASSOCIATED event (spec §A#2 — brcmfmac resets
+    power_save on reassociation, so the boot one-shot alone is
+    insufficient).
+    """
+
+    def _make(self, tmp_path: Path, *, actuator):
+        config = SupervisorConfig(
+            state_file=tmp_path / "network-state.json",
+        )
+        return NetworkSupervisor(
+            config=config,
+            power_save_actuator=actuator,
+        )
+
+    def test_sta_associated_fires_actuator(self, tmp_path: Path):
+        calls = []
+
+        def _fake():
+            calls.append(1)
+
+        sup = self._make(tmp_path, actuator=_fake)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        assert calls == [1]
+        # A second STA_ASSOCIATED event (router-side reassoc while in
+        # LINGER) MUST re-fire the actuator even though the state
+        # machine has no transition for (LINGER, STA_ASSOCIATED).
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        assert calls == [1, 1]
+
+    def test_non_assoc_events_do_not_fire_actuator(self, tmp_path: Path):
+        calls = []
+
+        def _fake():
+            calls.append(1)
+
+        sup = self._make(tmp_path, actuator=_fake)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_AUTH_FAILED)
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)
+        sup.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
+        sup.apply_event(SupervisorEvent.STA_DISCONNECTED)
+        assert calls == []
+
+    def test_actuator_exception_emits_warn_diag_does_not_wedge(self, tmp_path: Path):
+        def _boom():
+            raise RuntimeError("netctl socket not found")
+
+        sup = self._make(tmp_path, actuator=_boom)
+        # Transition still happens despite actuator failure.
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        assert sup.current_state == SupervisorState.LINGER
+        warn = [
+            e
+            for e in sup.snapshot_diagnostics()
+            if e.severity == "warn"
+            and e.source == "power_save"
+            and "actuator failed on STA_ASSOCIATED" in e.message
+        ]
+        assert len(warn) == 1, f"expected one warn diag, got: {warn}"
+
+    def test_observe_only_default_emits_would_fire_diag(self, tmp_path: Path):
+        """When no power_save_actuator is passed, the default stub
+        emits an info-level 'would re-fire' line so QA can confirm
+        the supervisor IS handling STA_ASSOCIATED on hosts without
+        the netctl socket."""
+        config = SupervisorConfig(state_file=tmp_path / "network-state.json")
+        sup = NetworkSupervisor(config=config)  # no actuator → default stub
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        info_would = [
+            e
+            for e in sup.snapshot_diagnostics()
+            if e.severity == "info" and e.source == "power_save" and "would re-fire" in e.message
+        ]
+        assert len(info_would) == 1
+
+    def test_set_power_save_actuator_swaps_at_runtime(self, tmp_path: Path):
+        """Mirror of set_channel_follow_actuator: dependencies.py +
+        the take-over orchestrator can hot-swap the actuator after
+        the supervisor is already running."""
+        calls = []
+
+        def _first():
+            calls.append("a")
+
+        def _second():
+            calls.append("b")
+
+        config = SupervisorConfig(state_file=tmp_path / "network-state.json")
+        sup = NetworkSupervisor(config=config, power_save_actuator=_first)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        assert calls == ["a"]
+        sup.set_power_save_actuator(_second)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        assert calls == ["a", "b"]
+
+    def test_power_save_fire_log_line_has_supervisor_prefix(self, tmp_path: Path, caplog):
+        """Sacred-review NIT #5: QA's grep convention
+        `grep '\\[network-supervisor\\]'` MUST also catch the
+        power-save fire line. The supervisor's _emit emits that
+        prefix for every diagnostic — pin it on this code path so a
+        future refactor that bypasses _emit fails loudly.
+        """
+
+        def _ok():
+            return None
+
+        sup = self._make(tmp_path, actuator=_ok)
+        with caplog.at_level("INFO", logger="openmarquee.network_supervisor"):
+            sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+            sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        fire_lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "actuator fired on STA_ASSOCIATED" in r.getMessage()
+        ]
+        assert len(fire_lines) == 1, f"expected one fire line, got: {fire_lines}"
+        line = fire_lines[0]
+        assert line.startswith("[network-supervisor]"), line
+        assert "source=power_save" in line
+        assert "severity=info" in line

@@ -673,10 +673,17 @@ class NetworkSupervisor:
         *,
         diagnostics: DiagnosticsRingBuffer | None = None,
         channel_follow_actuator: Callable[[ChannelFollowDecision], None] | None = None,
+        power_save_actuator: Callable[[], None] | None = None,
     ):
         self.config = config
         self.diagnostics = diagnostics or DiagnosticsRingBuffer()
         self._channel_follow_actuator = channel_follow_actuator or self._default_actuator
+        # P1.3 (2026-06-27): STA_ASSOCIATED re-fires the boot-oneshot
+        # power-save-off. Default actuator is observe-only (log line);
+        # dependencies.py wires the active netctl-driven actuator
+        # when a netctl socket is present. Spec §A#2:
+        # "[power_save] can be reset by reassociation."
+        self._power_save_actuator = power_save_actuator or self._default_power_save_actuator
         # State: start from on-disk OR default SETUP.
         persisted = load_persisted_state(config.state_file)
         if persisted is not None:
@@ -794,6 +801,28 @@ class NetworkSupervisor:
             f"actuator replaced (class={actuator.__class__.__name__})",
         )
 
+    def set_power_save_actuator(
+        self,
+        actuator: Callable[[], None],
+    ) -> None:
+        """Replace the power-save-off actuator at runtime. P1.3
+        (2026-06-27) uses this so dependencies.py can wire the
+        netctl-driven actuator only on hosts where the daemon
+        socket is present; tests + dev hosts without the daemon
+        keep the observe-only stub.
+
+        The new actuator takes effect on the NEXT STA_ASSOCIATED
+        event. Contract: actuators MUST return normally on success
+        and raise on failure; the supervisor catches the exception
+        and emits a warn diagnostic.
+        """
+        self._power_save_actuator = actuator
+        self._emit(
+            "power_save",
+            "info",
+            f"actuator replaced (class={actuator.__class__.__name__})",
+        )
+
     def mark_rollback_fired(self) -> None:
         """Called by the orchestrator's rollback() — records that a
         rollback just fired so the cooldown check at evaluate_
@@ -844,6 +873,15 @@ class NetworkSupervisor:
         Returns the (possibly unchanged) current state. Unrecognised
         (state, event) pairs are logged + ignored.
         """
+        # P1.3 (2026-06-27): fire the power-save-off re-fire BEFORE
+        # the state-machine transition so it runs on EVERY
+        # STA_ASSOCIATED event regardless of whether the transition
+        # itself defines a (state, event) edge. brcmfmac resets
+        # power_save on every reassociation; the supervisor's
+        # responsibility is to put it back, not to be opinionated
+        # about which states the spec considers "fresh."
+        if event == SupervisorEvent.STA_ASSOCIATED:
+            self._fire_power_save_on_assoc()
         new_state = next_state(self._state, event, fallback_mutex=self.config.fallback_mutex_mode)
         if new_state is None:
             self._emit(
@@ -978,6 +1016,42 @@ class NetworkSupervisor:
             f"channel={decision.target_channel} + restart hostapd "
             f"(reason={decision.reason})",
         )
+
+    def _default_power_save_actuator(self) -> None:
+        """Default power-save-off actuator: log only. dependencies.py
+        wires the netctl-driven actuator on hosts where the daemon
+        socket is present; tests + Mac dev keep this stub. The
+        observe-only line lets QA confirm the supervisor IS handling
+        STA_ASSOCIATED events even in non-production environments.
+        """
+        self._emit(
+            "power_save",
+            "info",
+            "actuator (observe-only): would re-fire openmarquee-wifi-powersave-off.sh on wlan0+ap0",
+        )
+
+    def _fire_power_save_on_assoc(self) -> None:
+        """P1.3 (2026-06-27) STA_ASSOCIATED -> re-fire power-save-off.
+        Caller is apply_event; failures of the actuator are caught +
+        downgraded to a warn diagnostic so a netctl outage never
+        wedges the state-machine transition path.
+        """
+        try:
+            self._power_save_actuator()
+        except Exception as e:  # noqa: BLE001 — defensive: never wedge apply_event
+            self._emit(
+                "power_save",
+                "warn",
+                f"actuator failed on STA_ASSOCIATED: {e!r}; "
+                "boot-oneshot setting remains in effect until next reassoc",
+            )
+        else:
+            self._emit(
+                "power_save",
+                "info",
+                "actuator fired on STA_ASSOCIATED (spec §A#2: brcmfmac "
+                "resets power_save on reassoc)",
+            )
 
     def _persist(self) -> None:
         try:

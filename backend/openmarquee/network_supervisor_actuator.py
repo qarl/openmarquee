@@ -57,6 +57,74 @@ class HostapdActuationError(RuntimeError):
     current_ap_channel"; the next poll retries."""
 
 
+class WifiPowerSaveActuationError(RuntimeError):
+    """Raised when the supervisor's STA_ASSOCIATED-driven
+    re-fire of openmarquee-wifi-powersave-off.sh fails. Caller
+    (the supervisor's apply_event) emits a diagnostic warn line
+    and continues; the next reassociation will retry."""
+
+
+def _netctl_send(
+    subcommand: str,
+    payload: bytes,
+    *,
+    timeout_s: float,
+    error_cls: type[RuntimeError],
+) -> None:
+    """Privilege-boundary invocation via the socket-activated root
+    daemon (P1.2-B.2). Shared core for every netctl call: pipes
+    `<subcommand>\\n<payload>` into the daemon and asserts a
+    single-line OK response.
+
+    Parametric on `error_cls` so each caller raises its own typed
+    exception (HostapdActuationError, WifiPowerSaveActuationError,
+    ...) without sharing a parent. Tests monkeypatch _netctl_send
+    once and exercise both call sites.
+    """
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.settimeout(timeout_s)
+    try:
+        try:
+            sock.connect(NETCTL_SOCKET_PATH)
+        except FileNotFoundError as e:
+            raise error_cls(f"netctl socket not found at {NETCTL_SOCKET_PATH}: {e}") from e
+        except OSError as e:
+            raise error_cls(f"netctl socket connect failed: {e}") from e
+        try:
+            sock.sendall(subcommand.encode("ascii") + b"\n")
+            if payload:
+                sock.sendall(payload)
+            sock.shutdown(_socket.SHUT_WR)
+        except OSError as e:
+            raise error_cls(f"netctl {subcommand}: send failed ({e})") from e
+        chunks: list[bytes] = []
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if sum(len(c) for c in chunks) > 8192:
+                    break
+        except TimeoutError as e:
+            raise error_cls(
+                f"netctl {subcommand}: response timed out after {timeout_s:.0f}s"
+            ) from e
+        except OSError as e:
+            raise error_cls(f"netctl {subcommand}: recv failed ({e})") from e
+        response = b"".join(chunks).decode("utf-8", errors="replace").rstrip("\n")
+        if response == "OK":
+            return
+        if response.startswith("ERR "):
+            raise error_cls(f"netctl {subcommand}: {response[4:]}")
+        if not response:
+            raise error_cls(f"netctl {subcommand}: empty response (daemon closed before reply?)")
+        raise error_cls(f"netctl {subcommand}: unexpected response {response!r}")
+    finally:
+        with contextlib.suppress(Exception):
+            sock.close()
+
+
 def _substitute_channel(conf_text: str, target_channel: int) -> str:
     """Pure substitution: replace the `channel=<N>` line in a hostapd
     config with `channel=<target_channel>`. If no `channel=` line is
@@ -97,74 +165,44 @@ def _run_netctl_hostapd_write_and_restart(
     *,
     timeout_s: float = NETCTL_TIMEOUT_S,
 ) -> None:
-    """P1.2-B.2: privilege-boundary invocation via the
-    socket-activated root daemon. QA verified that sudo cannot
-    function under NoNewPrivileges=true on the backend service;
-    the Unix-socket transport sidesteps that — the daemon runs as
-    root via a systemd template service, the backend just speaks
-    the protocol.
+    """P1.2-B.2 hostapd-write-and-restart wrapper. Delegates to
+    `_netctl_send` for the socket protocol; raises
+    HostapdActuationError on any failure.
 
     Sync (blocking) to match the actuator's blocking semantics
     inside the supervisor's sync apply_sta_freq. The actuator
     fires only on STA frequency CHANGE (boot association + rare
     router CSA) so ~5s of blocking once per change is acceptable.
-
-    Raises HostapdActuationError on any failure (connect, timeout,
-    non-OK response from daemon).
     """
-    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-    sock.settimeout(timeout_s)
-    try:
-        try:
-            sock.connect(NETCTL_SOCKET_PATH)
-        except FileNotFoundError as e:
-            raise HostapdActuationError(
-                f"netctl socket not found at {NETCTL_SOCKET_PATH}: {e}"
-            ) from e
-        except OSError as e:
-            raise HostapdActuationError(f"netctl socket connect failed: {e}") from e
-        try:
-            sock.sendall(b"hostapd-write-and-restart\n")
-            sock.sendall(new_conf.encode("utf-8"))
-            sock.shutdown(_socket.SHUT_WR)
-        except OSError as e:
-            raise HostapdActuationError(
-                f"netctl hostapd-write-and-restart: send failed ({e})"
-            ) from e
-        # Read until daemon closes its end.
-        chunks: list[bytes] = []
-        try:
-            while True:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                # Cap response so a chatty daemon can't blow memory.
-                if sum(len(c) for c in chunks) > 8192:
-                    break
-        except TimeoutError as e:
-            raise HostapdActuationError(
-                f"netctl hostapd-write-and-restart: response timed out after {timeout_s:.0f}s"
-            ) from e
-        except OSError as e:
-            raise HostapdActuationError(
-                f"netctl hostapd-write-and-restart: recv failed ({e})"
-            ) from e
-        response = b"".join(chunks).decode("utf-8", errors="replace").rstrip("\n")
-        if response == "OK":
-            return
-        if response.startswith("ERR "):
-            raise HostapdActuationError(f"netctl hostapd-write-and-restart: {response[4:]}")
-        if not response:
-            raise HostapdActuationError(
-                "netctl hostapd-write-and-restart: empty response (daemon closed before reply?)"
-            )
-        raise HostapdActuationError(
-            f"netctl hostapd-write-and-restart: unexpected response {response!r}"
-        )
-    finally:
-        with contextlib.suppress(Exception):
-            sock.close()
+    _netctl_send(
+        "hostapd-write-and-restart",
+        new_conf.encode("utf-8"),
+        timeout_s=timeout_s,
+        error_cls=HostapdActuationError,
+    )
+
+
+def _run_netctl_wifi_powersave_off(
+    *,
+    timeout_s: float = NETCTL_TIMEOUT_S,
+) -> None:
+    """P1.3 (2026-06-27) re-fire the boot-oneshot's power-save-off
+    logic on every STA reassociation. brcmfmac resets power_save on
+    reassoc per spec §A#2; the supervisor wires this into its
+    STA_ASSOCIATED handler. The netctl daemon runs the existing
+    /opt/openmarquee/system/openmarquee-wifi-powersave-off.sh
+    verbatim so iface coverage + logger tag stay in lock-step with
+    the boot oneshot.
+
+    Raises WifiPowerSaveActuationError on any failure; the caller
+    (supervisor.apply_event) emits a warn diagnostic and continues.
+    """
+    _netctl_send(
+        "wifi-powersave-off",
+        b"",
+        timeout_s=timeout_s,
+        error_cls=WifiPowerSaveActuationError,
+    )
 
 
 def _iw_dev_info(iface: str, *, timeout_s: float = IW_VERIFY_TIMEOUT_S) -> str:
@@ -249,8 +287,45 @@ class HostapdChannelActuator:
                 f"{decision.target_channel} actual={actual_channel}; "
                 "hostapd restarted but radio not on target channel"
             )
+        # P1.3 (2026-06-27): named "hostapd-started" log line in the
+        # spec's smoking-gun format. QA's grep pattern
+        # `journalctl -u openmarquee-backend | grep
+        # '\[network-supervisor\]'` now surfaces both STA-channel and
+        # AP-channel lines in the same stream; any divergence between
+        # the channel reported here and the STA channel logged by the
+        # supervisor's apply_sta_freq IS the channel mismatch the
+        # spec §Diagnostics calls out.
         log.info(
-            "hostapd-actuator: channel=%d verified on %s",
+            "[network-supervisor] source=channel_follow severity=info "
+            "message=hostapd-started channel=%d iface=%s verified=true",
             decision.target_channel,
             self.ap_iface,
         )
+
+
+class WifiPowerSaveActuator:
+    """P1.3 (2026-06-27) STA-reassociation power-save-off actuator.
+
+    The boot service openmarquee-wifi-powersave-off.service sets
+    `iw dev wlan0 set power_save off` at boot. brcmfmac resets the
+    setting on every reassociation (spec §A#2 — "It can be reset
+    by reassociation. Make this a boot-time service, not a
+    one-off."), so the supervisor wires a callable here onto its
+    STA_ASSOCIATED handler.
+
+    Default-active (unlike HostapdChannelActuator which is gated on
+    take-over). Rationale: power_save=off is idempotent + non-
+    destructive + the boot oneshot already enforces it on the same
+    box, so re-firing on reassoc doesn't fight anything. Falls back
+    silently if the netctl socket isn't present (e.g. dev hosts
+    without the daemon installed).
+
+    Instance is callable so it slots directly into the supervisor's
+    `power_save_actuator: Callable[[], None]` contract.
+    """
+
+    def __init__(self, *, timeout_s: float = NETCTL_TIMEOUT_S):
+        self.timeout_s = timeout_s
+
+    def __call__(self) -> None:
+        _run_netctl_wifi_powersave_off(timeout_s=self.timeout_s)

@@ -31,6 +31,8 @@ from openmarquee.network_supervisor_loop import (
     WPA_POLL_INTERVAL_S,
     _iw_binary_present,
     parse_iw_freq_mhz,
+    parse_iw_list_valid_combinations,
+    poll_iw_list_combos,
     supervisor_observe_loop,
 )
 
@@ -280,3 +282,232 @@ def test_intervals_are_sensible_defaults():
 def test_iw_binary_present_returns_bool():
     # Doesn't matter which value; the function must not raise.
     assert isinstance(_iw_binary_present(), bool)
+
+
+# ============================================================
+# P1.3 (2026-06-27) parse_iw_list_valid_combinations — pure parser
+# tests on canonical brcmfmac output + missing-section + multi-line.
+# ============================================================
+
+
+_BCM43438_IW_LIST_CANONICAL = """\
+Wiphy phy0
+\tmax # scan SSIDs: 10
+\tRetry short long limit: 7
+\tCoverage class: 0 (up to 0m)
+\tDevice supports RSN-IBSS.
+\tDevice supports AP-side u-APSD.
+\tSupported Ciphers:
+\t\t* WEP40 (00-0f-ac:1)
+\tAvailable Antennas: TX 0 RX 0
+\tSupported interface modes:
+\t\t * IBSS
+\t\t * managed
+\t\t * AP
+\t\t * P2P-client
+\t\t * P2P-GO
+\tBand 1:
+\t\tCapabilities: 0x107e
+\tsoftware interface modes (can always be added):
+\t\t * AP/VLAN
+\t\t * monitor
+\tvalid interface combinations:
+\t\t * #{ managed } <= 1, #{ AP } <= 1, #{ P2P-client, P2P-GO } <= 1,
+\t\t   total <= 4, #channels <= 1
+\tHT Capability overrides:
+\t\t * MCS: ff ff ff ff ff ff ff ff ff ff
+"""
+
+
+class TestParseIwListValidCombinations:
+    def test_extracts_block_from_canonical_brcmfmac_output(self):
+        result = parse_iw_list_valid_combinations(_BCM43438_IW_LIST_CANONICAL)
+        assert result is not None
+        # The canonical line MUST contain the spec's smoking-gun
+        # caps: managed <= 1 + AP <= 1 (combined).
+        assert "#{ managed } <= 1" in result
+        assert "#{ AP } <= 1" in result
+        assert "total <= 4" in result
+        # The block is joined with spaces (single-row for journal).
+        assert "\n" not in result
+
+    def test_returns_none_when_section_missing(self):
+        out = "Wiphy phy0\n\tmax # scan SSIDs: 10\n\tSupported Ciphers: ...\n"
+        assert parse_iw_list_valid_combinations(out) is None
+
+    def test_returns_none_on_empty_input(self):
+        assert parse_iw_list_valid_combinations("") is None
+
+    def test_stops_at_next_section_dedent(self):
+        """The parser MUST terminate the block when the next section
+        starts at the same indent as the header — otherwise we'd
+        capture HT-capability lines too."""
+        out = (
+            "\tvalid interface combinations:\n"
+            "\t\t * #{ managed } <= 1, #{ AP } <= 1, total <= 4\n"
+            "\tHT Capability overrides:\n"
+            "\t\t * MCS: ff ff ff\n"
+        )
+        result = parse_iw_list_valid_combinations(out)
+        assert result is not None
+        assert "MCS: ff" not in result
+        assert "managed" in result
+
+    def test_handles_single_line_block(self):
+        out = "\tvalid interface combinations:\n\t\t * #{ managed } <= 1, total <= 1\n"
+        result = parse_iw_list_valid_combinations(out)
+        assert result == "* #{ managed } <= 1, total <= 1"
+
+
+# ============================================================
+# poll_iw_list_combos — async subprocess shim
+# ============================================================
+
+
+class TestPollIwListCombos:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_iw_missing(self, monkeypatch):
+        """Mac dev / dev hosts without the iw binary return None
+        without raising."""
+
+        async def _fake_create_subprocess_exec(*args, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", "iw")
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+        result = await poll_iw_list_combos()
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_returns_combos_on_happy_path(self, monkeypatch):
+        async def _fake_create_subprocess_exec(*args, **kwargs):
+            class _P:
+                returncode = 0
+
+                async def communicate(self):
+                    return _BCM43438_IW_LIST_CANONICAL.encode("utf-8"), b""
+
+                def kill(self):
+                    pass
+
+            return _P()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+        result = await poll_iw_list_combos()
+        assert result is not None
+        assert "#{ AP } <= 1" in result
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_iw_returncode_nonzero(self, monkeypatch):
+        async def _fake_create_subprocess_exec(*args, **kwargs):
+            class _P:
+                returncode = 1
+
+                async def communicate(self):
+                    return b"", b"iw: cannot get wiphy info\n"
+
+                def kill(self):
+                    pass
+
+            return _P()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+        result = await poll_iw_list_combos()
+        assert result is None
+
+
+# ============================================================
+# supervisor_observe_loop boot-time iw-list diagnostic emission
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_observe_loop_emits_iw_list_diag_at_start(tmp_path: Path, monkeypatch):
+    """P1.3 spec §Diagnostics: the loop dumps `iw list` valid
+    interface combinations at startup so a firmware-side regression
+    in `#{ managed } <= 1, #{ AP } <= 1` is visible in the journal
+    the moment the supervisor wakes up.
+    """
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        # Differentiate iw list vs iw dev wlan0 info by argv.
+        if args[:2] == ("iw", "list"):
+
+            class _P:
+                returncode = 0
+
+                async def communicate(self):
+                    return _BCM43438_IW_LIST_CANONICAL.encode("utf-8"), b""
+
+                def kill(self):
+                    pass
+
+            return _P()
+
+        # iw dev wlan0 info — return associated-on-channel-11.
+        class _PFreq:
+            returncode = 0
+
+            async def communicate(self):
+                return b"\tchannel 11 (2462 MHz), width: 20 MHz\n", b""
+
+            def kill(self):
+                pass
+
+        return _PFreq()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    # Point wpa_ctrl_path at a guaranteed-missing path so the loop
+    # exercises only the iw-list diagnostic + STA freq path.
+    config = SupervisorConfig(
+        state_file=tmp_path / "network-state.json",
+        wpa_ctrl_path=tmp_path / "absent.sock",
+    )
+    sup = NetworkSupervisor(config=config)
+    task = asyncio.create_task(
+        supervisor_observe_loop(
+            sup,
+            wpa_poll_interval_s=0.005,
+            sta_freq_poll_interval_s=0.02,
+        )
+    )
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    diag = sup.snapshot_diagnostics()
+    iw_list_lines = [e for e in diag if "iw_list_combos" in e.message]
+    assert len(iw_list_lines) >= 1, f"no iw_list_combos line in: {[e.message for e in diag]}"
+    # The captured combos line MUST surface the spec's smoking-gun
+    # caps: managed <= 1 + AP <= 1.
+    line = iw_list_lines[0].message
+    assert "#{ managed } <= 1" in line
+    assert "#{ AP } <= 1" in line
+
+
+@pytest.mark.asyncio
+async def test_observe_loop_emits_unavailable_diag_when_iw_missing(tmp_path: Path, monkeypatch):
+    """On Mac dev (no iw binary) the boot diagnostic still emits a
+    line so QA's journal grep is never silent."""
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "iw")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    config = SupervisorConfig(
+        state_file=tmp_path / "network-state.json",
+        wpa_ctrl_path=tmp_path / "absent.sock",
+    )
+    sup = NetworkSupervisor(config=config)
+    task = asyncio.create_task(
+        supervisor_observe_loop(sup, wpa_poll_interval_s=0.005, sta_freq_poll_interval_s=0.02)
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    diag = sup.snapshot_diagnostics()
+    unavailable = [e for e in diag if "iw_list_combos=unavailable" in e.message]
+    assert len(unavailable) == 1
