@@ -566,3 +566,96 @@ def test_hostapd_actuator_emits_supervisor_tagged_log_line(tmp_path, monkeypatch
     assert "channel=11" in line
     assert "iface=ap0" in line
     assert "verified=true" in line
+
+
+# ============================================================
+# P2 (2026-06-27) HostapdLifecycleActuator
+# ============================================================
+
+
+def _netctl_lifecycle_recorder(monkeypatch) -> list[tuple[str, bytes]]:
+    captured: list[tuple[str, bytes]] = []
+
+    def _stub(subcommand, payload, *, timeout_s, error_cls):
+        captured.append((subcommand, payload))
+
+    monkeypatch.setattr(
+        "openmarquee.network_supervisor_actuator._netctl_send",
+        _stub,
+    )
+    return captured
+
+
+class TestHostapdLifecycleActuator:
+    """The HostapdLifecycleActuator exposes .stop() + .start() that
+    map to the netctl `hostapd-stop` / `hostapd-start` subcommands.
+    The supervisor's _on_transition calls them on entry/exit of
+    ONLINE.
+    """
+
+    def test_stop_sends_hostapd_stop_subcommand(self, monkeypatch):
+        from openmarquee.network_supervisor_actuator import HostapdLifecycleActuator
+
+        captured = _netctl_lifecycle_recorder(monkeypatch)
+        actuator = HostapdLifecycleActuator()
+        actuator.stop()
+        assert captured == [("hostapd-stop", b"")]
+
+    def test_start_sends_hostapd_start_subcommand(self, monkeypatch):
+        from openmarquee.network_supervisor_actuator import HostapdLifecycleActuator
+
+        captured = _netctl_lifecycle_recorder(monkeypatch)
+        actuator = HostapdLifecycleActuator()
+        actuator.start()
+        assert captured == [("hostapd-start", b"")]
+
+    def test_stop_propagates_typed_error(self, monkeypatch):
+        from openmarquee.network_supervisor_actuator import (
+            HostapdLifecycleActuationError,
+            HostapdLifecycleActuator,
+        )
+
+        def _stub(subcommand, payload, *, timeout_s, error_cls):
+            raise error_cls("netctl hostapd-stop: helper rc=1: hostapd unit failed")
+
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator._netctl_send",
+            _stub,
+        )
+        actuator = HostapdLifecycleActuator()
+        with pytest.raises(HostapdLifecycleActuationError, match="hostapd unit failed"):
+            actuator.stop()
+
+    def test_start_propagates_typed_error(self, monkeypatch):
+        from openmarquee.network_supervisor_actuator import (
+            HostapdLifecycleActuationError,
+            HostapdLifecycleActuator,
+        )
+
+        def _stub(subcommand, payload, *, timeout_s, error_cls):
+            raise error_cls("netctl hostapd-start: helper rc=1: no such unit")
+
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator._netctl_send",
+            _stub,
+        )
+        actuator = HostapdLifecycleActuator()
+        with pytest.raises(HostapdLifecycleActuationError, match="no such unit"):
+            actuator.start()
+
+    def test_timeout_threads_through_to_both_calls(self, monkeypatch):
+        from openmarquee.network_supervisor_actuator import HostapdLifecycleActuator
+
+        captured: list[float] = []
+
+        def _stub(subcommand, payload, *, timeout_s, error_cls):
+            captured.append(timeout_s)
+
+        monkeypatch.setattr(
+            "openmarquee.network_supervisor_actuator._netctl_send",
+            _stub,
+        )
+        actuator = HostapdLifecycleActuator(timeout_s=8.0)
+        actuator.stop()
+        actuator.start()
+        assert captured == [8.0, 8.0]

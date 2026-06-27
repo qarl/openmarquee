@@ -674,6 +674,7 @@ class NetworkSupervisor:
         diagnostics: DiagnosticsRingBuffer | None = None,
         channel_follow_actuator: Callable[[ChannelFollowDecision], None] | None = None,
         power_save_actuator: Callable[[], None] | None = None,
+        ap_lifecycle_actuator: object | None = None,
     ):
         self.config = config
         self.diagnostics = diagnostics or DiagnosticsRingBuffer()
@@ -684,6 +685,14 @@ class NetworkSupervisor:
         # when a netctl socket is present. Spec §A#2:
         # "[power_save] can be reset by reassociation."
         self._power_save_actuator = power_save_actuator or self._default_power_save_actuator
+        # P2 (2026-06-27): AP up/down lifecycle. The supervisor's
+        # transition-effect dispatch calls .stop() / .start() on
+        # this object. Default actuator is observe-only (log-only).
+        # dependencies.py wires the netctl-driven HostapdLifecycle-
+        # Actuator on production hosts. Object protocol (not
+        # callable): must expose .stop() -> None and .start() ->
+        # None methods so a single instance handles both directions.
+        self._ap_lifecycle_actuator = ap_lifecycle_actuator or self._default_ap_lifecycle_actuator()
         # State: start from on-disk OR default SETUP.
         persisted = load_persisted_state(config.state_file)
         if persisted is not None:
@@ -700,6 +709,25 @@ class NetworkSupervisor:
             self._rollback_fired_at = None
         self._current_ap_channel: int | None = None
         self._current_sta_freq_mhz: int | None = None
+        # P2 (2026-06-27): LINGER timer. monotonic timestamp set on
+        # entry into LINGER; the observe loop calls
+        # `check_linger_timeout()` each tick + fires
+        # LINGER_TIMER_EXPIRED when (now - entered_at) >=
+        # linger_seconds. Cleared on exit from LINGER.
+        #
+        # Sacred-review BLOCKER fix (PR2): if we resumed from disk
+        # mid-LINGER (crashed/rebooted while in LINGER), seed the
+        # entered-at to NOW so the grace window restarts from boot.
+        # Without this seed, _linger_entered_at stays None and
+        # check_linger_timeout() returns False forever — the
+        # supervisor wedges in LINGER + the AP stays up until an
+        # STA_DISCONNECTED bumps to DEGRADED, contradicting the
+        # spec's "ONLINE is steady state" intent. Re-arming from
+        # NOW is the safest interpretation: a fresh grace window,
+        # not a stale one.
+        self._linger_entered_at: float | None = (
+            time.monotonic() if self._state == SupervisorState.LINGER else None
+        )
         # P1.2-B (2026-06-10): one-shot hook fired on the FIRST
         # STA_ASSOCIATED after the take-over orchestrator installs
         # it. See set_takeover_associated_hook for the wiring
@@ -897,6 +925,11 @@ class NetworkSupervisor:
             "info",
             f"transition {prev.value} -> {new_state.value} on event={event.value}",
         )
+        # P2 (2026-06-27): transition-effect dispatch. Fires AP
+        # up/down + arms/disarms the LINGER timer. Runs BEFORE
+        # _persist so the side-effects either succeed or the warn
+        # diagnostic is already in the ring buffer for QA.
+        self._on_transition(prev, new_state)
         self._persist()
         # P1.2-B: fire the take-over associated hook on the first
         # STA_ASSOCIATED event after a successful flip. One-shot:
@@ -1052,6 +1085,150 @@ class NetworkSupervisor:
                 "actuator fired on STA_ASSOCIATED (spec §A#2: brcmfmac "
                 "resets power_save on reassoc)",
             )
+
+    # --- P2 (2026-06-27) AP lifecycle + LINGER timer ---
+
+    class _DefaultApLifecycleActuator:
+        """Observe-only AP lifecycle actuator. Production hosts
+        get HostapdLifecycleActuator wired via dependencies.py;
+        tests + Mac dev keep this stub so the supervisor doesn't
+        touch hostapd."""
+
+        def __init__(self, supervisor: NetworkSupervisor):
+            self._supervisor = supervisor
+
+        def stop(self) -> None:
+            self._supervisor._emit(  # noqa: SLF001 — paired with the supervisor
+                "ap_lifecycle",
+                "info",
+                "actuator (observe-only): would stop hostapd",
+            )
+
+        def start(self) -> None:
+            self._supervisor._emit(  # noqa: SLF001 — paired with the supervisor
+                "ap_lifecycle",
+                "info",
+                "actuator (observe-only): would start hostapd",
+            )
+
+    def _default_ap_lifecycle_actuator(self) -> object:
+        """Factory: a back-pointed observe-only stub. Needs a method
+        because the inner class closes over `self` to emit
+        diagnostics through the supervisor's ring buffer.
+        """
+        return NetworkSupervisor._DefaultApLifecycleActuator(self)
+
+    def set_ap_lifecycle_actuator(self, actuator: object) -> None:
+        """Replace the AP lifecycle actuator at runtime. Contract:
+        `actuator.stop()` and `actuator.start()` are no-arg methods
+        that return None on success and raise on failure.
+        """
+        self._ap_lifecycle_actuator = actuator
+        self._emit(
+            "ap_lifecycle",
+            "info",
+            f"actuator replaced (class={actuator.__class__.__name__})",
+        )
+
+    def _on_transition(self, prev: SupervisorState, new: SupervisorState) -> None:
+        """P2 (2026-06-27) transition-effect dispatch.
+
+        Spec §"Onboarding state machine": ONLINE is the default
+        steady state with the AP torn down ("the setup network is
+        a temporary door, not a permanent feature"). DEGRADED and
+        SETUP need the AP up for recovery / portal access. So:
+          * Entering ONLINE from non-ONLINE: stop hostapd.
+          * Exiting ONLINE to non-ONLINE: start hostapd.
+
+        Also arm/disarm the LINGER grace-window timer. The observe
+        loop polls check_linger_timeout() each tick to fire
+        LINGER_TIMER_EXPIRED when the window elapses.
+
+        All actuator failures are caught + downgraded to a warn
+        diagnostic; the state machine never wedges on a netctl
+        outage.
+        """
+        # AP lifecycle.
+        if new == SupervisorState.ONLINE and prev != SupervisorState.ONLINE:
+            self._fire_ap_teardown(prev=prev)
+        elif prev == SupervisorState.ONLINE and new != SupervisorState.ONLINE:
+            self._fire_ap_reup(new=new)
+        # LINGER timer.
+        if new == SupervisorState.LINGER and prev != SupervisorState.LINGER:
+            self._linger_entered_at = time.monotonic()
+            self._emit(
+                "linger_timer",
+                "info",
+                f"armed linger timer ({self.config.linger_seconds:.0f}s)",
+            )
+        elif prev == SupervisorState.LINGER and new != SupervisorState.LINGER:
+            self._linger_entered_at = None
+            self._emit("linger_timer", "info", "disarmed linger timer (left LINGER)")
+
+    def _fire_ap_teardown(self, *, prev: SupervisorState) -> None:
+        try:
+            self._ap_lifecycle_actuator.stop()
+        except Exception as e:  # noqa: BLE001
+            self._emit(
+                "ap_lifecycle",
+                "warn",
+                f"stop actuator failed on {prev.value}->ONLINE: {e!r}; "
+                "AP remains up — concurrent AP+STA continues until "
+                "the next stop attempt or reboot",
+            )
+        else:
+            self._emit(
+                "ap_lifecycle",
+                "info",
+                f"stopped hostapd on {prev.value}->ONLINE (spec "
+                f'§"Onboarding state machine": ONLINE=AP off)',
+            )
+
+    def _fire_ap_reup(self, *, new: SupervisorState) -> None:
+        try:
+            self._ap_lifecycle_actuator.start()
+        except Exception as e:  # noqa: BLE001
+            self._emit(
+                "ap_lifecycle",
+                "warn",
+                f"start actuator failed on ONLINE->{new.value}: {e!r}; "
+                "AP remains down — recovery path is unavailable until "
+                "the next start attempt or operator reboot",
+            )
+        else:
+            self._emit(
+                "ap_lifecycle",
+                "info",
+                f"started hostapd on ONLINE->{new.value} (recovery path now available)",
+            )
+
+    @property
+    def linger_entered_at(self) -> float | None:
+        """time.monotonic() at LINGER entry, or None when not in
+        LINGER. Read by the observe loop's check_linger_timeout
+        gate."""
+        return self._linger_entered_at
+
+    def check_linger_timeout(self, *, now: float | None = None) -> bool:
+        """Called by the observe loop each tick. Returns True iff
+        the LINGER grace window has elapsed and the loop should
+        fire LINGER_TIMER_EXPIRED. Idempotent: subsequent calls
+        return False until the state machine actually transitions
+        out of LINGER (which clears `_linger_entered_at`).
+
+        `now` is `time.monotonic()` by default; tests override for
+        deterministic timing without sleeps.
+        """
+        if self._linger_entered_at is None:
+            return False
+        if self._state != SupervisorState.LINGER:
+            # Defensive: state changed without clearing the
+            # entered_at (shouldn't happen, but if it does we don't
+            # want to fire the timer based on a stale stamp).
+            return False
+        ref = now if now is not None else time.monotonic()
+        elapsed = ref - self._linger_entered_at
+        return elapsed >= self.config.linger_seconds
 
     def _persist(self) -> None:
         try:

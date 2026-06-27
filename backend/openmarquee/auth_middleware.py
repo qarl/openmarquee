@@ -70,6 +70,14 @@ _WHITELIST_EXACT: frozenset[str] = frozenset(
         "/api/auth/status",
         "/api/auth/set-password",
         "/api/auth/login",
+        # P2 (2026-06-27) captive-portal onboarding -- spec §"The
+        # display is the onboarding UI" authorizes these via the
+        # proximity-PIN model (the random per-boot PIN is rendered
+        # on the marquee + embedded in the WiFi-join QR), not via
+        # bearer token. The portal user has just joined the
+        # openMarquee-Setup AP and has no operator password yet.
+        "/api/onboarding/submit-credentials",
+        "/api/onboarding/status",
         # Peer-callable flock endpoints -- the spec authorizes them via
         # Tailscale ACL, not bearer token (a peer device doesn't have
         # the local operator's password).

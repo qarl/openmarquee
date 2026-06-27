@@ -64,6 +64,14 @@ class WifiPowerSaveActuationError(RuntimeError):
     and continues; the next reassociation will retry."""
 
 
+class HostapdLifecycleActuationError(RuntimeError):
+    """Raised when the supervisor's transition-driven hostapd
+    start/stop fails. Caller (the supervisor's _on_transition)
+    catches + emits a warn diagnostic; the next state transition
+    may retry depending on the direction (re-up on STA loss is
+    self-retrying via the wpa_supplicant event loop)."""
+
+
 def _netctl_send(
     subcommand: str,
     payload: bytes,
@@ -329,3 +337,71 @@ class WifiPowerSaveActuator:
 
     def __call__(self) -> None:
         _run_netctl_wifi_powersave_off(timeout_s=self.timeout_s)
+
+
+def _run_netctl_hostapd_stop(
+    *,
+    timeout_s: float = NETCTL_TIMEOUT_S,
+) -> None:
+    """P2 (2026-06-27) tear down the AP. Supervisor fires this on
+    LINGER->ONLINE per spec §"Onboarding state machine" — concurrent
+    24/7 is the fragile mode that produces the intermittent failures
+    the spec is trying to fix; ONLINE = STA-only steady state.
+
+    Raises HostapdLifecycleActuationError on any failure; the caller
+    (supervisor._on_transition) emits a warn diagnostic and continues.
+    """
+    _netctl_send(
+        "hostapd-stop",
+        b"",
+        timeout_s=timeout_s,
+        error_cls=HostapdLifecycleActuationError,
+    )
+
+
+def _run_netctl_hostapd_start(
+    *,
+    timeout_s: float = NETCTL_TIMEOUT_S,
+) -> None:
+    """P2 (2026-06-27) re-up the AP. Supervisor fires this on
+    ONLINE->DEGRADED (recovery path needs the AP) and on
+    ONLINE->SETUP (operator-driven re-entry). The hostapd.conf on
+    disk is reused as-is (channel-follow on a fresh association is
+    handled separately by hostapd-write-and-restart).
+
+    Raises HostapdLifecycleActuationError on any failure.
+    """
+    _netctl_send(
+        "hostapd-start",
+        b"",
+        timeout_s=timeout_s,
+        error_cls=HostapdLifecycleActuationError,
+    )
+
+
+class HostapdLifecycleActuator:
+    """P2 (2026-06-27) AP up/down lifecycle actuator.
+
+    Spec §"Onboarding state machine": ONLINE is the default steady
+    state (AP off — "the setup network is a temporary door, not a
+    permanent feature"). The supervisor's transition-effect
+    dispatch fires the appropriate method:
+      * `stop()` on LINGER->ONLINE (and CONNECTING/DEGRADED->ONLINE
+        in mutex mode) — tears down hostapd via netctl.
+      * `start()` on ONLINE->DEGRADED + ONLINE->SETUP — re-ups
+        hostapd via netctl.
+
+    The instance is wired into the supervisor's
+    `ap_lifecycle_actuator` slot. Default-active when the netctl
+    socket is present; fail-soft otherwise (the supervisor's
+    `_on_transition` catches the typed error + emits a warn diag).
+    """
+
+    def __init__(self, *, timeout_s: float = NETCTL_TIMEOUT_S):
+        self.timeout_s = timeout_s
+
+    def stop(self) -> None:
+        _run_netctl_hostapd_stop(timeout_s=self.timeout_s)
+
+    def start(self) -> None:
+        _run_netctl_hostapd_start(timeout_s=self.timeout_s)

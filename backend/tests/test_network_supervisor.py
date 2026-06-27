@@ -686,3 +686,248 @@ class TestPowerSaveRefireOnAssoc:
         assert line.startswith("[network-supervisor]"), line
         assert "source=power_save" in line
         assert "severity=info" in line
+
+
+# ============================================================
+# P2 (2026-06-27) _on_transition AP lifecycle + LINGER timer
+# ============================================================
+
+
+class _RecordingApActuator:
+    """Test double exposing the (stop, start) call sequence so
+    transition-effect tests can pin which side fired."""
+
+    def __init__(self, *, fail_on: str | None = None):
+        self.calls: list[str] = []
+        self.fail_on = fail_on
+
+    def stop(self) -> None:
+        self.calls.append("stop")
+        if self.fail_on == "stop":
+            raise RuntimeError("synthetic stop failure")
+
+    def start(self) -> None:
+        self.calls.append("start")
+        if self.fail_on == "start":
+            raise RuntimeError("synthetic start failure")
+
+
+class TestApLifecycleTransitions:
+    """The supervisor's transition-effect dispatch fires
+    `ap_lifecycle_actuator.stop()` when entering ONLINE and
+    `start()` when exiting it. Spec §"Onboarding state machine":
+    ONLINE is the default steady state with the AP torn down.
+    """
+
+    def _make(self, tmp_path, *, actuator, fallback_mutex=False):
+        config = SupervisorConfig(
+            state_file=tmp_path / "network-state.json",
+            fallback_mutex_mode=fallback_mutex,
+        )
+        return NetworkSupervisor(config=config, ap_lifecycle_actuator=actuator)
+
+    def test_linger_to_online_fires_stop(self, tmp_path: Path):
+        actuator = _RecordingApActuator()
+        sup = self._make(tmp_path, actuator=actuator)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+        assert actuator.calls == ["stop"]
+
+    def test_online_to_degraded_fires_start(self, tmp_path: Path):
+        actuator = _RecordingApActuator()
+        sup = self._make(tmp_path, actuator=actuator)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE (stop)
+        sup.apply_event(SupervisorEvent.STA_DISCONNECTED)  # → DEGRADED (start)
+        assert actuator.calls == ["stop", "start"]
+
+    def test_online_to_setup_fires_start(self, tmp_path: Path):
+        actuator = _RecordingApActuator()
+        sup = self._make(tmp_path, actuator=actuator)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+        sup.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
+        assert actuator.calls == ["stop", "start"]
+
+    def test_connecting_to_linger_does_not_fire_actuator(self, tmp_path: Path):
+        """AP is up in SETUP + CONNECTING + LINGER + DEGRADED — only
+        the ONLINE boundary moves it."""
+        actuator = _RecordingApActuator()
+        sup = self._make(tmp_path, actuator=actuator)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        sup.apply_event(SupervisorEvent.STA_DISCONNECTED)  # → DEGRADED
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        assert actuator.calls == []
+
+    def test_mutex_mode_skips_linger_and_fires_stop_on_connecting_to_online(self, tmp_path: Path):
+        """In fallback mutex regime, CONNECTING goes directly to
+        ONLINE on STA_ASSOCIATED — the stop must fire there."""
+        actuator = _RecordingApActuator()
+        sup = self._make(tmp_path, actuator=actuator, fallback_mutex=True)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → ONLINE (mutex)
+        assert actuator.calls == ["stop"]
+
+    def test_stop_actuator_failure_warn_diag_and_state_advances(self, tmp_path: Path):
+        """A netctl outage must NOT wedge the state machine. The
+        supervisor catches the failure + emits a warn diagnostic
+        and the state still transitions to ONLINE."""
+        actuator = _RecordingApActuator(fail_on="stop")
+        sup = self._make(tmp_path, actuator=actuator)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)
+        assert sup.current_state == SupervisorState.ONLINE
+        warn = [
+            e
+            for e in sup.snapshot_diagnostics()
+            if e.severity == "warn"
+            and e.source == "ap_lifecycle"
+            and "stop actuator failed" in e.message
+        ]
+        assert len(warn) == 1
+
+    def test_default_observe_only_actuator_emits_would_lines(self, tmp_path: Path):
+        """When no actuator is passed, the supervisor wires a stub
+        that just emits diagnostic 'would stop/start' lines — useful
+        on dev hosts without netctl. The stub is paired with the
+        supervisor's ring buffer via a back-pointer."""
+        config = SupervisorConfig(state_file=tmp_path / "network-state.json")
+        sup = NetworkSupervisor(config=config)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)
+        # 'would stop' line surfaces in the diagnostics ring buffer.
+        would_stop = [
+            e
+            for e in sup.snapshot_diagnostics()
+            if e.source == "ap_lifecycle" and "would stop" in e.message
+        ]
+        assert len(would_stop) == 1
+
+    def test_set_ap_lifecycle_actuator_swaps_at_runtime(self, tmp_path: Path):
+        first = _RecordingApActuator()
+        second = _RecordingApActuator()
+        config = SupervisorConfig(state_file=tmp_path / "network-state.json")
+        sup = NetworkSupervisor(config=config, ap_lifecycle_actuator=first)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)
+        assert first.calls == ["stop"]
+        sup.set_ap_lifecycle_actuator(second)
+        sup.apply_event(SupervisorEvent.STA_DISCONNECTED)  # → DEGRADED (start)
+        assert second.calls == ["start"]
+        # First actuator was NOT called for the second transition.
+        assert first.calls == ["stop"]
+
+
+class TestLingerTimer:
+    """The LINGER timer arms on entry into LINGER + the observe loop
+    polls check_linger_timeout() each tick to fire
+    LINGER_TIMER_EXPIRED when the grace window elapses.
+    """
+
+    def _make(self, tmp_path, *, linger_seconds=120.0):
+        config = SupervisorConfig(
+            state_file=tmp_path / "network-state.json",
+            linger_seconds=linger_seconds,
+        )
+        return NetworkSupervisor(config=config)
+
+    def test_arm_on_entry_into_linger(self, tmp_path: Path):
+        sup = self._make(tmp_path)
+        assert sup.linger_entered_at is None
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        assert sup.linger_entered_at is None  # CONNECTING, not LINGER
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        assert sup.current_state == SupervisorState.LINGER
+        assert sup.linger_entered_at is not None
+
+    def test_disarm_on_exit_from_linger(self, tmp_path: Path):
+        sup = self._make(tmp_path)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        assert sup.linger_entered_at is not None
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+        assert sup.linger_entered_at is None
+
+    def test_check_returns_false_outside_linger(self, tmp_path: Path):
+        sup = self._make(tmp_path)
+        # In SETUP — not LINGER.
+        assert sup.check_linger_timeout() is False
+        assert sup.check_linger_timeout(now=10_000.0) is False
+
+    def test_check_returns_false_before_window_elapses(self, tmp_path: Path):
+        sup = self._make(tmp_path, linger_seconds=120.0)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        ref = sup.linger_entered_at
+        assert sup.check_linger_timeout(now=ref + 60.0) is False
+        assert sup.check_linger_timeout(now=ref + 119.99) is False
+
+    def test_check_returns_true_after_window_elapses(self, tmp_path: Path):
+        sup = self._make(tmp_path, linger_seconds=120.0)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        ref = sup.linger_entered_at
+        assert sup.check_linger_timeout(now=ref + 120.0) is True
+        assert sup.check_linger_timeout(now=ref + 200.0) is True
+
+    def test_check_idempotent_after_transition_out(self, tmp_path: Path):
+        """Once the state machine transitions out of LINGER (e.g. via
+        LINGER_TIMER_EXPIRED that the loop drove), subsequent calls
+        to check_linger_timeout must return False — even though
+        linger_entered_at is cleared, defensive double-firing must
+        not occur."""
+        sup = self._make(tmp_path, linger_seconds=10.0)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        ref = sup.linger_entered_at
+        assert sup.check_linger_timeout(now=ref + 10.0) is True
+        # Fire the transition (what the loop would do).
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)
+        assert sup.current_state == SupervisorState.ONLINE
+        # Subsequent polls return False — state is no longer LINGER,
+        # entered_at is cleared.
+        assert sup.check_linger_timeout(now=ref + 200.0) is False
+
+    def test_resumed_linger_state_seeds_entered_at(self, tmp_path: Path):
+        """Sacred-review BLOCKER fix (PR2): if disk has state=LINGER
+        when the supervisor boots, _linger_entered_at MUST seed to
+        now() so check_linger_timeout works (otherwise it returns
+        False forever + AP stays up indefinitely, contradicting the
+        spec's ONLINE-is-steady-state intent).
+        """
+        # Persist a state file pinned to LINGER.
+        state_file = tmp_path / "network-state.json"
+        save_persisted_state(
+            PersistedState(state=SupervisorState.LINGER),
+            path=state_file,
+        )
+        config = SupervisorConfig(state_file=state_file, linger_seconds=120.0)
+        sup = NetworkSupervisor(config=config)
+        assert sup.current_state == SupervisorState.LINGER
+        assert sup.linger_entered_at is not None
+        # check_linger_timeout works: fresh window starts NOW.
+        assert sup.check_linger_timeout(now=sup.linger_entered_at + 119.0) is False
+        assert sup.check_linger_timeout(now=sup.linger_entered_at + 121.0) is True
+
+    def test_resumed_non_linger_state_does_not_seed_entered_at(self, tmp_path: Path):
+        """The seed is gated on state == LINGER — every other
+        persisted state leaves _linger_entered_at None."""
+        state_file = tmp_path / "network-state.json"
+        for s in (
+            SupervisorState.SETUP,
+            SupervisorState.CONNECTING,
+            SupervisorState.ONLINE,
+            SupervisorState.DEGRADED,
+        ):
+            save_persisted_state(PersistedState(state=s), path=state_file)
+            config = SupervisorConfig(state_file=state_file)
+            sup = NetworkSupervisor(config=config)
+            assert sup.current_state == s
+            assert sup.linger_entered_at is None, f"state={s} should not seed entered_at"

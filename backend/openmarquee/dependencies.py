@@ -947,7 +947,10 @@ def get_live_manager():
 @lru_cache
 def _network_supervisor_singleton():
     from openmarquee.network_supervisor import NetworkSupervisor, SupervisorConfig
-    from openmarquee.network_supervisor_actuator import WifiPowerSaveActuator
+    from openmarquee.network_supervisor_actuator import (
+        HostapdLifecycleActuator,
+        WifiPowerSaveActuator,
+    )
 
     storage = _settings_storage_singleton()
     settings = storage.load()
@@ -961,9 +964,15 @@ def _network_supervisor_singleton():
     # downgraded to a warn diagnostic, so this is safe to install
     # unconditionally. Tests that construct NetworkSupervisor
     # directly (not via the singleton) get the observe-only stub.
+    #
+    # P2 (2026-06-27): same pattern for the AP lifecycle actuator.
+    # The supervisor's _on_transition catches HostapdLifecycle-
+    # ActuationError and downgrades to a warn diagnostic, so this
+    # is safe to install unconditionally.
     return NetworkSupervisor(
         config=config,
         power_save_actuator=WifiPowerSaveActuator(),
+        ap_lifecycle_actuator=HostapdLifecycleActuator(),
     )
 
 
