@@ -38,6 +38,15 @@ uuid = { version = "1", default-features = false, features = ["serde"] }
 # if we hit a slide that needs shaping/bidi/ligatures.
 fontdue = "0.9"
 
+# PR3 onboarding marquee cards (2026-06-27) — QR encoder for the
+# SETUP/DEGRADED join code (spec §"The display is the onboarding
+# UI"). Pin to 0.14: pure-Rust (no native deps), MIT/Apache, the
+# de-facto Rust QR crate (kennytm). No optional features needed;
+# we use the `QrCode::new(...)` + bitmap API only. Binary impact
+# ~250 KB on aarch64 release. Transitive deps: `checked_int_cast`
+# (tiny utility crate, MIT). No network, no unsafe surprises.
+qrcode = { version = "0.14", default-features = false }
+
 # Bug 3 Slice 1 (2026-05-19) — runtime glyph cache mpsc channel.
 # crossbeam-channel's select! macro is the work-distribution
 # primitive for the worker thread pool. Pure Rust, cross-platform.

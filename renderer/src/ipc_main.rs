@@ -4439,6 +4439,51 @@ fn handle_inner_request(
                 }
             }
         }
+        IpcRequest::RenderSystemCard(p) => {
+            // PR3 (2026-06-27): overlay the supervisor-driven
+            // onboarding card. The pure layout work lives in
+            // crate::system_card::layout_card; the GLES2 paint
+            // wiring + the active-card state slot live in
+            // hdmi.rs (Linux-only). On host-Mac builds we
+            // accept the IPC (returns ok_empty) but the paint
+            // is a no-op.
+            #[cfg(target_os = "linux")]
+            {
+                let shapes = crate::system_card::layout_card(&p);
+                let deadline = p.ttl_ms.and_then(|ttl| {
+                    if ttl == 0 {
+                        None
+                    } else {
+                        Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_millis(u64::from(ttl)),
+                        )
+                    }
+                });
+                state.active_system_card = Some(crate::system_card::ActiveSystemCard {
+                    shapes,
+                    deadline,
+                    params: p,
+                });
+                ok_empty()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Host build: accept the op + drop. The pure
+                // layout is exercised by system_card::tests.
+                let _ = p;
+                ok_empty()
+            }
+        }
+        IpcRequest::ClearSystemCard => {
+            // PR3 (2026-06-27): supervisor's ONLINE transition
+            // sends this to revert to normal playlist paint.
+            #[cfg(target_os = "linux")]
+            {
+                state.active_system_card = None;
+            }
+            ok_empty()
+        }
     }
 }
 

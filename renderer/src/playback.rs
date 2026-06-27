@@ -61,6 +61,14 @@ pub struct PlaybackState {
     /// blend; when its duration elapses, to_slide promotes to
     /// current and pending clears.
     pub pending: Option<TransitionContext>,
+    /// PR3 (2026-06-27) onboarding system card overlay. Set by
+    /// RenderSystemCard, cleared by ClearSystemCard or ttl_ms
+    /// expiry. When Some, the paint loop draws the card on top
+    /// of (replacing) the playlist content. Linux-only because
+    /// the active card carries `system_card::ActiveSystemCard`
+    /// which holds the layout shapes the GLES2 paint consumes.
+    #[cfg(target_os = "linux")]
+    pub active_system_card: Option<crate::system_card::ActiveSystemCard>,
 }
 
 /// Result of advance(t_ms) -- tells the renderer what to paint
@@ -318,6 +326,24 @@ pub enum IpcRequest {
     /// failure on its actual BeginSlide and the existing
     /// UnsupportedSlide rail picks it up.
     PreloadSlide(PreloadSlideParams),
+    /// Op 12 (PR3, 2026-06-27): render a full-screen system card
+    /// overlay (onboarding state cards per
+    /// qa/onboarding-marquee-cards-mockup.html). The renderer
+    /// composites this on top of (replacing) the playlist paint
+    /// until either:
+    ///   * `ttl_ms` elapses (the renderer auto-clears),
+    ///   * or `ClearSystemCard` is sent (operator / supervisor
+    ///     explicit clear), or
+    ///   * another `RenderSystemCard` with a different `kind` is
+    ///     sent (replaces the active card).
+    /// Spec §"The display is the onboarding UI": every onboarding
+    /// state shows itself on the screen so no step is a mystery.
+    RenderSystemCard(RenderSystemCardParams),
+    /// Op 13 (PR3, 2026-06-27): clear any active system card +
+    /// return to normal playback paint. The supervisor sends this
+    /// when transitioning to ONLINE (= AP off, STA-only steady
+    /// state = no card overlay).
+    ClearSystemCard,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -371,6 +397,103 @@ pub struct PreloadSlideParams {
     /// `BeginSlideParams::slide_id` — the handler resolves the
     /// asset via content_root from the Open call.
     pub slide_id: Uuid,
+}
+
+/// PR3 (2026-06-27) system-card kinds. Maps to the 5 cards in
+/// qa/onboarding-marquee-cards-mockup.html. The supervisor's
+/// `_on_transition` picks the kind from the supervisor state per
+/// the spec's state → card mapping; the BOOT kind is fired by the
+/// backend lifespan as a one-shot identity card (~4s ttl).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SystemCardKind {
+    /// No stored creds → AP up, portal active. Card shows the
+    /// join-QR + SSID + PIN.
+    Setup,
+    /// Credentials submitted, STA mid-association. Card shows the
+    /// "Joining <target_ssid>" headline + spinner.
+    Connecting,
+    /// LINGER grace window: STA up, AP still up briefly, the card
+    /// teaches the device's home-network address.
+    Connected,
+    /// STA lost. Card re-shows the QR + an explanation by cause
+    /// (variant: lost | auth_fail | not_found_or_5ghz).
+    Degraded,
+    /// ~4-second boot identity card. Shows the monogram + the
+    /// address/IP + (PR4 follow-up) the rapid-boot hint line when
+    /// the gesture counter is armed.
+    Boot,
+}
+
+/// PR3 (2026-06-27) DEGRADED-card cause variant. The supervisor
+/// selects this based on the last STA disconnect reason; the card
+/// renderer maps it to a headline + a sub-line.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DegradedVariant {
+    /// Generic STA disconnect (router rebooted, signal lost, etc).
+    /// Headline: "Lost the wifi connection".
+    Lost,
+    /// STA auth failure (CTRL-EVENT-AUTH-REJECT / SSID-TEMP-
+    /// DISABLED). Headline: "WiFi password no longer works".
+    AuthFail,
+    /// SSID not in scan results, OR present only on 5 GHz (the
+    /// BCM43438 is 2.4 GHz only per spec). Headline: "Can't find
+    /// <SSID>".
+    NotFoundOr5ghz,
+}
+
+/// PR3 (2026-06-27) RenderSystemCard parameters. Every field is
+/// optional — the renderer's per-kind layout reads only the fields
+/// it needs; unused fields are ignored. JSON shape designed so a
+/// future card-kind addition lands as a new variant without
+/// breaking existing clients.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RenderSystemCardParams {
+    /// Which card to render.
+    pub kind: SystemCardKind,
+    /// Setup-AP SSID. Required for SETUP + DEGRADED (shown in the
+    /// kv strip + embedded in qr_payload).
+    #[serde(default)]
+    pub ssid: Option<String>,
+    /// Proximity PIN (per-boot random). Required for SETUP +
+    /// DEGRADED (shown in the kv strip + embedded in qr_payload's
+    /// `P:` field).
+    #[serde(default)]
+    pub pin: Option<String>,
+    /// QR-code payload: the WIFI: URI per spec §"The display is
+    /// the onboarding UI" — `WIFI:T:WPA;S:<ssid>;P:<pin>;;`. The
+    /// renderer's QR encoder bitmaps this; the bitmap lives on the
+    /// white panel. Required for SETUP + DEGRADED.
+    #[serde(default)]
+    pub qr_payload: Option<String>,
+    /// mDNS / hostname address (e.g. `openmarquee.local`). Required
+    /// for CONNECTED + BOOT (the headline / addr field).
+    #[serde(default)]
+    pub address: Option<String>,
+    /// IP address (e.g. `192.168.1.47`). Required for CONNECTED +
+    /// BOOT (rendered under the mDNS address in monospace).
+    #[serde(default)]
+    pub ip: Option<String>,
+    /// The home-network SSID being joined. Required for
+    /// CONNECTING ("Joining '<target_ssid>'…").
+    #[serde(default)]
+    pub target_ssid: Option<String>,
+    /// DEGRADED cause variant; picks the headline.
+    #[serde(default)]
+    pub variant: Option<DegradedVariant>,
+    /// Auto-clear after this many milliseconds. None / 0 means
+    /// "until-state-change" (supervisor explicitly clears via
+    /// ClearSystemCard or replaces with a new RenderSystemCard).
+    /// Per spec: BOOT ~4000, CONNECTED ~120000, others = None.
+    #[serde(default)]
+    pub ttl_ms: Option<u32>,
+    /// PR4 reserve: rapid-boot-gesture hint line on BOOT
+    /// ("Restart 2× more for Setup Mode"). Empty/None means no
+    /// hint. The slot is reserved here so PR4 lands as a wire-
+    /// compat payload-only change.
+    #[serde(default)]
+    pub boot_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
