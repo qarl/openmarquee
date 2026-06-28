@@ -2499,6 +2499,7 @@ where
                 &mut cache,
                 fonts,
                 Some(content_root),
+                &mut state,
             );
 
             // Snapshot-side-A Commit 2 (2026-06-21): capture the
@@ -2727,6 +2728,10 @@ fn run_paint_hook(
     cache: &mut SlideCache,
     fonts: Option<&FontCatalog>,
     content_root: Option<&Path>,
+    // PR3 (2026-06-27): the active system-card overlay slot lives
+    // in PlaybackState; the paint hook intercepts PaintSlide when
+    // active to render the supervisor's onboarding card instead.
+    state: &mut PlaybackState,
 ) -> IpcResponse {
     use crate::content::ContentItem;
     use crate::hdmi;
@@ -2761,6 +2766,42 @@ fn run_paint_hook(
     };
     let out = match result {
         OpResult::PaintSlide { slide_id, t_in_slide_ms } => {
+            // PR3 (2026-06-27): if a system card overlay is active
+            // (set by RenderSystemCard), paint the card INSTEAD of
+            // the playlist slide. The supervisor sends RenderSystem-
+            // Card on SETUP/CONNECTING/LINGER/DEGRADED transitions
+            // + ClearSystemCard on ONLINE; while active, every
+            // PaintSlide tick is intercepted here. The overlay
+            // paint also handles ttl-deadline auto-clear so a
+            // CONNECTED card (~120s ttl) reverts to playlist paint
+            // automatically.
+            #[cfg(target_os = "linux")]
+            {
+                match hdmi::maybe_paint_system_card_overlay(
+                    state,
+                    session.gl(),
+                    u32::from(session.mode_w()),
+                    u32::from(session.mode_h()),
+                ) {
+                    Ok(true) => {
+                        // Card painted; skip the playlist slide
+                        // dispatch + present this frame as the
+                        // overlay.
+                        return IpcResponse::Ok {
+                            result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
+                        };
+                    }
+                    Ok(false) => {
+                        // No active card OR ttl just expired —
+                        // fall through to the normal slide paint.
+                    }
+                    Err(e) => {
+                        return err(format!(
+                            "paint_slide: system-card overlay failed: {e:#}"
+                        ));
+                    }
+                }
+            }
             // Clone the borrow shape we need so we can take a
             // mutable borrow on cache.video_decoders later for
             // the Video branch without re-entering the borrow.

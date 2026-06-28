@@ -7932,6 +7932,18 @@ impl<'a> EglSession<'a> {
         self.gl
     }
 
+    /// PR3 (2026-06-27): logical render-target width in pixels.
+    /// Used by `maybe_paint_system_card_overlay` to scale the
+    /// normalized card shapes (0..1) to physical pixels.
+    pub fn mode_w(&self) -> u16 {
+        self.mode_w
+    }
+
+    /// PR3 (2026-06-27): logical render-target height in pixels.
+    pub fn mode_h(&self) -> u16 {
+        self.mode_h
+    }
+
     /// v1-spec-delta #10 (slice c) -- update cached settings.
     /// paint_and_present_one_frame_for_slide consults
     /// current_settings.is_color_identity() to decide whether
@@ -17348,6 +17360,243 @@ impl ObjectProps {
             .map(|(_, id)| *id)
             .ok_or_else(|| anyhow!("property {name:?} not found on object"))
     }
+}
+
+// ============================================================
+// PR3 (2026-06-27) onboarding system-card MVP paint.
+//
+// Per QA call (b): BG color-fill + text rendering via the existing
+// MSDF stack. Monogram/chip/QR/spinner primitives ship in PR3.1.
+//
+// The supervisor sends RenderSystemCard which sets
+// state.active_system_card. On each frame, paint_and_present_*
+// callers check for an active card and, if present, paint it
+// instead of the playlist content. The card auto-clears when its
+// optional ttl deadline elapses, OR on explicit ClearSystemCard
+// (the supervisor sends this on ONLINE).
+// ============================================================
+
+/// MVP system-card overlay paint. Returns Ok(true) if a card was
+/// painted (the per-frame caller should skip the playlist paint
+/// for this frame), Ok(false) if no card is active (paint the
+/// playlist normally). Side-effect: clears
+/// state.active_system_card if its ttl deadline has elapsed.
+///
+/// PR3 MVP scope: paints Background (glClear) + Text shapes
+/// (synthetic TextLayer through layout_text_to_quads +
+/// draw_text_layer_msdf). Other shapes (Monogram, Chip, QrPanel,
+/// Spinner, BootHint, Footer) ship in PR3.1.
+pub fn maybe_paint_system_card_overlay(
+    state: &mut crate::playback::PlaybackState,
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+) -> Result<bool> {
+    use crate::system_card::CardShape;
+
+    // 1. Snapshot + ttl deadline check. If expired, clear the slot
+    // + return "no card active" so the playlist paint proceeds.
+    {
+        let Some(card) = state.active_system_card.as_ref() else {
+            return Ok(false);
+        };
+        if let Some(deadline) = card.deadline {
+            if std::time::Instant::now() >= deadline {
+                state.active_system_card = None;
+                return Ok(false);
+            }
+        }
+    }
+
+    // 2. Clone the shape list so we can release the borrow on
+    // state.active_system_card before any subroutine mutation.
+    let shapes: Vec<CardShape> = state
+        .active_system_card
+        .as_ref()
+        .map(|c| c.shapes.clone())
+        .unwrap_or_default();
+
+    // 3. Paint each shape. PR3 MVP renders Background + Text;
+    // others are noted in a debug-level log to aid PR3.1.
+    for shape in &shapes {
+        match shape {
+            CardShape::Background { color } => {
+                use glow::HasContext;
+                unsafe {
+                    gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.clear_color(
+                        f32::from(color.0) / 255.0,
+                        f32::from(color.1) / 255.0,
+                        f32::from(color.2) / 255.0,
+                        1.0,
+                    );
+                    gl.clear(glow::COLOR_BUFFER_BIT);
+                }
+            }
+            CardShape::Text {
+                anchor,
+                max_height,
+                color,
+                font,
+                text,
+                align,
+            } => {
+                paint_system_card_text(
+                    gl, mode_w, mode_h, *anchor, *max_height, *color, *font, *align, text,
+                )?;
+            }
+            // PR3.1 follow-ups: monogram tile, solid-fill state
+            // chip, QR-image panel, spinner. The shape is in the
+            // layout (system_card::layout_card already emits them)
+            // so PR3.1 is a pure paint-side addition with no
+            // schema churn.
+            _ => {
+                // PR3.1 follow-ups: monogram tile, chip, qr panel,
+                // spinner, footer, boot hint. Silently skip in
+                // PR3 MVP — `eprintln!` is the renderer's logging
+                // convention but a per-frame skip-log would flood
+                // the journal at 30 Hz.
+                let _ = shape;
+            }
+        }
+    }
+
+    Ok(true)
+}
+
+/// PR3 MVP system-card text paint. Builds a synthetic TextLayer
+/// (so the existing MSDF pipeline does the layout + GL draws),
+/// computes the MsdfQuadGroup via `layout_text_to_quads`, and
+/// dispatches to `draw_text_layer_msdf`.
+fn paint_system_card_text(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    anchor: (f32, f32),
+    max_height: f32,
+    color: crate::system_card::Rgb,
+    font: crate::system_card::DisplayFont,
+    align: crate::system_card::Align,
+    text: &str,
+) -> Result<()> {
+    use crate::hdmi_logic::{layout_text_to_quads, MotionState};
+
+    let family = match font {
+        crate::system_card::DisplayFont::Headline => "Oswald",
+        crate::system_card::DisplayFont::Body => "Inter",
+        crate::system_card::DisplayFont::Mono => "JetBrains Mono",
+    };
+
+    let align_str = match align {
+        crate::system_card::Align::Left => "left",
+        crate::system_card::Align::Center => "center",
+        crate::system_card::Align::Right => "right",
+    };
+
+    let size_px = (max_height * mode_h as f32).max(8.0);
+
+    // Box covers the card from the anchor x rightward to the right
+    // edge (or symmetric for center-aligned). Vertical box is just
+    // tall enough for ~6 lines so multi-line text fits.
+    let box_x = anchor.0;
+    let box_y = anchor.1;
+    let box_w = match align {
+        crate::system_card::Align::Center => {
+            let half = box_x.min(1.0 - box_x);
+            (half * 2.0).clamp(0.05, 1.0)
+        }
+        _ => (1.0 - box_x - 0.046).max(0.05),
+    };
+    let box_h = (max_height * 6.0).min(1.0 - box_y).max(max_height);
+    // Shift box_x left by half its width for centered alignment so
+    // the TextLayer's left-anchored box still centers visually.
+    let box_x = match align {
+        crate::system_card::Align::Center => (anchor.0 - box_w / 2.0).max(0.0),
+        _ => box_x,
+    };
+
+    let color_hex = format!(
+        "#{:02x}{:02x}{:02x}",
+        color.0, color.1, color.2
+    );
+
+    let layer = crate::content::TextLayer {
+        text: text.to_string(),
+        name: String::from("system-card-text"),
+        font_family: Some(family.to_string()),
+        font_size_px: Some(size_px),
+        font_size_pct: None,
+        text_color: color_hex,
+        text_align: align_str.to_string(),
+        opacity: 1.0,
+        visible: true,
+        motion: String::from("static"),
+        motion_intensity: 0,
+        motion_phase: 0.0,
+        motion_speed: 0.0,
+        auto_mode: None,
+        auto_format: None,
+        outline: false,
+        drop_shadow: false,
+        blend: String::from("normal"),
+        anchor: String::from("top"),
+        weight: None,
+        r#box: crate::content::TextBox {
+            x: box_x,
+            y: box_y,
+            w: box_w,
+            h: box_h,
+        },
+    };
+
+    // Atlas lookup + lazy-upload.
+    ensure_msdf_atlas_for_family_or_default(gl, family);
+    let Some((atlas_tex, atlas)) = msdf_atlas_for_family(family)
+        .or_else(|| msdf_atlas_for_family("Inter"))
+    else {
+        eprintln!(
+            "[system-card] paint_text: no MSDF atlas for family={family} or Inter; skipping line"
+        );
+        return Ok(());
+    };
+
+    let box_w_px = layer.r#box.w * mode_w as f32;
+    let Some(group) = layout_text_to_quads(atlas, &layer.text, size_px, box_w_px, None) else {
+        // Empty / whitespace-only laid out to no ink.
+        return Ok(());
+    };
+
+    // Parse the text_color hex into RGBA floats matching the
+    // draw_text_layer_msdf convention.
+    let text_color = [
+        f32::from(color.0) / 255.0,
+        f32::from(color.1) / 255.0,
+        f32::from(color.2) / 255.0,
+        1.0,
+    ];
+
+    use glow::HasContext;
+    unsafe {
+        gl.enable(glow::BLEND);
+        gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+    }
+    let res = draw_text_layer_msdf(
+        gl,
+        mode_w,
+        mode_h,
+        &layer,
+        text_color,
+        MotionKind::Static,
+        MotionState::IDENTITY,
+        &group,
+        atlas_tex,
+        Some((0, 0, mode_w, mode_h)),
+    );
+    unsafe {
+        gl.disable(glow::BLEND);
+    }
+    res
 }
 
 #[cfg(test)]
