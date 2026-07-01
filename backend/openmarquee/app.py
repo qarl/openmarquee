@@ -334,10 +334,23 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             # supervisor's CURRENT state (SETUP for no-creds, or
             # nothing for ONLINE) so a cold-boot device does not
             # skip the onboarding overlay just because it never
-            # transitioned through a state-change since boot. Uses
-            # asyncio.to_thread to avoid blocking the event loop on
-            # the renderer IPC (fix-pass B2 pattern).
+            # transitioned through a state-change since boot.
+            #
+            # PR3 fix-pass F1(b) (2026-07-01): WAIT for the renderer
+            # to be READY (past EGL cold-start, ~18s worst case)
+            # before firing the BOOT card. Emitting during the
+            # cold window used to timeout the render_system_card
+            # IPC → the AutoFallback demoted the shared primary to
+            # Mock → the whole video pipeline blanked on a fresh
+            # Jason boot. Now we watch the playback loop's
+            # `_ready_sent` flag (which flips only after the FIRST
+            # successful renderer.advance() while NOT in fallback)
+            # AND `renderer.is_in_fallback` so we never issue a card
+            # IPC into a still-warming or already-fallen-back
+            # primary.
             BOOT_TTL_MS = 4000
+            READY_POLL_INTERVAL_S = 0.25
+            READY_WAIT_TIMEOUT_S = 90.0  # matches systemd TimeoutStartSec
 
             def _params_for_state(st: str) -> dict | None:
                 if st == "SETUP":
@@ -354,10 +367,44 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 # ONLINE = AP off, no overlay.
                 return None
 
+            async def _wait_for_renderer_ready() -> bool:
+                """Poll the playback loop's ready flag + the
+                renderer's fallback state. Returns True once the
+                real (non-fallback) renderer is confirmed painting;
+                False on timeout OR if the renderer is already in
+                fallback (mock — there is no cold-start to wait
+                for, but there is no point firing a card either)."""
+                loop = get_playback_loop()
+                renderer = get_renderer()
+                elapsed = 0.0
+                while elapsed < READY_WAIT_TIMEOUT_S:
+                    try:
+                        in_fallback = bool(getattr(renderer, "is_in_fallback", False))
+                    except Exception:  # noqa: BLE001
+                        in_fallback = False
+                    if in_fallback:
+                        return False
+                    if getattr(loop, "_ready_sent", False):
+                        return True
+                    await asyncio.sleep(READY_POLL_INTERVAL_S)
+                    elapsed += READY_POLL_INTERVAL_S
+                return False
+
             async def _emit_boot_and_current_state_card() -> None:
                 renderer = get_renderer()
+                ready = await _wait_for_renderer_ready()
+                if not ready:
+                    log.info(
+                        "system-card boot task: renderer not ready "
+                        "before timeout; skipping BOOT + catch-up card"
+                    )
+                    return
+                # Renderer is READY — safe to fire the BOOT card
+                # without risking a cold-start timeout demoting the
+                # primary. render_system_card is fail-soft on the
+                # card path per F1; a subprocess blip here just
+                # logs at debug level.
                 try:
-                    await asyncio.sleep(0.1)
                     await asyncio.to_thread(
                         renderer.render_system_card,
                         {
@@ -367,7 +414,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                         },
                     )
                 except Exception:  # noqa: BLE001
-                    log.debug("boot card emit failed (renderer not ready?)")
+                    log.debug("boot card emit failed", exc_info=True)
 
                 # Wait for BOOT to auto-clear (plus a small buffer)
                 # before pushing the current-state card so BOOT is
@@ -379,7 +426,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                     if params is not None:
                         await asyncio.to_thread(renderer.render_system_card, params)
                 except Exception:  # noqa: BLE001
-                    log.debug("current-state card emit failed (renderer down?)")
+                    log.debug("current-state card emit failed", exc_info=True)
 
             asyncio.create_task(  # noqa: RUF006 — fire-and-forget
                 _emit_boot_and_current_state_card(),

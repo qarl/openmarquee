@@ -427,6 +427,98 @@ class TestClearSystemCardPreview:
 
 
 # ============================================================
+# PR3 fix-pass F3 (2026-07-01) — the preview endpoint must
+# return 502 when the render actually landed on the Mock (i.e.
+# the AutoFallback had already been demoted). Prior tests
+# monkey-patched a bare-raising renderer + bypassed
+# AutoFallbackRenderer entirely, so they green-lit a path
+# production never takes. This suite drives through the REAL
+# AutoFallback with a subprocess-dead primary → the wrapper
+# falls back on the render_frame path, and then card ops paint
+# on the mock while `is_in_fallback` reports True. The preview
+# endpoint sees the fallback signal and returns 502.
+# ============================================================
+
+
+class TestPreviewEndpointReportsFallbackTruthfully:
+    def _make_fallen_wrapper(self):
+        """AutoFallbackRenderer whose primary raises on
+        render_frame → the wrapper is-in-fallback after one video
+        frame. Card ops then forward to the mock without raising."""
+        import tempfile
+        from pathlib import Path
+
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.mock import MockRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        class _PrimaryDeadOnVideo:
+            width = 1920
+            height = 1080
+
+            def render_frame(self, frame, **kwargs):
+                raise RustRendererSubprocessError("simulated on render_frame")
+
+            def end_external_frames(self):
+                pass
+
+            def render_system_card(self, params):
+                # Never reached — the wrapper's fallback catches
+                # this via the video path before any card call.
+                raise AssertionError("should not be reached after fallback")
+
+            def clear_system_card(self):
+                raise AssertionError("should not be reached after fallback")
+
+        def _mock_factory():
+            tmp = Path(tempfile.mkdtemp(prefix="pr3-f3-")) / "preview.png"
+            return MockRenderer(width=1920, height=1080, output_path=tmp)
+
+        wrapper = AutoFallbackRenderer(
+            primary=_PrimaryDeadOnVideo(),
+            mock_factory=_mock_factory,
+        )
+        wrapper.render_frame(b"\x00" * (1920 * 1080 * 3))
+        assert wrapper.is_in_fallback is True
+        return wrapper
+
+    def test_render_preview_returns_502_when_wrapper_in_fallback(
+        self, client: TestClient, monkeypatch
+    ):
+        """The wrapper has already fallen back to the mock (video
+        subprocess died). The card render succeeds on the mock but
+        `is_in_fallback` is True → the preview endpoint returns 502
+        so QA glass-verifies on truthful responses."""
+        from openmarquee import dependencies as deps
+
+        wrapper = self._make_fallen_wrapper()
+        monkeypatch.setattr(deps, "get_renderer", lambda: wrapper)
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "SETUP"},
+        )
+        assert response.status_code == 502
+        assert "fallback" in response.text.lower()
+        # Card DID paint on the mock (success semantics for the
+        # supervisor path), so the mock recorded the call — the
+        # endpoint reports 502 to the CALLER regardless.
+        assert wrapper._mock.system_card_calls == [{"kind": "SETUP"}]
+
+    def test_clear_preview_returns_502_when_wrapper_in_fallback(
+        self, client: TestClient, monkeypatch
+    ):
+        from openmarquee import dependencies as deps
+
+        wrapper = self._make_fallen_wrapper()
+        monkeypatch.setattr(deps, "get_renderer", lambda: wrapper)
+        response = client.post("/api/system/clear-system-card-preview")
+        assert response.status_code == 502
+        assert "fallback" in response.text.lower()
+
+
+# ============================================================
 # PR3 fix-pass S2 (2026-07-01) — byte-length clamp on _check_len.
 # ============================================================
 

@@ -867,6 +867,19 @@ async def render_system_card_preview(
     # Off-load to a worker thread so the event loop keeps polling
     # concurrent requests — same pattern as the sibling /api/system
     # endpoints (fbset/iw/tailscale) above.
+    #
+    # PR3 fix-pass F3 (2026-07-01): under the AutoFallbackRenderer
+    # the primary's `render_system_card` no longer swallows
+    # subprocess errors (F1), but the swap-to-mock is also gone
+    # (F1), so a dead subprocess renders SUCCESSFULLY on the mock
+    # AFTER the swap in a legacy code path. The AutoFallback
+    # wrapper we ship in this pass propagates errors on the card
+    # path — but we also verify that the render actually landed
+    # on the REAL renderer (not the mock) by checking
+    # `is_in_fallback` after the call. If the primary was already
+    # in fallback (or the exception path put us there), the card
+    # was painted on the mock — return 502 so QA glass-verifies
+    # on truthful responses.
     try:
         await asyncio.to_thread(renderer.render_system_card, params)
     except Exception as e:  # noqa: BLE001
@@ -875,6 +888,14 @@ async def render_system_card_preview(
             status_code=502,
             detail=f"renderer render_system_card failed: {e}",
         ) from e
+    if _is_in_fallback(renderer):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "renderer is in fallback (mock) — card painted on the "
+                "mock, not the real display"
+            ),
+        )
     return RenderSystemCardPreviewResponse(status="rendered")
 
 
@@ -900,4 +921,25 @@ async def clear_system_card_preview() -> RenderSystemCardPreviewResponse:
             status_code=502,
             detail=f"renderer clear_system_card failed: {e}",
         ) from e
+    if _is_in_fallback(renderer):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "renderer is in fallback (mock) — clear applied to the "
+                "mock, not the real display"
+            ),
+        )
     return RenderSystemCardPreviewResponse(status="cleared")
+
+
+def _is_in_fallback(renderer: object) -> bool:
+    """PR3 fix-pass F3 (2026-07-01): true iff the renderer is
+    currently painting on the MockRenderer (i.e. the primary
+    Rust IPC path is down). `AutoFallbackRenderer` exposes this
+    as a property; bare RustRenderer / MockRenderer do not, so
+    getattr with default False keeps unit tests that inject a
+    minimal renderer stub happy."""
+    try:
+        return bool(getattr(renderer, "is_in_fallback", False))
+    except Exception:  # noqa: BLE001
+        return False
