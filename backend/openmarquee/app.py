@@ -300,9 +300,56 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
             supervisor = get_network_supervisor()
             await supervisor.lifespan_start()
+            # PR3 (2026-06-27): wire the SystemCardPublisher adapter
+            # around the live Renderer so state transitions from
+            # SETUP/CONNECTING/LINGER/DEGRADED fire RenderSystemCard
+            # and ONLINE fires ClearSystemCard. Failures on the
+            # renderer side (subprocess dead, IPC error) are caught
+            # inside the publisher's supervisor-facing wrapper —
+            # they never wedge the supervisor.
+            try:
+                from openmarquee.rendering.system_card_publisher import (
+                    SystemCardPublisher,
+                )
+
+                supervisor.set_system_card_publisher(SystemCardPublisher(get_renderer()))
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "startup: system-card publisher wire failed; "
+                    "supervisor keeps the observe-only stub"
+                )
             network_supervisor_handle = asyncio.create_task(
                 supervisor_observe_loop(supervisor),
                 name="network-supervisor-observe",
+            )
+
+            # PR3 (2026-06-27) BOOT card lifespan side-task: shows
+            # the "openmarquee.local" identity card for ~4 seconds
+            # right after startup so a user watching the sign at
+            # boot learns the device address without needing the
+            # portal. Fires after supervisor is wired so its default
+            # kind-per-state emit doesn't overwrite the BOOT card
+            # immediately.
+            async def _emit_boot_card_then_yield() -> None:
+                try:
+                    # Small delay so the initial state emit
+                    # (SETUP/ONLINE from persisted state) lands
+                    # first — we want BOOT to be the visible card,
+                    # not immediately clobbered.
+                    await asyncio.sleep(0.1)
+                    get_renderer().render_system_card(
+                        {
+                            "kind": "BOOT",
+                            "address": "openmarquee.local",
+                            "ttl_ms": 4000,
+                        }
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug("boot card emit failed (renderer not ready?)")
+
+            asyncio.create_task(  # noqa: RUF006 — fire-and-forget
+                _emit_boot_card_then_yield(),
+                name="system-card-boot",
             )
             # P1.2-B (2026-06-10): take-over evaluation. Env-gated by
             # OPENMARQUEE_NETWORK_TAKEOVER_ENABLED=1 (default OFF

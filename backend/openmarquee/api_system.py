@@ -725,3 +725,164 @@ async def memory_snapshot(limit: int = 20) -> MemorySnapshot:
             for stat in stats
         ],
     )
+
+
+# ============================================================
+# PR3 (2026-06-27) — auth-gated onboarding-card preview endpoint.
+#
+# POST /api/system/render-system-card-preview lets QA drive one
+# specific card state onto the sign for glass-verify WITHOUT
+# driving the full supervisor state machine (which would toggle
+# real wifi state on production and risk stranding the sign).
+#
+# Auth-gated by NOT being in auth_middleware's allowlist — every
+# `/api/system/*` route except `/csp-report` requires a bearer
+# token, so this inherits the same operator-only trust boundary.
+# ============================================================
+
+
+# PR3 finish-pass (2026-07-01): field byte-caps mirror the Rust-side
+# clamps in renderer/src/system_card.rs so an oversized payload
+# fails HERE (HTTP 422) with a clear error rather than being
+# silently truncated on the paint side.
+_MAX_SSID_LEN = 40
+_MAX_PIN_LEN = 12
+_MAX_QR_PAYLOAD_LEN = 256
+_MAX_ADDRESS_LEN = 128
+_MAX_IP_LEN = 45
+_MAX_BOOT_HINT_LEN = 96
+_ALLOWED_KINDS = frozenset({"SETUP", "CONNECTING", "CONNECTED", "DEGRADED", "BOOT"})
+_ALLOWED_VARIANTS = frozenset({"lost", "auth_fail", "not_found_or_5ghz"})
+
+
+class RenderSystemCardPreviewRequest(BaseModel):
+    """Auth-gated preview endpoint payload. Every field except `kind`
+    is optional so QA can render minimal cards; the renderer's per-
+    kind layout falls back to sensible defaults where needed."""
+
+    kind: str
+    ssid: str | None = None
+    pin: str | None = None
+    qr_payload: str | None = None
+    address: str | None = None
+    ip: str | None = None
+    target_ssid: str | None = None
+    variant: str | None = None
+    ttl_ms: int | None = None
+    boot_hint: str | None = None
+
+
+class RenderSystemCardPreviewResponse(BaseModel):
+    status: str
+
+
+def _check_len(field: str, value: str | None, cap: int) -> None:
+    if value is None:
+        return
+    if len(value) > cap:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{field} exceeds {cap}-byte cap",
+        )
+
+
+@router.post(
+    "/render-system-card-preview",
+    response_model=RenderSystemCardPreviewResponse,
+)
+async def render_system_card_preview(
+    body: RenderSystemCardPreviewRequest,
+) -> RenderSystemCardPreviewResponse:
+    """PR3 (2026-06-27) glass-verify hook: push one RenderSystemCard
+    to the live renderer so QA can inspect each card state on the
+    sign without driving the supervisor state machine (which would
+    toggle real wifi state on production).
+
+    Strand-safe: it does NOT touch the supervisor or the wifi
+    stack — only the renderer's overlay slot. The next real
+    supervisor transition (or the ttl_ms elapsing) reverts the
+    overlay. Also strand-safe when the renderer is unhealthy: an
+    IPC failure is caught inside the RustRenderer wrapper and
+    downgraded to a warn log.
+    """
+    kind = body.kind.upper()
+    if kind not in _ALLOWED_KINDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"kind must be one of {sorted(_ALLOWED_KINDS)}; got {body.kind!r}",
+        )
+    if body.variant is not None and body.variant not in _ALLOWED_VARIANTS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"variant must be one of {sorted(_ALLOWED_VARIANTS)}; got {body.variant!r}",
+        )
+    _check_len("ssid", body.ssid, _MAX_SSID_LEN)
+    _check_len("pin", body.pin, _MAX_PIN_LEN)
+    _check_len("qr_payload", body.qr_payload, _MAX_QR_PAYLOAD_LEN)
+    _check_len("address", body.address, _MAX_ADDRESS_LEN)
+    _check_len("ip", body.ip, _MAX_IP_LEN)
+    _check_len("target_ssid", body.target_ssid, _MAX_ADDRESS_LEN)
+    _check_len("boot_hint", body.boot_hint, _MAX_BOOT_HINT_LEN)
+    if body.ttl_ms is not None and (body.ttl_ms < 0 or body.ttl_ms > 3_600_000):
+        raise HTTPException(
+            status_code=422,
+            detail="ttl_ms must be in [0, 3_600_000]",
+        )
+
+    # Build the params dict — drop None fields so the Rust side's
+    # `#[serde(default)]` picks them up as absent rather than
+    # explicit null.
+    params: dict[str, object] = {"kind": kind}
+    for name in (
+        "ssid",
+        "pin",
+        "qr_payload",
+        "address",
+        "ip",
+        "target_ssid",
+        "variant",
+        "ttl_ms",
+        "boot_hint",
+    ):
+        val = getattr(body, name)
+        if val is not None:
+            params[name] = val
+
+    # Import locally so the preview endpoint doesn't force the
+    # renderer singleton to materialize on import — matches the
+    # deferred-import pattern the rest of api_system.py uses.
+    from openmarquee.dependencies import get_renderer
+
+    renderer = get_renderer()
+    try:
+        renderer.render_system_card(params)
+    except Exception as e:  # noqa: BLE001
+        log.warning("render_system_card_preview: renderer.render_system_card failed: %s", e)
+        raise HTTPException(
+            status_code=502,
+            detail=f"renderer render_system_card failed: {e}",
+        ) from e
+    return RenderSystemCardPreviewResponse(status="rendered")
+
+
+@router.post(
+    "/clear-system-card-preview",
+    response_model=RenderSystemCardPreviewResponse,
+)
+async def clear_system_card_preview() -> RenderSystemCardPreviewResponse:
+    """PR3 (2026-06-27) glass-verify hook: push a ClearSystemCard.
+    Companion to render-system-card-preview so QA can revert to
+    the playlist paint without waiting for a ttl to elapse.
+    """
+    from openmarquee.dependencies import get_renderer
+
+    renderer = get_renderer()
+    try:
+        renderer.clear_system_card()
+    except Exception as e:  # noqa: BLE001
+        log.warning("clear_system_card_preview: renderer.clear_system_card failed: %s", e)
+        raise HTTPException(
+            status_code=502,
+            detail=f"renderer clear_system_card failed: {e}",
+        ) from e
+    return RenderSystemCardPreviewResponse(status="cleared")

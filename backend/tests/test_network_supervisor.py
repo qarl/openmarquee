@@ -947,3 +947,170 @@ class TestLingerTimer:
             sup = NetworkSupervisor(config=config)
             assert sup.current_state == s
             assert sup.linger_entered_at is None, f"state={s} should not seed entered_at"
+
+
+# ============================================================
+# PR3 (2026-06-27) — supervisor system-card publisher on transitions.
+# ============================================================
+
+
+class _RecordingSystemCardPublisher:
+    """Recording stub for the SystemCardPublisher contract: exposes
+    `.render(params)` and `.clear()` and appends every call to a list
+    so tests can assert on the emit sequence."""
+
+    def __init__(self):
+        self.render_calls: list[dict] = []
+        self.clear_calls: int = 0
+
+    def render(self, params: dict) -> None:
+        self.render_calls.append(dict(params))
+
+    def clear(self) -> None:
+        self.clear_calls += 1
+
+
+class TestSystemCardOnTransition:
+    """The supervisor's `_on_transition` publishes a RenderSystemCard
+    matching the new state OR a ClearSystemCard when the new state
+    is ONLINE (spec §"Onboarding state machine": ONLINE = AP off, no
+    overlay). Every path to ONLINE must clear."""
+
+    def _make(self, tmp_path: Path, publisher, *, fallback_mutex: bool = False):
+        config = SupervisorConfig(
+            fallback_mutex_mode=fallback_mutex,
+            state_file=tmp_path / "network-state.json",
+        )
+        return NetworkSupervisor(config=config, system_card_publisher=publisher)
+
+    def test_setup_to_connecting_renders_connecting_card(self, tmp_path: Path):
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        assert sup.current_state == SupervisorState.CONNECTING
+        kinds = [c.get("kind") for c in pub.render_calls]
+        assert kinds == ["CONNECTING"]
+        assert pub.clear_calls == 0
+
+    def test_connecting_to_linger_renders_connected_card(self, tmp_path: Path):
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        assert sup.current_state == SupervisorState.LINGER
+        kinds = [c.get("kind") for c in pub.render_calls]
+        assert kinds == ["CONNECTING", "CONNECTED"]
+
+    def test_linger_to_online_clears_card(self, tmp_path: Path):
+        """Concurrent-regime path to ONLINE — the canonical spec
+        path."""
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+        assert sup.current_state == SupervisorState.ONLINE
+        assert pub.clear_calls == 1
+
+    def test_connecting_to_online_in_mutex_mode_clears_card(self, tmp_path: Path):
+        """Mutex-regime path to ONLINE: CONNECTING skips LINGER and
+        goes straight to ONLINE on STA_ASSOCIATED. Card must clear."""
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub, fallback_mutex=True)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → ONLINE (mutex)
+        assert sup.current_state == SupervisorState.ONLINE
+        assert pub.clear_calls == 1
+
+    def test_degraded_to_online_in_mutex_mode_clears_card(self, tmp_path: Path):
+        """Mutex-regime DEGRADED reassociates directly to ONLINE. Card
+        must clear on that path too."""
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub, fallback_mutex=True)
+        # Get to DEGRADED via CONNECTING -> ONLINE -> STA_DISCONNECTED.
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → ONLINE
+        sup.apply_event(SupervisorEvent.STA_DISCONNECTED)  # → DEGRADED
+        assert sup.current_state == SupervisorState.DEGRADED
+        clears_before = pub.clear_calls
+        # Re-associate → back to ONLINE (mutex path).
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        assert sup.current_state == SupervisorState.ONLINE
+        assert pub.clear_calls == clears_before + 1
+
+    def test_linger_to_degraded_renders_degraded_card(self, tmp_path: Path):
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        sup.apply_event(SupervisorEvent.STA_DISCONNECTED)  # → DEGRADED
+        assert sup.current_state == SupervisorState.DEGRADED
+        # The last render was DEGRADED with variant "lost".
+        assert pub.render_calls[-1].get("kind") == "DEGRADED"
+        assert pub.render_calls[-1].get("variant") == "lost"
+
+    def test_online_to_degraded_renders_degraded_card(self, tmp_path: Path):
+        """ONLINE→DEGRADED must render the DEGRADED card (portal
+        recovery path). Also confirms a clear from the earlier
+        LINGER→ONLINE happened."""
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+        assert pub.clear_calls == 1
+        sup.apply_event(SupervisorEvent.STA_DISCONNECTED)  # → DEGRADED
+        assert sup.current_state == SupervisorState.DEGRADED
+        assert pub.render_calls[-1].get("kind") == "DEGRADED"
+
+    def test_operator_setup_mode_from_online_renders_setup_card(self, tmp_path: Path):
+        """Operator-driven ONLINE→SETUP (Setup Mode re-entry) must
+        also render the SETUP card so the sign shows the join QR."""
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+        sup.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
+        assert sup.current_state == SupervisorState.SETUP
+        assert pub.render_calls[-1].get("kind") == "SETUP"
+
+    def test_publisher_failure_is_downgraded_to_warn_diag(self, tmp_path: Path):
+        """A publisher that raises must NOT wedge apply_event; the
+        transition still lands and a warn diagnostic is emitted."""
+
+        class BustedPublisher:
+            def render(self, params: dict) -> None:
+                raise RuntimeError("simulated renderer death")
+
+            def clear(self) -> None:
+                raise RuntimeError("simulated renderer death")
+
+        sup = self._make(tmp_path, BustedPublisher())
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        assert sup.current_state == SupervisorState.CONNECTING
+        # No exception propagated. Diag ring buffer records the warn.
+        warns = [
+            e
+            for e in sup.snapshot_diagnostics()
+            if e.severity == "warn"
+            and e.source == "system_card"
+            and "publisher failed" in e.message
+        ]
+        assert warns, "expected a system_card warn diagnostic on publisher failure"
+
+    def test_default_stub_records_diagnostic_only(self, tmp_path: Path):
+        """When no publisher is injected the default observe-only
+        stub emits a diagnostic per transition — so a supervisor
+        without a Renderer wired still produces a grep-able trail."""
+        config = SupervisorConfig(state_file=tmp_path / "network-state.json")
+        sup = NetworkSupervisor(config=config)  # default publisher
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        infos = [
+            e
+            for e in sup.snapshot_diagnostics()
+            if e.severity == "info"
+            and e.source == "system_card"
+            and "would render kind=CONNECTING" in e.message
+        ]
+        assert infos, "expected a would-render info diagnostic"

@@ -6317,4 +6317,185 @@ mod tests {
         }
         Some(lines[start..pos].join("\n"))
     }
+
+    // ============================================================
+    // PR3 (2026-06-27) — IPC handler for RenderSystemCard /
+    // ClearSystemCard: ttl math + slot set/clear. Runs on Linux
+    // only because the active slot lives behind #[cfg(linux)]; the
+    // host build's PaintSlide branch never touches state.active_-
+    // system_card so these behaviours are a no-op there.
+    // ============================================================
+
+    #[cfg(target_os = "linux")]
+    fn system_card_params(kind: crate::playback::SystemCardKind) -> crate::playback::RenderSystemCardParams {
+        crate::playback::RenderSystemCardParams {
+            kind,
+            ssid: None,
+            pin: None,
+            qr_payload: None,
+            address: None,
+            ip: None,
+            target_ssid: None,
+            variant: None,
+            ttl_ms: None,
+            boot_hint: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_ttl_none_leaves_deadline_none() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::default();
+        let mut p = system_card_params(crate::playback::SystemCardKind::Setup);
+        p.ttl_ms = None;
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        assert!(card.deadline.is_none(), "ttl_ms=None must map to no deadline");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_ttl_zero_maps_to_none() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::default();
+        let mut p = system_card_params(crate::playback::SystemCardKind::Setup);
+        p.ttl_ms = Some(0);
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        assert!(
+            card.deadline.is_none(),
+            "ttl_ms=0 must collapse to None (until-state-change)"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_ttl_positive_sets_future_deadline() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::default();
+        let mut p = system_card_params(crate::playback::SystemCardKind::Connected);
+        p.ttl_ms = Some(5_000);
+        let before = std::time::Instant::now();
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        let deadline = card.deadline.expect("ttl_ms>0 must set a deadline");
+        let elapsed_to_deadline = deadline.saturating_duration_since(before);
+        assert!(
+            elapsed_to_deadline >= std::time::Duration::from_millis(4_990),
+            "deadline earlier than expected: got {:?}",
+            elapsed_to_deadline
+        );
+        assert!(
+            elapsed_to_deadline <= std::time::Duration::from_millis(5_500),
+            "deadline later than expected: got {:?}",
+            elapsed_to_deadline
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clear_system_card_clears_slot() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::default();
+        let p = system_card_params(crate::playback::SystemCardKind::Setup);
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(state.active_system_card.is_some());
+        let _resp = handle_inner_request(
+            IpcRequest::ClearSystemCard,
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(state.active_system_card.is_none(), "ClearSystemCard must clear slot");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_replaces_active_card() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::default();
+        let mut first = system_card_params(crate::playback::SystemCardKind::Setup);
+        first.ssid = Some("first".to_string());
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(first),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let mut second = system_card_params(crate::playback::SystemCardKind::Connecting);
+        second.target_ssid = Some("second".to_string());
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(second),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        assert_eq!(card.params.kind, crate::playback::SystemCardKind::Connecting);
+        assert_eq!(card.params.target_ssid.as_deref(), Some("second"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn begin_slide_safety_net_clears_active_system_card() {
+        // Even without a valid slide_id in the cache, BeginSlide's
+        // safety-net clear on state.active_system_card must fire
+        // BEFORE the load path runs. We only assert that the slot
+        // becomes None; the response may Err on the unknown slide.
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::default();
+        // Prime the slot.
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(system_card_params(
+                crate::playback::SystemCardKind::Setup,
+            )),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(state.active_system_card.is_some());
+        // Now BeginSlide with an unknown id — safety-net clears
+        // the slot regardless of the load outcome.
+        let _resp = handle_inner_request(
+            IpcRequest::BeginSlide(BeginSlideParams {
+                slide_id: uuid(1),
+                t0_ms: 0,
+                duration_ms: 1_000,
+            }),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(
+            state.active_system_card.is_none(),
+            "BeginSlide must clear an active system card as a safety net"
+        );
+    }
 }

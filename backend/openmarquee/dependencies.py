@@ -252,6 +252,43 @@ class AutoFallbackRenderer:
         except RustRendererSubprocessError as e:
             self._swap_to_mock(f"reopen: {e}")
 
+    def render_system_card(self, params: dict) -> None:
+        """PR3 (2026-06-27): forward the onboarding-card render to
+        whichever renderer is currently active. Swap-to-mock on
+        subprocess-layer death matches the render_frame / reopen
+        forwarders; a card render failure must never wedge the
+        supervisor."""
+        if self._mock is not None:
+            self._mock.render_system_card(params)
+            return
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        try:
+            self._primary.render_system_card(params)
+        except RustRendererSubprocessError as e:
+            self._swap_to_mock(f"render_system_card: {e}")
+            if self._mock is not None:
+                self._mock.render_system_card(params)
+
+    def clear_system_card(self) -> None:
+        """PR3 (2026-06-27): forward the onboarding-card clear.
+        Same swap-to-mock policy as render_system_card."""
+        if self._mock is not None:
+            self._mock.clear_system_card()
+            return
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        try:
+            self._primary.clear_system_card()
+        except RustRendererSubprocessError as e:
+            self._swap_to_mock(f"clear_system_card: {e}")
+            if self._mock is not None:
+                self._mock.clear_system_card()
+
     # --- Lifecycle ---
 
     def open(self):

@@ -271,3 +271,156 @@ def test_info_cors_for_captive_portal_ap_origin(client: TestClient):
     )
     assert response.status_code == 200
     assert response.headers.get("access-control-allow-origin") == ("http://192.168.4.1")
+
+
+# ============================================================
+# PR3 (2026-06-27) — /api/system/render-system-card-preview
+# ============================================================
+
+
+class _RecordingRenderer:
+    """Test double for the Renderer protocol's system-card methods.
+    Just records the calls so tests can assert on them without
+    booting the real IPC subprocess."""
+
+    def __init__(self):
+        self.render_calls: list[dict] = []
+        self.clear_calls: int = 0
+        # A minimal subset of the wider Renderer protocol so
+        # get_renderer's callers don't blow up on attribute access.
+        self.width = 1920
+        self.height = 1080
+
+    def render_system_card(self, params: dict) -> None:
+        self.render_calls.append(dict(params))
+
+    def clear_system_card(self) -> None:
+        self.clear_calls += 1
+
+
+@pytest.fixture
+def recording_renderer(monkeypatch):
+    renderer = _RecordingRenderer()
+    # api_system does `from openmarquee.dependencies import get_renderer`
+    # inside the handler, so we patch the dependencies-module symbol.
+    from openmarquee import dependencies as deps
+
+    monkeypatch.setattr(deps, "get_renderer", lambda: renderer)
+    return renderer
+
+
+class TestRenderSystemCardPreview:
+    def test_happy_path_setup_card(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={
+                "kind": "SETUP",
+                "ssid": "openMarquee-Setup",
+                "pin": "4827",
+                "qr_payload": "WIFI:T:WPA;S:openMarquee-Setup;P:4827;;",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"status": "rendered"}
+        assert len(recording_renderer.render_calls) == 1
+        assert recording_renderer.render_calls[0]["kind"] == "SETUP"
+        assert recording_renderer.render_calls[0]["ssid"] == "openMarquee-Setup"
+
+    def test_omits_none_fields(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "CONNECTING", "target_ssid": "HomeWiFi"},
+        )
+        assert response.status_code == 200
+        params = recording_renderer.render_calls[0]
+        assert params == {"kind": "CONNECTING", "target_ssid": "HomeWiFi"}
+        # None fields must NOT appear as explicit null in the params
+        assert "ssid" not in params
+        assert "pin" not in params
+
+    def test_rejects_unknown_kind(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "NOT_A_KIND"},
+        )
+        assert response.status_code == 422
+        assert recording_renderer.render_calls == []
+
+    def test_rejects_unknown_variant(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "DEGRADED", "variant": "not_a_variant"},
+        )
+        assert response.status_code == 422
+
+    def test_rejects_oversize_qr_payload(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "SETUP", "qr_payload": "A" * 500},
+        )
+        assert response.status_code == 422
+
+    def test_rejects_oversize_ssid(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "SETUP", "ssid": "S" * 200},
+        )
+        assert response.status_code == 422
+
+    def test_rejects_negative_ttl(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "BOOT", "ttl_ms": -1},
+        )
+        assert response.status_code == 422
+
+    def test_maps_kind_to_uppercase(self, client: TestClient, recording_renderer):
+        """Case tolerance: the Rust side uses UPPERCASE serde
+        rename; the endpoint accepts either case for convenience
+        but normalises."""
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "setup"},
+        )
+        assert response.status_code == 200
+        assert recording_renderer.render_calls[0]["kind"] == "SETUP"
+
+    def test_502_on_renderer_failure(self, client: TestClient, monkeypatch):
+        class BustedRenderer:
+            width = 1920
+            height = 1080
+
+            def render_system_card(self, params: dict) -> None:
+                raise RuntimeError("subprocess dead")
+
+        from openmarquee import dependencies as deps
+
+        monkeypatch.setattr(deps, "get_renderer", lambda: BustedRenderer())
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "SETUP"},
+        )
+        assert response.status_code == 502
+        assert "subprocess dead" in response.text
+
+
+class TestClearSystemCardPreview:
+    def test_happy_path(self, client: TestClient, recording_renderer):
+        response = client.post("/api/system/clear-system-card-preview")
+        assert response.status_code == 200
+        assert response.json() == {"status": "cleared"}
+        assert recording_renderer.clear_calls == 1
+
+    def test_502_on_renderer_failure(self, client: TestClient, monkeypatch):
+        class BustedRenderer:
+            width = 1920
+            height = 1080
+
+            def clear_system_card(self) -> None:
+                raise RuntimeError("subprocess dead")
+
+        from openmarquee import dependencies as deps
+
+        monkeypatch.setattr(deps, "get_renderer", lambda: BustedRenderer())
+        response = client.post("/api/system/clear-system-card-preview")
+        assert response.status_code == 502
