@@ -773,3 +773,140 @@ class TestAutoFallbackRenderer:
             "UnsupportedSlideError must be caught BEFORE SubprocessError "
             "(see slice-4 dispatch subagent-review item #1)"
         )
+
+
+# ============================================================
+# PR3 fix-pass F1 (2026-07-01) — card-path errors must NOT
+# demote the shared playback renderer to Mock. Otherwise a
+# transient BOOT-card-during-cold-start blip would blank the
+# whole video pipeline on a fresh boot.
+# ============================================================
+
+
+class _CardRaisingRenderer:
+    """Minimal RustRenderer stand-in whose card ops always raise
+    RustRendererSubprocessError, but whose lifecycle / render_frame
+    surface stays alive so AutoFallbackRenderer's default fallback
+    trigger (render_frame) is NOT auto-fired by the fixture."""
+
+    def __init__(self):
+        self.width = 1920
+        self.height = 1080
+        self.render_system_card_calls = 0
+        self.clear_system_card_calls = 0
+
+    def render_system_card(self, params):
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        self.render_system_card_calls += 1
+        raise RustRendererSubprocessError("simulated subprocess death on card path")
+
+    def clear_system_card(self):
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        self.clear_system_card_calls += 1
+        raise RustRendererSubprocessError("simulated subprocess death on card path")
+
+
+def _mock_factory():
+    """MockRenderer factory that produces a temp-output-path Mock
+    with fixed dims so the AutoFallback swap path doesn't blow up
+    on missing constructor args."""
+    import tempfile
+    from pathlib import Path
+
+    from openmarquee.rendering.mock import MockRenderer
+
+    tmp = Path(tempfile.mkdtemp(prefix="pr3-mock-")) / "preview.png"
+    return MockRenderer(width=1920, height=1080, output_path=tmp)
+
+
+class TestCardPathDoesNotDemotePrimary:
+    def test_render_system_card_failure_does_not_swap_to_mock(self):
+        """A card-path subprocess error must NOT flip
+        is_in_fallback → the shared video pipeline stays on the
+        real Rust renderer. This is F1's core contract."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        primary = _CardRaisingRenderer()
+        wrapper = AutoFallbackRenderer(primary=primary, mock_factory=_mock_factory)
+        assert wrapper.is_in_fallback is False
+        with pytest.raises(RustRendererSubprocessError):
+            wrapper.render_system_card({"kind": "SETUP"})
+        # The card path re-raises so the caller (SystemCardPublisher /
+        # preview endpoint) sees the error, but the primary is
+        # UNTOUCHED — no fallback swap.
+        assert wrapper.is_in_fallback is False
+        assert wrapper._primary is primary
+        assert wrapper._mock is None
+
+    def test_clear_system_card_failure_does_not_swap_to_mock(self):
+        """Mirror of render_system_card — clear path also stays on
+        primary through a subprocess error."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        primary = _CardRaisingRenderer()
+        wrapper = AutoFallbackRenderer(primary=primary, mock_factory=_mock_factory)
+        with pytest.raises(RustRendererSubprocessError):
+            wrapper.clear_system_card()
+        assert wrapper.is_in_fallback is False
+
+    def test_video_path_still_swaps_on_subprocess_error(self):
+        """F1 is scoped to the CARD path: the video path
+        (render_frame) MUST still trigger the swap-to-mock (the
+        video pipeline is broken if the subprocess dies)."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        class _VideoRaisingRenderer(_CardRaisingRenderer):
+            def render_frame(self, frame, **kwargs):
+                raise RustRendererSubprocessError("simulated on render_frame")
+
+            def end_external_frames(self) -> None:
+                pass
+
+        primary = _VideoRaisingRenderer()
+        wrapper = AutoFallbackRenderer(primary=primary, mock_factory=_mock_factory)
+        assert wrapper.is_in_fallback is False
+        wrapper.render_frame(b"\x00" * (1920 * 1080 * 3))
+        assert wrapper.is_in_fallback is True
+
+    def test_card_path_after_video_fallback_forwards_to_mock(self):
+        """Once render_frame has demoted the primary, subsequent
+        card-path calls forward to the mock without raising."""
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        class _VideoRaisingRenderer(_CardRaisingRenderer):
+            def render_frame(self, frame, **kwargs):
+                raise RustRendererSubprocessError("boom")
+
+            def end_external_frames(self) -> None:
+                pass
+
+        primary = _VideoRaisingRenderer()
+        wrapper = AutoFallbackRenderer(primary=primary, mock_factory=_mock_factory)
+        # Full-frame bytes so the mock's downstream render_frame
+        # (post-swap) doesn't ValueError on a short payload.
+        wrapper.render_frame(b"\x00" * (1920 * 1080 * 3))
+        assert wrapper.is_in_fallback
+        # Now render_system_card forwards to the mock without
+        # raising — the mock records the call.
+        wrapper.render_system_card({"kind": "SETUP"})
+        wrapper.clear_system_card()
+        assert wrapper._mock.system_card_calls == [{"kind": "SETUP"}]
+        assert wrapper._mock.clear_system_card_calls == 1

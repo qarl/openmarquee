@@ -7932,6 +7932,18 @@ impl<'a> EglSession<'a> {
         self.gl
     }
 
+    /// PR3 (2026-06-27): logical render-target width in pixels.
+    /// Used by `maybe_paint_system_card_overlay` to scale the
+    /// normalized card shapes (0..1) to physical pixels.
+    pub fn mode_w(&self) -> u16 {
+        self.mode_w
+    }
+
+    /// PR3 (2026-06-27): logical render-target height in pixels.
+    pub fn mode_h(&self) -> u16 {
+        self.mode_h
+    }
+
     /// v1-spec-delta #10 (slice c) -- update cached settings.
     /// paint_and_present_one_frame_for_slide consults
     /// current_settings.is_color_identity() to decide whether
@@ -17348,6 +17360,402 @@ impl ObjectProps {
             .map(|(_, id)| *id)
             .ok_or_else(|| anyhow!("property {name:?} not found on object"))
     }
+}
+
+// ============================================================
+// PR3 (2026-06-27) onboarding system-card MVP paint.
+//
+// Per QA call (b): BG color-fill + text rendering via the existing
+// MSDF stack. Monogram/chip/QR/spinner primitives ship in PR3.1.
+//
+// The supervisor sends RenderSystemCard which sets
+// state.active_system_card. On each frame, paint_and_present_*
+// callers check for an active card and, if present, paint it
+// instead of the playlist content. The card auto-clears when its
+// optional ttl deadline elapses, OR on explicit ClearSystemCard
+// (the supervisor sends this on ONLINE).
+// ============================================================
+
+/// PR3 finish-pass safety cap for `ttl_ms=None` cards: even the
+/// "until-state-change" cards (SETUP/CONNECTING/DEGRADED) get
+/// force-cleared after this window so a supervisor crash / missed-
+/// ClearSystemCard can never wedge the sign forever. 60 minutes is
+/// long enough that a legitimate slow onboarding never trips it
+/// but short enough that a wedged sign self-heals within an hour.
+const SYSTEM_CARD_MAX_LIFETIME_S: u64 = 60 * 60;
+
+/// MVP system-card overlay paint + present.
+///
+/// Returns Ok(true) when a card was painted AND presented to the
+/// panel (the per-frame caller should skip the normal playlist
+/// paint for this frame — the frame is already on scanout). Returns
+/// Ok(false) when no card is active OR the ttl deadline has just
+/// elapsed (the caller falls through to normal playlist paint).
+///
+/// Present sequence mirrors `paint_and_present_one_frame_for_slide`
+/// verbatim: `eglSwapBuffers` → `gbm_surface.lock_front_buffer` →
+/// `add_framebuffer` → `commit_fb` → `rotate_scanout_3_deep`. The
+/// PR3-original hook was inert (drew to the FBO but never swapped)
+/// which froze the sign on the last playlist frame for the whole
+/// onboarding — QA review 2026-07-01 called this out as the sign-
+/// freezing bug. The full present-sequence here is what makes the
+/// card actually reach the panel.
+///
+/// PR3 MVP scope: paints Background (glClear) + Text (synthetic
+/// TextLayer through the existing MSDF stack) + QR panel
+/// (scissored glClear-per-module). Monogram / Chip / Spinner /
+/// Footer / BootHint remain on the skip arm — PR3.1 fidelity.
+pub fn maybe_paint_system_card_overlay(
+    state: &mut crate::playback::PlaybackState,
+    session: &mut EglSession,
+    card_drm: &Card,
+) -> Result<bool> {
+    use crate::system_card::CardShape;
+
+    // 1. Snapshot + ttl deadline check + max-lifetime safety cap.
+    //    An expired card clears the slot + returns "no card active"
+    //    so the playlist paint resumes on the next frame.
+    {
+        let Some(card) = state.active_system_card.as_ref() else {
+            return Ok(false);
+        };
+        let now = std::time::Instant::now();
+        // Deadline (from RenderSystemCard.ttl_ms > 0) OR the
+        // absolute max-lifetime cap (ttl_ms=None safety net).
+        let ttl_expired = card
+            .deadline
+            .map(|d| now >= d)
+            .unwrap_or(false);
+        let max_life_expired = card.activated_at.elapsed().as_secs()
+            >= SYSTEM_CARD_MAX_LIFETIME_S;
+        if ttl_expired || max_life_expired {
+            state.active_system_card = None;
+            return Ok(false);
+        }
+    }
+
+    // 2. Clone the shape list so we can release the borrow on
+    //    state.active_system_card before per-shape draws that may
+    //    mutate the session.
+    let shapes: Vec<CardShape> = state
+        .active_system_card
+        .as_ref()
+        .map(|c| c.shapes.clone())
+        .unwrap_or_default();
+
+    let (gl, mode_w, mode_h) = {
+        let gl: *const glow::Context = session.gl();
+        (gl, u32::from(session.mode_w()), u32::from(session.mode_h()))
+    };
+    // SAFETY: session outlives this borrow; we only read gl and
+    // never through-cast to a mutable borrow.
+    let gl: &glow::Context = unsafe { &*gl };
+
+    // 3. Paint the shape list. PR3 MVP renders Background + Text +
+    //    QrPanel (via scissored glClear so we don't need to compile
+    //    a texture-quad shader for the MVP). Other shapes silently
+    //    skip in this pass — PR3.1 lands the monogram / chip /
+    //    spinner / footer primitives.
+    use glow::HasContext;
+    unsafe {
+        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        gl.disable(glow::SCISSOR_TEST);
+    }
+    for shape in &shapes {
+        match shape {
+            CardShape::Background { color } => unsafe {
+                gl.disable(glow::SCISSOR_TEST);
+                gl.clear_color(
+                    f32::from(color.0) / 255.0,
+                    f32::from(color.1) / 255.0,
+                    f32::from(color.2) / 255.0,
+                    1.0,
+                );
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            },
+            CardShape::Text {
+                anchor,
+                max_height,
+                color,
+                font,
+                text,
+                align,
+            } => {
+                paint_system_card_text(
+                    gl, mode_w, mode_h, *anchor, *max_height, *color, *font, *align, text,
+                )?;
+            }
+            CardShape::QrPanel {
+                top_left,
+                size,
+                payload,
+                caption: _caption,
+            } => {
+                paint_system_card_qr_panel(gl, mode_w, mode_h, *top_left, *size, payload);
+            }
+            // PR3.1 follow-ups: monogram tile, solid-fill state
+            // chip, spinner, footer, boot hint. Silently skipped
+            // in PR3 MVP — a per-frame log would flood the journal
+            // at ~30 Hz.
+            _ => {
+                let _ = shape;
+            }
+        }
+    }
+    unsafe {
+        gl.disable(glow::SCISSOR_TEST);
+    }
+
+    // 4. PRESENT — the critical piece the original PR3 was missing.
+    //    Same sequence as paint_and_present_one_frame_for_slide.
+    session.maybe_live_preview_capture();
+    session
+        .egl_lib
+        .swap_buffers(session.display, session.egl_surface)
+        .map_err(|e| anyhow!("eglSwapBuffers (system-card) failed: {e:?}"))?;
+    let new_bo = unsafe {
+        session
+            .gbm_surface
+            .lock_front_buffer()
+            .context("gbm_surface_lock_front_buffer (system-card) failed")?
+    };
+    let fb_buf = GbmBufferAdapter::new(&new_bo)
+        .context("read GBM bo metadata (system-card)")?;
+    let new_fb = card_drm
+        .add_framebuffer(&fb_buf, 32, 32)
+        .map_err(|e| anyhow!("drmModeAddFB (system-card) failed: {e}"))?;
+    if let Err(e) = commit_fb(session, card_drm, new_fb) {
+        // Roll back: free the FB + drop the BO before propagating.
+        if let Err(de) = card_drm.destroy_framebuffer(new_fb) {
+            eprintln!(
+                "warn: system-card cleanup destroy_framebuffer({new_fb:?}) on commit-fail: {de}"
+            );
+        }
+        drop(new_bo);
+        return Err(e);
+    }
+    // 3-deep scanout rotation matches the flip-race-fix-D pattern
+    // used by every other paint arm.
+    rotate_scanout_3_deep(session, card_drm, new_bo, new_fb, "system_card");
+
+    Ok(true)
+}
+
+/// Paint one QR code inside its layout panel. White background
+/// spans `size` × `size` of card width, `top_left` in normalized
+/// (0..1) coords. Dark modules render as scissored glClear rects.
+///
+/// Uses scissored glClear rather than a textured-quad shader so
+/// the MVP doesn't need a new pipeline; O(N²) clears with N≈25
+/// costs ~625 clears at up to 30 Hz — trivial for vc4 GLES2.
+fn paint_system_card_qr_panel(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    top_left: (f32, f32),
+    size: f32,
+    payload: &str,
+) {
+    use glow::HasContext;
+
+    let panel_x_px = (top_left.0 * mode_w as f32) as i32;
+    let panel_y_px = (top_left.1 * mode_h as f32) as i32;
+    let panel_w_px = (size * mode_w as f32) as i32;
+    let panel_h_px = panel_w_px; // square panel
+
+    // GL scissor Y is bottom-origin; convert card-space top-left
+    // (top-origin) to bottom-origin.
+    let panel_y_bl = mode_h as i32 - panel_y_px - panel_h_px;
+
+    // 1. White panel background.
+    unsafe {
+        gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(panel_x_px, panel_y_bl, panel_w_px, panel_h_px);
+        gl.clear_color(1.0, 1.0, 1.0, 1.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+
+    // 2. Encode + draw modules. If encoding fails (payload too
+    //    long / malformed) the panel just shows as white; the
+    //    supervisor's diagnostic ring buffer records the failure.
+    let Ok(qr) = crate::qr::encode_qr(payload) else {
+        eprintln!(
+            "[system-card] qr encode failed for payload of length {}; drawing empty panel",
+            payload.len()
+        );
+        unsafe {
+            gl.disable(glow::SCISSOR_TEST);
+        }
+        return;
+    };
+
+    // Inset the QR modules by ~5% of the panel to give a quiet
+    // zone (spec: 4-module quiet zone; 5% at typical QR sizes is
+    // close enough for the MVP).
+    let quiet_zone_frac = 0.05;
+    let inner_offset = (panel_w_px as f32 * quiet_zone_frac) as i32;
+    let inner_w = panel_w_px - 2 * inner_offset;
+    let module_px = (inner_w as f32 / qr.size as f32).max(1.0);
+
+    unsafe {
+        gl.clear_color(0.0, 0.0, 0.0, 1.0);
+    }
+    for y in 0..qr.size {
+        for x in 0..qr.size {
+            if !qr.module(x, y) {
+                continue;
+            }
+            let mx_px = panel_x_px + inner_offset + (x as f32 * module_px) as i32;
+            let my_px = panel_y_px + inner_offset + (y as f32 * module_px) as i32;
+            // Round up so adjacent modules touch (avoids single-
+            // pixel white seams at fractional sizes).
+            let mw_px = module_px.ceil() as i32;
+            let mh_px = module_px.ceil() as i32;
+            // Convert to bottom-origin for scissor.
+            let my_bl = mode_h as i32 - my_px - mh_px;
+            unsafe {
+                gl.scissor(mx_px, my_bl, mw_px, mh_px);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+        }
+    }
+    unsafe {
+        gl.disable(glow::SCISSOR_TEST);
+    }
+}
+
+/// PR3 MVP system-card text paint. Builds a synthetic TextLayer
+/// (so the existing MSDF pipeline does the layout + GL draws),
+/// computes the MsdfQuadGroup via `layout_text_to_quads`, and
+/// dispatches to `draw_text_layer_msdf`.
+fn paint_system_card_text(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    anchor: (f32, f32),
+    max_height: f32,
+    color: crate::system_card::Rgb,
+    font: crate::system_card::DisplayFont,
+    align: crate::system_card::Align,
+    text: &str,
+) -> Result<()> {
+    use crate::hdmi_logic::{layout_text_to_quads, MotionState};
+
+    let family = match font {
+        crate::system_card::DisplayFont::Headline => "Oswald",
+        crate::system_card::DisplayFont::Body => "Inter",
+        crate::system_card::DisplayFont::Mono => "JetBrains Mono",
+    };
+
+    let align_str = match align {
+        crate::system_card::Align::Left => "left",
+        crate::system_card::Align::Center => "center",
+        crate::system_card::Align::Right => "right",
+    };
+
+    let size_px = (max_height * mode_h as f32).max(8.0);
+
+    // Box covers the card from the anchor x rightward to the right
+    // edge (or symmetric for center-aligned). Vertical box is just
+    // tall enough for ~6 lines so multi-line text fits.
+    let box_x = anchor.0;
+    let box_y = anchor.1;
+    let box_w = match align {
+        crate::system_card::Align::Center => {
+            let half = box_x.min(1.0 - box_x);
+            (half * 2.0).clamp(0.05, 1.0)
+        }
+        _ => (1.0 - box_x - 0.046).max(0.05),
+    };
+    let box_h = (max_height * 6.0).min(1.0 - box_y).max(max_height);
+    // Shift box_x left by half its width for centered alignment so
+    // the TextLayer's left-anchored box still centers visually.
+    let box_x = match align {
+        crate::system_card::Align::Center => (anchor.0 - box_w / 2.0).max(0.0),
+        _ => box_x,
+    };
+
+    let color_hex = format!(
+        "#{:02x}{:02x}{:02x}",
+        color.0, color.1, color.2
+    );
+
+    let layer = crate::content::TextLayer {
+        text: text.to_string(),
+        name: String::from("system-card-text"),
+        font_family: Some(family.to_string()),
+        font_size_px: Some(size_px),
+        font_size_pct: None,
+        text_color: color_hex,
+        text_align: align_str.to_string(),
+        opacity: 1.0,
+        visible: true,
+        motion: String::from("static"),
+        motion_intensity: 0,
+        motion_phase: 0.0,
+        motion_speed: 0.0,
+        auto_mode: None,
+        auto_format: None,
+        outline: false,
+        drop_shadow: false,
+        blend: String::from("normal"),
+        anchor: String::from("top"),
+        weight: None,
+        r#box: crate::content::TextBox {
+            x: box_x,
+            y: box_y,
+            w: box_w,
+            h: box_h,
+        },
+    };
+
+    // Atlas lookup + lazy-upload.
+    ensure_msdf_atlas_for_family_or_default(gl, family);
+    let Some((atlas_tex, atlas)) = msdf_atlas_for_family(family)
+        .or_else(|| msdf_atlas_for_family("Inter"))
+    else {
+        eprintln!(
+            "[system-card] paint_text: no MSDF atlas for family={family} or Inter; skipping line"
+        );
+        return Ok(());
+    };
+
+    let box_w_px = layer.r#box.w * mode_w as f32;
+    let Some(group) = layout_text_to_quads(atlas, &layer.text, size_px, box_w_px, None) else {
+        // Empty / whitespace-only laid out to no ink.
+        return Ok(());
+    };
+
+    // Parse the text_color hex into RGBA floats matching the
+    // draw_text_layer_msdf convention.
+    let text_color = [
+        f32::from(color.0) / 255.0,
+        f32::from(color.1) / 255.0,
+        f32::from(color.2) / 255.0,
+        1.0,
+    ];
+
+    use glow::HasContext;
+    unsafe {
+        gl.enable(glow::BLEND);
+        gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+    }
+    let res = draw_text_layer_msdf(
+        gl,
+        mode_w,
+        mode_h,
+        &layer,
+        text_color,
+        MotionKind::Static,
+        MotionState::IDENTITY,
+        &group,
+        atlas_tex,
+        Some((0, 0, mode_w, mode_h)),
+    );
+    unsafe {
+        gl.disable(glow::BLEND);
+    }
+    res
 }
 
 #[cfg(test)]

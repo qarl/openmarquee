@@ -2499,6 +2499,7 @@ where
                 &mut cache,
                 fonts,
                 Some(content_root),
+                &mut state,
             );
 
             // Snapshot-side-A Commit 2 (2026-06-21): capture the
@@ -2727,6 +2728,10 @@ fn run_paint_hook(
     cache: &mut SlideCache,
     fonts: Option<&FontCatalog>,
     content_root: Option<&Path>,
+    // PR3 (2026-06-27): the active system-card overlay slot lives
+    // in PlaybackState; the paint hook intercepts PaintSlide when
+    // active to render the supervisor's onboarding card instead.
+    state: &mut PlaybackState,
 ) -> IpcResponse {
     use crate::content::ContentItem;
     use crate::hdmi;
@@ -2761,6 +2766,38 @@ fn run_paint_hook(
     };
     let out = match result {
         OpResult::PaintSlide { slide_id, t_in_slide_ms } => {
+            // PR3 (2026-06-27, finish-pass 2026-07-01): if a system
+            // card overlay is active (set by RenderSystemCard),
+            // paint the card INSTEAD of the playlist slide AND
+            // PRESENT it via the full eglSwap→lock→addFB→commit_fb
+            // sequence. The supervisor sends RenderSystemCard on
+            // SETUP/CONNECTING/LINGER/DEGRADED transitions +
+            // ClearSystemCard on ONLINE. The overlay paint owns
+            // ttl-deadline auto-clear + the max-lifetime safety net
+            // so a CONNECTED card (~120s ttl) reverts to playlist
+            // paint automatically, and a stuck `ttl=None` card
+            // self-heals within an hour.
+            #[cfg(target_os = "linux")]
+            {
+                match hdmi::maybe_paint_system_card_overlay(state, session, card) {
+                    Ok(true) => {
+                        // Card painted + presented; skip the
+                        // playlist slide dispatch.
+                        return IpcResponse::Ok {
+                            result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
+                        };
+                    }
+                    Ok(false) => {
+                        // No active card OR ttl just expired —
+                        // fall through to the normal slide paint.
+                    }
+                    Err(e) => {
+                        return err(format!(
+                            "paint_slide: system-card overlay failed: {e:#}"
+                        ));
+                    }
+                }
+            }
             // Clone the borrow shape we need so we can take a
             // mutable borrow on cache.video_decoders later for
             // the Video branch without re-entering the borrow.
@@ -3091,6 +3128,30 @@ fn run_paint_hook(
             }
         }
         OpResult::PaintTransition { from, to, kind, progress } => {
+            // PR3 finish-pass (2026-07-01): system-card overlay
+            // intercepts PaintTransition as well as PaintSlide so
+            // a transition tick that fires while a card is active
+            // doesn't flicker to playlist content between card
+            // frames. Same overlay function + present sequence as
+            // the PaintSlide arm above.
+            #[cfg(target_os = "linux")]
+            {
+                match hdmi::maybe_paint_system_card_overlay(state, session, card) {
+                    Ok(true) => {
+                        return IpcResponse::Ok {
+                            result: OpResult::PaintTransition { from, to, kind, progress },
+                        };
+                    }
+                    Ok(false) => {
+                        // Fall through to the normal transition paint.
+                    }
+                    Err(e) => {
+                        return err(format!(
+                            "paint_transition: system-card overlay failed: {e:#}"
+                        ));
+                    }
+                }
+            }
             // Phase 8 slice 6 (2026-05-16): build TransitionEndpoint
             // per-kind from cache state. Video endpoints route their
             // V4L2 decoder state from `cache.video_decoders` +
@@ -3547,6 +3608,19 @@ fn handle_inner_request(
             err("Open already called; nested Open is not supported")
         }
         IpcRequest::BeginSlide(p) => {
+            // PR3 fix-pass B1 (2026-07-01): the earlier "clear on
+            // any BeginSlide/BeginTransition" safety net had the
+            // wrong shape — playback keeps advancing under an
+            // active overlay + sends BeginSlide once per slide, so
+            // a persistent (ttl=None) SETUP/CONNECTING/DEGRADED
+            // card was nuked ~8-15s in and the QR vanished. A
+            // persistent card OWNS the screen while active. Real
+            // exits are (a) explicit ClearSystemCard (supervisor
+            // sends on ONLINE), (b) the 60-min max-lifetime cap
+            // (anti-wedge in maybe_paint_system_card_overlay), and
+            // (c) natural ttl expiry for BOOT/CONNECTED-style
+            // cards. Playlist paint automatically resumes when
+            // one of those exits fires.
             // r102.1: V3D BO probe at BeginSlide entry. Brackets
             // the slide-change boundary so QA can compare slide-
             // change delta vs transition-paint delta.
@@ -3893,6 +3967,11 @@ fn handle_inner_request(
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
+            // PR3 fix-pass B1 (2026-07-01): companion to BeginSlide
+            // above — the earlier per-transition clear was wrong.
+            // A persistent card owns the screen; the two real exits
+            // stay: ClearSystemCard from the supervisor, and the
+            // 60-min max-lifetime cap in the paint overlay.
             // r110 c3.3.1 (2026-06-11): clear the poster-sourced
             // signal at transition entry so it scopes exactly to
             // "this transition window." c3.2.2 bake_a/bake_b
@@ -4438,6 +4517,62 @@ fn handle_inner_request(
                     }
                 }
             }
+        }
+        IpcRequest::RenderSystemCard(p) => {
+            // PR3 (2026-06-27): overlay the supervisor-driven
+            // onboarding card. The pure layout work lives in
+            // crate::system_card::layout_card; the GLES2 paint
+            // wiring + the active-card state slot live in
+            // hdmi.rs (Linux-only). On host-Mac builds we
+            // accept the IPC (returns ok_empty) but the paint
+            // is a no-op.
+            #[cfg(target_os = "linux")]
+            {
+                // PR3 finish-pass (2026-07-01): clamp incoming text
+                // fields BEFORE layout so a chatty client can't
+                // grow the per-frame shape-clone cost or leak long
+                // strings through the diagnostic ring buffer /
+                // preview endpoint. Clamp is applied to a moved
+                // copy so the returned response params (for
+                // debugging) still reflect the request.
+                let p = crate::system_card::clamp_params(p);
+                let shapes = crate::system_card::layout_card(&p);
+                // ttl_ms=0 collapses to None (until-state-change);
+                // any positive value → absolute Instant deadline.
+                let deadline = p.ttl_ms.and_then(|ttl| {
+                    if ttl == 0 {
+                        None
+                    } else {
+                        Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_millis(u64::from(ttl)),
+                        )
+                    }
+                });
+                state.active_system_card = Some(crate::system_card::ActiveSystemCard {
+                    shapes,
+                    deadline,
+                    activated_at: std::time::Instant::now(),
+                    params: p,
+                });
+                ok_empty()
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // Host build: accept the op + drop. The pure
+                // layout is exercised by system_card::tests.
+                let _ = p;
+                ok_empty()
+            }
+        }
+        IpcRequest::ClearSystemCard => {
+            // PR3 (2026-06-27): supervisor's ONLINE transition
+            // sends this to revert to normal playlist paint.
+            #[cfg(target_os = "linux")]
+            {
+                state.active_system_card = None;
+            }
+            ok_empty()
         }
     }
 }
@@ -6182,5 +6317,220 @@ mod tests {
             }
         }
         Some(lines[start..pos].join("\n"))
+    }
+
+    // ============================================================
+    // PR3 (2026-06-27) — IPC handler for RenderSystemCard /
+    // ClearSystemCard: ttl math + slot set/clear. Runs on Linux
+    // only because the active slot lives behind #[cfg(linux)]; the
+    // host build's PaintSlide branch never touches state.active_-
+    // system_card so these behaviours are a no-op there.
+    // ============================================================
+
+    #[cfg(target_os = "linux")]
+    fn system_card_params(kind: crate::playback::SystemCardKind) -> crate::playback::RenderSystemCardParams {
+        crate::playback::RenderSystemCardParams {
+            kind,
+            ssid: None,
+            pin: None,
+            qr_payload: None,
+            address: None,
+            ip: None,
+            target_ssid: None,
+            variant: None,
+            ttl_ms: None,
+            boot_hint: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_ttl_none_leaves_deadline_none() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let mut p = system_card_params(crate::playback::SystemCardKind::Setup);
+        p.ttl_ms = None;
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        assert!(card.deadline.is_none(), "ttl_ms=None must map to no deadline");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_ttl_zero_maps_to_none() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let mut p = system_card_params(crate::playback::SystemCardKind::Setup);
+        p.ttl_ms = Some(0);
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        assert!(
+            card.deadline.is_none(),
+            "ttl_ms=0 must collapse to None (until-state-change)"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_ttl_positive_sets_future_deadline() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let mut p = system_card_params(crate::playback::SystemCardKind::Connected);
+        p.ttl_ms = Some(5_000);
+        let before = std::time::Instant::now();
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        let deadline = card.deadline.expect("ttl_ms>0 must set a deadline");
+        let elapsed_to_deadline = deadline.saturating_duration_since(before);
+        assert!(
+            elapsed_to_deadline >= std::time::Duration::from_millis(4_990),
+            "deadline earlier than expected: got {:?}",
+            elapsed_to_deadline
+        );
+        assert!(
+            elapsed_to_deadline <= std::time::Duration::from_millis(5_500),
+            "deadline later than expected: got {:?}",
+            elapsed_to_deadline
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn clear_system_card_clears_slot() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let p = system_card_params(crate::playback::SystemCardKind::Setup);
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(state.active_system_card.is_some());
+        let _resp = handle_inner_request(
+            IpcRequest::ClearSystemCard,
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(state.active_system_card.is_none(), "ClearSystemCard must clear slot");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_replaces_active_card() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let mut first = system_card_params(crate::playback::SystemCardKind::Setup);
+        first.ssid = Some("first".to_string());
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(first),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let mut second = system_card_params(crate::playback::SystemCardKind::Connecting);
+        second.target_ssid = Some("second".to_string());
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(second),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        assert_eq!(card.params.kind, crate::playback::SystemCardKind::Connecting);
+        assert_eq!(card.params.target_ssid.as_deref(), Some("second"));
+    }
+
+    /// PR3 fix-pass B1 (2026-07-01) — the inverse contract: a
+    /// BeginSlide arriving under an active persistent card MUST
+    /// leave the slot intact. The earlier safety-net clear was
+    /// nuking the QR at ~8-15s in; a persistent card owns the
+    /// screen until ClearSystemCard or the 60-min cap fires.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn begin_slide_does_not_clear_active_system_card() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        // Prime the slot with a ttl=None (persistent) card.
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(system_card_params(
+                crate::playback::SystemCardKind::Setup,
+            )),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(state.active_system_card.is_some());
+        // Fire BeginSlide (unknown id — the load will error but
+        // that doesn't matter for the invariant).
+        let _resp = handle_inner_request(
+            IpcRequest::BeginSlide(BeginSlideParams {
+                slide_id: uuid(1),
+                t0_ms: 0,
+                duration_ms: 1_000,
+            }),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(
+            state.active_system_card.is_some(),
+            "BeginSlide must NOT clear an active persistent card"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn begin_transition_does_not_clear_active_system_card() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(system_card_params(
+                crate::playback::SystemCardKind::Setup,
+            )),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(state.active_system_card.is_some());
+        let _resp = handle_inner_request(
+            IpcRequest::BeginTransition(BeginTransitionParams {
+                to_slide_id: uuid(2),
+                to_duration_ms: 1_000,
+                kind: "cut".to_string(),
+                transition_ms: 500,
+                t0_ms: 0,
+            }),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(
+            state.active_system_card.is_some(),
+            "BeginTransition must NOT clear an active persistent card"
+        );
     }
 }

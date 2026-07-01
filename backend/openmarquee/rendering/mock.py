@@ -155,6 +155,12 @@ class MockRenderer:
         self.end_external_frames_calls: int = 0
         self.reopen_calls: int = 0
         self.capture_calls: list[str] = []
+        # PR3 (2026-06-27) — recorded system-card ops for supervisor
+        # + API-endpoint tests. Each entry is the params dict passed
+        # to render_system_card; clear_system_card just bumps the
+        # counter.
+        self.system_card_calls: list[dict[str, object]] = []
+        self.clear_system_card_calls: int = 0
 
         # State machine mirror -- same shape as the Rust sidecar's
         # playback.rs::advance returns. None until open + first
@@ -367,6 +373,18 @@ class MockRenderer:
         restart. Present so MockRenderer satisfies the Renderer
         protocol. Counted for tests."""
         self.reopen_calls += 1
+
+    def render_system_card(self, params: dict) -> None:
+        """PR3 (2026-06-27) — record the params dict for supervisor +
+        preview-endpoint tests. No painting; the mock does not touch
+        pixels. `dict(params)` copies defensively so a caller that
+        mutates the dict after the call doesn't taint the record."""
+        self.system_card_calls.append(dict(params))
+
+    def clear_system_card(self) -> None:
+        """PR3 (2026-06-27) — record the clear. Idempotent from the
+        caller's POV; the counter distinguishes 0 / 1+ calls."""
+        self.clear_system_card_calls += 1
 
     # ------------------------------------------------------------------
     # Internals

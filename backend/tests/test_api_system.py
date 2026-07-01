@@ -271,3 +271,323 @@ def test_info_cors_for_captive_portal_ap_origin(client: TestClient):
     )
     assert response.status_code == 200
     assert response.headers.get("access-control-allow-origin") == ("http://192.168.4.1")
+
+
+# ============================================================
+# PR3 (2026-06-27) — /api/system/render-system-card-preview
+# ============================================================
+
+
+class _RecordingRenderer:
+    """Test double for the Renderer protocol's system-card methods.
+    Just records the calls so tests can assert on them without
+    booting the real IPC subprocess."""
+
+    def __init__(self):
+        self.render_calls: list[dict] = []
+        self.clear_calls: int = 0
+        # A minimal subset of the wider Renderer protocol so
+        # get_renderer's callers don't blow up on attribute access.
+        self.width = 1920
+        self.height = 1080
+
+    def render_system_card(self, params: dict) -> None:
+        self.render_calls.append(dict(params))
+
+    def clear_system_card(self) -> None:
+        self.clear_calls += 1
+
+
+@pytest.fixture
+def recording_renderer(monkeypatch):
+    renderer = _RecordingRenderer()
+    # api_system does `from openmarquee.dependencies import get_renderer`
+    # inside the handler, so we patch the dependencies-module symbol.
+    from openmarquee import dependencies as deps
+
+    monkeypatch.setattr(deps, "get_renderer", lambda: renderer)
+    return renderer
+
+
+class TestRenderSystemCardPreview:
+    def test_happy_path_setup_card(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={
+                "kind": "SETUP",
+                "ssid": "openMarquee-Setup",
+                "pin": "4827",
+                "qr_payload": "WIFI:T:WPA;S:openMarquee-Setup;P:4827;;",
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"status": "rendered"}
+        assert len(recording_renderer.render_calls) == 1
+        assert recording_renderer.render_calls[0]["kind"] == "SETUP"
+        assert recording_renderer.render_calls[0]["ssid"] == "openMarquee-Setup"
+
+    def test_omits_none_fields(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "CONNECTING", "target_ssid": "HomeWiFi"},
+        )
+        assert response.status_code == 200
+        params = recording_renderer.render_calls[0]
+        assert params == {"kind": "CONNECTING", "target_ssid": "HomeWiFi"}
+        # None fields must NOT appear as explicit null in the params
+        assert "ssid" not in params
+        assert "pin" not in params
+
+    def test_rejects_unknown_kind(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "NOT_A_KIND"},
+        )
+        assert response.status_code == 422
+        assert recording_renderer.render_calls == []
+
+    def test_rejects_unknown_variant(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "DEGRADED", "variant": "not_a_variant"},
+        )
+        assert response.status_code == 422
+
+    def test_rejects_oversize_qr_payload(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "SETUP", "qr_payload": "A" * 500},
+        )
+        assert response.status_code == 422
+
+    def test_rejects_oversize_ssid(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "SETUP", "ssid": "S" * 200},
+        )
+        assert response.status_code == 422
+
+    def test_rejects_negative_ttl(self, client: TestClient, recording_renderer):
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "BOOT", "ttl_ms": -1},
+        )
+        assert response.status_code == 422
+
+    def test_maps_kind_to_uppercase(self, client: TestClient, recording_renderer):
+        """Case tolerance: the Rust side uses UPPERCASE serde
+        rename; the endpoint accepts either case for convenience
+        but normalises."""
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "setup"},
+        )
+        assert response.status_code == 200
+        assert recording_renderer.render_calls[0]["kind"] == "SETUP"
+
+    def test_502_on_renderer_failure(self, client: TestClient, monkeypatch):
+        class BustedRenderer:
+            width = 1920
+            height = 1080
+
+            def render_system_card(self, params: dict) -> None:
+                raise RuntimeError("subprocess dead")
+
+        from openmarquee import dependencies as deps
+
+        monkeypatch.setattr(deps, "get_renderer", lambda: BustedRenderer())
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "SETUP"},
+        )
+        assert response.status_code == 502
+        assert "subprocess dead" in response.text
+
+
+class TestClearSystemCardPreview:
+    def test_happy_path(self, client: TestClient, recording_renderer):
+        response = client.post("/api/system/clear-system-card-preview")
+        assert response.status_code == 200
+        assert response.json() == {"status": "cleared"}
+        assert recording_renderer.clear_calls == 1
+
+    def test_502_on_renderer_failure(self, client: TestClient, monkeypatch):
+        class BustedRenderer:
+            width = 1920
+            height = 1080
+
+            def clear_system_card(self) -> None:
+                raise RuntimeError("subprocess dead")
+
+        from openmarquee import dependencies as deps
+
+        monkeypatch.setattr(deps, "get_renderer", lambda: BustedRenderer())
+        response = client.post("/api/system/clear-system-card-preview")
+        assert response.status_code == 502
+
+
+# ============================================================
+# PR3 fix-pass F3 (2026-07-01) — the preview endpoint must
+# return 502 when the render actually landed on the Mock (i.e.
+# the AutoFallback had already been demoted). Prior tests
+# monkey-patched a bare-raising renderer + bypassed
+# AutoFallbackRenderer entirely, so they green-lit a path
+# production never takes. This suite drives through the REAL
+# AutoFallback with a subprocess-dead primary → the wrapper
+# falls back on the render_frame path, and then card ops paint
+# on the mock while `is_in_fallback` reports True. The preview
+# endpoint sees the fallback signal and returns 502.
+# ============================================================
+
+
+class TestPreviewEndpointReportsFallbackTruthfully:
+    def _make_fallen_wrapper(self):
+        """AutoFallbackRenderer whose primary raises on
+        render_frame → the wrapper is-in-fallback after one video
+        frame. Card ops then forward to the mock without raising."""
+        import tempfile
+        from pathlib import Path
+
+        from openmarquee.dependencies import AutoFallbackRenderer
+        from openmarquee.rendering.mock import MockRenderer
+        from openmarquee.rendering.rust_renderer import (
+            RustRendererSubprocessError,
+        )
+
+        class _PrimaryDeadOnVideo:
+            width = 1920
+            height = 1080
+
+            def render_frame(self, frame, **kwargs):
+                raise RustRendererSubprocessError("simulated on render_frame")
+
+            def end_external_frames(self):
+                pass
+
+            def render_system_card(self, params):
+                # Never reached — the wrapper's fallback catches
+                # this via the video path before any card call.
+                raise AssertionError("should not be reached after fallback")
+
+            def clear_system_card(self):
+                raise AssertionError("should not be reached after fallback")
+
+        def _mock_factory():
+            tmp = Path(tempfile.mkdtemp(prefix="pr3-f3-")) / "preview.png"
+            return MockRenderer(width=1920, height=1080, output_path=tmp)
+
+        wrapper = AutoFallbackRenderer(
+            primary=_PrimaryDeadOnVideo(),
+            mock_factory=_mock_factory,
+        )
+        wrapper.render_frame(b"\x00" * (1920 * 1080 * 3))
+        assert wrapper.is_in_fallback is True
+        return wrapper
+
+    def test_render_preview_returns_502_when_wrapper_in_fallback(
+        self, client: TestClient, monkeypatch
+    ):
+        """The wrapper has already fallen back to the mock (video
+        subprocess died). The card render succeeds on the mock but
+        `is_in_fallback` is True → the preview endpoint returns 502
+        so QA glass-verifies on truthful responses."""
+        from openmarquee import dependencies as deps
+
+        wrapper = self._make_fallen_wrapper()
+        monkeypatch.setattr(deps, "get_renderer", lambda: wrapper)
+        response = client.post(
+            "/api/system/render-system-card-preview",
+            json={"kind": "SETUP"},
+        )
+        assert response.status_code == 502
+        assert "fallback" in response.text.lower()
+        # Card DID paint on the mock (success semantics for the
+        # supervisor path), so the mock recorded the call — the
+        # endpoint reports 502 to the CALLER regardless.
+        assert wrapper._mock.system_card_calls == [{"kind": "SETUP"}]
+
+    def test_clear_preview_returns_502_when_wrapper_in_fallback(
+        self, client: TestClient, monkeypatch
+    ):
+        from openmarquee import dependencies as deps
+
+        wrapper = self._make_fallen_wrapper()
+        monkeypatch.setattr(deps, "get_renderer", lambda: wrapper)
+        response = client.post("/api/system/clear-system-card-preview")
+        assert response.status_code == 502
+        assert "fallback" in response.text.lower()
+
+
+# ============================================================
+# PR3 fix-pass S2 (2026-07-01) — byte-length clamp on _check_len.
+# ============================================================
+
+
+def test_check_len_uses_utf8_byte_length():
+    """Regression pin for the codepoint-vs-byte clamp fix. A 40-char
+    ASCII SSID is 40 bytes (fits MAX_SSID_LEN=40). A 21-char UTF-8
+    string of 2-byte grapheme runs is 42 bytes (over cap) — must
+    reject with 422."""
+    from openmarquee.api_system import _MAX_SSID_LEN, _check_len
+
+    # 40 ASCII chars = 40 bytes — passes.
+    _check_len("ssid", "A" * _MAX_SSID_LEN, _MAX_SSID_LEN)
+    # 21 é chars = 42 bytes — must raise.
+    import pytest as _pytest
+
+    with _pytest.raises(Exception) as excinfo:  # HTTPException
+        _check_len("ssid", "é" * 21, _MAX_SSID_LEN)
+    assert "40-byte cap" in str(excinfo.value.detail)
+
+
+# ============================================================
+# PR3 fix-pass S2 (2026-07-01) — 401 tests for both preview
+# endpoints when auth is engaged (production shape). Piggy-backs
+# on the same env-flip pattern the auth suite uses so the middle-
+# ware actually gates.
+# ============================================================
+
+
+@pytest.fixture
+def client_auth_engaged(tmp_path: Path):
+    """TestClient with OPENMARQUEE_DISABLE_AUTH unset so the auth
+    middleware gates. Isolated AuthStorage path per test. See
+    backend/tests/test_auth.py::client for the pattern."""
+    import os as _os
+    from unittest.mock import patch
+
+    from openmarquee.dependencies import _auth_storage_singleton
+
+    auth_path = tmp_path / "auth.json"
+    _auth_storage_singleton.cache_clear()
+    with patch.dict(
+        _os.environ,
+        {"OPENMARQUEE_AUTH_PATH": str(auth_path)},
+    ):
+        _os.environ.pop("OPENMARQUEE_DISABLE_AUTH", None)
+        try:
+            from openmarquee.app import app
+
+            with TestClient(app) as c:
+                yield c
+        finally:
+            _os.environ["OPENMARQUEE_DISABLE_AUTH"] = "1"
+    _auth_storage_singleton.cache_clear()
+
+
+def test_render_system_card_preview_requires_auth(client_auth_engaged: TestClient):
+    """The /api/system/render-system-card-preview endpoint is NOT
+    in the auth_middleware allowlist — an unauthenticated POST must
+    return 401 so an attacker on the LAN can't drive card state on
+    a production sign."""
+    response = client_auth_engaged.post(
+        "/api/system/render-system-card-preview",
+        json={"kind": "SETUP"},
+    )
+    assert response.status_code == 401
+
+
+def test_clear_system_card_preview_requires_auth(client_auth_engaged: TestClient):
+    """Companion 401 pin for the clear-preview endpoint."""
+    response = client_auth_engaged.post("/api/system/clear-system-card-preview")
+    assert response.status_code == 401

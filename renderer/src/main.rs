@@ -125,6 +125,15 @@ mod glyph_cache_colr;
 // individually `#[cfg(target_os = "linux")]` gated inside the
 // module so Mac compiles + runs the pure-Rust tests.
 mod v4l2;
+/// PR3 (2026-06-27) — QR-code bitmap generation for the SETUP +
+/// DEGRADED onboarding cards. Pure module: pure-Rust qrcode crate;
+/// host-runnable on macOS (no GL deps); GLES2 upload happens in
+/// `system_card.rs` on the Pi.
+mod qr;
+/// PR3 (2026-06-27) — onboarding system cards (SETUP/CONNECTING/
+/// CONNECTED/DEGRADED/BOOT). Pure layout module: positions + sizes
+/// in cqw units; the GLES2 paint lives in hdmi.rs (Linux-only).
+mod system_card;
 /// QA H2 (2026-05-23) — V4L2 H.264 decoder priming + per-slide
 /// state, shared between the IPC sidecar and the standalone reel.
 /// Linux-only; the module's `#![cfg(target_os = "linux")]` collapses

@@ -55,6 +55,24 @@ pub struct VideoDecoderState {
     pub capture_h: u32,
 }
 
+// PR3 fix-pass G1 (2026-07-01): Debug impl added so `Result::expect_err`
+// callers in the video-decode tests compile on Linux (Ok type of a
+// Result must be Debug for expect_err's panic-formatter). Fields
+// aren't printed — `Decoder` wraps a Mutex + FDs whose fmt::Debug
+// isn't derivable without a wider blast radius. This is enough for
+// the test harness's "should have errored" panic message.
+impl std::fmt::Debug for VideoDecoderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoDecoderState")
+            .field("next_sample_idx", &self.next_sample_idx)
+            .field("frames_decoded", &self.frames_decoded)
+            .field("capture_w", &self.capture_w)
+            .field("capture_h", &self.capture_h)
+            .field("decoder", &"<opaque v4l2::Decoder>")
+            .finish()
+    }
+}
+
 impl VideoDecoderState {
     /// Convenience for "did we make progress this tick?" — returns
     /// the current `frames_decoded` counter (incremented by the

@@ -675,6 +675,7 @@ class NetworkSupervisor:
         channel_follow_actuator: Callable[[ChannelFollowDecision], None] | None = None,
         power_save_actuator: Callable[[], None] | None = None,
         ap_lifecycle_actuator: object | None = None,
+        system_card_publisher: object | None = None,
     ):
         self.config = config
         self.diagnostics = diagnostics or DiagnosticsRingBuffer()
@@ -693,6 +694,15 @@ class NetworkSupervisor:
         # callable): must expose .stop() -> None and .start() ->
         # None methods so a single instance handles both directions.
         self._ap_lifecycle_actuator = ap_lifecycle_actuator or self._default_ap_lifecycle_actuator()
+        # PR3 (2026-06-27) system-card publisher. _on_transition
+        # calls .render(params) on non-ONLINE transitions and
+        # .clear() on ONLINE (all paths). Default is an observe-
+        # only stub that emits a diagnostic line so a supervisor
+        # without a real Renderer wired (dev / test) still produces
+        # a grep-able transition trail. dependencies.py wires the
+        # SystemCardPublisher adapter around the RustRenderer on
+        # production.
+        self._system_card_publisher = system_card_publisher or self._default_system_card_publisher()
         # State: start from on-disk OR default SETUP.
         persisted = load_persisted_state(config.state_file)
         if persisted is not None:
@@ -1130,6 +1140,51 @@ class NetworkSupervisor:
             f"actuator replaced (class={actuator.__class__.__name__})",
         )
 
+    # --- PR3 (2026-06-27) system-card publisher ---
+
+    class _DefaultSystemCardPublisher:
+        """Observe-only system-card publisher. Production hosts get
+        the SystemCardPublisher adapter around the RustRenderer;
+        tests + dev-hosts without a Renderer keep this stub so
+        transitions still generate a grep-able diagnostic trail.
+        """
+
+        def __init__(self, supervisor: NetworkSupervisor):
+            self._supervisor = supervisor
+
+        def render(self, params: dict) -> None:
+            self._supervisor._emit(  # noqa: SLF001 — paired with the supervisor
+                "system_card",
+                "info",
+                f"publisher (observe-only): would render kind={params.get('kind')}",
+            )
+
+        def clear(self) -> None:
+            self._supervisor._emit(  # noqa: SLF001 — paired with the supervisor
+                "system_card",
+                "info",
+                "publisher (observe-only): would clear",
+            )
+
+    def _default_system_card_publisher(self) -> object:
+        """Factory: back-pointed observe-only stub. Same pattern as
+        _default_ap_lifecycle_actuator."""
+        return NetworkSupervisor._DefaultSystemCardPublisher(self)
+
+    def set_system_card_publisher(self, publisher: object) -> None:
+        """Replace the system-card publisher at runtime. Contract:
+        `publisher.render(params: dict)` and `publisher.clear()` —
+        both return None on success and raise on failure.
+        Failures are caught + downgraded to a warn diagnostic; the
+        supervisor never wedges on a renderer outage.
+        """
+        self._system_card_publisher = publisher
+        self._emit(
+            "system_card",
+            "info",
+            f"publisher replaced (class={publisher.__class__.__name__})",
+        )
+
     def _on_transition(self, prev: SupervisorState, new: SupervisorState) -> None:
         """P2 (2026-06-27) transition-effect dispatch.
 
@@ -1180,6 +1235,96 @@ class NetworkSupervisor:
         elif prev == SupervisorState.LINGER and new != SupervisorState.LINGER:
             self._linger_entered_at = None
             self._emit("linger_timer", "info", "disarmed linger timer (left LINGER)")
+
+        # PR3 (2026-06-27) system-card overlay. Every path to ONLINE
+        # clears the card (spec §"Onboarding state machine": ONLINE
+        # is the AP-off / no-overlay steady state). Every other
+        # transition renders the matching card. Failures are caught
+        # + downgraded to a warn diagnostic so a renderer outage
+        # never wedges the state machine.
+        self._fire_system_card_for_transition(prev=prev, new=new)
+
+    def _fire_system_card_for_transition(
+        self, *, prev: SupervisorState, new: SupervisorState
+    ) -> None:
+        """PR3 (2026-06-27) — publish a RenderSystemCard / ClearSystemCard
+        matching the new state:
+            SETUP      → SETUP card (portal QR + PIN)
+            CONNECTING → CONNECTING card (joining <target_ssid>…)
+            LINGER     → CONNECTED card (address + IP, ~2min ttl)
+            ONLINE     → clear (spec: AP-off steady state)
+            DEGRADED   → DEGRADED card (variant defaults to `lost`;
+                         preview endpoint can render more specific
+                         variants)
+        """
+        # Skip re-render when the state didn't actually change
+        # (defensive: callers shouldn't fire _on_transition without
+        # a real change, but a no-op guard costs nothing).
+        if prev == new:
+            return
+        try:
+            if new == SupervisorState.ONLINE:
+                self._system_card_publisher.clear()
+                self._emit(
+                    "system_card",
+                    "info",
+                    f"cleared on {prev.value}->ONLINE (spec: ONLINE = AP off, no overlay)",
+                )
+                return
+            params = self._system_card_params_for_state(new)
+            self._system_card_publisher.render(params)
+            self._emit(
+                "system_card",
+                "info",
+                f"rendered kind={params['kind']} on {prev.value}->{new.value}",
+            )
+        except Exception as e:  # noqa: BLE001 — never wedge apply_event
+            self._emit(
+                "system_card",
+                "warn",
+                f"publisher failed on {prev.value}->{new.value}: {e!r}; "
+                "overlay may be stale until the next transition",
+            )
+
+    def _system_card_params_for_state(self, new: SupervisorState) -> dict:
+        """PR3 (2026-06-27) — build the RenderSystemCard params for a
+        state. Kept small: the supervisor doesn't hold the mDNS
+        name / IP / per-boot PIN in this MVP — the auth-gated
+        preview endpoint (POST /api/system/render-system-card-preview)
+        is where QA drives cards with rich fields. In production the
+        renderer's per-kind layout falls back to sensible defaults
+        (e.g. SETUP card shows the mockup's default headline copy)
+        when fields are absent.
+        """
+        if new == SupervisorState.SETUP:
+            return {"kind": "SETUP"}
+        if new == SupervisorState.CONNECTING:
+            return {
+                "kind": "CONNECTING",
+                "target_ssid": self._last_sta_ssid,
+            }
+        if new == SupervisorState.LINGER:
+            # ttl matches the LINGER grace window (2min) so the
+            # renderer auto-clears if the supervisor is somehow
+            # unable to emit ClearSystemCard on the LINGER→ONLINE
+            # edge. Belt-and-suspenders with the max-lifetime cap.
+            return {
+                "kind": "CONNECTED",
+                "address": "openmarquee.local",
+                "ttl_ms": int(self.config.linger_seconds * 1000),
+            }
+        if new == SupervisorState.DEGRADED:
+            # Default variant is `lost`; a future extension may
+            # thread the specific auth_fail / not_found_or_5ghz
+            # variant here based on the last STA disconnect
+            # reason recorded by the observe loop.
+            return {
+                "kind": "DEGRADED",
+                "variant": "lost",
+                "target_ssid": self._last_sta_ssid,
+            }
+        # Should be unreachable — every non-ONLINE state maps above.
+        return {"kind": "SETUP"}
 
     def _fire_ap_teardown(self, *, prev: SupervisorState) -> None:
         try:

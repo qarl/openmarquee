@@ -922,6 +922,34 @@ class RustRenderer:
                 ) from e
 
     # ------------------------------------------------------------------
+    # PR3 (2026-06-27) — onboarding system-card overlay.
+    # ------------------------------------------------------------------
+
+    def render_system_card(self, params: dict[str, Any]) -> None:
+        """Op 12 (PR3): display a full-screen onboarding system card
+        overlay per spec §"The display is the onboarding UI". See the
+        `Renderer` Protocol docstring for the params shape.
+
+        PR3 fix-pass S1 (2026-07-01): raises subprocess-layer errors
+        so callers can distinguish "renderer accepted the card" from
+        "renderer dropped it." The best-effort supervisor path lives
+        in `SystemCardPublisher` (background thread, log-and-swallow);
+        the preview endpoint awaits its own `asyncio.to_thread` and
+        maps a raised exception to HTTP 502 so QA glass-verifies on
+        truthful responses.
+        """
+        self._send_op("render_system_card", dict(params))
+
+    def clear_system_card(self) -> None:
+        """Op 13 (PR3): clear any active system card + return to
+        normal playlist paint. Idempotent.
+
+        PR3 fix-pass S1 (2026-07-01): raises subprocess-layer errors
+        to callers — same rationale as `render_system_card`.
+        """
+        self._send_op("clear_system_card", None)
+
+    # ------------------------------------------------------------------
     # Liveness.
     # ------------------------------------------------------------------
 

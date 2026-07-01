@@ -300,9 +300,137 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
             supervisor = get_network_supervisor()
             await supervisor.lifespan_start()
+            # PR3 (2026-06-27): wire the SystemCardPublisher adapter
+            # around the live Renderer so state transitions from
+            # SETUP/CONNECTING/LINGER/DEGRADED fire RenderSystemCard
+            # and ONLINE fires ClearSystemCard. Failures on the
+            # renderer side (subprocess dead, IPC error) are caught
+            # inside the publisher's supervisor-facing wrapper —
+            # they never wedge the supervisor.
+            try:
+                from openmarquee.rendering.system_card_publisher import (
+                    SystemCardPublisher,
+                )
+
+                supervisor.set_system_card_publisher(SystemCardPublisher(get_renderer()))
+            except Exception:  # noqa: BLE001
+                log.exception(
+                    "startup: system-card publisher wire failed; "
+                    "supervisor keeps the observe-only stub"
+                )
             network_supervisor_handle = asyncio.create_task(
                 supervisor_observe_loop(supervisor),
                 name="network-supervisor-observe",
+            )
+
+            # PR3 (2026-06-27) BOOT card lifespan side-task: shows
+            # the "openmarquee.local" identity card for ~4 seconds
+            # right after startup so a user watching the sign at
+            # boot learns the device address without needing the
+            # portal.
+            #
+            # PR3 fix-pass B3 (2026-07-01): after the BOOT card auto-
+            # clears on its ttl, emit the card that matches the
+            # supervisor's CURRENT state (SETUP for no-creds, or
+            # nothing for ONLINE) so a cold-boot device does not
+            # skip the onboarding overlay just because it never
+            # transitioned through a state-change since boot.
+            #
+            # PR3 fix-pass F1(b) (2026-07-01): WAIT for the renderer
+            # to be READY (past EGL cold-start, ~18s worst case)
+            # before firing the BOOT card. Emitting during the
+            # cold window used to timeout the render_system_card
+            # IPC → the AutoFallback demoted the shared primary to
+            # Mock → the whole video pipeline blanked on a fresh
+            # Jason boot. Now we watch the playback loop's
+            # `_ready_sent` flag (which flips only after the FIRST
+            # successful renderer.advance() while NOT in fallback)
+            # AND `renderer.is_in_fallback` so we never issue a card
+            # IPC into a still-warming or already-fallen-back
+            # primary.
+            BOOT_TTL_MS = 4000
+            READY_POLL_INTERVAL_S = 0.25
+            READY_WAIT_TIMEOUT_S = 90.0  # matches systemd TimeoutStartSec
+
+            def _params_for_state(st: str) -> dict | None:
+                if st == "SETUP":
+                    return {"kind": "SETUP"}
+                if st == "CONNECTING":
+                    return {"kind": "CONNECTING"}
+                if st == "LINGER":
+                    return {
+                        "kind": "CONNECTED",
+                        "address": "openmarquee.local",
+                    }
+                if st == "DEGRADED":
+                    return {"kind": "DEGRADED", "variant": "lost"}
+                # ONLINE = AP off, no overlay.
+                return None
+
+            async def _wait_for_renderer_ready() -> bool:
+                """Poll the playback loop's ready flag + the
+                renderer's fallback state. Returns True once the
+                real (non-fallback) renderer is confirmed painting;
+                False on timeout OR if the renderer is already in
+                fallback (mock — there is no cold-start to wait
+                for, but there is no point firing a card either)."""
+                loop = get_playback_loop()
+                renderer = get_renderer()
+                elapsed = 0.0
+                while elapsed < READY_WAIT_TIMEOUT_S:
+                    try:
+                        in_fallback = bool(getattr(renderer, "is_in_fallback", False))
+                    except Exception:  # noqa: BLE001
+                        in_fallback = False
+                    if in_fallback:
+                        return False
+                    if getattr(loop, "_ready_sent", False):
+                        return True
+                    await asyncio.sleep(READY_POLL_INTERVAL_S)
+                    elapsed += READY_POLL_INTERVAL_S
+                return False
+
+            async def _emit_boot_and_current_state_card() -> None:
+                renderer = get_renderer()
+                ready = await _wait_for_renderer_ready()
+                if not ready:
+                    log.info(
+                        "system-card boot task: renderer not ready "
+                        "before timeout; skipping BOOT + catch-up card"
+                    )
+                    return
+                # Renderer is READY — safe to fire the BOOT card
+                # without risking a cold-start timeout demoting the
+                # primary. render_system_card is fail-soft on the
+                # card path per F1; a subprocess blip here just
+                # logs at debug level.
+                try:
+                    await asyncio.to_thread(
+                        renderer.render_system_card,
+                        {
+                            "kind": "BOOT",
+                            "address": "openmarquee.local",
+                            "ttl_ms": BOOT_TTL_MS,
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    log.debug("boot card emit failed", exc_info=True)
+
+                # Wait for BOOT to auto-clear (plus a small buffer)
+                # before pushing the current-state card so BOOT is
+                # visible for its full window.
+                await asyncio.sleep(BOOT_TTL_MS / 1000.0 + 0.1)
+                try:
+                    state_str = supervisor.current_state.value
+                    params = _params_for_state(state_str)
+                    if params is not None:
+                        await asyncio.to_thread(renderer.render_system_card, params)
+                except Exception:  # noqa: BLE001
+                    log.debug("current-state card emit failed", exc_info=True)
+
+            asyncio.create_task(  # noqa: RUF006 — fire-and-forget
+                _emit_boot_and_current_state_card(),
+                name="system-card-boot",
             )
             # P1.2-B (2026-06-10): take-over evaluation. Env-gated by
             # OPENMARQUEE_NETWORK_TAKEOVER_ENABLED=1 (default OFF

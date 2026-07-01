@@ -252,6 +252,37 @@ class AutoFallbackRenderer:
         except RustRendererSubprocessError as e:
             self._swap_to_mock(f"reopen: {e}")
 
+    def render_system_card(self, params: dict) -> None:
+        """PR3 fix-pass F1 (2026-07-01): the card path is BEST-EFFORT
+        and must NOT trigger `_swap_to_mock`. A dropped card is a
+        visual glitch; demoting the shared playback renderer over
+        it darkens the sign. This is the reverse policy from
+        `render_frame`/`reopen` (where subprocess death implies the
+        video pipeline is already broken).
+
+        Behaviour:
+            * If already in fallback, just forward to the mock —
+              the caller may still want the mock's call-recording.
+            * If on primary, forward + re-raise subprocess errors so
+              the CALLER (SystemCardPublisher / preview endpoint)
+              can decide what to do. The primary stays selected.
+        """
+        if self._mock is not None:
+            self._mock.render_system_card(params)
+            return
+        # Propagate errors — the caller decides on visibility.
+        self._primary.render_system_card(params)
+
+    def clear_system_card(self) -> None:
+        """PR3 fix-pass F1 (2026-07-01): mirror of
+        `render_system_card` — best-effort, no swap-to-mock on
+        error, propagate for caller-side handling.
+        """
+        if self._mock is not None:
+            self._mock.clear_system_card()
+            return
+        self._primary.clear_system_card()
+
     # --- Lifecycle ---
 
     def open(self):
