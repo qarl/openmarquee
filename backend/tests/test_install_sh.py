@@ -150,6 +150,82 @@ def test_dry_run_pip_install_uses_wheels_when_present(
     assert "--no-build-isolation" in out
 
 
+def test_dry_run_configures_avahi_mdns(dry_output: str, tmp_path_factory) -> None:
+    """HANDOVER-BLOCKER 2026-07-01 (onboarding mDNS PR): avahi advertises
+    `openmarquee.local` after the setup AP tears down. Without this
+    section the LINGER card + post-onboarding redirect promise a name
+    that doesn't resolve — Jason loses the sign.
+
+    Assert (a) install.sh's dry-run mentions the avahi setup section,
+    (b) both source files exist on disk, (c) the daemon.conf overrides
+    host-name + limits to wlan0, (d) the service file publishes
+    _http._tcp on port 80.
+    """
+    # (a) Section runs (both DRYRUN log lines fire).
+    assert "avahi" in dry_output.lower()
+    assert "avahi-daemon" in dry_output
+    assert "openmarquee.service" in dry_output
+
+    # (b) Source files exist under system/avahi/.
+    src_dir = _REPO_ROOT / "system" / "avahi"
+    daemon_conf = src_dir / "avahi-daemon.conf"
+    service_file = src_dir / "openmarquee.service"
+    assert daemon_conf.exists(), f"missing {daemon_conf}"
+    assert service_file.exists(), f"missing {service_file}"
+
+    # (c) avahi-daemon.conf pins host-name=openmarquee + allow-interfaces
+    #     =wlan0. Whitespace-tolerant checks so a future reformat
+    #     doesn't false-fail.
+    conf_text = daemon_conf.read_text()
+    assert "host-name=openmarquee" in conf_text, (
+        "avahi-daemon.conf must set host-name=openmarquee so "
+        "openmarquee.local resolves regardless of /etc/hostname"
+    )
+    assert "allow-interfaces=wlan0" in conf_text, (
+        "avahi-daemon.conf must scope advertisements to wlan0 so "
+        "the AP interface ap0 isn't dual-advertised during SETUP"
+    )
+
+    # (d) openmarquee.service publishes _http._tcp on port 80. Check
+    #     the substring presence + adjacency (port right after type)
+    #     without doing full XML parsing — the deploy path is a
+    #     verbatim install, so exact substring match is safe.
+    svc_text = service_file.read_text()
+    assert "<type>_http._tcp</type>" in svc_text
+    assert "<port>80</port>" in svc_text
+    # Name wildcard uses %h so the record follows the host-name= key
+    # above (which we pinned to openmarquee).
+    assert 'replace-wildcards="yes">%h' in svc_text
+
+
+def test_dry_run_lists_avahi_in_packages() -> None:
+    """The image build lays down apt packages via the pi-gen 00-packages
+    manifest. avahi-daemon + libnss-mdns must both be present or a
+    fresh SD-card image ships without the mDNS responder — install.sh's
+    apt-install fallback would kick in on first boot but that requires
+    internet + adds first-boot latency. The image build is the primary
+    path.
+    """
+    packages_file = (
+        _REPO_ROOT
+        / "images"
+        / "openmarquee"
+        / "stage-openmarquee"
+        / "00-install-packages"
+        / "00-packages"
+    )
+    text = packages_file.read_text().split()
+    assert "avahi-daemon" in text, (
+        "images/openmarquee/stage-openmarquee/00-install-packages/00-packages "
+        "must list avahi-daemon so the SD-card image ships with the mDNS "
+        "responder pre-installed"
+    )
+    assert "libnss-mdns" in text, (
+        "libnss-mdns must also be listed so .local resolves via NSS on "
+        "the Pi itself (nsswitch mdns4_minimal hook)"
+    )
+
+
 def test_dry_run_installs_three_systemd_units(dry_output: str) -> None:
     """Step 3 -- backend, ap0, tailscale. Dropping any one breaks a
     specific service: backend = no UI; ap0 = no AP interface (so
