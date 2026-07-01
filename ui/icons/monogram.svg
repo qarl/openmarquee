@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  openMarquee "oM" monogram — brand lockup mark from
+  qa/onboarding-marquee-cards-mockup.html (2026-06-10 spec §"Finding
+  the device after onboarding"). Used as the source SVG for the PWA
+  icons (apple-touch-icon 180x180, manifest icon 192x192, maskable
+  512x512). The apple-touch-icon PNGs are pre-rendered from this
+  file via `scripts/render-pwa-icons.sh`.
+
+  Design: amber accent bg (#ffb84d), dark ink text (#1a0f00), bold
+  "oM" glyph centered. Full-canvas fill (no explicit rounded corners
+  — iOS auto-rounds apple-touch-icon; Android manifest declares
+  purpose="maskable" and the platform inscribes its own mask, so
+  bleeding the fill to the edges keeps the icon safe under any
+  crop shape).
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Amber accent fill, full canvas. iOS + Android apply the platform
+       corner-radius; a solid-fill background survives every mask
+       shape (square, squircle, circle, teardrop) without leaving
+       negative-space wedges at the corners. -->
+  <rect x="0" y="0" width="512" height="512" fill="#ffb84d"/>
+  <!--
+    "oM" glyph. Centered on the 80% inner safe zone (256±205 px) so
+    Android's maskable inscribed mask doesn't chop the letters.
+    Font is a system-friendly bold sans; the mockup uses 900 weight
+    with negative letter-spacing for a tight lockup — we match with
+    font-weight=900 + letter-spacing=-15.
+  -->
+  <text x="256" y="256"
+        text-anchor="middle"
+        dominant-baseline="central"
+        font-family="Helvetica, Arial, sans-serif"
+        font-weight="900"
+        font-size="240"
+        letter-spacing="-15"
+        fill="#1a0f00">oM</text>
+</svg>

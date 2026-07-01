@@ -892,8 +892,7 @@ async def render_system_card_preview(
         raise HTTPException(
             status_code=502,
             detail=(
-                "renderer is in fallback (mock) — card painted on the "
-                "mock, not the real display"
+                "renderer is in fallback (mock) — card painted on the mock, not the real display"
             ),
         )
     return RenderSystemCardPreviewResponse(status="rendered")
@@ -925,8 +924,7 @@ async def clear_system_card_preview() -> RenderSystemCardPreviewResponse:
         raise HTTPException(
             status_code=502,
             detail=(
-                "renderer is in fallback (mock) — clear applied to the "
-                "mock, not the real display"
+                "renderer is in fallback (mock) — clear applied to the mock, not the real display"
             ),
         )
     return RenderSystemCardPreviewResponse(status="cleared")

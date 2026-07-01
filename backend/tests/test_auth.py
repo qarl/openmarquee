@@ -1076,6 +1076,41 @@ def test_ui_html_pages_whitelisted(client: TestClient):
         assert response.status_code != 401, f"middleware 401'd a whitelisted path: {path}"
 
 
+def test_pwa_manifest_and_icons_whitelisted(client: TestClient):
+    """PR #23 (2026-07-01) onboarding PWA: the browser fetches
+    /manifest.webmanifest via `<link rel="manifest">` and the icons
+    via `<link rel="apple-touch-icon">` + the manifest's icons[]
+    entries. NEITHER attaches a bearer token, so gating them 401s
+    the install-tile fetch:
+
+      - Android: 401 on manifest = no install banner. The whole
+        Add-to-Home-Screen path is dead.
+      - iOS: 401 on apple-touch-icon.png = Safari falls back to a
+        page screenshot for the home-screen tile, losing the
+        branded oM monogram + the point of the feature.
+
+    Regression guard: manifest + a representative icon path must
+    not 401.
+
+    (Same StaticFiles caveat as test_ui_html_pages_whitelisted:
+    the test backend doesn't mount ui/, so 404 is fine — only 401
+    from the auth middleware fails this test.)
+    """
+    client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    for path in (
+        "/manifest.webmanifest",
+        "/icons/apple-touch-icon.png",
+        "/icons/icon-192.png",
+        "/icons/icon-512-maskable.png",
+        "/icons/monogram.svg",
+    ):
+        response = client.get(path)
+        assert response.status_code != 401, f"middleware 401'd a whitelisted PWA path: {path}"
+
+
 def test_test_harness_paths_whitelisted(client: TestClient):
     """The Live-takeover fake-camera harness at ui/test/ must be
     reachable without a bearer token, same auth shape as /dist/.

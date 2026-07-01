@@ -19,6 +19,16 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>openMarquee — welcome</title>
+    <!-- PWA "bookmark moment" 2026-07-01: manifest + apple-touch-icon
+         so the LINGER redirect can land the user on this page and
+         offer Add to Home Screen (see qa/spec-onboarding-ap-sta-
+         concurrent-2026-06-10.md §"Finding the device after
+         onboarding" #2). -->
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+    <link rel="icon" type="image/svg+xml" href="/icons/monogram.svg">
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon.png">
+    <meta name="theme-color" content="#ffb84d">
     <style>
         :root {
             /* Mirrors main UI's /styles.css palette — same accent +
@@ -415,6 +425,15 @@
         <a class="welcome-continue" href="/set-password.html">
             Continue — set up my sign
         </a>
+
+        <!-- PWA "bookmark moment" 2026-07-01: on iOS Safari or on a
+             Chromium-derived browser firing beforeinstallprompt, this
+             container gets a small dismissible banner inviting Add to
+             Home Screen. Empty when the app is already installed, when
+             the user recently dismissed, or on browsers that neither
+             fire beforeinstallprompt nor match the iOS Safari sniff.
+             welcome.js mounts the banner via pwa-install-prompt.js. -->
+        <div id="pwa-install-slot" aria-live="polite"></div>
 
         <footer class="welcome-footer">
             <span>
