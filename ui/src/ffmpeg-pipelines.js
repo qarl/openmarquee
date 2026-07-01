@@ -213,7 +213,24 @@ export function transcodeToH264(
                 "-maxrate", "8M",
                 "-bufsize", "16M",
                 "-pix_fmt", "yuv420p",
-                "-an", // drop audio — signs don't speak
+                // HDMI-audio 2026-07-01 (qarl decision, locked): any
+                // video with an audio track just plays its sound out
+                // the sign's HDMI. Ingest re-encodes to AAC 128k
+                // 48kHz stereo (48kHz matches HDMI's native rate so
+                // ALSA needn't resample) instead of stripping. When
+                // the source has NO audio stream this is a harmless
+                // no-op (ffmpeg produces a video-only output). The
+                // playback-side helper (backend/openmarquee/
+                // playback.py) is what actually opens ALSA + plays;
+                // this is just the ingest side making the audio
+                // AVAILABLE on the stored asset. Silent stills/text/
+                // image slides remain silent (playback helper only
+                // spawns on VideoSlide entry). Note: only affects
+                // videos uploaded AFTER this change; existing on-
+                // sign assets stay silent unless re-uploaded.
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ar", "48000",
                 outName,
             ]));
             onProgress?.(100);

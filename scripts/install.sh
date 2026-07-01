@@ -1142,14 +1142,52 @@ if [ -f "$BOOT_LIB" ]; then
             # memory accounting + systemd-OOMD become available.
             strip_cmdline_token "cgroup_disable=memory" "${boot_dir}/cmdline.txt" \
                 || say "  WARNING: cmdline.txt strip skipped (see above)"
+            # HDMI audio 2026-07-01 (qarl decision, locked): ensure
+            # `dtparam=audio=on` is present so the vc4hdmi ALSA card
+            # exposes on boot. Idempotent — no-op when already set
+            # (the live production sign already has it). Guarded so
+            # non-zero doesn't trip set -e on a redeploy: a stale
+            # boot file must not block a production update.
+            patch_config_txt_audio "${boot_dir}/config.txt" \
+                || say "  WARNING: config.txt audio patch skipped (see above)"
         else
             say "  DRYRUN: would patch config.txt (disable_splash=1) +"
             say "          cmdline.txt (quiet splash plymouth.ignore-serial-consoles)"
             say "          cmdline.txt strip (cgroup_disable=memory)"
+            say "          config.txt audio (dtparam=audio=on)"
         fi
     fi
 else
     say "  boot-config-lib.sh absent at ${BOOT_LIB}; skip boot-config patch"
+fi
+
+# --- 4b. HDMI audio: openmarquee user in 'audio' group --------------------
+#
+# HDMI audio 2026-07-01 (qarl decision, locked): the openmarquee-backend
+# service runs as user `openmarquee` and needs to open /dev/snd/* to pipe
+# VideoSlide audio out the vc4hdmi ALSA card. /dev/snd/ is owned root:audio
+# with group-rw permissions, so the backend user MUST be in `audio` or
+# every ffmpeg spawn ENOENTS on the ALSA device and the sign is silent.
+#
+# QA verified live (2026-07-01): a fresh SD-card image left the backend
+# user OUT of `audio` and every audio spawn failed silently. usermod is
+# idempotent — repeated runs with the user already in the group print an
+# informational log and exit 0. We wrap it defensively so an unexpected
+# failure (missing user, missing group) doesn't abort the install.
+#
+# Effect is permanent per subsequent process starts — a running backend
+# needs a restart to pick the new group up. Section 8's daemon-reload +
+# service restart below handles that automatically on install.sh redeploy.
+if getent passwd openmarquee >/dev/null 2>&1 && getent group audio >/dev/null 2>&1; then
+    say "Ensure openmarquee is in 'audio' group (HDMI audio)"
+    if [ "$DRY_RUN" -eq 0 ]; then
+        usermod -aG audio openmarquee \
+            || say "  WARNING: usermod -aG audio openmarquee failed (HDMI audio may be silent)"
+    else
+        say "  DRYRUN: would run 'usermod -aG audio openmarquee'"
+    fi
+else
+    say "  openmarquee user or audio group missing; skipping audio-group add"
 fi
 
 # 5. Install the plymouth-quit --retain-splash handoff drop-in. This

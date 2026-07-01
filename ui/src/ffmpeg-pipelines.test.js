@@ -176,8 +176,79 @@ describe("transcodeToH264", () => {
         expect(args[args.indexOf("-c:v") + 1]).toBe("libx264");
         expect(args).toContain("-pix_fmt");
         expect(args[args.indexOf("-pix_fmt") + 1]).toBe("yuv420p");
-        expect(args).toContain("-an");  // no audio
+        // HDMI-audio 2026-07-01 (qarl decision): keep the audio
+        // stream (re-encode to AAC 48kHz stereo). Backend
+        // playback.py's ffmpeg helper opens ALSA on video-slide
+        // entry. -an was removed; the assertion below pins the
+        // replacement flags.
+        expect(args).not.toContain("-an");
+        expect(args).toContain("-c:a");
+        expect(args[args.indexOf("-c:a") + 1]).toBe("aac");
         expect(args.find(a => a.startsWith("scale=1280:720"))).toBeTruthy();
+    });
+
+    // HDMI-audio 2026-07-01: pin the audio re-encode flags.
+    // Regression catcher — a future refactor that drops or
+    // downgrades these would silently break the sign's audio
+    // (falling back to source-format audio that ALSA may not
+    // be able to play out HDMI, OR to no audio if -an sneaks
+    // back in).
+    it("re-encodes audio to AAC 128k 48kHz (HDMI ALSA-friendly)", async () => {
+        const { transcodeToH264 } = await import("./ffmpeg-pipelines.js");
+        await transcodeToH264({
+            file: new Blob(["fake mp4"], { type: "video/mp4" }),
+            width: 1280,
+            height: 720,
+        });
+        const args = ffmpegState.instance.calls.exec[0];
+
+        // AAC — HDMI + ALSA's most compatible codec + what
+        // ffmpeg -f alsa on the playback side expects.
+        expect(args).toContain("-c:a");
+        expect(args[args.indexOf("-c:a") + 1]).toBe("aac");
+
+        // 128k bitrate — sensible signage-content ceiling; keeps
+        // the ingest asset small vs going straight from source.
+        expect(args).toContain("-b:a");
+        expect(args[args.indexOf("-b:a") + 1]).toBe("128k");
+
+        // 48kHz — matches HDMI's native rate so ALSA needn't
+        // resample. The 44.1kHz alternative would resample every
+        // frame on the Zero 2 W's CPU.
+        expect(args).toContain("-ar");
+        expect(args[args.indexOf("-ar") + 1]).toBe("48000");
+
+        // No stray -an. This would produce silent output even
+        // with the -c:a aac / -b:a flags present (-an takes
+        // precedence and ffmpeg drops audio entirely).
+        expect(args).not.toContain("-an");
+    });
+
+    // HDMI-audio 2026-07-01: silent-source robustness. When the
+    // source has no audio stream, -c:a aac is a harmless no-op
+    // (ffmpeg emits a video-only output). The unit test mock
+    // can't exercise the real ffmpeg branching, but this test
+    // documents the intent + guards against a future revert of
+    // "unconditionally send -c:a aac" -> "only send when audio
+    // is present" that would need a different code path.
+    it("emits the audio flags unconditionally (silent-source safe)", async () => {
+        const { transcodeToH264 } = await import("./ffmpeg-pipelines.js");
+        // Same call shape as a silent-source upload would use --
+        // the args are input-independent at this layer.
+        await transcodeToH264({
+            file: new Blob(["fake mp4"], { type: "video/mp4" }),
+            width: 640,
+            height: 480,
+        });
+        const args = ffmpegState.instance.calls.exec[0];
+        // Audio flags present regardless of source content.
+        expect(args).toContain("-c:a");
+        expect(args).toContain("-b:a");
+        expect(args).toContain("-ar");
+        // And the video-only-if-silent contract is preserved:
+        // no -an means ffmpeg's default (keep audio if present,
+        // no audio if absent) applies.
+        expect(args).not.toContain("-an");
     });
 
     // Perf-night r4 (2026-05-26): VPU-friendly preset pin. Each flag

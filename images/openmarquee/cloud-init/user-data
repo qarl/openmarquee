@@ -77,4 +77,13 @@ bootcmd:
 runcmd:
   - systemctl enable ssh
   - systemctl start ssh
+  # HDMI audio 2026-07-01 (qarl decision, locked): the openmarquee
+  # backend needs to open /dev/snd/* to pipe VideoSlide audio out
+  # HDMI. Add the user to the 'audio' group BEFORE install.sh runs
+  # so any early service starts inside install.sh see the correct
+  # group membership. usermod -aG is idempotent (no-op when the
+  # user is already in the group). install.sh also does this add
+  # on the redeploy path — this line is the fresh-SD flash belt-
+  # and-suspenders per QA's live-verified fix on 2026-07-01.
+  - usermod -aG audio openmarquee || echo "warn: usermod audio failed"
   - bash /opt/openmarquee/scripts/install.sh

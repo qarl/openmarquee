@@ -35,6 +35,7 @@ from uuid import UUID
 
 from openmarquee import sd_notify
 from openmarquee.content import ContentItem, StreamSlide, WebSlide
+from openmarquee.hdmi_audio import HdmiAudioHelper
 from openmarquee.perf_stats import STATS as _PERF_STATS
 from openmarquee.rendering import Renderer
 from openmarquee.stream_consumer import StreamConsumer
@@ -226,6 +227,7 @@ class PlaybackLoop:
         stuck_backoff_seconds: float = 3.0,
         active_playlist_id: Callable[[], UUID | None] | None = None,
         web_screenshot_producer: (Callable[[WebSlide, int, int], Awaitable[bool]] | None) = None,
+        content_root: Path | None = None,
     ):
         self._renderer = renderer
         self._fetch_items = fetch_items
@@ -395,6 +397,18 @@ class PlaybackLoop:
         # warn was a real diagnostic gap.
         self._last_tick_warn_at: float | None = None
 
+        # HDMI audio 2026-07-01 (qarl decision, locked): any VideoSlide
+        # with an audio track plays its sound out the sign's HDMI. The
+        # helper spawns a detached ffmpeg-to-ALSA process on VideoSlide
+        # entry + kills it on any lifecycle boundary (transition, non-
+        # video slide, pause, stop). Master clock stays the Python wall
+        # clock; audio is fire-and-forget, native rate, hard-cut.
+        # None if no content_root supplied (unit tests) — the helper
+        # methods below all no-op when the attribute is None.
+        self._hdmi_audio: HdmiAudioHelper | None = (
+            HdmiAudioHelper(content_root) if content_root is not None else None
+        )
+
     @property
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
@@ -542,6 +556,19 @@ class PlaybackLoop:
         """Start the loop. No-op if already running."""
         if self.is_running:
             return
+        # HDMI-audio startup: probe ALSA once + sweep any stray helpers
+        # from a prior openmarquee run. Idempotent — safe to call every
+        # start(); after the first success it's a cheap no-op.
+        # PR#22 review-BLOCKER-1+2: run OFF the event loop (aplay -L
+        # + pgrep can each burn up to 5s) + wrap in blanket try/except.
+        if self._hdmi_audio is not None:
+            try:
+                await asyncio.to_thread(self._hdmi_audio.initialize)
+            except Exception:
+                log.exception(
+                    "playback: hdmi-audio initialize() raised "
+                    "(silent; start continues without audio)",
+                )
         # Bind the Events to the running event loop on each start.
         self._stop_event = asyncio.Event()
         self._pause_event = asyncio.Event()
@@ -589,6 +616,20 @@ class PlaybackLoop:
         task = self._task
         self._task = None
         self._stop_event.set()
+        # HDMI-audio: kill any currently-playing helper so a stop()
+        # produces immediate silence instead of letting the current
+        # clip's audio drain to end-of-loop before the wake propagates.
+        # Idempotent + no-op when audio is globally disabled.
+        # PR#22 review-BLOCKER-1+2: run OFF the event loop + wrap in
+        # blanket try/except so a wedged ALSA reap can't block stop()
+        # nor propagate into an outer awaiter.
+        if self._hdmi_audio is not None:
+            try:
+                await asyncio.to_thread(self._hdmi_audio.stop_current)
+            except Exception:
+                log.exception(
+                    "playback: hdmi-audio stop() kill raised (silent; stop continues)",
+                )
         # Wake any in-flight _wait so the loop coroutine exits promptly
         # rather than draining its current sleep.
         if self._wake_event is not None:
@@ -707,6 +748,45 @@ class PlaybackLoop:
                 self._current_type = item.type
                 self._current_transition = item.transition
                 self._current_transition_ms = item.transition_ms
+                # HDMI-audio 2026-07-01: on VideoSlide entry, spawn an
+                # ffmpeg helper piping the clip's audio to the sign's
+                # ALSA card. On non-video entry, kill any prior helper
+                # (belt+suspenders silence for stills/text). start_for
+                # _slide is idempotent — it stops any current helper
+                # first — so back-to-back video slides get a clean
+                # hard-cut boundary.
+                #
+                # PR#22 review-BLOCKER-1 fix: run the helper op OFF the
+                # event loop via asyncio.to_thread. The helper's
+                # internal stop_current() does synchronous proc.wait
+                # (SIGTERM 1s + SIGKILL 1s worst case ~2s). A wedged
+                # ffmpeg on ALSA close would otherwise block the whole
+                # event loop -> delay slide advance + starve FastAPI
+                # handlers. to_thread hops it to an executor worker so
+                # the coroutine stays scheduleable.
+                #
+                # PR#22 review-BLOCKER-2 fix: this call site is
+                # OUTSIDE the outer per-slide try/except; wrap in a
+                # blanket try/except Exception so an unenumerated
+                # helper failure can't kill the playback task ->
+                # freeze the sign (systemd-reboot only). Audio must
+                # NEVER propagate into the video advance path.
+                if self._hdmi_audio is not None:
+                    try:
+                        if item.type == "video":
+                            await asyncio.to_thread(
+                                self._hdmi_audio.start_for_slide,
+                                item.id,
+                            )
+                        else:
+                            await asyncio.to_thread(
+                                self._hdmi_audio.stop_current,
+                            )
+                    except Exception:
+                        log.exception(
+                            "playback: hdmi-audio slide-entry hook "
+                            "raised (silent; not fatal to advance)",
+                        )
                 # Stamp slot t0 here so EVERY slot (static image,
                 # static text, dynamic text, video) has a correct
                 # baseline for capture_current_frame's elapsed_s.
@@ -938,6 +1018,19 @@ class PlaybackLoop:
             return
         self._resume_event.clear()
         self._pause_event.set()
+        # HDMI-audio: kill any currently-playing helper so pause()
+        # produces immediate silence (Live takeover expects the sign
+        # to yield BOTH video AND audio to the live session). No-op
+        # when disabled or nothing playing.
+        # PR#22 review-BLOCKER-1+2: run OFF the event loop + wrap in
+        # blanket try/except so a wedged ALSA reap can't block pause().
+        if self._hdmi_audio is not None:
+            try:
+                await asyncio.to_thread(self._hdmi_audio.stop_current)
+            except Exception:
+                log.exception(
+                    "playback: hdmi-audio pause() kill raised (silent; pause continues)",
+                )
         # Wake any in-flight _wait so live takeover yields promptly
         # rather than waiting for the current sleep to drain.
         if self._wake_event is not None:
@@ -1513,6 +1606,27 @@ class PlaybackLoop:
             and not self._pause_event.is_set()
         ):
             transition_t0_ms = t0_ms + int((loop.time() - t0) * 1000)
+            # HDMI-audio 2026-07-01: hard-cut audio at transition-begin.
+            # Per brief: "kill A's helper, start B's when B becomes
+            # current." Silences audio during the ~600ms visual
+            # transition window; B's helper spawns on the next outer
+            # iteration's VideoSlide entry (see start_for_slide hook
+            # above). Placing the kill BEFORE the IPC to_thread so a
+            # never-returning renderer can't leave A's helper piping
+            # stale audio.
+            #
+            # PR#22 review-BLOCKER-1+2: to_thread hop so the reap
+            # doesn't block the event loop, plus a blanket try/except
+            # so an audio failure can't kill the playback task
+            # (this call site is outside the outer per-slide guard).
+            if self._hdmi_audio is not None:
+                try:
+                    await asyncio.to_thread(self._hdmi_audio.stop_current)
+                except Exception:
+                    log.exception(
+                        "playback: hdmi-audio pre-transition kill "
+                        "raised (silent; not fatal to advance)",
+                    )
             try:
                 # Perf-night r4: off-loop per the rust_renderer.py:843-891
                 # sweep (now resolved). Same rationale as begin_slide /

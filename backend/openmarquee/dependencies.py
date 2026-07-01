@@ -879,6 +879,11 @@ def _playback_loop_singleton() -> PlaybackLoop:
         get_timezone=current_timezone,
         active_playlist_id=active_playlist_id,
         web_screenshot_producer=web_screenshot_producer,
+        # HDMI-audio 2026-07-01: thread content_root so the audio
+        # helper can locate each slide's asset.mp4. Reuses the same
+        # resolver the rest of the backend does so tests + production
+        # agree.
+        content_root=_resolve_content_root(),
     )
     loop_holder["loop"] = loop
     return loop
