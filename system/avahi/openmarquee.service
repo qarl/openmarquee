@@ -1,0 +1,43 @@
+<?xml version="1.0" standalone='no'?>
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  mDNS service advertisement for the openMarquee dashboard.
+
+  Deployed at /etc/avahi/services/openmarquee.service by
+  scripts/install.sh. Avahi picks up files under that directory
+  automatically + hot-reloads on change.
+
+  Per qa/spec-onboarding-ap-sta-concurrent-2026-06-10.md §"Finding
+  the device after onboarding" #1: mDNS is the primary post-
+  onboarding entry point. The LINGER card + the operator's phone
+  after AP teardown resolve `openmarquee.local` -> the device's
+  home-wifi IP, and this record advertises the http endpoint under
+  the same name so `.local` DNS-SD browsers (macOS Bonjour, iOS/
+  Android mDNS clients) surface the sign without a bookmark.
+
+  <name replace-wildcards="yes">%h</name>
+      %h expands to the mDNS host-name avahi announces. That name
+      is set by /etc/avahi/avahi-daemon.conf's `host-name=` key.
+      This project ships that key as `openmarquee`, so the record
+      shows up as "openmarquee" in mDNS browsers regardless of the
+      per-device /etc/hostname suffix (openmarquee-a3b7 etc.).
+
+  <type>_http._tcp</type> + <port>80</port>
+      Matches the FastAPI backend's listen port
+      (system/openmarquee-backend.service ExecStart --port 80).
+      DNS-SD clients that resolve `_http._tcp.local` get a direct
+      hit on the dashboard.
+
+  <txt-record>path=/</txt-record>
+      Bonjour convention: browsers that surface web endpoints use
+      the `path=` TXT hint to construct the URL. Root "/" is the
+      dashboard entry (main.js's SPA router takes over from there).
+-->
+<service-group>
+  <name replace-wildcards="yes">%h</name>
+  <service>
+    <type>_http._tcp</type>
+    <port>80</port>
+    <txt-record>path=/</txt-record>
+  </service>
+</service-group>

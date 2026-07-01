@@ -1190,6 +1190,78 @@ else
     say "  openmarquee user or audio group missing; skipping audio-group add"
 fi
 
+# --- 4c. mDNS: avahi-daemon + openmarquee.local advertisement -------------
+#
+# HANDOVER-BLOCKER 2026-07-01 (QA audit): the LINGER card + post-
+# onboarding redirect promise `openmarquee.local` resolves from the
+# operator's phone after the setup AP tears down. That name only
+# resolves if avahi-daemon is installed + advertising on wlan0. Before
+# this section, avahi lived only in the spec — onboarding shipped a
+# broken promise (Jason loses the sign after ONLINE).
+#
+# Two files land here + avahi picks them up on daemon restart:
+#   1. /etc/avahi/avahi-daemon.conf — overrides host-name to
+#      `openmarquee` (so `.local` announces the marketing name
+#      regardless of the per-device randomized /etc/hostname) and
+#      allow-interfaces=wlan0 (so the AP interface ap0 isn't
+#      dual-advertised during the SETUP overlap window; wlan0
+#      advertisement survives AP teardown because wlan0 stays up).
+#   2. /etc/avahi/services/openmarquee.service — the _http._tcp
+#      port-80 record so DNS-SD browsers surface the dashboard.
+#
+# Both files are staged as source-of-truth under system/avahi/ so the
+# image build + install.sh redeploy both drop the same content.
+AVAHI_SRC_DIR="${OPT_DIR}/system/avahi"
+AVAHI_CONF_DST="${ROOT_PREFIX}/etc/avahi/avahi-daemon.conf"
+AVAHI_SVC_DIR="${ROOT_PREFIX}/etc/avahi/services"
+# Header logged unconditionally so test_install_sh's dry-run coverage
+# can pin the section presence (matches the hostapd/dnsmasq pattern).
+# The actual apt-install + file drop is guarded on AVAHI_SRC_DIR
+# existence below so a tmpdir dry-run without the sources doesn't
+# error.
+say "Configure avahi (mDNS openmarquee.local advertisement)"
+say "  avahi-daemon.conf -> ${AVAHI_CONF_DST}"
+say "  openmarquee.service -> ${AVAHI_SVC_DIR}/openmarquee.service"
+if [ -d "$AVAHI_SRC_DIR" ]; then
+    if [ "$DRY_RUN" -eq 0 ]; then
+        # Ensure avahi is installed. Idempotent — apt-get returns 0 +
+        # says "already the newest version" when it's already there.
+        # Redeploy path: on a Pi that already has avahi from the image
+        # build this is a cheap short-circuit; on a fresh Pi that
+        # skipped the image build it's the install.
+        if ! command -v avahi-daemon >/dev/null 2>&1; then
+            apt-get update -qq \
+                || say "  WARNING: apt-get update failed (avahi may not install)"
+            apt-get install -y --no-install-recommends avahi-daemon libnss-mdns \
+                || say "  WARNING: avahi install failed; mDNS unavailable"
+        fi
+        # Copy config + service. Non-destructive on the redeploy path:
+        # cp overwrites atomically per POSIX, so a concurrent avahi read
+        # can't see a half-written file.
+        run install -m 0644 "${AVAHI_SRC_DIR}/avahi-daemon.conf" "$AVAHI_CONF_DST" \
+            || say "  WARNING: avahi-daemon.conf install failed (redeploy)"
+        run mkdir -p "$AVAHI_SVC_DIR"
+        run install -m 0644 "${AVAHI_SRC_DIR}/openmarquee.service" \
+            "${AVAHI_SVC_DIR}/openmarquee.service" \
+            || say "  WARNING: openmarquee.service install failed (redeploy)"
+        # Enable + restart. `enable --now` covers both fresh installs
+        # (start it) and redeploys where the unit is already running
+        # (restart to pick up the new conf/service files). Non-fatal
+        # on failure — mDNS is a nice-to-have; a wedged systemctl
+        # mustn't block the rest of install.sh.
+        run systemctl enable --now avahi-daemon.service \
+            || say "  WARNING: systemctl enable --now avahi-daemon failed"
+        run systemctl restart avahi-daemon.service \
+            || say "  WARNING: systemctl restart avahi-daemon failed"
+    else
+        say "  DRYRUN: would apt-install avahi-daemon + libnss-mdns"
+        say "  DRYRUN: would install ${AVAHI_CONF_DST} + ${AVAHI_SVC_DIR}/openmarquee.service"
+        say "  DRYRUN: would systemctl enable --now + restart avahi-daemon"
+    fi
+else
+    say "  ${AVAHI_SRC_DIR} absent; skipping avahi setup (mDNS unavailable)"
+fi
+
 # 5. Install the plymouth-quit --retain-splash handoff drop-in. This
 #    keeps the splash framebuffer on screen until the renderer paints
 #    its first frame (no black flash). The drop-in lands in a
