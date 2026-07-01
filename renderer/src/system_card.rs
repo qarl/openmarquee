@@ -120,7 +120,8 @@ pub enum CardShape {
 
 /// PR3 active-card state held by the renderer (one per HDMI
 /// session). Set on RenderSystemCard; cleared on ClearSystemCard
-/// OR ttl-expiry detected by the paint loop.
+/// OR ttl-expiry detected by the paint loop OR the finish-pass
+/// max-lifetime safety net.
 #[derive(Debug, Clone)]
 pub struct ActiveSystemCard {
     pub params: RenderSystemCardParams,
@@ -129,6 +130,66 @@ pub struct ActiveSystemCard {
     /// OR None for "until-state-change" (supervisor must
     /// explicitly send ClearSystemCard or replace the card).
     pub deadline: Option<std::time::Instant>,
+    /// PR3 finish-pass (2026-07-01) — safety net for `ttl_ms=None`
+    /// cards. Even the "until-state-change" cards get force-cleared
+    /// after `SYSTEM_CARD_MAX_LIFETIME_S` (see hdmi.rs) so a
+    /// supervisor crash / missed-ClearSystemCard can never wedge
+    /// the sign indefinitely.
+    pub activated_at: std::time::Instant,
+}
+
+/// PR3 finish-pass (2026-07-01) — per-field byte caps applied to
+/// incoming `RenderSystemCardParams` before layout. Prevents a
+/// chatty client from growing the per-frame shape-clone cost or
+/// leaking long strings through the diagnostic ring buffer / QR
+/// encoder / preview endpoint. Chosen to bound the actual visual
+/// content:
+///   * SSID: IEEE 802.11 caps SSID at 32 bytes; +8 headroom for
+///     the preview endpoint's leading-space quirks.
+///   * PIN: 12 bytes fits the widest sane per-boot PIN.
+///   * QR payload: WIFI:T:WPA;S:<32>;P:<63>;; ≈ 128 bytes worst-
+///     case; 256 gives forward-headroom for future URI schemes.
+///   * addresses / target_ssid: 128 bytes covers even long mDNS
+///     names + descriptive suffixes.
+///   * boot_hint: PR4 reserves this for the rapid-boot line; 96
+///     bytes fits any localised copy of "Restart 2× more…"
+pub const MAX_SSID_LEN: usize = 40;
+pub const MAX_PIN_LEN: usize = 12;
+pub const MAX_QR_PAYLOAD_LEN: usize = 256;
+pub const MAX_ADDRESS_LEN: usize = 128;
+pub const MAX_IP_LEN: usize = 45; // IPv4 or IPv6 (INET6_ADDRSTRLEN is 46 incl. nul)
+pub const MAX_BOOT_HINT_LEN: usize = 96;
+
+fn clamp_opt_string(s: Option<String>, max: usize) -> Option<String> {
+    s.map(|mut owned| {
+        if owned.len() > max {
+            // Split on a char boundary at or before `max` so a
+            // multibyte UTF-8 sequence is never bisected.
+            let cut = owned
+                .char_indices()
+                .take_while(|(idx, _)| *idx <= max)
+                .last()
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            owned.truncate(cut);
+        }
+        owned
+    })
+}
+
+/// PR3 finish-pass (2026-07-01) — clamp every incoming string field
+/// to a sane maximum. Called by the IPC handler before storing the
+/// params on `ActiveSystemCard` so downstream consumers (paint,
+/// diagnostics, preview) all see bounded strings.
+pub fn clamp_params(mut p: RenderSystemCardParams) -> RenderSystemCardParams {
+    p.ssid = clamp_opt_string(p.ssid, MAX_SSID_LEN);
+    p.pin = clamp_opt_string(p.pin, MAX_PIN_LEN);
+    p.qr_payload = clamp_opt_string(p.qr_payload, MAX_QR_PAYLOAD_LEN);
+    p.address = clamp_opt_string(p.address, MAX_ADDRESS_LEN);
+    p.ip = clamp_opt_string(p.ip, MAX_IP_LEN);
+    p.target_ssid = clamp_opt_string(p.target_ssid, MAX_ADDRESS_LEN);
+    p.boot_hint = clamp_opt_string(p.boot_hint, MAX_BOOT_HINT_LEN);
+    p
 }
 
 /// PR3 layout entrypoint: turn IPC params into the shape list.
@@ -138,7 +199,10 @@ pub fn layout_card(params: &RenderSystemCardParams) -> Vec<CardShape> {
     let mut shapes = Vec::with_capacity(8);
     shapes.push(CardShape::Background { color: BG });
     match params.kind {
-        SystemCardKind::Setup => layout_setup(params, &mut shapes),
+        // PR3 finish-pass forward-compat: `Unknown` (from a newer
+        // backend) degrades to the SETUP layout — safe default:
+        // AP-up + QR + PIN, so a user still has a path forward.
+        SystemCardKind::Setup | SystemCardKind::Unknown => layout_setup(params, &mut shapes),
         SystemCardKind::Connecting => layout_connecting(params, &mut shapes),
         SystemCardKind::Connected => layout_connected(params, &mut shapes),
         SystemCardKind::Degraded => layout_degraded(params, &mut shapes),
@@ -369,7 +433,7 @@ pub fn degraded_copy(
                     .to_string(),
             )
         }
-        Some(DegradedVariant::Lost) | None => (
+        Some(DegradedVariant::Lost | DegradedVariant::Unknown) | None => (
             "Lost the wifi\nconnection".to_string(),
             "The signal dropped or the router rebooted.".to_string(),
         ),
@@ -625,5 +689,89 @@ mod tests {
         p.boot_hint = Some("Restart 2× more for Setup Mode".to_string());
         let shapes = layout_card(&p);
         assert!(shapes.iter().any(|s| matches!(s, CardShape::BootHint { text, .. } if text.contains("Restart"))));
+    }
+
+    // ============================================================
+    // PR3 finish-pass (2026-07-01) — clamp params, forward-compat
+    // `Unknown` variants, and Setup fallback behaviour.
+    // ============================================================
+
+    #[test]
+    fn clamp_params_truncates_long_ssid_to_max() {
+        let mut p = params(SystemCardKind::Setup);
+        let too_long = "x".repeat(MAX_SSID_LEN + 20);
+        p.ssid = Some(too_long);
+        let clamped = clamp_params(p);
+        assert_eq!(clamped.ssid.as_deref().unwrap().len(), MAX_SSID_LEN);
+    }
+
+    #[test]
+    fn clamp_params_truncates_long_pin_to_max() {
+        let mut p = params(SystemCardKind::Setup);
+        p.pin = Some("1".repeat(MAX_PIN_LEN * 3));
+        let clamped = clamp_params(p);
+        assert_eq!(clamped.pin.as_deref().unwrap().len(), MAX_PIN_LEN);
+    }
+
+    #[test]
+    fn clamp_params_truncates_long_qr_payload_to_max() {
+        let mut p = params(SystemCardKind::Setup);
+        p.qr_payload = Some("A".repeat(MAX_QR_PAYLOAD_LEN * 2));
+        let clamped = clamp_params(p);
+        assert_eq!(
+            clamped.qr_payload.as_deref().unwrap().len(),
+            MAX_QR_PAYLOAD_LEN
+        );
+    }
+
+    #[test]
+    fn clamp_params_passes_through_short_values_unchanged() {
+        let mut p = params(SystemCardKind::Setup);
+        p.ssid = Some("openMarquee-Setup".to_string());
+        p.pin = Some("4827".to_string());
+        let clamped = clamp_params(p);
+        assert_eq!(clamped.ssid.as_deref(), Some("openMarquee-Setup"));
+        assert_eq!(clamped.pin.as_deref(), Some("4827"));
+    }
+
+    #[test]
+    fn clamp_params_preserves_utf8_char_boundary() {
+        // A UTF-8 multibyte grapheme (2-byte é ×) must not be
+        // bisected by the byte-length truncate.
+        let mut p = params(SystemCardKind::Setup);
+        let mut long = String::from("café ");
+        while long.len() < MAX_SSID_LEN + 5 {
+            long.push_str("café ");
+        }
+        p.ssid = Some(long);
+        let clamped = clamp_params(p);
+        let out = clamped.ssid.as_deref().unwrap();
+        assert!(out.len() <= MAX_SSID_LEN);
+        // A `truncate` at a bad byte would fail this validation.
+        assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn unknown_kind_layouts_as_setup_card() {
+        // Forward-compat: an `Unknown` from a newer backend should
+        // degrade to the SETUP layout (safest visible fallback).
+        let mut p = params(SystemCardKind::Unknown);
+        p.qr_payload = Some("WIFI:T:WPA;S:x;P:1;;".to_string());
+        p.ssid = Some("x".to_string());
+        p.pin = Some("1".to_string());
+        let shapes = layout_card(&p);
+        assert!(shapes.iter().any(|s| matches!(s, CardShape::QrPanel { .. })));
+        assert!(shapes.iter().any(|s| matches!(s,
+            CardShape::Chip { label, .. } if label == "SETUP MODE"
+        )));
+    }
+
+    #[test]
+    fn unknown_degraded_variant_falls_back_to_lost_copy() {
+        // Forward-compat: a `Some(DegradedVariant::Unknown)` from a
+        // newer backend must not panic + must render the generic
+        // "Lost the wifi connection" headline (safest generic copy).
+        let (headline, _sub) = degraded_copy(Some(DegradedVariant::Unknown), None);
+        assert!(headline.contains("Lost the wifi"));
     }
 }

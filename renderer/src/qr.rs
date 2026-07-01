@@ -131,4 +131,52 @@ mod tests {
         let qr = encode_qr("abc").expect("encodes");
         assert_eq!(qr.module_count(), qr.size * qr.size);
     }
+
+    /// PR3 finish-pass (2026-07-01) — end-to-end encode/decode
+    /// round-trip so a "structurally-valid-but-wrong-payload" QR
+    /// (right finder patterns, wrong data modules) can't pass. We
+    /// render the QrBitmap into a small grayscale image, wrap it
+    /// in `rqrr`, and assert the decoded payload equals the input.
+    ///
+    /// Uses the canonical onboarding WIFI: URI so a regression in
+    /// how the encoder or paint code interprets that string breaks
+    /// this test loudly.
+    #[test]
+    fn round_trips_canonical_wifi_uri_through_decoder() {
+        let payload = "WIFI:T:WPA;S:openMarquee-Setup;P:4827;;";
+        let qr = encode_qr(payload).expect("encodes");
+
+        // Render the bitmap into a grayscale image with a 4-module
+        // quiet zone (rqrr requires SOME quiet zone around the
+        // finder patterns) and a 4x pixel scale so decoders never
+        // struggle with a 1-px-per-module encoding.
+        let scale = 4usize;
+        let quiet = 4usize;
+        let img_side = (qr.size + 2 * quiet) * scale;
+        let mut pixels: Vec<u8> = vec![0xFF; img_side * img_side];
+        for y in 0..qr.size {
+            for x in 0..qr.size {
+                if !qr.module(x, y) {
+                    continue;
+                }
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let px_x = (quiet + x) * scale + dx;
+                        let px_y = (quiet + y) * scale + dy;
+                        pixels[px_y * img_side + px_x] = 0x00;
+                    }
+                }
+            }
+        }
+        let mut img =
+            rqrr::PreparedImage::prepare_from_greyscale(img_side, img_side, |x, y| {
+                pixels[y * img_side + x]
+            });
+        let grids = img.detect_grids();
+        assert_eq!(grids.len(), 1, "expected one QR grid; got {}", grids.len());
+        let (_meta, content) = grids[0]
+            .decode()
+            .expect("decode canonical WIFI: URI round-trip");
+        assert_eq!(content, payload, "round-tripped payload mismatch");
+    }
 }

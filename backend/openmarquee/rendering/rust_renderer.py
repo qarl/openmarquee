@@ -922,6 +922,47 @@ class RustRenderer:
                 ) from e
 
     # ------------------------------------------------------------------
+    # PR3 (2026-06-27) — onboarding system-card overlay.
+    # ------------------------------------------------------------------
+
+    def render_system_card(self, params: dict[str, Any]) -> None:
+        """Op 12 (PR3): display a full-screen onboarding system card
+        overlay per spec §"The display is the onboarding UI". See the
+        `Renderer` Protocol docstring for the params shape.
+
+        Best-effort: subprocess errors are caught and logged rather
+        than raised. A supervisor lifecycle transition (SETUP →
+        CONNECTING etc.) must never wedge waiting on the renderer;
+        a dropped card is a visual glitch, not a functional bug.
+        """
+        try:
+            self._send_op("render_system_card", dict(params))
+        except (
+            RustRendererError,
+            RustRendererProtocolError,
+            RustRendererSubprocessError,
+        ) as e:
+            log.warning(
+                "render_system_card: send failed (kind=%s); dropping: %s",
+                params.get("kind", "?"),
+                e,
+            )
+
+    def clear_system_card(self) -> None:
+        """Op 13 (PR3): clear any active system card + return to
+        normal playlist paint. Idempotent; best-effort like
+        render_system_card.
+        """
+        try:
+            self._send_op("clear_system_card", None)
+        except (
+            RustRendererError,
+            RustRendererProtocolError,
+            RustRendererSubprocessError,
+        ) as e:
+            log.warning("clear_system_card: send failed; dropping: %s", e)
+
+    # ------------------------------------------------------------------
     # Liveness.
     # ------------------------------------------------------------------
 

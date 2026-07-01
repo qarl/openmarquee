@@ -2766,27 +2766,23 @@ fn run_paint_hook(
     };
     let out = match result {
         OpResult::PaintSlide { slide_id, t_in_slide_ms } => {
-            // PR3 (2026-06-27): if a system card overlay is active
-            // (set by RenderSystemCard), paint the card INSTEAD of
-            // the playlist slide. The supervisor sends RenderSystem-
-            // Card on SETUP/CONNECTING/LINGER/DEGRADED transitions
-            // + ClearSystemCard on ONLINE; while active, every
-            // PaintSlide tick is intercepted here. The overlay
-            // paint also handles ttl-deadline auto-clear so a
-            // CONNECTED card (~120s ttl) reverts to playlist paint
-            // automatically.
+            // PR3 (2026-06-27, finish-pass 2026-07-01): if a system
+            // card overlay is active (set by RenderSystemCard),
+            // paint the card INSTEAD of the playlist slide AND
+            // PRESENT it via the full eglSwap→lock→addFB→commit_fb
+            // sequence. The supervisor sends RenderSystemCard on
+            // SETUP/CONNECTING/LINGER/DEGRADED transitions +
+            // ClearSystemCard on ONLINE. The overlay paint owns
+            // ttl-deadline auto-clear + the max-lifetime safety net
+            // so a CONNECTED card (~120s ttl) reverts to playlist
+            // paint automatically, and a stuck `ttl=None` card
+            // self-heals within an hour.
             #[cfg(target_os = "linux")]
             {
-                match hdmi::maybe_paint_system_card_overlay(
-                    state,
-                    session.gl(),
-                    u32::from(session.mode_w()),
-                    u32::from(session.mode_h()),
-                ) {
+                match hdmi::maybe_paint_system_card_overlay(state, session, card) {
                     Ok(true) => {
-                        // Card painted; skip the playlist slide
-                        // dispatch + present this frame as the
-                        // overlay.
+                        // Card painted + presented; skip the
+                        // playlist slide dispatch.
                         return IpcResponse::Ok {
                             result: OpResult::PaintSlide { slide_id, t_in_slide_ms },
                         };
@@ -3132,6 +3128,30 @@ fn run_paint_hook(
             }
         }
         OpResult::PaintTransition { from, to, kind, progress } => {
+            // PR3 finish-pass (2026-07-01): system-card overlay
+            // intercepts PaintTransition as well as PaintSlide so
+            // a transition tick that fires while a card is active
+            // doesn't flicker to playlist content between card
+            // frames. Same overlay function + present sequence as
+            // the PaintSlide arm above.
+            #[cfg(target_os = "linux")]
+            {
+                match hdmi::maybe_paint_system_card_overlay(state, session, card) {
+                    Ok(true) => {
+                        return IpcResponse::Ok {
+                            result: OpResult::PaintTransition { from, to, kind, progress },
+                        };
+                    }
+                    Ok(false) => {
+                        // Fall through to the normal transition paint.
+                    }
+                    Err(e) => {
+                        return err(format!(
+                            "paint_transition: system-card overlay failed: {e:#}"
+                        ));
+                    }
+                }
+            }
             // Phase 8 slice 6 (2026-05-16): build TransitionEndpoint
             // per-kind from cache state. Video endpoints route their
             // V4L2 decoder state from `cache.video_decoders` +
@@ -3588,6 +3608,15 @@ fn handle_inner_request(
             err("Open already called; nested Open is not supported")
         }
         IpcRequest::BeginSlide(p) => {
+            // PR3 finish-pass (2026-07-01) ttl safety net: a fresh
+            // BeginSlide from the backend means "resume the playlist" —
+            // any active system card is stale by definition. Clear
+            // it so a supervisor that missed sending ClearSystemCard
+            // (crash / race / logic bug) cannot wedge the sign.
+            #[cfg(target_os = "linux")]
+            {
+                state.active_system_card = None;
+            }
             // r102.1: V3D BO probe at BeginSlide entry. Brackets
             // the slide-change boundary so QA can compare slide-
             // change delta vs transition-paint delta.
@@ -3934,6 +3963,14 @@ fn handle_inner_request(
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
+            // PR3 finish-pass (2026-07-01) ttl safety net (mirror
+            // of BeginSlide above): a fresh BeginTransition means
+            // playlist paint is resuming; a lingering system card
+            // is stale.
+            #[cfg(target_os = "linux")]
+            {
+                state.active_system_card = None;
+            }
             // r110 c3.3.1 (2026-06-11): clear the poster-sourced
             // signal at transition entry so it scopes exactly to
             // "this transition window." c3.2.2 bake_a/bake_b
@@ -4490,7 +4527,17 @@ fn handle_inner_request(
             // is a no-op.
             #[cfg(target_os = "linux")]
             {
+                // PR3 finish-pass (2026-07-01): clamp incoming text
+                // fields BEFORE layout so a chatty client can't
+                // grow the per-frame shape-clone cost or leak long
+                // strings through the diagnostic ring buffer /
+                // preview endpoint. Clamp is applied to a moved
+                // copy so the returned response params (for
+                // debugging) still reflect the request.
+                let p = crate::system_card::clamp_params(p);
                 let shapes = crate::system_card::layout_card(&p);
+                // ttl_ms=0 collapses to None (until-state-change);
+                // any positive value → absolute Instant deadline.
                 let deadline = p.ttl_ms.and_then(|ttl| {
                     if ttl == 0 {
                         None
@@ -4504,6 +4551,7 @@ fn handle_inner_request(
                 state.active_system_card = Some(crate::system_card::ActiveSystemCard {
                     shapes,
                     deadline,
+                    activated_at: std::time::Instant::now(),
                     params: p,
                 });
                 ok_empty()

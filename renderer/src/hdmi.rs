@@ -17376,64 +17376,103 @@ impl ObjectProps {
 // (the supervisor sends this on ONLINE).
 // ============================================================
 
-/// MVP system-card overlay paint. Returns Ok(true) if a card was
-/// painted (the per-frame caller should skip the playlist paint
-/// for this frame), Ok(false) if no card is active (paint the
-/// playlist normally). Side-effect: clears
-/// state.active_system_card if its ttl deadline has elapsed.
+/// PR3 finish-pass safety cap for `ttl_ms=None` cards: even the
+/// "until-state-change" cards (SETUP/CONNECTING/DEGRADED) get
+/// force-cleared after this window so a supervisor crash / missed-
+/// ClearSystemCard can never wedge the sign forever. 60 minutes is
+/// long enough that a legitimate slow onboarding never trips it
+/// but short enough that a wedged sign self-heals within an hour.
+const SYSTEM_CARD_MAX_LIFETIME_S: u64 = 60 * 60;
+
+/// MVP system-card overlay paint + present.
 ///
-/// PR3 MVP scope: paints Background (glClear) + Text shapes
-/// (synthetic TextLayer through layout_text_to_quads +
-/// draw_text_layer_msdf). Other shapes (Monogram, Chip, QrPanel,
-/// Spinner, BootHint, Footer) ship in PR3.1.
+/// Returns Ok(true) when a card was painted AND presented to the
+/// panel (the per-frame caller should skip the normal playlist
+/// paint for this frame — the frame is already on scanout). Returns
+/// Ok(false) when no card is active OR the ttl deadline has just
+/// elapsed (the caller falls through to normal playlist paint).
+///
+/// Present sequence mirrors `paint_and_present_one_frame_for_slide`
+/// verbatim: `eglSwapBuffers` → `gbm_surface.lock_front_buffer` →
+/// `add_framebuffer` → `commit_fb` → `rotate_scanout_3_deep`. The
+/// PR3-original hook was inert (drew to the FBO but never swapped)
+/// which froze the sign on the last playlist frame for the whole
+/// onboarding — QA review 2026-07-01 called this out as the sign-
+/// freezing bug. The full present-sequence here is what makes the
+/// card actually reach the panel.
+///
+/// PR3 MVP scope: paints Background (glClear) + Text (synthetic
+/// TextLayer through the existing MSDF stack) + QR panel
+/// (scissored glClear-per-module). Monogram / Chip / Spinner /
+/// Footer / BootHint remain on the skip arm — PR3.1 fidelity.
 pub fn maybe_paint_system_card_overlay(
     state: &mut crate::playback::PlaybackState,
-    gl: &glow::Context,
-    mode_w: u32,
-    mode_h: u32,
+    session: &mut EglSession,
+    card_drm: &Card,
 ) -> Result<bool> {
     use crate::system_card::CardShape;
 
-    // 1. Snapshot + ttl deadline check. If expired, clear the slot
-    // + return "no card active" so the playlist paint proceeds.
+    // 1. Snapshot + ttl deadline check + max-lifetime safety cap.
+    //    An expired card clears the slot + returns "no card active"
+    //    so the playlist paint resumes on the next frame.
     {
         let Some(card) = state.active_system_card.as_ref() else {
             return Ok(false);
         };
-        if let Some(deadline) = card.deadline {
-            if std::time::Instant::now() >= deadline {
-                state.active_system_card = None;
-                return Ok(false);
-            }
+        let now = std::time::Instant::now();
+        // Deadline (from RenderSystemCard.ttl_ms > 0) OR the
+        // absolute max-lifetime cap (ttl_ms=None safety net).
+        let ttl_expired = card
+            .deadline
+            .map(|d| now >= d)
+            .unwrap_or(false);
+        let max_life_expired = card.activated_at.elapsed().as_secs()
+            >= SYSTEM_CARD_MAX_LIFETIME_S;
+        if ttl_expired || max_life_expired {
+            state.active_system_card = None;
+            return Ok(false);
         }
     }
 
     // 2. Clone the shape list so we can release the borrow on
-    // state.active_system_card before any subroutine mutation.
+    //    state.active_system_card before per-shape draws that may
+    //    mutate the session.
     let shapes: Vec<CardShape> = state
         .active_system_card
         .as_ref()
         .map(|c| c.shapes.clone())
         .unwrap_or_default();
 
-    // 3. Paint each shape. PR3 MVP renders Background + Text;
-    // others are noted in a debug-level log to aid PR3.1.
+    let (gl, mode_w, mode_h) = {
+        let gl: *const glow::Context = session.gl();
+        (gl, u32::from(session.mode_w()), u32::from(session.mode_h()))
+    };
+    // SAFETY: session outlives this borrow; we only read gl and
+    // never through-cast to a mutable borrow.
+    let gl: &glow::Context = unsafe { &*gl };
+
+    // 3. Paint the shape list. PR3 MVP renders Background + Text +
+    //    QrPanel (via scissored glClear so we don't need to compile
+    //    a texture-quad shader for the MVP). Other shapes silently
+    //    skip in this pass — PR3.1 lands the monogram / chip /
+    //    spinner / footer primitives.
+    use glow::HasContext;
+    unsafe {
+        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        gl.disable(glow::SCISSOR_TEST);
+    }
     for shape in &shapes {
         match shape {
-            CardShape::Background { color } => {
-                use glow::HasContext;
-                unsafe {
-                    gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-                    gl.disable(glow::SCISSOR_TEST);
-                    gl.clear_color(
-                        f32::from(color.0) / 255.0,
-                        f32::from(color.1) / 255.0,
-                        f32::from(color.2) / 255.0,
-                        1.0,
-                    );
-                    gl.clear(glow::COLOR_BUFFER_BIT);
-                }
-            }
+            CardShape::Background { color } => unsafe {
+                gl.disable(glow::SCISSOR_TEST);
+                gl.clear_color(
+                    f32::from(color.0) / 255.0,
+                    f32::from(color.1) / 255.0,
+                    f32::from(color.2) / 255.0,
+                    1.0,
+                );
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            },
             CardShape::Text {
                 anchor,
                 max_height,
@@ -17446,23 +17485,143 @@ pub fn maybe_paint_system_card_overlay(
                     gl, mode_w, mode_h, *anchor, *max_height, *color, *font, *align, text,
                 )?;
             }
+            CardShape::QrPanel {
+                top_left,
+                size,
+                payload,
+                caption: _caption,
+            } => {
+                paint_system_card_qr_panel(gl, mode_w, mode_h, *top_left, *size, payload);
+            }
             // PR3.1 follow-ups: monogram tile, solid-fill state
-            // chip, QR-image panel, spinner. The shape is in the
-            // layout (system_card::layout_card already emits them)
-            // so PR3.1 is a pure paint-side addition with no
-            // schema churn.
+            // chip, spinner, footer, boot hint. Silently skipped
+            // in PR3 MVP — a per-frame log would flood the journal
+            // at ~30 Hz.
             _ => {
-                // PR3.1 follow-ups: monogram tile, chip, qr panel,
-                // spinner, footer, boot hint. Silently skip in
-                // PR3 MVP — `eprintln!` is the renderer's logging
-                // convention but a per-frame skip-log would flood
-                // the journal at 30 Hz.
                 let _ = shape;
             }
         }
     }
+    unsafe {
+        gl.disable(glow::SCISSOR_TEST);
+    }
+
+    // 4. PRESENT — the critical piece the original PR3 was missing.
+    //    Same sequence as paint_and_present_one_frame_for_slide.
+    session.maybe_live_preview_capture();
+    session
+        .egl_lib
+        .swap_buffers(session.display, session.egl_surface)
+        .map_err(|e| anyhow!("eglSwapBuffers (system-card) failed: {e:?}"))?;
+    let new_bo = unsafe {
+        session
+            .gbm_surface
+            .lock_front_buffer()
+            .context("gbm_surface_lock_front_buffer (system-card) failed")?
+    };
+    let fb_buf = GbmBufferAdapter::new(&new_bo)
+        .context("read GBM bo metadata (system-card)")?;
+    let new_fb = card_drm
+        .add_framebuffer(&fb_buf, 32, 32)
+        .map_err(|e| anyhow!("drmModeAddFB (system-card) failed: {e}"))?;
+    if let Err(e) = commit_fb(session, card_drm, new_fb) {
+        // Roll back: free the FB + drop the BO before propagating.
+        if let Err(de) = card_drm.destroy_framebuffer(new_fb) {
+            eprintln!(
+                "warn: system-card cleanup destroy_framebuffer({new_fb:?}) on commit-fail: {de}"
+            );
+        }
+        drop(new_bo);
+        return Err(e);
+    }
+    // 3-deep scanout rotation matches the flip-race-fix-D pattern
+    // used by every other paint arm.
+    rotate_scanout_3_deep(session, card_drm, new_bo, new_fb, "system_card");
 
     Ok(true)
+}
+
+/// Paint one QR code inside its layout panel. White background
+/// spans `size` × `size` of card width, `top_left` in normalized
+/// (0..1) coords. Dark modules render as scissored glClear rects.
+///
+/// Uses scissored glClear rather than a textured-quad shader so
+/// the MVP doesn't need a new pipeline; O(N²) clears with N≈25
+/// costs ~625 clears at up to 30 Hz — trivial for vc4 GLES2.
+fn paint_system_card_qr_panel(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    top_left: (f32, f32),
+    size: f32,
+    payload: &str,
+) {
+    use glow::HasContext;
+
+    let panel_x_px = (top_left.0 * mode_w as f32) as i32;
+    let panel_y_px = (top_left.1 * mode_h as f32) as i32;
+    let panel_w_px = (size * mode_w as f32) as i32;
+    let panel_h_px = panel_w_px; // square panel
+
+    // GL scissor Y is bottom-origin; convert card-space top-left
+    // (top-origin) to bottom-origin.
+    let panel_y_bl = mode_h as i32 - panel_y_px - panel_h_px;
+
+    // 1. White panel background.
+    unsafe {
+        gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(panel_x_px, panel_y_bl, panel_w_px, panel_h_px);
+        gl.clear_color(1.0, 1.0, 1.0, 1.0);
+        gl.clear(glow::COLOR_BUFFER_BIT);
+    }
+
+    // 2. Encode + draw modules. If encoding fails (payload too
+    //    long / malformed) the panel just shows as white; the
+    //    supervisor's diagnostic ring buffer records the failure.
+    let Ok(qr) = crate::qr::encode_qr(payload) else {
+        eprintln!(
+            "[system-card] qr encode failed for payload of length {}; drawing empty panel",
+            payload.len()
+        );
+        unsafe {
+            gl.disable(glow::SCISSOR_TEST);
+        }
+        return;
+    };
+
+    // Inset the QR modules by ~5% of the panel to give a quiet
+    // zone (spec: 4-module quiet zone; 5% at typical QR sizes is
+    // close enough for the MVP).
+    let quiet_zone_frac = 0.05;
+    let inner_offset = (panel_w_px as f32 * quiet_zone_frac) as i32;
+    let inner_w = panel_w_px - 2 * inner_offset;
+    let module_px = (inner_w as f32 / qr.size as f32).max(1.0);
+
+    unsafe {
+        gl.clear_color(0.0, 0.0, 0.0, 1.0);
+    }
+    for y in 0..qr.size {
+        for x in 0..qr.size {
+            if !qr.module(x, y) {
+                continue;
+            }
+            let mx_px = panel_x_px + inner_offset + (x as f32 * module_px) as i32;
+            let my_px = panel_y_px + inner_offset + (y as f32 * module_px) as i32;
+            // Round up so adjacent modules touch (avoids single-
+            // pixel white seams at fractional sizes).
+            let mw_px = module_px.ceil() as i32;
+            let mh_px = module_px.ceil() as i32;
+            // Convert to bottom-origin for scissor.
+            let my_bl = mode_h as i32 - my_px - mh_px;
+            unsafe {
+                gl.scissor(mx_px, my_bl, mw_px, mh_px);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+        }
+    }
+    unsafe {
+        gl.disable(glow::SCISSOR_TEST);
+    }
 }
 
 /// PR3 MVP system-card text paint. Builds a synthetic TextLayer

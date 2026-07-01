@@ -404,11 +404,12 @@ pub struct PreloadSlideParams {
 /// `_on_transition` picks the kind from the supervisor state per
 /// the spec's state → card mapping; the BOOT kind is fired by the
 /// backend lifespan as a one-shot identity card (~4s ttl).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum SystemCardKind {
     /// No stored creds → AP up, portal active. Card shows the
     /// join-QR + SSID + PIN.
+    #[default]
     Setup,
     /// Credentials submitted, STA mid-association. Card shows the
     /// "Joining <target_ssid>" headline + spinner.
@@ -423,16 +424,24 @@ pub enum SystemCardKind {
     /// address/IP + (PR4 follow-up) the rapid-boot hint line when
     /// the gesture counter is armed.
     Boot,
+    /// PR3 finish-pass (2026-07-01) forward-compat: any unrecognised
+    /// `kind` value from a newer backend deserializes to `Unknown`
+    /// rather than failing the whole `RenderSystemCard` message.
+    /// The renderer treats Unknown the same as Setup (safe default:
+    /// AP-up card). Variant added last so its ordinal is stable.
+    #[serde(other)]
+    Unknown,
 }
 
 /// PR3 (2026-06-27) DEGRADED-card cause variant. The supervisor
 /// selects this based on the last STA disconnect reason; the card
 /// renderer maps it to a headline + a sub-line.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DegradedVariant {
     /// Generic STA disconnect (router rebooted, signal lost, etc).
     /// Headline: "Lost the wifi connection".
+    #[default]
     Lost,
     /// STA auth failure (CTRL-EVENT-AUTH-REJECT / SSID-TEMP-
     /// DISABLED). Headline: "WiFi password no longer works".
@@ -441,6 +450,12 @@ pub enum DegradedVariant {
     /// BCM43438 is 2.4 GHz only per spec). Headline: "Can't find
     /// <SSID>".
     NotFoundOr5ghz,
+    /// PR3 finish-pass (2026-07-01) forward-compat: unknown variant
+    /// from a newer backend falls through to Unknown, which
+    /// `degraded_copy` treats the same as Lost (safest generic
+    /// headline).
+    #[serde(other)]
+    Unknown,
 }
 
 /// PR3 (2026-06-27) RenderSystemCard parameters. Every field is
