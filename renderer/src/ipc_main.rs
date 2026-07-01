@@ -3608,15 +3608,19 @@ fn handle_inner_request(
             err("Open already called; nested Open is not supported")
         }
         IpcRequest::BeginSlide(p) => {
-            // PR3 finish-pass (2026-07-01) ttl safety net: a fresh
-            // BeginSlide from the backend means "resume the playlist" —
-            // any active system card is stale by definition. Clear
-            // it so a supervisor that missed sending ClearSystemCard
-            // (crash / race / logic bug) cannot wedge the sign.
-            #[cfg(target_os = "linux")]
-            {
-                state.active_system_card = None;
-            }
+            // PR3 fix-pass B1 (2026-07-01): the earlier "clear on
+            // any BeginSlide/BeginTransition" safety net had the
+            // wrong shape — playback keeps advancing under an
+            // active overlay + sends BeginSlide once per slide, so
+            // a persistent (ttl=None) SETUP/CONNECTING/DEGRADED
+            // card was nuked ~8-15s in and the QR vanished. A
+            // persistent card OWNS the screen while active. Real
+            // exits are (a) explicit ClearSystemCard (supervisor
+            // sends on ONLINE), (b) the 60-min max-lifetime cap
+            // (anti-wedge in maybe_paint_system_card_overlay), and
+            // (c) natural ttl expiry for BOOT/CONNECTED-style
+            // cards. Playlist paint automatically resumes when
+            // one of those exits fires.
             // r102.1: V3D BO probe at BeginSlide entry. Brackets
             // the slide-change boundary so QA can compare slide-
             // change delta vs transition-paint delta.
@@ -3963,14 +3967,11 @@ fn handle_inner_request(
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
-            // PR3 finish-pass (2026-07-01) ttl safety net (mirror
-            // of BeginSlide above): a fresh BeginTransition means
-            // playlist paint is resuming; a lingering system card
-            // is stale.
-            #[cfg(target_os = "linux")]
-            {
-                state.active_system_card = None;
-            }
+            // PR3 fix-pass B1 (2026-07-01): companion to BeginSlide
+            // above — the earlier per-transition clear was wrong.
+            // A persistent card owns the screen; the two real exits
+            // stay: ClearSystemCard from the supervisor, and the
+            // 60-min max-lifetime cap in the paint overlay.
             // r110 c3.3.1 (2026-06-11): clear the poster-sourced
             // signal at transition entry so it scopes exactly to
             // "this transition window." c3.2.2 bake_a/bake_b
@@ -6347,7 +6348,7 @@ mod tests {
     fn render_system_card_ttl_none_leaves_deadline_none() {
         let td = tempfile::tempdir().unwrap();
         let mut state = crate::playback::PlaybackState::new();
-        let mut cache = SlideCache::default();
+        let mut cache = SlideCache::new();
         let mut p = system_card_params(crate::playback::SystemCardKind::Setup);
         p.ttl_ms = None;
         let _resp = handle_inner_request(
@@ -6365,7 +6366,7 @@ mod tests {
     fn render_system_card_ttl_zero_maps_to_none() {
         let td = tempfile::tempdir().unwrap();
         let mut state = crate::playback::PlaybackState::new();
-        let mut cache = SlideCache::default();
+        let mut cache = SlideCache::new();
         let mut p = system_card_params(crate::playback::SystemCardKind::Setup);
         p.ttl_ms = Some(0);
         let _resp = handle_inner_request(
@@ -6386,7 +6387,7 @@ mod tests {
     fn render_system_card_ttl_positive_sets_future_deadline() {
         let td = tempfile::tempdir().unwrap();
         let mut state = crate::playback::PlaybackState::new();
-        let mut cache = SlideCache::default();
+        let mut cache = SlideCache::new();
         let mut p = system_card_params(crate::playback::SystemCardKind::Connected);
         p.ttl_ms = Some(5_000);
         let before = std::time::Instant::now();
@@ -6416,7 +6417,7 @@ mod tests {
     fn clear_system_card_clears_slot() {
         let td = tempfile::tempdir().unwrap();
         let mut state = crate::playback::PlaybackState::new();
-        let mut cache = SlideCache::default();
+        let mut cache = SlideCache::new();
         let p = system_card_params(crate::playback::SystemCardKind::Setup);
         let _resp = handle_inner_request(
             IpcRequest::RenderSystemCard(p),
@@ -6439,7 +6440,7 @@ mod tests {
     fn render_system_card_replaces_active_card() {
         let td = tempfile::tempdir().unwrap();
         let mut state = crate::playback::PlaybackState::new();
-        let mut cache = SlideCache::default();
+        let mut cache = SlideCache::new();
         let mut first = system_card_params(crate::playback::SystemCardKind::Setup);
         first.ssid = Some("first".to_string());
         let _resp = handle_inner_request(
@@ -6461,17 +6462,18 @@ mod tests {
         assert_eq!(card.params.target_ssid.as_deref(), Some("second"));
     }
 
+    /// PR3 fix-pass B1 (2026-07-01) — the inverse contract: a
+    /// BeginSlide arriving under an active persistent card MUST
+    /// leave the slot intact. The earlier safety-net clear was
+    /// nuking the QR at ~8-15s in; a persistent card owns the
+    /// screen until ClearSystemCard or the 60-min cap fires.
     #[cfg(target_os = "linux")]
     #[test]
-    fn begin_slide_safety_net_clears_active_system_card() {
-        // Even without a valid slide_id in the cache, BeginSlide's
-        // safety-net clear on state.active_system_card must fire
-        // BEFORE the load path runs. We only assert that the slot
-        // becomes None; the response may Err on the unknown slide.
+    fn begin_slide_does_not_clear_active_system_card() {
         let td = tempfile::tempdir().unwrap();
         let mut state = crate::playback::PlaybackState::new();
-        let mut cache = SlideCache::default();
-        // Prime the slot.
+        let mut cache = SlideCache::new();
+        // Prime the slot with a ttl=None (persistent) card.
         let _resp = handle_inner_request(
             IpcRequest::RenderSystemCard(system_card_params(
                 crate::playback::SystemCardKind::Setup,
@@ -6481,8 +6483,8 @@ mod tests {
             td.path(),
         );
         assert!(state.active_system_card.is_some());
-        // Now BeginSlide with an unknown id — safety-net clears
-        // the slot regardless of the load outcome.
+        // Fire BeginSlide (unknown id — the load will error but
+        // that doesn't matter for the invariant).
         let _resp = handle_inner_request(
             IpcRequest::BeginSlide(BeginSlideParams {
                 slide_id: uuid(1),
@@ -6494,8 +6496,41 @@ mod tests {
             td.path(),
         );
         assert!(
-            state.active_system_card.is_none(),
-            "BeginSlide must clear an active system card as a safety net"
+            state.active_system_card.is_some(),
+            "BeginSlide must NOT clear an active persistent card"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn begin_transition_does_not_clear_active_system_card() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(system_card_params(
+                crate::playback::SystemCardKind::Setup,
+            )),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(state.active_system_card.is_some());
+        let _resp = handle_inner_request(
+            IpcRequest::BeginTransition(BeginTransitionParams {
+                to_slide_id: uuid(2),
+                to_duration_ms: 1_000,
+                kind: "cut".to_string(),
+                transition_ms: 500,
+                t0_ms: 0,
+            }),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        assert!(
+            state.active_system_card.is_some(),
+            "BeginTransition must NOT clear an active persistent card"
         );
     }
 }

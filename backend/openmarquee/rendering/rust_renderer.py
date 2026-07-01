@@ -930,37 +930,24 @@ class RustRenderer:
         overlay per spec §"The display is the onboarding UI". See the
         `Renderer` Protocol docstring for the params shape.
 
-        Best-effort: subprocess errors are caught and logged rather
-        than raised. A supervisor lifecycle transition (SETUP →
-        CONNECTING etc.) must never wedge waiting on the renderer;
-        a dropped card is a visual glitch, not a functional bug.
+        PR3 fix-pass S1 (2026-07-01): raises subprocess-layer errors
+        so callers can distinguish "renderer accepted the card" from
+        "renderer dropped it." The best-effort supervisor path lives
+        in `SystemCardPublisher` (background thread, log-and-swallow);
+        the preview endpoint awaits its own `asyncio.to_thread` and
+        maps a raised exception to HTTP 502 so QA glass-verifies on
+        truthful responses.
         """
-        try:
-            self._send_op("render_system_card", dict(params))
-        except (
-            RustRendererError,
-            RustRendererProtocolError,
-            RustRendererSubprocessError,
-        ) as e:
-            log.warning(
-                "render_system_card: send failed (kind=%s); dropping: %s",
-                params.get("kind", "?"),
-                e,
-            )
+        self._send_op("render_system_card", dict(params))
 
     def clear_system_card(self) -> None:
         """Op 13 (PR3): clear any active system card + return to
-        normal playlist paint. Idempotent; best-effort like
-        render_system_card.
+        normal playlist paint. Idempotent.
+
+        PR3 fix-pass S1 (2026-07-01): raises subprocess-layer errors
+        to callers — same rationale as `render_system_card`.
         """
-        try:
-            self._send_op("clear_system_card", None)
-        except (
-            RustRendererError,
-            RustRendererProtocolError,
-            RustRendererSubprocessError,
-        ) as e:
-            log.warning("clear_system_card: send failed; dropping: %s", e)
+        self._send_op("clear_system_card", None)
 
     # ------------------------------------------------------------------
     # Liveness.

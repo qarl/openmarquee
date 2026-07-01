@@ -777,9 +777,15 @@ class RenderSystemCardPreviewResponse(BaseModel):
 
 
 def _check_len(field: str, value: str | None, cap: int) -> None:
+    """PR3 fix-pass S2 (2026-07-01): byte-length check to match the
+    Rust-side `system_card::clamp_params` byte truncation. Prior
+    version used Python's `len(str)` which counts codepoints, so a
+    UTF-8 multi-byte SSID / target-SSID could pass here but hit the
+    Rust byte-cap on paint.
+    """
     if value is None:
         return
-    if len(value) > cap:
+    if len(value.encode("utf-8")) > cap:
         raise HTTPException(
             status_code=422,
             detail=f"{field} exceeds {cap}-byte cap",
@@ -854,8 +860,15 @@ async def render_system_card_preview(
     from openmarquee.dependencies import get_renderer
 
     renderer = get_renderer()
+    # PR3 fix-pass B2 (2026-07-01): the RustRenderer IPC call
+    # blocks on the subprocess RLock + JSON readline for up to
+    # ~10s (~18s on cold-start). Running it inline freezes the
+    # captive-portal HTTP the operator may be mid-onboarding on.
+    # Off-load to a worker thread so the event loop keeps polling
+    # concurrent requests — same pattern as the sibling /api/system
+    # endpoints (fbset/iw/tailscale) above.
     try:
-        renderer.render_system_card(params)
+        await asyncio.to_thread(renderer.render_system_card, params)
     except Exception as e:  # noqa: BLE001
         log.warning("render_system_card_preview: renderer.render_system_card failed: %s", e)
         raise HTTPException(
@@ -877,8 +890,10 @@ async def clear_system_card_preview() -> RenderSystemCardPreviewResponse:
     from openmarquee.dependencies import get_renderer
 
     renderer = get_renderer()
+    # PR3 fix-pass B2 (2026-07-01): same asyncio.to_thread off-load
+    # as render-system-card-preview.
     try:
-        renderer.clear_system_card()
+        await asyncio.to_thread(renderer.clear_system_card)
     except Exception as e:  # noqa: BLE001
         log.warning("clear_system_card_preview: renderer.clear_system_card failed: %s", e)
         raise HTTPException(

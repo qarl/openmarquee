@@ -424,3 +424,78 @@ class TestClearSystemCardPreview:
         monkeypatch.setattr(deps, "get_renderer", lambda: BustedRenderer())
         response = client.post("/api/system/clear-system-card-preview")
         assert response.status_code == 502
+
+
+# ============================================================
+# PR3 fix-pass S2 (2026-07-01) — byte-length clamp on _check_len.
+# ============================================================
+
+
+def test_check_len_uses_utf8_byte_length():
+    """Regression pin for the codepoint-vs-byte clamp fix. A 40-char
+    ASCII SSID is 40 bytes (fits MAX_SSID_LEN=40). A 21-char UTF-8
+    string of 2-byte grapheme runs is 42 bytes (over cap) — must
+    reject with 422."""
+    from openmarquee.api_system import _MAX_SSID_LEN, _check_len
+
+    # 40 ASCII chars = 40 bytes — passes.
+    _check_len("ssid", "A" * _MAX_SSID_LEN, _MAX_SSID_LEN)
+    # 21 é chars = 42 bytes — must raise.
+    import pytest as _pytest
+
+    with _pytest.raises(Exception) as excinfo:  # HTTPException
+        _check_len("ssid", "é" * 21, _MAX_SSID_LEN)
+    assert "40-byte cap" in str(excinfo.value.detail)
+
+
+# ============================================================
+# PR3 fix-pass S2 (2026-07-01) — 401 tests for both preview
+# endpoints when auth is engaged (production shape). Piggy-backs
+# on the same env-flip pattern the auth suite uses so the middle-
+# ware actually gates.
+# ============================================================
+
+
+@pytest.fixture
+def client_auth_engaged(tmp_path: Path):
+    """TestClient with OPENMARQUEE_DISABLE_AUTH unset so the auth
+    middleware gates. Isolated AuthStorage path per test. See
+    backend/tests/test_auth.py::client for the pattern."""
+    import os as _os
+    from unittest.mock import patch
+
+    from openmarquee.dependencies import _auth_storage_singleton
+
+    auth_path = tmp_path / "auth.json"
+    _auth_storage_singleton.cache_clear()
+    with patch.dict(
+        _os.environ,
+        {"OPENMARQUEE_AUTH_PATH": str(auth_path)},
+    ):
+        _os.environ.pop("OPENMARQUEE_DISABLE_AUTH", None)
+        try:
+            from openmarquee.app import app
+
+            with TestClient(app) as c:
+                yield c
+        finally:
+            _os.environ["OPENMARQUEE_DISABLE_AUTH"] = "1"
+    _auth_storage_singleton.cache_clear()
+
+
+def test_render_system_card_preview_requires_auth(client_auth_engaged: TestClient):
+    """The /api/system/render-system-card-preview endpoint is NOT
+    in the auth_middleware allowlist — an unauthenticated POST must
+    return 401 so an attacker on the LAN can't drive card state on
+    a production sign."""
+    response = client_auth_engaged.post(
+        "/api/system/render-system-card-preview",
+        json={"kind": "SETUP"},
+    )
+    assert response.status_code == 401
+
+
+def test_clear_system_card_preview_requires_auth(client_auth_engaged: TestClient):
+    """Companion 401 pin for the clear-preview endpoint."""
+    response = client_auth_engaged.post("/api/system/clear-system-card-preview")
+    assert response.status_code == 401

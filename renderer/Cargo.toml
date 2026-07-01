@@ -137,6 +137,16 @@ nix = { version = "0.29", features = ["ioctl"], default-features = false }
 # Integration tests for content.rs's file-IO wrappers.
 tempfile = "3"
 
+# PR3 fix-pass G1 (2026-07-01): tests call `uuid::Uuid::new_v4()`
+# which needs the `v4` feature. The main [dependencies] `uuid`
+# entry keeps `default-features = false` to avoid pulling extra
+# code paths into the release binary; dev-dependencies additive
+# feature enables v4 only for `cargo test`. macOS `cargo test`
+# never surfaced this because the Uuid::new_v4 site is inside a
+# `#[cfg(target_os = "linux")]` test in hdmi.rs; QA's cargo test
+# on einstein caught it.
+uuid = { version = "1", features = ["v4"] }
+
 # PR3 finish-pass (2026-07-01) — pure-Rust QR decoder for the QR
 # encode/decode round-trip test. Ensures qr::encode_qr produces a
 # QR whose payload actually round-trips, so a "structurally-valid-

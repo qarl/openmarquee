@@ -327,28 +327,62 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             # the "openmarquee.local" identity card for ~4 seconds
             # right after startup so a user watching the sign at
             # boot learns the device address without needing the
-            # portal. Fires after supervisor is wired so its default
-            # kind-per-state emit doesn't overwrite the BOOT card
-            # immediately.
-            async def _emit_boot_card_then_yield() -> None:
+            # portal.
+            #
+            # PR3 fix-pass B3 (2026-07-01): after the BOOT card auto-
+            # clears on its ttl, emit the card that matches the
+            # supervisor's CURRENT state (SETUP for no-creds, or
+            # nothing for ONLINE) so a cold-boot device does not
+            # skip the onboarding overlay just because it never
+            # transitioned through a state-change since boot. Uses
+            # asyncio.to_thread to avoid blocking the event loop on
+            # the renderer IPC (fix-pass B2 pattern).
+            BOOT_TTL_MS = 4000
+
+            def _params_for_state(st: str) -> dict | None:
+                if st == "SETUP":
+                    return {"kind": "SETUP"}
+                if st == "CONNECTING":
+                    return {"kind": "CONNECTING"}
+                if st == "LINGER":
+                    return {
+                        "kind": "CONNECTED",
+                        "address": "openmarquee.local",
+                    }
+                if st == "DEGRADED":
+                    return {"kind": "DEGRADED", "variant": "lost"}
+                # ONLINE = AP off, no overlay.
+                return None
+
+            async def _emit_boot_and_current_state_card() -> None:
+                renderer = get_renderer()
                 try:
-                    # Small delay so the initial state emit
-                    # (SETUP/ONLINE from persisted state) lands
-                    # first — we want BOOT to be the visible card,
-                    # not immediately clobbered.
                     await asyncio.sleep(0.1)
-                    get_renderer().render_system_card(
+                    await asyncio.to_thread(
+                        renderer.render_system_card,
                         {
                             "kind": "BOOT",
                             "address": "openmarquee.local",
-                            "ttl_ms": 4000,
-                        }
+                            "ttl_ms": BOOT_TTL_MS,
+                        },
                     )
                 except Exception:  # noqa: BLE001
                     log.debug("boot card emit failed (renderer not ready?)")
 
+                # Wait for BOOT to auto-clear (plus a small buffer)
+                # before pushing the current-state card so BOOT is
+                # visible for its full window.
+                await asyncio.sleep(BOOT_TTL_MS / 1000.0 + 0.1)
+                try:
+                    state_str = supervisor.current_state.value
+                    params = _params_for_state(state_str)
+                    if params is not None:
+                        await asyncio.to_thread(renderer.render_system_card, params)
+                except Exception:  # noqa: BLE001
+                    log.debug("current-state card emit failed (renderer down?)")
+
             asyncio.create_task(  # noqa: RUF006 — fire-and-forget
-                _emit_boot_card_then_yield(),
+                _emit_boot_and_current_state_card(),
                 name="system-card-boot",
             )
             # P1.2-B (2026-06-10): take-over evaluation. Env-gated by
