@@ -154,10 +154,27 @@ export function wireCopyButtons(root = document) {
     }
 }
 
+import { mountPwaInstallPrompt } from "./pwa-install-prompt.js";
+
 if (typeof window !== "undefined") {
     window.addEventListener("DOMContentLoaded", () => {
         renderWelcomeQR();
         wireCopyButtons();
+        // PWA "bookmark moment" (spec §"Finding the device after
+        // onboarding" #2). On iOS Safari OR Chromium fire the install
+        // prompt in the small slot below the Continue button; else
+        // the mount is a silent no-op. Failures never propagate —
+        // welcome.js MUST keep working even if pwa-install-prompt.js
+        // is missing (offline captive-portal deploys where a stale
+        // dist can lack the module).
+        try {
+            const slot = document.getElementById("pwa-install-slot");
+            if (slot) {
+                mountPwaInstallPrompt(slot);
+            }
+        } catch (err) {
+            console.warn("pwa install prompt mount failed (non-fatal):", err);
+        }
     });
 }
 

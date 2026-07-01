@@ -4,6 +4,18 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
     <title>openMarquee</title>
+    <!-- PWA "bookmark moment" 2026-07-01: manifest + apple-touch-icon
+         let a phone that navigates here after onboarding install the
+         dashboard as a home-screen tile. See qa/spec-onboarding-ap-
+         sta-concurrent-2026-06-10.md §"Finding the device after
+         onboarding" #2. The prompt itself is mounted on welcome.html
+         (LINGER landing); dashboard just carries the manifest so
+         a later revisit can still trigger Add-to-Home-Screen. -->
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+    <link rel="icon" type="image/svg+xml" href="/icons/monogram.svg">
+    <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon.png">
+    <meta name="theme-color" content="#ffb84d">
     <link rel="stylesheet" href="/styles.css">
 </head>
 <body class="om-app" data-theme="dark" data-accent="amber" data-density="compact" data-layout="desktop">

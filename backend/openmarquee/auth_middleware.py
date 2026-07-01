@@ -67,6 +67,16 @@ _WHITELIST_EXACT: frozenset[str] = frozenset(
         "/spike.html",  # ffmpeg-wasm spike page, exercised by smoke.spec.js
         "/styles.css",  # main stylesheet referenced by index.html
         "/favicon.ico",
+        # Onboarding PWA "bookmark moment" (spec 2026-06-10
+        # §"Finding the device after onboarding" #2, PR #23):
+        # the browser fetches manifest.webmanifest via
+        # `<link rel=manifest>` and it CANNOT carry a bearer
+        # token. Gating it would 401 the manifest -> the
+        # Android install path is dead + iOS falls back to a
+        # page-screenshot tile instead of the branded oM
+        # monogram. Same rationale as /styles.css above:
+        # inert static content, safe unauth surface.
+        "/manifest.webmanifest",
         "/api/auth/status",
         "/api/auth/set-password",
         "/api/auth/login",
@@ -140,6 +150,15 @@ _WHITELIST_PREFIX: tuple[str, ...] = (
     # Peer-fetch route: /api/flock/asset/<UUID>/<filename>. Same
     # tailnet-ACL rationale as the flock list above.
     "/api/flock/asset/",
+    # Onboarding PWA icons (spec 2026-06-10 §"Finding the device
+    # after onboarding" #2, PR #23). Fetched by the browser as
+    # `<link rel="apple-touch-icon">` + as manifest icons; NEITHER
+    # attaches a bearer token. Same rationale as /dist/ + /styles.css:
+    # inert static content, no unauth surface. Contents:
+    # monogram.svg (source), apple-touch-icon.png (iOS 180x180),
+    # icon-192.png + icon-512-maskable.png (Android manifest),
+    # favicon.png.
+    "/icons/",
 )
 
 # Bug 3+4 (qarl 2026-05-16): media routes that the operator's browser
