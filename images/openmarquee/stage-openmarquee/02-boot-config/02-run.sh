@@ -52,3 +52,9 @@ strip_cmdline_token "cgroup_disable=memory" "${boot_dir}/cmdline.txt"
 # net within budget on 512MB Zero 2 W).
 patch_config_txt_gpu_mem  "${boot_dir}/config.txt"
 patch_cmdline_txt_cma     "${boot_dir}/cmdline.txt"
+# HDMI audio 2026-07-01 (qarl decision, locked): the vc4hdmi ALSA
+# card is exposed by vc4-kms-v3d + dtparam=audio=on. Trixie ships
+# the line commented; live production sign already has it
+# uncommented, so bake the same shape into the SD-card image + the
+# redeploy path.
+patch_config_txt_audio    "${boot_dir}/config.txt"

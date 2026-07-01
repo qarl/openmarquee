@@ -199,6 +199,45 @@ patch_config_txt_gpu_mem() {
     fi
 }
 
+# Ensure `dtparam=audio=on` is set in a Pi config.txt, IN PLACE.
+# Idempotent.
+#
+# HDMI audio 2026-07-01 (qarl decision, locked): any video with an
+# audio track plays its sound out the sign's HDMI. The Pi's vc4hdmi
+# ALSA card is exposed by the vc4-kms-v3d driver when
+# `dtparam=audio=on` is present (Trixie ships it commented). The
+# live sign already has this line; new SD-card images + redeploy
+# reruns need the same shape for symmetry.
+#
+# Trixie stock config.txt has an existing `dtparam=audio=on` line
+# commented out ("#dtparam=audio=on"); we want an UNCOMMENTED one.
+# Behavior:
+#   - exactly ONE uncommented `dtparam=audio=on` line present →
+#     no-op
+#   - any other state (only commented out, missing, misspelled) →
+#     APPEND a fresh `[all]` / `dtparam=audio=on` block at EOF
+#
+# Uses the same append-with-explicit-header pattern as
+# `patch_config_txt_gpu_mem` above so `[section]` context inherited
+# from an earlier header can't leave the line scoped to only some
+# Pi models.
+patch_config_txt_audio() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        echo "patch_config_txt_audio: $file not found" >&2
+        return 1
+    fi
+    # Count UNCOMMENTED `dtparam=audio=on` lines. Line-start + any
+    # whitespace + literal `dtparam=audio=on` — no leading `#`.
+    if grep -qE '^[[:space:]]*dtparam[[:space:]]*=[[:space:]]*audio[[:space:]]*=[[:space:]]*on[[:space:]]*$' "$file"; then
+        echo "config.txt: dtparam=audio=on already set — no-op"
+        return 0
+    fi
+    printf '\n# openMarquee HDMI-audio 2026-07-01: enable the vc4hdmi\n# ALSA card so the Python playback loop can pipe VideoSlide\n# audio out HDMI via ffmpeg. Explicit [all] header pins scope\n# across all model variants.\n[all]\ndtparam=audio=on\n' \
+        >> "$file"
+    echo "config.txt: appended [all]/dtparam=audio=on"
+}
+
 # Set `cma=256M` in a Pi cmdline.txt, IN PLACE. Idempotent.
 #
 # r110 c3.3.2-followup (2026-06-11): paired with
