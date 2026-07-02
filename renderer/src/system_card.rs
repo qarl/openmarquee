@@ -136,6 +136,14 @@ pub struct ActiveSystemCard {
     /// supervisor crash / missed-ClearSystemCard can never wedge
     /// the sign indefinitely.
     pub activated_at: std::time::Instant,
+    /// PR3.1 (2026-07-01) — cache the encoded QR bitmap so the paint
+    /// loop skips ~625 modules of encoder + palette work every
+    /// frame while the card is active. Populated at construction
+    /// (in ipc_main.rs's RenderSystemCard arm) when the params
+    /// carry a non-empty qr_payload; None otherwise. Arc so the
+    /// per-frame clone in the paint hook is O(1) refcount bump
+    /// rather than O(N²) bitmap copy.
+    pub qr_cache: Option<std::sync::Arc<crate::qr::QrBitmap>>,
 }
 
 /// PR3 finish-pass (2026-07-01) — per-field byte caps applied to
