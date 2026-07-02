@@ -7,7 +7,7 @@
 // name shown as the label. Renames don't shift identity, so highlight
 // + selection don't break across an edit.
 
-import { mediaSrc } from "./api.js";
+import { contentTileThumbnailAttrs } from "./api.js";
 import { DEFAULT_PLAYLIST_ID } from "./constants.js";
 
 const TEMPLATE = `
@@ -104,8 +104,13 @@ export function mountPlaylistBrowser(container, options) {
         }
         const safeName = escapeHtml(displayName || "(unnamed)");
         const itemsLabel = itemCount === 1 ? "1 slide" : `${itemCount} slides`;
+        // 2026-07-02 (handover-blocker fix): swap to the small
+        // /thumbnail JPEG endpoint + lazy-load + onerror placeholder.
         const thumb = firstItem
-            ? `<img class="playlist-browser-tile-thumb" alt="" src="${mediaSrc(`/api/content/${firstItem.id}/asset?v=${encodeURIComponent(firstItem.updated_at || firstItem.created_at || firstItem.id)}`)}">`
+            ? `<img class="playlist-browser-tile-thumb" alt="" ${contentTileThumbnailAttrs(
+                  firstItem.id,
+                  firstItem.updated_at || firstItem.created_at || firstItem.id,
+              )}>`
             : `<div class="playlist-browser-tile-thumb playlist-browser-tile-thumb--empty"></div>`;
         li.innerHTML = `
             <button type="button" class="playlist-browser-tile-action"

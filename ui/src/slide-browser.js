@@ -6,7 +6,7 @@
 // subpage browser click-to-edit) since each is natural in its
 // location.
 
-import { mediaSrc } from "./api.js";
+import { contentTileThumbnailAttrs } from "./api.js";
 import { attachAutoTextOverlay } from "./auto-text-overlay.js";
 
 const TEMPLATE = `
@@ -101,11 +101,22 @@ export function mountSlideBrowser(container, options) {
         // Type badge retired: with the slides shell tab subnav (Text /
         // Image / Video) filtering by type, the per-tile corner badge
         // was redundant chrome.
+        // 2026-07-02 (handover-blocker fix): use the small /thumbnail
+        // JPEG endpoint via `contentTileThumbnailAttrs` — the raw
+        // /asset PNG is 1-3 MB each and ~15 concurrent GETs OOM'd the
+        // memory-tight Pi Zero 2 W (qarl). Helper also emits
+        // loading="lazy" so off-screen tiles don't fetch, and an
+        // onerror that swaps to a static placeholder data-URI
+        // (never to /video).
+        const thumbAttrs = contentTileThumbnailAttrs(
+            item.id,
+            item.updated_at || item.created_at || refreshVersion,
+        );
         li.innerHTML = `
             <button type="button" class="slide-browser-tile-action" title="${safeName}">
                 <span class="slide-browser-tile-thumb-wrap">
                     <img class="slide-browser-tile-thumb" alt="" draggable="false"
-                         src="${mediaSrc(`/api/content/${item.id}/asset?v=${encodeURIComponent(item.updated_at || item.created_at || refreshVersion)}`)}">
+                         ${thumbAttrs}>
                 </span>
                 <span class="slide-browser-tile-name">${safeName}</span>
             </button>

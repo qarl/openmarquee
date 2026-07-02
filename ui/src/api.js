@@ -151,6 +151,55 @@ export function mediaSrc(path) {
 }
 
 /**
+ * 2026-07-02 (handover-blocker fix): placeholder shown when a content
+ * tile's thumbnail 404s (or the fetch fails). Inline SVG data URI so
+ * the swap happens in-browser with zero additional network round-
+ * trips — qarl 2026-07-02: "it should NOT default to loading the
+ * video when the thumbnail is missing." This is the "when it's
+ * missing" behavior: quiet dark tile, never a /video fetch.
+ */
+export const CONTENT_THUMBNAIL_PLACEHOLDER_SRC =
+    "data:image/svg+xml;utf8," +
+    encodeURIComponent(
+        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 4 3'>" +
+            "<rect fill='%23222' width='4' height='3'/>" +
+            "</svg>",
+    );
+
+/**
+ * 2026-07-02 (handover-blocker fix): tile-thumbnail attributes.
+ * Returns the src / loading / onerror / decoding fragments to paste
+ * into a tile `<img>` tag so all three list views (slide-browser,
+ * playlist-track, playlist-browser) render the same:
+ *   * src → the small `/thumbnail` endpoint (JPEG, ~15-40 KB) NOT
+ *     the raw `/asset` PNG (1-3 MB, OOM'd the Pi with ~15 tiles).
+ *   * loading="lazy" so the browser's IntersectionObserver skips
+ *     off-screen tiles until they scroll into view.
+ *   * decoding="async" so PNG/JPEG decode doesn't block paint.
+ *   * onerror swaps to the inline placeholder above — a static
+ *     data URI, NEVER a /video fetch.
+ * Pure function; safe to call during innerHTML string assembly.
+ *
+ * @param {string} contentId — the content item's UUID.
+ * @param {string|number} [cacheStamp] — item.updated_at / created_at
+ *   so a re-upload busts the cached tile without a hard reload.
+ */
+export function contentTileThumbnailAttrs(contentId, cacheStamp = "") {
+    const stampParam = cacheStamp
+        ? `?v=${encodeURIComponent(cacheStamp)}`
+        : "";
+    const src = mediaSrc(`/api/content/${contentId}/thumbnail${stampParam}`);
+    // onerror only fires once per element (per HTML5 spec) so the
+    // placeholder can't loop-fire against a 404 endpoint. The
+    // handler also nulls itself as belt-and-suspenders in case a
+    // browser diverges from the spec.
+    const onerror =
+        "this.onerror=null;this." +
+        `src=${JSON.stringify(CONTENT_THUMBNAIL_PLACEHOLDER_SRC)}`;
+    return `src="${src}" loading="lazy" decoding="async" onerror="${onerror.replace(/"/g, "&quot;")}"`;
+}
+
+/**
  * 15.3: Best-effort "pull a one-line operator-friendly message out of a
  * non-OK response." Handles three shapes FastAPI emits:
  *   - 422 ValidationError -> `{detail: [{msg, loc, ...}, ...]}` (array)

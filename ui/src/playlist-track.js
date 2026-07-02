@@ -16,7 +16,7 @@
 // (~36 KB minified). Loaded lazily inside refresh() so the cold
 // path that doesn't open the Playlists panel doesn't pay for it.
 
-import { mediaSrc } from "./api.js";
+import { contentTileThumbnailAttrs, mediaSrc } from "./api.js";
 import { attachAutoSave } from "./auto-save.js";
 import { attachAutoTextOverlay } from "./auto-text-overlay.js";
 import { DEFAULT_PLAYLIST_ID } from "./constants.js";
@@ -817,12 +817,18 @@ function renderThumbWrap(item, {
         ? `<span class="${classPrefix}-lock" title="Stored for a different output mode — won't play on this device">⚠</span>`
         : "";
     const draggableAttr = draggable ? "" : ` draggable="false"`;
-    const src = mediaSrc(
-        `/api/content/${item.id}/asset?v=${encodeURIComponent(item.updated_at || item.created_at || cacheBust)}`,
+    // 2026-07-02 (handover-blocker fix): swap to the small /thumbnail
+    // JPEG endpoint + lazy-load + onerror placeholder — the raw
+    // /asset PNG was blowing up memory on the Pi. Emits the whole
+    // src / loading / decoding / onerror block so future call sites
+    // stay consistent.
+    const thumbAttrs = contentTileThumbnailAttrs(
+        item.id,
+        item.updated_at || item.created_at || cacheBust,
     );
     return `<div class="${classPrefix}-thumb-wrap">
             <img class="${classPrefix}-thumb" alt=""${draggableAttr}
-                 src="${src}">
+                 ${thumbAttrs}>
             ${lockedBadge}${extraChildren}
         </div>`;
 }

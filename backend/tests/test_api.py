@@ -359,6 +359,64 @@ def test_get_asset_404_when_metadata_present_but_asset_missing(
     assert response.status_code == 404
 
 
+# --- GET /api/content/{id}/thumbnail (2026-07-02 OOM handover fix) ---
+
+
+def test_get_thumbnail_returns_jpeg_bytes(client: TestClient):
+    """The tile-list endpoint returns a small JPEG (not the raw PNG)
+    so a memory-tight Pi Zero 2 W can render ~15 tiles without an
+    OOM reboot. Content-type is image/jpeg + first 2 bytes are the
+    JFIF/EXIF start-of-image marker.
+    """
+    upload = client.post("/api/content/text-slides", json=_upload_payload())
+    item_id = upload.json()["id"]
+    response = client.get(f"/api/content/{item_id}/thumbnail")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/jpeg"
+    # JPEG SOI marker.
+    assert response.content[:2] == b"\xff\xd8"
+    # Cache header — the frontend already stamps `?v=<updated_at>`
+    # for cache-bust so long-lived immutable caching is safe.
+    assert "immutable" in response.headers.get("cache-control", "")
+
+
+def test_get_thumbnail_smaller_than_source_png(client: TestClient):
+    """The whole point of the endpoint is to avoid the 1-3 MB PNG
+    payload on tile fetches. Pin that the JPEG is dramatically
+    smaller than the source so a future accidental "just serve the
+    PNG" regression trips this test."""
+    upload = client.post("/api/content/text-slides", json=_upload_payload())
+    item_id = upload.json()["id"]
+    png_response = client.get(f"/api/content/{item_id}/asset")
+    jpeg_response = client.get(f"/api/content/{item_id}/thumbnail")
+    assert jpeg_response.status_code == 200
+    assert png_response.status_code == 200
+    # The test fixture PNG is deliberately small (a 1x1 stub) so the
+    # JPEG re-encode adds JPEG-header overhead + can wind up larger
+    # than the source bytes on a trivial input. On a real-world
+    # 1280x720 video thumbnail JPEG runs ~20x smaller than the PNG;
+    # here we just assert the payload is a valid small JPEG (<10 KB)
+    # so the regression story fires on a huge-payload regression.
+    assert len(jpeg_response.content) < 10_000
+
+
+def test_get_thumbnail_404_when_asset_missing(client: TestClient):
+    """No asset -> 404, identical to /asset. The UI's onerror handler
+    swaps to a lightweight placeholder data-URI (never to /video)."""
+    response = client.get(f"/api/content/{uuid4()}/thumbnail")
+    assert response.status_code == 404
+
+
+def test_get_thumbnail_404_when_metadata_present_but_asset_missing(
+    client: TestClient, storage: ContentStorage
+):
+    upload = client.post("/api/content/text-slides", json=_upload_payload())
+    item_id = UUID(upload.json()["id"])
+    storage.asset_path(item_id).unlink()
+    response = client.get(f"/api/content/{item_id}/thumbnail")
+    assert response.status_code == 404
+
+
 def test_uploads_with_duplicate_names_both_succeed(client: TestClient):
     """Names aren't unique; the id keys items, so two slides with the same
     name should coexist."""

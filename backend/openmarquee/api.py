@@ -14,7 +14,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 # LEVER 2 lazy-imports (2026-06-24): Pillow (~5-8 MB RSS) is only
 # referenced inside the two _decode_*_payload helpers below. Both
@@ -1018,6 +1018,53 @@ async def get_asset(item_id: UUID, storage: StorageDep) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"no asset for {item_id}")
     return FileResponse(path, media_type="image/png")
+
+
+@router.get(
+    "/{item_id}/thumbnail",
+    responses={
+        200: {"content": {"image/jpeg": {}}},
+        404: {"description": "No asset for that id (nothing to thumbnail)."},
+    },
+)
+async def get_thumbnail(item_id: UUID, storage: StorageDep) -> Response:
+    """2026-07-02 (handover-relevant): small downscaled JPEG of the
+    item's asset.png for list-view tiles. The `/asset` endpoint
+    serves the raw 1280x720 lossless PNG (1-3 MB each); with ~15
+    tiles on the dashboard content view the concurrent load
+    OOM-rebooted a memory-tight Pi Zero 2 W (qarl 2026-07-02).
+    This endpoint returns a ~15-40 KB JPEG so the browser can lazy-
+    load the whole grid without pressuring uvicorn.
+
+    On-demand from asset.png via Pillow — a ~50 ms downscale on the
+    Pi is acceptable for once-per-view. Cached in-process by
+    (item_id, mtime) so subsequent hits are instant. Missing
+    asset.png → 404 identical to /asset (the UI's onerror handler
+    swaps to a lightweight placeholder data-URI, NEVER to /video
+    per qarl 2026-07-02).
+    """
+    from openmarquee.content.thumbnail import generate_thumbnail_jpeg
+
+    path = storage.asset_path(item_id)
+    if not path.exists():
+        raise HTTPException(
+            status_code=404, detail=f"no asset for {item_id} (nothing to thumbnail)"
+        )
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+        jpeg_bytes = generate_thumbnail_jpeg(path, mtime_ns=mtime_ns)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("thumbnail generation failed for %s: %r", item_id, exc)
+        raise HTTPException(
+            status_code=500, detail=f"thumbnail generation failed for {item_id}"
+        ) from exc
+    return Response(
+        content=jpeg_bytes,
+        media_type="image/jpeg",
+        # Client + intermediary caches are safe: URL callers already
+        # include `?v=<updated_at>` so a re-upload busts the cache.
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 @router.put("/videos/{item_id}", response_model=VideoSlide)
