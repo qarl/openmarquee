@@ -122,6 +122,19 @@ class SupervisorEvent(StrEnum):
     STA_ASSOCIATED = "STA_ASSOCIATED"
     STA_AUTH_FAILED = "STA_AUTH_FAILED"
     STA_DISCONNECTED = "STA_DISCONNECTED"
+    # 2026-07-01 (audit 4b follow-up): wpa_supplicant couldn't find
+    # the target SSID in its scan. Classifies the DEGRADED-card
+    # variant as "not_found" or, when the last iw-scan saw the SSID
+    # only on 5 GHz, "not_found_or_5ghz". No state-machine
+    # transition yet — the supervisor records the classification for
+    # the NEXT DEGRADED render. Wiring an ONLINE/CONNECTING →
+    # DEGRADED edge on this event is a separate PR.
+    STA_SSID_NOT_FOUND = "STA_SSID_NOT_FOUND"
+    # 2026-07-01 (audit 4b follow-up): wpa_supplicant's scan itself
+    # failed (interface disappeared, firmware crash, EBUSY). No
+    # classification — logged for diagnostics; the supervisor keeps
+    # whatever variant was last recorded.
+    STA_SCAN_FAILED = "STA_SCAN_FAILED"
     LINGER_TIMER_EXPIRED = "LINGER_TIMER_EXPIRED"
     OPERATOR_REQUESTED_SETUP_MODE = "OPERATOR_REQUESTED_SETUP_MODE"
     SETUP_MODE_TIMER_EXPIRED = "SETUP_MODE_TIMER_EXPIRED"
@@ -625,6 +638,27 @@ def parse_wpa_event(raw: str) -> tuple[SupervisorEvent | None, dict]:
         "CTRL-EVENT-SSID-TEMP-DISABLED"
     ):
         return SupervisorEvent.STA_AUTH_FAILED, fields
+    # 2026-07-01 (audit 4b follow-up): the target SSID isn't in the
+    # scan. `CTRL-EVENT-NETWORK-NOT-FOUND` is the string
+    # wpa_supplicant actually emits (wpa_ctrl.c); `CTRL-EVENT-SSID-
+    # NOT-FOUND` is accepted as a defensive alias because the spec-
+    # facing name in the QA audit + several downstream docs uses
+    # the SSID-NOT-FOUND phrasing. Fold both here so a rename on
+    # either side doesn't silently drop the classification.
+    if body.startswith("CTRL-EVENT-NETWORK-NOT-FOUND") or body.startswith(
+        "CTRL-EVENT-SSID-NOT-FOUND"
+    ):
+        for token in body.split():
+            if "=" in token:
+                k, v = token.split("=", 1)
+                fields[k] = v.strip().strip('"')
+        return SupervisorEvent.STA_SSID_NOT_FOUND, fields
+    if body.startswith("CTRL-EVENT-SCAN-FAILED"):
+        for token in body.split():
+            if "=" in token:
+                k, v = token.split("=", 1)
+                fields[k] = v.strip()
+        return SupervisorEvent.STA_SCAN_FAILED, fields
     return None, fields
 
 
@@ -736,11 +770,20 @@ class NetworkSupervisor:
         # which is the correct conservative story (we don't know
         # what caused it after a reboot).
         #
-        # Follow-up: `not_found_or_5ghz` needs a scan-fail /
-        # SSID-not-found signal we don't currently emit. Wired-up
-        # here so a future PR that adds that event only has to set
-        # this field.
+        # 2026-07-01 (audit 4b follow-up): the `not_found_or_5ghz`
+        # variant's classifier now IS wired — wpa_supplicant's
+        # CTRL-EVENT-NETWORK-NOT-FOUND (see parse_wpa_event above)
+        # maps to STA_SSID_NOT_FOUND. On that event we consult the
+        # last iw-scan band table below to decide "not_found" vs
+        # "not_found_or_5ghz" for the DEGRADED card.
         self._last_degraded_variant: str | None = None
+        # 2026-07-01 (audit 4b follow-up): per-SSID band table
+        # populated from the last `iw dev wlan0 scan`. Values are
+        # "2.4" | "5" — matching WifiNetwork.band. Cleared to {}
+        # when no scan has run. `record_scan_bands()` overwrites
+        # this whole dict per scan (a network that disappeared
+        # should stop classifying).
+        self._last_scan_bands: dict[str, str] = {}
         self._current_ap_channel: int | None = None
         self._current_sta_freq_mhz: int | None = None
         # P2 (2026-06-27): LINGER timer. monotonic timestamp set on
@@ -956,6 +999,20 @@ class NetworkSupervisor:
             # Successful reconnect resets the story so a later drop
             # doesn't inherit the prior reason.
             self._last_degraded_variant = None
+        elif event == SupervisorEvent.STA_SSID_NOT_FOUND:
+            # 2026-07-01 (audit 4b follow-up): the SSID isn't in the
+            # scan. If the last iw-scan saw the target SSID *only* on
+            # 5 GHz, surface the "not_found_or_5ghz" variant so the
+            # card explains the 5-GHz-only case; otherwise fall
+            # back to the plain "not_found" copy.
+            target = self._last_sta_ssid
+            band = self._last_scan_bands.get(target) if target is not None else None
+            self._last_degraded_variant = "not_found_or_5ghz" if band == "5" else "not_found"
+        elif event == SupervisorEvent.STA_SCAN_FAILED:
+            # Scan itself failed (driver / firmware). Nothing to
+            # classify — keep whatever variant was last recorded and
+            # let the diagnostics ring buffer carry the failure detail.
+            pass
         new_state = next_state(self._state, event, fallback_mutex=self.config.fallback_mutex_mode)
         if new_state is None:
             self._emit(
@@ -1011,6 +1068,23 @@ class NetworkSupervisor:
                         # still applies.
                         _asyncio.run(result)
         return self._state
+
+    def record_scan_bands(self, bands: dict[str, str]) -> None:
+        """2026-07-01 (audit 4b follow-up): record the per-SSID band
+        table from the most recent iw-scan (see
+        ``api_system._parse_iw_scan``). Overwrites the previous
+        table wholesale so a network that stopped broadcasting no
+        longer classifies. When STA_SSID_NOT_FOUND fires next, the
+        classifier reads from here to decide "not_found" vs
+        "not_found_or_5ghz" for the DEGRADED card.
+
+        No wiring today calls this — the follow-up PR that lands
+        wpa_supplicant SCAN-RESULTS ingestion (or, more cheaply, a
+        periodic /api/system/wifi-scan poll) is what will feed it.
+        Kept as a public method so that follow-up is a one-line
+        integration.
+        """
+        self._last_scan_bands = dict(bands)
 
     def apply_sta_freq(self, freq_mhz: int) -> ChannelFollowDecision:
         """Record the STA's current frequency + ask the channel-
@@ -1350,13 +1424,15 @@ class NetworkSupervisor:
                 "ttl_ms": int(self.config.linger_seconds * 1000),
             }
         if new == SupervisorState.DEGRADED:
-            # 2026-07-01 (audit 4b): thread the actual recorded
-            # disconnect reason from `_last_degraded_variant` so the
-            # renderer picks the specific variant (auth_fail vs the
-            # generic lost). None -> "lost" default matches the
-            # renderer's fallback (system_card.rs unknown_degraded_
-            # variant_falls_back_to_lost_copy test) so a
-            # variant-less transition still renders sensible copy.
+            # 2026-07-01 (audit 4b + follow-up): thread the actual
+            # recorded disconnect reason from
+            # `_last_degraded_variant` so the renderer picks the
+            # specific variant (auth_fail / not_found /
+            # not_found_or_5ghz vs the generic lost). None -> "lost"
+            # default matches the renderer's fallback (system_card.rs
+            # unknown_degraded_variant_falls_back_to_lost_copy test)
+            # so a variant-less transition still renders sensible
+            # copy.
             return {
                 "kind": "DEGRADED",
                 "variant": self._last_degraded_variant or "lost",

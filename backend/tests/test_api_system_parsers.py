@@ -155,6 +155,79 @@ BSS aa
     assert nets[0].ssid == "Café 🎉 网络"
 
 
+# 2026-07-01 (audit 4b follow-up): band-classification fixtures. Each
+# BSS's `freq:` line is what upstream classifies as 2.4 vs 5 GHz.
+IW_MIXED_BANDS = """\
+BSS aa:bb:cc:dd:ee:ff
+\tfreq: 2412
+\tsignal: -50.00 dBm
+\tSSID: HomeNet
+BSS 11:22:33:44:55:66
+\tfreq: 5240
+\tsignal: -70.00 dBm
+\tSSID: Guest5G
+BSS ff:ee:dd:cc:bb:aa
+\tfreq: 5745
+\tsignal: -55.00 dBm
+\tSSID: HomeNet
+"""
+
+
+def test_iw_captures_freq_and_band_for_2_4ghz_bss():
+    nets = _parse_iw_scan(IW_MIXED_BANDS)
+    by = {n.ssid: n for n in nets}
+    # HomeNet has BSSes on both bands; 2.4-preferred aggregation.
+    assert by["HomeNet"].band == "2.4"
+    # Strongest-signal wins for freq_mhz: -50 on 2412 beats -55 on 5745.
+    assert by["HomeNet"].freq_mhz == 2412
+
+
+def test_iw_classifies_5ghz_only_ssid_as_band_5():
+    """The exact case the DEGRADED `not_found_or_5ghz` variant
+    surfaces: an SSID whose only visible BSS is on 5 GHz. The
+    Pi's radio is 2.4-only, so this network isn't joinable."""
+    nets = _parse_iw_scan(IW_MIXED_BANDS)
+    by = {n.ssid: n for n in nets}
+    assert by["Guest5G"].band == "5"
+    assert by["Guest5G"].freq_mhz == 5240
+
+
+def test_iw_band_none_when_no_freq_line():
+    """Unknown-band BSSes (freq line missing / out of both bands)
+    must produce band=None so the classifier doesn't
+    misinterpret an absent freq as either 2.4 or 5."""
+    out = """\
+BSS aa
+\tsignal: -50.00 dBm
+\tSSID: NoFreqNet
+"""
+    nets = _parse_iw_scan(out)
+    assert nets[0].band is None
+    assert nets[0].freq_mhz is None
+
+
+def test_iw_hidden_ssid_does_not_leak_freq_into_next_block():
+    """A hidden-SSID BSS (empty SSID) is skipped, but the
+    per-BSS freq accumulator must NOT leak into the next block —
+    otherwise a 5 GHz hidden BSS would poison the 2.4 GHz block
+    that follows it and mis-classify the visible SSID."""
+    out = """\
+BSS aa
+\tfreq: 5220
+\tsignal: -60.00 dBm
+\tSSID:
+BSS bb
+\tsignal: -55.00 dBm
+\tSSID: Visible2G
+"""
+    nets = _parse_iw_scan(out)
+    by = {n.ssid: n for n in nets}
+    # Visible2G had no freq line of its own; must NOT inherit the
+    # hidden BSS's 5220.
+    assert by["Visible2G"].freq_mhz is None
+    assert by["Visible2G"].band is None
+
+
 def test_iw_signal_resets_between_blocks():
     """`current_signal` is set to None after each SSID match.
     The third block has no signal line; the parser doesn't carry

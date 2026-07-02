@@ -395,6 +395,26 @@ class TestParseWpaEvent:
         ev, _ = parse_wpa_event("<3>CTRL-EVENT-SCAN-RESULTS")
         assert ev is None
 
+    def test_ctrl_event_network_not_found_maps_to_ssid_not_found(self):
+        # 2026-07-01 (audit 4b follow-up): wpa_supplicant's actual
+        # event name for "target SSID absent from scan results" is
+        # CTRL-EVENT-NETWORK-NOT-FOUND. Must map to STA_SSID_NOT_FOUND
+        # so the supervisor can classify the DEGRADED card variant.
+        ev, _ = parse_wpa_event("<3>CTRL-EVENT-NETWORK-NOT-FOUND ")
+        assert ev == SupervisorEvent.STA_SSID_NOT_FOUND
+
+    def test_ctrl_event_ssid_not_found_alias_maps_to_ssid_not_found(self):
+        # Defensive alias: the QA audit + several docs use the
+        # `SSID-NOT-FOUND` phrasing. Both spellings must resolve to
+        # the same SupervisorEvent so a rename on either side
+        # doesn't silently drop the classification.
+        ev, _ = parse_wpa_event('<3>CTRL-EVENT-SSID-NOT-FOUND ssid="qarl"')
+        assert ev == SupervisorEvent.STA_SSID_NOT_FOUND
+
+    def test_ctrl_event_scan_failed_maps_to_scan_failed(self):
+        ev, _ = parse_wpa_event("<3>CTRL-EVENT-SCAN-FAILED ret=-16 retry=1")
+        assert ev == SupervisorEvent.STA_SCAN_FAILED
+
     def test_handles_missing_priority_prefix(self):
         # If the event arrives without the <N> prefix the parser
         # should still recover.
@@ -1131,6 +1151,84 @@ class TestSystemCardOnTransition:
         # 'lost' via the STA_DISCONNECTED handler. Semantically the
         # SAME variant either way, but the important invariant is that
         # the field went through None on reconnect (proven above).
+
+    def test_ssid_not_found_without_scan_data_classifies_as_not_found(
+        self,
+        tmp_path: Path,
+    ):
+        """2026-07-01 (audit 4b follow-up): when wpa_supplicant reports
+        SSID-NOT-FOUND and we have no iw-scan band data yet (or the
+        target SSID isn't in the table), the classifier defaults to
+        'not_found' — the safest interpretation is "router off / SSID
+        misspelled" rather than the 5 GHz story.
+        """
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+        # Prime the target SSID so the classifier has something to
+        # look up (even though the scan table is empty).
+        sup._last_sta_ssid = "MyHomeWifi"
+        sup.apply_event(SupervisorEvent.STA_SSID_NOT_FOUND)
+        assert sup._last_degraded_variant == "not_found"
+
+    def test_ssid_not_found_with_5ghz_only_scan_classifies_as_not_found_or_5ghz(
+        self,
+        tmp_path: Path,
+    ):
+        """The exact case the split variant surfaces: the last iw scan
+        found the target SSID on 5 GHz only. Classifier picks
+        'not_found_or_5ghz' so the DEGRADED card tells the operator
+        to check the router's 2.4 GHz radio instead of assuming the
+        SSID is wrong.
+        """
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup._last_sta_ssid = "MyHomeWifi"
+        sup.record_scan_bands({"MyHomeWifi": "5", "Neighbor2G": "2.4"})
+        sup.apply_event(SupervisorEvent.STA_SSID_NOT_FOUND)
+        assert sup._last_degraded_variant == "not_found_or_5ghz"
+
+    def test_ssid_not_found_with_2_4ghz_scan_stays_not_found(
+        self,
+        tmp_path: Path,
+    ):
+        """SSID is visible on 2.4 GHz but wpa_supplicant still couldn't
+        find it (transient scan miss, mid-boot race). Classifier
+        must NOT jump to the 5 GHz story — the 2.4 GHz radio is
+        broadcasting fine, so the failure is likely transient /
+        signal-quality.
+        """
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup._last_sta_ssid = "MyHomeWifi"
+        sup.record_scan_bands({"MyHomeWifi": "2.4"})
+        sup.apply_event(SupervisorEvent.STA_SSID_NOT_FOUND)
+        assert sup._last_degraded_variant == "not_found"
+
+    def test_scan_failed_leaves_last_variant_untouched(self, tmp_path: Path):
+        """CTRL-EVENT-SCAN-FAILED is a driver / firmware failure; it
+        carries no signal about the target SSID's presence or band.
+        The classifier must keep whatever variant was last recorded
+        (or None) — surface the failure via the diagnostics ring
+        buffer, not by overwriting the DEGRADED variant.
+        """
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup._last_sta_ssid = "MyHomeWifi"
+        sup._last_degraded_variant = "auth_fail"
+        sup.apply_event(SupervisorEvent.STA_SCAN_FAILED)
+        assert sup._last_degraded_variant == "auth_fail"
+
+    def test_record_scan_bands_overwrites_previous_table(self, tmp_path: Path):
+        """record_scan_bands is the follow-up wiring hook: each new
+        scan must replace the previous table wholesale so a network
+        that stopped broadcasting stops classifying.
+        """
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.record_scan_bands({"A": "2.4", "B": "5"})
+        sup.record_scan_bands({"C": "2.4"})
+        assert sup._last_scan_bands == {"C": "2.4"}
 
     def test_operator_setup_mode_from_online_renders_setup_card(self, tmp_path: Path):
         """Operator-driven ONLINE→SETUP (Setup Mode re-entry) must

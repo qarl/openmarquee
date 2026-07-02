@@ -418,7 +418,7 @@ pub enum SystemCardKind {
     /// teaches the device's home-network address.
     Connected,
     /// STA lost. Card re-shows the QR + an explanation by cause
-    /// (variant: lost | auth_fail | not_found_or_5ghz).
+    /// (variant: lost | auth_fail | not_found | not_found_or_5ghz).
     Degraded,
     /// ~4-second boot identity card. Shows the monogram + the
     /// address/IP + (PR4 follow-up) the rapid-boot hint line when
@@ -446,9 +446,16 @@ pub enum DegradedVariant {
     /// STA auth failure (CTRL-EVENT-AUTH-REJECT / SSID-TEMP-
     /// DISABLED). Headline: "WiFi password no longer works".
     AuthFail,
-    /// SSID not in scan results, OR present only on 5 GHz (the
-    /// BCM43438 is 2.4 GHz only per spec). Headline: "Can't find
-    /// <SSID>".
+    /// SSID absent from scan results and NOT visible on 5 GHz
+    /// either (router off, out of range, or SSID misspelled).
+    /// Distinct from `NotFoundOr5ghz` so the card can name the
+    /// specific mode.
+    NotFound,
+    /// SSID present in scan results but only on 5 GHz (the
+    /// BCM43438 is 2.4 GHz only per spec). Distinct from
+    /// `NotFound` so the card can tell the operator to check
+    /// the router's 2.4 GHz radio instead of assuming the SSID
+    /// is wrong.
     NotFoundOr5ghz,
     /// PR3 finish-pass (2026-07-01) forward-compat: unknown variant
     /// from a newer backend falls through to Unknown, which
