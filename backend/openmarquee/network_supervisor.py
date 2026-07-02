@@ -1094,6 +1094,28 @@ class NetworkSupervisor:
         """
         self._last_scan_bands = dict(bands)
 
+    def record_target_ssid(self, ssid: str | None) -> None:
+        """2026-07-02 (PR #30 review FIX-FIRST): stamp the target
+        SSID onto `_last_sta_ssid` at credential-submit time so a
+        subsequent CONNECTING -> SETUP transition renders the
+        classified reason banner WITH the network name (and so the
+        band lookup keys on a real SSID instead of None, which was
+        making the 5GHz classification unreachable on any never-
+        connected device).
+
+        Called from api_onboarding.submit_credentials before
+        firing HAS_STORED_CREDENTIALS. Idempotent: passing None
+        clears the field (matches the fresh-boot semantic).
+
+        The observe loop's parse_wpa_event fields also carry the
+        active SSID once wpa_supplicant reports it; that path
+        remains as a belt-and-suspenders update (a re-scan mid-
+        session can still refresh the field), but the submit-
+        time write is what makes the reason banner name the
+        network on a first-time setup.
+        """
+        self._last_sta_ssid = ssid
+
     def apply_sta_freq(self, freq_mhz: int) -> ChannelFollowDecision:
         """Record the STA's current frequency + ask the channel-
         follow engine for the AP-side decision. Calls the actuator

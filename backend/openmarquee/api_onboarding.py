@@ -174,6 +174,14 @@ async def submit_credentials(
         password=body.password,
     )
 
+    # 2026-07-02 (PR #30 review FIX-FIRST): stamp the target SSID
+    # BEFORE the state transition so a subsequent CONNECTING →
+    # SETUP failure classification renders the reason banner with
+    # the network name AND the classifier's band lookup keys on a
+    # real SSID (not None) — otherwise the 5-GHz-only variant is
+    # unreachable on a never-connected device.
+    supervisor.record_target_ssid(body.ssid)
+
     # Drive the supervisor's state machine so the portal's status
     # poll sees SETUP -> CONNECTING right away (don't wait for
     # wpa_supplicant's CTRL-EVENT-CONNECTED which arrives several
