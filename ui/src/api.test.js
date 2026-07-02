@@ -7,6 +7,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
     apiFetch,
     AUTH_TOKEN_KEY,
+    CONTENT_THUMBNAIL_PLACEHOLDER_SRC,
+    contentTileThumbnailAttrs,
     mediaSrc,
     deleteContent,
     effectiveDisplayDims,
@@ -827,5 +829,50 @@ describe("mediaSrc", () => {
         localStorage.setItem(AUTH_TOKEN_KEY, "1.a/b+c=d");
         const out = mediaSrc("/api/content/abc/asset");
         expect(out).toBe("/api/content/abc/asset?token=1.a%2Fb%2Bc%3Dd");
+    });
+});
+
+describe("contentTileThumbnailAttrs (2026-07-02 handover OOM fix)", () => {
+    it("targets the SMALL /thumbnail endpoint, not the raw /asset PNG", () => {
+        const html = contentTileThumbnailAttrs("abc", "2026-07-02");
+        expect(html).toContain("/api/content/abc/thumbnail");
+        // The whole point of this helper is to avoid /asset on tile
+        // fetches. If a future call site swaps the path back this
+        // regression test explodes.
+        expect(html).not.toContain("/asset");
+    });
+
+    it("attaches loading=lazy so off-screen tiles don't fetch", () => {
+        const html = contentTileThumbnailAttrs("abc", "v1");
+        expect(html).toMatch(/loading="lazy"/);
+    });
+
+    it("attaches decoding=async so decode doesn't block paint", () => {
+        const html = contentTileThumbnailAttrs("abc", "v1");
+        expect(html).toMatch(/decoding="async"/);
+    });
+
+    it("attaches onerror that swaps to the placeholder data URI (NOT /video)", () => {
+        const html = contentTileThumbnailAttrs("abc", "v1");
+        // qarl 2026-07-02: "it should NOT default to loading the
+        // video when the thumbnail is missing." The onerror MUST
+        // resolve to a static data URI, never a /video fetch.
+        expect(html).toMatch(/onerror="[^"]+"/);
+        expect(html).not.toContain("/video");
+        // The placeholder is a data-URI SVG.
+        expect(CONTENT_THUMBNAIL_PLACEHOLDER_SRC).toMatch(/^data:image\/svg\+xml/);
+    });
+
+    it("URL-encodes the cache-bust stamp so ISO timestamps round-trip", () => {
+        const html = contentTileThumbnailAttrs("abc", "2026-07-02T10:00:00Z");
+        expect(html).toContain(
+            "/api/content/abc/thumbnail?v=2026-07-02T10%3A00%3A00Z",
+        );
+    });
+
+    it("omits the cache-bust query when no stamp is provided", () => {
+        const html = contentTileThumbnailAttrs("abc");
+        expect(html).toContain("/api/content/abc/thumbnail");
+        expect(html).not.toContain("?v=");
     });
 });
