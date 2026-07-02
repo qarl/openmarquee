@@ -63,6 +63,17 @@ class DisplayDims(BaseModel):
 class WifiNetwork(BaseModel):
     ssid: str
     signal_dbm: int | None = None
+    # 2026-07-01 (onboarding audit 4b follow-up): band the strongest
+    # BSS for this SSID was seen on. Populated only from the `iw` path
+    # (the airport path doesn't expose per-BSS frequency in a stable
+    # column). `"2.4"` if ANY BSS was on 2.4 GHz; `"5"` if only 5 GHz
+    # BSSes were seen; `None` if no `freq:` line matched. Preferring
+    # 2.4 when both bands are present matches what the Pi's radio can
+    # actually join (BCM43438 is 2.4 GHz only), so this field
+    # doubles as the classifier for the DEGRADED card's
+    # `not_found_or_5ghz` variant.
+    freq_mhz: int | None = None
+    band: str | None = None
 
 
 class WifiScanResult(BaseModel):
@@ -177,14 +188,28 @@ async def scan_wifi() -> WifiScanResult:
 
 
 def _parse_iw_scan(output: str) -> list[WifiNetwork]:
-    """Pull SSIDs + signal from `iw dev wlan0 scan` output.
+    """Pull SSID + signal + band from `iw dev wlan0 scan` output.
 
-    Each BSS block contains `signal: -53.00 dBm` and `SSID: foo` lines.
-    Dedupe on SSID, keeping the strongest signal.
+    Each BSS block contains a `freq: <MHz>` line, `signal: -53.00 dBm`,
+    and `SSID: foo`. Dedupe on SSID: keep the strongest signal, and
+    aggregate band coverage across BSSes — if ANY BSS for this SSID
+    was on 2.4 GHz, `band` is "2.4"; only 5 GHz BSSes → "5"; no
+    freq line matched anywhere → None.
+
+    Band aggregation across BSSes is deliberately 2.4-preferred:
+    the BCM43438 radio on the Pi Zero 2 W is 2.4 GHz only, so an
+    SSID visible on both bands IS reachable (via its 2.4 GHz BSS).
+    An SSID whose only BSSes are 5 GHz is the exact case the
+    DEGRADED card's `not_found_or_5ghz` variant surfaces.
     """
     networks: dict[str, WifiNetwork] = {}
     current_signal: int | None = None
+    current_freq_mhz: int | None = None
     for line in output.splitlines():
+        freq_m = re.match(r"\s*freq:\s*(\d+)", line)
+        if freq_m:
+            current_freq_mhz = int(freq_m.group(1))
+            continue
         sig = re.match(r"\s*signal:\s*(-?\d+(?:\.\d+)?)\s*dBm", line)
         if sig:
             current_signal = int(float(sig.group(1)))
@@ -193,18 +218,59 @@ def _parse_iw_scan(output: str) -> list[WifiNetwork]:
         if ssid_m:
             ssid = ssid_m.group(1).strip()
             if not ssid:
+                # Still reset the per-BSS accumulators so a hidden-
+                # SSID BSS doesn't leak its freq/signal into the
+                # next block.
+                current_signal = None
+                current_freq_mhz = None
                 continue
+            band = _band_for_freq(current_freq_mhz)
             existing = networks.get(ssid)
-            if existing is None or (
-                current_signal is not None
-                and (existing.signal_dbm is None or current_signal > existing.signal_dbm)
-            ):
-                networks[ssid] = WifiNetwork(ssid=ssid, signal_dbm=current_signal)
+            if existing is None:
+                networks[ssid] = WifiNetwork(
+                    ssid=ssid,
+                    signal_dbm=current_signal,
+                    freq_mhz=current_freq_mhz,
+                    band=band,
+                )
+            else:
+                # Strongest-signal-wins for signal_dbm + freq_mhz,
+                # but band is 2.4-preferred so an SSID on both bands
+                # classifies as reachable (the Pi's radio is 2.4-only).
+                stronger = current_signal is not None and (
+                    existing.signal_dbm is None or current_signal > existing.signal_dbm
+                )
+                merged_band = existing.band
+                if band == "2.4" or merged_band is None:
+                    merged_band = band or merged_band
+                networks[ssid] = WifiNetwork(
+                    ssid=ssid,
+                    signal_dbm=current_signal if stronger else existing.signal_dbm,
+                    freq_mhz=current_freq_mhz if stronger else existing.freq_mhz,
+                    band=merged_band,
+                )
             current_signal = None
+            current_freq_mhz = None
     return sorted(
         networks.values(),
         key=lambda n: (-(n.signal_dbm or -999), n.ssid),
     )
+
+
+def _band_for_freq(freq_mhz: int | None) -> str | None:
+    """Return `"2.4"` for 2.4 GHz-range freqs, `"5"` for 5 GHz range,
+    None otherwise. The exact channel ↔ freq mapping stays in
+    network_supervisor.freq_to_channel; this helper only needs
+    coarse-grained band classification for the DEGRADED-card
+    `not_found_or_5ghz` variant.
+    """
+    if freq_mhz is None:
+        return None
+    if 2400 <= freq_mhz <= 2500:
+        return "2.4"
+    if 4900 <= freq_mhz <= 5900:
+        return "5"
+    return None
 
 
 # --- /api/system/info — flock health probe payload (Phase B.1) ---
@@ -752,7 +818,7 @@ _MAX_ADDRESS_LEN = 128
 _MAX_IP_LEN = 45
 _MAX_BOOT_HINT_LEN = 96
 _ALLOWED_KINDS = frozenset({"SETUP", "CONNECTING", "CONNECTED", "DEGRADED", "BOOT"})
-_ALLOWED_VARIANTS = frozenset({"lost", "auth_fail", "not_found_or_5ghz"})
+_ALLOWED_VARIANTS = frozenset({"lost", "auth_fail", "not_found", "not_found_or_5ghz"})
 
 
 class RenderSystemCardPreviewRequest(BaseModel):

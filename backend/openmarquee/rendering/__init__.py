@@ -88,7 +88,7 @@ class Renderer(Protocol):
               "address": str | None,      # mDNS name for CONNECTED / BOOT
               "ip": str | None,
               "target_ssid": str | None,  # CONNECTING / DEGRADED
-              "variant": "lost" | "auth_fail" | "not_found_or_5ghz" | None,
+              "variant": "lost" | "auth_fail" | "not_found" | "not_found_or_5ghz" | None,
               "ttl_ms": int | None,       # None / 0 = until-state-change
               "boot_hint": str | None,    # PR4 rapid-boot line
             }

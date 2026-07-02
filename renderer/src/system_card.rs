@@ -433,11 +433,18 @@ pub fn degraded_copy(
             "WiFi password\nno longer works".to_string(),
             "The router rejected the saved password.".to_string(),
         ),
-        Some(DegradedVariant::NotFoundOr5ghz) => {
+        Some(DegradedVariant::NotFound) => {
             let ssid = target_ssid.unwrap_or("the wifi");
             (
                 format!("Can\u{2019}t find\n{}", ssid),
-                "Router off / out of range, or 5 GHz-only (this device is 2.4 GHz)."
+                "Router off, out of range, or the network name changed.".to_string(),
+            )
+        }
+        Some(DegradedVariant::NotFoundOr5ghz) => {
+            let ssid = target_ssid.unwrap_or("the wifi");
+            (
+                format!("Can\u{2019}t find\n{}\non 2.4 GHz", ssid),
+                "This device is 2.4 GHz only. Check the router\u{2019}s 2.4 GHz radio."
                     .to_string(),
             )
         }
@@ -661,6 +668,34 @@ mod tests {
             })
             .expect("DEGRADED must emit a Headline Text");
         assert!(headline.contains("HomeWiFi"), "got headline={:?}", headline);
+    }
+
+    #[test]
+    fn degraded_not_found_and_5ghz_variants_split_copy() {
+        // 2026-07-01 (audit 4b follow-up): NotFound (SSID absent
+        // from any band) and NotFoundOr5ghz (SSID present but only
+        // on 5 GHz) must render distinct sub-line copy so the
+        // operator knows whether the router is off / out of range
+        // OR the 2.4 GHz radio is disabled.
+        let (nf_head, nf_sub) = degraded_copy(Some(DegradedVariant::NotFound), Some("HomeWiFi"));
+        let (fg_head, fg_sub) =
+            degraded_copy(Some(DegradedVariant::NotFoundOr5ghz), Some("HomeWiFi"));
+        assert!(nf_head.contains("HomeWiFi"));
+        assert!(fg_head.contains("HomeWiFi"));
+        assert_ne!(
+            nf_sub, fg_sub,
+            "NotFound + NotFoundOr5ghz must render distinct sub-line copy"
+        );
+        assert!(
+            fg_sub.contains("2.4 GHz"),
+            "5GHz variant must explicitly name the 2.4 GHz radio; got sub={:?}",
+            fg_sub
+        );
+        assert!(
+            !nf_sub.contains("2.4 GHz"),
+            "NotFound variant must NOT reference 2.4 GHz (router is off / out of range); got sub={:?}",
+            nf_sub
+        );
     }
 
     #[test]
