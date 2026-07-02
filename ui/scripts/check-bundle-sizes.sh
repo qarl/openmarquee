@@ -142,12 +142,23 @@ if [ "$DASHBOARD_BUILT" -eq 1 ]; then
         "../renderer-wasm/pkg/renderer_wasm.js"
         "index.html"
     )
+    # ui/index.html threshold bumped 1700 -> 1850 on 2026-07-02 to
+    # accommodate PR #23's add-to-home-screen PWA tags:
+    # <link rel="manifest">, <link rel="apple-touch-icon">, and
+    # <meta name="theme-color"> pushed the gz size to 1777 (104% of
+    # the pre-PWA 1700 threshold). The installable-dashboard is
+    # intended per PR #23, so per the baseline-report policy
+    # ("surface as a finding, update the threshold with
+    # justification, do NOT auto-revert") the correct response is a
+    # threshold bump. 1850 = ~4% headroom above the current gz
+    # measurement so a future favicon / apple-touch-icon-size
+    # follow-up doesn't have to touch this file again immediately.
     THRESHOLDS+=(
         72000
         18000
         60600
         3600
-        1700
+        1850
     )
     LABELS+=(
         "dist-dashboard/main.js"
