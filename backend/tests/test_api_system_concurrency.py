@@ -43,8 +43,24 @@ async def test_slow_wifi_scan_doesnt_block_concurrent_state_polls(
     slow_seconds = 1.0  # short enough for a quick test; tests the principle
 
     class FakeCompleted:
+        # subprocess.CompletedProcess-shaped: full field set so any
+        # subprocess-consuming path reached during this monkey-patch's
+        # scope is satisfied. Historically only `stdout` + `returncode`
+        # were set (the wifi-scan handler is the only path this test
+        # nominally exercises), but pytest-observed thread pollution
+        # from an autostart `apply_enabled` background thread caused
+        # `wifi_station._run_nmcli` to hit `result.stderr or ""` and
+        # blow up with `AttributeError: 'FakeCompleted' object has no
+        # attribute 'stderr'` mid-CI-run (surfaced as an unhandled-
+        # thread-exception warning, 2026-07-02). Adding the empty
+        # `stderr` here + the `args` slot (subprocess writes it on the
+        # return object) makes the mock forward-safe for any other
+        # subprocess consumer a monkey-patched sibling test spawns
+        # a thread into.
         stdout = ""
+        stderr = ""
         returncode = 0
+        args: list[str] = []
 
     def slow_run(*_args, **_kwargs):
         time.sleep(slow_seconds)

@@ -158,8 +158,15 @@ def test_discover_parses_tailscale_status_json(client: TestClient, monkeypatch):
     }
 
     class FakeProc:
+        # Full CompletedProcess-shaped field set: any subprocess
+        # consumer reached during this monkey-patch's scope (including
+        # background threads spawned by prior tests, e.g. wifi_station
+        # `apply_enabled` which reads `result.stderr`) is satisfied.
+        # See test_api_system_concurrency.FakeCompleted for the mock-
+        # completeness postmortem 2026-07-02.
         returncode = 0
         stdout = json.dumps(payload)
+        stderr = ""
 
     monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/bin/tailscale")
     monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: FakeProc())
@@ -197,8 +204,12 @@ def test_discover_marks_already_added_peers(client: TestClient, monkeypatch):
     }
 
     class FakeProc:
+        # Mock-completeness (see the paired comment above): add
+        # `stderr` so background subprocess consumers (e.g. wifi_
+        # station apply_enabled) don't blow up on `result.stderr`.
         returncode = 0
         stdout = json.dumps(payload)
+        stderr = ""
 
     monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/bin/tailscale")
     monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: FakeProc())
@@ -216,6 +227,7 @@ def test_discover_handles_tailscale_failure_gracefully(client: TestClient, monke
     class FakeProc:
         returncode = 1
         stdout = ""
+        stderr = ""
 
     monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/bin/tailscale")
     monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: FakeProc())
@@ -232,6 +244,7 @@ def test_discover_handles_malformed_json(client: TestClient, monkeypatch):
     class FakeProc:
         returncode = 0
         stdout = "not json at all"
+        stderr = ""
 
     monkeypatch.setattr(mod.shutil, "which", lambda _name: "/usr/bin/tailscale")
     monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: FakeProc())
