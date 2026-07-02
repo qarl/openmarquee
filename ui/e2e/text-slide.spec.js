@@ -35,12 +35,15 @@ test("save a text slide → it shows up in the Playlists pallet + the asset serv
         "Opening",
     );
 
-    // And the asset URL returns a real PNG.
+    // And the tile's thumbnail URL returns a real JPEG. 2026-07-02
+    // (handover-blocker fix): tile thumbnails now hit the new small-
+    // JPEG /thumbnail endpoint instead of the raw 1-3 MB /asset PNG
+    // — the raw endpoint was OOM-rebooting a Pi Zero 2 W dashboard.
     const thumb = palletTiles.first().locator(".pallet-tile-thumb");
     await expect(thumb).toBeVisible();
     const thumbResp = await page.request.get(await thumb.getAttribute("src"));
     expect(thumbResp.status()).toBe(200);
-    expect(thumbResp.headers()["content-type"]).toBe("image/png");
+    expect(thumbResp.headers()["content-type"]).toBe("image/jpeg");
 });
 
 test("two text slides both land in the pallet", async ({ page }) => {
