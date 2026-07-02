@@ -128,16 +128,22 @@ const SECTION_TEMPLATE = `
                         <legend>
                             <label class="field-inline">
                                 <input type="checkbox" class="field-wifi-ap-enabled" checked>
-                                Access point (captive-portal network phones join during setup)
+                                Setup Mode (auto-enables when the sign can't reach its wifi)
                             </label>
                         </legend>
+                        <p class="field-hint" style="margin: 4px 0 10px;">
+                            Setup Mode is off during normal use. If the sign loses its home
+                            wifi it turns Setup Mode on automatically so a phone can join
+                            to reconnect it — no cables, no console. Setup Mode turns
+                            itself off again once the sign is back online.
+                        </p>
                         <div class="row" style="gap: 10px;">
                             <label class="field om-field" style="flex: 1;">
-                                <span>AP SSID</span>
+                                <span>Setup Mode SSID</span>
                                 <input type="text" class="om-input field-wifi-ssid" maxlength="32">
                             </label>
                             <label class="field om-field secret-field" style="flex: 1;" data-secret="wifi-ap-password">
-                                <span>AP password (8-63 chars)</span>
+                                <span>Setup Mode password (8-63 chars)</span>
                                 <div class="secret-display"
                                      style="display: flex; gap: 8px; align-items: center; padding: 6px 0;">
                                     <span class="secret-status" style="font-family: var(--om-mono); color: var(--om-text-dim); font-size: 12px;"></span>
@@ -147,7 +153,7 @@ const SECTION_TEMPLATE = `
                                     <input type="password" class="om-input secret-current-password"
                                            placeholder="Current login password" autocomplete="current-password">
                                     <input type="password" class="om-input secret-new-value"
-                                           placeholder="New AP password (8-63 chars)" minlength="8" maxlength="63">
+                                           placeholder="New Setup Mode password (8-63 chars)" minlength="8" maxlength="63">
                                     <div style="display: flex; gap: 6px;">
                                         <button type="button" class="om-btn primary sm secret-save-btn">Save</button>
                                         <button type="button" class="om-btn sm secret-cancel-btn">Cancel</button>
@@ -201,9 +207,11 @@ const SECTION_TEMPLATE = `
                         <p class="settings-wifi-status" role="status" aria-live="polite" hidden
                            style="margin: 6px 0 0; color: var(--om-text-dim); font-size: 12px;"></p>
                         <p class="field-hint" style="margin: 6px 0 0;">
-                            Runs concurrently with the access point on the Pi's single
-                            radio; both modes share the same channel. Disabling both
-                            modes isn't allowed — the device would be unreachable.
+                            The sign uses this network as its primary connection. If it
+                            drops off (wrong password, network out of range, router down)
+                            the sign flips to Setup Mode so you can join it directly to
+                            fix things. Disabling both modes isn't allowed — the sign
+                            would be unreachable.
                         </p>
 
                         <fieldset class="settings-tailscale">

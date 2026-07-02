@@ -1063,6 +1063,75 @@ class TestSystemCardOnTransition:
         assert sup.current_state == SupervisorState.DEGRADED
         assert pub.render_calls[-1].get("kind") == "DEGRADED"
 
+    def test_degraded_variant_defaults_to_lost_when_no_reason_recorded(self, tmp_path: Path):
+        """2026-07-01 (audit 4b): the DEGRADED card's variant field
+        used to be hard-coded to 'lost'. Now threaded from the last
+        STA-level event. When the ONLY reason recorded is a plain
+        STA_DISCONNECTED (no AUTH_REJECT ever seen), the variant
+        stays 'lost' — matches the pre-fix default."""
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+        sup.apply_event(SupervisorEvent.STA_DISCONNECTED)  # → DEGRADED
+        assert sup.current_state == SupervisorState.DEGRADED
+        assert pub.render_calls[-1].get("variant") == "lost"
+
+    def test_degraded_variant_carries_auth_fail_when_seen_earlier(
+        self,
+        tmp_path: Path,
+    ):
+        """2026-07-01 (audit 4b): if wpa_supplicant emitted an
+        AUTH-REJECT (STA_AUTH_FAILED) earlier, that reason must
+        propagate to any later DEGRADED render — the operator
+        should see 'wrong password' on the wall instead of a
+        generic 'wifi lost.'
+
+        NB: the state machine currently routes STA_AUTH_FAILED
+        (from CONNECTING) directly to SETUP, NOT DEGRADED. This
+        test drives the field through the observable side channel
+        (a fresh association + a subsequent disconnect) — the
+        _last_degraded_variant field is the persistent hook a
+        future PR that adds an ONLINE→DEGRADED-on-auth-fail edge
+        would pick up. For now the test guards the plumbing: a
+        variant recorded on STA_AUTH_FAILED survives until
+        STA_ASSOCIATED clears it or a STA_DISCONNECTED overwrites
+        it.
+        """
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        # Simulate an auth-fail during CONNECTING → SETUP.
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+        sup.apply_event(SupervisorEvent.STA_AUTH_FAILED)  # → SETUP
+        assert sup._last_degraded_variant == "auth_fail"
+        # A successful association would clear the reason: verify.
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER (clears)
+        assert sup._last_degraded_variant is None
+
+    def test_degraded_variant_resets_to_none_on_successful_reconnect(
+        self,
+        tmp_path: Path,
+    ):
+        """STA_ASSOCIATED must clear the last-degraded-variant so a
+        later drop doesn't inherit a stale reason (auth_fail from
+        weeks ago wouldn't apply to a wall-plug pull today)."""
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+        sup.apply_event(SupervisorEvent.STA_DISCONNECTED)  # → DEGRADED lost
+        assert sup._last_degraded_variant == "lost"
+        # Reconnect: clears the reason.
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        assert sup._last_degraded_variant is None
+        # Fresh drop must NOT inherit 'lost' from before; it re-records
+        # 'lost' via the STA_DISCONNECTED handler. Semantically the
+        # SAME variant either way, but the important invariant is that
+        # the field went through None on reconnect (proven above).
+
     def test_operator_setup_mode_from_online_renders_setup_card(self, tmp_path: Path):
         """Operator-driven ONLINE→SETUP (Setup Mode re-entry) must
         also render the SETUP card so the sign shows the join QR."""

@@ -717,6 +717,30 @@ class NetworkSupervisor:
             self._last_sta_channel = None
             self._takeover_active = False
             self._rollback_fired_at = None
+        # 2026-07-01 (onboarding audit 4b): the DEGRADED card's
+        # `variant` field (schema: "lost" | "auth_fail" |
+        # "not_found_or_5ghz") lets the renderer surface WHY the sign
+        # is off-net rather than a generic "wifi lost." Pre-fix the
+        # supervisor hard-coded variant="lost" for every DEGRADED
+        # publish; here we track the last STA-level reason so the
+        # next DEGRADED render picks it up.
+        #
+        # None means "haven't seen a classifying event yet"; the
+        # renderer falls back to "lost" copy in that case (see
+        # `_system_card_params_for_state` below). Cleared on
+        # STA_ASSOCIATED so a successful reconnect resets the story
+        # -- a later drop doesn't inherit the prior reason.
+        #
+        # Not persisted across supervisor restarts: a reboot mid-
+        # DEGRADED loses the specific reason + falls back to "lost",
+        # which is the correct conservative story (we don't know
+        # what caused it after a reboot).
+        #
+        # Follow-up: `not_found_or_5ghz` needs a scan-fail /
+        # SSID-not-found signal we don't currently emit. Wired-up
+        # here so a future PR that adds that event only has to set
+        # this field.
+        self._last_degraded_variant: str | None = None
         self._current_ap_channel: int | None = None
         self._current_sta_freq_mhz: int | None = None
         # P2 (2026-06-27): LINGER timer. monotonic timestamp set on
@@ -920,6 +944,18 @@ class NetworkSupervisor:
         # about which states the spec considers "fresh."
         if event == SupervisorEvent.STA_ASSOCIATED:
             self._fire_power_save_on_assoc()
+        # 2026-07-01 (onboarding audit 4b): record the STA-level
+        # reason so the NEXT DEGRADED card publish surfaces the
+        # specific variant. See `_last_degraded_variant` in
+        # __init__ for the full rationale + limitations.
+        if event == SupervisorEvent.STA_AUTH_FAILED:
+            self._last_degraded_variant = "auth_fail"
+        elif event == SupervisorEvent.STA_DISCONNECTED:
+            self._last_degraded_variant = "lost"
+        elif event == SupervisorEvent.STA_ASSOCIATED:
+            # Successful reconnect resets the story so a later drop
+            # doesn't inherit the prior reason.
+            self._last_degraded_variant = None
         new_state = next_state(self._state, event, fallback_mutex=self.config.fallback_mutex_mode)
         if new_state is None:
             self._emit(
@@ -1314,13 +1350,16 @@ class NetworkSupervisor:
                 "ttl_ms": int(self.config.linger_seconds * 1000),
             }
         if new == SupervisorState.DEGRADED:
-            # Default variant is `lost`; a future extension may
-            # thread the specific auth_fail / not_found_or_5ghz
-            # variant here based on the last STA disconnect
-            # reason recorded by the observe loop.
+            # 2026-07-01 (audit 4b): thread the actual recorded
+            # disconnect reason from `_last_degraded_variant` so the
+            # renderer picks the specific variant (auth_fail vs the
+            # generic lost). None -> "lost" default matches the
+            # renderer's fallback (system_card.rs unknown_degraded_
+            # variant_falls_back_to_lost_copy test) so a
+            # variant-less transition still renders sensible copy.
             return {
                 "kind": "DEGRADED",
-                "variant": "lost",
+                "variant": self._last_degraded_variant or "lost",
                 "target_ssid": self._last_sta_ssid,
             }
         # Should be unreachable — every non-ONLINE state maps above.

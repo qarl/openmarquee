@@ -47,6 +47,43 @@ const SAMPLE = {
 };
 
 describe("mountSettings", () => {
+    it("wifi AP fieldset uses new 'Setup Mode' lifecycle copy (not the old concurrent-AP wording)", async () => {
+        // 2026-07-01 (onboarding audit 4b): the wifi AP field labels
+        // used to describe the OLD concurrent-AP model
+        // ("Access point (captive-portal…)", "Runs concurrently with
+        // the access point on the Pi's single radio…"). The spec
+        // (qa/spec-onboarding-ap-sta-concurrent-2026-06-10.md)
+        // retires that model in favor of a "Setup Mode" that is
+        // normally OFF and turns on automatically when the sign
+        // loses its wifi. This is a copy-regression guard.
+        const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+            ok: true,
+            json: async () => ({}),
+        });
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => SAMPLE,
+            onSave: vi.fn(),
+        });
+        await tick();
+        const text = container.textContent;
+        // New copy MUST appear.
+        expect(text).toMatch(/Setup Mode/);
+        expect(text).toMatch(
+            /auto-enables when the sign can't reach its wifi/i,
+        );
+        // Old copy MUST NOT appear (retired per spec §"Fallback
+        // position" / audit 4b).
+        expect(text).not.toMatch(/Access point \(captive-portal/i);
+        expect(text).not.toMatch(/Runs concurrently with the access point/i);
+        // Field labels use "Setup Mode SSID / password", not "AP …".
+        const ssidLabel = container.querySelector(".field-wifi-ssid")
+            ?.closest("label")
+            ?.querySelector("span")?.textContent;
+        expect(ssidLabel).toMatch(/Setup Mode SSID/);
+        fetchSpy.mockRestore();
+    });
+
     it("device_id row is read-only and populated from /api/system/info when present", async () => {
         // qarl 2026-05-12 (a2): MySignXXX device_id is exposed by
         // /api/system/info, surfaced as a read-only row above the
