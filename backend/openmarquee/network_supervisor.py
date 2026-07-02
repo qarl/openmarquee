@@ -175,6 +175,14 @@ def next_state(
     # in portal). In both regimes.
     if s == SupervisorState.CONNECTING and e == SupervisorEvent.STA_AUTH_FAILED:
         return SupervisorState.SETUP
+    # 2026-07-02 (audit 4b close-out): CONNECTING → SETUP when the
+    # target SSID isn't in the scan. Mirrors the STA_AUTH_FAILED
+    # edge — keep the portal up so the operator can pick a different
+    # network or unmask a hidden SSID. The SETUP card carries the
+    # classified variant (`not_found` vs `not_found_or_5ghz`) so
+    # the on-glass reason banner is specific.
+    if s == SupervisorState.CONNECTING and e == SupervisorEvent.STA_SSID_NOT_FOUND:
+        return SupervisorState.SETUP
     # LINGER → ONLINE when the grace timer expires.
     if s == SupervisorState.LINGER and e == SupervisorEvent.LINGER_TIMER_EXPIRED:
         return SupervisorState.ONLINE
@@ -1086,6 +1094,28 @@ class NetworkSupervisor:
         """
         self._last_scan_bands = dict(bands)
 
+    def record_target_ssid(self, ssid: str | None) -> None:
+        """2026-07-02 (PR #30 review FIX-FIRST): stamp the target
+        SSID onto `_last_sta_ssid` at credential-submit time so a
+        subsequent CONNECTING -> SETUP transition renders the
+        classified reason banner WITH the network name (and so the
+        band lookup keys on a real SSID instead of None, which was
+        making the 5GHz classification unreachable on any never-
+        connected device).
+
+        Called from api_onboarding.submit_credentials before
+        firing HAS_STORED_CREDENTIALS. Idempotent: passing None
+        clears the field (matches the fresh-boot semantic).
+
+        The observe loop's parse_wpa_event fields also carry the
+        active SSID once wpa_supplicant reports it; that path
+        remains as a belt-and-suspenders update (a re-scan mid-
+        session can still refresh the field), but the submit-
+        time write is what makes the reason banner name the
+        network on a first-time setup.
+        """
+        self._last_sta_ssid = ssid
+
     def apply_sta_freq(self, freq_mhz: int) -> ChannelFollowDecision:
         """Record the STA's current frequency + ask the channel-
         follow engine for the AP-side decision. Calls the actuator
@@ -1407,7 +1437,21 @@ class NetworkSupervisor:
         when fields are absent.
         """
         if new == SupervisorState.SETUP:
-            return {"kind": "SETUP"}
+            # 2026-07-02 (audit 4b close-out): thread the classified
+            # variant onto the SETUP card too. The state machine
+            # routes CONNECTING → SETUP on STA_AUTH_FAILED or
+            # STA_SSID_NOT_FOUND, so the SETUP card is where the
+            # operator lands after a first-connect failure — the
+            # renderer picks up `variant` + `target_ssid` and
+            # paints a reason banner on the on-glass card. When no
+            # variant is set (fresh boot, no prior failure), the
+            # card renders as it did before (no banner).
+            params: dict = {"kind": "SETUP"}
+            if self._last_degraded_variant is not None:
+                params["variant"] = self._last_degraded_variant
+                if self._last_sta_ssid is not None:
+                    params["target_ssid"] = self._last_sta_ssid
+            return params
         if new == SupervisorState.CONNECTING:
             return {
                 "kind": "CONNECTING",

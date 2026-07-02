@@ -104,6 +104,25 @@ def test_submit_credentials_drives_supervisor_into_connecting(
     assert status["state"] == SupervisorState.CONNECTING.value
 
 
+def test_submit_credentials_records_target_ssid_on_supervisor(
+    client: TestClient, storage: SettingsStorage
+):
+    """2026-07-02 (PR #30 review FIX-FIRST): submit-credentials MUST
+    stamp `_last_sta_ssid` before firing HAS_STORED_CREDENTIALS.
+    Without this the classifier's band lookup on a subsequent
+    STA_SSID_NOT_FOUND keys on None -> always "not_found", and the
+    5-GHz-only banner is unreachable on any never-connected device.
+    Also without this the SETUP-with-reason banner would name "the
+    wifi" instead of the actual network.
+    """
+    client.post(
+        "/api/onboarding/submit-credentials",
+        json={"ssid": "MyHomeWifi", "password": "open-sesame"},
+    )
+    supervisor = _network_supervisor_singleton()
+    assert supervisor._last_sta_ssid == "MyHomeWifi"
+
+
 def test_submit_credentials_rejects_short_password(client: TestClient):
     response = client.post(
         "/api/onboarding/submit-credentials",

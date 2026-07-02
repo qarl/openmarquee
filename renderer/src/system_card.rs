@@ -281,6 +281,53 @@ fn layout_setup(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
         text: "Scan with your phone camera → the setup\npage opens automatically. No camera? Join\nthe network above and enter the PIN."
             .to_string(),
     });
+    // 2026-07-02 (audit 4b close-out): if the supervisor threaded a
+    // classified variant into the SETUP card (state machine routed
+    // CONNECTING → SETUP via STA_AUTH_FAILED or STA_SSID_NOT_FOUND),
+    // paint a reason banner across the bottom in DANGER color so the
+    // operator standing at the sign knows WHY the last attempt
+    // failed. On a fresh boot / no prior failure `params.variant`
+    // is None and we skip the banner (the card renders identically
+    // to the pre-close-out layout).
+    if let Some(reason) = setup_reason_copy(params.variant, params.target_ssid.as_deref()) {
+        shapes.push(CardShape::Text {
+            anchor: (0.07, 0.90),
+            max_height: 0.026,
+            color: DANGER,
+            font: DisplayFont::Body,
+            align: Align::Left,
+            text: reason,
+        });
+    }
+}
+
+/// 2026-07-02 (audit 4b close-out) SETUP-card reason banner copy.
+/// Pure function; returns `None` when the variant carries no useful
+/// signal for a first-connect failure (Lost / Unknown / absent),
+/// so the caller can skip the banner cleanly.
+pub fn setup_reason_copy(
+    variant: Option<DegradedVariant>,
+    target_ssid: Option<&str>,
+) -> Option<String> {
+    let ssid = target_ssid.unwrap_or("the wifi");
+    match variant {
+        Some(DegradedVariant::AuthFail) => Some(
+            "Last attempt: password rejected. Re-scan the QR and enter the correct wifi password.".to_string(),
+        ),
+        Some(DegradedVariant::NotFound) => Some(format!(
+            "Last attempt: \u{201C}{}\u{201D} not in range. Check the network name and the router.",
+            ssid
+        )),
+        Some(DegradedVariant::NotFoundOr5ghz) => Some(format!(
+            "Last attempt: \u{201C}{}\u{201D} is 5 GHz only. This device needs a 2.4 GHz network.",
+            ssid
+        )),
+        // Lost + Unknown + None: no first-connect story to tell —
+        // Lost means the STA disconnected AFTER connecting (never
+        // happens during onboarding SETUP entry), Unknown is a
+        // forward-compat catch-all, None is the fresh-boot case.
+        _ => None,
+    }
 }
 
 fn layout_connecting(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
@@ -529,6 +576,101 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[test]
+    fn setup_no_variant_omits_reason_banner() {
+        // 2026-07-02 (audit 4b close-out): a SETUP card with no
+        // classified variant (fresh boot, no prior failure) must
+        // render identically to the pre-close-out layout — no
+        // DANGER-colored Text shapes anywhere.
+        let p = params(SystemCardKind::Setup);
+        let shapes = layout_card(&p);
+        assert!(
+            !shapes.iter().any(|s| matches!(
+                s,
+                CardShape::Text { color: DANGER, .. }
+            )),
+            "SETUP without variant must NOT emit a DANGER-colored reason banner"
+        );
+    }
+
+    #[test]
+    fn setup_auth_fail_variant_paints_password_reason() {
+        let mut p = params(SystemCardKind::Setup);
+        p.variant = Some(DegradedVariant::AuthFail);
+        p.target_ssid = Some("HomeWifi".to_string());
+        let shapes = layout_card(&p);
+        let banner = shapes
+            .iter()
+            .find_map(|s| match s {
+                CardShape::Text { text, color: DANGER, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("SETUP + auth_fail must emit a DANGER-colored reason banner");
+        assert!(
+            banner.to_lowercase().contains("password"),
+            "auth_fail banner must name the password; got {:?}",
+            banner
+        );
+    }
+
+    #[test]
+    fn setup_not_found_variant_paints_ssid_in_reason() {
+        let mut p = params(SystemCardKind::Setup);
+        p.variant = Some(DegradedVariant::NotFound);
+        p.target_ssid = Some("HomeWifi".to_string());
+        let shapes = layout_card(&p);
+        let banner = shapes
+            .iter()
+            .find_map(|s| match s {
+                CardShape::Text { text, color: DANGER, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("SETUP + not_found must emit a DANGER-colored reason banner");
+        assert!(
+            banner.contains("HomeWifi"),
+            "not_found banner must name the target SSID; got {:?}",
+            banner
+        );
+    }
+
+    #[test]
+    fn setup_not_found_or_5ghz_variant_calls_out_5ghz() {
+        let mut p = params(SystemCardKind::Setup);
+        p.variant = Some(DegradedVariant::NotFoundOr5ghz);
+        p.target_ssid = Some("HomeWifi".to_string());
+        let shapes = layout_card(&p);
+        let banner = shapes
+            .iter()
+            .find_map(|s| match s {
+                CardShape::Text { text, color: DANGER, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("SETUP + not_found_or_5ghz must emit a DANGER banner");
+        assert!(
+            banner.contains("5 GHz") && banner.contains("2.4 GHz"),
+            "5 GHz banner must name both bands; got {:?}",
+            banner
+        );
+        assert!(banner.contains("HomeWifi"));
+    }
+
+    #[test]
+    fn setup_lost_variant_omits_reason_banner() {
+        // Lost means STA dropped AFTER connecting — nonsensical on the
+        // SETUP card (first-connect story). setup_reason_copy returns
+        // None so no banner paints, even though the variant is set.
+        let mut p = params(SystemCardKind::Setup);
+        p.variant = Some(DegradedVariant::Lost);
+        let shapes = layout_card(&p);
+        assert!(
+            !shapes.iter().any(|s| matches!(
+                s,
+                CardShape::Text { color: DANGER, .. }
+            )),
+            "SETUP + Lost variant must NOT paint a first-connect banner"
+        );
     }
 
     #[test]

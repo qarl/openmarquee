@@ -12,7 +12,12 @@ captured-output fixtures + edge cases.
 
 from __future__ import annotations
 
-from openmarquee.api_system import _parse_airport_scan, _parse_iw_scan
+from openmarquee.api_system import (
+    WifiNetwork,
+    _feed_scan_bands_to_supervisor,
+    _parse_airport_scan,
+    _parse_iw_scan,
+)
 
 # --- iw scan parser ----------------------------------------------------------
 
@@ -377,3 +382,68 @@ def test_airport_uppercase_bssid_matched():
     nets = _parse_airport_scan(out)
     assert nets[0].ssid == "UpCase"
     assert nets[0].signal_dbm == -45
+
+
+# --- supervisor scan-band feed --------------------------------------------
+
+
+class _RecordingSupervisor:
+    """Records `record_scan_bands` calls so the api_system
+    integration test can assert the wiring without spinning up a
+    real supervisor singleton (which pulls in netctl actuators +
+    on-disk state)."""
+
+    def __init__(self):
+        self.calls: list[dict[str, str]] = []
+
+    def record_scan_bands(self, bands: dict[str, str]) -> None:
+        self.calls.append(dict(bands))
+
+
+def test_feed_scan_bands_only_forwards_known_bands(monkeypatch):
+    """2026-07-02 (audit 4b close-out): the wifi-scan handler feeds
+    the per-SSID band table to the supervisor. WifiNetwork rows
+    with `band is None` (freq line missing / out of both bands)
+    are dropped so an unknowable band doesn't clobber a
+    previously-recorded value."""
+    recorder = _RecordingSupervisor()
+    from openmarquee import dependencies
+
+    monkeypatch.setattr(dependencies, "get_network_supervisor", lambda: recorder)
+    networks = [
+        WifiNetwork(ssid="Home", signal_dbm=-50, freq_mhz=2412, band="2.4"),
+        WifiNetwork(ssid="Guest5G", signal_dbm=-70, freq_mhz=5240, band="5"),
+        WifiNetwork(ssid="Unknown", signal_dbm=-60, freq_mhz=None, band=None),
+    ]
+    _feed_scan_bands_to_supervisor(networks)
+    assert recorder.calls == [{"Home": "2.4", "Guest5G": "5"}]
+
+
+def test_feed_scan_bands_silent_when_supervisor_import_fails(monkeypatch):
+    """Fire-and-forget contract: if the supervisor singleton isn't
+    wired (early boot, mid-test, dev host without the module) the
+    call is a silent no-op, NOT a 500. The wifi-scan response is
+    the primary contract; the classifier update is a side effect."""
+    from openmarquee import dependencies
+
+    def _boom():
+        raise RuntimeError("no supervisor wired")
+
+    monkeypatch.setattr(dependencies, "get_network_supervisor", _boom)
+    networks = [WifiNetwork(ssid="Home", signal_dbm=-50, freq_mhz=2412, band="2.4")]
+    # Must not raise.
+    _feed_scan_bands_to_supervisor(networks)
+
+
+def test_feed_scan_bands_no_op_on_empty_bands(monkeypatch):
+    """A scan that produced only unknown-band networks still calls
+    record_scan_bands so a network that WAS on the list but is now
+    absent stops classifying. Empty dict is the expected argument.
+    """
+    recorder = _RecordingSupervisor()
+    from openmarquee import dependencies
+
+    monkeypatch.setattr(dependencies, "get_network_supervisor", lambda: recorder)
+    networks = [WifiNetwork(ssid="NoFreq", signal_dbm=-60, freq_mhz=None, band=None)]
+    _feed_scan_bands_to_supervisor(networks)
+    assert recorder.calls == [{}]

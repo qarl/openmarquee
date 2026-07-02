@@ -456,6 +456,19 @@ pub enum DegradedVariant {
     /// `NotFound` so the card can tell the operator to check
     /// the router's 2.4 GHz radio instead of assuming the SSID
     /// is wrong.
+    ///
+    /// 2026-07-02 (PR #30 review FIX-FIRST): explicit rename to
+    /// `"not_found_or_5ghz"`. serde's `#[serde(rename_all =
+    /// "snake_case")]` produces `"not_found_or5ghz"` (no
+    /// underscore before the digit) because snake_case treats
+    /// letter->digit as an intra-word boundary, not a word break.
+    /// The backend has always emitted the 4-underscore form so
+    /// without this explicit rename every 5-GHz-only DEGRADED /
+    /// SETUP-reason payload fell through the `#[serde(other)]`
+    /// Unknown arm silently — banner rendered nothing. Pinned by
+    /// the `degraded_variant_wire_strings_round_trip` test below
+    /// so this class of Python↔Rust wire mismatch can't recur.
+    #[serde(rename = "not_found_or_5ghz")]
     NotFoundOr5ghz,
     /// PR3 finish-pass (2026-07-01) forward-compat: unknown variant
     /// from a newer backend falls through to Unknown, which
@@ -1441,5 +1454,61 @@ mod tests {
             "got: {}",
             invalid.message()
         );
+    }
+
+    #[test]
+    fn degraded_variant_wire_strings_round_trip() {
+        // 2026-07-02 (PR #30 review FIX-FIRST): pin every wire
+        // string the Python backend emits (openmarquee.rendering
+        // + network_supervisor._system_card_params_for_state) to
+        // its Rust variant. Guards against the class of mismatch
+        // that made the 5-GHz-only banner render as Unknown for
+        // weeks pre-fix: serde's `snake_case` naming produced
+        // `not_found_or5ghz` (no underscore before the digit)
+        // while the backend sent `not_found_or_5ghz` (with) —
+        // silent fall-through via `#[serde(other)]` to Unknown.
+        //
+        // Every non-Unknown variant here should decode to its
+        // named enum member AND re-encode to the EXACT same wire
+        // string. If a future rename breaks either direction this
+        // test explodes.
+        for (wire, expected) in [
+            ("lost", DegradedVariant::Lost),
+            ("auth_fail", DegradedVariant::AuthFail),
+            ("not_found", DegradedVariant::NotFound),
+            ("not_found_or_5ghz", DegradedVariant::NotFoundOr5ghz),
+        ] {
+            let decoded: DegradedVariant =
+                serde_json::from_str(&format!("\"{wire}\"")).unwrap_or_else(|e| {
+                    panic!(
+                        "wire string {:?} failed to decode: {} (a rename on \
+                         either side likely broke the Python↔Rust contract)",
+                        wire, e
+                    )
+                });
+            assert_eq!(
+                decoded, expected,
+                "wire string {:?} decoded to the wrong variant",
+                wire
+            );
+            let reencoded = serde_json::to_string(&expected).unwrap();
+            assert_eq!(
+                reencoded,
+                format!("\"{wire}\""),
+                "variant {:?} re-encoded to a different wire string \
+                 than the backend expects",
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn degraded_variant_unknown_wire_string_decodes_to_unknown_variant() {
+        // Forward-compat: a wire string the renderer doesn't know
+        // (older renderer + newer backend that shipped a new
+        // variant) MUST decode to Unknown, not fail deserialization
+        // — the whole RenderSystemCard payload would 502 otherwise.
+        let decoded: DegradedVariant = serde_json::from_str(r#""cosmic_ray""#).unwrap();
+        assert_eq!(decoded, DegradedVariant::Unknown);
     }
 }
