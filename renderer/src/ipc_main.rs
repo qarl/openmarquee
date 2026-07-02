@@ -4549,10 +4549,34 @@ fn handle_inner_request(
                         )
                     }
                 });
+                // PR3.1 perf (item #7): encode the QR ONCE at
+                // card-activation time and cache the bitmap on
+                // ActiveSystemCard. The paint hook then does an
+                // O(1) Arc clone per frame instead of a full
+                // encoder + palette dance per shape iteration.
+                let qr_cache = p.qr_payload.as_deref().and_then(|payload| {
+                    if payload.is_empty() {
+                        None
+                    } else {
+                        match crate::qr::encode_qr(payload) {
+                            Ok(bmp) => Some(std::sync::Arc::new(bmp)),
+                            Err(e) => {
+                                eprintln!(
+                                    "[system-card] qr encode failed at activation \
+                                     for {}-byte payload: {}",
+                                    payload.len(),
+                                    e
+                                );
+                                None
+                            }
+                        }
+                    }
+                });
                 state.active_system_card = Some(crate::system_card::ActiveSystemCard {
                     shapes,
                     deadline,
                     activated_at: std::time::Instant::now(),
+                    qr_cache,
                     params: p,
                 });
                 ok_empty()
@@ -6460,6 +6484,74 @@ mod tests {
         let card = state.active_system_card.as_ref().expect("slot set");
         assert_eq!(card.params.kind, crate::playback::SystemCardKind::Connecting);
         assert_eq!(card.params.target_ssid.as_deref(), Some("second"));
+    }
+
+    /// PR3.1 perf item #7 (2026-07-01) — RenderSystemCard populates
+    /// the QR bitmap cache at ACTIVATION time when a qr_payload is
+    /// present. The paint hook then reads the cached bitmap instead
+    /// of re-encoding every frame.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_populates_qr_cache_when_payload_present() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let mut p = system_card_params(crate::playback::SystemCardKind::Setup);
+        p.qr_payload = Some("WIFI:T:WPA;S:openMarquee-Setup;P:4827;;".to_string());
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        let cached = card.qr_cache.as_ref().expect(
+            "qr_cache must be populated at activation when qr_payload is present",
+        );
+        assert!(cached.size >= 21, "expected QR V1+ size; got {}", cached.size);
+        // Sanity: the finder pattern's top-left corner is dark.
+        assert!(cached.module(0, 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_leaves_qr_cache_none_when_payload_absent() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let p = system_card_params(crate::playback::SystemCardKind::Boot);
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        assert!(
+            card.qr_cache.is_none(),
+            "kind=BOOT has no qr_payload; cache must be None"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn render_system_card_leaves_qr_cache_none_when_payload_empty() {
+        let td = tempfile::tempdir().unwrap();
+        let mut state = crate::playback::PlaybackState::new();
+        let mut cache = SlideCache::new();
+        let mut p = system_card_params(crate::playback::SystemCardKind::Setup);
+        p.qr_payload = Some(String::new()); // empty
+        let _resp = handle_inner_request(
+            IpcRequest::RenderSystemCard(p),
+            &mut state,
+            &mut cache,
+            td.path(),
+        );
+        let card = state.active_system_card.as_ref().expect("slot set");
+        assert!(
+            card.qr_cache.is_none(),
+            "empty qr_payload must NOT allocate a cached bitmap"
+        );
     }
 
     /// PR3 fix-pass B1 (2026-07-01) — the inverse contract: a

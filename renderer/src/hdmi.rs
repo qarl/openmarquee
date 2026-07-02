@@ -17422,45 +17422,72 @@ pub fn maybe_paint_system_card_overlay(
         let now = std::time::Instant::now();
         // Deadline (from RenderSystemCard.ttl_ms > 0) OR the
         // absolute max-lifetime cap (ttl_ms=None safety net).
-        let ttl_expired = card
-            .deadline
-            .map(|d| now >= d)
-            .unwrap_or(false);
-        let max_life_expired = card.activated_at.elapsed().as_secs()
-            >= SYSTEM_CARD_MAX_LIFETIME_S;
+        let ttl_expired = card.deadline.map(|d| now >= d).unwrap_or(false);
+        let max_life_expired =
+            card.activated_at.elapsed().as_secs() >= SYSTEM_CARD_MAX_LIFETIME_S;
         if ttl_expired || max_life_expired {
             state.active_system_card = None;
             return Ok(false);
         }
     }
 
-    // 2. Clone the shape list so we can release the borrow on
-    //    state.active_system_card before per-shape draws that may
-    //    mutate the session.
-    let shapes: Vec<CardShape> = state
-        .active_system_card
-        .as_ref()
-        .map(|c| c.shapes.clone())
-        .unwrap_or_default();
-
-    let (gl, mode_w, mode_h) = {
-        let gl: *const glow::Context = session.gl();
-        (gl, u32::from(session.mode_w()), u32::from(session.mode_h()))
+    // 2. Borrow shapes + a spinner-phase seed from the active card
+    //    WITHOUT cloning the shape Vec (perf, and the borrow lifetime
+    //    stays under our control by shadowing `session`/`state`
+    //    borrows below). We DO copy the small cache (QR modules) via
+    //    Arc so per-frame QR encoding is skipped once the card is
+    //    active (PR3.1 perf item #7).
+    //
+    //    activated_at gives the spinner its animation phase without
+    //    needing a separate frame counter.
+    let (shapes, qr_cache, activated_at): (
+        Vec<CardShape>,
+        Option<std::sync::Arc<crate::qr::QrBitmap>>,
+        std::time::Instant,
+    ) = {
+        let card = state
+            .active_system_card
+            .as_ref()
+            .expect("active card checked above");
+        (
+            card.shapes.clone(),
+            card.qr_cache.clone(),
+            card.activated_at,
+        )
     };
-    // SAFETY: session outlives this borrow; we only read gl and
-    // never through-cast to a mutable borrow.
-    let gl: &glow::Context = unsafe { &*gl };
+    let spinner_phase = activated_at.elapsed().as_secs_f32();
 
-    // 3. Paint the shape list. PR3 MVP renders Background + Text +
-    //    QrPanel (via scissored glClear so we don't need to compile
-    //    a texture-quad shader for the MVP). Other shapes silently
-    //    skip in this pass — PR3.1 lands the monogram / chip /
-    //    spinner / footer primitives.
+    // 3. PR3.1 rotation/brightness fix (item #1): route the card paint
+    //    through the SAME scene_fbo + run_present_pass pipeline as
+    //    text/image/video arms. Direct-to-scanout paint (PR3 MVP)
+    //    rendered wrong-oriented on rotated panels + un-dimmed under
+    //    non-identity brightness/gamma. Now: paint shapes into
+    //    scene_fbo when settings are non-identity OR rotated; the
+    //    present pass then blits scene_tex → default fb with the same
+    //    brightness / gamma / rotation shader every other arm uses.
+    let identity = session.current_settings.is_color_identity();
+    let rotation = session.rotation;
+    let mode_w = u32::from(session.mode_w);
+    let mode_h = u32::from(session.mode_h);
+    let scene_fbo_handle = if !identity || rotation != 0 {
+        Some(unsafe { ensure_scene_fbo(session, mode_w, mode_h)? })
+    } else {
+        None
+    };
+
     use glow::HasContext;
     unsafe {
-        gl.viewport(0, 0, mode_w as i32, mode_h as i32);
-        gl.disable(glow::SCISSOR_TEST);
+        if let Some((fbo, _)) = scene_fbo_handle {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+        }
+        session.gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+        session.gl.disable(glow::SCISSOR_TEST);
     }
+    // Immutable gl handle for the per-shape paint helpers. The
+    // helpers only read the GL context; the scene_fbo bind + present
+    // pass mutate via session.gl directly.
+    let gl: &glow::Context = session.gl;
+
     for shape in &shapes {
         match shape {
             CardShape::Background { color } => unsafe {
@@ -17489,21 +17516,95 @@ pub fn maybe_paint_system_card_overlay(
                 top_left,
                 size,
                 payload,
-                caption: _caption,
+                caption,
             } => {
-                paint_system_card_qr_panel(gl, mode_w, mode_h, *top_left, *size, payload);
+                paint_system_card_qr_panel(
+                    gl,
+                    mode_w,
+                    mode_h,
+                    *top_left,
+                    *size,
+                    payload,
+                    caption,
+                    qr_cache.as_deref(),
+                )?;
             }
-            // PR3.1 follow-ups: monogram tile, solid-fill state
-            // chip, spinner, footer, boot hint. Silently skipped
-            // in PR3 MVP — a per-frame log would flood the journal
-            // at ~30 Hz.
-            _ => {
-                let _ = shape;
+            // PR3.1 fidelity primitives.
+            CardShape::Monogram { top_left, tile_size } => {
+                paint_system_card_monogram(gl, mode_w, mode_h, *top_left, *tile_size)?;
+            }
+            CardShape::Chip {
+                top_right,
+                label,
+                bg,
+                ink,
+                text_height,
+            } => {
+                paint_system_card_chip(
+                    gl,
+                    mode_w,
+                    mode_h,
+                    *top_right,
+                    label,
+                    *bg,
+                    *ink,
+                    *text_height,
+                )?;
+            }
+            CardShape::Spinner {
+                center,
+                radius,
+                color,
+            } => {
+                paint_system_card_spinner(
+                    gl,
+                    mode_w,
+                    mode_h,
+                    *center,
+                    *radius,
+                    *color,
+                    spinner_phase,
+                );
+            }
+            CardShape::Footer {
+                text,
+                color,
+                max_height,
+            } => {
+                paint_system_card_footer(gl, mode_w, mode_h, text, *color, *max_height)?;
+            }
+            CardShape::BootHint {
+                center_bottom,
+                text,
+                color,
+            } => {
+                paint_system_card_boot_hint(
+                    gl,
+                    mode_w,
+                    mode_h,
+                    *center_bottom,
+                    text,
+                    *color,
+                )?;
             }
         }
     }
     unsafe {
-        gl.disable(glow::SCISSOR_TEST);
+        session.gl.disable(glow::SCISSOR_TEST);
+    }
+
+    // 3a. Present pass: bind default fb + blit scene_tex through the
+    //     rotation/brightness/gamma shader when we painted into
+    //     scene_fbo.
+    if let Some((_fbo, tex)) = scene_fbo_handle {
+        let brightness = session.current_settings.brightness as f32 / 100.0;
+        let gamma = session.current_settings.gamma;
+        let (phys_w, phys_h) = session.phys_mode_size();
+        unsafe {
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            session.gl.viewport(0, 0, phys_w as i32, phys_h as i32);
+            run_present_pass(session.gl, tex, brightness, gamma, rotation)?;
+        }
     }
 
     // 4. PRESENT — the critical piece the original PR3 was missing.
@@ -17541,13 +17642,17 @@ pub fn maybe_paint_system_card_overlay(
     Ok(true)
 }
 
-/// Paint one QR code inside its layout panel. White background
-/// spans `size` × `size` of card width, `top_left` in normalized
-/// (0..1) coords. Dark modules render as scissored glClear rects.
+/// PR3.1 (2026-07-01) — paint the QR panel using a CACHED QrBitmap
+/// (built once at RenderSystemCard activation, see ipc_main.rs) so
+/// the per-frame cost is O(dark_module_count) scissored glClears
+/// instead of re-encoding the QR + rebuilding the bitmap every tick.
+/// Falls back to on-demand encoding when the cache is None (defensive:
+/// keeps the panel painting even on a codepath that skipped the
+/// activation-time encode).
 ///
-/// Uses scissored glClear rather than a textured-quad shader so
-/// the MVP doesn't need a new pipeline; O(N²) clears with N≈25
-/// costs ~625 clears at up to 30 Hz — trivial for vc4 GLES2.
+/// Below the QR grid we render a small caption line ("Scan to join" /
+/// "Scan to fix") via the standard MSDF text pipeline so the panel
+/// visually reads as one unit.
 fn paint_system_card_qr_panel(
     gl: &glow::Context,
     mode_w: u32,
@@ -17555,7 +17660,9 @@ fn paint_system_card_qr_panel(
     top_left: (f32, f32),
     size: f32,
     payload: &str,
-) {
+    caption: &str,
+    cached: Option<&crate::qr::QrBitmap>,
+) -> Result<()> {
     use glow::HasContext;
 
     let panel_x_px = (top_left.0 * mode_w as f32) as i32;
@@ -17575,18 +17682,25 @@ fn paint_system_card_qr_panel(
         gl.clear(glow::COLOR_BUFFER_BIT);
     }
 
-    // 2. Encode + draw modules. If encoding fails (payload too
-    //    long / malformed) the panel just shows as white; the
-    //    supervisor's diagnostic ring buffer records the failure.
-    let Ok(qr) = crate::qr::encode_qr(payload) else {
-        eprintln!(
-            "[system-card] qr encode failed for payload of length {}; drawing empty panel",
-            payload.len()
-        );
-        unsafe {
-            gl.disable(glow::SCISSOR_TEST);
+    // 2. Prefer the cached bitmap. Fall back to a fresh encode only
+    //    when the activation-time cache is unavailable.
+    let owned_fallback;
+    let qr: &crate::qr::QrBitmap = match cached {
+        Some(c) => c,
+        None => {
+            let Ok(bmp) = crate::qr::encode_qr(payload) else {
+                eprintln!(
+                    "[system-card] qr encode failed for payload of length {}; drawing empty panel",
+                    payload.len()
+                );
+                unsafe {
+                    gl.disable(glow::SCISSOR_TEST);
+                }
+                return Ok(());
+            };
+            owned_fallback = bmp;
+            &owned_fallback
         }
-        return;
     };
 
     // Inset the QR modules by ~5% of the panel to give a quiet
@@ -17622,6 +17736,244 @@ fn paint_system_card_qr_panel(
     unsafe {
         gl.disable(glow::SCISSOR_TEST);
     }
+
+    // 3. Caption line below the panel. Positioned to fit the 1.9cqw
+    //    caption at ~2% of card width below the panel — matches the
+    //    mockup's `.qcap` spacing.
+    if !caption.is_empty() {
+        let caption_y = top_left.1 + size + 0.012;
+        paint_system_card_text(
+            gl,
+            mode_w,
+            mode_h,
+            (top_left.0 + size * 0.5, caption_y),
+            0.019,
+            crate::system_card::MUTED,
+            crate::system_card::DisplayFont::Body,
+            crate::system_card::Align::Center,
+            caption,
+        )?;
+    }
+    Ok(())
+}
+
+/// PR3.1 (2026-07-01) — utility: paint a solid-color axis-aligned
+/// rectangle in normalized card-space (0..1). Wraps the scissored-
+/// glClear idiom in one helper so every rect-drawing primitive
+/// (monogram tile, chip pill, footer bar backing) shares the same
+/// coordinate conversion.
+fn paint_system_card_rect(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: crate::system_card::Rgb,
+) {
+    use glow::HasContext;
+    let x_px = (x * mode_w as f32) as i32;
+    let y_px = (y * mode_h as f32) as i32;
+    let w_px = ((w * mode_w as f32) as i32).max(1);
+    let h_px = ((h * mode_h as f32) as i32).max(1);
+    let y_bl = mode_h as i32 - y_px - h_px;
+    unsafe {
+        gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(x_px, y_bl, w_px, h_px);
+        gl.clear_color(
+            f32::from(color.0) / 255.0,
+            f32::from(color.1) / 255.0,
+            f32::from(color.2) / 255.0,
+            1.0,
+        );
+        gl.clear(glow::COLOR_BUFFER_BIT);
+        gl.disable(glow::SCISSOR_TEST);
+    }
+}
+
+/// PR3.1 (2026-07-01) — monogram lockup: solid amber tile with
+/// centered "oM" text + "openMarquee" word to the right of the tile.
+fn paint_system_card_monogram(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    top_left: (f32, f32),
+    tile_size: f32,
+) -> Result<()> {
+    // Amber tile with the "oM" glyphs inside. Corner rounding is
+    // sharp (a rounded-rect shader is out of scope for PR3.1; the
+    // full-fidelity paint layer stays close enough to the mockup
+    // for the sign-across-a-room read).
+    paint_system_card_rect(
+        gl,
+        mode_w,
+        mode_h,
+        top_left.0,
+        top_left.1,
+        tile_size,
+        tile_size,
+        crate::system_card::ACCENT,
+    );
+    // "oM" glyphs, dark accent-ink color, sized to fit the tile.
+    // Vertically nudged so the cap-height sits visually centered.
+    paint_system_card_text(
+        gl,
+        mode_w,
+        mode_h,
+        (top_left.0 + tile_size * 0.15, top_left.1 + tile_size * 0.20),
+        tile_size * 0.60,
+        crate::system_card::ACCENT_INK,
+        crate::system_card::DisplayFont::Headline,
+        crate::system_card::Align::Left,
+        "oM",
+    )?;
+    // Word mark to the right of the tile, cap-height matched to
+    // the tile height for the mockup's balanced lockup.
+    let word_x = top_left.0 + tile_size + 0.013;
+    paint_system_card_text(
+        gl,
+        mode_w,
+        mode_h,
+        (word_x, top_left.1 + tile_size * 0.20),
+        tile_size * 0.55,
+        crate::system_card::TEXT,
+        crate::system_card::DisplayFont::Headline,
+        crate::system_card::Align::Left,
+        "openMarquee",
+    )?;
+    Ok(())
+}
+
+/// PR3.1 (2026-07-01) — state chip: solid-fill amber/green/red
+/// background with a label. Anchor is the chip's top-right corner
+/// in normalized card-space (matches the mockup's `.chip`
+/// placement).
+fn paint_system_card_chip(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    top_right: (f32, f32),
+    label: &str,
+    bg: crate::system_card::Rgb,
+    ink: crate::system_card::Rgb,
+    text_height: f32,
+) -> Result<()> {
+    // Approximate chip width from the label length (mono-ish font;
+    // 0.011 per char is a safe ratio for the 700-weight display
+    // types). Padding is 0.017 of card width per side (mockup:
+    // 1.7cqw). Height is the text cap-height + ~0.015 padding
+    // above/below.
+    let padding_x = 0.017_f32;
+    let padding_y = 0.010_f32;
+    let approx_char_w = text_height * 0.85;
+    let chip_w = (label.chars().count() as f32) * approx_char_w + padding_x * 2.0;
+    let chip_h = text_height + padding_y * 2.0;
+    let chip_x = (1.0 - top_right.0 - chip_w).max(0.0);
+    let chip_y = top_right.1;
+    paint_system_card_rect(gl, mode_w, mode_h, chip_x, chip_y, chip_w, chip_h, bg);
+    paint_system_card_text(
+        gl,
+        mode_w,
+        mode_h,
+        (chip_x + padding_x, chip_y + padding_y),
+        text_height,
+        ink,
+        crate::system_card::DisplayFont::Headline,
+        crate::system_card::Align::Left,
+        label,
+    )?;
+    Ok(())
+}
+
+/// PR3.1 (2026-07-01) — CONNECTING-card spinner: 8 rotating dots
+/// around a circle. Uses `phase_s` (seconds since card activation)
+/// to compute the current angular offset — one rotation per 1.2s.
+///
+/// Dots are drawn as square scissored glClears (the visual size is
+/// small enough that the difference from a proper circle is not
+/// perceptible at panel resolution — same rationale as the sharp-
+/// cornered monogram tile).
+fn paint_system_card_spinner(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    center: (f32, f32),
+    radius: f32,
+    color: crate::system_card::Rgb,
+    phase_s: f32,
+) {
+    let dot_count = 8;
+    let rotation_period_s = 1.2_f32;
+    let base_angle = (phase_s / rotation_period_s) * std::f32::consts::TAU;
+    let dot_size = radius * 0.28;
+    for i in 0..dot_count {
+        let angle = base_angle
+            + (i as f32) * (std::f32::consts::TAU / dot_count as f32);
+        // Rotation clockwise on screen; y axis inverted vs math.
+        let dx = angle.cos() * radius;
+        let dy = angle.sin() * radius;
+        let x = center.0 + dx - dot_size * 0.5;
+        let y = center.1 - dy - dot_size * 0.5;
+        paint_system_card_rect(gl, mode_w, mode_h, x, y, dot_size, dot_size, color);
+    }
+}
+
+/// PR3.1 (2026-07-01) — footer bar: single centered muted-color text
+/// line at the bottom of the card. Used by CONNECTED to remind the
+/// user where the sign lives.
+fn paint_system_card_footer(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    text: &str,
+    color: crate::system_card::Rgb,
+    max_height: f32,
+) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    // Centered horizontally, ~4.6% up from the bottom edge (mockup
+    // `.foot.b`).
+    paint_system_card_text(
+        gl,
+        mode_w,
+        mode_h,
+        (0.5, 1.0 - 0.046 - max_height),
+        max_height,
+        color,
+        crate::system_card::DisplayFont::Body,
+        crate::system_card::Align::Center,
+        text,
+    )
+}
+
+/// PR3.1 (2026-07-01) — BOOT-card hint line ("Restart 2× more for
+/// Setup Mode"). PR4 turns this on when the rapid-boot counter is
+/// armed; PR3.1 just paints the text when present.
+fn paint_system_card_boot_hint(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    center_bottom: (f32, f32),
+    text: &str,
+    color: crate::system_card::Rgb,
+) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let max_height = 0.020_f32;
+    paint_system_card_text(
+        gl,
+        mode_w,
+        mode_h,
+        (center_bottom.0, center_bottom.1 - max_height),
+        max_height,
+        color,
+        crate::system_card::DisplayFont::Body,
+        crate::system_card::Align::Center,
+        text,
+    )
 }
 
 /// PR3 MVP system-card text paint. Builds a synthetic TextLayer
