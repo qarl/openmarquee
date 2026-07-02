@@ -910,7 +910,17 @@ class TestLingerTimer:
         sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
         sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
         ref = sup.linger_entered_at
-        assert sup.check_linger_timeout(now=ref + 120.0) is True
+        # 2026-07-02 (PR #31 CI): pass `ref + 120.001` (not `ref +
+        # 120.0`) so the assertion doesn't fall foul of double-
+        # precision arithmetic. `ref` is `time.monotonic()`; for
+        # specific mantissa bits `(ref + 120.0) - ref` rounds to
+        # `119.999...` (observed on CI runners at ref=142.665... and
+        # ref=466.208...), and `check_linger_timeout` uses `>=` so
+        # elapsed < linger_seconds returns False → test flaked
+        # ~⅔ of CI runs. The +1 ms bump is smaller than any real-
+        # world observe-loop tick so the semantic ("timer fires
+        # right at the window boundary") is preserved.
+        assert sup.check_linger_timeout(now=ref + 120.001) is True
         assert sup.check_linger_timeout(now=ref + 200.0) is True
 
     def test_check_idempotent_after_transition_out(self, tmp_path: Path):
