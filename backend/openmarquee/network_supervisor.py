@@ -175,6 +175,14 @@ def next_state(
     # in portal). In both regimes.
     if s == SupervisorState.CONNECTING and e == SupervisorEvent.STA_AUTH_FAILED:
         return SupervisorState.SETUP
+    # 2026-07-02 (audit 4b close-out): CONNECTING → SETUP when the
+    # target SSID isn't in the scan. Mirrors the STA_AUTH_FAILED
+    # edge — keep the portal up so the operator can pick a different
+    # network or unmask a hidden SSID. The SETUP card carries the
+    # classified variant (`not_found` vs `not_found_or_5ghz`) so
+    # the on-glass reason banner is specific.
+    if s == SupervisorState.CONNECTING and e == SupervisorEvent.STA_SSID_NOT_FOUND:
+        return SupervisorState.SETUP
     # LINGER → ONLINE when the grace timer expires.
     if s == SupervisorState.LINGER and e == SupervisorEvent.LINGER_TIMER_EXPIRED:
         return SupervisorState.ONLINE
@@ -1407,7 +1415,21 @@ class NetworkSupervisor:
         when fields are absent.
         """
         if new == SupervisorState.SETUP:
-            return {"kind": "SETUP"}
+            # 2026-07-02 (audit 4b close-out): thread the classified
+            # variant onto the SETUP card too. The state machine
+            # routes CONNECTING → SETUP on STA_AUTH_FAILED or
+            # STA_SSID_NOT_FOUND, so the SETUP card is where the
+            # operator lands after a first-connect failure — the
+            # renderer picks up `variant` + `target_ssid` and
+            # paints a reason banner on the on-glass card. When no
+            # variant is set (fresh boot, no prior failure), the
+            # card renders as it did before (no banner).
+            params: dict = {"kind": "SETUP"}
+            if self._last_degraded_variant is not None:
+                params["variant"] = self._last_degraded_variant
+                if self._last_sta_ssid is not None:
+                    params["target_ssid"] = self._last_sta_ssid
+            return params
         if new == SupervisorState.CONNECTING:
             return {
                 "kind": "CONNECTING",

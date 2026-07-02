@@ -90,6 +90,38 @@ class TestNextState:
                 == SupervisorState.SETUP
             )
 
+    def test_connecting_to_setup_on_ssid_not_found(self):
+        # 2026-07-02 (audit 4b close-out): CONNECTING → SETUP on
+        # STA_SSID_NOT_FOUND mirrors the STA_AUTH_FAILED edge — same
+        # "keep portal up, surface reason on card" story. Same in
+        # both regimes.
+        for mutex in (False, True):
+            assert (
+                next_state(
+                    SupervisorState.CONNECTING,
+                    SupervisorEvent.STA_SSID_NOT_FOUND,
+                    fallback_mutex=mutex,
+                )
+                == SupervisorState.SETUP
+            )
+
+    def test_scan_failed_stays_diagnostic_only(self):
+        # STA_SCAN_FAILED does NOT get a transition — wpa_supplicant
+        # retries scans automatically; the failure carries no signal
+        # about the target SSID's band, so the operator card doesn't
+        # need to change. The event is surfaced via the diagnostics
+        # ring buffer instead. Assert every state × STA_SCAN_FAILED
+        # returns None so a future drive-by author has to make an
+        # explicit decision before adding an edge.
+        for s in (
+            SupervisorState.SETUP,
+            SupervisorState.CONNECTING,
+            SupervisorState.LINGER,
+            SupervisorState.ONLINE,
+            SupervisorState.DEGRADED,
+        ):
+            assert next_state(s, SupervisorEvent.STA_SCAN_FAILED) is None
+
     def test_linger_timer_expired_to_online(self):
         assert (
             next_state(SupervisorState.LINGER, SupervisorEvent.LINGER_TIMER_EXPIRED)
@@ -1229,6 +1261,75 @@ class TestSystemCardOnTransition:
         sup.record_scan_bands({"A": "2.4", "B": "5"})
         sup.record_scan_bands({"C": "2.4"})
         assert sup._last_scan_bands == {"C": "2.4"}
+
+    def test_ssid_not_found_from_connecting_transitions_to_setup(
+        self,
+        tmp_path: Path,
+    ):
+        """2026-07-02 (audit 4b close-out): the STA_SSID_NOT_FOUND
+        event during CONNECTING must transition to SETUP so the
+        portal stays up + the on-glass card renders the classified
+        reason (target SSID name + band signal). Without this edge
+        the variant is recorded but never rendered — the failure
+        was the reason for the whole audit.
+        """
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+        assert sup.current_state == SupervisorState.CONNECTING
+        sup._last_sta_ssid = "MyHomeWifi"
+        sup.record_scan_bands({"MyHomeWifi": "5"})
+        sup.apply_event(SupervisorEvent.STA_SSID_NOT_FOUND)
+        assert sup.current_state == SupervisorState.SETUP
+        # SETUP card was rendered with the 5 GHz variant + SSID so
+        # the on-glass reason banner is specific.
+        last = pub.render_calls[-1]
+        assert last.get("kind") == "SETUP"
+        assert last.get("variant") == "not_found_or_5ghz"
+        assert last.get("target_ssid") == "MyHomeWifi"
+
+    def test_auth_fail_from_connecting_threads_variant_onto_setup_card(
+        self,
+        tmp_path: Path,
+    ):
+        """The pre-close-out path (STA_AUTH_FAILED → SETUP) also
+        picks up the SETUP card's new variant threading so the
+        on-glass card explains the password-rejected case, not just
+        the "Set up your marquee" default headline.
+        """
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+        sup._last_sta_ssid = "MyHomeWifi"
+        sup.apply_event(SupervisorEvent.STA_AUTH_FAILED)  # → SETUP
+        assert sup.current_state == SupervisorState.SETUP
+        last = pub.render_calls[-1]
+        assert last.get("kind") == "SETUP"
+        assert last.get("variant") == "auth_fail"
+        assert last.get("target_ssid") == "MyHomeWifi"
+
+    def test_fresh_setup_card_omits_variant_when_no_prior_failure(
+        self,
+        tmp_path: Path,
+    ):
+        """Fresh boot / no prior failure: the SETUP card renders
+        without a variant so the renderer's default layout (no
+        reason banner) shows. Guards against a regression where a
+        stale variant leaks into an initial SETUP render.
+        """
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        # Force a SETUP render via the operator-requested path from a
+        # state that lacks any prior failure classification.
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER, clears
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+        sup.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
+        last = pub.render_calls[-1]
+        assert last.get("kind") == "SETUP"
+        assert "variant" not in last, (
+            "SETUP card must NOT carry a stale variant when _last_degraded_variant is None"
+        )
 
     def test_operator_setup_mode_from_online_renders_setup_card(self, tmp_path: Path):
         """Operator-driven ONLINE→SETUP (Setup Mode re-entry) must

@@ -141,6 +141,15 @@ async def scan_wifi() -> WifiScanResult:
       2. `airport -s` (macOS — the legacy path; Apple deprecated from
          14.4 onwards and returns empty unless run as root).
       3. None / "none" source — UI falls back to manual SSID entry.
+
+    2026-07-02 (audit 4b close-out): on the `iw` path we also feed the
+    per-SSID band table into the NetworkSupervisor's
+    `record_scan_bands()` so a subsequent STA_SSID_NOT_FOUND event
+    classifies as `not_found_or_5ghz` when the target SSID was only
+    visible on 5 GHz. The macOS `airport` path stays scan-only —
+    airport doesn't expose per-BSS frequency in a stable column, so
+    the WifiNetwork.band field is None and the classifier stays at
+    its default `"not_found"`.
     """
     # Linux / Pi path.
     if shutil.which("iw"):
@@ -157,6 +166,7 @@ async def scan_wifi() -> WifiScanResult:
             )
             networks = _parse_iw_scan(out.stdout)
             if networks or out.returncode == 0:
+                _feed_scan_bands_to_supervisor(networks)
                 return WifiScanResult(networks=networks, source="iw")
         except Exception:
             log.exception("iw scan failed")
@@ -182,6 +192,37 @@ async def scan_wifi() -> WifiScanResult:
             log.exception("airport scan failed")
 
     return WifiScanResult(networks=[], source="none")
+
+
+def _feed_scan_bands_to_supervisor(networks: list[WifiNetwork]) -> None:
+    """2026-07-02 (audit 4b close-out): push per-SSID band data into
+    the process-wide NetworkSupervisor's classifier so a subsequent
+    STA_SSID_NOT_FOUND event picks up the `not_found_or_5ghz`
+    variant when appropriate.
+
+    Import + fetch inline (not via FastAPI Depends) so this stays a
+    fire-and-forget side effect: if the singleton isn't wired
+    (early boot, mid-test, dev host without the supervisor
+    initialized) the call is a silent no-op — the /api/system/
+    wifi-scan endpoint's primary contract is the JSON response, not
+    the classifier update.
+
+    Only SSIDs with a `band` classification participate; SSIDs
+    with `band is None` (no `freq:` line matched) are dropped so
+    they don't clobber a previously-recorded band with an
+    unknowable value.
+    """
+    bands: dict[str, str] = {n.ssid: n.band for n in networks if n.band is not None}
+    try:
+        from openmarquee.dependencies import get_network_supervisor
+
+        supervisor = get_network_supervisor()
+    except Exception:
+        return
+    try:
+        supervisor.record_scan_bands(bands)
+    except Exception:
+        log.exception("failed to feed wifi-scan band table to supervisor")
 
 
 # --- parsers ---
