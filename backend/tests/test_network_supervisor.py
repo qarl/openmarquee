@@ -38,6 +38,7 @@ from openmarquee.network_supervisor import (
     SupervisorConfig,
     SupervisorEvent,
     SupervisorState,
+    _split_nmcli_terse_row,
     decide_channel_follow,
     freq_to_channel,
     hysteresis_allows_switch,
@@ -1392,3 +1393,133 @@ class TestSystemCardOnTransition:
             and "would render kind=CONNECTING" in e.message
         ]
         assert infos, "expected a would-render info diagnostic"
+
+
+# ============================================================
+# Pre-staged wifi detection (2026-07-02, Jason handover)
+# ============================================================
+
+
+class TestSplitNmcliTerseRow:
+    """`_split_nmcli_terse_row` handles nmcli's `\\:` escaping so an
+    SSID like `Home:Router` round-trips as one column instead of
+    fragmenting into two."""
+
+    def test_plain_row_splits_on_unescaped_colons(self):
+        parts = _split_nmcli_terse_row("wlan0:wifi:connected:HomeWifi")
+        assert parts == ["wlan0", "wifi", "connected", "HomeWifi"]
+
+    def test_empty_trailing_column_is_kept(self):
+        # Disconnected devices report empty CONNECTION column.
+        parts = _split_nmcli_terse_row("wlan0:wifi:disconnected:")
+        assert parts == ["wlan0", "wifi", "disconnected", ""]
+
+    def test_escaped_colon_survives_in_ssid_column(self):
+        parts = _split_nmcli_terse_row(r"wlan0:wifi:connected:Home\:Router")
+        assert parts == ["wlan0", "wifi", "connected", "Home:Router"]
+
+
+class TestProbeAndSeedFromExistingConnection:
+    def _make(self, tmp_path):
+        config = SupervisorConfig(state_file=tmp_path / "network-state.json")
+        return NetworkSupervisor(config=config)
+
+    def test_seeds_online_when_probe_returns_ssid(self, tmp_path: Path):
+        """qarl 2026-07-02: pre-staged devices must NOT paint a dead
+        SETUP card. A probe that returns an SSID means wlan0 is
+        already associated → seed the state machine straight to
+        ONLINE bypassing the onboarding chain.
+        """
+        sup = self._make(tmp_path)
+        assert sup.current_state == SupervisorState.SETUP
+        seeded = sup.probe_and_seed_from_existing_connection(probe_fn=lambda: "MyHomeWifi")
+        assert seeded is True
+        assert sup.current_state == SupervisorState.ONLINE
+        # Target SSID is recorded so any future re-classification
+        # (auth_fail / not_found_or_5ghz) knows what network the
+        # sign was on.
+        assert sup._last_sta_ssid == "MyHomeWifi"
+
+    def test_no_seed_when_probe_returns_none(self, tmp_path: Path):
+        """Fresh device, no pre-existing wifi, no nmcli / probe returns
+        None. Supervisor must stay in SETUP so the onboarding UI
+        can guide the operator through the portal."""
+        sup = self._make(tmp_path)
+        seeded = sup.probe_and_seed_from_existing_connection(probe_fn=lambda: None)
+        assert seeded is False
+        assert sup.current_state == SupervisorState.SETUP
+
+    def test_no_seed_when_probe_returns_empty_string(self, tmp_path: Path):
+        """Defensive: an empty SSID string is treated the same as
+        None. Guards against nmcli output where the CONNECTION column
+        is truthy-empty (should never happen given the probe's
+        `and connection` filter, but hardens the seed call site)."""
+        sup = self._make(tmp_path)
+        seeded = sup.probe_and_seed_from_existing_connection(probe_fn=lambda: "")
+        assert seeded is False
+        assert sup.current_state == SupervisorState.SETUP
+
+    def test_no_seed_when_already_past_setup(self, tmp_path: Path):
+        """Idempotent: if a prior boot's persisted state already lands
+        the supervisor at ONLINE (or CONNECTING / LINGER / DEGRADED),
+        re-firing the probe MUST be a no-op — we don't want to
+        re-synthesize the credential-arrival chain and duplicate
+        transition-effect hooks."""
+        state_file = tmp_path / "network-state.json"
+        save_persisted_state(
+            PersistedState(state=SupervisorState.ONLINE),
+            path=state_file,
+        )
+        config = SupervisorConfig(state_file=state_file)
+        sup = NetworkSupervisor(config=config)
+        assert sup.current_state == SupervisorState.ONLINE
+        seeded = sup.probe_and_seed_from_existing_connection(
+            probe_fn=lambda: "MyHomeWifi"  # would seed if state were SETUP
+        )
+        assert seeded is False
+        assert sup.current_state == SupervisorState.ONLINE
+
+    def test_seed_fires_transition_effect_hooks(self, tmp_path: Path):
+        """The seeded ONLINE transition must fire the same AP-teardown
+        and system-card-clear hooks the onboarding path fires.
+        Otherwise the AP stays up + the SETUP card stays painted =
+        the exact bug the seed is meant to fix."""
+
+        class _RecordingPublisher:
+            def __init__(self):
+                self.render_calls: list[dict] = []
+                self.clear_calls = 0
+
+            def render(self, params: dict) -> None:
+                self.render_calls.append(dict(params))
+
+            def clear(self) -> None:
+                self.clear_calls += 1
+
+        pub = _RecordingPublisher()
+        config = SupervisorConfig(state_file=tmp_path / "network-state.json")
+        sup = NetworkSupervisor(config=config, system_card_publisher=pub)
+        sup.probe_and_seed_from_existing_connection(probe_fn=lambda: "HomeWifi")
+        # ONLINE was reached → the publisher was cleared at least
+        # once. The system-card clear runs on every transition INTO
+        # ONLINE, including the LINGER → ONLINE short-circuit inside
+        # the seed path.
+        assert pub.clear_calls >= 1
+        assert sup.current_state == SupervisorState.ONLINE
+
+    def test_probe_exception_is_swallowed(self, tmp_path: Path):
+        """A probe that raises (nmcli surprise output, socket error,
+        anything) must NOT wedge supervisor construction — the seed
+        is an optimization, not a load-bearing path. Log + move on
+        so the device still boots (into SETUP, matching the pre-
+        this-commit behavior).
+        """
+        sup = self._make(tmp_path)
+
+        def _boom() -> str | None:
+            raise RuntimeError("simulated nmcli surprise")
+
+        # Must not raise.
+        seeded = sup.probe_and_seed_from_existing_connection(probe_fn=_boom)
+        assert seeded is False
+        assert sup.current_state == SupervisorState.SETUP

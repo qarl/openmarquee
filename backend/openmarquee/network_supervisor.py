@@ -43,7 +43,9 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import socket
+import subprocess
 import tempfile
 import time
 from collections import deque
@@ -671,6 +673,94 @@ def parse_wpa_event(raw: str) -> tuple[SupervisorEvent | None, dict]:
 
 
 # ============================================================
+# Pre-staged wifi detection (Jason-handover, 2026-07-02)
+# ============================================================
+
+
+def _probe_existing_wifi_connection(*, timeout_s: float = 5.0) -> str | None:
+    """Return the SSID of an already-active wlan0 wifi connection, or
+    None if not connected / not detectable.
+
+    2026-07-02 (Jason handover, qarl handover-critical): the supervisor
+    persisted a SETUP boot state on devices whose wifi was staged via
+    nmcli (i.e. a pre-existing NM profile before onboarding shipped)
+    — SETUP mode painted a dead PIN/QR card because take-over is off
+    so no AP was actually up, and the device just sat there wedged.
+    This helper answers the "am I already online?" question so
+    `NetworkSupervisor.probe_and_seed_from_existing_connection` can
+    skip the onboarding chain entirely and go straight to ONLINE.
+
+    Uses nmcli's terse output — stable-column contract:
+      wlan0:wifi:connected:MyHomeWifi
+      wlan0:wifi:disconnected:
+      wlan0:wifi:unavailable:
+
+    Fails soft: no nmcli binary, non-zero return, timeout, missing
+    columns → returns None. Callers must not rely on this returning
+    a value for correctness — it's an optimization to skip
+    onboarding when wifi is already up.
+
+    `timeout_s` bounds the subprocess so a wedged nmcli can't stall
+    supervisor construction indefinitely.
+    """
+    if not shutil.which("nmcli"):
+        return None
+    try:
+        result = subprocess.run(
+            ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        parts = _split_nmcli_terse_row(line)
+        if len(parts) < 4:
+            continue
+        device, dev_type, state, connection = parts[0], parts[1], parts[2], parts[3]
+        # DEVICE is stable "wlan0" on Pi OS; TYPE stays "wifi"; STATE
+        # is "connected" only when NM has an IP + carrier. An empty
+        # CONNECTION column means no active profile (e.g. hotspot AP
+        # would show as its own connection name — filtered by the
+        # SSID probe below, but nmcli only exposes an AP profile as
+        # DEVICE=wlan0 if the operator ran ap-mode, which we ignore
+        # by requiring a real CONNECTION name here anyway).
+        if device == "wlan0" and dev_type == "wifi" and state == "connected" and connection:
+            return connection
+    return None
+
+
+def _split_nmcli_terse_row(line: str) -> list[str]:
+    """Split nmcli --terse output on unescaped ':'. nmcli escapes
+    embedded colons with '\\:' — an SSID like `Home:Router` shows
+    up as `wlan0:wifi:connected:Home\\:Router`. Reversing that
+    escape here means the returned CONNECTION column is the actual
+    SSID even for edge-case names."""
+    parts: list[str] = []
+    buf: list[str] = []
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line) and line[i + 1] == ":":
+            buf.append(":")
+            i += 2
+            continue
+        if ch == ":":
+            parts.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+# ============================================================
 # The Supervisor (orchestrator)
 # ============================================================
 
@@ -1115,6 +1205,80 @@ class NetworkSupervisor:
         network on a first-time setup.
         """
         self._last_sta_ssid = ssid
+
+    def probe_and_seed_from_existing_connection(
+        self,
+        probe_fn: Callable[[], str | None] | None = None,
+    ) -> bool:
+        """2026-07-02 (Jason handover, qarl handover-critical): if
+        wlan0 is already associated to a real home wifi at supervisor
+        startup (pre-staged via nmcli / an existing NM profile
+        BEFORE onboarding shipped, NOT through the portal submit
+        flow), seed the state machine to ONLINE directly.
+
+        Without this, a pre-staged device boots to SETUP, paints a
+        dead PIN/QR card (take-over is off so no AP is up), and
+        never advances — because the supervisor only tracks wifi
+        arrived through its own onboarding submit event chain.
+        qarl 2026-07-02: 'treat "wlan0 already connected to a home
+        network" as "online, no onboarding needed," regardless of
+        whether that connection came from onboarding or was pre-
+        configured.'
+
+        Idempotent + safe to re-fire: only seeds when the current
+        state is SETUP + the probe returns an SSID. If already
+        past SETUP (persisted ONLINE from a previous boot,
+        supervisor is mid-CONNECTING, etc.) this is a no-op.
+        Every boot re-runs the probe so a pre-staged connection
+        that came up AFTER a prior boot's SETUP state also
+        transitions correctly.
+
+        The probe fires the SAME event chain as the onboarding
+        portal (HAS_STORED_CREDENTIALS → CONNECTING → STA_
+        ASSOCIATED → LINGER/ONLINE) so every transition-effect
+        hook (AP teardown on ONLINE, system-card clear, etc.)
+        runs as normal. LINGER is short-circuited to ONLINE
+        immediately (no 2-minute grace window is needed for a
+        connection that was already established before boot).
+
+        `probe_fn` is injectable so tests exercise the seed path
+        without shelling out to nmcli. Defaults to the module-
+        level `_probe_existing_wifi_connection` helper.
+
+        Returns True iff a seed happened, else False.
+        """
+        if self._state != SupervisorState.SETUP:
+            return False
+        probe = probe_fn or _probe_existing_wifi_connection
+        try:
+            ssid = probe()
+        except Exception:
+            log.exception("pre-staged wifi probe raised")
+            return False
+        if not ssid:
+            return False
+        self._emit(
+            "state_machine",
+            "info",
+            f"pre-staged wifi detected: wlan0 already on ssid={ssid!r}; "
+            "seeding SETUP -> ONLINE without onboarding submit "
+            "(qarl 2026-07-02 handover-critical: skip dead SETUP card "
+            "when wifi is already up)",
+        )
+        self.record_target_ssid(ssid)
+        # Synthesize the credential + association chain so every
+        # transition-effect hook (AP teardown on ONLINE, system-card
+        # clear, etc.) fires exactly as if the operator had come
+        # through the portal.
+        self.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        self.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        # Concurrent regime (default) lands in LINGER; short-circuit
+        # to ONLINE — the 2-min grace window is meant to hold the
+        # portal open long enough for the phone to see the confirmation
+        # page, and a pre-staged device has no portal to hold.
+        if self._state == SupervisorState.LINGER:
+            self.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)
+        return True
 
     def apply_sta_freq(self, freq_mhz: int) -> ChannelFollowDecision:
         """Record the STA's current frequency + ask the channel-

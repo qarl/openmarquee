@@ -1005,11 +1005,24 @@ def _network_supervisor_singleton():
     # The supervisor's _on_transition catches HostapdLifecycle-
     # ActuationError and downgrades to a warn diagnostic, so this
     # is safe to install unconditionally.
-    return NetworkSupervisor(
+    supervisor = NetworkSupervisor(
         config=config,
         power_save_actuator=WifiPowerSaveActuator(),
         ap_lifecycle_actuator=HostapdLifecycleActuator(),
     )
+    # 2026-07-02 (Jason handover, qarl handover-critical): if wlan0
+    # is already associated to a real home wifi (pre-staged via
+    # nmcli / an existing NM profile before onboarding shipped), seed
+    # the state directly to ONLINE instead of painting a dead SETUP
+    # PIN/QR card. Idempotent + safe when there's nothing to detect
+    # (silent no-op on dev hosts without nmcli, on devices that
+    # aren't pre-staged, and on subsequent supervisor accesses since
+    # `probe_and_seed_from_existing_connection` gates on state ==
+    # SETUP). Called AFTER construction so the persisted-state load
+    # in __init__ has already run — a device that's on-boarded via
+    # the portal previously boots straight to its persisted ONLINE.
+    supervisor.probe_and_seed_from_existing_connection()
+    return supervisor
 
 
 def get_network_supervisor():
