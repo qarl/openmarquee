@@ -59,6 +59,10 @@ from openmarquee.content import (
     VideoSlide,
     WebSlide,
 )
+from openmarquee.content.poster import (
+    PosterRegenerationError,
+    regenerate_video_poster_png,
+)
 
 # Bump when the on-disk envelope format changes in a non-backward-compatible
 # way. load() will refuse to read older versions until a migration is written.
@@ -412,7 +416,26 @@ class ContentStorage:
         `updated_at` semantics match save() — defaults to now() for local
         edits, accepts an explicit value so peer-ingest preserves the
         originating stamp.
+
+        2026-07-03 (Jason handover, qarl handover-critical): server-
+        side poster regeneration. The client-supplied thumbnail is
+        used as the FALLBACK; the first frame of `video_bytes` is
+        extracted via ffmpeg and stored as asset.png so the poster
+        stays in lock-step with the video across re-encodes, 720p
+        clamps, and any other path that touches the mp4 but not
+        the client-side canvas capture. On dev hosts without
+        ffmpeg the fallback path preserves pre-fix behavior. See
+        `content.poster.regenerate_video_poster_png` for the
+        design notes.
         """
+        try:
+            poster_png = regenerate_video_poster_png(video_bytes, fallback_png=thumbnail_png)
+        except PosterRegenerationError:
+            # `fallback_png` was provided (thumbnail_png), so
+            # `regenerate_video_poster_png` returns bytes instead of
+            # raising — this branch is defensive for a future
+            # signature change and should be unreachable today.
+            poster_png = thumbnail_png
         # Round-29: lock-protect the THREE-file write trio (envelope
         # via save(), thumbnail via save(), video bytes via the
         # _atomic_write_bytes here). RLock allows save()'s inner
@@ -425,7 +448,7 @@ class ContentStorage:
             item_dir = self.root / str(video.id)
             preexisting = item_dir.exists()
             try:
-                self.save(video, thumbnail_png, updated_at=updated_at)
+                self.save(video, poster_png, updated_at=updated_at)
                 self._atomic_write_bytes(item_dir / _VIDEO_FILENAME, video_bytes)
             except Exception:
                 # Only rm if this save created the dir — don't blow away another

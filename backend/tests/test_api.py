@@ -1038,6 +1038,65 @@ def test_delete_video_removes_mp4(client: TestClient, storage: ContentStorage):
     assert not storage.video_path(item_id).exists()
 
 
+# --- POST /api/content/videos/{id}/regenerate-poster (2026-07-03) ---
+
+
+def test_regenerate_poster_overwrites_asset_png_from_mp4(
+    client: TestClient, storage: ContentStorage, monkeypatch
+):
+    """qarl 2026-07-03 (Jason handover): the on-demand regeneration
+    endpoint reads the stored mp4 + overwrites asset.png with the
+    fresh first-frame extraction. Legacy content uploaded before
+    the auto-regen shipped is fixed via this path."""
+    post = client.post("/api/content/videos", json=_video_payload())
+    item_id = UUID(post.json()["id"])
+    # Stamp a known-stale poster on disk so we can prove the
+    # endpoint replaced it.
+    storage.asset_path(item_id).write_bytes(b"\x89PNG_STALE")
+    # Monkey-patch the poster helper so this test doesn't require
+    # a real ffmpeg on the runner.
+    monkeypatch.setattr(
+        "openmarquee.api.regenerate_video_poster_png",
+        lambda mp4_bytes: b"\x89PNG_regenerated_from_ffmpeg",
+    )
+    response = client.post(f"/api/content/videos/{item_id}/regenerate-poster")
+    assert response.status_code == 200
+    assert response.json() == {"regenerated": True, "id": str(item_id)}
+    assert storage.read_asset(item_id) == b"\x89PNG_regenerated_from_ffmpeg"
+
+
+def test_regenerate_poster_404_for_unknown_id(client: TestClient):
+    response = client.post(f"/api/content/videos/{uuid4()}/regenerate-poster")
+    assert response.status_code == 404
+
+
+def test_regenerate_poster_409_when_item_is_not_a_video(client: TestClient, monkeypatch):
+    """The endpoint is video-specific; a text/image slide id must 409
+    rather than 500 through the poster helper on non-mp4 bytes."""
+    text_post = client.post("/api/content/text-slides", json=_upload_payload())
+    text_id = text_post.json()["id"]
+    response = client.post(f"/api/content/videos/{text_id}/regenerate-poster")
+    assert response.status_code == 409
+
+
+def test_regenerate_poster_500_when_ffmpeg_fails_no_fallback(client: TestClient, monkeypatch):
+    """The endpoint has no client-side thumbnail to fall back to,
+    so a ffmpeg failure must surface to the operator as 500 (not
+    silently no-op with a stale poster)."""
+    post = client.post("/api/content/videos", json=_video_payload())
+    item_id = post.json()["id"]
+
+    from openmarquee.content.poster import PosterRegenerationError
+
+    def _boom(_mp4_bytes):
+        raise PosterRegenerationError("ffmpeg binary not found on PATH")
+
+    monkeypatch.setattr("openmarquee.api.regenerate_video_poster_png", _boom)
+    response = client.post(f"/api/content/videos/{item_id}/regenerate-poster")
+    assert response.status_code == 500
+    assert "ffmpeg" in response.json()["detail"].lower()
+
+
 def test_put_image_metadata_only_keeps_existing_bytes(client: TestClient, storage: ContentStorage):
     """Image PUT with image_base64=null preserves the stored bytes —
     operator renaming a slide shouldn't force a re-upload."""

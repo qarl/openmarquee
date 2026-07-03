@@ -33,6 +33,10 @@ from openmarquee.content import (
     WebSlide,
     validate_web_url,
 )
+from openmarquee.content.poster import (
+    PosterRegenerationError,
+    regenerate_video_poster_png,
+)
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
     get_content_storage,
@@ -1126,6 +1130,72 @@ async def get_video(item_id: UUID, storage: StorageDep) -> FileResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"no video for {item_id}")
     return FileResponse(path, media_type="video/mp4")
+
+
+@router.post(
+    "/videos/{item_id}/regenerate-poster",
+    status_code=200,
+    responses={
+        200: {"description": "Poster regenerated from the video's first frame."},
+        404: {"description": "No video for that id."},
+        409: {"description": "Item exists but isn't a video."},
+        500: {"description": "ffmpeg failed AND no fallback poster available."},
+    },
+)
+async def regenerate_video_poster(
+    item_id: UUID,
+    storage: StorageDep,
+    flock_sync: FlockSyncDep,
+    background: BackgroundTasks,
+) -> dict:
+    """2026-07-03 (Jason handover, qarl handover-critical): on-demand
+    poster regeneration for a video slide. Reads asset.mp4, extracts
+    the first frame via ffmpeg, overwrites asset.png.
+
+    Complements the automatic regen in `ContentStorage.save_video`
+    (which fires on every write of asset.mp4) for the cases where
+    the mp4 didn't change but the poster is stale — e.g. legacy
+    slides uploaded before this fix shipped, or a manual dashboard
+    "refresh thumbnail" affordance.
+
+    500 semantics: the client-side thumbnail isn't available here
+    (we're not re-uploading), so ffmpeg failure has no fallback
+    and must surface to the operator. dev hosts without ffmpeg
+    get a 500 with a clear message ("ffmpeg binary not found...").
+    """
+    try:
+        existing = storage.load(item_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"no video {item_id}") from exc
+    if existing.type != "video":
+        raise HTTPException(
+            status_code=409,
+            detail=f"{item_id} is a {existing.type}, not a video",
+        )
+    video_path = storage.video_path(item_id)
+    if not video_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=f"no video bytes for {item_id} (envelope exists but asset.mp4 missing)",
+        )
+    try:
+        mp4_bytes = video_path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"failed to read video bytes for {item_id}: {exc!r}",
+        ) from exc
+    try:
+        poster_png = regenerate_video_poster_png(mp4_bytes)
+    except PosterRegenerationError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    # Round-trip through save_video would re-run poster regen (fine)
+    # AND re-write asset.mp4 (wasteful). Just re-save the envelope +
+    # overwrite asset.png; storage.save() bumps updated_at so the
+    # `?v=<updated_at>` cache-bust invalidates stale UI tiles.
+    storage.save(existing, poster_png)
+    background.add_task(flock_sync.notify_peers, existing.id, "updated")
+    return {"regenerated": True, "id": str(item_id)}
 
 
 @router.delete("/{item_id}", status_code=204)
