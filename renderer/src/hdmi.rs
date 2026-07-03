@@ -6478,7 +6478,7 @@ pub fn paint_and_present_one_transition_frame(
         // allocate-and-delete codepath unchanged so QA can A/B at
         // deploy time.
         let program_cache_enabled = crate::v4l2::is_transition_program_cache_enabled();
-        let (program, a_pos, a_uv, u_src_a, u_src_b, u_t, u_aspect) = if program_cache_enabled {
+        let (program, a_pos, a_uv, u_src_a, u_src_b, u_t, u_aspect, u_resolution) = if program_cache_enabled {
             let cached = match cached_legacy_transition_program(session.gl, fs) {
                 Ok(c) => c,
                 Err(e) => {
@@ -6494,6 +6494,7 @@ pub fn paint_and_present_one_transition_frame(
                 cached.u_src_b,
                 cached.u_t,
                 cached.u_aspect,
+                cached.u_resolution,
             )
         } else {
             // Legacy per-tick path (kill-switch fallback). Mirrors
@@ -6525,7 +6526,8 @@ pub fn paint_and_present_one_transition_frame(
             let u_src_b = session.gl.get_uniform_location(program, "u_src_b");
             let u_t = session.gl.get_uniform_location(program, "u_t");
             let u_aspect = session.gl.get_uniform_location(program, "u_aspect");
-            (program, a_pos, a_uv, u_src_a, u_src_b, u_t, u_aspect)
+            let u_resolution = session.gl.get_uniform_location(program, "u_resolution");
+            (program, a_pos, a_uv, u_src_a, u_src_b, u_t, u_aspect, u_resolution)
         };
         // r102.3: VBO from per-session cache when enabled (single
         // 64-byte fullscreen-quad buffer reused across every
@@ -6633,6 +6635,15 @@ pub fn paint_and_present_one_transition_frame(
         session.gl.uniform_1_f32(
             u_aspect.as_ref(),
             (mode_w_u32 as f32) / (mode_h_u32 as f32),
+        );
+        // 2026-07-03 (Jason device): u_resolution for FS_PIXELATE's
+        // fixed-size mosaic block. No-op on shaders that don't
+        // declare it. Same LOGICAL dims as u_aspect (session.mode_w
+        // / session.mode_h are already swapped for 90/270 rotation).
+        session.gl.uniform_2_f32(
+            u_resolution.as_ref(),
+            mode_w_u32 as f32,
+            mode_h_u32 as f32,
         );
         session.gl.enable_vertex_attrib_array(a_pos);
         session.gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, 16, 0);
@@ -7162,6 +7173,13 @@ pub fn capture_sb_transition_mid_to_png(
                 ccp.u_aspect.as_ref(),
                 (mode_w as f32) / (mode_h as f32),
             );
+            // 2026-07-03: u_resolution for FS_PIXELATE's fixed-size
+            // mosaic. Same LOGICAL dims as u_aspect.
+            gl.uniform_2_f32(
+                ccp.u_resolution.as_ref(),
+                mode_w as f32,
+                mode_h as f32,
+            );
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             let stride = (4 * std::mem::size_of::<f32>()) as i32;
             gl.enable_vertex_attrib_array(ccp.a_pos);
@@ -7355,6 +7373,8 @@ fn capture_legacy_3pass_transition_mid_to_png(
             // r96: u_aspect for the iris arm. None for shaders that
             // don't declare it (silent no-op bind).
             let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+            // 2026-07-03: u_resolution for pixelate arm.
+            let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
 
             // Textured-quad VBO with full-screen NDC + identity UV.
             // Same vertex layout as VS_TEXTURED_QUAD callers across
@@ -7391,6 +7411,11 @@ fn capture_legacy_3pass_transition_mid_to_png(
                 gl.uniform_1_f32(
                     u_aspect.as_ref(),
                     (mode_w as f32) / (mode_h as f32),
+                );
+                gl.uniform_2_f32(
+                    u_resolution.as_ref(),
+                    mode_w as f32,
+                    mode_h as f32,
                 );
 
                 let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -7617,6 +7642,12 @@ pub fn capture_fullres_transition_mid_to_png(
                 gl.uniform_1_f32(
                     ccp.u_aspect.as_ref(),
                     (mode_w as f32) / (mode_h as f32),
+                );
+                // 2026-07-03: u_resolution for pixelate arm.
+                gl.uniform_2_f32(
+                    ccp.u_resolution.as_ref(),
+                    mode_w as f32,
+                    mode_h as f32,
                 );
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -10746,12 +10777,18 @@ pub fn render_fade_composite(
             // test stays uniform. FS_FADE doesn't declare it; the
             // bind below is a no-op.
             let u_aspect = gl.get_uniform_location(program, "u_aspect");
+            let u_resolution = gl.get_uniform_location(program, "u_resolution");
             gl.uniform_1_i32(u_src_a.as_ref(), 0);
             gl.uniform_1_i32(u_src_b.as_ref(), 1);
             gl.uniform_1_f32(u_t.as_ref(), t);
             gl.uniform_1_f32(
                 u_aspect.as_ref(),
                 (mode_w as f32) / (mode_h as f32),
+            );
+            gl.uniform_2_f32(
+                u_resolution.as_ref(),
+                mode_w as f32,
+                mode_h as f32,
             );
 
             let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -11013,6 +11050,8 @@ fn render_transition_animated_in_session(
         // r96: u_aspect for the iris arm. None for shaders that
         // don't declare it (silent no-op bind).
         let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        // 2026-07-03: u_resolution for pixelate arm.
+        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
 
         // -- Per-frame loop. The loop body is wrapped in an IIFE so
         // the cleanup_static call below runs UNCONDITIONALLY even
@@ -11168,6 +11207,12 @@ fn render_transition_animated_in_session(
                 gl.uniform_1_f32(
                     u_aspect.as_ref(),
                     (mode_w_u32 as f32) / (mode_h_u32 as f32),
+                );
+                // 2026-07-03: u_resolution for pixelate arm.
+                gl.uniform_2_f32(
+                    u_resolution.as_ref(),
+                    mode_w_u32 as f32,
+                    mode_h_u32 as f32,
                 );
 
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
@@ -11545,6 +11590,7 @@ fn render_transition_single_pass_in_session(
         let a_uv = csp.a_uv;
         let u_t_loc = csp.u_t.clone();
         let u_aspect_loc = csp.u_aspect.clone();
+        let u_resolution_loc = csp.u_resolution.clone();
         let u_a_bg_loc = csp.u_a_bg.clone();
         let u_b_bg_loc = csp.u_b_bg.clone();
         let u_a_tex_locs = &csp.u_a_tex_locs;
@@ -11604,6 +11650,13 @@ fn render_transition_single_pass_in_session(
                     gl.uniform_1_f32(
                         u_aspect_loc.as_ref(),
                         (mode_w_u32 as f32) / (mode_h_u32 as f32),
+                    );
+                    // 2026-07-03: u_resolution for pixelate arm.
+                    // Same LOGICAL dims as u_aspect.
+                    gl.uniform_2_f32(
+                        u_resolution_loc.as_ref(),
+                        mode_w_u32 as f32,
+                        mode_h_u32 as f32,
                     );
                     gl.uniform_3_f32(
                         u_a_bg_loc.as_ref(),
@@ -12207,6 +12260,12 @@ fn render_transition_scissored_bake_in_session(
                     gl.uniform_1_f32(
                         active_ccp.u_aspect.as_ref(),
                         (mode_w_u32 as f32) / (mode_h_u32 as f32),
+                    );
+                    // 2026-07-03: u_resolution for pixelate arm.
+                    gl.uniform_2_f32(
+                        active_ccp.u_resolution.as_ref(),
+                        mode_w_u32 as f32,
+                        mode_h_u32 as f32,
                     );
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                     let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -13047,6 +13106,12 @@ pub(crate) struct CachedLegacyTransitionProgram {
     /// shaders don't declare it so this resolves to None for
     /// most kinds and the bind is a silent no-op.
     pub u_aspect: Option<glow::NativeUniformLocation>,
+    /// 2026-07-03 (Jason device): u_resolution = (width, height) in
+    /// device pixels. Bound alongside u_aspect on every draw site;
+    /// FS_PIXELATE uses it to convert its fixed 10 px block into
+    /// UV space. Resolves to None for shaders that don't declare
+    /// it (silent no-op bind).
+    pub u_resolution: Option<glow::NativeUniformLocation>,
 }
 
 std::thread_local! {
@@ -13088,6 +13153,7 @@ pub(crate) fn cached_legacy_transition_program(
         let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
         let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
         let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
         let entry = CachedLegacyTransitionProgram {
             program,
             a_pos,
@@ -13096,6 +13162,7 @@ pub(crate) fn cached_legacy_transition_program(
             u_src_b,
             u_t,
             u_aspect,
+            u_resolution,
         };
         cache.insert(key, entry);
         Ok(entry)
@@ -13133,6 +13200,11 @@ struct CachedSpProgram {
     /// displays. Other SP shaders declare the uniform but GLSL drops
     /// it as unused.
     u_aspect: Option<glow::NativeUniformLocation>,
+    /// 2026-07-03 (Jason device): u_resolution = (mode_w, mode_h).
+    /// FS_PIXELATE uses it to keep its mosaic at a fixed
+    /// device-pixel size across resolutions. Silent no-op on
+    /// arms that don't declare it.
+    u_resolution: Option<glow::NativeUniformLocation>,
     u_a_bg: Option<glow::NativeUniformLocation>,
     u_b_bg: Option<glow::NativeUniformLocation>,
     u_a_tex_locs: [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE],
@@ -13185,6 +13257,7 @@ fn cached_transition_sp_program(
         // declared in the header but dropped by the GLSL optimizer
         // when unused), and bind_uniform_1f tolerates None silently.
         let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
         let u_a_bg = unsafe { gl.get_uniform_location(program, "u_a_bg") };
         let u_b_bg = unsafe { gl.get_uniform_location(program, "u_b_bg") };
         let resolve_slots = |prefix: &str, n: usize| -> [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] {
@@ -13202,6 +13275,7 @@ fn cached_transition_sp_program(
             a_uv,
             u_t,
             u_aspect,
+            u_resolution,
             u_a_bg,
             u_b_bg,
             u_a_tex_locs: resolve_slots("u_a_tex", n_a),
@@ -14014,10 +14088,13 @@ fn prewarm_shader_programs(session: &EglSession) {
     // prewarm_sp_session at line 11998 handles that in the reel
     // path; sidecar IPC paint goes through this path instead and
     // relies on the SP cache being populated lazily on first use.
+    // 2026-07-03 (Jason device): `marquee` removed. The pre-warm
+    // list is iterated linearly; no downstream code indexes into it
+    // by ordinal, so the N → N-1 shrink is safe.
     const TRANSITION_KINDS: &[&str] = &[
         "cut", "fade", "wipe", "iris", "dissolve", "pixelate", "scanline",
         "halftone", "glitch", "slide", "push", "scroll", "blinds", "flip",
-        "marquee", "shutter",
+        "shutter",
     ];
     for kind in TRANSITION_KINDS {
         // Composite path: skip kinds the runtime intentionally avoids
@@ -14670,6 +14747,10 @@ struct CachedCompositeProgram {
     /// kinds whose FS doesn't declare u_aspect (silent no-op
     /// bind).
     u_aspect: Option<glow::NativeUniformLocation>,
+    /// 2026-07-03 (Jason device): u_resolution = (mode_w, mode_h).
+    /// Used by the pixelate arm to convert its fixed 10 px block
+    /// into UV. Silent no-op on other kinds.
+    u_resolution: Option<glow::NativeUniformLocation>,
     u_a_xform: Option<glow::NativeUniformLocation>,
     u_b_xform: Option<glow::NativeUniformLocation>,
 }
@@ -14707,6 +14788,7 @@ fn cached_composite_program(gl: &glow::Context, kind: &str) -> Result<CachedComp
         // transition shaders). None for kinds whose FS doesn't
         // declare it; gl.uniform_1_f32(None, _) is a no-op.
         let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
         let u_a_xform = unsafe { gl.get_uniform_location(program, "u_a_xform") };
         let u_b_xform = unsafe { gl.get_uniform_location(program, "u_b_xform") };
         let ccp = CachedCompositeProgram {
@@ -14717,6 +14799,7 @@ fn cached_composite_program(gl: &glow::Context, kind: &str) -> Result<CachedComp
             u_src_b,
             u_t,
             u_aspect,
+            u_resolution,
             u_a_xform,
             u_b_xform,
         };
@@ -14784,6 +14867,7 @@ fn cached_cut_composite_program(
         // r96: u_aspect kept for shape parity with cached_composite_program.
         // FS_CUT_A/FS_CUT_B don't declare u_aspect, so this resolves to None.
         let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
         let u_a_xform = unsafe { gl.get_uniform_location(program, "u_a_xform") };
         let u_b_xform = unsafe { gl.get_uniform_location(program, "u_b_xform") };
         let ccp = CachedCompositeProgram {
@@ -14794,6 +14878,7 @@ fn cached_cut_composite_program(
             u_src_b,
             u_t,
             u_aspect,
+            u_resolution,
             u_a_xform,
             u_b_xform,
         };
