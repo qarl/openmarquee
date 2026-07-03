@@ -171,6 +171,110 @@ case "$cmd" in
         [ $# -eq 1 ] || usage
         systemctl start hostapd.service
         ;;
+    # ---------------------------------------------------------
+    # 2026-07-03 (qarl handover Phase B1): privileged wifi
+    # networks + device-name propagation subcommands. The
+    # backend (User=openmarquee, NoNewPrivileges=true) cannot
+    # invoke nmcli / hostnamectl / tailscale / systemctl directly
+    # — those all fail-soft to no-ops. These subcommands are the
+    # sanctioned crossings.
+    # ---------------------------------------------------------
+    nm-connection-add-wifi)
+        # Payload (stdin): 5 lines in this exact order —
+        #   con_name\n
+        #   ssid\n
+        #   password\n   (empty line for no PSK)
+        #   autoconnect  (yes|no)\n
+        #   priority     (integer)\n
+        # nmcli's argv contract accepts each as a stable connection
+        # setting; ssid + password come via argv (never stdin) so
+        # nmcli's argument-quoting handles them without shell
+        # interpolation on our end.
+        [ $# -eq 1 ] || usage
+        IFS=$'\n' read -r con_name || true
+        IFS=$'\n' read -r ssid || true
+        IFS=$'\n' read -r password || true
+        IFS=$'\n' read -r autoconnect || true
+        IFS=$'\n' read -r priority || true
+        [ -n "$con_name" ] || { echo "missing con_name" >&2; exit 2; }
+        [ -n "$ssid" ] || { echo "missing ssid" >&2; exit 2; }
+        # Priority parsing check (defensive — the backend already
+        # clamps this via Pydantic, but this is a privilege
+        # boundary).
+        [[ "$priority" =~ ^-?[0-9]{1,3}$ ]] || {
+            echo "invalid priority" >&2; exit 2;
+        }
+        nmcli connection add type wifi con-name "$con_name" ssid "$ssid" \
+            connection.autoconnect "$autoconnect" \
+            connection.autoconnect-priority "$priority"
+        if [ -n "$password" ]; then
+            nmcli connection modify "$con_name" \
+                wifi-sec.key-mgmt wpa-psk \
+                wifi-sec.psk "$password"
+        fi
+        ;;
+    nm-connection-modify-wifi)
+        # Same payload shape as nm-connection-add-wifi.
+        # Skips the key-mgmt / psk update when password is empty
+        # (preserves WPA3-SAE profiles per QA LOW note).
+        [ $# -eq 1 ] || usage
+        IFS=$'\n' read -r con_name || true
+        IFS=$'\n' read -r ssid || true
+        IFS=$'\n' read -r password || true
+        IFS=$'\n' read -r autoconnect || true
+        IFS=$'\n' read -r priority || true
+        [ -n "$con_name" ] || { echo "missing con_name" >&2; exit 2; }
+        [ -n "$ssid" ] || { echo "missing ssid" >&2; exit 2; }
+        [[ "$priority" =~ ^-?[0-9]{1,3}$ ]] || {
+            echo "invalid priority" >&2; exit 2;
+        }
+        nmcli connection modify "$con_name" \
+            802-11-wireless.ssid "$ssid" \
+            connection.autoconnect "$autoconnect" \
+            connection.autoconnect-priority "$priority"
+        if [ -n "$password" ]; then
+            nmcli connection modify "$con_name" \
+                wifi-sec.key-mgmt wpa-psk \
+                wifi-sec.psk "$password"
+        fi
+        ;;
+    nm-connection-delete)
+        # Payload (stdin): one line, the connection name to delete.
+        # Ownership + activated-state checks live in the Python
+        # actuator BEFORE the send — this is a raw privilege
+        # crossing.
+        [ $# -eq 1 ] || usage
+        IFS=$'\n' read -r con_name || true
+        [ -n "$con_name" ] || { echo "missing con_name" >&2; exit 2; }
+        nmcli connection delete "$con_name"
+        ;;
+    hostnamectl-set-hostname)
+        # Payload (stdin): one line, the new hostname.
+        # The backend has already normalised to DNS-safe chars via
+        # the sign_name field validator; hostnamectl also refuses
+        # obvious garbage, but the pre-normalisation is what
+        # guarantees the four consumers agree.
+        [ $# -eq 1 ] || usage
+        IFS=$'\n' read -r name || true
+        [ -n "$name" ] || { echo "missing name" >&2; exit 2; }
+        hostnamectl set-hostname "$name"
+        ;;
+    tailscale-set-hostname)
+        # Payload (stdin): one line, the new tailnet hostname.
+        [ $# -eq 1 ] || usage
+        IFS=$'\n' read -r name || true
+        [ -n "$name" ] || { echo "missing name" >&2; exit 2; }
+        tailscale set --hostname "$name"
+        ;;
+    avahi-write-and-restart)
+        # Payload (stdin): full avahi-daemon.conf content. Written
+        # atomically at /etc/avahi/avahi-daemon.conf then
+        # systemctl restart avahi-daemon. Same shape as the
+        # existing hostapd-write-and-restart above.
+        [ $# -eq 1 ] || usage
+        install_from_stdin /etc/avahi/avahi-daemon.conf 0644
+        systemctl restart avahi-daemon
+        ;;
     wifi-powersave-off)
         # P1.3 (2026-06-27): re-fire the boot-oneshot power-save
         # logic on every STA reassociation. brcmfmac resets

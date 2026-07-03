@@ -152,6 +152,13 @@ def _redact_secrets(dump: dict[str, Any]) -> dict[str, Any]:
     Each SECRET_FIELDS key gets replaced with SECRET_SENTINEL when the
     stored value is truthy (non-empty + non-None), or None when unset.
     Caller mutates the dict in place and returns it.
+
+    2026-07-03 (qarl handover B1): also masks every
+    `wifi_networks[i].password` — the multi-network schema stores
+    PSK per entry, so a bare SECRET_FIELDS scan misses them. Each
+    entry's `password` becomes SECRET_SENTINEL when populated or
+    None when unset; the entry's other fields (ssid, autoconnect,
+    priority) round-trip verbatim so the UI can render them.
     """
     for key in SECRET_FIELDS:
         value = dump.get(key)
@@ -159,6 +166,13 @@ def _redact_secrets(dump: dict[str, Any]) -> dict[str, Any]:
             dump[key] = SECRET_SENTINEL
         else:
             dump[key] = None
+    for entry in dump.get("wifi_networks") or []:
+        if not isinstance(entry, dict):
+            continue  # defensive: model_dump always emits dicts
+        if entry.get("password"):
+            entry["password"] = SECRET_SENTINEL
+        else:
+            entry["password"] = None
     return dump
 
 
@@ -301,6 +315,25 @@ async def set_settings(
     for key in SECRET_FIELDS:
         if payload.get(key) == SECRET_SENTINEL:
             payload[key] = getattr(previous, key)
+    # 2026-07-03 (qarl handover B1): per-entry SECRET_SENTINEL swap
+    # for `wifi_networks[i].password`. The UI submits `<set>` for a
+    # network whose PSK the operator hasn't retyped (the response was
+    # already masked); we look up the previously-stored PSK by SSID
+    # so the round-trip stores the same value as before. A brand-new
+    # network entry (SSID not in `previous.wifi_networks`) sending
+    # `<set>` is invalid — that means the UI never had a real PSK to
+    # display; leave the sentinel in place and let Pydantic reject
+    # it with the "expected 8-63 printable ASCII" error.
+    incoming_networks = payload.get("wifi_networks")
+    if isinstance(incoming_networks, list):
+        prev_psk_by_ssid = {entry.ssid: entry.password for entry in previous.wifi_networks}
+        for entry in incoming_networks:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("password") == SECRET_SENTINEL:
+                stored = prev_psk_by_ssid.get(entry.get("ssid"))
+                if stored is not None:
+                    entry["password"] = stored
     try:
         validated = SystemSettings.model_validate(payload)
     except Exception as exc:
@@ -376,6 +409,26 @@ async def set_settings(
             ssid=validated.wifi_station_ssid,
             password=validated.wifi_station_password,
         )
+    # 2026-07-03 (qarl handover B1): wifi_networks change → run
+    # the nmcli reconcile in a background thread. Compare the
+    # normalised model dumps so a re-save that didn't actually touch
+    # any network doesn't trigger a redundant reconcile.
+    if [n.model_dump() for n in previous.wifi_networks] != [
+        n.model_dump() for n in validated.wifi_networks
+    ]:
+        from openmarquee import wifi_networks_actuator
+
+        wifi_networks_actuator.apply_in_background(
+            list(validated.wifi_networks), ap_ssid=validated.wifi_ssid
+        )
+    # 2026-07-03 (qarl handover B1): sign_name change → propagate to
+    # hostname / Tailscale / setup-AP SSID / mDNS. All four sub-
+    # actuators are fail-soft and run in a background thread so a
+    # failed systemctl restart never wedges the PUT.
+    if previous.sign_name != validated.sign_name:
+        from openmarquee import name_actuator
+
+        name_actuator.apply_in_background(validated.sign_name)
     return _redact_secrets(validated.model_dump())
 
 
