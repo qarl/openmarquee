@@ -10,6 +10,7 @@ from openmarquee.settings import (
     SETTINGS_SCHEMA_VERSION,
     SettingsStorage,
     SystemSettings,
+    WifiNetworkEntry,
 )
 
 # --- Defaults ---
@@ -511,7 +512,11 @@ def test_legacy_settings_with_web_helper_keys_loads(tmp_path: Path):
         )
     )
     loaded = SettingsStorage(path).load()
-    assert loaded.sign_name == "Lobby Sign"
+    # 2026-07-03 (qarl handover): sign_name normalises whitespace to
+    # `-` on load so a legacy "Lobby Sign" value stays load-clean AND
+    # becomes DNS-safe automatically for the propagation actuators
+    # (hostnamectl / Tailscale / setup-AP SSID / mDNS host-name).
+    assert loaded.sign_name == "Lobby-Sign"
     dumped = loaded.model_dump()
     assert "web_helper_url" not in dumped
     assert "web_helper_token" not in dumped
@@ -576,3 +581,154 @@ def test_storage_accepts_unknown_schema_version_today(tmp_path: Path):
     storage = SettingsStorage(path)
     loaded = storage.load()
     assert loaded.schema_version == 999
+
+
+# --- Multi-network WiFi (2026-07-03 qarl handover) ----------------------
+
+
+class TestWifiNetworkEntry:
+    """`WifiNetworkEntry` is the per-network shape inside
+    `SystemSettings.wifi_networks`. Same charset rules as the legacy
+    `wifi_station_ssid/password` fields but with sensible defaults
+    for `autoconnect` and `priority` so a minimal add-network form
+    (ssid + password) validates cleanly."""
+
+    def test_minimal_entry_has_sane_defaults(self):
+        entry = WifiNetworkEntry(ssid="HomeWifi", password="open-sesame")
+        assert entry.autoconnect is True  # default: auto-join in range
+        assert entry.priority == 0  # neutral priority
+
+    def test_ssid_charset_matches_legacy_pattern(self):
+        with pytest.raises(ValidationError, match="ssid"):
+            WifiNetworkEntry(ssid="", password="open-sesame")
+        # 33 chars exceeds the SSID limit.
+        with pytest.raises(ValidationError, match="ssid"):
+            WifiNetworkEntry(ssid="A" * 33, password="open-sesame")
+
+    def test_password_charset_matches_legacy_pattern(self):
+        # 7 chars is too short for WPA2 (min 8).
+        with pytest.raises(ValidationError, match="password"):
+            WifiNetworkEntry(ssid="HomeWifi", password="short")
+        # None + empty string both allowed (write-only sentinel path).
+        assert WifiNetworkEntry(ssid="HomeWifi", password=None).password is None
+        assert WifiNetworkEntry(ssid="HomeWifi", password="").password is None
+
+    def test_priority_clamped_to_reasonable_range(self):
+        with pytest.raises(ValidationError):
+            WifiNetworkEntry(ssid="HomeWifi", password="open-sesame", priority=10_000)
+
+
+class TestMultiWifiMigration:
+    """Legacy settings.json (single `wifi_station_*` fields, no
+    `wifi_networks`) migrates cleanly into the list-based shape via
+    the `_migrate_legacy_wifi_station_fields` before-validator."""
+
+    def test_legacy_single_wifi_migrates_to_one_entry_list(self):
+        legacy = {
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "HomeWifi",
+            "wifi_station_password": "open-sesame",
+        }
+        loaded = SystemSettings.model_validate(legacy)
+        assert len(loaded.wifi_networks) == 1
+        assert loaded.wifi_networks[0].ssid == "HomeWifi"
+        assert loaded.wifi_networks[0].password == "open-sesame"
+        assert loaded.wifi_networks[0].autoconnect is True
+        assert loaded.wifi_networks[0].priority == 0
+
+    def test_legacy_without_creds_is_a_no_op(self):
+        """Legacy shape with wifi_station_enabled but blank creds:
+        migration adds NOTHING (the payload can't fill a real
+        connection profile), and downstream validation surfaces the
+        legacy 'missing ssid/password' error."""
+        with pytest.raises(ValidationError, match="wifi_station_"):
+            SystemSettings.model_validate(
+                {
+                    "wifi_station_enabled": True,
+                    "wifi_station_ssid": None,
+                    "wifi_station_password": None,
+                }
+            )
+
+    def test_migration_is_idempotent_when_list_already_populated(self):
+        """A payload that already carries the migrated list AND still
+        has the legacy fields (a half-in-flight rolling deploy):
+        skip re-adding a duplicate entry, honor the list as-is."""
+        payload = {
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "HomeWifi",
+            "wifi_station_password": "open-sesame",
+            "wifi_networks": [
+                {"ssid": "HomeWifi", "password": "open-sesame"},
+            ],
+        }
+        loaded = SystemSettings.model_validate(payload)
+        assert len(loaded.wifi_networks) == 1
+
+    def test_migration_prepends_when_list_has_a_different_network(self):
+        payload = {
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "HomeWifi",
+            "wifi_station_password": "open-sesame",
+            "wifi_networks": [
+                {"ssid": "GuestNetwork", "password": "guest-pass"},
+            ],
+        }
+        loaded = SystemSettings.model_validate(payload)
+        ssids = [n.ssid for n in loaded.wifi_networks]
+        assert "HomeWifi" in ssids
+        assert "GuestNetwork" in ssids
+
+    def test_wifi_networks_non_empty_satisfies_at_least_one_mode(self):
+        """The cross-field validator now accepts a non-empty
+        wifi_networks as "STA mode active" — an AP-off + no legacy
+        wifi_station_enabled configuration is valid IFF wifi_networks
+        is non-empty."""
+        settings = SystemSettings(
+            wifi_ap_enabled=False,
+            wifi_networks=[WifiNetworkEntry(ssid="HomeWifi", password="open-sesame")],
+        )
+        assert settings.wifi_ap_enabled is False
+        assert len(settings.wifi_networks) == 1
+
+    def test_empty_wifi_networks_and_no_ap_still_rejected(self):
+        with pytest.raises(ValidationError, match="wifi_ap_enabled"):
+            SystemSettings(wifi_ap_enabled=False)
+
+
+class TestSignNameNormalisation:
+    """`sign_name` propagates to hostname / Tailscale / setup-AP SSID
+    / mDNS host-name. The field validator normalises whitespace to
+    hyphen + drops non-safe chars rather than rejecting, so a legacy
+    "Lobby Sign" seed keeps loading cleanly."""
+
+    def test_spaces_collapse_to_hyphen(self):
+        s = SystemSettings(sign_name="Lobby Sign")
+        assert s.sign_name == "Lobby-Sign"
+
+    def test_multiple_spaces_collapse_to_single_hyphen(self):
+        s = SystemSettings(sign_name="A   B   C")
+        assert s.sign_name == "A-B-C"
+
+    def test_unsafe_punctuation_is_dropped(self):
+        # Apostrophe + exclamation are neither DNS-safe nor useful,
+        # so they get dropped rather than raising. The interior
+        # whitespace becomes `-` (whitespace-collapse runs before
+        # punctuation-drop) so `"Jason's Sign!"` → `"Jasons-Sign"`.
+        s = SystemSettings(sign_name="Jason's Sign!")
+        assert s.sign_name == "Jasons-Sign"
+
+    def test_leading_and_trailing_hyphens_stripped(self):
+        s = SystemSettings(sign_name="- MySign -")
+        assert s.sign_name == "MySign"
+
+    def test_perfectly_safe_input_passes_through_unchanged(self):
+        s = SystemSettings(sign_name="JasonsSign1")
+        assert s.sign_name == "JasonsSign1"
+
+    def test_empty_after_normalisation_raises(self):
+        # A pure-punctuation input has NO safe characters left after
+        # normalisation — surface a specific error instead of
+        # bricking downstream actuators.
+        with pytest.raises(ValidationError, match="DNS-safe"):
+            SystemSettings(sign_name="!!!")

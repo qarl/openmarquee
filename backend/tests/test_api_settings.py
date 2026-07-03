@@ -63,7 +63,12 @@ def test_get_returns_defaults_when_nothing_persisted(client: TestClient):
 def test_put_then_get_round_trip(client: TestClient):
     payload = {
         "schema_version": 1,
-        "sign_name": "Coffee Shop",
+        # 2026-07-03 (qarl handover): sign_name normalises whitespace
+        # to `-` at the field validator so a legacy "Coffee Shop" load
+        # becomes DNS-safe for the propagation actuators (hostnamectl
+        # / Tailscale / setup-AP SSID / mDNS). Send the pre-normalised
+        # value here so the wire round-trip is exact.
+        "sign_name": "Coffee-Shop",
         "output_mode": "hdmi",
         "display_width": 1920,
         "display_height": 1080,
@@ -102,6 +107,11 @@ def test_put_then_get_round_trip(client: TestClient):
     # shape is redacted.
     expected = dict(payload)
     expected["wifi_password"] = "<set>"
+    # 2026-07-03 (qarl handover): every response now carries
+    # wifi_networks (empty list on fresh installs). Not sent on the
+    # PUT payload above (back-compat: legacy PUT bodies still work),
+    # but the model dumps it.
+    expected["wifi_networks"] = []
     assert response.json() == expected
     # And reads back redacted.
     response = client.get("/api/settings")
