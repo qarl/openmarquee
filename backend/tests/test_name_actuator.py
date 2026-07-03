@@ -1,126 +1,165 @@
 """Unit tests for openmarquee.name_actuator (Phase B1 —
 qarl handover 2026-07-03).
 
-`apply_sign_name` propagates the device name to four consumers:
-hostnamectl, tailscale, avahi.conf + restart, hostapd.conf + restart.
-Every sub-actuator must FAIL SOFT so a missing binary / missing
-conf file / non-zero exit leaves the caller unharmed."""
+`apply_sign_name` propagates the device name to four consumers via
+the netctl socket daemon (2026-07-03 QA FIX 1: NoNewPrivileges on
+the backend blocks direct subprocess calls to hostnamectl /
+tailscale / systemctl, so the actuator ships payloads over the
+already-sanctioned root socket instead):
+
+  1. hostnamectl-set-hostname     (name payload)
+  2. tailscale-set-hostname       (name payload)
+  3. avahi-write-and-restart      (full rendered conf payload)
+  4. hostapd-write-and-restart    (full rendered conf payload —
+     REUSES the existing subcommand)
+
+Every sub-actuator must FAIL SOFT so a netctl connect error /
+non-zero response leaves the caller unharmed.
+"""
 
 from __future__ import annotations
 
 from openmarquee import name_actuator
 
 
-class _FakeCompleted:
-    def __init__(self, stdout: str = "", returncode: int = 0, stderr: str = ""):
-        self.stdout = stdout
-        self.returncode = returncode
-        self.stderr = stderr
+class _NetctlSpy:
+    """Record all _netctl_send calls made through the actuator.
+    Each call captured as (subcommand, payload) tuple."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, bytes]] = []
+        self.raise_error: type[Exception] | None = None
+
+    def _send(self, subcommand, payload, *, timeout_s=None, error_cls=RuntimeError):
+        self.calls.append((subcommand, payload))
+        if self.raise_error is not None:
+            raise error_cls("simulated netctl failure")
 
 
-class TestFailSoftPaths:
-    """Every sub-actuator must be a no-op (never raise) when its
-    dependency isn't available on the host."""
+def _install_netctl_spy(monkeypatch) -> _NetctlSpy:
+    """Patch the `_netctl_send` import in `openmarquee.network_supervisor_actuator`
+    (name_actuator does inline `from … import _netctl_send` inside each
+    sub-actuator, so we patch the source module)."""
+    spy = _NetctlSpy()
+    monkeypatch.setattr(
+        "openmarquee.network_supervisor_actuator._netctl_send",
+        spy._send,
+    )
+    return spy
 
-    def test_hostnamectl_no_op_when_binary_missing(self, monkeypatch):
-        called = {"n": 0}
 
-        def _fake_run(*_a, **_k):
-            called["n"] += 1
-            return _FakeCompleted()
-
-        monkeypatch.setattr("openmarquee.name_actuator.subprocess.run", _fake_run)
-        monkeypatch.setattr("openmarquee.name_actuator.shutil.which", lambda _n: None)
-        # Must not raise.
+class TestHostnamectlPath:
+    def test_sends_hostnamectl_set_hostname_via_netctl(self, monkeypatch):
+        spy = _install_netctl_spy(monkeypatch)
         name_actuator._apply_hostnamectl("JasonsSign1")
-        # subprocess.run was never invoked.
-        assert called["n"] == 0
+        assert spy.calls == [("hostnamectl-set-hostname", b"JasonsSign1\n")]
 
-    def test_tailscale_no_op_when_binary_missing(self, monkeypatch):
-        called = {"n": 0}
-        monkeypatch.setattr(
-            "openmarquee.name_actuator.subprocess.run",
-            lambda *_a, **_k: called.__setitem__("n", called["n"] + 1) or _FakeCompleted(),
-        )
-        monkeypatch.setattr("openmarquee.name_actuator.shutil.which", lambda _n: None)
+    def test_hostnamectl_fail_soft_on_netctl_error(self, monkeypatch):
+        spy = _install_netctl_spy(monkeypatch)
+        spy.raise_error = RuntimeError
+        # Must not raise even when the crossing fails.
+        name_actuator._apply_hostnamectl("JasonsSign1")
+        assert spy.calls == [("hostnamectl-set-hostname", b"JasonsSign1\n")]
+
+
+class TestTailscalePath:
+    def test_sends_tailscale_set_hostname_via_netctl(self, monkeypatch):
+        spy = _install_netctl_spy(monkeypatch)
         name_actuator._apply_tailscale_hostname("JasonsSign1")
-        assert called["n"] == 0
+        assert spy.calls == [("tailscale-set-hostname", b"JasonsSign1\n")]
 
-    def test_avahi_no_op_when_conf_missing(self, monkeypatch, tmp_path):
+    def test_tailscale_fail_soft_on_netctl_error(self, monkeypatch):
+        spy = _install_netctl_spy(monkeypatch)
+        spy.raise_error = RuntimeError
+        name_actuator._apply_tailscale_hostname("JasonsSign1")
+        assert spy.calls == [("tailscale-set-hostname", b"JasonsSign1\n")]
+
+
+class TestAvahiPath:
+    """The avahi sub-actuator reads the existing conf, rewrites the
+    host-name line locally, and ships the rewritten conf as payload."""
+
+    def test_no_op_when_conf_missing(self, monkeypatch, tmp_path):
+        spy = _install_netctl_spy(monkeypatch)
         monkeypatch.setattr(
             "openmarquee.name_actuator._AVAHI_CONF",
             tmp_path / "avahi-daemon.conf",  # doesn't exist
         )
+        name_actuator._apply_avahi_hostname("JasonsSign1")
+        assert spy.calls == []
+
+    def test_rewrites_and_ships_full_conf(self, monkeypatch, tmp_path):
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("[server]\n#host-name=openmarquee\ndomain-name=local\n")
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+        name_actuator._apply_avahi_hostname("JasonsSign1")
+        assert len(spy.calls) == 1
+        subcommand, payload = spy.calls[0]
+        assert subcommand == "avahi-write-and-restart"
+        text = payload.decode("utf-8")
+        assert "host-name=JasonsSign1" in text
+        assert "[server]" in text
+        assert "domain-name=local" in text
+        assert "#host-name=" not in text
+
+    def test_no_ship_when_value_unchanged(self, monkeypatch, tmp_path):
+        """When the conf already has the target host-name, don't
+        make a netctl round-trip (avoids a spurious avahi restart)."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("[server]\nhost-name=JasonsSign1\n")
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+        name_actuator._apply_avahi_hostname("JasonsSign1")
+        assert spy.calls == []
+
+    def test_avahi_fail_soft_on_netctl_error(self, monkeypatch, tmp_path):
+        spy = _install_netctl_spy(monkeypatch)
+        spy.raise_error = RuntimeError
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("[server]\nhost-name=old\n")
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
         # Must not raise.
         name_actuator._apply_avahi_hostname("JasonsSign1")
 
-    def test_hostapd_no_op_when_conf_missing(self, monkeypatch, tmp_path):
+
+class TestHostapdPath:
+    """The hostapd sub-actuator reads the existing conf, rewrites the
+    ssid= line locally, then ships via the existing (pre-Phase-B1)
+    hostapd-write-and-restart netctl subcommand."""
+
+    def test_no_op_when_conf_missing(self, monkeypatch, tmp_path):
+        spy = _install_netctl_spy(monkeypatch)
         monkeypatch.setattr(
             "openmarquee.name_actuator._HOSTAPD_CONF",
             tmp_path / "hostapd.conf",  # doesn't exist
         )
         name_actuator._apply_hostapd_ssid("JasonsSign1")
+        assert spy.calls == []
 
-
-class TestAvahiRewrite:
-    """The mDNS rewrite must set `host-name=<name>` correctly + not
-    lose the surrounding conf lines."""
-
-    def test_rewrites_existing_host_name_line(self, monkeypatch, tmp_path):
-        conf = tmp_path / "avahi-daemon.conf"
-        conf.write_text("[server]\n#host-name=openmarquee\ndomain-name=local\n")
-        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
-        # Stub systemctl to a no-op.
-        monkeypatch.setattr("openmarquee.name_actuator.shutil.which", lambda name: None)
-        name_actuator._apply_avahi_hostname("JasonsSign1")
-        contents = conf.read_text()
-        assert "host-name=JasonsSign1" in contents
-        # Surrounding lines survive.
-        assert "[server]" in contents
-        assert "domain-name=local" in contents
-        # No lingering commented-out line.
-        assert "#host-name=" not in contents
-
-    def test_appends_host_name_when_absent(self, monkeypatch, tmp_path):
-        conf = tmp_path / "avahi-daemon.conf"
-        conf.write_text("[server]\ndomain-name=local\n")
-        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
-        monkeypatch.setattr("openmarquee.name_actuator.shutil.which", lambda _n: None)
-        name_actuator._apply_avahi_hostname("JasonsSign1")
-        assert "host-name=JasonsSign1" in conf.read_text()
-
-    def test_no_write_when_value_unchanged(self, monkeypatch, tmp_path):
-        """If the conf already has the target host-name, don't
-        trigger a systemctl restart. Detect by checking the
-        systemctl-side spy."""
-        conf = tmp_path / "avahi-daemon.conf"
-        conf.write_text("[server]\nhost-name=JasonsSign1\n")
-        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
-        systemctl_calls: list = []
-        monkeypatch.setattr(
-            "openmarquee.name_actuator.shutil.which",
-            lambda name: "/usr/bin/systemctl" if name == "systemctl" else None,
-        )
-        monkeypatch.setattr(
-            "openmarquee.name_actuator.subprocess.run",
-            lambda *a, **k: systemctl_calls.append(a) or _FakeCompleted(),
-        )
-        name_actuator._apply_avahi_hostname("JasonsSign1")
-        assert systemctl_calls == []
-
-
-class TestHostapdRewrite:
-    def test_rewrites_existing_ssid_line(self, monkeypatch, tmp_path):
+    def test_rewrites_and_ships_via_existing_subcommand(self, monkeypatch, tmp_path):
+        spy = _install_netctl_spy(monkeypatch)
         conf = tmp_path / "hostapd.conf"
         conf.write_text("interface=ap0\nssid=openMarquee-SETUP\nchannel=6\n")
         monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
-        monkeypatch.setattr("openmarquee.name_actuator.shutil.which", lambda _n: None)
         name_actuator._apply_hostapd_ssid("JasonsSign1")
-        contents = conf.read_text()
-        assert "ssid=JasonsSign1" in contents
-        # Original AP settings intact.
-        assert "interface=ap0" in contents
-        assert "channel=6" in contents
+        assert len(spy.calls) == 1
+        subcommand, payload = spy.calls[0]
+        # 2026-07-03 (QA FIX 1): reuse the EXISTING subcommand — do
+        # NOT add a fresh "hostapd-set-ssid" one.
+        assert subcommand == "hostapd-write-and-restart"
+        text = payload.decode("utf-8")
+        assert "ssid=JasonsSign1" in text
+        assert "interface=ap0" in text
+        assert "channel=6" in text
+
+    def test_no_ship_when_ssid_unchanged(self, monkeypatch, tmp_path):
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "hostapd.conf"
+        conf.write_text("interface=ap0\nssid=JasonsSign1\n")
+        monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
+        name_actuator._apply_hostapd_ssid("JasonsSign1")
+        assert spy.calls == []
 
 
 class TestApplySignName:

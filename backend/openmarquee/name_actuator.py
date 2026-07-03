@@ -34,8 +34,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
-import shutil
-import subprocess
 import threading
 from pathlib import Path
 
@@ -86,64 +84,67 @@ def apply_in_background(name: str) -> threading.Thread:
 
 
 def _apply_hostnamectl(name: str) -> None:
-    """`hostnamectl set-hostname <name>` — sets the transient +
-    static hostname. Skipped when hostnamectl isn't on PATH (dev
-    hosts, minimal containers)."""
-    hostnamectl = shutil.which("hostnamectl")
-    if not hostnamectl:
-        log.info("name-actuator: hostnamectl not on PATH; skipping hostname update")
-        return
+    """Route `hostnamectl set-hostname <name>` through the netctl
+    socket daemon. 2026-07-03 (QA FIX 1): the backend runs under
+    NoNewPrivileges, which blocks the direct subprocess call — the
+    daemon does the crossing as root.
+    """
+    from openmarquee.network_supervisor_actuator import _netctl_send
+
+    class _HostnamectlError(RuntimeError):
+        pass
+
     try:
-        result = subprocess.run(
-            [hostnamectl, "set-hostname", name],
-            capture_output=True,
-            text=True,
-            timeout=_SUBPROCESS_TIMEOUT_S,
-            check=False,
+        _netctl_send(
+            "hostnamectl-set-hostname",
+            (name + "\n").encode("utf-8"),
+            timeout_s=_SUBPROCESS_TIMEOUT_S,
+            error_cls=_HostnamectlError,
         )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        log.warning("name-actuator: hostnamectl set-hostname failed: %r", exc)
-        return
-    if result.returncode != 0:
+    except _HostnamectlError as exc:
         log.warning(
-            "name-actuator: hostnamectl set-hostname returned rc=%d stderr=%r",
-            result.returncode,
-            result.stderr.strip()[:200],
+            "name-actuator: hostnamectl set-hostname failed via netctl (%s); "
+            "next sign_name-changing PUT retries",
+            type(exc).__name__,
         )
 
 
 def _apply_tailscale_hostname(name: str) -> None:
-    """`tailscale set --hostname <name>` — updates the node's tailnet
-    hostname. Skipped when tailscale isn't on PATH."""
-    tailscale = shutil.which("tailscale")
-    if not tailscale:
-        log.info("name-actuator: tailscale not on PATH; skipping tailnet hostname update")
-        return
+    """Route `tailscale set --hostname <name>` through the netctl
+    socket daemon. 2026-07-03 (QA FIX 1)."""
+    from openmarquee.network_supervisor_actuator import _netctl_send
+
+    class _TailscaleError(RuntimeError):
+        pass
+
     try:
-        result = subprocess.run(
-            [tailscale, "set", "--hostname", name],
-            capture_output=True,
-            text=True,
-            timeout=_SUBPROCESS_TIMEOUT_S,
-            check=False,
+        _netctl_send(
+            "tailscale-set-hostname",
+            (name + "\n").encode("utf-8"),
+            timeout_s=_SUBPROCESS_TIMEOUT_S,
+            error_cls=_TailscaleError,
         )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        log.warning("name-actuator: tailscale set --hostname failed: %r", exc)
-        return
-    if result.returncode != 0:
+    except _TailscaleError as exc:
         log.warning(
-            "name-actuator: tailscale set --hostname returned rc=%d stderr=%r",
-            result.returncode,
-            result.stderr.strip()[:200],
+            "name-actuator: tailscale set --hostname failed via netctl (%s); "
+            "next sign_name-changing PUT retries",
+            type(exc).__name__,
         )
 
 
 def _apply_avahi_hostname(name: str) -> None:
-    """Rewrite `/etc/avahi/avahi-daemon.conf`'s `host-name=` line +
-    `systemctl restart avahi-daemon`. Skipped when the file doesn't
-    exist (dev hosts, fresh installs) or when systemctl isn't
-    available.
+    """Render the full avahi-daemon.conf with the new host-name +
+    ship it via the netctl `avahi-write-and-restart` subcommand
+    (2026-07-03 QA FIX 1 — the daemon writes the file as root +
+    restarts avahi-daemon).
+
+    The render step reads the current conf via the filesystem
+    (which the backend user CAN do — read is unprivileged) and
+    substitutes the `host-name=` line. Skipped when the source
+    conf doesn't exist (dev hosts, fresh installs).
     """
+    from openmarquee.network_supervisor_actuator import _netctl_send
+
     if not _AVAHI_CONF.exists():
         log.info("name-actuator: %s missing; skipping mDNS hostname update", _AVAHI_CONF)
         return
@@ -152,35 +153,35 @@ def _apply_avahi_hostname(name: str) -> None:
     except OSError as exc:
         log.warning("name-actuator: read %s failed: %r", _AVAHI_CONF, exc)
         return
-    rewritten, matched = re.subn(
-        r"^\s*#?\s*host-name\s*=.*$",
-        f"host-name={name}",
-        original,
-        count=1,
-        flags=re.MULTILINE,
-    )
-    if matched == 0:
-        # File exists but has no host-name line — append one so a
-        # future manual edit doesn't inherit stale state.
-        rewritten = original.rstrip() + f"\nhost-name={name}\n"
+    rewritten = _substitute_hostname_line(original, name)
     if rewritten == original:
-        # Already set to the target value — no restart needed.
-        return
+        return  # Already at target value; skip round-trip.
+
+    class _AvahiError(RuntimeError):
+        pass
+
     try:
-        _AVAHI_CONF.write_text(rewritten)
-    except OSError as exc:
-        log.warning("name-actuator: write %s failed: %r", _AVAHI_CONF, exc)
-        return
-    _systemctl_restart("avahi-daemon")
+        _netctl_send(
+            "avahi-write-and-restart",
+            rewritten.encode("utf-8"),
+            timeout_s=_SUBPROCESS_TIMEOUT_S,
+            error_cls=_AvahiError,
+        )
+    except _AvahiError as exc:
+        log.warning(
+            "name-actuator: avahi-write-and-restart failed via netctl (%s); "
+            "next sign_name-changing PUT retries",
+            type(exc).__name__,
+        )
 
 
 def _apply_hostapd_ssid(name: str) -> None:
-    """Rewrite `/etc/hostapd/hostapd.conf`'s `ssid=` line +
-    `systemctl restart hostapd`. Skipped when the file doesn't
-    exist. This changes the setup-AP SSID so a phone that scans
-    for a NEW `<sign_name>-SETUP`-shaped network finds it; existing
-    setup sessions in flight will drop briefly during the restart.
-    """
+    """Re-render the hostapd.conf with the new SSID + ship via the
+    existing `hostapd-write-and-restart` netctl subcommand (2026-
+    07-03 QA FIX 1 — reuse the already-sanctioned crossing rather
+    than reimplement it unprivileged)."""
+    from openmarquee.network_supervisor_actuator import _netctl_send
+
     if not _HOSTAPD_CONF.exists():
         log.info("name-actuator: %s missing; skipping setup-AP SSID update", _HOSTAPD_CONF)
         return
@@ -189,46 +190,53 @@ def _apply_hostapd_ssid(name: str) -> None:
     except OSError as exc:
         log.warning("name-actuator: read %s failed: %r", _HOSTAPD_CONF, exc)
         return
+    rewritten = _substitute_ssid_line(original, name)
+    if rewritten == original:
+        return
+
+    class _HostapdError(RuntimeError):
+        pass
+
+    try:
+        _netctl_send(
+            "hostapd-write-and-restart",
+            rewritten.encode("utf-8"),
+            timeout_s=_SUBPROCESS_TIMEOUT_S,
+            error_cls=_HostapdError,
+        )
+    except _HostapdError as exc:
+        log.warning(
+            "name-actuator: hostapd-write-and-restart failed via netctl (%s); "
+            "next sign_name-changing PUT retries",
+            type(exc).__name__,
+        )
+
+
+def _substitute_hostname_line(conf_text: str, name: str) -> str:
+    """Pure substitution: replace `#?host-name=…` in avahi conf.
+    Appends a fresh `host-name=<name>` line when absent."""
     rewritten, matched = re.subn(
-        r"^\s*#?\s*ssid\s*=.*$",
-        f"ssid={name}",
-        original,
+        r"^\s*#?\s*host-name\s*=.*$",
+        f"host-name={name}",
+        conf_text,
         count=1,
         flags=re.MULTILINE,
     )
     if matched == 0:
-        rewritten = original.rstrip() + f"\nssid={name}\n"
-    if rewritten == original:
-        return
-    try:
-        _HOSTAPD_CONF.write_text(rewritten)
-    except OSError as exc:
-        log.warning("name-actuator: write %s failed: %r", _HOSTAPD_CONF, exc)
-        return
-    _systemctl_restart("hostapd")
+        rewritten = conf_text.rstrip() + f"\nhost-name={name}\n"
+    return rewritten
 
 
-def _systemctl_restart(unit: str) -> None:
-    """`systemctl restart <unit>` — fail-soft."""
-    systemctl = shutil.which("systemctl")
-    if not systemctl:
-        log.info("name-actuator: systemctl not on PATH; skipping %s restart", unit)
-        return
-    try:
-        result = subprocess.run(
-            [systemctl, "restart", unit],
-            capture_output=True,
-            text=True,
-            timeout=_SUBPROCESS_TIMEOUT_S,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        log.warning("name-actuator: systemctl restart %s failed: %r", unit, exc)
-        return
-    if result.returncode != 0:
-        log.warning(
-            "name-actuator: systemctl restart %s returned rc=%d stderr=%r",
-            unit,
-            result.returncode,
-            result.stderr.strip()[:200],
-        )
+def _substitute_ssid_line(conf_text: str, name: str) -> str:
+    """Pure substitution: replace `#?ssid=…` in hostapd.conf. Same
+    semantics as _substitute_hostname_line."""
+    rewritten, matched = re.subn(
+        r"^\s*#?\s*ssid\s*=.*$",
+        f"ssid={name}",
+        conf_text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if matched == 0:
+        rewritten = conf_text.rstrip() + f"\nssid={name}\n"
+    return rewritten

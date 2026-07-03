@@ -186,11 +186,29 @@ def _list_nm_wifi_connections() -> list[dict[str, str]]:
         if detail.returncode != 0:
             continue
 
+        # 2026-07-03 (QA FIX 3): parse detail rows with the escape-
+        # aware _split_terse_row, NOT `str.split(":", 1)` — an SSID
+        # or PSK containing an unescaped `:` gets its second
+        # fragment dropped by str.split, corrupting the value on
+        # reboot import. And don't `.strip()` PSK values: a
+        # legitimate PSK can start or end with whitespace + WPA2
+        # accepts printable ASCII 0x20-0x7e per the field
+        # validator, so trimming would silently mutate a valid
+        # value.
         detail_fields: dict[str, str] = {}
         for detail_line in detail.stdout.splitlines():
-            if ":" in detail_line:
-                key, value = detail_line.split(":", 1)
-                detail_fields[key.strip()] = value.strip()
+            if ":" not in detail_line:
+                continue
+            parts = _split_terse_row(detail_line)
+            if len(parts) < 2:
+                continue
+            key = parts[0]
+            # Rejoin everything past the first colon so a field
+            # value with an internal `:` round-trips exactly.
+            value = ":".join(parts[1:])
+            # Key names are always ASCII field paths (no whitespace);
+            # safe to strip. Value MUST NOT be stripped (see comment).
+            detail_fields[key.strip()] = value
 
         rows.append(
             {
@@ -322,90 +340,167 @@ def apply_wifi_networks(
             continue  # Setup-AP is off-limits.
         if row["ssid"] in wanted_ssids:
             continue  # Kept — matched by an entry above.
+        # 2026-07-03 (QA FIX 2): drop-NEBULA guard. NEVER delete a
+        # profile whose GENERAL.STATE is `activated` — that's the
+        # live uplink and blowing it up drops the sign off the
+        # network. If the operator wants to remove an active
+        # profile, they should first pick a different one (which
+        # this reconcile picks up + activates), THEN the previous
+        # one becomes inactive on the next tick. Fail-safe: if the
+        # state probe itself fails (nmcli non-zero / timeout /
+        # missing), also skip the delete — we'd rather leave a
+        # stale profile than accidentally kill the uplink.
+        if _is_connection_activated(name):
+            log.warning(
+                "wifi-networks-reconcile: skipping delete of %r — connection is "
+                "ACTIVATED (drop-NEBULA guard); the operator should switch to a "
+                "different network before removing this one",
+                name,
+            )
+            continue
         _apply_delete(name)
 
 
-def _apply_add(con_name: str, network: WifiNetworkEntry) -> None:
-    """`nmcli con add type wifi con-name … ssid … wifi-sec.key-mgmt
-    wpa-psk wifi-sec.psk … connection.autoconnect … connection.
-    autoconnect-priority …`. Fails soft."""
-    args = [
-        "connection",
-        "add",
-        "type",
-        "wifi",
-        "con-name",
+def _is_connection_activated(con_name: str) -> bool:
+    """2026-07-03 (QA FIX 2 drop-NEBULA guard): return True iff the
+    NM connection's `GENERAL.STATE` is `activated`. The state probe
+    is a read-only unprivileged operation (no `-s` flag, no PSK
+    read), so it works under NoNewPrivileges without needing to
+    round-trip through the netctl daemon.
+
+    Fail-safe posture: on ANY probe failure (nmcli not available,
+    timeout, non-zero return, unparseable output) return True so
+    the delete is skipped. Rationale: it's far safer to leave a
+    stale openmarquee-owned profile on disk than to accidentally
+    delete the ACTIVE uplink because we couldn't determine its
+    state.
+    """
+    try:
+        result = _run_nmcli(
+            "-t",
+            "-f",
+            "GENERAL.STATE",
+            "connection",
+            "show",
+            con_name,
+        )
+    except (_NmcliNotAvailable, subprocess.TimeoutExpired, OSError):
+        return True  # Fail-safe: unknown state → treat as activated.
+    if result.returncode != 0:
+        return True
+    # nmcli's `GENERAL.STATE` line reads: `GENERAL.STATE:activated`
+    # (or `activating` / `deactivating` / empty when down). Detect
+    # activated OR activating so a mid-connection swap is safe too.
+    for line in result.stdout.splitlines():
+        parts = _split_terse_row(line)
+        if len(parts) >= 2 and parts[0] == "GENERAL.STATE":
+            state = parts[1].strip().lower()
+            return state in {"activated", "activating"}
+    # No GENERAL.STATE line → connection is defined but not active.
+    return False
+
+
+def _network_payload(con_name: str, network: WifiNetworkEntry) -> bytes:
+    """Serialize a `WifiNetworkEntry` into the 5-line stdin payload
+    the netctl bash helper reads (see `nm-connection-add-wifi` +
+    `nm-connection-modify-wifi` in system/openmarquee-netctl).
+    Order: con_name / ssid / password / autoconnect / priority."""
+    autoconnect = "yes" if network.autoconnect else "no"
+    lines = [
         con_name,
-        "ssid",
         network.ssid,
-        "wifi-sec.key-mgmt",
-        "wpa-psk",
-        "connection.autoconnect",
-        "yes" if network.autoconnect else "no",
-        "connection.autoconnect-priority",
+        network.password or "",
+        autoconnect,
         str(network.priority),
     ]
-    if network.password:
-        args += ["wifi-sec.psk", network.password]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _apply_add(con_name: str, network: WifiNetworkEntry) -> None:
+    """Route the nmcli `connection add` through the netctl socket
+    daemon (2026-07-03 QA FIX 1). Under NoNewPrivileges the
+    backend can't call `nmcli connection add` directly — it fails
+    silently to a no-op. This crossing runs the real subprocess
+    as root via the socket-activated daemon.
+
+    Fails soft: any protocol error (socket missing on a dev host,
+    ERR from the daemon, timeout) logs a warning + returns. Never
+    logs stderr verbatim: an nmcli config-error line can echo the
+    PSK back, and journald is not a secret store."""
+    from openmarquee.network_supervisor_actuator import _netctl_send
+
+    class _AddError(RuntimeError):
+        """Typed exception so _netctl_send propagates a specific
+        error class; converted to a log-warn here."""
+
     try:
-        result = _run_nmcli(*args)
-    except (_NmcliNotAvailable, subprocess.TimeoutExpired, OSError) as exc:
-        log.warning("wifi-networks-reconcile: add %r failed: %r", con_name, exc)
-        return
-    if result.returncode != 0:
-        # Never log stderr verbatim — nmcli may echo the PSK back on
-        # a config-error line. Only log the return code + name so
-        # secrets stay out of the journal.
-        log.warning(
-            "wifi-networks-reconcile: add %r returned rc=%d",
-            con_name,
-            result.returncode,
+        _netctl_send(
+            "nm-connection-add-wifi",
+            _network_payload(con_name, network),
+            timeout_s=_NMCLI_TIMEOUT_S,
+            error_cls=_AddError,
         )
+    except _AddError as exc:
+        _log_netctl_failure("add", con_name, exc)
 
 
 def _apply_modify(con_name: str, network: WifiNetworkEntry) -> None:
-    """`nmcli con modify <name> …` — updates PSK, autoconnect,
-    priority in place. Fails soft."""
-    args = [
-        "connection",
-        "modify",
-        con_name,
-        "802-11-wireless.ssid",
-        network.ssid,
-        "connection.autoconnect",
-        "yes" if network.autoconnect else "no",
-        "connection.autoconnect-priority",
-        str(network.priority),
-    ]
-    if network.password:
-        args += ["wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", network.password]
+    """Route `nmcli connection modify` through netctl. See
+    `_apply_add` for the crossing rationale.
+
+    2026-07-03 (QA LOW): the bash side skips the
+    `wifi-sec.key-mgmt wpa-psk` write when password is empty,
+    which preserves WPA3-SAE profiles. The 5-line payload always
+    passes SSID / autoconnect / priority so a re-save with the
+    sentinel-preserved PSK still lands the non-secret changes."""
+    from openmarquee.network_supervisor_actuator import _netctl_send
+
+    class _ModifyError(RuntimeError):
+        pass
+
     try:
-        result = _run_nmcli(*args)
-    except (_NmcliNotAvailable, subprocess.TimeoutExpired, OSError) as exc:
-        log.warning("wifi-networks-reconcile: modify %r failed: %r", con_name, exc)
-        return
-    if result.returncode != 0:
-        log.warning(
-            "wifi-networks-reconcile: modify %r returned rc=%d",
-            con_name,
-            result.returncode,
+        _netctl_send(
+            "nm-connection-modify-wifi",
+            _network_payload(con_name, network),
+            timeout_s=_NMCLI_TIMEOUT_S,
+            error_cls=_ModifyError,
         )
+    except _ModifyError as exc:
+        _log_netctl_failure("modify", con_name, exc)
 
 
 def _apply_delete(con_name: str) -> None:
-    """`nmcli con delete <name>` — only ever called on profiles
-    matching the openmarquee-managed prefix. Fails soft."""
+    """Route `nmcli connection delete` through netctl. Only called
+    on profiles that already passed the ownership prefix check +
+    the activated-connection guard in `apply_wifi_networks`."""
+    from openmarquee.network_supervisor_actuator import _netctl_send
+
+    class _DeleteError(RuntimeError):
+        pass
+
     try:
-        result = _run_nmcli("connection", "delete", con_name)
-    except (_NmcliNotAvailable, subprocess.TimeoutExpired, OSError) as exc:
-        log.warning("wifi-networks-reconcile: delete %r failed: %r", con_name, exc)
-        return
-    if result.returncode != 0:
-        log.warning(
-            "wifi-networks-reconcile: delete %r returned rc=%d",
-            con_name,
-            result.returncode,
+        _netctl_send(
+            "nm-connection-delete",
+            (con_name + "\n").encode("utf-8"),
+            timeout_s=_NMCLI_TIMEOUT_S,
+            error_cls=_DeleteError,
         )
+    except _DeleteError as exc:
+        _log_netctl_failure("delete", con_name, exc)
+
+
+def _log_netctl_failure(op: str, con_name: str, exc: Exception) -> None:
+    """Common log line for the three netctl-routed reconcile ops.
+    Only the exception's TYPE + argv-visible fields land in
+    journald — never the raw exception message, which for an
+    add/modify failure could echo the PSK back from nmcli."""
+    log.warning(
+        "wifi-networks-reconcile: %s %r failed via netctl (%s); "
+        "reconcile partial, next PUT retries",
+        op,
+        con_name,
+        type(exc).__name__,
+    )
 
 
 def apply_in_background(

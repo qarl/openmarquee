@@ -67,6 +67,18 @@ ALLOWLIST = frozenset(
         # §A#2: brcmfmac resets power_save on reassoc, so the boot
         # one-shot alone is insufficient.
         "wifi-powersave-off",
+        # 2026-07-03 (qarl handover Phase B1): privileged subcommands
+        # for multi-network wifi reconcile + sign_name propagation.
+        # Each has argv + payload contracts documented on the bash
+        # helper side. The Python actuators
+        # (wifi_networks_actuator.py, name_actuator.py) route their
+        # write operations through here.
+        "nm-connection-add-wifi",
+        "nm-connection-modify-wifi",
+        "nm-connection-delete",
+        "hostnamectl-set-hostname",
+        "tailscale-set-hostname",
+        "avahi-write-and-restart",
     }
 )
 

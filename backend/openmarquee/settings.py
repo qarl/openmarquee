@@ -104,11 +104,19 @@ class WifiNetworkEntry(BaseModel):
     """2026-07-03 (qarl handover): one home wifi network the device
     should try to join. A list of these lives on
     `SystemSettings.wifi_networks` and is reconciled against
-    NetworkManager connection profiles named
-    `openmarquee-managed-<i>` — that naming convention is what lets
-    the reconcile actuator know which profiles it owns without
-    clobbering hand-added `nmcli con add` profiles OR the setup-AP
-    profile.
+    NetworkManager connection profiles.
+
+    Ownership convention (see `wifi_networks_actuator` module
+    docstring for full detail): profiles auto-created by the
+    reconcile use the connection name `openmarquee-<ssid>`, and
+    the ownership predicate is the BROAD `openmarquee-` prefix.
+    That means Jason's device's pre-existing `openmarquee-sign-
+    wifi` / `openmarquee-mgmt-wifi` / `openmarquee-admin-wifi`
+    profiles ARE adopted + managed by the reconcile — deleting
+    them requires them to fall out of `wifi_networks` on a PUT.
+    Hand-added `nmcli con` profiles WITHOUT the `openmarquee-`
+    prefix stay outside the ownership predicate and are never
+    deleted by the reconcile.
 
     Passwords are WRITE-ONLY at the API boundary — the redactor
     replaces every populated `password` with the `<set>` sentinel
