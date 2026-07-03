@@ -732,3 +732,74 @@ class TestSignNameNormalisation:
         # bricking downstream actuators.
         with pytest.raises(ValidationError, match="DNS-safe"):
             SystemSettings(sign_name="!!!")
+
+
+class TestSeedWifiNetworksFromNmHardenB:
+    """2026-07-03 (QA HARDEN B): the seed-from-NM path must ONLY
+    flip `wifi_networks_seeded_from_nm=True` when the nmcli probe
+    ACTUALLY succeeded. A transient nmcli error must leave the flag
+    False so the next boot re-runs the import — otherwise a
+    subsequent PUT triggers a reconcile that deletes the inactive
+    fallback profiles (qarl / admin) that lived in NM but aren't
+    in settings.wifi_networks yet.
+    """
+
+    def _run_seed(self, tmp_path: Path, monkeypatch, *, probe_ok: bool, imported: list):
+        """Wire the seed path with a scripted import_existing_wifi_profiles
+        response + a stub-True `_wifi_nmcli_available`, then call
+        load() (which triggers the seed on the second-and-later
+        load, not the first-mint one). Returns (was_flipped,
+        was_persisted_during_seed, resulting_settings)."""
+        monkeypatch.setattr(
+            "openmarquee.settings.SettingsStorage._wifi_nmcli_available",
+            lambda _self: True,
+        )
+        monkeypatch.setattr(
+            "openmarquee.wifi_networks_actuator.import_existing_wifi_profiles",
+            lambda *_a, **_k: (probe_ok, imported),
+        )
+        storage = SettingsStorage(tmp_path / "settings.json")
+        # First load mints defaults + persists; seed hook does NOT run
+        # on the first-mint branch. Discard it, then spy save() before
+        # the second load which exercises the seed path.
+        storage.load()
+        saved_calls: list[SystemSettings] = []
+        original_save = storage.save
+
+        def _spy_save(s):
+            saved_calls.append(s)
+            original_save(s)
+
+        monkeypatch.setattr(storage, "save", _spy_save)
+        loaded = storage.load()
+        return loaded.wifi_networks_seeded_from_nm, bool(saved_calls), loaded
+
+    def test_flag_flips_when_probe_succeeds_with_profiles(self, tmp_path, monkeypatch):
+        """Happy path: nmcli responded, returned entries → flag flips
+        + settings persisted."""
+        entries = [
+            {"ssid": "NEBULA", "password": "psk-nebula-1", "autoconnect": True, "priority": 0}
+        ]
+        flipped, persisted, loaded = self._run_seed(
+            tmp_path, monkeypatch, probe_ok=True, imported=entries
+        )
+        assert flipped is True
+        assert persisted is True
+        assert any(n.ssid == "NEBULA" for n in loaded.wifi_networks)
+
+    def test_flag_flips_when_probe_succeeds_with_zero_profiles(self, tmp_path, monkeypatch):
+        """Boundary: nmcli responded with genuinely zero wifi profiles.
+        Flag flips (nothing more to import; the retry-next-boot loop
+        would be wasted work)."""
+        flipped, persisted, _ = self._run_seed(tmp_path, monkeypatch, probe_ok=True, imported=[])
+        assert flipped is True
+        assert persisted is True
+
+    def test_flag_STAYS_false_when_probe_fails(self, tmp_path, monkeypatch):
+        """Regression: on a transient nmcli error the import path
+        returns (False, []). The seed hook MUST NOT flip the flag,
+        MUST NOT persist. Next boot re-runs the import so the
+        inactive fallback profiles aren't lost to a later reconcile."""
+        flipped, persisted, _ = self._run_seed(tmp_path, monkeypatch, probe_ok=False, imported=[])
+        assert flipped is False
+        assert persisted is False

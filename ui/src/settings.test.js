@@ -951,4 +951,190 @@ describe("mountSettings", () => {
         );
         expect(httpsBox.checked).toBe(true);
     });
+
+    // Phase B2 (qarl handover 2026-07-03): multi-network Wi-Fi list.
+    // On first load the imported profiles (qarl / NEBULA / admin on
+    // the Jason device) show up; add form appends; remove drops; the
+    // sentinel-preserved password roundtrips through save without
+    // rotating the stored PSK.
+    describe("Phase B2 wifi_networks section", () => {
+        const SAMPLE_MULTI = {
+            ...SAMPLE,
+            wifi_networks: [
+                { ssid: "NEBULA", password: "<set>", autoconnect: true, priority: 0 },
+                { ssid: "qarl", password: "<set>", autoconnect: true, priority: 0 },
+                { ssid: "admin", password: null, autoconnect: true, priority: 0 },
+            ],
+        };
+
+        it("renders the adopted networks on first load", async () => {
+            const container = document.createElement("div");
+            mount(container, {
+                fetchSettings: async () => SAMPLE_MULTI,
+                onSave: vi.fn(),
+            });
+            await tick();
+            const items = container.querySelectorAll(".field-wifi-networks-item");
+            expect(items).toHaveLength(3);
+            const ssids = Array.from(items).map(
+                (li) => li.querySelector(".field-wifi-networks-item-ssid").textContent,
+            );
+            expect(ssids).toEqual(["NEBULA", "qarl", "admin"]);
+        });
+
+        it("shows masked '<set>' for passwords + 'no password' for open networks", async () => {
+            const container = document.createElement("div");
+            mount(container, {
+                fetchSettings: async () => SAMPLE_MULTI,
+                onSave: vi.fn(),
+            });
+            await tick();
+            const passwords = Array.from(
+                container.querySelectorAll(".field-wifi-networks-item-password"),
+            ).map((el) => el.textContent);
+            expect(passwords[0]).toBe("password: <set>");
+            expect(passwords[1]).toBe("password: <set>");
+            expect(passwords[2]).toBe("no password");
+        });
+
+        it("emits an empty-state hint when no networks are saved", async () => {
+            const container = document.createElement("div");
+            mount(container, {
+                fetchSettings: async () => ({ ...SAMPLE, wifi_networks: [] }),
+                onSave: vi.fn(),
+            });
+            await tick();
+            const empty = container.querySelector(".field-wifi-networks-empty");
+            expect(empty.hidden).toBe(false);
+            const items = container.querySelectorAll(".field-wifi-networks-item");
+            expect(items).toHaveLength(0);
+        });
+
+        it("Add-network form appends the entry + triggers a save with wifi_networks in the payload", async () => {
+            const onSave = vi.fn().mockResolvedValue(undefined);
+            const container = document.createElement("div");
+            mount(container, {
+                fetchSettings: async () => SAMPLE_MULTI,
+                onSave,
+            });
+            await tick();
+            const ssidInput = container.querySelector(".field-wifi-networks-add-ssid");
+            const pwInput = container.querySelector(".field-wifi-networks-add-password");
+            const btn = container.querySelector(".field-wifi-networks-add-btn");
+            ssidInput.value = "GuestNet";
+            pwInput.value = "guest-password-1234";
+            btn.click();
+            await tick();
+            const items = container.querySelectorAll(".field-wifi-networks-item");
+            expect(items).toHaveLength(4);
+            const ssids = Array.from(items).map(
+                (li) => li.querySelector(".field-wifi-networks-item-ssid").textContent,
+            );
+            expect(ssids).toContain("GuestNet");
+            // Save fired at least once; the last call should carry
+            // the new entry with the operator-typed plaintext PSK.
+            expect(onSave).toHaveBeenCalled();
+            const lastPayload = onSave.mock.calls.at(-1)[0];
+            expect(lastPayload.wifi_networks).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({
+                        ssid: "GuestNet",
+                        password: "guest-password-1234",
+                    }),
+                ]),
+            );
+        });
+
+        it("Add-form rejects duplicate SSID without mutating the list", async () => {
+            const onSave = vi.fn().mockResolvedValue(undefined);
+            const container = document.createElement("div");
+            mount(container, {
+                fetchSettings: async () => SAMPLE_MULTI,
+                onSave,
+            });
+            await tick();
+            const ssidInput = container.querySelector(".field-wifi-networks-add-ssid");
+            const btn = container.querySelector(".field-wifi-networks-add-btn");
+            const statusEl = container.querySelector(".field-wifi-networks-add-status");
+            ssidInput.value = "NEBULA";  // already in the list
+            btn.click();
+            await tick();
+            const items = container.querySelectorAll(".field-wifi-networks-item");
+            expect(items).toHaveLength(3);  // unchanged
+            expect(statusEl.textContent).toMatch(/already in the list/);
+        });
+
+        it("Add-form rejects an over-cap SSID (>32 chars)", async () => {
+            const container = document.createElement("div");
+            mount(container, {
+                fetchSettings: async () => SAMPLE_MULTI,
+                onSave: vi.fn(),
+            });
+            await tick();
+            const ssidInput = container.querySelector(".field-wifi-networks-add-ssid");
+            const btn = container.querySelector(".field-wifi-networks-add-btn");
+            const statusEl = container.querySelector(".field-wifi-networks-add-status");
+            // Force past maxlength=32 by direct assignment (jsdom does
+            // enforce maxlength on `.value` setter for input[text],
+            // but not always for programmatic set). Ensure our JS
+            // guard fires either way.
+            const tooLong = "X".repeat(40);
+            ssidInput.value = tooLong;
+            btn.click();
+            await tick();
+            expect(container.querySelectorAll(".field-wifi-networks-item")).toHaveLength(3);
+            expect(statusEl.textContent).toMatch(/32/);
+        });
+
+        it("Remove button drops the entry + triggers a save", async () => {
+            const onSave = vi.fn().mockResolvedValue(undefined);
+            const container = document.createElement("div");
+            mount(container, {
+                fetchSettings: async () => SAMPLE_MULTI,
+                onSave,
+            });
+            await tick();
+            const beforeItems = container.querySelectorAll(".field-wifi-networks-item");
+            expect(beforeItems).toHaveLength(3);
+            // Click the remove button on the first row (NEBULA).
+            beforeItems[0]
+                .querySelector(".field-wifi-networks-item-remove")
+                .click();
+            await tick();
+            const afterItems = container.querySelectorAll(".field-wifi-networks-item");
+            expect(afterItems).toHaveLength(2);
+            const remaining = Array.from(afterItems).map(
+                (li) => li.querySelector(".field-wifi-networks-item-ssid").textContent,
+            );
+            expect(remaining).toEqual(["qarl", "admin"]);
+            expect(onSave).toHaveBeenCalled();
+            const lastPayload = onSave.mock.calls.at(-1)[0];
+            expect(lastPayload.wifi_networks.map((n) => n.ssid)).not.toContain("NEBULA");
+        });
+
+        it("save payload roundtrips sentinel '<set>' for existing entries so PSKs aren't rotated", async () => {
+            const onSave = vi.fn().mockResolvedValue(undefined);
+            const container = document.createElement("div");
+            mount(container, {
+                fetchSettings: async () => SAMPLE_MULTI,
+                onSave,
+            });
+            await tick();
+            // Kick a save by adding a fresh entry, then inspect the payload.
+            const ssidInput = container.querySelector(".field-wifi-networks-add-ssid");
+            const pwInput = container.querySelector(".field-wifi-networks-add-password");
+            const btn = container.querySelector(".field-wifi-networks-add-btn");
+            ssidInput.value = "Fresh";
+            pwInput.value = "fresh-password-1234";
+            btn.click();
+            await tick();
+            expect(onSave).toHaveBeenCalled();
+            const lastPayload = onSave.mock.calls.at(-1)[0];
+            const nebula = lastPayload.wifi_networks.find((n) => n.ssid === "NEBULA");
+            expect(nebula).toBeDefined();
+            // Sentinel is preserved verbatim so the backend keeps the
+            // stored PSK — this is the QA-B1 secret-redaction contract.
+            expect(nebula.password).toBe("<set>");
+        });
+    });
 });

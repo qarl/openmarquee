@@ -161,6 +161,45 @@ class TestHostapdPath:
         name_actuator._apply_hostapd_ssid("JasonsSign1")
         assert spy.calls == []
 
+    def test_ap_ssid_clamped_to_32_octets(self, monkeypatch, tmp_path):
+        """2026-07-03 (QA HARDEN A): hostapd's `ssid=` line is capped at
+        32 octets per 802.11. sign_name can be up to 63 chars (RFC 1123
+        hostname). A longer sign_name must be TRUNCATED before the AP
+        SSID rewrite so hostapd doesn't fail-to-restart and take the
+        recovery-AP down.
+
+        The hostname / Tailscale / mDNS consumers keep the full name;
+        only the AP SSID clamp is scoped to the hostapd sub-actuator."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "hostapd.conf"
+        conf.write_text("interface=ap0\nssid=openMarquee-SETUP\nchannel=6\n")
+        monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
+        # 40 chars, well over the 32-octet cap.
+        long_name = "A-Really-Long-Sign-Name-That-Overflows-XY"
+        assert len(long_name) == 41
+        name_actuator._apply_hostapd_ssid(long_name)
+        assert len(spy.calls) == 1
+        _, payload = spy.calls[0]
+        text = payload.decode("utf-8")
+        # The AP SSID line MUST be present, truncated to 32 chars.
+        expected_clamped = long_name[:32]
+        assert len(expected_clamped) == 32
+        assert f"ssid={expected_clamped}\n" in text
+        # And the FULL untruncated name must NOT appear anywhere.
+        assert long_name not in text
+
+    def test_exactly_32_chars_not_clamped(self, monkeypatch, tmp_path):
+        """Boundary check: a 32-octet sign_name is exactly at the cap
+        and MUST NOT be truncated."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "hostapd.conf"
+        conf.write_text("interface=ap0\nssid=old\n")
+        monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
+        boundary_name = "X" * 32
+        name_actuator._apply_hostapd_ssid(boundary_name)
+        _, payload = spy.calls[0]
+        assert f"ssid={boundary_name}\n" in payload.decode("utf-8")
+
 
 class TestApplySignName:
     """The top-level orchestrator calls all four sub-actuators
