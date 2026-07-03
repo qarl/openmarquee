@@ -330,7 +330,20 @@ def apply_wifi_networks(
         log.info("wifi-networks-reconcile: nmcli not available; skipping")
         return
 
-    _, existing = _list_nm_wifi_connections()
+    # 2026-07-03 (QA HARDEN B v2, F5): the enumerate probe MUST have
+    # succeeded before we mutate — otherwise we upsert against a blind
+    # view. With existing=[] the delete loop is a no-op (safe) but the
+    # upsert loop would fire _apply_add for EVERY wanted network,
+    # producing duplicate openmarquee-<ssid> profiles on the device.
+    # A reconcile against an unknown world is a no-op; the operator's
+    # next PUT (or the next reconcile-triggering settings edit) re-tries.
+    probe_ok, existing = _list_nm_wifi_connections()
+    if not probe_ok:
+        log.warning(
+            "wifi-networks-reconcile: nmcli enumerate probe failed; "
+            "skipping reconcile (would upsert against a blind view)"
+        )
+        return
     existing_by_ssid = {row["ssid"]: row for row in existing if row["ssid"]}
     wanted_ssids = {n.ssid for n in networks}
 

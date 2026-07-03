@@ -397,6 +397,42 @@ class TestApplyWifiNetworks:
         )
         assert spy.calls == []
 
+    def test_reconcile_noop_on_probe_failure(self, monkeypatch):
+        """2026-07-03 (QA HARDEN B v2, F5): if the enumerate probe
+        fails (`_list_nm_wifi_connections` returns `(False, [])`),
+        the reconcile MUST be a no-op — no add / modify / delete
+        crossings fire.
+
+        Motivation: without this guard, `existing=[]` from a
+        transient failure would make every wanted SSID look
+        un-provisioned + trigger `_apply_add`, producing duplicate
+        `openmarquee-<ssid>` profiles on the device. Better to leave
+        the previous reconcile in place + retry on next PUT.
+        """
+        spy = _install_netctl_spy(monkeypatch)
+
+        def _fake_run(args, **_kwargs):
+            cmd = list(args[1:])
+            if cmd[:5] == ["-t", "-f", "NAME,TYPE", "connection", "show"]:
+                # Simulate a probe failure.
+                return _FakeCompleted(returncode=1, stderr="transient error")
+            return _FakeCompleted(returncode=0)
+
+        monkeypatch.setattr("openmarquee.wifi_networks_actuator.subprocess.run", _fake_run)
+        monkeypatch.setattr(
+            "openmarquee.wifi_networks_actuator.shutil.which",
+            lambda name: "/usr/bin/nmcli" if name == "nmcli" else None,
+        )
+        wifi_networks_actuator.apply_wifi_networks(
+            [
+                WifiNetworkEntry(ssid="NEBULA", password="nebula-pw-here"),
+                WifiNetworkEntry(ssid="qarl", password="qarl-pw-here"),
+            ]
+        )
+        # NO netctl crossings — the reconcile bailed out on the probe
+        # failure before hitting the upsert or delete loops.
+        assert spy.calls == []
+
     def test_modify_fires_on_existing_ssid_match(self, monkeypatch):
         """When a profile with the same SSID already exists, the
         reconcile MODIFIES it (preserves the existing con-name),
