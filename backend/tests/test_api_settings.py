@@ -112,6 +112,13 @@ def test_put_then_get_round_trip(client: TestClient):
     # PUT payload above (back-compat: legacy PUT bodies still work),
     # but the model dumps it.
     expected["wifi_networks"] = []
+    # 2026-07-03 (qarl handover B1): the one-shot NM-import guard
+    # flag appears on every response; false when nmcli isn't
+    # available (CI runners) so the boot-time import doesn't fire
+    # + doesn't get persisted. Value is orthogonal to the round-
+    # trip semantics; include it in expected so the wire shape
+    # comparison stays exhaustive.
+    expected["wifi_networks_seeded_from_nm"] = False
     assert response.json() == expected
     # And reads back redacted.
     response = client.get("/api/settings")

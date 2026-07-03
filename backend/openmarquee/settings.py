@@ -21,6 +21,7 @@ of settings.json instead of inventing its own ad-hoc config path.
 """
 
 import json
+import logging
 import re
 import secrets
 from pathlib import Path
@@ -37,6 +38,8 @@ from pydantic import (
 
 from openmarquee._atomic import atomic_write_text
 from openmarquee._storage_recovery import quarantine_corrupt_file
+
+log = logging.getLogger(__name__)
 
 # Bump when the on-disk format changes in a non-backward-compatible way.
 # Same migration discipline as `openmarquee.schedule` and
@@ -367,6 +370,22 @@ class SystemSettings(BaseModel):
             "response)."
         ),
     )
+    # 2026-07-03 (qarl handover B1): one-shot boot flag set to True
+    # by SettingsStorage.load() after it runs the NM-import path
+    # (see `wifi_networks_actuator.import_existing_wifi_profiles`).
+    # This idempotency guard means the import fires AT MOST once
+    # per device — an operator who intentionally deletes every
+    # network via the dashboard won't get them silently re-imported
+    # on the next boot from stale nmcli state.
+    wifi_networks_seeded_from_nm: bool = Field(
+        default=False,
+        description=(
+            "One-shot flag: True once the boot-time NM-import path "
+            "has run for this device (whether it found profiles or "
+            "not). Prevents re-import after the operator intentionally "
+            "clears the list via the dashboard."
+        ),
+    )
 
     timezone: str | None = Field(
         default=None,
@@ -684,6 +703,15 @@ class SettingsStorage:
     def stats_snapshot(cls) -> dict[str, int]:
         return dict(cls._stats)
 
+    @staticmethod
+    def _wifi_nmcli_available() -> bool:
+        """Return True when nmcli is on PATH — used to gate the
+        one-shot boot-time import path. Extracted so tests can
+        monkeypatch it without touching subprocess."""
+        import shutil
+
+        return shutil.which("nmcli") is not None
+
     def load(self) -> SystemSettings:
         type(self)._stats["load_calls"] += 1
         """Load settings from disk. On first access (no file yet) we mint
@@ -747,12 +775,78 @@ class SettingsStorage:
         # secrets don't leak through the recovery path.
         try:
             data = json.loads(self.path.read_text())
-            return SystemSettings.model_validate(data)
+            settings = SystemSettings.model_validate(data)
         except (json.JSONDecodeError, ValidationError) as exc:
             quarantine_corrupt_file(self.path, exc)
             fresh = SystemSettings()
             self.save(fresh)
             return fresh
+        # 2026-07-03 (qarl handover B1): one-shot import-from-NM path.
+        # On the Jason device the 3 existing wifi profiles
+        # (openmarquee-sign-wifi, openmarquee-mgmt-wifi,
+        # openmarquee-admin-wifi) live in NM but not in
+        # settings.wifi_networks. `import_existing_wifi_profiles`
+        # walks nmcli's connection list + adopts them (reading their
+        # PSKs) so the dashboard's future "Wi-Fi networks" section
+        # shows the 3 already-programmed networks. Guarded by
+        # `wifi_networks_seeded_from_nm` so an operator who
+        # intentionally deletes every network via the dashboard
+        # doesn't get them silently re-imported on the next boot.
+        # Fails soft: nmcli missing / non-zero produces an empty
+        # import list + still flips the flag so we don't retry
+        # indefinitely.
+        if not settings.wifi_networks_seeded_from_nm:
+            settings = self._seed_wifi_networks_from_nm(settings)
+        return settings
+
+    def _seed_wifi_networks_from_nm(self, settings: SystemSettings) -> SystemSettings:
+        """One-shot: adopt NM's currently-configured wifi profiles
+        into settings.wifi_networks. Sets `wifi_networks_seeded_
+        from_nm=True` when the import actually ran against a
+        working nmcli so the boot-time overhead is bounded to once.
+
+        Dev hosts without nmcli LEAVE THE FLAG FALSE + DON'T
+        PERSIST so an eventual deploy to a real device still runs
+        the import cleanly — and so unit tests don't get an
+        implicit save-mutation of every load. Extracted as a
+        method so tests can monkeypatch either
+        `_wifi_nmcli_available` or `import_existing_wifi_profiles`.
+        """
+        if not self._wifi_nmcli_available():
+            return settings  # dev host — no flip, no save
+        from openmarquee.wifi_networks_actuator import import_existing_wifi_profiles
+
+        try:
+            imported = import_existing_wifi_profiles(ap_ssid=settings.wifi_ssid)
+        except Exception:  # noqa: BLE001 — fail-soft on the whole hook
+            log.exception("wifi-networks-import: unexpected error; skipping seed")
+            imported = []
+        # De-duplicate against any already-present entries (idempotency
+        # belt-and-suspenders — if the migration validator already
+        # added an entry for the same SSID, the import won't clobber).
+        existing_ssids = {n.ssid for n in settings.wifi_networks}
+        merged = list(settings.wifi_networks)
+        for entry_dict in imported:
+            if entry_dict["ssid"] in existing_ssids:
+                continue
+            try:
+                merged.append(WifiNetworkEntry.model_validate(entry_dict))
+            except ValidationError as exc:
+                log.warning(
+                    "wifi-networks-import: skipping malformed profile ssid=%r: %r",
+                    entry_dict.get("ssid"),
+                    exc,
+                )
+                continue
+        updated = settings.model_copy(
+            update={"wifi_networks": merged, "wifi_networks_seeded_from_nm": True}
+        )
+        # Persist so subsequent boots don't re-run the import.
+        try:
+            self.save(updated)
+        except OSError:
+            log.exception("wifi-networks-import: failed to persist seeded settings")
+        return updated
 
     def save(self, settings: SystemSettings) -> None:
         """Replace the on-disk settings with `settings`. Atomic via rename."""
