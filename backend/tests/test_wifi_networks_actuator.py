@@ -158,7 +158,10 @@ class TestImportExistingWifiProfiles:
             ),
         }
         self._install_fake_nmcli(monkeypatch, list_stdout, detail_stdouts)
-        imported = wifi_networks_actuator.import_existing_wifi_profiles(ap_ssid="openMarquee-SETUP")
+        probe_ok, imported = wifi_networks_actuator.import_existing_wifi_profiles(
+            ap_ssid="openMarquee-SETUP"
+        )
+        assert probe_ok is True
         assert len(imported) == 3
         ssids = {entry["ssid"] for entry in imported}
         assert ssids == {"NEBULA", "qarl", "admin"}
@@ -167,12 +170,18 @@ class TestImportExistingWifiProfiles:
         assert psks["qarl"] == "qarl-pw-here"
         assert psks["admin"] == "admin-pw-here"
 
-    def test_returns_empty_when_nmcli_missing(self, monkeypatch):
+    def test_returns_probe_failed_when_nmcli_missing(self, monkeypatch):
+        """2026-07-03 (QA HARDEN B): nmcli-missing is a probe
+        failure, not a success-with-no-profiles. Caller must be
+        able to tell them apart so a transient nmcli failure
+        doesn't flip `wifi_networks_seeded_from_nm`."""
         monkeypatch.setattr(
             "openmarquee.wifi_networks_actuator.shutil.which",
             lambda _name: None,
         )
-        assert wifi_networks_actuator.import_existing_wifi_profiles() == []
+        probe_ok, imported = wifi_networks_actuator.import_existing_wifi_profiles()
+        assert probe_ok is False
+        assert imported == []
 
     def test_skips_hidden_or_empty_ssid_profiles(self, monkeypatch):
         list_stdout = "openmarquee-hidden:802-11-wireless\n"
@@ -180,7 +189,12 @@ class TestImportExistingWifiProfiles:
             "openmarquee-hidden": "802-11-wireless.ssid:\nconnection.interface-name:wlan0\n",
         }
         self._install_fake_nmcli(monkeypatch, list_stdout, detail_stdouts)
-        assert wifi_networks_actuator.import_existing_wifi_profiles() == []
+        probe_ok, imported = wifi_networks_actuator.import_existing_wifi_profiles()
+        # Probe DID succeed — no profiles matched the filter, but nmcli
+        # responded cleanly. This is the "genuinely no wifi profiles"
+        # case QA HARDEN B distinguishes from a transient failure.
+        assert probe_ok is True
+        assert imported == []
 
     def test_colon_in_psk_round_trips(self, monkeypatch):
         """2026-07-03 (QA FIX 3): a PSK containing a `:` must
@@ -208,7 +222,8 @@ class TestImportExistingWifiProfiles:
             ),
         }
         self._install_fake_nmcli(monkeypatch, list_stdout, detail_stdouts)
-        imported = wifi_networks_actuator.import_existing_wifi_profiles()
+        probe_ok, imported = wifi_networks_actuator.import_existing_wifi_profiles()
+        assert probe_ok is True
         assert len(imported) == 1
         assert imported[0]["ssid"] == weird_ssid
         assert imported[0]["password"] == weird_psk
@@ -380,6 +395,42 @@ class TestApplyWifiNetworks:
         wifi_networks_actuator.apply_wifi_networks(
             [WifiNetworkEntry(ssid="X", password="pw-here-1234")]
         )
+        assert spy.calls == []
+
+    def test_reconcile_noop_on_probe_failure(self, monkeypatch):
+        """2026-07-03 (QA HARDEN B v2, F5): if the enumerate probe
+        fails (`_list_nm_wifi_connections` returns `(False, [])`),
+        the reconcile MUST be a no-op — no add / modify / delete
+        crossings fire.
+
+        Motivation: without this guard, `existing=[]` from a
+        transient failure would make every wanted SSID look
+        un-provisioned + trigger `_apply_add`, producing duplicate
+        `openmarquee-<ssid>` profiles on the device. Better to leave
+        the previous reconcile in place + retry on next PUT.
+        """
+        spy = _install_netctl_spy(monkeypatch)
+
+        def _fake_run(args, **_kwargs):
+            cmd = list(args[1:])
+            if cmd[:5] == ["-t", "-f", "NAME,TYPE", "connection", "show"]:
+                # Simulate a probe failure.
+                return _FakeCompleted(returncode=1, stderr="transient error")
+            return _FakeCompleted(returncode=0)
+
+        monkeypatch.setattr("openmarquee.wifi_networks_actuator.subprocess.run", _fake_run)
+        monkeypatch.setattr(
+            "openmarquee.wifi_networks_actuator.shutil.which",
+            lambda name: "/usr/bin/nmcli" if name == "nmcli" else None,
+        )
+        wifi_networks_actuator.apply_wifi_networks(
+            [
+                WifiNetworkEntry(ssid="NEBULA", password="nebula-pw-here"),
+                WifiNetworkEntry(ssid="qarl", password="qarl-pw-here"),
+            ]
+        )
+        # NO netctl crossings — the reconcile bailed out on the probe
+        # failure before hitting the upsert or delete loops.
         assert spy.calls == []
 
     def test_modify_fires_on_existing_ssid_match(self, monkeypatch):

@@ -279,6 +279,59 @@ const SECTION_TEMPLATE = `
                             </label>
                         </fieldset>
                     </fieldset>
+
+                    <!-- 2026-07-03 (qarl handover Phase B2): multi-network
+                         wifi list. The device round-robins these on link
+                         loss so a sign with 3 saved networks (qarl / NEBULA /
+                         admin) auto-recovers when the primary drops. -->
+                    <fieldset class="settings-wifi-networks">
+                        <legend>Wi-Fi networks</legend>
+                        <p class="settings-hint">
+                            Networks the sign can auto-join, in priority order.
+                            The device rotates through them if the current one
+                            drops. New devices adopt any pre-existing NetworkManager
+                            profiles on first boot.
+                        </p>
+                        <ul class="field-wifi-networks-list"
+                            style="list-style: none; padding: 0; margin: 8px 0; display: flex; flex-direction: column; gap: 6px;">
+                            <!-- rendered by renderWifiNetworksList() -->
+                        </ul>
+                        <p class="field-wifi-networks-empty"
+                           hidden
+                           style="margin: 6px 0; color: var(--om-text-dim); font-size: 13px;">
+                            No networks saved yet. Add one below.
+                        </p>
+                        <div class="field-wifi-networks-add"
+                             style="display: grid; gap: 8px; margin-top: 12px; padding: 10px; background: var(--om-card-bg-2); border-radius: 8px;">
+                            <div style="font-family: var(--om-mono); font-size: 11px; letter-spacing: 0.12em; color: var(--om-text-fade); text-transform: uppercase;">Add network</div>
+                            <div class="row" style="gap: 8px;">
+                                <label class="field om-field" style="flex: 1;">
+                                    <span>SSID</span>
+                                    <input type="text" class="om-input field-wifi-networks-add-ssid"
+                                           maxlength="32" placeholder="Network name" autocomplete="off">
+                                </label>
+                                <label class="field om-field" style="flex: 1;">
+                                    <span>Password</span>
+                                    <!-- No minlength on the DOM node: attachAutoSave gates
+                                         saves on form.reportValidity(), so a partial password
+                                         here would block autosave on ALL other fields until
+                                         cleared. JS handler (see click listener below)
+                                         enforces the 8-63 chars rule at Add time instead. -->
+                                    <input type="password" class="om-input field-wifi-networks-add-password"
+                                           maxlength="63" placeholder="8-63 chars"
+                                           autocomplete="new-password">
+                                </label>
+                            </div>
+                            <div style="display: flex; gap: 8px; align-items: center;">
+                                <button type="button" class="om-btn primary sm field-wifi-networks-add-btn">
+                                    Add network
+                                </button>
+                                <p class="field-wifi-networks-add-status"
+                                   role="status" aria-live="polite"
+                                   style="margin: 0; color: var(--om-text-dim); font-size: 12px;"></p>
+                            </div>
+                        </div>
+                    </fieldset>
                 </div>
             </div>
 
@@ -423,6 +476,29 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     const tsAuthUrlEl = container.querySelector(".field-tailscale-auth-url");
     const tsAuthPollEl = container.querySelector(".field-tailscale-auth-poll");
     const nowValueEl = container.querySelector('[data-field="device-now-value"]');
+
+    // 2026-07-03 (qarl handover Phase B2): multi-network wifi_networks
+    // list + add-form. Kept in a local mutable array (`wifiNetworks`)
+    // that the render + collectPayload paths both read; the operator's
+    // add/remove/edit actions mutate the array + trigger autosave.
+    const wifiNetworksListEl = container.querySelector(
+        ".field-wifi-networks-list",
+    );
+    const wifiNetworksEmptyEl = container.querySelector(
+        ".field-wifi-networks-empty",
+    );
+    const wifiNetworksAddSsidEl = container.querySelector(
+        ".field-wifi-networks-add-ssid",
+    );
+    const wifiNetworksAddPasswordEl = container.querySelector(
+        ".field-wifi-networks-add-password",
+    );
+    const wifiNetworksAddBtn = container.querySelector(
+        ".field-wifi-networks-add-btn",
+    );
+    const wifiNetworksAddStatusEl = container.querySelector(
+        ".field-wifi-networks-add-status",
+    );
 
     // One-time population of non-data-driven selects.
     for (const mode of OUTPUT_MODES) {
@@ -798,6 +874,21 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             // (matches the device's at-rest behavior; the boot path
             // already provisions HTTPS).
             tsHttpsEnabledEl.checked = settings.tailscale_https_enabled !== false;
+            // Phase B2: hydrate the multi-network list. The backend
+            // returns password as SECRET_SENTINEL "<set>" (or null) so
+            // the plaintext PSK never leaves the device; we hold the
+            // sentinel verbatim so a subsequent PUT round-trips it and
+            // the server preserves the stored value.
+            wifiNetworks.splice(0, wifiNetworks.length);
+            for (const entry of settings.wifi_networks || []) {
+                wifiNetworks.push({
+                    ssid: entry.ssid,
+                    password: entry.password ?? null,
+                    autoconnect: entry.autoconnect !== false,
+                    priority: Number(entry.priority ?? 0),
+                });
+            }
+            renderWifiNetworksList();
             syncWifiGrayOut();
             syncTailscaleStationGating();
             syncWs281xOrderVisibility();
@@ -913,6 +1004,100 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     // Enable.
     pollTailscaleStatus();
 
+    // 2026-07-03 (qarl handover Phase B2): local mirror of the
+    // multi-network wifi list. Persisted via the same autosave PUT
+    // that shipped display / hostname / etc., so no separate
+    // sub-endpoint is needed. See collectPayload for the wire shape.
+    // Sentinel-preserve pattern: existing entries carry password:
+    // "<set>" verbatim, and the backend's PSK-redaction logic in
+    // SettingsStorage recognises the sentinel + keeps the stored
+    // PSK. New entries carry the operator-typed plaintext.
+    const wifiNetworks = [];
+
+    function renderWifiNetworksList() {
+        // Rebuild the whole <ul> — the list is small (typically ≤5
+        // entries on a device) so full re-render is simpler than
+        // diffing.
+        wifiNetworksListEl.innerHTML = "";
+        if (wifiNetworks.length === 0) {
+            wifiNetworksEmptyEl.hidden = false;
+            return;
+        }
+        wifiNetworksEmptyEl.hidden = true;
+        wifiNetworks.forEach((entry, index) => {
+            const li = document.createElement("li");
+            li.className = "field-wifi-networks-item";
+            li.dataset.index = String(index);
+            li.style.cssText =
+                "display: flex; gap: 10px; align-items: center; "
+                + "padding: 8px 10px; border-radius: 6px; "
+                + "background: var(--om-card-bg-2);";
+            const ssidEl = document.createElement("span");
+            ssidEl.className = "field-wifi-networks-item-ssid";
+            ssidEl.style.cssText =
+                "font-family: var(--om-mono); font-size: 13px; flex: 1;";
+            ssidEl.textContent = entry.ssid;
+            const pwEl = document.createElement("span");
+            pwEl.className = "field-wifi-networks-item-password";
+            pwEl.style.cssText =
+                "font-family: var(--om-mono); font-size: 12px; color: var(--om-text-dim);";
+            pwEl.textContent = entry.password ? "password: <set>" : "no password";
+            const removeBtn = document.createElement("button");
+            removeBtn.type = "button";
+            removeBtn.className = "om-btn sm field-wifi-networks-item-remove";
+            removeBtn.textContent = "Remove";
+            removeBtn.addEventListener("click", () => {
+                wifiNetworks.splice(index, 1);
+                renderWifiNetworksList();
+                // Fire autosave: the form-level input event is the
+                // trigger attachAutoSave listens for.
+                form.dispatchEvent(new Event("input", { bubbles: true }));
+            });
+            li.appendChild(ssidEl);
+            li.appendChild(pwEl);
+            li.appendChild(removeBtn);
+            wifiNetworksListEl.appendChild(li);
+        });
+    }
+
+    wifiNetworksAddBtn?.addEventListener("click", () => {
+        const ssid = wifiNetworksAddSsidEl.value.trim();
+        const password = wifiNetworksAddPasswordEl.value;
+        wifiNetworksAddStatusEl.textContent = "";
+        if (!ssid) {
+            wifiNetworksAddStatusEl.textContent = "SSID required.";
+            return;
+        }
+        if (ssid.length > 32) {
+            wifiNetworksAddStatusEl.textContent = "SSID must be 32 chars or fewer.";
+            return;
+        }
+        if (password && (password.length < 8 || password.length > 63)) {
+            wifiNetworksAddStatusEl.textContent =
+                "Password must be 8-63 chars.";
+            return;
+        }
+        if (wifiNetworks.some((n) => n.ssid === ssid)) {
+            wifiNetworksAddStatusEl.textContent = `"${ssid}" is already in the list.`;
+            return;
+        }
+        wifiNetworks.push({
+            ssid,
+            password: password || null,
+            autoconnect: true,
+            priority: 0,
+        });
+        wifiNetworksAddSsidEl.value = "";
+        wifiNetworksAddPasswordEl.value = "";
+        renderWifiNetworksList();
+        // Trigger autosave — attachAutoSave listens for input events
+        // on any form-descendant field. dispatchEvent 'input' at the
+        // form level is the canonical way to kick a save without
+        // requiring the operator to touch another field.
+        form.dispatchEvent(new Event("input", { bubbles: true }));
+        wifiNetworksAddStatusEl.textContent = `Added "${ssid}".`;
+    });
+
     function collectPayload() {
         return {
             sign_name: signNameEl.value,
@@ -928,6 +1113,16 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             wifi_station_enabled: stationEnabledEl.checked,
             wifi_station_ssid: stationSsidEl.value.trim() || null,
             wifi_station_password: stationPasswordEl.value || null,
+            // Phase B2: multi-network list. Pass through verbatim
+            // (including sentinel `<set>` values for existing PSKs)
+            // so a save that only touches display fields doesn't
+            // rotate the stored passwords.
+            wifi_networks: wifiNetworks.map((n) => ({
+                ssid: n.ssid,
+                password: n.password,
+                autoconnect: n.autoconnect !== false,
+                priority: Number(n.priority) || 0,
+            })),
             ws281x_pixel_order: ws281xOrderEl.value || "row_major",
             timezone: tzEl.value || null,
             tailscale_enabled: tsEnabledEl.checked,

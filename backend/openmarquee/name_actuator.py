@@ -175,11 +175,26 @@ def _apply_avahi_hostname(name: str) -> None:
         )
 
 
+_HOSTAPD_SSID_MAX_OCTETS = 32
+"""IEEE 802.11 SSID field max is 32 octets. `sign_name` is already
+DNS-safe ASCII (SystemSettings validator: whitespace normalized to `-`,
+non-safe punctuation dropped), so char-count == octet-count and a
+simple `[:32]` slice is the correct clamp."""
+
+
 def _apply_hostapd_ssid(name: str) -> None:
     """Re-render the hostapd.conf with the new SSID + ship via the
     existing `hostapd-write-and-restart` netctl subcommand (2026-
     07-03 QA FIX 1 — reuse the already-sanctioned crossing rather
-    than reimplement it unprivileged)."""
+    than reimplement it unprivileged).
+
+    2026-07-03 (QA HARDEN A): `sign_name` can be up to 63 chars
+    (RFC 1123 hostname), but hostapd's `ssid=` line is capped at
+    32 octets per 802.11. A longer value makes hostapd fail-to-
+    restart and takes the recovery-AP down. Clamp the AP SSID to
+    the hostapd cap; the hostname / Tailscale / mDNS consumers
+    still see the full name.
+    """
     from openmarquee.network_supervisor_actuator import _netctl_send
 
     if not _HOSTAPD_CONF.exists():
@@ -190,7 +205,14 @@ def _apply_hostapd_ssid(name: str) -> None:
     except OSError as exc:
         log.warning("name-actuator: read %s failed: %r", _HOSTAPD_CONF, exc)
         return
-    rewritten = _substitute_ssid_line(original, name)
+    ap_ssid = name[:_HOSTAPD_SSID_MAX_OCTETS]
+    if ap_ssid != name:
+        log.info(
+            "name-actuator: sign_name %r exceeds hostapd 32-octet SSID cap; AP SSID clamped to %r",
+            name,
+            ap_ssid,
+        )
+    rewritten = _substitute_ssid_line(original, ap_ssid)
     if rewritten == original:
         return
 

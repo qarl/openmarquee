@@ -810,8 +810,9 @@ class SettingsStorage:
     def _seed_wifi_networks_from_nm(self, settings: SystemSettings) -> SystemSettings:
         """One-shot: adopt NM's currently-configured wifi profiles
         into settings.wifi_networks. Sets `wifi_networks_seeded_
-        from_nm=True` when the import actually ran against a
-        working nmcli so the boot-time overhead is bounded to once.
+        from_nm=True` ONLY when the nmcli probe actually succeeded
+        so the boot-time overhead is bounded to once but a
+        transient failure retries next boot.
 
         Dev hosts without nmcli LEAVE THE FLAG FALSE + DON'T
         PERSIST so an eventual deploy to a real device still runs
@@ -819,16 +820,29 @@ class SettingsStorage:
         implicit save-mutation of every load. Extracted as a
         method so tests can monkeypatch either
         `_wifi_nmcli_available` or `import_existing_wifi_profiles`.
+
+        2026-07-03 (QA HARDEN B): `import_existing_wifi_profiles`
+        now returns `(probe_ok, entries)`. Only flip the seeded
+        flag when `probe_ok=True` — a transient nmcli error means
+        we don't know whether there are inactive fallback profiles
+        (openmarquee-qarl-wifi, openmarquee-admin-wifi) that
+        aren't in settings.wifi_networks yet, and flipping the
+        flag would let a subsequent PUT-triggered reconcile delete
+        them (they'd be openmarquee-owned + inactive + missing
+        from the settings list → deletable per the reconcile
+        algorithm). Retrying next boot is cheap; losing the
+        fallbacks is not.
         """
         if not self._wifi_nmcli_available():
             return settings  # dev host — no flip, no save
         from openmarquee.wifi_networks_actuator import import_existing_wifi_profiles
 
+        probe_ok = False
+        imported: list[dict[str, object]] = []
         try:
-            imported = import_existing_wifi_profiles(ap_ssid=settings.wifi_ssid)
+            probe_ok, imported = import_existing_wifi_profiles(ap_ssid=settings.wifi_ssid)
         except Exception:  # noqa: BLE001 — fail-soft on the whole hook
             log.exception("wifi-networks-import: unexpected error; skipping seed")
-            imported = []
         # De-duplicate against any already-present entries (idempotency
         # belt-and-suspenders — if the migration validator already
         # added an entry for the same SSID, the import won't clobber).
@@ -846,6 +860,16 @@ class SettingsStorage:
                     exc,
                 )
                 continue
+        if not probe_ok:
+            # 2026-07-03 (QA HARDEN B): probe failed — do NOT flip
+            # the seeded flag so we retry on the next boot. Also
+            # don't persist a partial-merge, since a later successful
+            # probe should re-seed atomically.
+            log.info(
+                "wifi-networks-import: nmcli probe failed; leaving "
+                "wifi_networks_seeded_from_nm=False so next boot retries",
+            )
+            return settings
         updated = settings.model_copy(
             update={"wifi_networks": merged, "wifi_networks_seeded_from_nm": True}
         )

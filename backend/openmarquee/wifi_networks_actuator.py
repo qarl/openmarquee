@@ -134,10 +134,17 @@ def _is_setup_ap_row(name: str, iface: str | None, ssid: str | None, ap_ssid: st
     return bool(ap_ssid and ssid == ap_ssid)
 
 
-def _list_nm_wifi_connections() -> list[dict[str, str]]:
-    """Return `[{name, ssid, iface}, ...]` for every nmcli wifi
-    connection. Fails soft: on any subprocess error returns [] so
-    the caller (import path) proceeds with an empty adopt list.
+def _list_nm_wifi_connections() -> tuple[bool, list[dict[str, str]]]:
+    """Return `(probe_ok, [{name, ssid, iface, psk}, ...])` for every
+    nmcli wifi connection.
+
+    2026-07-03 (QA HARDEN B): the tuple lets the import path
+    distinguish "nmcli responded cleanly, no wifi profiles exist"
+    (probe_ok=True, rows=[]) from "nmcli errored transiently" (probe_ok
+    =False, rows=[]). Without this, `_seed_wifi_networks_from_nm`
+    can flip `wifi_networks_seeded_from_nm=True` on a transient
+    error and lose the inactive fallback profiles (qarl/admin) to
+    a later reconcile.
 
     Uses two calls because nmcli's `connection show` doesn't
     surface the SSID directly on some versions — we `connection
@@ -155,9 +162,9 @@ def _list_nm_wifi_connections() -> list[dict[str, str]]:
             "show",
         )
     except (_NmcliNotAvailable, subprocess.TimeoutExpired, OSError):
-        return []
+        return False, []
     if list_result.returncode != 0:
-        return []
+        return False, []
 
     rows: list[dict[str, str]] = []
     for line in list_result.stdout.splitlines():
@@ -218,16 +225,16 @@ def _list_nm_wifi_connections() -> list[dict[str, str]]:
                 "psk": detail_fields.get("802-11-wireless-security.psk", ""),
             }
         )
-    return rows
+    return True, rows
 
 
 def import_existing_wifi_profiles(
     *,
     ap_ssid: str | None = None,
-) -> list[dict[str, object]]:
+) -> tuple[bool, list[dict[str, object]]]:
     """Read NetworkManager's currently-configured wifi connection
-    profiles + return them as raw `WifiNetworkEntry`-shape dicts
-    (ssid + password + autoconnect + priority). Filters:
+    profiles + return `(probe_ok, [WifiNetworkEntry-shape dicts])`.
+    Filters:
 
       * Type != wifi → skipped.
       * setup-AP (`openmarquee-SETUP*` name, `ap0` iface, or SSID
@@ -235,11 +242,14 @@ def import_existing_wifi_profiles(
       * Profiles with an empty SSID (hidden network with no
         broadcast) → skipped.
 
-    Called from `SettingsStorage.load()` once per boot when
-    `wifi_networks_seeded_from_nm` is False — first-boot on Jason's
-    device adopts the 3 existing `openmarquee-*-wifi` profiles; a
-    dev host without nmcli gets [] and the settings continue with
-    an empty list.
+    2026-07-03 (QA HARDEN B): the return-tuple lets the caller
+    tell "nmcli responded successfully with zero wifi profiles"
+    (probe_ok=True, entries=[]) apart from "nmcli errored /
+    missing" (probe_ok=False, entries=[]). Only in the former
+    case is it safe to flip `wifi_networks_seeded_from_nm=True`;
+    a probe failure must NOT flip the flag or a subsequent PUT-
+    triggered reconcile would delete the inactive fallback
+    profiles that live in NM but aren't in settings.
 
     Returns dicts, not WifiNetworkEntry instances, so the caller
     can hand the result to `SystemSettings.model_validate` without
@@ -247,11 +257,12 @@ def import_existing_wifi_profiles(
     weird SSID falls through the model's error surface (not this
     helper's).
 
-    Fails soft: nmcli missing / non-zero / malformed output all
-    surface as an empty list.
+    Fails soft: nmcli missing / non-zero / malformed output surface
+    as `(False, [])`.
     """
+    probe_ok, rows = _list_nm_wifi_connections()
     imported: list[dict[str, object]] = []
-    for row in _list_nm_wifi_connections():
+    for row in rows:
         if _is_setup_ap_row(row["name"], row["iface"], row["ssid"], ap_ssid):
             log.info(
                 "wifi-networks-import: skipping setup-AP profile name=%r iface=%r ssid=%r",
@@ -284,7 +295,7 @@ def import_existing_wifi_profiles(
             ssid,
             "present" if psk else "absent",
         )
-    return imported
+    return probe_ok, imported
 
 
 def apply_wifi_networks(
@@ -319,7 +330,20 @@ def apply_wifi_networks(
         log.info("wifi-networks-reconcile: nmcli not available; skipping")
         return
 
-    existing = _list_nm_wifi_connections()
+    # 2026-07-03 (QA HARDEN B v2, F5): the enumerate probe MUST have
+    # succeeded before we mutate — otherwise we upsert against a blind
+    # view. With existing=[] the delete loop is a no-op (safe) but the
+    # upsert loop would fire _apply_add for EVERY wanted network,
+    # producing duplicate openmarquee-<ssid> profiles on the device.
+    # A reconcile against an unknown world is a no-op; the operator's
+    # next PUT (or the next reconcile-triggering settings edit) re-tries.
+    probe_ok, existing = _list_nm_wifi_connections()
+    if not probe_ok:
+        log.warning(
+            "wifi-networks-reconcile: nmcli enumerate probe failed; "
+            "skipping reconcile (would upsert against a blind view)"
+        )
+        return
     existing_by_ssid = {row["ssid"]: row for row in existing if row["ssid"]}
     wanted_ssids = {n.ssid for n in networks}
 
