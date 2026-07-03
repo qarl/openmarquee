@@ -84,6 +84,88 @@ def _default_sign_name() -> str:
     return f"Sign{secrets.token_hex(2)[:3].upper()}"
 
 
+# 2026-07-03 (qarl handover): DNS-safe subset for `sign_name` — the
+# device name propagates to hostname (hostnamectl), Tailscale hostname
+# (tailscale set --hostname), the setup-AP SSID, and the mDNS
+# host-name. All four consumers demand DNS-safe chars, so we validate
+# the field at the API boundary rather than letting the actuators
+# fail one-by-one on a slash / colon / emoji.
+#
+# RFC 1123 hostname chars, 1-63 per label, no trailing/leading
+# hyphen — same shape as _TAILSCALE_HOSTNAME_PATTERN, hoisted so
+# sign_name shares the rule.
+_SIGN_NAME_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?$")
+
+
+class WifiNetworkEntry(BaseModel):
+    """2026-07-03 (qarl handover): one home wifi network the device
+    should try to join. A list of these lives on
+    `SystemSettings.wifi_networks` and is reconciled against
+    NetworkManager connection profiles named
+    `openmarquee-managed-<i>` — that naming convention is what lets
+    the reconcile actuator know which profiles it owns without
+    clobbering hand-added `nmcli con add` profiles OR the setup-AP
+    profile.
+
+    Passwords are WRITE-ONLY at the API boundary — the redactor
+    replaces every populated `password` with the `<set>` sentinel
+    on responses, and the PUT handler swaps `<set>` for the stored
+    value before validation. Plaintext PSK never leaves the process.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    ssid: str = Field(
+        ...,
+        description="Home WiFi SSID (1-32 printable ASCII chars).",
+    )
+    password: str | None = Field(
+        default=None,
+        description=(
+            "WPA2 passphrase (8-63 printable ASCII chars). WRITE-ONLY: "
+            "GET / PUT responses redact this to `<set>` when populated "
+            "or omit it when empty; the PUT handler substitutes `<set>` "
+            "back with the stored value before validation."
+        ),
+    )
+    autoconnect: bool = Field(
+        default=True,
+        description=(
+            "Whether NetworkManager should auto-join this network when "
+            "in range. Set False for a network the operator wants "
+            "manual control over."
+        ),
+    )
+    priority: int = Field(
+        default=0,
+        ge=-999,
+        le=999,
+        description=(
+            "NetworkManager `connection.autoconnect-priority`. Higher "
+            "priority wins when multiple saved networks are in range. "
+            "Range clamped so a typo can't render the field invalid."
+        ),
+    )
+
+    @field_validator("ssid")
+    @classmethod
+    def _check_ssid(cls, value: str) -> str:
+        if not _SSID_PATTERN.match(value):
+            raise ValueError(
+                f"wifi_networks[].ssid: expected 1-32 printable ASCII chars, got {value!r}"
+            )
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def _check_password(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return None
+        if not _WIFI_PASSPHRASE_PATTERN.match(value):
+            raise ValueError("wifi_networks[].password: expected 8-63 printable ASCII chars")
+        return value
+
+
 class SystemSettings(BaseModel):
     """Device-wide configuration. One per device; persisted as a single file."""
 
@@ -239,17 +321,51 @@ class SystemSettings(BaseModel):
     # anything else that needs internet. Runs concurrently with the AP
     # on the Pi Zero 2 W's single radio (same channel; see SYSTEM_SPEC
     # §4.1). Empty creds are allowed while the toggle is off.
+    #
+    # LEGACY single-network fields — retained for read-only backward
+    # compatibility during rolling deploys + persisted-settings.json
+    # migration. New code paths (API + UI) key off `wifi_networks`
+    # below. On load, `_migrate_legacy_wifi_station_fields` converts
+    # any populated single-network shape into a one-entry
+    # `wifi_networks` list; the resulting SystemSettings then clears
+    # the legacy trio so a save-back round-trip persists only the
+    # canonical list. See `_migrate_legacy_wifi_station_fields`
+    # docstring for the full migration rationale.
     wifi_station_enabled: bool = Field(
         default=False,
-        description="Join the operator's existing WiFi on wlan0.",
+        description="DEPRECATED (2026-07-03): use `wifi_networks` (a non-empty "
+        "list implies the same 'STA mode wants to run' semantic).",
     )
     wifi_station_ssid: str | None = Field(
         default=None,
-        description="SSID of the home WiFi to join.",
+        description="DEPRECATED (2026-07-03): use `wifi_networks[i].ssid`.",
     )
     wifi_station_password: str | None = Field(
         default=None,
-        description="Passphrase for the home WiFi (8-63 printable ASCII).",
+        description="DEPRECATED (2026-07-03): use `wifi_networks[i].password`.",
+    )
+
+    # 2026-07-03 (qarl handover): multi-network home wifi. Each entry
+    # in this list becomes an NM connection profile on the device.
+    # `_wifi_station_actuator.apply_networks` reconciles the list
+    # against nmcli's `openmarquee-managed-<i>` connection names
+    # (add / update / delete) so the on-disk NM state matches the
+    # settings exactly + doesn't clobber the setup-AP profile or
+    # Tailscale.
+    #
+    # Passwords are WRITE-ONLY at the API boundary: `_redact_secrets`
+    # masks each `.password` on every GET / PUT response, and the
+    # PUT handler substitutes the `<set>` sentinel back with the
+    # stored value before validation so the UI can round-trip a
+    # network without ever seeing plaintext PSK.
+    wifi_networks: list[WifiNetworkEntry] = Field(
+        default_factory=list,
+        description=(
+            "Home WiFi networks the device should try to join, in "
+            "priority order. Each entry becomes an NM connection "
+            "profile; passwords are write-only (masked in every API "
+            "response)."
+        ),
     )
 
     timezone: str | None = Field(
@@ -315,6 +431,57 @@ class SystemSettings(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def _migrate_legacy_wifi_station_fields(cls, data: object) -> object:
+        """2026-07-03 (qarl handover): migrate the single-network
+        `wifi_station_ssid` / `wifi_station_password` shape into a
+        one-entry `wifi_networks` list. Fires BEFORE field validation
+        so a settings.json persisted pre-multi-wifi loads cleanly on
+        upgrade + a save-back round-trip persists only the canonical
+        list shape.
+
+        Idempotent: a payload that already carries `wifi_networks` is
+        left untouched, and if the migration WOULD produce a duplicate
+        entry (same SSID as an existing wifi_networks[i]) it's a
+        no-op. The legacy fields stay in the payload so back-compat
+        readers see them; a downstream `model_validator(mode="after")`
+        could zero them, but the low-risk path is to preserve for
+        now + let a follow-up PR retire the fields once the UI has
+        rolled out.
+
+        No-ops if `data` isn't a dict (a bare dict is the only
+        settings-load shape; anything else is Pydantic's problem).
+        """
+        if not isinstance(data, dict):
+            return data
+        legacy_ssid = data.get("wifi_station_ssid")
+        legacy_password = data.get("wifi_station_password")
+        existing_networks = data.get("wifi_networks") or []
+        if not legacy_ssid or not legacy_password:
+            return data
+        # Idempotent: if the legacy SSID already appears in the list
+        # (as a dict OR a fully-validated WifiNetworkEntry), skip.
+        for entry in existing_networks:
+            entry_ssid = (
+                entry.get("ssid") if isinstance(entry, dict) else getattr(entry, "ssid", None)
+            )
+            if entry_ssid == legacy_ssid:
+                return data
+        migrated = [
+            {
+                "ssid": legacy_ssid,
+                "password": legacy_password,
+                "autoconnect": True,
+                "priority": 0,
+            },
+            *existing_networks,
+        ]
+        # Return a shallow copy with the merged list so we don't
+        # mutate the caller's payload (matters when settings storage
+        # keeps its own reference for a subsequent save).
+        return {**data, "wifi_networks": migrated}
+
+    @model_validator(mode="before")
+    @classmethod
     def _coerce_legacy_output_mode(cls, data: object) -> object:
         """Coerce legacy on-disk output_mode values to "hdmi".
 
@@ -357,6 +524,54 @@ class SystemSettings(BaseModel):
             raise ValueError(f"wifi_ssid: expected 1-32 printable ASCII chars, got {value!r}")
         return value
 
+    @field_validator("sign_name")
+    @classmethod
+    def _check_sign_name(cls, value: str) -> str:
+        """2026-07-03 (qarl handover): sign_name propagates to hostname
+        (hostnamectl), Tailscale hostname (tailscale set --hostname),
+        the setup-AP SSID, and the mDNS host-name. All four consumers
+        need DNS-safe characters.
+
+        This validator NORMALIZES rather than rejects so a legacy
+        settings.json seeded with `"Lobby Sign"` or `"Coffee Shop"`
+        loads cleanly and the propagation actuators see a DNS-safe
+        value. Rules:
+          * Whitespace runs collapse to a single `-`.
+          * Any char outside `[A-Za-z0-9-]` is dropped.
+          * Leading / trailing `-` stripped (RFC 1123 label rule).
+          * Empty result → ValueError (something has to remain).
+          * Result over 63 chars → truncated.
+        A perfectly DNS-safe input is returned unchanged.
+        """
+        # Preserve the empty-string reject — the min_length=1 field
+        # constraint would already fire, but keeping this branch
+        # first makes the error message specific.
+        if not value:
+            raise ValueError("sign_name: must be non-empty")
+        # Collapse whitespace to hyphen so "Lobby Sign" → "Lobby-Sign".
+        normalized = re.sub(r"\s+", "-", value)
+        # Drop everything outside the RFC 1123 label alphabet.
+        normalized = re.sub(r"[^A-Za-z0-9\-]", "", normalized)
+        # Strip leading + trailing hyphens (RFC 1123 label rule).
+        normalized = normalized.strip("-")
+        # Truncate to 63 chars (DNS label limit).
+        normalized = normalized[:63]
+        if not normalized:
+            raise ValueError(
+                "sign_name: no DNS-safe characters left after "
+                "normalisation. Use letters/digits/hyphen "
+                f"(input was {value!r})."
+            )
+        if not _SIGN_NAME_PATTERN.match(normalized):
+            # Defense-in-depth: the normalisation above should always
+            # produce a matching string, but a bug in the regex here
+            # is easier to catch than a downstream actuator failure.
+            raise ValueError(
+                f"sign_name normalisation produced {normalized!r} which "
+                "still doesn't match the DNS-safe pattern"
+            )
+        return normalized
+
     @field_validator("wifi_password")
     @classmethod
     def _check_wifi_password(cls, value: str) -> str:
@@ -390,16 +605,26 @@ class SystemSettings(BaseModel):
         isolated — captive portal dies AND remote management dies. The
         UI gates against this; this validator is the server-side
         belt-and-braces so a manual settings.json edit can't brick a
-        deployed device."""
-        if not self.wifi_ap_enabled and not self.wifi_station_enabled:
+        deployed device.
+
+        2026-07-03 (qarl handover): "STA enabled" now means
+        `wifi_networks` is non-empty OR the legacy
+        `wifi_station_enabled` toggle is still on (back-compat during
+        rolling deploys). The legacy sub-clause preserving
+        wifi_station_ssid/password remains — a settings.json still
+        writing the legacy fields shouldn't produce an unreachable
+        device just because it hasn't migrated to the list yet.
+        """
+        sta_active = bool(self.wifi_networks) or self.wifi_station_enabled
+        if not self.wifi_ap_enabled and not sta_active:
             raise ValueError(
-                "at least one of wifi_ap_enabled / wifi_station_enabled "
-                "must be true — disabling both network modes would leave "
-                "the device unreachable"
+                "at least one of wifi_ap_enabled or wifi_networks / "
+                "wifi_station_enabled must be true — disabling every "
+                "network path would leave the device unreachable"
             )
-        # If station is enabled, it needs credentials to actually connect.
-        # Empty creds with the toggle on is a user mistake worth catching.
-        if self.wifi_station_enabled:
+        # Legacy sub-clause: if wifi_station_enabled is on (a payload
+        # that predates multi-wifi rollout), it still needs creds.
+        if self.wifi_station_enabled and not self.wifi_networks:
             if not self.wifi_station_ssid:
                 raise ValueError("wifi_station_enabled=true but wifi_station_ssid is empty")
             if not self.wifi_station_password:
