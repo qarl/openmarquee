@@ -4647,6 +4647,30 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         }
         let bake_us = t_bake.elapsed().as_micros();
 
+        // 2026-07-04 (Jason device H2 arc — geometry fix): capture
+        // the LOGICAL composite BEFORE the rotation present pass.
+        // Post-fix qarl reported top-half-black frames; QA
+        // diagnosed the source: `copy_tex_image_2d(mode_w, mode_h)`
+        // read from the POST-rotation default fb (physical dims
+        // = swapped mode dims on rotated panels), so on a portrait
+        // (rotation=90/270) sign the read exceeded the fb's height
+        // and returned undefined bytes for the excess rows. Fix:
+        // source from the LOGICAL composite here — either
+        // `scene_fbo` (rotated / non-identity) or default fb
+        // (identity + rotation=0). At this point in the fn (before
+        // the rotation present pass at Step 3 below), the LOGICAL
+        // composite is what's bound. Source dims here equal
+        // (mode_w, mode_h) — the size the transition side's
+        // UseCachedComposite blit expects.
+        unsafe {
+            capture_last_video_paint_composite(
+                session,
+                capture_composite_for,
+                H2CaptureSite::TextOverVideoCached,
+                mode_w,
+                mode_h,
+            )?
+        };
         // Step 3 (rotation case): present scene FBO -> default fb
         // with CURRENT brightness/gamma/rotation. Honors settings
         // changes even on cached paint.
@@ -4666,9 +4690,6 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         // Step 4: standard scanout swap+commit -- verbatim mirror
         // of the non-cached path's tail.
         let t_scanout = std::time::Instant::now();
-        // 2026-07-04 (Jason device H2 arc): capture the composited
-        // frame BEFORE swap — cached-blit path variant.
-        unsafe { capture_last_video_paint_composite(session, capture_composite_for)? };
         // QA live-preview hook (2026-06-13): no-op unless
         // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
         session.maybe_live_preview_capture();
@@ -4890,6 +4911,21 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         }
     }
 
+    // 2026-07-04 (Jason device H2 arc — geometry fix): capture the
+    // LOGICAL composite BEFORE the rotation present pass. See the
+    // capture-site comment in the cached-blit path above for the
+    // full rationale (post-rotation default fb is physical dims;
+    // sourcing mode dims from it exceeds the fb bounds on rotated
+    // targets and produces the "top half black" symptom).
+    unsafe {
+        capture_last_video_paint_composite(
+            session,
+            capture_composite_for,
+            H2CaptureSite::TextOverVideoLive,
+            mode_w,
+            mode_h,
+        )?
+    };
     // Step 3: present pass through scene FBO if rotated/non-
     // identity. Mirrors paint_and_present_one_frame_for_slide.
     let t_present = std::time::Instant::now();
@@ -4914,9 +4950,6 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // step release contract per qa/r38b-hdmi-cma-deep-read-2026-
     // 06-02.md §2).
     let t_phase = std::time::Instant::now();
-    // 2026-07-04 (Jason device H2 arc): capture the composited
-    // frame BEFORE swap on the non-cached text-over-video path.
-    unsafe { capture_last_video_paint_composite(session, capture_composite_for)? };
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
@@ -5438,6 +5471,20 @@ pub fn paint_and_present_one_video_slide_frame(
         t_phase.elapsed().as_nanos() as u64,
     );
     let t_phase = std::time::Instant::now();
+    // 2026-07-04 (Jason device H2 arc — geometry fix): capture the
+    // LOGICAL composite BEFORE the rotation present pass on the
+    // pure-video path too. Same rotation-vs-mode dim mismatch
+    // rationale as the text-over-video paths above.
+    let (mode_w_cap, mode_h_cap) = (session.mode_w as u32, session.mode_h as u32);
+    unsafe {
+        capture_last_video_paint_composite(
+            session,
+            capture_composite_for,
+            H2CaptureSite::VideoSlide,
+            mode_w_cap,
+            mode_h_cap,
+        )?
+    };
     // FYS bug 5: rotated route -- present the logical scene FBO onto
     // the panel-native default fb with the rotating present pass.
     if let Some((_fbo, tex)) = scene_fbo_handle {
@@ -5457,12 +5504,6 @@ pub fn paint_and_present_one_video_slide_frame(
     );
     let t_phase = std::time::Instant::now();
     let t_commit = if profile_first { Some(std::time::Instant::now()) } else { None };
-    // 2026-07-04 (Jason device H2 arc): capture the composited
-    // frame into `session.last_video_paint_composite_tex` if the
-    // PreloadSlide signal is armed for THIS slide's video_id.
-    // Runs BEFORE eglSwapBuffers so the GL_FRAMEBUFFER color
-    // attachment still holds the composited frame.
-    unsafe { capture_last_video_paint_composite(session, capture_composite_for)? };
     let r = finish_video_slide_swap_and_commit(session, card);
     crate::profile::record_phase(
         "paint_present",
@@ -5510,10 +5551,35 @@ pub fn paint_and_present_one_video_slide_frame(
 ///
 /// GLES2-safe (no READ_FRAMEBUFFER dance; `copy_tex_image_2d`
 /// sources from whatever is bound to `GL_FRAMEBUFFER`).
+/// 2026-07-04 (Jason device H2 arc — instrumented pass): seq
+/// counter for the env-gated PNG dump path. Wraps at
+/// `H2_DUMP_RING_SIZE` so `/var/tmp` doesn't fill on a long soak.
+#[cfg(target_os = "linux")]
+static H2_DUMP_SEQ: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(target_os = "linux")]
+const H2_DUMP_RING_SIZE: u32 = 20;
+
+/// 2026-07-04 (Jason device H2 arc — instrumented): capture-site
+/// tag for the log marker. Runtime callers pass the paint-fn name
+/// so QA can grep which of the three call sites fired.
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug)]
+enum H2CaptureSite {
+    VideoSlide,
+    TextOverVideoCached,
+    TextOverVideoLive,
+    TransitionBlit,
+}
+
 #[cfg(target_os = "linux")]
 unsafe fn capture_last_video_paint_composite(
     session: &mut EglSession,
     capture_composite_for: Option<uuid::Uuid>,
+    site: H2CaptureSite,
+    source_fb_w: u32,
+    source_fb_h: u32,
 ) -> Result<()> {
     use glow::HasContext;
     let Some(vid) = capture_composite_for else {
@@ -5521,7 +5587,50 @@ unsafe fn capture_last_video_paint_composite(
     };
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
+    let rotation = session.rotation;
     let gl = session.gl;
+    // Query the currently-bound GL_FRAMEBUFFER so the log line names
+    // the actual source of the copy_tex_image_2d read. `0` means the
+    // default framebuffer (window-system surface). Nonzero = a user-
+    // created FBO (scene_fbo, cached_pair_a/b, bake atlas, etc).
+    let bound_fbo = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+    // QA-mandated (2026-07-04) diagnostic line: bound_fbo + its dims
+    // + mode dims + rotation + site tag. Lets QA grep for
+    // "h2_composite_capture ... rotation=90 fb_dims=1280x720 mode=720x1280"
+    // and confirm the geometry mismatch class without needing a
+    // PNG. Emitted on every capture attempt (light — one per
+    // slide-hold paint during the ~1s PreloadSlide-armed window).
+    eprintln!(
+        "[perf] h2_composite_capture site={:?} vid={} bound_fbo={} fb_dims={}x{} \
+         mode={}x{} rotation={} slot_dims_match={}",
+        site,
+        &vid.to_string()[..8],
+        bound_fbo,
+        source_fb_w,
+        source_fb_h,
+        mode_w,
+        mode_h,
+        rotation,
+        matches!(
+            session.last_video_paint_composite_tex,
+            Some((slot_vid, _, w, h)) if slot_vid == vid && w == mode_w && h == mode_h,
+        ),
+    );
+    // 2026-07-04 (Jason device H2 arc — geometry fix): copy dims
+    // must be the MIN of the source framebuffer's dims and the
+    // mode dims — reading (mode_w × mode_h) from a physically-
+    // smaller default fb (post-rotation present pass) reads
+    // BEYOND the fb bounds → the "top half of the frame is
+    // black" symptom qarl reported. Callers are responsible for
+    // routing the capture through the LOGICAL composite FBO
+    // (scene_fbo when rotated / non-identity; default fb when
+    // identity + rotation=0) BEFORE the rotation present pass,
+    // so `source_fb_w/h` should always equal or exceed
+    // `mode_w/h`. Belt-and-suspenders clamp here so a future
+    // caller mis-wire won't produce black output — it'll produce
+    // a smaller-region capture that will at least be legible.
+    let copy_w = std::cmp::min(source_fb_w, mode_w);
+    let copy_h = std::cmp::min(source_fb_h, mode_h);
     // Reuse existing slot if it matches the vid AND is sized to
     // the current mode. Otherwise free + create fresh.
     let reuse = matches!(
@@ -5558,11 +5667,81 @@ unsafe fn capture_last_video_paint_composite(
         glow::RGBA,
         0,
         0,
-        mode_w as i32,
-        mode_h as i32,
+        copy_w as i32,
+        copy_h as i32,
         0,
     );
     gl.bind_texture(glow::TEXTURE_2D, None);
+    // Env-gated PNG dump (2026-07-04 QA-mandated). When
+    // OPENMARQUEE_H2_DUMP_COMPOSITE=1, glReadPixels the currently-
+    // bound framebuffer into an RGBA byte buffer + encode PNG at
+    // /var/tmp/h2-composite-<site>-<vid8>-<seq>.png. Wraps at
+    // H2_DUMP_RING_SIZE (20) so a long soak doesn't fill disk.
+    // OFF by default (env unset → zero cost beyond the getenv
+    // check).
+    if std::env::var_os("OPENMARQUEE_H2_DUMP_COMPOSITE").is_some() {
+        let seq = H2_DUMP_SEQ
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % H2_DUMP_RING_SIZE;
+        let mut pixels: Vec<u8> = vec![0u8; (copy_w * copy_h * 4) as usize];
+        gl.read_pixels(
+            0,
+            0,
+            copy_w as i32,
+            copy_h as i32,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(pixels.as_mut_slice()),
+        );
+        // GL's origin is bottom-left; PNG wants top-down. Flip.
+        let stride = (copy_w * 4) as usize;
+        let mut flipped: Vec<u8> = vec![0u8; pixels.len()];
+        for row in 0..(copy_h as usize) {
+            let src_off = row * stride;
+            let dst_off = (copy_h as usize - 1 - row) * stride;
+            flipped[dst_off..dst_off + stride]
+                .copy_from_slice(&pixels[src_off..src_off + stride]);
+        }
+        let path = format!(
+            "/var/tmp/h2-composite-{:?}-{}-{:02}.png",
+            site,
+            &vid.to_string()[..8],
+            seq,
+        );
+        match std::fs::File::create(&path) {
+            Ok(file) => {
+                let mut enc = png::Encoder::new(std::io::BufWriter::new(file), copy_w, copy_h);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                match enc.write_header() {
+                    Ok(mut writer) => {
+                        if let Err(e) = writer.write_image_data(&flipped) {
+                            eprintln!(
+                                "[perf] h2_dump_write_err path={} err={:#}",
+                                path, e,
+                            );
+                        } else {
+                            eprintln!(
+                                "[perf] h2_dump_wrote path={} dims={}x{} bytes={}",
+                                path,
+                                copy_w,
+                                copy_h,
+                                flipped.len(),
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[perf] h2_dump_header_err path={} err={:#}",
+                        path, e,
+                    ),
+                }
+            }
+            Err(e) => eprintln!(
+                "[perf] h2_dump_create_err path={} err={:#}",
+                path, e,
+            ),
+        }
+    }
     Ok(())
 }
 
