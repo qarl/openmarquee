@@ -1575,6 +1575,7 @@ precision mediump float;
 uniform sampler2D u_src_a;
 uniform sampler2D u_src_b;
 uniform float u_t;
+uniform vec2 u_resolution;
 varying vec2 v_uv;
 float _hash(vec2 p) {
     p = 50.0 * fract(p * 0.3183099 + vec2(0.71, 0.113));
@@ -1583,7 +1584,16 @@ float _hash(vec2 p) {
 void main() {
     vec4 a = texture2D(u_src_a, v_uv);
     vec4 b = texture2D(u_src_b, v_uv);
-    float threshold = _hash(v_uv);
+    // 2026-07-04 (Jason device): reveal quantized to 10x10 device-pixel
+    // blocks — every pixel in a block shares one threshold and flips
+    // together in the same random order. Pre-fix hashed on v_uv so the
+    // reveal was per-pixel and read as noise; qarl wanted the unit to
+    // be visible chunks across the room. PIXELATE_BLOCK_PX (10.0) is
+    // the shared knob with FS_PIXELATE. u_resolution is the framebuffer
+    // (width, height) in device pixels, bound alongside u_aspect at
+    // every draw site.
+    vec2 block = floor(v_uv * u_resolution / 10.0);
+    float threshold = _hash(block);
     float mask = step(threshold, u_t);
     gl_FragColor = mix(a, b, mask);
 }
@@ -1852,20 +1862,24 @@ void main() {
 
 /// Fragment shader: shutter — hexagonal aperture. A regular hexagon
 /// centered on the canvas grows from a point at t=0 to fully
-/// covering the canvas at t=1. The 16:9 aspect-correct projection
-/// keeps the hex regular at 1080p. The 0.866025 constant is
-/// cos(30°). Mirrors Python ref `_FRAGMENT_SHUTTER`.
+/// covering the canvas at t=1. `u_aspect` drives the x-normalization
+/// so the hex stays REGULAR at every target aspect (was hardcoded
+/// 16.0/9.0 pre-2026-07-04, which stretched the hex into a squashed
+/// hexagon on the rotated FYS 9:16 target — same failure mode as the
+/// halftone-oval bug). The 0.866025 constant is cos(30°). Mirrors
+/// Python ref `_FRAGMENT_SHUTTER`.
 pub const FS_SHUTTER: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_src_a;
 uniform sampler2D u_src_b;
 uniform float u_t;
+uniform float u_aspect;
 varying vec2 v_uv;
 void main() {
     vec4 a = texture2D(u_src_a, v_uv);
     vec4 b = texture2D(u_src_b, v_uv);
     vec2 d = v_uv - vec2(0.5);
-    d.x *= 16.0 / 9.0;
+    d.x *= u_aspect;
     float k = 0.866025;
     float c1 = abs(d.x * k + d.y * 0.5);
     float c2 = abs(d.y);
@@ -2543,12 +2557,19 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
         }
         "dissolve" => {
-            // Per-pixel hash threshold reveal.
+            // 2026-07-04 (Jason device): reveal quantized to 10 x 10
+            // device-pixel blocks — see FS_DISSOLVE for the rationale.
+            // Every pixel in a block shares one threshold and flips
+            // together in the same random order. `u_resolution` is
+            // bound by every dissolve caller (SP + legacy paths);
+            // `PIXELATE_BLOCK_PX` (10.0) is the shared knob with
+            // FS_PIXELATE.
             s.push_str("    vec3 ca = u_a_bg;\n");
             push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
             s.push_str("    vec3 cb = u_b_bg;\n");
             push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
-            s.push_str("    float threshold = _hash(v_uv);\n");
+            s.push_str("    vec2 block = floor(v_uv * u_resolution / 10.0);\n");
+            s.push_str("    float threshold = _hash(block);\n");
             s.push_str("    float mask = step(threshold, u_t);\n");
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
         }
@@ -2601,13 +2622,17 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
         }
         "shutter" => {
-            // Hexagonal aperture inscribed-radius test.
+            // Hexagonal aperture inscribed-radius test. u_aspect
+            // drives the x-normalization so the hex stays REGULAR
+            // at every target aspect — was hardcoded 16.0/9.0
+            // pre-2026-07-04 (Jason device), which squashed the hex
+            // on the rotated FYS 9:16 target.
             s.push_str("    vec3 ca = u_a_bg;\n");
             push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
             s.push_str("    vec3 cb = u_b_bg;\n");
             push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
             s.push_str("    vec2 d = v_uv - vec2(0.5);\n");
-            s.push_str("    d.x *= 16.0 / 9.0;\n");
+            s.push_str("    d.x *= u_aspect;\n");
             s.push_str("    float k = 0.866025;\n");
             s.push_str("    float c1 = abs(d.x * k + d.y * 0.5);\n");
             s.push_str("    float c2 = abs(d.y);\n");
@@ -6770,9 +6795,16 @@ mod tests {
             !FS_DISSOLVE.contains("precision highp"),
             "FS_DISSOLVE must not use highp (P3 dropped it)",
         );
-        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+        for uniform in ["u_src_a", "u_src_b", "u_t", "u_resolution"] {
             assert!(FS_DISSOLVE.contains(uniform));
         }
+        // 2026-07-04 (Jason device): reveal quantized to 10 x 10
+        // device-pixel blocks. Pin the block-index derivation +
+        // confirm the pre-fix per-pixel hash-on-v_uv is gone so a
+        // rewrite can't silently drop back to a native-pixel reveal.
+        assert!(FS_DISSOLVE.contains("floor(v_uv * u_resolution / 10.0)"));
+        assert!(FS_DISSOLVE.contains("_hash(block)"));
+        assert!(!FS_DISSOLVE.contains("_hash(v_uv)"));
         // IQ markers pinned: 1/pi seed scale (0.3183099),
         // 50.0 amplifier, vec2 seed offsets (0.71, 0.113). Pin so
         // a future edit doesn't silently regress to a non-mediump-
@@ -7224,17 +7256,36 @@ mod tests {
     #[test]
     fn fs_shutter_targets_gles2_and_pins_uniforms() {
         assert!(FS_SHUTTER.starts_with("#version 100\n"));
-        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+        for uniform in ["u_src_a", "u_src_b", "u_t", "u_aspect"] {
             assert!(FS_SHUTTER.contains(uniform));
         }
         // 0.866025 = cos(30°), the half-height-to-half-width ratio
-        // of a regular hexagon. 16:9 aspect correction keeps the
-        // hex regular at 1080p. 1.5*u_t is the inscribed-radius
+        // of a regular hexagon. 1.5*u_t is the inscribed-radius
         // growth (1.5 = ~max hex_d at the corners with aspect
         // correction).
         assert!(FS_SHUTTER.contains("0.866025"));
-        assert!(FS_SHUTTER.contains("16.0 / 9.0"));
         assert!(FS_SHUTTER.contains("1.5 * u_t"));
+        // 2026-07-04 (Jason device): x-normalization now driven by
+        // u_aspect so the hex stays REGULAR at every target aspect —
+        // was hardcoded 16.0/9.0 pre-fix, which squashed the hex on
+        // the rotated FYS 9:16 target (same failure mode as the
+        // halftone-oval bug). Pin the u_aspect drive AND assert the
+        // hardcode is gone so a regression can't silently drift
+        // back.
+        assert!(FS_SHUTTER.contains("d.x *= u_aspect"));
+        assert!(!FS_SHUTTER.contains("16.0 / 9.0"));
+    }
+
+    /// 2026-07-04 (Jason device): confirm the SP shutter arm also
+    /// uses u_aspect, not the pre-fix 16.0/9.0 hardcode. Mirrors the
+    /// halftone-oval regression guard in
+    /// `fs_transition_sp_source_batch_b_dispatch`.
+    #[test]
+    fn fs_transition_sp_source_shutter_uses_u_aspect() {
+        let shutter = fs_transition_sp_source("shutter", 0, 0).unwrap();
+        assert!(shutter.contains("d.x *= u_aspect"));
+        assert!(!shutter.contains("16.0 / 9.0"));
+        assert!(shutter.contains("0.866025"));
     }
 
     #[test]
@@ -7645,6 +7696,55 @@ mod tests {
         assert!(dissolve.contains("precision mediump float"));
         assert!(!dissolve.contains("precision highp"));
         assert!(dissolve.contains("_hash"));
+        // 2026-07-04 (Jason device): SP dissolve reveals in 10 x 10
+        // device-pixel blocks — every pixel in a block shares one
+        // threshold. Pin the block-index derivation + confirm the
+        // pre-fix per-pixel hash-on-v_uv is gone.
+        assert!(dissolve.contains("floor(v_uv * u_resolution / 10.0)"));
+        assert!(dissolve.contains("_hash(block)"));
+        assert!(!dissolve.contains("_hash(v_uv)"));
+    }
+
+    /// 2026-07-04 (Jason device): behavioural test for the dissolve
+    /// block-quantized reveal. Two v_uv coords that fall inside the
+    /// SAME 10 x 10 device-pixel block must produce the same hash-block
+    /// input; two coords in DIFFERENT blocks must produce different
+    /// block inputs (the hash itself can collide by chance — this test
+    /// only pins the quantization).
+    #[test]
+    fn dissolve_reveal_quantizes_to_10px_blocks() {
+        // Simulate a 1920x1080 target framebuffer.
+        let mode_w = 1920.0_f32;
+        let mode_h = 1080.0_f32;
+        let px = 1.0 / mode_w;
+        // Anchor v_uv inside block (37, 21) — column * 10 px, row * 10 px.
+        let anchor_u = 37.0 * 10.0 / mode_w + 3.0 * px;
+        let anchor_v = 21.0 * 10.0 / mode_h + 3.0 * (1.0 / mode_h);
+        // Any offset within the block should yield the same block index.
+        let block = |u: f32, v: f32| -> (i32, i32) {
+            let bx = (u * mode_w / 10.0).floor() as i32;
+            let by = (v * mode_h / 10.0).floor() as i32;
+            (bx, by)
+        };
+        let anchor_block = block(anchor_u, anchor_v);
+        for du in 0..10 {
+            for dv in 0..10 {
+                let u = 37.0 * 10.0 / mode_w + (du as f32) / mode_w;
+                let v = 21.0 * 10.0 / mode_h + (dv as f32) / mode_h;
+                assert_eq!(
+                    block(u, v),
+                    anchor_block,
+                    "coords within a 10px block must resolve to the same block index"
+                );
+            }
+        }
+        // Neighbour block on x-axis: block (38, 21) must differ.
+        let neighbour_u = 38.0 * 10.0 / mode_w + 3.0 * px;
+        assert_ne!(
+            block(neighbour_u, anchor_v),
+            anchor_block,
+            "coords in different 10px blocks must resolve to different block indices"
+        );
     }
 
     #[test]
