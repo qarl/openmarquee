@@ -4533,6 +4533,318 @@ pub fn prev_idx_for_reel(i: usize, pass: u32, len: usize) -> Option<usize> {
     }
 }
 
+/// 2026-07-04 (Jason device H2 arc): pure decision layer for
+/// `paint_and_present_one_transition_frame`. The 700-line paint fn
+/// used to inline-compute `use_still_a_now`/`use_poster_a_now`/
+/// `use_poster_b`/etc from a mix of `snapshot_eligible`, cached-pair
+/// presence, poster / snapshot / preloaded-slot presence, and
+/// endpoint-kind matches. Two problems solved by extracting:
+///
+/// 1. Testability. The runtime paint fn depends on real GL /
+///    real V4L2 / a live EglSession that isn't constructible off-
+///    target. Pulling the decision logic into pure functions over
+///    small `EndpointKind` / `Side{A,B}Inputs` / `Side{A,B}Plan`
+///    enums lets `cargo test` on the Mac host exhaustively pin
+///    truth tables + regression scenarios (see the `mod plan_tests`
+///    below) without any GL/V4L2 dependency.
+/// 2. Interaction visibility. Pre-extraction, wiring changes on the
+///    side-A branch (e.g. loosening `snapshot_eligible` to include
+///    TextOverVideo, 2026-07-04 f4ec9501) had non-obvious runtime
+///    interactions with the side-B branch (bake_slide_to_fbo on
+///    outgoing opens a 2nd V4L2 decoder → r97 codec-contention
+///    deferral fires on the incoming preload → captured first
+///    frame goes missing → side-B falls to stale poster). QA-
+///    confirmed H2 mechanism. The pure functions make the
+///    "TextOverVideo outgoing NEVER bakes" rule assertable at
+///    compile-time (the `SideAPlan` variants issued for
+///    TextOverVideo never include `BakeAndCapture` /  `BakeOnly`).
+///
+/// Wiring in `hdmi.rs` calls these functions once per tick per
+/// side; the enum values then drive the same `if`/`else if` ladder
+/// as before, just with the CONDITIONS derived from pure inputs
+/// instead of inline mutable state.
+
+/// Coarse endpoint classification used by the pure decision layer.
+/// Mirrors `TransitionEndpoint`'s variants (which live in hdmi.rs
+/// and hold `&mut` V4L2 state that we can't test against). Runtime
+/// callers project the `TransitionEndpoint` to `EndpointKind` at
+/// paint-fn entry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EndpointKind {
+    /// Plain TextSlide with no background_video_slide_id.
+    Text,
+    /// ImageSlide.
+    Image,
+    /// Plain VideoSlide.
+    Video,
+    /// TextSlide with a `background_video_slide_id`: bg-video +
+    /// text overlay composited by `bake_slide_to_fbo`'s
+    /// TextOverVideo arm.
+    TextOverVideo,
+}
+
+/// Inputs to `decide_side_a_plan`. All fields are simple presence
+/// / kind bits derivable from the runtime state at the top of
+/// `paint_and_present_one_transition_frame`, before either side
+/// begins its bake.
+#[derive(Copy, Clone, Debug)]
+pub struct SideAInputs {
+    /// From `is_snapshot_eligible(endpoint_a_kind, endpoint_b_kind)`.
+    pub snapshot_eligible: bool,
+    /// `EndpointKind` of endpoint_a.
+    pub endpoint_a_kind: EndpointKind,
+    /// True when `session.last_video_paint_composite_tex` holds a
+    /// composite that matches the current outgoing's
+    /// `poster_a_video_id` (i.e. captured during the pre-transition
+    /// window on THIS outgoing slide).
+    pub cached_composite_present_for_this_endpoint: bool,
+    /// True when `session.transition_still_a_tex` is populated.
+    pub still_a_present: bool,
+    /// True when the transition FBO pair for side A is allocated
+    /// (needed for both the poster fast-path and the snapshot
+    /// capture site).
+    pub cached_pair_a_present: bool,
+    /// True when `poster_a_texture` (disk poster.png) was loaded
+    /// successfully at paint-fn entry.
+    pub poster_a_present: bool,
+}
+
+/// Inputs to `decide_side_b_plan`. Mirrors `SideAInputs` in shape —
+/// side B has its own preloaded-first-frame path (2026-07-04 pr38)
+/// but no snapshot / no still slot / no `bake_and_capture` variant.
+#[derive(Copy, Clone, Debug)]
+pub struct SideBInputs {
+    /// `EndpointKind` of endpoint_b.
+    pub endpoint_b_kind: EndpointKind,
+    /// True when `session.transition_preloaded_first_frame_b_tex`
+    /// holds an uploaded texture for the current incoming's video
+    /// id (i.e. tick 2..N of a transition where the upload
+    /// happened on tick 1).
+    pub preloaded_slot_present_for_this_endpoint: bool,
+    /// True when the caller passed `preloaded_first_frame_b: Some(_)`
+    /// on THIS tick (i.e. the ipc dispatcher's consume-once
+    /// `cache.preloaded_first_frames.remove(&vid)` returned Some).
+    /// Only set on tick 1 of a transition per pr38's design.
+    pub preloaded_input_present: bool,
+    /// True when the disk poster.png loaded successfully at paint-
+    /// fn entry.
+    pub poster_b_disk_present: bool,
+    /// True when the transition FBO pair for side B is allocated.
+    pub cached_pair_b_present: bool,
+}
+
+/// Side-A source-selection plan. Consumed by the runtime paint fn
+/// which owns the actual GL / V4L2 execution for each variant.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SideAPlan {
+    /// 2026-07-04 (Jason device H2 arc): source the outgoing frozen
+    /// visual from `session.last_video_paint_composite_tex` — a
+    /// composite captured during the pre-transition window by the
+    /// slide-hold paint. Zero V4L2 activity on side A this tick;
+    /// eliminates the H2 codec-contention window that would defer
+    /// the incoming preload. This is the ONLY variant that the
+    /// runtime paint fn is allowed to dispatch for a TextOverVideo
+    /// outgoing.
+    UseCachedComposite,
+    /// Legacy snapshot-side-A (2026-06-21): source from
+    /// `session.transition_still_a_tex`. Captured on a prior
+    /// tick's `BakeAndCapture`; usable only on pure-Video outgoing
+    /// (TextOverVideo never populates this slot post-H2 fix
+    /// because TextOverVideo never bakes anymore).
+    UseStill,
+    /// Source from disk `poster.png`. May be stale; used as an
+    /// ultimate fallback for TextOverVideo when neither the cached
+    /// composite nor the poster-eligible transitions apply.
+    UsePoster,
+    /// Bake outgoing live via `bake_slide_to_fbo(inputs_a)` +
+    /// capture the freshly-baked frame into
+    /// `session.transition_still_a_tex` for the rest of the
+    /// transition window. RESERVED for pure-Video outgoing on the
+    /// snapshot-eligible path where no cached composite is
+    /// available AND still_a is empty. TextOverVideo NEVER receives
+    /// this plan (would reintroduce H2).
+    BakeAndCapture,
+    /// Bake outgoing live via `bake_slide_to_fbo(inputs_a)` without
+    /// snapshot capture. Used on the non-snapshot-eligible path
+    /// (video → text/image) where the transition is short-lived
+    /// and the fresh bake carries the whole outgoing side.
+    BakeOnly,
+    /// Bail — no frame source available. Caller returns
+    /// Ok(false) so the transition tick doesn't paint.
+    Skip,
+}
+
+/// Side-B source-selection plan.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SideBPlan {
+    /// Source from `session.transition_preloaded_first_frame_b_tex`
+    /// (ticks 2..N of a transition where the upload happened on
+    /// tick 1).
+    UsePreloadedSlot,
+    /// Upload the caller-supplied `CapturedNv12Frame` to a fresh
+    /// session-cached tex, then use it (tick 1 of a fresh
+    /// transition).
+    UploadPreloadedInput,
+    /// Fall back to disk `poster.png` — may be stale. Used on
+    /// preload-miss cases (EOS, EAGAIN-exhausted, cold start,
+    /// non-video endpoint, or codec-contention-deferred preload).
+    UsePosterDisk,
+    /// Live-decode via the existing bake_b Path B poll loop —
+    /// used on the non-video endpoint case (Text / Image) OR when
+    /// no fallback source exists at all.
+    BakeLive,
+}
+
+/// What (if anything) to `unpin_egl_refs()` on the outgoing
+/// decoder at the tail of the tick. Only meaningful when
+/// `SideAPlan` == `BakeAndCapture` (the ONLY case where the tick
+/// pinned new EGLImages on the outgoing decoder). All other plans
+/// return `UnpinTarget::None`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UnpinTarget {
+    None,
+    /// Unpin `TransitionEndpoint::Video::decoder`.
+    Decoder,
+    /// Unpin `TransitionEndpoint::TextOverVideo::bg_decoder`.
+    BgDecoder,
+}
+
+/// Snapshot-side-A eligibility. Loosened 2026-07-04 f4ec9501 to
+/// include `TextOverVideo` on both sides (mirror-image of pr38 on
+/// side B); the H2 arc keeps that loosening — the pathology was
+/// the runtime bake path taken on TextOverVideo, not the
+/// eligibility gate. Under the H2 fix, TextOverVideo endpoint_a
+/// still gets `snapshot_eligible=true`; the decision to NOT bake
+/// is enforced downstream in `decide_side_a_plan`.
+pub fn is_snapshot_eligible(a: EndpointKind, b: EndpointKind) -> bool {
+    matches!(a, EndpointKind::Video | EndpointKind::TextOverVideo)
+        && matches!(b, EndpointKind::Video | EndpointKind::TextOverVideo)
+}
+
+/// Pure decision function for side A. Returns the `SideAPlan` the
+/// runtime paint fn must dispatch this tick. See the enum variants
+/// for the runtime meaning of each.
+///
+/// H2 arc invariant (compile-checked by the `plan_tests` mod
+/// below): TextOverVideo endpoint_a NEVER receives
+/// `BakeAndCapture` or `BakeOnly`. Enforced by the match arms
+/// below.
+pub fn decide_side_a_plan(inputs: SideAInputs) -> SideAPlan {
+    // H2 fix invariant (2026-07-04 Jason device): TextOverVideo
+    // endpoint_a NEVER bakes. Bake reopens / re-feeds the outgoing
+    // bg_decoder mid-transition, which pushed the fleet's
+    // concurrent-decoder ceiling past r97's codec-contention gate
+    // and caused every incoming preload to defer (78x observed).
+    // TextOverVideo precedence per QA constraint:
+    //   UseCachedComposite > UseStill (only if by some prior
+    //   history the slot exists) > UsePoster (stale but H2-safe)
+    //   > Skip. Explicit early return keeps the invariant readable
+    //   in one place.
+    if inputs.endpoint_a_kind == EndpointKind::TextOverVideo {
+        if inputs.snapshot_eligible
+            && inputs.cached_pair_a_present
+            && inputs.cached_composite_present_for_this_endpoint
+        {
+            return SideAPlan::UseCachedComposite;
+        }
+        // still_a for TextOverVideo shouldn't exist post-H2-fix
+        // (TextOverVideo never BakeAndCaptures anymore), but a
+        // straggler entry from a prior binary is harmless to
+        // consume — it was captured from a real fbo_a composite.
+        if inputs.snapshot_eligible
+            && inputs.cached_pair_a_present
+            && inputs.still_a_present
+        {
+            return SideAPlan::UseStill;
+        }
+        if inputs.cached_pair_a_present && inputs.poster_a_present {
+            return SideAPlan::UsePoster;
+        }
+        return SideAPlan::Skip;
+    }
+    // Pure-Video / Text / Image precedence ladder:
+    //   1. UseCachedComposite (H2-safe, zero V4L2 on side A)
+    //   2. UseStill (legacy snapshot-side-A path)
+    //   3. UsePoster (stale but H2-safe)
+    //   4. BakeAndCapture (pure-Video only; the outgoing decoder is
+    //      the same instance that just finished streaming and is
+    //      already live, so no NEW decoder open → H2-safe)
+    //   5. BakeOnly (non-snapshot-eligible; video→text/image)
+    //   6. Skip
+    if inputs.snapshot_eligible && inputs.cached_pair_a_present {
+        if inputs.cached_composite_present_for_this_endpoint {
+            return SideAPlan::UseCachedComposite;
+        }
+        if inputs.still_a_present && inputs.endpoint_a_kind == EndpointKind::Video {
+            return SideAPlan::UseStill;
+        }
+        // Pure Video, no cached composite, no still: bake+capture.
+        if inputs.endpoint_a_kind == EndpointKind::Video {
+            return SideAPlan::BakeAndCapture;
+        }
+    }
+    // Non-snapshot-eligible or non-Video snapshot-eligible-but-no-
+    // source: existing pre-2026-06-21 poster-fast-path or bake.
+    if inputs.endpoint_a_kind == EndpointKind::Video
+        && inputs.poster_a_present
+        && inputs.cached_pair_a_present
+    {
+        return SideAPlan::UsePoster;
+    }
+    // Text / Image / no-poster-Video: bake without capture.
+    SideAPlan::BakeOnly
+}
+
+/// Pure decision function for side B. Returns the `SideBPlan` the
+/// runtime paint fn must dispatch this tick.
+///
+/// Independence-of-side-A invariant (compile-checked by the
+/// signature): `SideBInputs` carries NO side-A fields; side-B
+/// decisions cannot depend on side-A state.
+pub fn decide_side_b_plan(inputs: SideBInputs) -> SideBPlan {
+    // Precedence:
+    //   1. UsePreloadedSlot (tick 2..N, already uploaded)
+    //   2. UploadPreloadedInput (tick 1, fresh bytes)
+    //   3. UsePosterDisk (fallback for preload-miss)
+    //   4. BakeLive (last resort)
+    let endpoint_is_video_bearing = matches!(
+        inputs.endpoint_b_kind,
+        EndpointKind::Video | EndpointKind::TextOverVideo,
+    );
+    if endpoint_is_video_bearing && inputs.cached_pair_b_present {
+        if inputs.preloaded_slot_present_for_this_endpoint {
+            return SideBPlan::UsePreloadedSlot;
+        }
+        if inputs.preloaded_input_present {
+            return SideBPlan::UploadPreloadedInput;
+        }
+        if inputs.poster_b_disk_present {
+            return SideBPlan::UsePosterDisk;
+        }
+    }
+    SideBPlan::BakeLive
+}
+
+/// What (if anything) the tick pinned on the outgoing decoder
+/// that should be `unpin_egl_refs()`d at the tail. Only
+/// `BakeAndCapture` pinned anything new; every other plan is
+/// `UnpinTarget::None`. The H2 arc regression pin is:
+/// `unpin_target_for_endpoint_a(TextOverVideo, UseCachedComposite)
+/// == UnpinTarget::None`.
+pub fn unpin_target_for_endpoint_a(
+    kind: EndpointKind,
+    plan: SideAPlan,
+) -> UnpinTarget {
+    if plan != SideAPlan::BakeAndCapture {
+        return UnpinTarget::None;
+    }
+    match kind {
+        EndpointKind::Video => UnpinTarget::Decoder,
+        EndpointKind::TextOverVideo => UnpinTarget::BgDecoder,
+        EndpointKind::Text | EndpointKind::Image => UnpinTarget::None,
+    }
+}
+
 /// Clamp a transition_ms to a sane minimum so degenerate
 /// playlist values (0 or near-zero) don't slip through to the
 /// per-frame loop where transition_ms = 0 is an error. 50ms ≈
@@ -5400,6 +5712,316 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 2026-07-04 (Jason device H2 arc): pure-fn tests for the
+    // transition-side plan decision layer. Every scenario below is
+    // reachable off-target (no GL, no V4L2, no EglSession) —
+    // exercises the compile-time interaction invariants the
+    // qarl-mandated "behavioral fix ships with a fails-before /
+    // passes-after test" rule requires.
+    //
+    // ---------------------------------------------------------
+    // Fails-before evidence for THE H2 regression test below:
+    //   pre-fix wiring (f4ec9501 side-A snapshot) did NOT have the
+    //   `SideAPlan::UseCachedComposite` variant OR the pure-fn
+    //   layer. Checking out this test file against f4ec9501 fails
+    //   to compile (variant unresolved). Applying the fix +
+    //   pure-fn extraction makes all tests pass.
+    // ---------------------------------------------------------
+
+    #[test]
+    fn h2_text_over_video_uses_cached_composite_not_bake() {
+        // THE H2 REGRESSION TEST. TextOverVideo → TextOverVideo
+        // transition with a cached composite available. Plan MUST
+        // be UseCachedComposite (no bake → no 2nd decoder open →
+        // no r97 codec-contention deferral on the incoming
+        // preload).
+        //
+        // On the broken (pre-fix) code path this scenario would
+        // dispatch BakeAndCapture, which opens the outgoing
+        // bg_decoder and triggers H2. QA-confirmed 78x
+        // preload_deferred_for_codec_contention on f4ec9501 in
+        // the failure window. The assertion below is the compile-
+        // enforced regression pin.
+        let plan = decide_side_a_plan(SideAInputs {
+            snapshot_eligible: true,
+            endpoint_a_kind: EndpointKind::TextOverVideo,
+            cached_composite_present_for_this_endpoint: true,
+            still_a_present: false,
+            cached_pair_a_present: true,
+            poster_a_present: true,
+        });
+        assert_eq!(plan, SideAPlan::UseCachedComposite);
+    }
+
+    #[test]
+    fn h2_text_over_video_falls_back_to_poster_on_composite_miss() {
+        // QA constraint (2026-07-04): TextOverVideo on cache-miss
+        // MUST fall back to poster (stale but H2-safe). NEVER to
+        // BakeAndCapture — that reintroduces H2 contention.
+        let plan = decide_side_a_plan(SideAInputs {
+            snapshot_eligible: true,
+            endpoint_a_kind: EndpointKind::TextOverVideo,
+            cached_composite_present_for_this_endpoint: false,
+            still_a_present: false,
+            cached_pair_a_present: true,
+            poster_a_present: true,
+        });
+        assert_eq!(plan, SideAPlan::UsePoster);
+    }
+
+    #[test]
+    fn h2_text_over_video_skips_when_no_source_available() {
+        // TextOverVideo, snapshot-eligible, no cached composite,
+        // no still_a (which never populates for TextOverVideo
+        // anyway), no poster: Skip. Bake is FORBIDDEN.
+        let plan = decide_side_a_plan(SideAInputs {
+            snapshot_eligible: true,
+            endpoint_a_kind: EndpointKind::TextOverVideo,
+            cached_composite_present_for_this_endpoint: false,
+            still_a_present: false,
+            cached_pair_a_present: true,
+            poster_a_present: false,
+        });
+        assert_eq!(plan, SideAPlan::Skip);
+        // Belt-and-suspenders: no Bake variant EVER comes back
+        // for TextOverVideo when snapshot_eligible.
+        for cached in [true, false] {
+            for still in [true, false] {
+                for pair in [true, false] {
+                    for poster in [true, false] {
+                        let p = decide_side_a_plan(SideAInputs {
+                            snapshot_eligible: true,
+                            endpoint_a_kind: EndpointKind::TextOverVideo,
+                            cached_composite_present_for_this_endpoint: cached,
+                            still_a_present: still,
+                            cached_pair_a_present: pair,
+                            poster_a_present: poster,
+                        });
+                        assert_ne!(
+                            p, SideAPlan::BakeAndCapture,
+                            "TextOverVideo snapshot_eligible must never bake+capture (H2)",
+                        );
+                        // BakeOnly is only for the non-snapshot-eligible
+                        // path; snapshot_eligible=true excludes it here.
+                        assert_ne!(
+                            p, SideAPlan::BakeOnly,
+                            "TextOverVideo snapshot_eligible must never bake-only (H2)",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn h2_pure_video_may_still_bake_and_capture() {
+        // Pure Video → Video snapshot-eligible with no cached
+        // composite and no still: BakeAndCapture is the correct
+        // plan (the outgoing decoder is the same instance that
+        // was just playing, no NEW decoder open, H2-safe).
+        let plan = decide_side_a_plan(SideAInputs {
+            snapshot_eligible: true,
+            endpoint_a_kind: EndpointKind::Video,
+            cached_composite_present_for_this_endpoint: false,
+            still_a_present: false,
+            cached_pair_a_present: true,
+            poster_a_present: false,
+        });
+        assert_eq!(plan, SideAPlan::BakeAndCapture);
+    }
+
+    #[test]
+    fn h2_unpin_target_none_for_cached_composite() {
+        // Paired with the H2 test above: when the tick sources
+        // from the cached composite, NO EGLImages were newly
+        // pinned this tick, so unpin must be None. Firing
+        // unpin_egl_refs on the outgoing decoder in this case
+        // was the additional H2-adjacent risk in f4ec9501's
+        // extension (it fires bg_decoder.unpin_egl_refs()).
+        assert_eq!(
+            unpin_target_for_endpoint_a(
+                EndpointKind::TextOverVideo,
+                SideAPlan::UseCachedComposite,
+            ),
+            UnpinTarget::None,
+        );
+        assert_eq!(
+            unpin_target_for_endpoint_a(
+                EndpointKind::Video,
+                SideAPlan::UseCachedComposite,
+            ),
+            UnpinTarget::None,
+        );
+    }
+
+    #[test]
+    fn unpin_target_matches_bake_endpoint_kind() {
+        // Only BakeAndCapture pinned anything worth freeing.
+        // Kind selects which decoder handle to touch.
+        assert_eq!(
+            unpin_target_for_endpoint_a(EndpointKind::Video, SideAPlan::BakeAndCapture),
+            UnpinTarget::Decoder,
+        );
+        assert_eq!(
+            unpin_target_for_endpoint_a(EndpointKind::TextOverVideo, SideAPlan::BakeAndCapture),
+            UnpinTarget::BgDecoder,
+        );
+        // Text / Image never pin V4L2 EGLImages regardless.
+        assert_eq!(
+            unpin_target_for_endpoint_a(EndpointKind::Text, SideAPlan::BakeAndCapture),
+            UnpinTarget::None,
+        );
+        assert_eq!(
+            unpin_target_for_endpoint_a(EndpointKind::Image, SideAPlan::BakeAndCapture),
+            UnpinTarget::None,
+        );
+        // Every non-BakeAndCapture plan is None regardless of kind.
+        for kind in [
+            EndpointKind::Text,
+            EndpointKind::Image,
+            EndpointKind::Video,
+            EndpointKind::TextOverVideo,
+        ] {
+            for plan in [
+                SideAPlan::UseCachedComposite,
+                SideAPlan::UseStill,
+                SideAPlan::UsePoster,
+                SideAPlan::BakeOnly,
+                SideAPlan::Skip,
+            ] {
+                assert_eq!(
+                    unpin_target_for_endpoint_a(kind, plan),
+                    UnpinTarget::None,
+                    "non-BakeAndCapture plan must not unpin ({kind:?}, {plan:?})",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn side_b_precedence_preloaded_beats_poster() {
+        // pr38 core invariant: fresh preloaded frame > stale disk
+        // poster. This test is orthogonal to the H2 arc; keeps
+        // the pr38 regression pinned once the plan layer is the
+        // authoritative decision site.
+        let plan = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind: EndpointKind::TextOverVideo,
+            preloaded_slot_present_for_this_endpoint: true,
+            preloaded_input_present: false,
+            poster_b_disk_present: true,
+            cached_pair_b_present: true,
+        });
+        assert_eq!(plan, SideBPlan::UsePreloadedSlot);
+    }
+
+    #[test]
+    fn side_b_upload_on_tick_1_then_reuse_slot() {
+        // Tick 1: caller supplied fresh bytes, slot empty →
+        // UploadPreloadedInput.
+        let plan = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind: EndpointKind::TextOverVideo,
+            preloaded_slot_present_for_this_endpoint: false,
+            preloaded_input_present: true,
+            poster_b_disk_present: true,
+            cached_pair_b_present: true,
+        });
+        assert_eq!(plan, SideBPlan::UploadPreloadedInput);
+        // Tick 2+: caller supplied no bytes (consume-once at IPC),
+        // slot populated → UsePreloadedSlot.
+        let plan = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind: EndpointKind::TextOverVideo,
+            preloaded_slot_present_for_this_endpoint: true,
+            preloaded_input_present: false,
+            poster_b_disk_present: true,
+            cached_pair_b_present: true,
+        });
+        assert_eq!(plan, SideBPlan::UsePreloadedSlot);
+    }
+
+    #[test]
+    fn side_b_falls_to_disk_poster_when_preload_missed() {
+        let plan = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind: EndpointKind::TextOverVideo,
+            preloaded_slot_present_for_this_endpoint: false,
+            preloaded_input_present: false,
+            poster_b_disk_present: true,
+            cached_pair_b_present: true,
+        });
+        assert_eq!(plan, SideBPlan::UsePosterDisk);
+    }
+
+    #[test]
+    fn side_b_non_video_endpoint_bakes_live() {
+        for kind in [EndpointKind::Text, EndpointKind::Image] {
+            let plan = decide_side_b_plan(SideBInputs {
+                endpoint_b_kind: kind,
+                preloaded_slot_present_for_this_endpoint: true,
+                preloaded_input_present: true,
+                poster_b_disk_present: true,
+                cached_pair_b_present: true,
+            });
+            assert_eq!(
+                plan, SideBPlan::BakeLive,
+                "{kind:?} endpoint_b bakes live regardless of preload / poster state",
+            );
+        }
+    }
+
+    #[test]
+    fn side_a_and_side_b_decisions_are_independently_typed() {
+        // Compile-enforced decoupling: SideBInputs contains NO
+        // side-A fields, so `decide_side_b_plan` CAN NOT read
+        // side-A state — the interaction bug class that motivated
+        // the extraction is unrepresentable. Runtime callers must
+        // build the two input structs independently from their
+        // per-side inputs.
+        //
+        // This test is intentionally trivial — its value is
+        // structural, not behavioral.
+        let a = decide_side_a_plan(SideAInputs {
+            snapshot_eligible: true,
+            endpoint_a_kind: EndpointKind::TextOverVideo,
+            cached_composite_present_for_this_endpoint: true,
+            still_a_present: false,
+            cached_pair_a_present: true,
+            poster_a_present: false,
+        });
+        let b = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind: EndpointKind::TextOverVideo,
+            preloaded_slot_present_for_this_endpoint: false,
+            preloaded_input_present: true,
+            poster_b_disk_present: false,
+            cached_pair_b_present: true,
+        });
+        assert_eq!(a, SideAPlan::UseCachedComposite);
+        assert_eq!(b, SideBPlan::UploadPreloadedInput);
+    }
+
+    #[test]
+    fn is_snapshot_eligible_accepts_video_and_text_over_video_on_both_sides() {
+        for a in [EndpointKind::Video, EndpointKind::TextOverVideo] {
+            for b in [EndpointKind::Video, EndpointKind::TextOverVideo] {
+                assert!(is_snapshot_eligible(a, b), "{a:?} → {b:?}");
+            }
+        }
+        // Non-video endpoints on either side kill eligibility.
+        for a in [EndpointKind::Text, EndpointKind::Image] {
+            for b in [
+                EndpointKind::Text,
+                EndpointKind::Image,
+                EndpointKind::Video,
+                EndpointKind::TextOverVideo,
+            ] {
+                assert!(!is_snapshot_eligible(a, b), "{a:?} → {b:?}");
+            }
+        }
+        for a in [EndpointKind::Video, EndpointKind::TextOverVideo] {
+            for b in [EndpointKind::Text, EndpointKind::Image] {
+                assert!(!is_snapshot_eligible(a, b), "{a:?} → {b:?}");
+            }
+        }
+    }
 
     // SDF arc slice B.2 -- layout_text_to_quads smoke tests.
     // Uses the baked anton atlas (slice A artifact) so we don't

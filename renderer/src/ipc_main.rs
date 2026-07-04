@@ -3048,6 +3048,17 @@ fn run_paint_hook(
                                 "paint_dispatch",
                                 t_dispatch.elapsed().as_nanos() as u64,
                             );
+                            // 2026-07-04 (Jason device H2 arc):
+                            // capture-composite hint. Fires only
+                            // when PreloadSlide has armed the
+                            // signal AND the current outgoing's
+                            // bg_video_id matches this paint's
+                            // bg_id. `filter` returns None on
+                            // mismatch → paint fn skips the
+                            // glCopyTexImage2D cost.
+                            let capture_composite_for = state
+                                .capture_composite_video_id
+                                .filter(|v| *v == bg_id);
                             if let Err(e) = hdmi::paint_and_present_one_text_over_video_slide_frame(
                                 session,
                                 card,
@@ -3059,6 +3070,7 @@ fn run_paint_hook(
                                 &mut dec_state.next_sample_idx,
                                 &mut dec_state.frames_decoded,
                                 &dec_state.decoder,
+                                capture_composite_for,
                             ) {
                                 return err(format!("paint_slide (text-over-video) failed: {e:#}"));
                             }
@@ -3165,6 +3177,12 @@ fn run_paint_hook(
                         "paint_dispatch",
                         t_dispatch.elapsed().as_nanos() as u64,
                     );
+                    // 2026-07-04 (Jason device H2 arc): capture-
+                    // composite hint. For pure Video slides the
+                    // video_id matches the slide's own id.
+                    let capture_composite_for = state
+                        .capture_composite_video_id
+                        .filter(|v| *v == slide_id);
                     if let Err(e) = hdmi::paint_and_present_one_video_slide_frame(
                         session,
                         card,
@@ -3172,6 +3190,7 @@ fn run_paint_hook(
                         &mut dec_state.next_sample_idx,
                         &mut dec_state.frames_decoded,
                         &dec_state.decoder,
+                        capture_composite_for,
                     ) {
                         return err(format!("paint_slide (video) failed: {e:#}"));
                     }
@@ -3685,6 +3704,12 @@ fn handle_inner_request(
             err("Open already called; nested Open is not supported")
         }
         IpcRequest::BeginSlide(p) => {
+            // 2026-07-04 (Jason device H2 arc): new slide is now
+            // current. Clear the PreloadSlide-gated capture signal
+            // so any leftover slot-capture (belt-and-suspenders
+            // for the case where BeginTransition didn't fire, or
+            // fired for a different transition) stops here.
+            state.capture_composite_video_id = None;
             // PR3 fix-pass B1 (2026-07-01): the earlier "clear on
             // any BeginSlide/BeginTransition" safety net had the
             // wrong shape — playback keeps advancing under an
@@ -4044,6 +4069,13 @@ fn handle_inner_request(
             ok_empty()
         }
         IpcRequest::BeginTransition(p) => {
+            // 2026-07-04 (Jason device H2 arc): transition takes
+            // over — no more slide-hold paints for the outgoing;
+            // stop capturing. The SLOT (session.last_video_paint_
+            // composite_tex) persists through the transition
+            // window so paint_and_present_one_transition_frame can
+            // read it as the SideAPlan::UseCachedComposite source.
+            state.capture_composite_video_id = None;
             // PR3 fix-pass B1 (2026-07-01): companion to BeginSlide
             // above — the earlier per-transition clear was wrong.
             // A persistent card owns the screen; the two real exits
@@ -4297,6 +4329,31 @@ fn handle_inner_request(
             }
         }
         IpcRequest::PreloadSlide(p) => {
+            // 2026-07-04 (Jason device H2 arc): PreloadSlide is the
+            // ~1s "next transition is coming" signal from the backend.
+            // Use it as the gate for capturing the current outgoing
+            // slide's composited frame each remaining slide-hold
+            // paint tick, so `paint_and_present_one_transition_frame`
+            // can source the H2-safe frozen-entry visual from
+            // `session.last_video_paint_composite_tex` instead of
+            // baking (which would open a 2nd decoder → r97 codec-
+            // contention deferral of THIS preload). Signal cleared
+            // at BeginTransition (transition takes over) + BeginSlide
+            // (new slide is current) as belt-and-suspenders.
+            //
+            // The video_id we cache under is the outgoing's decoder-
+            // lookup id (Video's own id OR TextOverVideo's
+            // bg_video_slide_id), matching the poster_a_video_id
+            // shape the transition side keys on.
+            if let Some(cur) = state.current.as_ref() {
+                let outgoing_video_id: Option<uuid::Uuid> =
+                    match cache.items.peek(&cur.slide_id) {
+                        Some(ContentItem::Video(_)) => Some(cur.slide_id),
+                        Some(ContentItem::Text(s)) => s.background_video_slide_id,
+                        _ => None,
+                    };
+                state.capture_composite_video_id = outgoing_video_id;
+            }
             // r58 (2026-06-04): pre-warm a slide's cache state ahead
             // of BeginSlide so the V4L2 decoder bring-up cost
             // (~70-270 ms per r56 measurement) happens off the

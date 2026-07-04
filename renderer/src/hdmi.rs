@@ -614,6 +614,24 @@ pub struct EglSession<'a> {
     /// Freed at session teardown + on invalidation.
     transition_preloaded_first_frame_b_tex:
         Option<(uuid::Uuid, glow::NativeTexture, u32, u32)>,
+    /// 2026-07-04 (Jason device H2 arc): "last already-displayed
+    /// frame" for the outgoing side of the next transition. Captured
+    /// by `paint_and_present_one_frame_for_slide` at end of the
+    /// slide-hold paint, gated by `PlaybackState.capture_composite_
+    /// video_id` (set by the PreloadSlide IPC arm during the ~1s
+    /// preload-lead window before a transition; NOT full-time — a
+    /// 6-12% GPU overhead on a 24fps at-budget sign is not
+    /// acceptable). Consumed by `paint_and_present_one_transition_
+    /// frame` as the H2-safe `SideAPlan::UseCachedComposite`
+    /// source: zero V4L2 activity on side A at transition time
+    /// → no 2nd outgoing decoder open → no r97 codec-contention
+    /// deferral on the incoming preload → pr38's preloaded-first-
+    /// frame path continues to work.
+    ///
+    /// Shape: `(source_video_id, tex, mode_w, mode_h)`. Freed on
+    /// session teardown.
+    last_video_paint_composite_tex:
+        Option<(uuid::Uuid, glow::NativeTexture, u32, u32)>,
     /// r102.2: dims the cached transition_fbo_a/b were
     /// allocated against. Invalidates the cache on mode change
     /// (HDMI hot-plug, rotation flip). `None` while the cache
@@ -1044,6 +1062,7 @@ where
         transition_tex_b: None,
         transition_still_a_tex: None,
         transition_preloaded_first_frame_b_tex: None,
+        last_video_paint_composite_tex: None,
         transition_fbo_dims: None,
         // CMA-arc 2026-06-22 RANK 3: idle-free timestamps. Stamped
         // by ensure_transition_fbo_pair + ensure_bake_atlas; read
@@ -1356,6 +1375,12 @@ where
         // session teardown so slot's video_id / dims don't survive
         // into a next session.
         if let Some((_vid, tex, _, _)) = session.transition_preloaded_first_frame_b_tex.take() {
+            gl.delete_texture(tex);
+        }
+        // 2026-07-04 H2 arc: last-video-paint composite (side-A
+        // frozen-entry source). Same teardown shape as the pr38
+        // preloaded_first_frame slot above.
+        if let Some((_vid, tex, _, _)) = session.last_video_paint_composite_tex.take() {
             gl.delete_texture(tex);
         }
         session.transition_fbo_dims = None;
@@ -3993,6 +4018,11 @@ pub fn render_video_slide_in_session(
             &mut state.next_sample_idx,
             &mut state.frames_decoded,
             &state.decoder,
+            // 2026-07-04 (Jason device H2 arc): standalone reel
+            // preview path — no PreloadSlide signal machinery,
+            // never captures. Pass None; paint fn skips the
+            // glCopyTexImage2D cost.
+            None,
         )?;
         let elapsed = frame_start.elapsed();
         if elapsed < frame_budget {
@@ -4435,6 +4465,15 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
+    // 2026-07-04 (Jason device H2 arc): when `Some(vid)`, capture
+    // the currently-bound framebuffer's composited color attachment
+    // into `session.last_video_paint_composite_tex` at end of paint
+    // (before eglSwapBuffers). Gated by the PreloadSlide-set
+    // `PlaybackState.capture_composite_video_id` — caller passes
+    // Some only when the signal is active AND matches this slide's
+    // outgoing video_id. See `SideAPlan::UseCachedComposite`
+    // consumer in `paint_and_present_one_transition_frame`.
+    capture_composite_for: Option<uuid::Uuid>,
 ) -> Result<()> {
     use glow::HasContext;
     // CMA-arc 2026-06-22 RANK 3: same idle-FBO free as the
@@ -4627,6 +4666,9 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         // Step 4: standard scanout swap+commit -- verbatim mirror
         // of the non-cached path's tail.
         let t_scanout = std::time::Instant::now();
+        // 2026-07-04 (Jason device H2 arc): capture the composited
+        // frame BEFORE swap — cached-blit path variant.
+        unsafe { capture_last_video_paint_composite(session, capture_composite_for)? };
         // QA live-preview hook (2026-06-13): no-op unless
         // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
         session.maybe_live_preview_capture();
@@ -4872,6 +4914,9 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // step release contract per qa/r38b-hdmi-cma-deep-read-2026-
     // 06-02.md §2).
     let t_phase = std::time::Instant::now();
+    // 2026-07-04 (Jason device H2 arc): capture the composited
+    // frame BEFORE swap on the non-cached text-over-video path.
+    unsafe { capture_last_video_paint_composite(session, capture_composite_for)? };
     // QA live-preview hook (2026-06-13): no-op unless
     // OPENMARQUEE_LIVE_PREVIEW_PATH is set in the env.
     session.maybe_live_preview_capture();
@@ -5295,6 +5340,12 @@ pub fn paint_and_present_one_video_slide_frame(
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
+    // 2026-07-04 (Jason device H2 arc): capture-composite arg.
+    // Same shape + semantics as
+    // paint_and_present_one_text_over_video_slide_frame's arg;
+    // see that fn's docs. For pure-Video slides, the video_id
+    // matches the slide's own id.
+    capture_composite_for: Option<uuid::Uuid>,
 ) -> Result<()> {
     // CMA-arc 2026-06-22 RANK 3: idle-free at video-slide hold
     // entry. THIS IS THE WEDGE-REEL PATH (3-video crossfade
@@ -5406,6 +5457,12 @@ pub fn paint_and_present_one_video_slide_frame(
     );
     let t_phase = std::time::Instant::now();
     let t_commit = if profile_first { Some(std::time::Instant::now()) } else { None };
+    // 2026-07-04 (Jason device H2 arc): capture the composited
+    // frame into `session.last_video_paint_composite_tex` if the
+    // PreloadSlide signal is armed for THIS slide's video_id.
+    // Runs BEFORE eglSwapBuffers so the GL_FRAMEBUFFER color
+    // attachment still holds the composited frame.
+    unsafe { capture_last_video_paint_composite(session, capture_composite_for)? };
     let r = finish_video_slide_swap_and_commit(session, card);
     crate::profile::record_phase(
         "paint_present",
@@ -5433,6 +5490,82 @@ pub fn paint_and_present_one_video_slide_frame(
 /// drmModeAddFB, page-flip commit, shift scanout_current ->
 /// scanout_prev. Caller must have ALREADY dropped the Frame +
 /// incremented frames_decoded.
+/// 2026-07-04 (Jason device H2 arc): capture the currently-bound
+/// framebuffer's composited color attachment into
+/// `session.last_video_paint_composite_tex`. Called at end of a
+/// video-bearing slide-hold paint, RIGHT BEFORE eglSwapBuffers,
+/// gated by the PreloadSlide signal.
+///
+/// Cost: one `glCopyTexImage2D` at mode dims (~2-4ms at 720p on
+/// bcm2835). Only fires when `capture_composite_for` is `Some(vid)`
+/// (i.e. the PreloadSlide-set `PlaybackState.capture_composite_
+/// video_id` matched THIS slide's video id at ipc dispatch time).
+///
+/// Reuses an existing slot texture if it matches the current
+/// `vid` AND is sized to the current mode; otherwise frees the
+/// stale entry and creates a fresh one. The texture is a plain
+/// RGBA8 sized to `(mode_w, mode_h)` — the same shape the
+/// transition side's `run_blit_pass` expects for
+/// `SideAPlan::UseCachedComposite`.
+///
+/// GLES2-safe (no READ_FRAMEBUFFER dance; `copy_tex_image_2d`
+/// sources from whatever is bound to `GL_FRAMEBUFFER`).
+#[cfg(target_os = "linux")]
+unsafe fn capture_last_video_paint_composite(
+    session: &mut EglSession,
+    capture_composite_for: Option<uuid::Uuid>,
+) -> Result<()> {
+    use glow::HasContext;
+    let Some(vid) = capture_composite_for else {
+        return Ok(());
+    };
+    let mode_w = session.mode_w as u32;
+    let mode_h = session.mode_h as u32;
+    let gl = session.gl;
+    // Reuse existing slot if it matches the vid AND is sized to
+    // the current mode. Otherwise free + create fresh.
+    let reuse = matches!(
+        session.last_video_paint_composite_tex,
+        Some((slot_vid, _, w, h)) if slot_vid == vid && w == mode_w && h == mode_h,
+    );
+    let dest_tex = if reuse {
+        session
+            .last_video_paint_composite_tex
+            .expect("guarded above")
+            .1
+    } else {
+        if let Some((_, stale_tex, _, _)) = session.last_video_paint_composite_tex.take() {
+            gl.delete_texture(stale_tex);
+        }
+        let tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("H2 last-composite create_texture: {e}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        session.last_video_paint_composite_tex = Some((vid, tex, mode_w, mode_h));
+        tex
+    };
+    // copy_tex_image_2d sources from currently bound
+    // GL_FRAMEBUFFER's color attachment (the composited frame).
+    gl.bind_texture(glow::TEXTURE_2D, Some(dest_tex));
+    gl.copy_tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA,
+        0,
+        0,
+        mode_w as i32,
+        mode_h as i32,
+        0,
+    );
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn finish_video_slide_swap_and_commit(
     session: &mut EglSession,
@@ -6061,16 +6194,45 @@ pub fn paint_and_present_one_transition_frame(
     // stale still (e.g. back-to-back BeginTransition without an
     // intervening Slide hold -- BeginTransition handler frees
     // anyway, so this is theoretically dead, but cheap).
-    let snapshot_eligible = matches!(
-        &endpoint_a,
-        TransitionEndpoint::Video { .. }
-    ) && matches!(
-        &endpoint_b,
-        TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
-    );
+    // 2026-07-04 (Jason device H2 arc): project the runtime
+    // `TransitionEndpoint` variants to `EndpointKind` so the pure
+    // decision layer in hdmi_logic.rs can key on kind without
+    // touching any &mut V4L2 state. `is_snapshot_eligible` here
+    // is called with the widened endpoint_a set (Video |
+    // TextOverVideo) matching the pure-fn definition in
+    // hdmi_logic.rs.
+    use crate::hdmi_logic::{
+        decide_side_a_plan, decide_side_b_plan, is_snapshot_eligible,
+        unpin_target_for_endpoint_a, EndpointKind, SideAInputs, SideAPlan,
+        SideBInputs, SideBPlan, UnpinTarget,
+    };
+    let endpoint_a_kind = match &endpoint_a {
+        TransitionEndpoint::Text(_) => EndpointKind::Text,
+        TransitionEndpoint::Image(_) => EndpointKind::Image,
+        TransitionEndpoint::Video { .. } => EndpointKind::Video,
+        TransitionEndpoint::TextOverVideo { .. } => EndpointKind::TextOverVideo,
+    };
+    let endpoint_b_kind = match &endpoint_b {
+        TransitionEndpoint::Text(_) => EndpointKind::Text,
+        TransitionEndpoint::Image(_) => EndpointKind::Image,
+        TransitionEndpoint::Video { .. } => EndpointKind::Video,
+        TransitionEndpoint::TextOverVideo { .. } => EndpointKind::TextOverVideo,
+    };
+    let snapshot_eligible = is_snapshot_eligible(endpoint_a_kind, endpoint_b_kind);
     if !snapshot_eligible {
         free_transition_still_a_tex(session);
     }
+    // 2026-07-04 (Jason device H2 arc): does the last-video-paint
+    // composite slot hold a matching frame for THIS transition's
+    // outgoing? Matches by Uuid — slot's `source_video_id` must
+    // equal the current `poster_a_video_id` (Video's own id OR
+    // TextOverVideo's bg-video slide id). Populated by the
+    // slide-hold paint during the PreloadSlide-armed window
+    // preceding this BeginTransition.
+    let cached_composite_present_for_this_endpoint = matches!(
+        (session.last_video_paint_composite_tex, poster_a_video_id),
+        (Some((slot_vid, _, _, _)), Some(cur_vid)) if slot_vid == cur_vid,
+    );
 
     // Ok(true) = transition frame painted + ready to present;
     // Ok(false) = FYS bug C skip (a video endpoint had no frame
@@ -6229,17 +6391,76 @@ pub fn paint_and_present_one_transition_frame(
         // V4L2 feeds (snapshot blit). r97 deferred-preload +
         // side-B Path B retry still active as the ceiling
         // guard + cold-start fallback.
-        let use_still_a_now = snapshot_eligible
-            && cached_pair_a.is_some()
-            && session.transition_still_a_tex.is_some();
-        // Poster on A is suppressed when snapshot_eligible
-        // (snapshot is the strictly-better source for
-        // outgoing). Non-eligible cases (e.g. TextOverVideo
-        // on A) keep the existing poster path verbatim.
-        let use_poster_a_now = use_poster_a
-            && cached_pair_a.is_some()
-            && !snapshot_eligible;
-        let (fbo_a, tex_a) = if use_poster_a_now {
+        // 2026-07-04 (Jason device H2 arc): all side-A source-
+        // selection is now driven by the pure `decide_side_a_plan`
+        // from hdmi_logic.rs. Runtime bools below are 1:1 with
+        // SideAPlan variants; the plan_tests mod exhaustively
+        // pins the truth table (see the h2_* tests) so
+        // TextOverVideo endpoint_a can NEVER land on a Bake
+        // variant — compile-checked by the enum + covered by
+        // the exhaustive-loop regression test.
+        let side_a_plan = decide_side_a_plan(SideAInputs {
+            snapshot_eligible,
+            endpoint_a_kind,
+            cached_composite_present_for_this_endpoint,
+            still_a_present: session.transition_still_a_tex.is_some(),
+            cached_pair_a_present: cached_pair_a.is_some(),
+            poster_a_present: poster_a_texture.is_some(),
+        });
+        let use_cached_composite_a_now = side_a_plan == SideAPlan::UseCachedComposite;
+        let use_still_a_now = side_a_plan == SideAPlan::UseStill;
+        let use_poster_a_now = side_a_plan == SideAPlan::UsePoster;
+        let should_bake_a_and_capture = side_a_plan == SideAPlan::BakeAndCapture;
+        let should_skip_a = side_a_plan == SideAPlan::Skip;
+        // Emit the tick-1 journal marker QA asked for. Plan is
+        // constant across ticks 2..N so once is sufficient; the
+        // marker lets QA correlate side_a_plan=UseCachedComposite
+        // firing WITH side_b_plan=UsePreloadedSlot/UploadPreloaded
+        // Input on the sign log — both signals green together
+        // guards against the pr37/pr38/f4ec9501 whack-a-mole.
+        if progress < 0.05 {
+            eprintln!(
+                "[perf] side_a_plan={:?} side_b_plan_hint=pending endpoint_a_kind={:?} \
+                 endpoint_b_kind={:?} snapshot_eligible={} cached_composite_hit={} \
+                 progress={:.3}",
+                side_a_plan, endpoint_a_kind, endpoint_b_kind,
+                snapshot_eligible, cached_composite_present_for_this_endpoint,
+                progress,
+            );
+        }
+        // If the plan is Skip, bail early: no side-A source is
+        // available (rare — TextOverVideo with no cached composite,
+        // no still, no poster). Caller returns Ok(false) so the
+        // tick doesn't paint.
+        if should_skip_a {
+            crate::hdmi_logic::warn_paint_transition_skip(
+                kind, progress, "side_a_plan_skip",
+            );
+            return Ok(false);
+        }
+        // Silence unused-variable warnings on the plan bits we
+        // haven't wired into their own branch below yet. Both
+        // BakeAndCapture / BakeOnly land in the shared `else` bake
+        // path since the pure-fn already gated their eligibility;
+        // the `should_bake_a_and_capture` flag guides the
+        // subsequent snapshot-capture block.
+        let _ = should_bake_a_and_capture;
+        let (fbo_a, tex_a) = if use_cached_composite_a_now {
+            // H2-safe side-A source: blit the previously-captured
+            // slide-hold composite into the cached transition
+            // FBO_A. Zero V4L2 activity on side A this tick.
+            let (_vid, composite_tex, _tex_w, _tex_h) = session
+                .last_video_paint_composite_tex
+                .expect("guarded by cached_composite_present_for_this_endpoint");
+            let (fbo, tex) = cached_pair_a.expect("guarded by cached_pair_a_present");
+            use glow::HasContext;
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
+            session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            session.gl.clear(glow::COLOR_BUFFER_BIT);
+            run_blit_pass(session.gl, composite_tex)?;
+            (fbo, tex)
+        } else if use_poster_a_now {
             let (poster_tex, poster_w, poster_h) = poster_a_texture.expect("guarded above");
             let (fbo, tex) = cached_pair_a.expect("guarded above");
             use glow::HasContext;
@@ -6358,7 +6579,15 @@ pub fn paint_and_present_one_transition_frame(
         //
         // Frees: BeginSlide / BeginTransition / Advance-after-
         // Slide-paint hooks in ipc_main.rs handle lifecycle.
-        if snapshot_eligible
+        // 2026-07-04 (Jason device H2 arc): snapshot-capture site
+        // gated on `side_a_plan == BakeAndCapture` (the ONLY plan
+        // that leaves a freshly-baked live-decode frame in fbo_a).
+        // Pre-H2-fix the gate was `snapshot_eligible &&
+        // !still_a_present`, which fired whenever the plan was
+        // BakeAndCapture BUT ALSO whenever poster/still had just
+        // been consumed (spurious captures of stale/poster
+        // content). The pure-fn gate is tighter + kind-safe.
+        if should_bake_a_and_capture
             && cached_pair_a.is_some()
             && session.transition_still_a_tex.is_none()
         {
@@ -6416,8 +6645,25 @@ pub fn paint_and_present_one_transition_frame(
             // borrow ended at the inputs_a match (the bake call
             // released the inner reborrows), so a fresh `&`
             // borrow is fine here.
-            if let TransitionEndpoint::Video { decoder, .. } = &endpoint_a {
-                decoder.unpin_egl_refs();
+            // 2026-07-04 (Jason device H2 arc): unpin dispatch
+            // driven by the pure `unpin_target_for_endpoint_a`.
+            // Returns `Decoder` for Video, `BgDecoder` for
+            // TextOverVideo (though TextOverVideo can never reach
+            // BakeAndCapture per the H2 invariant), and `None`
+            // otherwise. Compile-checked by the exhaustive
+            // `unpin_target_matches_bake_endpoint_kind` test.
+            match unpin_target_for_endpoint_a(endpoint_a_kind, side_a_plan) {
+                UnpinTarget::Decoder => {
+                    if let TransitionEndpoint::Video { decoder, .. } = &endpoint_a {
+                        decoder.unpin_egl_refs();
+                    }
+                }
+                UnpinTarget::BgDecoder => {
+                    if let TransitionEndpoint::TextOverVideo { bg_decoder, .. } = &endpoint_a {
+                        bg_decoder.unpin_egl_refs();
+                    }
+                }
+                UnpinTarget::None => {}
             }
         }
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
@@ -6497,6 +6743,33 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
+        // 2026-07-04 (Jason device H2 arc): compute the side-B
+        // plan via the pure `decide_side_b_plan` for the tick-1
+        // journal marker. The runtime dispatch below still uses
+        // the existing `use_poster_b` boolean (behavior unchanged
+        // from pr38) — the plan is derived from the SAME inputs so
+        // the two agree by construction. Emitting the marker at
+        // tick 1 lets QA correlate side_a_plan=UseCachedComposite
+        // firing WITH side_b_plan=UsePreloadedSlot/UploadPreloaded
+        // Input in the sign log (both signals green together).
+        let side_b_plan = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind,
+            preloaded_slot_present_for_this_endpoint: matches!(
+                (session.transition_preloaded_first_frame_b_tex, poster_b_video_id),
+                (Some((slot_vid, _, _, _)), Some(cur_vid)) if slot_vid == cur_vid,
+            ),
+            preloaded_input_present: preloaded_first_frame_b.is_some(),
+            poster_b_disk_present: poster_b_texture_disk.is_some(),
+            cached_pair_b_present: cached_pair_b.is_some(),
+        });
+        if progress < 0.05 {
+            eprintln!(
+                "[perf] side_b_plan={:?} endpoint_b_kind={:?} progress={:.3}",
+                side_b_plan, endpoint_b_kind, progress,
+            );
+        }
+        let _ = side_b_plan;
+        let _: SideBPlan;  // keep the type reference so unused-import doesn't trip
         // r110 stage 3 commit 3.2.2: poster fast-path for bake_b
         // (mirrors bake_a's poster fast-path above; same FROZEN
         // ENTRY contract). When endpoint_b is video-bearing AND
