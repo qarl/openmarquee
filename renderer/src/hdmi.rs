@@ -4481,6 +4481,10 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     // the text-slide hold path, so this call site is load-bearing
     // for the wedge-reel A/B.
     unsafe { free_idle_session_fbos(session); }
+    // 2026-07-04 (Jason device loop-desync arc — instrument B):
+    // 30s-throttled decoder resource snapshot from the text-over-
+    // video paint hot path. Same shape as the pure-video call site.
+    decoder.emit_resource_snapshot_throttled();
     // r61 Phase B (2026-06-04): first-frame paint breakdown for the
     // text-over-video hot path. r58 + r57 shaved most of the
     // pre-transition stall; the residual gap qarl can still see is
@@ -5387,6 +5391,11 @@ pub fn paint_and_present_one_video_slide_frame(
     // fired on the wedge-reel A/B. Adding here lights the
     // reclaim where the test reel exercises it.
     unsafe { free_idle_session_fbos(session); }
+    // 2026-07-04 (Jason device loop-desync arc — instrument B):
+    // 30s-throttled decoder resource snapshot from the pure-video
+    // paint hot path. Emit is cheap on the miss branch (one atomic
+    // load) so this is fine at 24fps.
+    decoder.emit_resource_snapshot_throttled();
     let mode_w = session.mode_w as u32;
     let mode_h = session.mode_h as u32;
     // V4L2 piece 4f first-frame profile gate. profile_first is

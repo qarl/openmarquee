@@ -1277,6 +1277,21 @@ struct DecoderInner {
     /// buffer was dequeued. r48 closes the race by tracking
     /// kernel-vs-userspace ownership explicitly.
     free_output_slots: VecDeque<u32>,
+    /// 2026-07-04 (Jason device loop-desync arc): monotonic counter
+    /// bumped on each `resume_after_eos` call, i.e. once per video
+    /// loop boundary. Feeds the `[perf] video_loop_boundary
+    /// loop_num=<N>` marker so QA can grep loop N's resource
+    /// snapshot against loop N+K's and see leaks / drifts. Also
+    /// gates the `OPENMARQUEE_LOOP_DUMP=1` env-gated PNG dump
+    /// (first ~3 frames post-loop). Reset only on decoder open.
+    loop_counter: usize,
+    /// 2026-07-04 (Jason device loop-desync arc): counter of
+    /// frames DQBUF'd since the most recent `resume_after_eos`.
+    /// Bounded window for the env-gated PNG dump path: only the
+    /// first `LOOP_DUMP_FRAMES_PER_LOOP` (currently 3) frames are
+    /// captured after each loop so `/var/tmp` doesn't fill on a
+    /// long soak. Reset to 0 on `resume_after_eos`.
+    frames_since_last_loop: u32,
     /// File. Declared LAST so Drop closes it AFTER the
     /// MmapRegion Drops munmap. (Rust drops struct fields in
     /// declaration order; mapping the kernel order requires the
@@ -1873,6 +1888,123 @@ fn open_with_ebusy_backoff(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
+/// 2026-07-04 (Jason device loop-desync arc — instrument): resource
+/// counts snapshot for the `[perf] video_loop_boundary` /
+/// `[perf] decoder_resource_snapshot` markers. All values are
+/// point-in-time reads from `DecoderInner` state under the lock.
+/// Grep pattern QA uses:
+///
+///   [perf] video_loop_boundary decoder_seq=<N> loop_num=<N>
+///     output_slots_free=<N>/<N> capture_in_flight=<N>/<N>
+///     capture_egl_images=<N>/<N> cap_fmt_wh=<WxH> cap_fmt_stride=<N>
+///     cap_fmt_num_planes=<N> cap_display_h=<N> dmabuf_fds_len=<N>
+///     capture_drained=<bool> output_streaming=<bool>
+///     capture_streaming=<bool> frames_since_last_loop=<N>
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct DecoderResourceSnapshot {
+    pub output_slots_free: usize,
+    pub output_slots_alloc: usize,
+    pub capture_in_flight_count: usize,
+    pub capture_alloc: usize,
+    pub capture_egl_images_populated: usize,
+    pub capture_egl_images_total: usize,
+    pub cap_fmt_w: u32,
+    pub cap_fmt_h: u32,
+    pub cap_fmt_stride: u32,
+    pub cap_fmt_num_planes: u8,
+    pub cap_display_h: u32,
+    pub dmabuf_fds_len: usize,
+    pub capture_drained: bool,
+    pub output_streaming: bool,
+    pub capture_streaming: bool,
+    pub frames_since_last_loop: u32,
+}
+
+/// Build a snapshot from a locked `DecoderInner`. Caller holds the
+/// mutex; this function is a pure read.
+#[cfg(target_os = "linux")]
+fn build_decoder_resource_snapshot(inner: &DecoderInner) -> DecoderResourceSnapshot {
+    let (cap_w, cap_h, cap_stride, cap_num_planes) = inner
+        .capture_format
+        .as_ref()
+        .map(|f| (
+            f.width,
+            f.height,
+            f.plane_fmt.first().map(|p| p.bytesperline).unwrap_or(0),
+            f.num_planes,
+        ))
+        .unwrap_or((0, 0, 0, 0));
+    DecoderResourceSnapshot {
+        output_slots_free: inner.free_output_slots.len(),
+        output_slots_alloc: inner.mapped_output.len(),
+        capture_in_flight_count: inner.capture_in_flight.iter().filter(|&&x| x).count(),
+        capture_alloc: inner.capture_in_flight.len(),
+        capture_egl_images_populated: inner
+            .capture_egl_images
+            .iter()
+            .filter(|x| x.is_some())
+            .count(),
+        capture_egl_images_total: inner.capture_egl_images.len(),
+        cap_fmt_w: cap_w,
+        cap_fmt_h: cap_h,
+        cap_fmt_stride: cap_stride,
+        cap_fmt_num_planes: cap_num_planes,
+        cap_display_h: inner.capture_display_height,
+        dmabuf_fds_len: inner.capture_dmabuf_fds.len(),
+        capture_drained: inner.capture_drained,
+        output_streaming: inner.output_streaming,
+        capture_streaming: inner.capture_streaming,
+        frames_since_last_loop: inner.frames_since_last_loop,
+    }
+}
+
+/// Emit the resource snapshot as a `[perf]` line. `marker_name` is
+/// the log marker (`video_loop_boundary` for the per-loop A pass;
+/// `decoder_resource_snapshot` for the throttled steady-state B
+/// pass). `loop_num` fires when the marker is A.
+#[cfg(target_os = "linux")]
+fn emit_decoder_resource_snapshot(
+    marker_name: &str,
+    decoder_seq: usize,
+    loop_num: Option<usize>,
+    s: &DecoderResourceSnapshot,
+) {
+    use std::io::Write as _;
+    let loop_part = match loop_num {
+        Some(n) => format!(" loop_num={}", n),
+        None => String::new(),
+    };
+    let _ = writeln!(
+        std::io::stderr(),
+        "[perf] {} decoder_seq={}{} \
+         output_slots_free={}/{} capture_in_flight={}/{} \
+         capture_egl_images={}/{} cap_fmt_wh={}x{} cap_fmt_stride={} \
+         cap_fmt_num_planes={} cap_display_h={} dmabuf_fds_len={} \
+         capture_drained={} output_streaming={} capture_streaming={} \
+         frames_since_last_loop={}",
+        marker_name,
+        decoder_seq,
+        loop_part,
+        s.output_slots_free,
+        s.output_slots_alloc,
+        s.capture_in_flight_count,
+        s.capture_alloc,
+        s.capture_egl_images_populated,
+        s.capture_egl_images_total,
+        s.cap_fmt_w,
+        s.cap_fmt_h,
+        s.cap_fmt_stride,
+        s.cap_fmt_num_planes,
+        s.cap_display_h,
+        s.dmabuf_fds_len,
+        s.capture_drained,
+        s.output_streaming,
+        s.capture_streaming,
+        s.frames_since_last_loop,
+    );
+}
+
 /// V4L2 M2M H.264 decoder client.
 #[cfg(target_os = "linux")]
 pub struct Decoder {
@@ -1920,6 +2052,8 @@ impl Decoder {
             output_eof_sent: false,
             capture_drained: false,
             free_output_slots: VecDeque::new(),
+            loop_counter: 0,
+            frames_since_last_loop: 0,
             file,
             path: path.to_path_buf(),
         };
@@ -2220,6 +2354,50 @@ impl Decoder {
             .map(|f| f.height)
             .unwrap_or(0);
         compute_y_crop_max(display_h, alloc_h)
+    }
+
+    /// 2026-07-04 (Jason device loop-desync arc — instrument):
+    /// public resource snapshot for the throttled B pass. Callers
+    /// grab a snapshot every ~30s from the paint hot path so QA can
+    /// see resource counts drift over steady-state playback.
+    /// Returns the raw counts + the decoder_seq for correlation with
+    /// the per-loop A marker.
+    pub fn debug_resource_snapshot(&self) -> (usize, DecoderResourceSnapshot) {
+        let inner = self.inner.lock().unwrap();
+        (inner.decoder_seq, build_decoder_resource_snapshot(&inner))
+    }
+
+    /// 2026-07-04 (Jason device loop-desync arc — instrument):
+    /// emit the throttled B-pass snapshot line. Callers use their
+    /// own throttling gate (e.g. AtomicU64 last-emit-ns) so this
+    /// helper stays cheap on the hot path — just the mutex lock
+    /// + the formatting + writeln.
+    pub fn emit_resource_snapshot_line(&self, marker_name: &str) {
+        let (decoder_seq, s) = self.debug_resource_snapshot();
+        emit_decoder_resource_snapshot(marker_name, decoder_seq, None, &s);
+    }
+
+    /// 2026-07-04 (Jason device loop-desync arc — instrument B):
+    /// wrapper that gates `emit_resource_snapshot_line` on a
+    /// 30-second interval. Called from the paint hot path so QA
+    /// can plot decoder resource counts over steady-state playback
+    /// (independent of loop boundaries). Cheap on the miss path:
+    /// one atomic load + one Instant::now comparison. `throttle_
+    /// interval_ns` matches the H2 markers' 30s rhythm.
+    pub fn emit_resource_snapshot_throttled(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST_EMIT_NS: AtomicU64 = AtomicU64::new(0);
+        const THROTTLE_INTERVAL_NS: u64 = 30_000_000_000; // 30 s
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let last = LAST_EMIT_NS.load(Ordering::Relaxed);
+        if now_ns.saturating_sub(last) < THROTTLE_INTERVAL_NS {
+            return;
+        }
+        LAST_EMIT_NS.store(now_ns, Ordering::Relaxed);
+        self.emit_resource_snapshot_line("decoder_resource_snapshot");
     }
 
     /// r83 Phase A (2026-06-08): query the kernel's compose rect
@@ -3015,6 +3193,25 @@ impl Decoder {
     /// wrap fires). CMA budget unchanged (no allocation; no
     /// stream/buffer pool churn).
     pub fn resume_after_eos(&self) -> Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        // 2026-07-04 (Jason device loop-desync arc — instrument A):
+        // bump the loop counter + reset the post-loop frame counter
+        // BEFORE the ioctl. Fires on every reprime entry regardless
+        // of the `capture_drained` gate so QA can see whether the
+        // userspace-observed loop count matches the kernel's EOS
+        // count. Also emits the resource-snapshot marker.
+        inner.loop_counter = inner.loop_counter.saturating_add(1);
+        inner.frames_since_last_loop = 0;
+        let loop_num = inner.loop_counter;
+        let decoder_seq = inner.decoder_seq;
+        let snap = build_decoder_resource_snapshot(&inner);
+        drop(inner);
+        emit_decoder_resource_snapshot(
+            "video_loop_boundary",
+            decoder_seq,
+            Some(loop_num),
+            &snap,
+        );
         let mut inner = self.inner.lock().unwrap();
         // Gate the ioctl on capture_drained. Per V4L2 spec
         // V4L2_DEC_CMD_START on a non-stopped decoder is
@@ -3913,6 +4110,14 @@ impl Decoder {
         };
         let plane_lengths = [planes[0].bytesused as usize, planes[1].bytesused as usize];
         let inner_arc = self.inner.clone();
+        // 2026-07-04 (Jason device loop-desync arc — instrument C):
+        // snapshot the loop_counter + frames_since_last_loop BEFORE
+        // dropping the read borrow so the env-gated PNG dump path
+        // below can key filenames on the current loop's frame index.
+        let (loop_num, frames_since_last_loop_before) = (
+            inner_mut.loop_counter,
+            inner_mut.frames_since_last_loop,
+        );
         drop(inner_mut);
         // Mark in-flight + handle EOF flag in a separate lock
         // scope so the Frame construction is the last action.
@@ -3921,6 +4126,17 @@ impl Decoder {
             if (idx as usize) < inner_w.capture_in_flight.len() {
                 inner_w.capture_in_flight[idx as usize] = true;
             }
+            // 2026-07-04 (Jason device loop-desync arc — instrument):
+            // bump the post-loop frame counter. Reset to 0 in
+            // `resume_after_eos` at loop boundaries; every
+            // successful DQBUF here increments it. Used both by
+            // the env-gated PNG dump (only first ~3 frames per
+            // loop) and by the `[perf] video_loop_boundary` /
+            // `decoder_resource_snapshot` markers so QA can
+            // correlate loop N's post-loop frame count against
+            // loop N+K's.
+            inner_w.frames_since_last_loop =
+                inner_w.frames_since_last_loop.saturating_add(1);
             if is_last {
                 // r110 stage 3 commit 3 (2026-06-11): DEFANGED
                 // per QA expanded-mandate "defensive don't-
@@ -3970,6 +4186,65 @@ impl Decoder {
                 );
             }
         }
+        // 2026-07-04 (Jason device loop-desync arc — instrument C):
+        // env-gated per-plane PNG dump. When
+        // `OPENMARQUEE_LOOP_DUMP=1`, the first LOOP_DUMP_FRAMES_PER_
+        // LOOP (3) frames after each loop boundary are written as
+        // TWO grayscale PNGs — Y plane at native dims,
+        // UV plane at (width, height/2) showing the raw interleaved
+        // Cb/Cr bytes as one grayscale channel. Separately-dumped
+        // planes are the H-1 vs H-2/H-3 discriminator: if Y and UV
+        // clearly show DIFFERENT frames' content (whole-plane
+        // mismatch), it's H-1 (capture_egl_images cache drift /
+        // dmabuf FD reuse). If UV is shifted / partially garbage /
+        // mostly zeroed WITHIN the same frame, it's H-2 (UV offset
+        // arithmetic drift) or H-3 (partial write).
+        //
+        // Filenames: /var/tmp/loop-<vid8unused>-decoder<seq>-loop<N>
+        // -frame<M>-<y|uv>.png. `vid8` is not available here (no
+        // slide_id context inside v4l2.rs), so the dump uses the
+        // decoder_seq alone — QA correlates via the paint-side
+        // journal markers which slide_id matches which decoder_seq.
+        // Ring cap: total files per decoder × per loop bounded by
+        // LOOP_DUMP_FRAMES_PER_LOOP × 2 planes. On a long soak the
+        // static-atomic seq handles further ring behavior.
+        if frames_since_last_loop_before < LOOP_DUMP_FRAMES_PER_LOOP
+            && std::env::var_os("OPENMARQUEE_LOOP_DUMP").is_some()
+        {
+            let decoder_seq = self.inner.lock().unwrap().decoder_seq;
+            let frame_m = frames_since_last_loop_before;
+            // SAFETY: y_ptr / uv_ptr point into the mmap'd CAPTURE
+            // region for buffer `idx`. The Arc-owned DecoderInner
+            // outlives the slices we construct here (the read runs
+            // BEFORE Frame is returned; the mmap region is guarded
+            // by the same Arc). Values are point-in-time snapshots
+            // for the PNG; we release them before returning.
+            let y_slice = unsafe {
+                if y_ptr.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(y_ptr, y_len)
+                }
+            };
+            let uv_slice = unsafe {
+                if uv_ptr.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(uv_ptr, uv_len)
+                }
+            };
+            dump_loop_frame_planes(
+                decoder_seq,
+                loop_num,
+                frame_m,
+                idx,
+                width,
+                height,
+                stride,
+                y_slice,
+                uv_slice,
+            );
+        }
         Ok(Some(Frame {
             inner: inner_arc,
             capture_buffer_index: idx,
@@ -3983,6 +4258,150 @@ impl Decoder {
             dmabuf_fd,
             stride,
         }))
+    }
+}
+
+/// 2026-07-04 (Jason device loop-desync arc — instrument C):
+/// bounds on the env-gated PNG dump so `/var/tmp` doesn't fill on
+/// a long soak. 3 frames × 2 planes = 6 files per loop per decoder.
+#[cfg(target_os = "linux")]
+const LOOP_DUMP_FRAMES_PER_LOOP: u32 = 3;
+
+/// 2026-07-04 (Jason device loop-desync arc — instrument C): write
+/// the current DQBUF'd Y and UV planes as separate grayscale PNGs
+/// to `/var/tmp/loop-decoder<seq>-loop<N>-frame<M>-<y|uv>-buf<idx>.png`.
+///
+/// - Y plane: `width × height` bytes, one gray sample per pixel.
+///   Some codecs pad rows to `stride > width`; we honour that by
+///   copying row-by-row.
+/// - UV plane: bcm2835-codec single-plane NV12 emits Cb/Cr
+///   interleaved at `width × height/2` bytes (byte 0 = Cb₀, byte
+///   1 = Cr₀, byte 2 = Cb₁, ...). Dumped as-is as a grayscale image
+///   of width × (height/2). The visible checkerboard pattern is
+///   NOT a bug — it's Cb/Cr alternating; QA reads structure /
+///   region correlation, not the "image".
+///
+/// Errors are best-effort logged; a failed PNG write does NOT
+/// abort the DQBUF path (this is instrumentation).
+#[cfg(target_os = "linux")]
+fn dump_loop_frame_planes(
+    decoder_seq: usize,
+    loop_num: usize,
+    frame_m: u32,
+    buf_idx: u32,
+    width: u32,
+    height: u32,
+    stride: u32,
+    y_slice: &[u8],
+    uv_slice: &[u8],
+) {
+    use std::io::BufWriter;
+    // Repack Y with stride → width rows so the PNG is a clean
+    // width × height grayscale.
+    let y_repack = if (stride as usize) == (width as usize) {
+        y_slice.to_vec()
+    } else {
+        let mut out = Vec::with_capacity((width * height) as usize);
+        for row in 0..(height as usize) {
+            let src_off = row * stride as usize;
+            let end = src_off + width as usize;
+            if end > y_slice.len() {
+                break;
+            }
+            out.extend_from_slice(&y_slice[src_off..end]);
+        }
+        out
+    };
+    let y_path = format!(
+        "/var/tmp/loop-decoder{}-loop{}-frame{}-buf{}-y.png",
+        decoder_seq, loop_num, frame_m, buf_idx,
+    );
+    match std::fs::File::create(&y_path) {
+        Ok(file) => {
+            let mut enc = png::Encoder::new(BufWriter::new(file), width, height);
+            enc.set_color(png::ColorType::Grayscale);
+            enc.set_depth(png::BitDepth::Eight);
+            match enc.write_header() {
+                Ok(mut w) => {
+                    if let Err(e) = w.write_image_data(&y_repack) {
+                        eprintln!(
+                            "[perf] loop_dump_y_write_err path={} err={:#}",
+                            y_path, e,
+                        );
+                    } else {
+                        eprintln!(
+                            "[perf] loop_dump_y_wrote path={} dims={}x{}",
+                            y_path, width, height,
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "[perf] loop_dump_y_header_err path={} err={:#}",
+                    y_path, e,
+                ),
+            }
+        }
+        Err(e) => eprintln!(
+            "[perf] loop_dump_y_create_err path={} err={:#}",
+            y_path, e,
+        ),
+    }
+    // UV: repack too (stride may pad UV like Y). UV rows = height/2
+    // for NV12; UV row width = width (interleaved Cb/Cr = full-width
+    // bytes at half-height).
+    let uv_row_bytes = width as usize;
+    let uv_rows = (height as usize) / 2;
+    let uv_repack = if (stride as usize) == uv_row_bytes {
+        uv_slice.to_vec()
+    } else {
+        let mut out = Vec::with_capacity(uv_row_bytes * uv_rows);
+        for row in 0..uv_rows {
+            let src_off = row * stride as usize;
+            let end = src_off + uv_row_bytes;
+            if end > uv_slice.len() {
+                break;
+            }
+            out.extend_from_slice(&uv_slice[src_off..end]);
+        }
+        out
+    };
+    let uv_path = format!(
+        "/var/tmp/loop-decoder{}-loop{}-frame{}-buf{}-uv.png",
+        decoder_seq, loop_num, frame_m, buf_idx,
+    );
+    match std::fs::File::create(&uv_path) {
+        Ok(file) => {
+            let mut enc = png::Encoder::new(
+                BufWriter::new(file),
+                width,
+                uv_rows as u32,
+            );
+            enc.set_color(png::ColorType::Grayscale);
+            enc.set_depth(png::BitDepth::Eight);
+            match enc.write_header() {
+                Ok(mut w) => {
+                    if let Err(e) = w.write_image_data(&uv_repack) {
+                        eprintln!(
+                            "[perf] loop_dump_uv_write_err path={} err={:#}",
+                            uv_path, e,
+                        );
+                    } else {
+                        eprintln!(
+                            "[perf] loop_dump_uv_wrote path={} dims={}x{}",
+                            uv_path, width, uv_rows,
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "[perf] loop_dump_uv_header_err path={} err={:#}",
+                    uv_path, e,
+                ),
+            }
+        }
+        Err(e) => eprintln!(
+            "[perf] loop_dump_uv_create_err path={} err={:#}",
+            uv_path, e,
+        ),
     }
 }
 
