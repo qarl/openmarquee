@@ -4298,10 +4298,25 @@ fn dump_loop_frame_planes(
     use std::io::BufWriter;
     // Repack Y with stride → width rows so the PNG is a clean
     // width × height grayscale.
+    //
+    // Bug fix (2026-07-04 QA-caught): the fast-path branch was
+    // `y_slice.to_vec()` which returned the ENTIRE NV12 buffer
+    // (1382400 bytes at 1280×720 = Y+UV in one contiguous slab)
+    // because `y_len` at construction = `planes[0].bytesused` =
+    // the full buffer size for single-plane NV12. The PNG encoder
+    // rejected the payload ("expected 921600 got 1382400"). The
+    // slow-path row loop was correct — it copied exactly
+    // `width` bytes per row for `height` rows. Fix: slice `y_slice`
+    // to `width × height` bytes FIRST, then either take that slice
+    // as-is (stride == width) or row-repack (stride > width).
+    let y_bytes_expected = (width as usize) * (height as usize);
     let y_repack = if (stride as usize) == (width as usize) {
-        y_slice.to_vec()
+        // Contiguous Y plane at [0 .. width*height). Everything
+        // past `width*height` is the UV plane (owned by the UV
+        // path below).
+        y_slice[..y_bytes_expected.min(y_slice.len())].to_vec()
     } else {
-        let mut out = Vec::with_capacity((width * height) as usize);
+        let mut out = Vec::with_capacity(y_bytes_expected);
         for row in 0..(height as usize) {
             let src_off = row * stride as usize;
             let end = src_off + width as usize;
