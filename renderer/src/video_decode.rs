@@ -632,6 +632,37 @@ pub struct DrainDetail {
     pub eos_seen: bool,
 }
 
+/// 2026-07-04 (Jason device): captured NV12 first-frame bytes for
+/// the transition freeze-entry path. The preload worker drains one
+/// frame from the CAPTURE queue; instead of DROPPING the DQBUF'd
+/// buffer (its data lost), it copies the Y and UV planes into
+/// OWNED buffers before drop. Main thread later uploads Y +
+/// UV → RGBA via the standard bake-video shader pipeline to
+/// produce the transition frozen-entry visual — an actual
+/// freshly-decoded first frame instead of the potentially
+/// weeks-stale poster.png on disk.
+///
+/// Fields mirror the Frame accessors so the upload site can plug
+/// straight into the existing NV12 tex_image_2d pattern:
+///   - `width`  = `frame.width()`  (native decode dims)
+///   - `height` = `frame.height()`
+///   - `y_stride` = `frame.stride()` (Y plane row stride; bcm2835-
+///                   codec's empirical `stride == width` on the
+///                   MMAP path, but the field is passed through
+///                   so a future codec / alignment change doesn't
+///                   silently truncate rows here)
+///   - `y_crop_max` = `dec_state.decoder.capture_y_crop_max()`
+///                   at drain time (frame-domain cover-fit constant
+///                   the blit-pass shader consumes)
+pub struct CapturedNv12Frame {
+    pub y: Vec<u8>,
+    pub uv: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    pub y_stride: u32,
+    pub y_crop_max: f32,
+}
+
 /// Public drain that delegates to the detail-recording variant with
 /// a throwaway detail. Kept for any future caller that doesn't care
 /// about the detail.
@@ -641,6 +672,91 @@ pub fn drain_one_capture_for_preload(
 ) -> usize {
     let mut detail = DrainDetail::default();
     drain_one_capture_for_preload_with_detail(dec_state, budget_ms, &mut detail)
+}
+
+/// 2026-07-04 (Jason device): drain variant that CAPTURES the Y and
+/// UV planes of the first drained frame into owned buffers before
+/// dropping the Frame. Otherwise identical to
+/// `drain_one_capture_for_preload_with_detail` — same budget +
+/// EAGAIN-poll loop + eos/other-error accounting.
+///
+/// Returns `(drained_count, captured_frame)`; captured_frame is
+/// `Some` iff drained_count == 1 (i.e. we successfully DQBUF'd
+/// one frame within the budget). On EOS / EAGAIN-exhausted / real
+/// error, drained_count == 0 and captured_frame == None — caller
+/// falls back to whatever the pre-preload path already did (poster,
+/// live-decode).
+///
+/// Cost: two `Vec::from` allocations sized `Y.len()` and `UV.len()`
+/// (~3 MB combined at 1080p NV12). The bytes are copied out of the
+/// MMAP buffer before the Frame is dropped, so the underlying
+/// V4L2 CAPTURE buffer is immediately re-QBUF'd (kernel pool never
+/// loses a buffer).
+pub fn drain_one_capture_for_preload_capturing(
+    dec_state: &mut VideoDecoderState,
+    budget_ms: u64,
+    detail: &mut DrainDetail,
+) -> (usize, Option<CapturedNv12Frame>) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_millis(budget_ms);
+    let mut drained = 0usize;
+    let mut captured: Option<CapturedNv12Frame> = None;
+    let y_crop_max = dec_state.decoder.capture_y_crop_max();
+    while Instant::now() < deadline {
+        match dec_state.decoder.next_frame() {
+            Ok(Some(frame)) => {
+                let y_plane = frame.y_plane();
+                let uv_plane = frame.uv_plane();
+                let f_w = frame.width();
+                let f_h = frame.height();
+                let stride = frame.stride();
+                // Fingerprint-log first for parity with the non-
+                // capturing drain path (QA correlates against
+                // `preload_drain_fp` in journal analysis).
+                let fp = crate::hdmi::fingerprint_9_points(
+                    y_plane,
+                    stride as usize,
+                    f_w as usize,
+                    f_h as usize,
+                    1,
+                );
+                eprintln!(
+                    "[perf] preload_drain_fp frames_decoded_pre={} \
+                     frame_dims={}x{} stride={} fp_y={:?}",
+                    dec_state.frames_decoded, f_w, f_h, stride, fp,
+                );
+                captured = Some(CapturedNv12Frame {
+                    y: y_plane.to_vec(),
+                    uv: uv_plane.to_vec(),
+                    width: f_w,
+                    height: f_h,
+                    y_stride: stride,
+                    y_crop_max,
+                });
+                drop(frame);
+                dec_state.frames_decoded += 1;
+                drained += 1;
+                break;
+            }
+            Ok(None) => {
+                detail.eos_seen = true;
+                break;
+            }
+            Err(e) if e.to_string().contains("EAGAIN") => {
+                detail.eagain_polls += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => {
+                detail.other_errs += 1;
+                eprintln!(
+                    "[perf] preload_handoff_drain_err err={:#}",
+                    e
+                );
+                break;
+            }
+        }
+    }
+    (drained, captured)
 }
 
 /// r78 Phase A: detail-recording variant. Same logic; accumulates
@@ -761,7 +877,7 @@ pub fn drain_one_capture_for_preload_with_detail(
 pub fn prime_video_decoder_for_preload(
     dem: &Mp4Demuxer,
     slide_id: uuid::Uuid,
-) -> Result<VideoDecoderState> {
+) -> Result<(VideoDecoderState, Option<CapturedNv12Frame>)> {
     use std::time::Instant;
     // r91 (2026-06-08) probe per QA dispatch: caller-tagged
     // prime_entry. Fires regardless of EOS_FLUSH gate.
@@ -801,23 +917,33 @@ pub fn prime_video_decoder_for_preload(
 
     if !eos_flush_enabled {
         // r84-baseline (default): prime + one-shot drain + emit.
+        // 2026-07-04 (Jason device): drain now uses the capturing
+        // variant so the drained first frame's Y+UV planes ship to
+        // main thread as `CapturedNv12Frame`. Downstream: paint_and_
+        // present_one_transition_frame uploads them into a texture
+        // and uses that as the frozen-entry visual, replacing the
+        // possibly-stale poster.png fallback that was showing on
+        // the sign.
         let t_prime_only = Instant::now();
         let mut state = prime_video_decoder_with_warmup(dem, PRIME_WARMUP_FOR_PRELOAD)?;
         let prime_only_us = t_prime_only.elapsed().as_micros();
         let budget_ms = preload_capture_drain_budget_ms();
         let t_drain = Instant::now();
         let mut detail = DrainDetail::default();
-        let drained = drain_one_capture_for_preload_with_detail(&mut state, budget_ms, &mut detail);
+        let (drained, captured) = drain_one_capture_for_preload_capturing(
+            &mut state, budget_ms, &mut detail,
+        );
         let drain_us = t_drain.elapsed().as_micros();
         eprintln!(
-            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={} was_deferred=false",
+            "[perf] preload_handoff slide_id={} frames_drained={} prime_only_us={} drain_us={} budget_ms={} was_deferred=false captured={}",
             slide_id, drained, prime_only_us, drain_us, budget_ms,
+            captured.is_some(),
         );
         eprintln!(
             "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
             slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
         );
-        return Ok(state);
+        return Ok((state, captured));
     }
 
     // r85 EOS-flush body (gated by OPENMARQUEE_EOS_FLUSH=1).
@@ -936,7 +1062,11 @@ pub fn prime_video_decoder_for_preload(
         "[perf] preload_handoff_drain_detail slide_id={} eagain_polls={} other_errs={} eos_seen={}",
         slide_id, detail.eagain_polls, detail.other_errs, detail.eos_seen,
     );
-    Ok(state)
+    // 2026-07-04: EOS-flush branch is a debug-only experiment path
+    // (gated behind OPENMARQUEE_EOS_FLUSH=1 which stays OFF in prod).
+    // It doesn't participate in the Jason-device first-frame capture
+    // path — return None so callers fall through to poster.
+    Ok((state, None))
 }
 
 /// r83: previous r80-r82 preload body kept for reference under

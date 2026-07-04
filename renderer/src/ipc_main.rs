@@ -732,6 +732,22 @@ struct SlideCache {
         uuid::Uuid,
         PreloadHandle,
     >,
+    /// 2026-07-04 (Jason device): captured NV12 first-frame planes
+    /// for video slides, keyed by video_slide_id. Populated by
+    /// `ensure_preload_complete` when the preload worker returned a
+    /// `CapturedNv12Frame`; consumed once by the PaintTransition
+    /// hook, which uploads the planes as an RGBA texture in
+    /// `paint_and_present_one_transition_frame` and uses that as
+    /// the frozen-entry visual for the incoming side, replacing
+    /// the possibly-stale poster.png fallback. Entries are removed
+    /// on consumption (single-use) AND on the slide's next
+    /// PreloadSlide (fresh capture supersedes any stale entry).
+    /// No LruMap cap: entries are one-shot, so the map's steady-
+    /// state size is bounded by the preload concurrency cap
+    /// (currently 2). Cleared entirely on cache reset paths.
+    #[cfg(target_os = "linux")]
+    preloaded_first_frames:
+        std::collections::HashMap<uuid::Uuid, crate::video_decode::CapturedNv12Frame>,
 }
 
 /// r65 (2026-06-05): handle stored in `SlideCache.pending_preloads`
@@ -758,6 +774,21 @@ struct PreloadArtifacts {
     /// Video kind that primed successfully.
     #[cfg(target_os = "linux")]
     decoders: Vec<(uuid::Uuid, VideoDecoderState)>,
+    /// 2026-07-04 (Jason device): Linux-only. `(video_slide_id,
+    /// CapturedNv12Frame)` pairs for the transition freeze-entry
+    /// path. The preload worker drained one frame from CAPTURE
+    /// as its handoff-unblock step (r76 Phase B); the capturing
+    /// drain variant copies the Y+UV planes so main thread can
+    /// upload them as an RGBA texture at BeginTransition and use
+    /// that as the frozen-entry visual, replacing the possibly-
+    /// stale poster.png fallback qarl observed on the sign.
+    /// One entry per Video kind that primed successfully AND
+    /// where the drain returned a frame (drained == 1). None
+    /// for videos where the drain hit EOS / EAGAIN-exhausted /
+    /// error, in which case the existing poster fallback stays
+    /// on the critical path.
+    #[cfg(target_os = "linux")]
+    first_frames: Vec<(uuid::Uuid, crate::video_decode::CapturedNv12Frame)>,
     /// Slide-ids whose load found a JSON but the demuxer / V4L2
     /// prime failed. Main thread inserts these into video_skip
     /// so the existing UnsupportedSlide rail picks them up.
@@ -783,6 +814,8 @@ impl SlideCache {
             pending_preloads: std::collections::HashMap::new(),
             #[cfg(target_os = "linux")]
             pending_recreates: std::collections::HashMap::new(),
+            #[cfg(target_os = "linux")]
+            preloaded_first_frames: std::collections::HashMap::new(),
         }
     }
 
@@ -1312,6 +1345,8 @@ fn preload_in_worker(
         demuxers: Vec::new(),
         #[cfg(target_os = "linux")]
         decoders: Vec::new(),
+        #[cfg(target_os = "linux")]
+        first_frames: Vec::new(),
         skip_marks: Vec::new(),
     };
     let mtime = std::fs::metadata(
@@ -1341,6 +1376,8 @@ fn preload_in_worker(
                         artifacts.demuxers.extend(bg.demuxers);
                         #[cfg(target_os = "linux")]
                         artifacts.decoders.extend(bg.decoders);
+                        #[cfg(target_os = "linux")]
+                        artifacts.first_frames.extend(bg.first_frames);
                         artifacts.skip_marks.extend(bg.skip_marks);
                     }
                     Err(e) => {
@@ -1399,13 +1436,23 @@ fn preload_in_worker(
                     match crate::video_decode::prime_video_decoder_for_preload(
                         &dem, item_id,
                     ) {
-                        Ok(dec_state) => {
+                        Ok((dec_state, captured_first_frame)) => {
                             let prime_us = t_prime.elapsed().as_micros();
                             eprintln!(
-                                "[perf] preload_worker_prime slide_id={} prime_us={}",
-                                item_id, prime_us
+                                "[perf] preload_worker_prime slide_id={} prime_us={} captured_first_frame={}",
+                                item_id, prime_us, captured_first_frame.is_some(),
                             );
                             artifacts.decoders.push((item_id, dec_state));
+                            // 2026-07-04 (Jason device): ship the
+                            // captured NV12 first frame to main
+                            // thread. paint_and_present_one_transition
+                            // _frame uploads it as an RGBA texture
+                            // and uses it as the frozen-entry visual
+                            // in place of the potentially-stale
+                            // poster.png fallback.
+                            if let Some(cf) = captured_first_frame {
+                                artifacts.first_frames.push((item_id, cf));
+                            }
                         }
                         Err(e) => {
                             eprintln!(
@@ -1608,6 +1655,15 @@ fn ensure_preload_complete(cache: &mut SlideCache, slide_id: uuid::Uuid) {
             for (id, dec) in artifacts.decoders {
                 cache.video_decoders.insert(id, dec);
             }
+            // 2026-07-04 (Jason device): install captured NV12
+            // first frames into the per-cache map. Fresh entries
+            // supersede any older stale entry for the same
+            // video_slide_id (a repeat preload always ships the
+            // most recent decode).
+            #[cfg(target_os = "linux")]
+            for (id, cf) in artifacts.first_frames {
+                cache.preloaded_first_frames.insert(id, cf);
+            }
             for id in artifacts.skip_marks {
                 cache.video_skip.insert(id);
             }
@@ -1672,6 +1728,14 @@ fn try_drain_finished_recreates(cache: &mut SlideCache) {
                 }
                 for (aid, dec) in artifacts.decoders {
                     cache.video_decoders.insert(aid, dec);
+                }
+                // 2026-07-04 (Jason device): install captured first
+                // frames from the recreate path too — a recreate is
+                // effectively a fresh prime + drain, and the fresh
+                // capture should also supersede any earlier stale
+                // entry for the same video_slide_id.
+                for (aid, cf) in artifacts.first_frames {
+                    cache.preloaded_first_frames.insert(aid, cf);
                 }
                 for aid in artifacts.skip_marks {
                     cache.video_skip.insert(aid);
@@ -3547,6 +3611,18 @@ fn run_paint_hook(
             // — drift risk heading into c3.2.1/c3.2.2.
             let poster_a_video_id = from_dec_id;
             let poster_b_video_id = to_dec_id;
+            // 2026-07-04 (Jason device): pull the captured NV12 first
+            // frame for the incoming (B) side, if the preload worker
+            // stashed one. Take-by-remove so a single transition
+            // consumes it once; subsequent ticks reuse the uploaded
+            // texture inside the paint helper (kept in the session
+            // slot). The (possibly-stale) poster.png fallback stays
+            // in place for the case where no preloaded frame is
+            // available (preload timed out, cold-start with no lead
+            // time, EOS on drain, or non-video endpoint).
+            let preloaded_first_frame_b: Option<crate::video_decode::CapturedNv12Frame> =
+                poster_b_video_id
+                    .and_then(|vid| cache.preloaded_first_frames.remove(&vid));
             if let Err(e) = hdmi::paint_and_present_one_transition_frame(
                 session,
                 card,
@@ -3558,6 +3634,7 @@ fn run_paint_hook(
                 progress,
                 poster_a_video_id,
                 poster_b_video_id,
+                preloaded_first_frame_b.as_ref(),
             ) {
                 return err(format!("paint_transition failed: {e:#}"));
             }
