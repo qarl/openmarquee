@@ -6061,9 +6061,29 @@ pub fn paint_and_present_one_transition_frame(
     // stale still (e.g. back-to-back BeginTransition without an
     // intervening Slide hold -- BeginTransition handler frees
     // anyway, so this is theoretically dead, but cheap).
+    // 2026-07-04 (Jason device): loosened endpoint_a acceptance to
+    // `Video | TextOverVideo`, mirroring the existing endpoint_b
+    // set. Pre-fix, snapshot-side-A required endpoint_a to be PURE
+    // `Video`, which excluded TextSlide-with-background_video_slide_id
+    // (dispatched as `TransitionEndpoint::TextOverVideo`). qarl's
+    // reel is 19-of-25 TextOverVideo; every one of those transitions
+    // fell through `!snapshot_eligible` → `use_poster_a_now` and
+    // sourced the stale disk poster_a for the outgoing side. Sign
+    // diagnostics 2026-07-04 confirmed: 195x `poster_a_sourced` +
+    // 0x `snapshot_side_a_captured` in a 30-min window.
+    //
+    // TextOverVideo composited-fbo_a contract: the bake_slide_to_fbo
+    // TextOverVideo arm composites bg-video + text overlay into
+    // fbo_a directly, so glCopyTexImage2D at the capture site below
+    // (~line 6385) captures the whole what-user-saw exit visual —
+    // exactly the frozen entry we want. The parked-decoder EGLImage
+    // cleanup at ~line 6419 was extended in the same commit to
+    // destructure TextOverVideo's `bg_decoder`, otherwise the
+    // outgoing bg V4L2 decoder's DMABUF EGLImages would sit
+    // allocated-but-idle for the rest of the fade.
     let snapshot_eligible = matches!(
         &endpoint_a,
-        TransitionEndpoint::Video { .. }
+        TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
     ) && matches!(
         &endpoint_b,
         TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
@@ -6409,15 +6429,30 @@ pub fn paint_and_present_one_transition_frame(
             // arrives ~bake_b boundary, exactly the CMA-peak
             // moment.
             //
-            // snapshot_eligible guarantees endpoint_a is plain
-            // Video, so a Video destructure is total. Subagent
-            // BLOCKER avoidance: borrow endpoint_a IMMUTABLY
-            // (`&endpoint_a`) — the prior `&mut endpoint_a`
-            // borrow ended at the inputs_a match (the bake call
-            // released the inner reborrows), so a fresh `&`
-            // borrow is fine here.
-            if let TransitionEndpoint::Video { decoder, .. } = &endpoint_a {
-                decoder.unpin_egl_refs();
+            // 2026-07-04 (Jason device): snapshot_eligible now
+            // accepts endpoint_a of BOTH `Video` and `TextOverVideo`,
+            // so this cleanup must destructure both variants. The
+            // outgoing V4L2 owner is `decoder` for pure Video and
+            // `bg_decoder` for TextOverVideo (the text overlays are
+            // GL glyphs — no V4L2 decoder to unpin). Pre-fix, the
+            // TextOverVideo case wouldn't reach here (snapshot_
+            // eligible was false); now that it does, missing this
+            // extension would leave the outgoing bg V4L2 decoder's
+            // 1-4 cached DMABUF EGLImages allocated for the rest
+            // of the fade — the exact dead-weight CMA the pure-
+            // Video path already frees. Subagent BLOCKER avoidance:
+            // borrow endpoint_a IMMUTABLY (`&endpoint_a`) — the
+            // prior `&mut endpoint_a` borrow ended at the inputs_a
+            // match (the bake call released the inner reborrows),
+            // so a fresh `&` borrow is fine here.
+            match &endpoint_a {
+                TransitionEndpoint::Video { decoder, .. } => {
+                    decoder.unpin_egl_refs();
+                }
+                TransitionEndpoint::TextOverVideo { bg_decoder, .. } => {
+                    bg_decoder.unpin_egl_refs();
+                }
+                _ => {}
             }
         }
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
