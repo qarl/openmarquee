@@ -60,7 +60,7 @@ idna==3.18
     #   httpx
 ifaddr==0.2.0
     # via aioice
-numpy==2.5.0
+numpy==2.5.1
     # via openmarquee (pyproject.toml)
 pillow==12.2.0
     # via openmarquee (pyproject.toml)
@@ -93,7 +93,7 @@ typing-inspection==0.4.2
     # via
     #   fastapi
     #   pydantic
-uvicorn==0.49.0
+uvicorn==0.50.0
     # via openmarquee (pyproject.toml)
 uvloop==0.22.1
     # via uvicorn
