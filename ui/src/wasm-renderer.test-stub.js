@@ -36,7 +36,3 @@ export function isFontRegistered(_name) {
 export function rasterizeText(_text, _font, _size, _color) {
     return null;
 }
-
-export function clearRasterizeCache() {
-    // no-op
-}
