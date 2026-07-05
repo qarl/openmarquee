@@ -1628,6 +1628,19 @@ pub struct Frame {
     /// for `EGL_DMA_BUF_PLANE*_PITCH_EXT` -- subagent-blocker
     /// check in piece 4's "Stride vs width" review section.
     stride: u32,
+    /// 2026-07-04 (Jason device loop-desync arc — instrument):
+    /// snapshot of `DecoderInner.loop_counter` at DQBUF time.
+    /// Lets the paint hot path gate INSTR-1 (env-gated shader-
+    /// input plane dump) on "first few frames after each loop"
+    /// WITHOUT re-taking the decoder mutex. Zero cost on the
+    /// non-instrumented path.
+    loop_num: usize,
+    /// 2026-07-04 (Jason device loop-desync arc — instrument):
+    /// snapshot of `DecoderInner.frames_since_last_loop` at DQBUF
+    /// time (value BEFORE the DQBUF-side bump). 0 = first frame
+    /// after a `resume_after_eos` boundary; 1, 2 = the two
+    /// immediately following.
+    frames_since_last_loop: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -1688,6 +1701,24 @@ impl Frame {
     /// referenced internally by Frame::Drop's re-QBUF).
     pub fn capture_buffer_index(&self) -> u32 {
         self.capture_buffer_index
+    }
+
+    /// 2026-07-04 (Jason device loop-desync arc — instrument):
+    /// per-frame snapshot of the decoder's monotonic loop counter.
+    /// Callers use it to tag journal / PNG dumps at the paint site
+    /// without re-taking the decoder mutex.
+    pub fn loop_num(&self) -> usize {
+        self.loop_num
+    }
+
+    /// 2026-07-04 (Jason device loop-desync arc — instrument):
+    /// per-frame snapshot of `DecoderInner.frames_since_last_loop`
+    /// AT DQBUF TIME (value BEFORE the bump). 0 = this Frame is
+    /// the FIRST DQBUF after a loop boundary; 1, 2 = the two
+    /// immediately following. Same window the loop-dump C ring
+    /// uses at the DQBUF site.
+    pub fn frames_since_last_loop(&self) -> u32 {
+        self.frames_since_last_loop
     }
 }
 
@@ -4245,6 +4276,95 @@ impl Decoder {
                 uv_slice,
             );
         }
+        // 2026-07-04 (Jason device loop-desync arc — INSTR-2 primary):
+        // env-gated DOUBLE-READ at the DQBUF site to prove /
+        // disprove the bcm2835-codec "DQBUF returns SUCCESS while
+        // still writing the buffer" kernel-race hypothesis. Reads
+        // the y_plane + uv_plane bytes TWICE ~10 ms apart, hashes
+        // both, and emits a `[perf] double_read_delta` line with
+        // per-plane hashes + delta. If y_hash1 != y_hash2 OR
+        // uv_hash1 != uv_hash2, the kernel is still writing to a
+        // buffer we DQBUF'd — path-agnostic direct proof
+        // (independent of DMABUF vs MMAP).
+        //
+        // Gated on `OPENMARQUEE_LOOP_DUMP_DOUBLE=1` AND the same
+        // 3-frame post-loop ring the existing C dump uses so the
+        // 10 ms sleep only fires 3 times per loop per decoder
+        // (not on every steady-state paint).
+        if frames_since_last_loop_before < LOOP_DUMP_FRAMES_PER_LOOP
+            && std::env::var_os("OPENMARQUEE_LOOP_DUMP_DOUBLE").is_some()
+        {
+            let y_bytes_expected = (width as usize) * (height as usize);
+            let uv_bytes_expected = y_bytes_expected / 2;
+            // Bound to actual slice length (single-plane NV12: y_len
+            // is the whole buffer's bytesused; slice to width*height
+            // for the Y plane read).
+            let y1_slice = unsafe {
+                if y_ptr.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(
+                        y_ptr,
+                        y_bytes_expected.min(y_len),
+                    )
+                }
+            };
+            let uv1_slice = unsafe {
+                if uv_ptr.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(
+                        uv_ptr,
+                        uv_bytes_expected.min(uv_len),
+                    )
+                }
+            };
+            let y_hash1 = plane_fnv1a_hash(y1_slice);
+            let uv_hash1 = plane_fnv1a_hash(uv1_slice);
+            let t_pre_sleep = std::time::Instant::now();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let read2_delay_us = t_pre_sleep.elapsed().as_micros();
+            let y2_slice = unsafe {
+                if y_ptr.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(
+                        y_ptr,
+                        y_bytes_expected.min(y_len),
+                    )
+                }
+            };
+            let uv2_slice = unsafe {
+                if uv_ptr.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(
+                        uv_ptr,
+                        uv_bytes_expected.min(uv_len),
+                    )
+                }
+            };
+            let y_hash2 = plane_fnv1a_hash(y2_slice);
+            let uv_hash2 = plane_fnv1a_hash(uv2_slice);
+            let y_stable = y_hash1 == y_hash2;
+            let uv_stable = uv_hash1 == uv_hash2;
+            eprintln!(
+                "[perf] double_read_delta buf_idx={} loop_num={} \
+                 frame_m={} y_hash1={:08x} y_hash2={:08x} \
+                 uv_hash1={:08x} uv_hash2={:08x} \
+                 y_stable={} uv_stable={} read2_delay_us={}",
+                idx,
+                loop_num,
+                frames_since_last_loop_before,
+                y_hash1,
+                y_hash2,
+                uv_hash1,
+                uv_hash2,
+                y_stable,
+                uv_stable,
+                read2_delay_us,
+            );
+        }
         Ok(Some(Frame {
             inner: inner_arc,
             capture_buffer_index: idx,
@@ -4257,8 +4377,25 @@ impl Decoder {
             uv_len,
             dmabuf_fd,
             stride,
+            loop_num,
+            frames_since_last_loop: frames_since_last_loop_before,
         }))
     }
+}
+
+/// 2026-07-04 (Jason device loop-desync arc — instrument):
+/// FNV-1a 32-bit hash of a byte slice. Cheap (~1ms at 1MB on
+/// bcm2835), sensitive to any single-byte modification. Used by
+/// INSTR-2's double-read to detect kernel writes to a DQBUF'd
+/// buffer.
+#[cfg(target_os = "linux")]
+fn plane_fnv1a_hash(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c9dc5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    h
 }
 
 /// 2026-07-04 (Jason device loop-desync arc — instrument C):

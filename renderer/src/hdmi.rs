@@ -10216,6 +10216,149 @@ unsafe fn bake_external_nv12_to_current_fbo(
 /// feed=/dqbuf=/dmabuf_blit_pass=` lines as the pre-refactor
 /// paint function. The `swap_commit=/total=` log stays in the
 /// caller because only the caller does the swap.
+/// 2026-07-04 (Jason device loop-desync arc — INSTR-1 DMABUF):
+/// dump the Frame's y_plane and uv_plane bytes as two grayscale
+/// PNGs at the shader-input site of the DMABUF paint path. Reads
+/// the CPU-side mmap (piece 4a-fix: both DMABUF and MMAP paths
+/// keep the same mmap regions populated), so a mid-write kernel
+/// race would be captured as byte-level differences between this
+/// dump and the DQBUF-site C dump for the same buffer index.
+///
+/// Filenames: /var/tmp/shaderinput-decoder<seq_via_loop_num>
+/// -loop<N>-frame<M>-buf<idx>-<y|uv>.png. Also emits
+/// [perf] shader_input_dump y_first16=<hex> uv_first16=<hex>
+/// buf_idx=<N> loop_num=<N> frame_m=<N> so QA can grep even
+/// without pulling the PNG.
+#[cfg(target_os = "linux")]
+fn dump_shader_input_planes_dmabuf(frame: &crate::v4l2::Frame) {
+    use std::io::BufWriter;
+    let width = frame.width();
+    let height = frame.height();
+    let stride = frame.stride();
+    let buf_idx = frame.capture_buffer_index();
+    let loop_num = frame.loop_num();
+    let frame_m = frame.frames_since_last_loop();
+    let y_slice = frame.y_plane();
+    let uv_slice = frame.uv_plane();
+    let y_bytes_expected = (width as usize) * (height as usize);
+    // Y plane: slice to width*height (Frame's y_len is the whole
+    // buffer's bytesused for single-plane NV12 per the v4l2.rs
+    // DQBUF path).
+    let y_head = &y_slice[..y_bytes_expected.min(y_slice.len())];
+    let y_repack: Vec<u8> = if (stride as usize) == (width as usize) {
+        y_head.to_vec()
+    } else {
+        let mut out = Vec::with_capacity(y_bytes_expected);
+        for row in 0..(height as usize) {
+            let src_off = row * stride as usize;
+            let end = src_off + width as usize;
+            if end > y_head.len() {
+                break;
+            }
+            out.extend_from_slice(&y_head[src_off..end]);
+        }
+        out
+    };
+    let uv_row_bytes = width as usize;
+    let uv_rows = (height as usize) / 2;
+    let uv_head_len = uv_row_bytes * uv_rows;
+    let uv_head = &uv_slice[..uv_head_len.min(uv_slice.len())];
+    let uv_repack: Vec<u8> = if (stride as usize) == uv_row_bytes {
+        uv_head.to_vec()
+    } else {
+        let mut out = Vec::with_capacity(uv_head_len);
+        for row in 0..uv_rows {
+            let src_off = row * stride as usize;
+            let end = src_off + uv_row_bytes;
+            if end > uv_head.len() {
+                break;
+            }
+            out.extend_from_slice(&uv_head[src_off..end]);
+        }
+        out
+    };
+    // First-16-bytes hex for a quick grep tag alongside the PNG.
+    let hex_prefix = |b: &[u8]| -> String {
+        b.iter()
+            .take(16)
+            .map(|c| format!("{:02x}", c))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    eprintln!(
+        "[perf] shader_input_dump y_first16={} uv_first16={} \
+         buf_idx={} loop_num={} frame_m={} dims={}x{} stride={}",
+        hex_prefix(y_head),
+        hex_prefix(uv_head),
+        buf_idx,
+        loop_num,
+        frame_m,
+        width,
+        height,
+        stride,
+    );
+    let y_path = format!(
+        "/var/tmp/shaderinput-loop{}-frame{}-buf{}-y.png",
+        loop_num, frame_m, buf_idx,
+    );
+    if let Ok(file) = std::fs::File::create(&y_path) {
+        let mut enc = png::Encoder::new(BufWriter::new(file), width, height);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        match enc.write_header() {
+            Ok(mut w) => {
+                if let Err(e) = w.write_image_data(&y_repack) {
+                    eprintln!(
+                        "[perf] shader_input_y_write_err path={} err={:#}",
+                        y_path, e,
+                    );
+                } else {
+                    eprintln!(
+                        "[perf] shader_input_y_wrote path={} dims={}x{}",
+                        y_path, width, height,
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "[perf] shader_input_y_header_err path={} err={:#}",
+                y_path, e,
+            ),
+        }
+    }
+    let uv_path = format!(
+        "/var/tmp/shaderinput-loop{}-frame{}-buf{}-uv.png",
+        loop_num, frame_m, buf_idx,
+    );
+    if let Ok(file) = std::fs::File::create(&uv_path) {
+        let mut enc = png::Encoder::new(
+            BufWriter::new(file),
+            width,
+            uv_rows as u32,
+        );
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        match enc.write_header() {
+            Ok(mut w) => {
+                if let Err(e) = w.write_image_data(&uv_repack) {
+                    eprintln!(
+                        "[perf] shader_input_uv_write_err path={} err={:#}",
+                        uv_path, e,
+                    );
+                } else {
+                    eprintln!(
+                        "[perf] shader_input_uv_wrote path={} dims={}x{}",
+                        uv_path, width, uv_rows,
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "[perf] shader_input_uv_header_err path={} err={:#}",
+                uv_path, e,
+            ),
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 unsafe fn bake_video_slide_to_current_fbo(
     session: &mut EglSession,
@@ -10404,6 +10547,30 @@ unsafe fn bake_video_slide_to_current_fbo(
     // we fall through to MMAP).
     if let Some(fd) = frame.dma_buf_fd() {
         let stride = frame.stride();
+        // 2026-07-04 (Jason device loop-desync arc — INSTR-1 DMABUF):
+        // env-gated CPU-side dump of the y_plane and uv_plane
+        // bytes at the DMABUF shader-input site. The Frame's
+        // y_ptr/uv_ptr point at the SAME mmap'd kernel buffer the
+        // dmabuf FD wraps (piece 4a-fix: REQBUFS uses
+        // V4L2_MEMORY_MMAP regardless of capture_buffer_type; the
+        // dmabuf fds are an ADDITIONAL view on the same kernel
+        // buffers). Reading via the mmap here shows what the GPU
+        // will sample from the dmabuf when
+        // `run_nv12_dmabuf_blit_pass` binds the EGLImage below.
+        //
+        // Compare against the DQBUF-site C dump: if this later
+        // dump differs from the earlier one for the same buffer
+        // index, the kernel wrote to the buffer between DQBUF and
+        // shader input — direct proof of the race. Gated on
+        // OPENMARQUEE_SHADER_INPUT_DUMP=1 AND
+        // `frame.frames_since_last_loop() < 3` so the cost is
+        // bounded (few dumps per loop per decoder). PNG errors
+        // are best-effort logged; never abort the paint.
+        if frame.frames_since_last_loop() < 3
+            && std::env::var_os("OPENMARQUEE_SHADER_INPUT_DUMP").is_some()
+        {
+            dump_shader_input_planes_dmabuf(&frame);
+        }
         let t_blit = if profile_first { Some(std::time::Instant::now()) } else { None };
         // DMABUF path: zero CPU upload — EGLImage is imported inside
         // run_nv12_dmabuf_blit_pass + sampled via OES_external. Record
