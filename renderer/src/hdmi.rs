@@ -10359,6 +10359,88 @@ fn dump_shader_input_planes_dmabuf(frame: &crate::v4l2::Frame) {
     }
 }
 
+/// 2026-07-04 (Jason device loop-desync arc — INSTR-3
+/// playback-scanout dump): glReadPixels the currently-bound
+/// framebuffer as RGBA + encode a PNG at
+/// /var/tmp/playback-scanout-loop<N>-frame<M>-buf<idx>.png.
+///
+/// This is the DISPLAY-TRUTH probe: fires post-shader in
+/// bake_video_slide_to_current_fbo, so the framebuffer holds the
+/// shader's RGBA output of the DMABUF/EGLImage sample — the
+/// exact pixels qarl would see if a text overlay didn't paint on
+/// top. If chroma desync is present at qarl's viewpoint, it
+/// manifests HERE as a visible color-shifted image.
+///
+/// GL bottom-origin flipped to top-down before PNG encode
+/// (matches the H2 composite dump's flip convention).
+///
+/// Errors are best-effort logged; never abort the paint.
+#[cfg(target_os = "linux")]
+unsafe fn dump_playback_scanout(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    loop_num: usize,
+    frame_m: u32,
+    buf_idx: u32,
+) {
+    use glow::HasContext;
+    use std::io::BufWriter;
+    let mut pixels: Vec<u8> = vec![0u8; (mode_w * mode_h * 4) as usize];
+    gl.read_pixels(
+        0,
+        0,
+        mode_w as i32,
+        mode_h as i32,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        glow::PixelPackData::Slice(pixels.as_mut_slice()),
+    );
+    let stride = (mode_w * 4) as usize;
+    let mut flipped: Vec<u8> = vec![0u8; pixels.len()];
+    for row in 0..(mode_h as usize) {
+        let src_off = row * stride;
+        let dst_off = (mode_h as usize - 1 - row) * stride;
+        flipped[dst_off..dst_off + stride]
+            .copy_from_slice(&pixels[src_off..src_off + stride]);
+    }
+    let path = format!(
+        "/var/tmp/playback-scanout-loop{}-frame{}-buf{}.png",
+        loop_num, frame_m, buf_idx,
+    );
+    match std::fs::File::create(&path) {
+        Ok(file) => {
+            let mut enc = png::Encoder::new(BufWriter::new(file), mode_w, mode_h);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            match enc.write_header() {
+                Ok(mut w) => {
+                    if let Err(e) = w.write_image_data(&flipped) {
+                        eprintln!(
+                            "[perf] playback_scanout_write_err path={} err={:#}",
+                            path, e,
+                        );
+                    } else {
+                        eprintln!(
+                            "[perf] playback_scanout_wrote path={} dims={}x{} \
+                             loop_num={} frame_m={} buf_idx={}",
+                            path, mode_w, mode_h, loop_num, frame_m, buf_idx,
+                        );
+                    }
+                }
+                Err(e) => eprintln!(
+                    "[perf] playback_scanout_header_err path={} err={:#}",
+                    path, e,
+                ),
+            }
+        }
+        Err(e) => eprintln!(
+            "[perf] playback_scanout_create_err path={} err={:#}",
+            path, e,
+        ),
+    }
+}
+
 #[cfg(target_os = "linux")]
 unsafe fn bake_video_slide_to_current_fbo(
     session: &mut EglSession,
@@ -10623,6 +10705,52 @@ unsafe fn bake_video_slide_to_current_fbo(
                 "paint_bake_video_shader",
                 t_phase_shader.elapsed().as_nanos() as u64,
             );
+            // 2026-07-04 (Jason device loop-desync arc — INSTR-3
+            // playback-scanout dump). Env-gated
+            // OPENMARQUEE_PLAYBACK_SCANOUT_DUMP=1. glReadPixels the
+            // currently-bound framebuffer (the fbo bake_video just
+            // drew the bg-video into) as an RGBA PNG. This is the
+            // DISPLAY-TRUTH capture QA specifically asked for —
+            // shows what the GPU produced from the DMABUF/EGLImage
+            // sample, at the point of the shader output. If qarl's
+            // Y/UV desync is present, it's visible HERE as a
+            // real chroma-shifted image.
+            //
+            // Requirements per QA (2026-07-04):
+            //   (1) capture the DISPLAYED frame at the point qarl
+            //       sees the symptom. ✓ this fires post-shader,
+            //       captures the composited RGBA the panel will
+            //       scan out.
+            //   (2) LIGHT — no sleeps, capture only a few frames
+            //       right at/after a loop so a timing race isn't
+            //       masked by probe cost. Gated on
+            //       `frame.frames_since_last_loop() < 3` — fires
+            //       exactly on the FIRST 3 frames of each loop
+            //       (the window most likely to expose a buffer-
+            //       reuse race), quiet otherwise. glReadPixels +
+            //       PNG encode = ~5-10 ms per capture on bcm2835
+            //       at 720p RGBA; bounded to 3 * per-loop * per-
+            //       decoder — negligible over a soak.
+            //
+            // Filename: /var/tmp/playback-scanout-loop<N>-frame<M>
+            // -buf<idx>.png. Compare against the earlier
+            // shader_input_dump PNGs for the same buf_idx — if the
+            // scanout shows chroma desync while the shader_input
+            // Y+UV planes were clean, the race is downstream of
+            // the CPU-side dump (GPU sampling an EGLImage whose
+            // dmabuf was re-QBUF'd + re-decoded during scanout).
+            if frame.frames_since_last_loop() < 3
+                && std::env::var_os("OPENMARQUEE_PLAYBACK_SCANOUT_DUMP").is_some()
+            {
+                dump_playback_scanout(
+                    session.gl,
+                    mode_w,
+                    mode_h,
+                    frame.loop_num(),
+                    frame.frames_since_last_loop(),
+                    frame.capture_buffer_index(),
+                );
+            }
             // Drop the Frame so its Drop re-QBUFs CAPTURE BEFORE the
             // caller's buffer swap; holding the Frame across the next
             // advance would starve the codec of CAPTURE buffers.
