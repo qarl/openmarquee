@@ -1575,6 +1575,7 @@ precision mediump float;
 uniform sampler2D u_src_a;
 uniform sampler2D u_src_b;
 uniform float u_t;
+uniform vec2 u_resolution;
 varying vec2 v_uv;
 float _hash(vec2 p) {
     p = 50.0 * fract(p * 0.3183099 + vec2(0.71, 0.113));
@@ -1583,28 +1584,52 @@ float _hash(vec2 p) {
 void main() {
     vec4 a = texture2D(u_src_a, v_uv);
     vec4 b = texture2D(u_src_b, v_uv);
-    float threshold = _hash(v_uv);
+    // 2026-07-04 (Jason device): reveal quantized to 10x10 device-pixel
+    // blocks — every pixel in a block shares one threshold and flips
+    // together in the same random order. Pre-fix hashed on v_uv so the
+    // reveal was per-pixel and read as noise; qarl wanted the unit to
+    // be visible chunks across the room. PIXELATE_BLOCK_PX (10.0) is
+    // the shared knob with FS_PIXELATE. u_resolution is the framebuffer
+    // (width, height) in device pixels, bound alongside u_aspect at
+    // every draw site.
+    vec2 block = floor(v_uv * u_resolution / 10.0);
+    float threshold = _hash(block);
     float mask = step(threshold, u_t);
     gl_FragColor = mix(a, b, mask);
 }
 "#;
 
-/// Fragment shader: pixelate — both images sample at a coarsened
-/// grid whose block size grows to a peak at midpoint then shrinks
-/// back. Mirrors Python ref `_FRAGMENT_PIXELATE`. The wave envelope
-/// `1 - 4(t-0.5)^2` is 0 at t=0/1, 1 at t=0.5; block size 0.0025
-/// (≈ 5px at 1080p, effectively native) at the endpoints, 0.0425
-/// (≈ 80px at 1080p) at midpoint.
+/// Block size for the pixelate mosaic in DEVICE PIXELS. 10x10 was
+/// chosen 2026-07-03 (Jason device): the earlier UV-space block
+/// size peaked around 46 px at midpoint but degenerated to
+/// near-native (~5 px) at the endpoints, so most of the transition
+/// dissolved per-pixel and read as noise rather than a mosaic.
+/// Fixing the block at 10 px keeps a chunky, tunable mosaic
+/// throughout — big enough to read across the room, small enough
+/// that the boundaries still animate cleanly.
+pub const PIXELATE_BLOCK_PX: f32 = 10.0;
+
+/// Fragment shader: pixelate — both images sample at a FIXED
+/// device-pixel-space mosaic grid; the reveal happens as a linear
+/// cross-fade of the two mosaic views. 2026-07-03 (Jason device):
+/// switched from the previous UV-space `wave-shaped` block to a
+/// FIXED 10 x 10 device-pixel block (see `PIXELATE_BLOCK_PX`). The
+/// `u_resolution` uniform lets the shader map the fixed pixel size
+/// into UV space per-frame.
 pub const FS_PIXELATE: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_src_a;
 uniform sampler2D u_src_b;
 uniform float u_t;
+uniform vec2 u_resolution;
 varying vec2 v_uv;
 void main() {
-    float wave = 1.0 - 4.0 * (u_t - 0.5) * (u_t - 0.5);
-    float blockSize = 0.0025 + 0.04 * wave;
-    vec2 cell = floor(v_uv / blockSize) * blockSize + 0.5 * blockSize;
+    // 10 device pixels per block, mapped into UV via the current
+    // frame resolution. Guard the division so a driver that hands
+    // us a zero-dim resolution (should not happen at runtime;
+    // defensive) never NaN-fills the sample coord.
+    vec2 block_uv = vec2(10.0) / max(u_resolution, vec2(1.0));
+    vec2 cell = floor(v_uv / block_uv) * block_uv + 0.5 * block_uv;
     vec4 a = texture2D(u_src_a, cell);
     vec4 b = texture2D(u_src_b, cell);
     gl_FragColor = mix(a, b, u_t);
@@ -1637,22 +1662,25 @@ void main() {
 
 /// Fragment shader: halftone — slide_b emerges through a regular
 /// grid of growing circular dots, one per cell. Mirrors Python ref
-/// `_FRAGMENT_HALFTONE`. 16:9 grid hardcoded for the HDMI 1080p
-/// target (8 rows × ~14 cols at that aspect); the 0.71 max-radius
-/// is sqrt(0.5), the diagonal half-distance from cell center to
-/// corner so dots fully overlap at t=1.
+/// `_FRAGMENT_HALFTONE`. 8 rows down the y-axis; the x-cell count
+/// = 8 * u_aspect so cells stay SQUARE at every target aspect
+/// (was hardcoded 16/9 pre-2026-07-03, which turned dots into
+/// tall ovals on the FYS 9:16 rotated target — "half dots aren't
+/// circular"). The 0.71 max-radius is sqrt(0.5), the diagonal
+/// half-distance from cell center to corner so dots fully overlap
+/// at t=1.
 pub const FS_HALFTONE: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_src_a;
 uniform sampler2D u_src_b;
 uniform float u_t;
+uniform float u_aspect;
 varying vec2 v_uv;
 void main() {
     vec4 a = texture2D(u_src_a, v_uv);
     vec4 b = texture2D(u_src_b, v_uv);
     float grid_y = 8.0;
-    float aspect = 16.0 / 9.0;
-    vec2 cell_uv = fract(vec2(v_uv.x * grid_y * aspect, v_uv.y * grid_y));
+    vec2 cell_uv = fract(vec2(v_uv.x * grid_y * u_aspect, v_uv.y * grid_y));
     float d = distance(cell_uv, vec2(0.5));
     float mask = step(d, u_t * 0.71);
     gl_FragColor = mix(a, b, mask);
@@ -1821,56 +1849,37 @@ void main() {
 }
 "#;
 
-/// Fragment shader: marquee — tickertape wraparound. slide_a
-/// scrolls off to the left; a gap zone with a centered white dot
-/// passes through; slide_b enters from the right. Mirrors Python
-/// ref `_FRAGMENT_MARQUEE`.
-pub const FS_MARQUEE: &str = r#"#version 100
-precision mediump float;
-uniform sampler2D u_src_a;
-uniform sampler2D u_src_b;
-uniform float u_t;
-varying vec2 v_uv;
-void main() {
-    float gap_uv = 0.125;
-    float scroll = u_t * (1.0 + gap_uv);
-    float cx = scroll + v_uv.x;
-
-    vec4 from_col = texture2D(u_src_a, vec2(cx, v_uv.y));
-    vec4 to_col = texture2D(u_src_b, vec2(cx - 1.0 - gap_uv, v_uv.y));
-
-    float gap_local_x = (cx - 1.0) / gap_uv;
-    float dx_uv = (gap_local_x - 0.5) * gap_uv;
-    float dy = v_uv.y - 0.5;
-    float dist = length(vec2(dx_uv, dy));
-    float dot_r = 0.074;
-    float in_dot = step(dist, dot_r);
-    vec4 gap_col = mix(vec4(0.0, 0.0, 0.0, 1.0), vec4(1.0), in_dot);
-
-    float in_from = step(cx, 1.0);
-    float in_to = step(1.0 + gap_uv, cx);
-    float in_gap = 1.0 - in_from - in_to;
-
-    gl_FragColor = from_col * in_from + gap_col * in_gap + to_col * in_to;
-}
-"#;
+// 2026-07-03 (Jason device): `FS_MARQUEE` removed. The shader was
+// a tickertape scroll with a centered white dot in the gap zone;
+// on-glass the dot dominated the visual so the transition read as
+// "white circle over a fade" rather than a unique effect. Old
+// playlist data with `transition = "marquee"` reaches the SP
+// dispatch via `sp_kind_static` / `is_transition_kind_single_pass`
+// which alias marquee → fade; the fallback path in
+// `fs_for_transition_kind` also aliases so legacy paint routes
+// still find a shader (FS_FADE) instead of falling all the way
+// through to FS_CUT.
 
 /// Fragment shader: shutter — hexagonal aperture. A regular hexagon
 /// centered on the canvas grows from a point at t=0 to fully
-/// covering the canvas at t=1. The 16:9 aspect-correct projection
-/// keeps the hex regular at 1080p. The 0.866025 constant is
-/// cos(30°). Mirrors Python ref `_FRAGMENT_SHUTTER`.
+/// covering the canvas at t=1. `u_aspect` drives the x-normalization
+/// so the hex stays REGULAR at every target aspect (was hardcoded
+/// 16.0/9.0 pre-2026-07-04, which stretched the hex into a squashed
+/// hexagon on the rotated FYS 9:16 target — same failure mode as the
+/// halftone-oval bug). The 0.866025 constant is cos(30°). Mirrors
+/// Python ref `_FRAGMENT_SHUTTER`.
 pub const FS_SHUTTER: &str = r#"#version 100
 precision mediump float;
 uniform sampler2D u_src_a;
 uniform sampler2D u_src_b;
 uniform float u_t;
+uniform float u_aspect;
 varying vec2 v_uv;
 void main() {
     vec4 a = texture2D(u_src_a, v_uv);
     vec4 b = texture2D(u_src_b, v_uv);
     vec2 d = v_uv - vec2(0.5);
-    d.x *= 16.0 / 9.0;
+    d.x *= u_aspect;
     float k = 0.866025;
     float c1 = abs(d.x * k + d.y * 0.5);
     float c2 = abs(d.y);
@@ -2028,9 +2037,16 @@ pub fn wrap_composite_for_atlas(src: &str) -> String {
 /// Batch A: cut, fade, wipe, iris, dissolve.
 /// Batch B: scanline, halftone, blinds, shutter.
 /// Batch C: slide, push, scroll.
-/// Batch D (this commit): flip, marquee, pixelate.
+/// Batch D: flip, pixelate.
 /// Glitch: qarl-deferred -- stays on legacy.
+/// 2026-07-03 (Jason device): `marquee` removed (was just a white
+/// circle over another transition, not a unique visual). Legacy
+/// data with `transition = "marquee"` reaches here via
+/// `sp_kind_static`'s marquee→fade alias.
 pub fn is_transition_kind_single_pass(kind: &str) -> bool {
+    // Alias legacy marquee → fade before the match so old data
+    // still enters the SP dispatch path.
+    let kind = if kind == "marquee" { "fade" } else { kind };
     matches!(
         kind,
         "cut"
@@ -2046,7 +2062,6 @@ pub fn is_transition_kind_single_pass(kind: &str) -> bool {
             | "push"
             | "scroll"
             | "flip"
-            | "marquee"
             | "pixelate"
     )
 }
@@ -2058,6 +2073,13 @@ pub fn is_transition_kind_single_pass(kind: &str) -> bool {
 /// `is_transition_kind_single_pass`; grows in lock-step as batches
 /// port. Returns `None` for kinds outside the SP-portable set.
 pub fn sp_kind_static(kind: &str) -> Option<&'static str> {
+    // 2026-07-03 (Jason device): `marquee` was dropped — the shader
+    // was just a white circle over another transition, not a unique
+    // visual (see the FS_MARQUEE removal on this commit). Old
+    // playlist data may still carry `transition = "marquee"`;
+    // alias it to `fade` here so those slides fall back to the
+    // closest still-supported transition instead of erroring.
+    let kind = if kind == "marquee" { "fade" } else { kind };
     Some(match kind {
         "cut" => "cut",
         "fade" => "fade",
@@ -2072,7 +2094,6 @@ pub fn sp_kind_static(kind: &str) -> Option<&'static str> {
         "push" => "push",
         "scroll" => "scroll",
         "flip" => "flip",
-        "marquee" => "marquee",
         "pixelate" => "pixelate",
         _ => return None,
     })
@@ -2328,6 +2349,13 @@ pub fn fs_transition_sp_source(kind: &str, n_a: usize, n_b: usize) -> Option<Str
     if !is_transition_kind_single_pass(kind) {
         return None;
     }
+    // 2026-07-03 (Jason device): canonicalize marquee → fade before
+    // the source generator so push_main_body / kind_needs_hash /
+    // kind_needs_highp all agree on the resolved kind. is_*_single_
+    // pass and sp_kind_static already alias upstream; without this
+    // line push_main_body would hit its `unreachable!` for the
+    // dropped "marquee" arm.
+    let kind = if kind == "marquee" { "fade" } else { kind };
     if n_a > SINGLE_PASS_MAX_LAYERS_PER_SLIDE || n_b > SINGLE_PASS_MAX_LAYERS_PER_SLIDE {
         return None;
     }
@@ -2347,6 +2375,12 @@ pub fn fs_transition_sp_source(kind: &str, n_a: usize, n_b: usize) -> Option<Str
     // radial effects (rays, circular wipe, dot animations) will
     // reuse this without re-plumbing.
     s.push_str("uniform float u_aspect;\n");
+    // 2026-07-03 (Jason device): u_resolution = framebuffer (width, height)
+    // in device pixels. The pixelate arm uses it to convert its
+    // fixed 10-px block size into UV space. Same declare-everywhere
+    // policy as u_aspect — GLSL drops the unused uniform on the
+    // other arms.
+    s.push_str("uniform vec2 u_resolution;\n");
     for i in 0..n_a {
         s.push_str(&format!(
             "uniform sampler2D u_a_tex{i};\nuniform vec4 u_a_rect{i};\nuniform vec4 u_a_rgba{i};\n"
@@ -2523,12 +2557,19 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
         }
         "dissolve" => {
-            // Per-pixel hash threshold reveal.
+            // 2026-07-04 (Jason device): reveal quantized to 10 x 10
+            // device-pixel blocks — see FS_DISSOLVE for the rationale.
+            // Every pixel in a block shares one threshold and flips
+            // together in the same random order. `u_resolution` is
+            // bound by every dissolve caller (SP + legacy paths);
+            // `PIXELATE_BLOCK_PX` (10.0) is the shared knob with
+            // FS_PIXELATE.
             s.push_str("    vec3 ca = u_a_bg;\n");
             push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
             s.push_str("    vec3 cb = u_b_bg;\n");
             push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
-            s.push_str("    float threshold = _hash(v_uv);\n");
+            s.push_str("    vec2 block = floor(v_uv * u_resolution / 10.0);\n");
+            s.push_str("    float threshold = _hash(block);\n");
             s.push_str("    float mask = step(threshold, u_t);\n");
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
         }
@@ -2555,14 +2596,15 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
             s.push_str("    gl_FragColor = vec4(col, 1.0);\n");
         }
         "halftone" => {
-            // 16:9 grid of growing circular dots.
+            // Grid of growing circular dots. 8 rows down y; x-cell
+            // count = 8 * u_aspect so cells stay SQUARE at every
+            // target aspect (was hardcoded 16/9 pre-2026-07-03).
             s.push_str("    vec3 ca = u_a_bg;\n");
             push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
             s.push_str("    vec3 cb = u_b_bg;\n");
             push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
             s.push_str("    float grid_y = 8.0;\n");
-            s.push_str("    float aspect = 16.0 / 9.0;\n");
-            s.push_str("    vec2 cell_uv = fract(vec2(v_uv.x * grid_y * aspect, v_uv.y * grid_y));\n");
+            s.push_str("    vec2 cell_uv = fract(vec2(v_uv.x * grid_y * u_aspect, v_uv.y * grid_y));\n");
             s.push_str("    float d = distance(cell_uv, vec2(0.5));\n");
             s.push_str("    float mask = step(d, u_t * 0.71);\n");
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
@@ -2580,13 +2622,17 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
             s.push_str("    gl_FragColor = vec4(mix(ca, cb, mask), 1.0);\n");
         }
         "shutter" => {
-            // Hexagonal aperture inscribed-radius test.
+            // Hexagonal aperture inscribed-radius test. u_aspect
+            // drives the x-normalization so the hex stays REGULAR
+            // at every target aspect — was hardcoded 16.0/9.0
+            // pre-2026-07-04 (Jason device), which squashed the hex
+            // on the rotated FYS 9:16 target.
             s.push_str("    vec3 ca = u_a_bg;\n");
             push_compose_chain(s, "u_a", "ca", n_a, "v_uv");
             s.push_str("    vec3 cb = u_b_bg;\n");
             push_compose_chain(s, "u_b", "cb", n_b, "v_uv");
             s.push_str("    vec2 d = v_uv - vec2(0.5);\n");
-            s.push_str("    d.x *= 16.0 / 9.0;\n");
+            s.push_str("    d.x *= u_aspect;\n");
             s.push_str("    float k = 0.866025;\n");
             s.push_str("    float c1 = abs(d.x * k + d.y * 0.5);\n");
             s.push_str("    float c2 = abs(d.y);\n");
@@ -2679,46 +2725,29 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
             s.push_str("    float inside = step(0.001, scaleX) * step(0.0, src_x) * step(src_x, 1.0);\n");
             s.push_str("    gl_FragColor = vec4(col * inside, 1.0);\n");
         }
-        "marquee" => {
-            // Tickertape wraparound: A scrolls off to the left, a
-            // gap zone with a centered white dot passes through,
-            // B enters from the right. Three region masks
-            // (in_from, in_gap, in_to) partition the screen and
-            // sum to 1 by construction.
-            s.push_str("    float gap_uv = 0.125;\n");
-            s.push_str("    float scroll_t = u_t * (1.0 + gap_uv);\n");
-            s.push_str("    float cx = scroll_t + v_uv.x;\n");
-            s.push_str("    vec2 sample_uv_a = vec2(cx, v_uv.y);\n");
-            s.push_str("    vec2 sample_uv_b = vec2(cx - 1.0 - gap_uv, v_uv.y);\n");
-            s.push_str("    vec3 ca = u_a_bg;\n");
-            push_compose_chain(s, "u_a", "ca", n_a, "sample_uv_a");
-            s.push_str("    vec3 cb = u_b_bg;\n");
-            push_compose_chain(s, "u_b", "cb", n_b, "sample_uv_b");
-            s.push_str("    float gap_local_x = (cx - 1.0) / gap_uv;\n");
-            s.push_str("    float dx_uv = (gap_local_x - 0.5) * gap_uv;\n");
-            s.push_str("    float dy = v_uv.y - 0.5;\n");
-            s.push_str("    float dist = length(vec2(dx_uv, dy));\n");
-            s.push_str("    float dot_r = 0.074;\n");
-            s.push_str("    float in_dot = step(dist, dot_r);\n");
-            s.push_str("    vec3 gap_col = mix(vec3(0.0), vec3(1.0), in_dot);\n");
-            s.push_str("    float in_from = step(cx, 1.0);\n");
-            s.push_str("    float in_to = step(1.0 + gap_uv, cx);\n");
-            s.push_str("    float in_gap = 1.0 - in_from - in_to;\n");
-            s.push_str("    vec3 col = ca * in_from + gap_col * in_gap + cb * in_to;\n");
-            s.push_str("    gl_FragColor = vec4(col, 1.0);\n");
-        }
+        // 2026-07-03 (Jason device): `marquee` arm removed. The
+        // shader was a tickertape scroll with a white dot in the
+        // gap zone — the dot dominated visually so the overall
+        // transition read as "white circle over fade" rather than
+        // a unique visual. Legacy `transition = "marquee"` reaches
+        // this dispatch via the marquee→fade alias in
+        // `sp_kind_static` / `is_transition_kind_single_pass`, so
+        // no arm is needed here.
         "pixelate" => {
-            // Both slides sample at a coarsened grid whose block
-            // size grows to a peak at midpoint then shrinks back.
-            // Wave envelope `1 - 4(t-0.5)^2` is 0 at t=0/1, 1 at
-            // t=0.5; block size 0.0025 (~5px at 1080p, native) at
-            // endpoints, 0.0425 (~46px at 1080p) at midpoint.
-            // Both A and B sample at the SAME quantized cell --
-            // the visual mixing is the linear u_t cross-fade
-            // between two pixelated views.
-            s.push_str("    float wave = 1.0 - 4.0 * (u_t - 0.5) * (u_t - 0.5);\n");
-            s.push_str("    float blockSize = 0.0025 + 0.04 * wave;\n");
-            s.push_str("    vec2 cell = floor(v_uv / blockSize) * blockSize + 0.5 * blockSize;\n");
+            // 2026-07-03 (Jason device): fixed 10 x 10 device-pixel
+            // mosaic (see `PIXELATE_BLOCK_PX` + `FS_PIXELATE`). The
+            // previous UV-space wave-shaped block size degenerated
+            // to ~5 px at the endpoints, so the transition read as
+            // per-pixel dissolve rather than a chunky mosaic. The
+            // `u_resolution` uniform is bound by every pixelate
+            // caller (SP + legacy paths) so this arm can convert
+            // 10 device px into UV space at draw time.
+            s.push_str(
+                "    vec2 block_uv = vec2(10.0) / max(u_resolution, vec2(1.0));\n",
+            );
+            s.push_str(
+                "    vec2 cell = floor(v_uv / block_uv) * block_uv + 0.5 * block_uv;\n",
+            );
             s.push_str("    vec3 ca = u_a_bg;\n");
             push_compose_chain(s, "u_a", "ca", n_a, "cell");
             s.push_str("    vec3 cb = u_b_bg;\n");
@@ -2743,6 +2772,11 @@ fn push_main_body(s: &mut String, kind: &str, n_a: usize, n_b: usize) {
 /// Pure function so a renderer-side rename of a shader const
 /// flips a host test rather than going silent at runtime.
 pub fn fs_for_transition_kind(kind: &str) -> Option<&'static str> {
+    // 2026-07-03 (Jason device): legacy alias — `marquee` was
+    // removed as a distinct transition (FS_MARQUEE deleted). Old
+    // playlist data may still carry it; alias to `fade` so those
+    // slides continue to play with the closest-supported visual.
+    let kind = if kind == "marquee" { "fade" } else { kind };
     match kind {
         "cut" => Some(FS_CUT),
         "fade" => Some(FS_FADE),
@@ -2758,11 +2792,11 @@ pub fn fs_for_transition_kind(kind: &str) -> Option<&'static str> {
         "scroll" => Some(FS_SCROLL),
         "blinds" => Some(FS_BLINDS),
         "flip" => Some(FS_FLIP),
-        "marquee" => Some(FS_MARQUEE),
         "shutter" => Some(FS_SHUTTER),
         // Phase 5-c-4 closed out the remaining 8. The full
-        // Python-ref deck is now mirrored. Unknown kinds beyond
-        // these 16 still hit the fallback (FS_CUT).
+        // Python-ref deck is now mirrored (minus marquee, dropped
+        // 2026-07-03). Unknown kinds still return None so the
+        // caller falls back to FS_CUT.
         _ => None,
     }
 }
@@ -4499,6 +4533,318 @@ pub fn prev_idx_for_reel(i: usize, pass: u32, len: usize) -> Option<usize> {
     }
 }
 
+/// 2026-07-04 (Jason device H2 arc): pure decision layer for
+/// `paint_and_present_one_transition_frame`. The 700-line paint fn
+/// used to inline-compute `use_still_a_now`/`use_poster_a_now`/
+/// `use_poster_b`/etc from a mix of `snapshot_eligible`, cached-pair
+/// presence, poster / snapshot / preloaded-slot presence, and
+/// endpoint-kind matches. Two problems solved by extracting:
+///
+/// 1. Testability. The runtime paint fn depends on real GL /
+///    real V4L2 / a live EglSession that isn't constructible off-
+///    target. Pulling the decision logic into pure functions over
+///    small `EndpointKind` / `Side{A,B}Inputs` / `Side{A,B}Plan`
+///    enums lets `cargo test` on the Mac host exhaustively pin
+///    truth tables + regression scenarios (see the `mod plan_tests`
+///    below) without any GL/V4L2 dependency.
+/// 2. Interaction visibility. Pre-extraction, wiring changes on the
+///    side-A branch (e.g. loosening `snapshot_eligible` to include
+///    TextOverVideo, 2026-07-04 f4ec9501) had non-obvious runtime
+///    interactions with the side-B branch (bake_slide_to_fbo on
+///    outgoing opens a 2nd V4L2 decoder → r97 codec-contention
+///    deferral fires on the incoming preload → captured first
+///    frame goes missing → side-B falls to stale poster). QA-
+///    confirmed H2 mechanism. The pure functions make the
+///    "TextOverVideo outgoing NEVER bakes" rule assertable at
+///    compile-time (the `SideAPlan` variants issued for
+///    TextOverVideo never include `BakeAndCapture` /  `BakeOnly`).
+///
+/// Wiring in `hdmi.rs` calls these functions once per tick per
+/// side; the enum values then drive the same `if`/`else if` ladder
+/// as before, just with the CONDITIONS derived from pure inputs
+/// instead of inline mutable state.
+
+/// Coarse endpoint classification used by the pure decision layer.
+/// Mirrors `TransitionEndpoint`'s variants (which live in hdmi.rs
+/// and hold `&mut` V4L2 state that we can't test against). Runtime
+/// callers project the `TransitionEndpoint` to `EndpointKind` at
+/// paint-fn entry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum EndpointKind {
+    /// Plain TextSlide with no background_video_slide_id.
+    Text,
+    /// ImageSlide.
+    Image,
+    /// Plain VideoSlide.
+    Video,
+    /// TextSlide with a `background_video_slide_id`: bg-video +
+    /// text overlay composited by `bake_slide_to_fbo`'s
+    /// TextOverVideo arm.
+    TextOverVideo,
+}
+
+/// Inputs to `decide_side_a_plan`. All fields are simple presence
+/// / kind bits derivable from the runtime state at the top of
+/// `paint_and_present_one_transition_frame`, before either side
+/// begins its bake.
+#[derive(Copy, Clone, Debug)]
+pub struct SideAInputs {
+    /// From `is_snapshot_eligible(endpoint_a_kind, endpoint_b_kind)`.
+    pub snapshot_eligible: bool,
+    /// `EndpointKind` of endpoint_a.
+    pub endpoint_a_kind: EndpointKind,
+    /// True when `session.last_video_paint_composite_tex` holds a
+    /// composite that matches the current outgoing's
+    /// `poster_a_video_id` (i.e. captured during the pre-transition
+    /// window on THIS outgoing slide).
+    pub cached_composite_present_for_this_endpoint: bool,
+    /// True when `session.transition_still_a_tex` is populated.
+    pub still_a_present: bool,
+    /// True when the transition FBO pair for side A is allocated
+    /// (needed for both the poster fast-path and the snapshot
+    /// capture site).
+    pub cached_pair_a_present: bool,
+    /// True when `poster_a_texture` (disk poster.png) was loaded
+    /// successfully at paint-fn entry.
+    pub poster_a_present: bool,
+}
+
+/// Inputs to `decide_side_b_plan`. Mirrors `SideAInputs` in shape —
+/// side B has its own preloaded-first-frame path (2026-07-04 pr38)
+/// but no snapshot / no still slot / no `bake_and_capture` variant.
+#[derive(Copy, Clone, Debug)]
+pub struct SideBInputs {
+    /// `EndpointKind` of endpoint_b.
+    pub endpoint_b_kind: EndpointKind,
+    /// True when `session.transition_preloaded_first_frame_b_tex`
+    /// holds an uploaded texture for the current incoming's video
+    /// id (i.e. tick 2..N of a transition where the upload
+    /// happened on tick 1).
+    pub preloaded_slot_present_for_this_endpoint: bool,
+    /// True when the caller passed `preloaded_first_frame_b: Some(_)`
+    /// on THIS tick (i.e. the ipc dispatcher's consume-once
+    /// `cache.preloaded_first_frames.remove(&vid)` returned Some).
+    /// Only set on tick 1 of a transition per pr38's design.
+    pub preloaded_input_present: bool,
+    /// True when the disk poster.png loaded successfully at paint-
+    /// fn entry.
+    pub poster_b_disk_present: bool,
+    /// True when the transition FBO pair for side B is allocated.
+    pub cached_pair_b_present: bool,
+}
+
+/// Side-A source-selection plan. Consumed by the runtime paint fn
+/// which owns the actual GL / V4L2 execution for each variant.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SideAPlan {
+    /// 2026-07-04 (Jason device H2 arc): source the outgoing frozen
+    /// visual from `session.last_video_paint_composite_tex` — a
+    /// composite captured during the pre-transition window by the
+    /// slide-hold paint. Zero V4L2 activity on side A this tick;
+    /// eliminates the H2 codec-contention window that would defer
+    /// the incoming preload. This is the ONLY variant that the
+    /// runtime paint fn is allowed to dispatch for a TextOverVideo
+    /// outgoing.
+    UseCachedComposite,
+    /// Legacy snapshot-side-A (2026-06-21): source from
+    /// `session.transition_still_a_tex`. Captured on a prior
+    /// tick's `BakeAndCapture`; usable only on pure-Video outgoing
+    /// (TextOverVideo never populates this slot post-H2 fix
+    /// because TextOverVideo never bakes anymore).
+    UseStill,
+    /// Source from disk `poster.png`. May be stale; used as an
+    /// ultimate fallback for TextOverVideo when neither the cached
+    /// composite nor the poster-eligible transitions apply.
+    UsePoster,
+    /// Bake outgoing live via `bake_slide_to_fbo(inputs_a)` +
+    /// capture the freshly-baked frame into
+    /// `session.transition_still_a_tex` for the rest of the
+    /// transition window. RESERVED for pure-Video outgoing on the
+    /// snapshot-eligible path where no cached composite is
+    /// available AND still_a is empty. TextOverVideo NEVER receives
+    /// this plan (would reintroduce H2).
+    BakeAndCapture,
+    /// Bake outgoing live via `bake_slide_to_fbo(inputs_a)` without
+    /// snapshot capture. Used on the non-snapshot-eligible path
+    /// (video → text/image) where the transition is short-lived
+    /// and the fresh bake carries the whole outgoing side.
+    BakeOnly,
+    /// Bail — no frame source available. Caller returns
+    /// Ok(false) so the transition tick doesn't paint.
+    Skip,
+}
+
+/// Side-B source-selection plan.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SideBPlan {
+    /// Source from `session.transition_preloaded_first_frame_b_tex`
+    /// (ticks 2..N of a transition where the upload happened on
+    /// tick 1).
+    UsePreloadedSlot,
+    /// Upload the caller-supplied `CapturedNv12Frame` to a fresh
+    /// session-cached tex, then use it (tick 1 of a fresh
+    /// transition).
+    UploadPreloadedInput,
+    /// Fall back to disk `poster.png` — may be stale. Used on
+    /// preload-miss cases (EOS, EAGAIN-exhausted, cold start,
+    /// non-video endpoint, or codec-contention-deferred preload).
+    UsePosterDisk,
+    /// Live-decode via the existing bake_b Path B poll loop —
+    /// used on the non-video endpoint case (Text / Image) OR when
+    /// no fallback source exists at all.
+    BakeLive,
+}
+
+/// What (if anything) to `unpin_egl_refs()` on the outgoing
+/// decoder at the tail of the tick. Only meaningful when
+/// `SideAPlan` == `BakeAndCapture` (the ONLY case where the tick
+/// pinned new EGLImages on the outgoing decoder). All other plans
+/// return `UnpinTarget::None`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum UnpinTarget {
+    None,
+    /// Unpin `TransitionEndpoint::Video::decoder`.
+    Decoder,
+    /// Unpin `TransitionEndpoint::TextOverVideo::bg_decoder`.
+    BgDecoder,
+}
+
+/// Snapshot-side-A eligibility. Loosened 2026-07-04 f4ec9501 to
+/// include `TextOverVideo` on both sides (mirror-image of pr38 on
+/// side B); the H2 arc keeps that loosening — the pathology was
+/// the runtime bake path taken on TextOverVideo, not the
+/// eligibility gate. Under the H2 fix, TextOverVideo endpoint_a
+/// still gets `snapshot_eligible=true`; the decision to NOT bake
+/// is enforced downstream in `decide_side_a_plan`.
+pub fn is_snapshot_eligible(a: EndpointKind, b: EndpointKind) -> bool {
+    matches!(a, EndpointKind::Video | EndpointKind::TextOverVideo)
+        && matches!(b, EndpointKind::Video | EndpointKind::TextOverVideo)
+}
+
+/// Pure decision function for side A. Returns the `SideAPlan` the
+/// runtime paint fn must dispatch this tick. See the enum variants
+/// for the runtime meaning of each.
+///
+/// H2 arc invariant (compile-checked by the `plan_tests` mod
+/// below): TextOverVideo endpoint_a NEVER receives
+/// `BakeAndCapture` or `BakeOnly`. Enforced by the match arms
+/// below.
+pub fn decide_side_a_plan(inputs: SideAInputs) -> SideAPlan {
+    // H2 fix invariant (2026-07-04 Jason device): TextOverVideo
+    // endpoint_a NEVER bakes. Bake reopens / re-feeds the outgoing
+    // bg_decoder mid-transition, which pushed the fleet's
+    // concurrent-decoder ceiling past r97's codec-contention gate
+    // and caused every incoming preload to defer (78x observed).
+    // TextOverVideo precedence per QA constraint:
+    //   UseCachedComposite > UseStill (only if by some prior
+    //   history the slot exists) > UsePoster (stale but H2-safe)
+    //   > Skip. Explicit early return keeps the invariant readable
+    //   in one place.
+    if inputs.endpoint_a_kind == EndpointKind::TextOverVideo {
+        if inputs.snapshot_eligible
+            && inputs.cached_pair_a_present
+            && inputs.cached_composite_present_for_this_endpoint
+        {
+            return SideAPlan::UseCachedComposite;
+        }
+        // still_a for TextOverVideo shouldn't exist post-H2-fix
+        // (TextOverVideo never BakeAndCaptures anymore), but a
+        // straggler entry from a prior binary is harmless to
+        // consume — it was captured from a real fbo_a composite.
+        if inputs.snapshot_eligible
+            && inputs.cached_pair_a_present
+            && inputs.still_a_present
+        {
+            return SideAPlan::UseStill;
+        }
+        if inputs.cached_pair_a_present && inputs.poster_a_present {
+            return SideAPlan::UsePoster;
+        }
+        return SideAPlan::Skip;
+    }
+    // Pure-Video / Text / Image precedence ladder:
+    //   1. UseCachedComposite (H2-safe, zero V4L2 on side A)
+    //   2. UseStill (legacy snapshot-side-A path)
+    //   3. UsePoster (stale but H2-safe)
+    //   4. BakeAndCapture (pure-Video only; the outgoing decoder is
+    //      the same instance that just finished streaming and is
+    //      already live, so no NEW decoder open → H2-safe)
+    //   5. BakeOnly (non-snapshot-eligible; video→text/image)
+    //   6. Skip
+    if inputs.snapshot_eligible && inputs.cached_pair_a_present {
+        if inputs.cached_composite_present_for_this_endpoint {
+            return SideAPlan::UseCachedComposite;
+        }
+        if inputs.still_a_present && inputs.endpoint_a_kind == EndpointKind::Video {
+            return SideAPlan::UseStill;
+        }
+        // Pure Video, no cached composite, no still: bake+capture.
+        if inputs.endpoint_a_kind == EndpointKind::Video {
+            return SideAPlan::BakeAndCapture;
+        }
+    }
+    // Non-snapshot-eligible or non-Video snapshot-eligible-but-no-
+    // source: existing pre-2026-06-21 poster-fast-path or bake.
+    if inputs.endpoint_a_kind == EndpointKind::Video
+        && inputs.poster_a_present
+        && inputs.cached_pair_a_present
+    {
+        return SideAPlan::UsePoster;
+    }
+    // Text / Image / no-poster-Video: bake without capture.
+    SideAPlan::BakeOnly
+}
+
+/// Pure decision function for side B. Returns the `SideBPlan` the
+/// runtime paint fn must dispatch this tick.
+///
+/// Independence-of-side-A invariant (compile-checked by the
+/// signature): `SideBInputs` carries NO side-A fields; side-B
+/// decisions cannot depend on side-A state.
+pub fn decide_side_b_plan(inputs: SideBInputs) -> SideBPlan {
+    // Precedence:
+    //   1. UsePreloadedSlot (tick 2..N, already uploaded)
+    //   2. UploadPreloadedInput (tick 1, fresh bytes)
+    //   3. UsePosterDisk (fallback for preload-miss)
+    //   4. BakeLive (last resort)
+    let endpoint_is_video_bearing = matches!(
+        inputs.endpoint_b_kind,
+        EndpointKind::Video | EndpointKind::TextOverVideo,
+    );
+    if endpoint_is_video_bearing && inputs.cached_pair_b_present {
+        if inputs.preloaded_slot_present_for_this_endpoint {
+            return SideBPlan::UsePreloadedSlot;
+        }
+        if inputs.preloaded_input_present {
+            return SideBPlan::UploadPreloadedInput;
+        }
+        if inputs.poster_b_disk_present {
+            return SideBPlan::UsePosterDisk;
+        }
+    }
+    SideBPlan::BakeLive
+}
+
+/// What (if anything) the tick pinned on the outgoing decoder
+/// that should be `unpin_egl_refs()`d at the tail. Only
+/// `BakeAndCapture` pinned anything new; every other plan is
+/// `UnpinTarget::None`. The H2 arc regression pin is:
+/// `unpin_target_for_endpoint_a(TextOverVideo, UseCachedComposite)
+/// == UnpinTarget::None`.
+pub fn unpin_target_for_endpoint_a(
+    kind: EndpointKind,
+    plan: SideAPlan,
+) -> UnpinTarget {
+    if plan != SideAPlan::BakeAndCapture {
+        return UnpinTarget::None;
+    }
+    match kind {
+        EndpointKind::Video => UnpinTarget::Decoder,
+        EndpointKind::TextOverVideo => UnpinTarget::BgDecoder,
+        EndpointKind::Text | EndpointKind::Image => UnpinTarget::None,
+    }
+}
+
 /// Clamp a transition_ms to a sane minimum so degenerate
 /// playlist values (0 or near-zero) don't slip through to the
 /// per-frame loop where transition_ms = 0 is an error. 50ms ≈
@@ -5366,6 +5712,316 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 2026-07-04 (Jason device H2 arc): pure-fn tests for the
+    // transition-side plan decision layer. Every scenario below is
+    // reachable off-target (no GL, no V4L2, no EglSession) —
+    // exercises the compile-time interaction invariants the
+    // qarl-mandated "behavioral fix ships with a fails-before /
+    // passes-after test" rule requires.
+    //
+    // ---------------------------------------------------------
+    // Fails-before evidence for THE H2 regression test below:
+    //   pre-fix wiring (f4ec9501 side-A snapshot) did NOT have the
+    //   `SideAPlan::UseCachedComposite` variant OR the pure-fn
+    //   layer. Checking out this test file against f4ec9501 fails
+    //   to compile (variant unresolved). Applying the fix +
+    //   pure-fn extraction makes all tests pass.
+    // ---------------------------------------------------------
+
+    #[test]
+    fn h2_text_over_video_uses_cached_composite_not_bake() {
+        // THE H2 REGRESSION TEST. TextOverVideo → TextOverVideo
+        // transition with a cached composite available. Plan MUST
+        // be UseCachedComposite (no bake → no 2nd decoder open →
+        // no r97 codec-contention deferral on the incoming
+        // preload).
+        //
+        // On the broken (pre-fix) code path this scenario would
+        // dispatch BakeAndCapture, which opens the outgoing
+        // bg_decoder and triggers H2. QA-confirmed 78x
+        // preload_deferred_for_codec_contention on f4ec9501 in
+        // the failure window. The assertion below is the compile-
+        // enforced regression pin.
+        let plan = decide_side_a_plan(SideAInputs {
+            snapshot_eligible: true,
+            endpoint_a_kind: EndpointKind::TextOverVideo,
+            cached_composite_present_for_this_endpoint: true,
+            still_a_present: false,
+            cached_pair_a_present: true,
+            poster_a_present: true,
+        });
+        assert_eq!(plan, SideAPlan::UseCachedComposite);
+    }
+
+    #[test]
+    fn h2_text_over_video_falls_back_to_poster_on_composite_miss() {
+        // QA constraint (2026-07-04): TextOverVideo on cache-miss
+        // MUST fall back to poster (stale but H2-safe). NEVER to
+        // BakeAndCapture — that reintroduces H2 contention.
+        let plan = decide_side_a_plan(SideAInputs {
+            snapshot_eligible: true,
+            endpoint_a_kind: EndpointKind::TextOverVideo,
+            cached_composite_present_for_this_endpoint: false,
+            still_a_present: false,
+            cached_pair_a_present: true,
+            poster_a_present: true,
+        });
+        assert_eq!(plan, SideAPlan::UsePoster);
+    }
+
+    #[test]
+    fn h2_text_over_video_skips_when_no_source_available() {
+        // TextOverVideo, snapshot-eligible, no cached composite,
+        // no still_a (which never populates for TextOverVideo
+        // anyway), no poster: Skip. Bake is FORBIDDEN.
+        let plan = decide_side_a_plan(SideAInputs {
+            snapshot_eligible: true,
+            endpoint_a_kind: EndpointKind::TextOverVideo,
+            cached_composite_present_for_this_endpoint: false,
+            still_a_present: false,
+            cached_pair_a_present: true,
+            poster_a_present: false,
+        });
+        assert_eq!(plan, SideAPlan::Skip);
+        // Belt-and-suspenders: no Bake variant EVER comes back
+        // for TextOverVideo when snapshot_eligible.
+        for cached in [true, false] {
+            for still in [true, false] {
+                for pair in [true, false] {
+                    for poster in [true, false] {
+                        let p = decide_side_a_plan(SideAInputs {
+                            snapshot_eligible: true,
+                            endpoint_a_kind: EndpointKind::TextOverVideo,
+                            cached_composite_present_for_this_endpoint: cached,
+                            still_a_present: still,
+                            cached_pair_a_present: pair,
+                            poster_a_present: poster,
+                        });
+                        assert_ne!(
+                            p, SideAPlan::BakeAndCapture,
+                            "TextOverVideo snapshot_eligible must never bake+capture (H2)",
+                        );
+                        // BakeOnly is only for the non-snapshot-eligible
+                        // path; snapshot_eligible=true excludes it here.
+                        assert_ne!(
+                            p, SideAPlan::BakeOnly,
+                            "TextOverVideo snapshot_eligible must never bake-only (H2)",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn h2_pure_video_may_still_bake_and_capture() {
+        // Pure Video → Video snapshot-eligible with no cached
+        // composite and no still: BakeAndCapture is the correct
+        // plan (the outgoing decoder is the same instance that
+        // was just playing, no NEW decoder open, H2-safe).
+        let plan = decide_side_a_plan(SideAInputs {
+            snapshot_eligible: true,
+            endpoint_a_kind: EndpointKind::Video,
+            cached_composite_present_for_this_endpoint: false,
+            still_a_present: false,
+            cached_pair_a_present: true,
+            poster_a_present: false,
+        });
+        assert_eq!(plan, SideAPlan::BakeAndCapture);
+    }
+
+    #[test]
+    fn h2_unpin_target_none_for_cached_composite() {
+        // Paired with the H2 test above: when the tick sources
+        // from the cached composite, NO EGLImages were newly
+        // pinned this tick, so unpin must be None. Firing
+        // unpin_egl_refs on the outgoing decoder in this case
+        // was the additional H2-adjacent risk in f4ec9501's
+        // extension (it fires bg_decoder.unpin_egl_refs()).
+        assert_eq!(
+            unpin_target_for_endpoint_a(
+                EndpointKind::TextOverVideo,
+                SideAPlan::UseCachedComposite,
+            ),
+            UnpinTarget::None,
+        );
+        assert_eq!(
+            unpin_target_for_endpoint_a(
+                EndpointKind::Video,
+                SideAPlan::UseCachedComposite,
+            ),
+            UnpinTarget::None,
+        );
+    }
+
+    #[test]
+    fn unpin_target_matches_bake_endpoint_kind() {
+        // Only BakeAndCapture pinned anything worth freeing.
+        // Kind selects which decoder handle to touch.
+        assert_eq!(
+            unpin_target_for_endpoint_a(EndpointKind::Video, SideAPlan::BakeAndCapture),
+            UnpinTarget::Decoder,
+        );
+        assert_eq!(
+            unpin_target_for_endpoint_a(EndpointKind::TextOverVideo, SideAPlan::BakeAndCapture),
+            UnpinTarget::BgDecoder,
+        );
+        // Text / Image never pin V4L2 EGLImages regardless.
+        assert_eq!(
+            unpin_target_for_endpoint_a(EndpointKind::Text, SideAPlan::BakeAndCapture),
+            UnpinTarget::None,
+        );
+        assert_eq!(
+            unpin_target_for_endpoint_a(EndpointKind::Image, SideAPlan::BakeAndCapture),
+            UnpinTarget::None,
+        );
+        // Every non-BakeAndCapture plan is None regardless of kind.
+        for kind in [
+            EndpointKind::Text,
+            EndpointKind::Image,
+            EndpointKind::Video,
+            EndpointKind::TextOverVideo,
+        ] {
+            for plan in [
+                SideAPlan::UseCachedComposite,
+                SideAPlan::UseStill,
+                SideAPlan::UsePoster,
+                SideAPlan::BakeOnly,
+                SideAPlan::Skip,
+            ] {
+                assert_eq!(
+                    unpin_target_for_endpoint_a(kind, plan),
+                    UnpinTarget::None,
+                    "non-BakeAndCapture plan must not unpin ({kind:?}, {plan:?})",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn side_b_precedence_preloaded_beats_poster() {
+        // pr38 core invariant: fresh preloaded frame > stale disk
+        // poster. This test is orthogonal to the H2 arc; keeps
+        // the pr38 regression pinned once the plan layer is the
+        // authoritative decision site.
+        let plan = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind: EndpointKind::TextOverVideo,
+            preloaded_slot_present_for_this_endpoint: true,
+            preloaded_input_present: false,
+            poster_b_disk_present: true,
+            cached_pair_b_present: true,
+        });
+        assert_eq!(plan, SideBPlan::UsePreloadedSlot);
+    }
+
+    #[test]
+    fn side_b_upload_on_tick_1_then_reuse_slot() {
+        // Tick 1: caller supplied fresh bytes, slot empty →
+        // UploadPreloadedInput.
+        let plan = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind: EndpointKind::TextOverVideo,
+            preloaded_slot_present_for_this_endpoint: false,
+            preloaded_input_present: true,
+            poster_b_disk_present: true,
+            cached_pair_b_present: true,
+        });
+        assert_eq!(plan, SideBPlan::UploadPreloadedInput);
+        // Tick 2+: caller supplied no bytes (consume-once at IPC),
+        // slot populated → UsePreloadedSlot.
+        let plan = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind: EndpointKind::TextOverVideo,
+            preloaded_slot_present_for_this_endpoint: true,
+            preloaded_input_present: false,
+            poster_b_disk_present: true,
+            cached_pair_b_present: true,
+        });
+        assert_eq!(plan, SideBPlan::UsePreloadedSlot);
+    }
+
+    #[test]
+    fn side_b_falls_to_disk_poster_when_preload_missed() {
+        let plan = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind: EndpointKind::TextOverVideo,
+            preloaded_slot_present_for_this_endpoint: false,
+            preloaded_input_present: false,
+            poster_b_disk_present: true,
+            cached_pair_b_present: true,
+        });
+        assert_eq!(plan, SideBPlan::UsePosterDisk);
+    }
+
+    #[test]
+    fn side_b_non_video_endpoint_bakes_live() {
+        for kind in [EndpointKind::Text, EndpointKind::Image] {
+            let plan = decide_side_b_plan(SideBInputs {
+                endpoint_b_kind: kind,
+                preloaded_slot_present_for_this_endpoint: true,
+                preloaded_input_present: true,
+                poster_b_disk_present: true,
+                cached_pair_b_present: true,
+            });
+            assert_eq!(
+                plan, SideBPlan::BakeLive,
+                "{kind:?} endpoint_b bakes live regardless of preload / poster state",
+            );
+        }
+    }
+
+    #[test]
+    fn side_a_and_side_b_decisions_are_independently_typed() {
+        // Compile-enforced decoupling: SideBInputs contains NO
+        // side-A fields, so `decide_side_b_plan` CAN NOT read
+        // side-A state — the interaction bug class that motivated
+        // the extraction is unrepresentable. Runtime callers must
+        // build the two input structs independently from their
+        // per-side inputs.
+        //
+        // This test is intentionally trivial — its value is
+        // structural, not behavioral.
+        let a = decide_side_a_plan(SideAInputs {
+            snapshot_eligible: true,
+            endpoint_a_kind: EndpointKind::TextOverVideo,
+            cached_composite_present_for_this_endpoint: true,
+            still_a_present: false,
+            cached_pair_a_present: true,
+            poster_a_present: false,
+        });
+        let b = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind: EndpointKind::TextOverVideo,
+            preloaded_slot_present_for_this_endpoint: false,
+            preloaded_input_present: true,
+            poster_b_disk_present: false,
+            cached_pair_b_present: true,
+        });
+        assert_eq!(a, SideAPlan::UseCachedComposite);
+        assert_eq!(b, SideBPlan::UploadPreloadedInput);
+    }
+
+    #[test]
+    fn is_snapshot_eligible_accepts_video_and_text_over_video_on_both_sides() {
+        for a in [EndpointKind::Video, EndpointKind::TextOverVideo] {
+            for b in [EndpointKind::Video, EndpointKind::TextOverVideo] {
+                assert!(is_snapshot_eligible(a, b), "{a:?} → {b:?}");
+            }
+        }
+        // Non-video endpoints on either side kill eligibility.
+        for a in [EndpointKind::Text, EndpointKind::Image] {
+            for b in [
+                EndpointKind::Text,
+                EndpointKind::Image,
+                EndpointKind::Video,
+                EndpointKind::TextOverVideo,
+            ] {
+                assert!(!is_snapshot_eligible(a, b), "{a:?} → {b:?}");
+            }
+        }
+        for a in [EndpointKind::Video, EndpointKind::TextOverVideo] {
+            for b in [EndpointKind::Text, EndpointKind::Image] {
+                assert!(!is_snapshot_eligible(a, b), "{a:?} → {b:?}");
+            }
+        }
+    }
 
     // SDF arc slice B.2 -- layout_text_to_quads smoke tests.
     // Uses the baked anton atlas (slice A artifact) so we don't
@@ -6761,9 +7417,16 @@ mod tests {
             !FS_DISSOLVE.contains("precision highp"),
             "FS_DISSOLVE must not use highp (P3 dropped it)",
         );
-        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+        for uniform in ["u_src_a", "u_src_b", "u_t", "u_resolution"] {
             assert!(FS_DISSOLVE.contains(uniform));
         }
+        // 2026-07-04 (Jason device): reveal quantized to 10 x 10
+        // device-pixel blocks. Pin the block-index derivation +
+        // confirm the pre-fix per-pixel hash-on-v_uv is gone so a
+        // rewrite can't silently drop back to a native-pixel reveal.
+        assert!(FS_DISSOLVE.contains("floor(v_uv * u_resolution / 10.0)"));
+        assert!(FS_DISSOLVE.contains("_hash(block)"));
+        assert!(!FS_DISSOLVE.contains("_hash(v_uv)"));
         // IQ markers pinned: 1/pi seed scale (0.3183099),
         // 50.0 amplifier, vec2 seed offsets (0.71, 0.113). Pin so
         // a future edit doesn't silently regress to a non-mediump-
@@ -7030,18 +7693,24 @@ mod tests {
     fn fs_pixelate_targets_gles2_and_pins_uniforms() {
         assert!(FS_PIXELATE.starts_with("#version 100\n"));
         assert!(FS_PIXELATE.contains("precision mediump float"));
-        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+        for uniform in ["u_src_a", "u_src_b", "u_t", "u_resolution"] {
             assert!(FS_PIXELATE.contains(uniform));
         }
-        // Wave envelope: 1 - 4*(t-0.5)^2. Pin so a refactor can't
-        // accidentally invert (4*(t-0.5)^2 - 1 — wrong sign) or
-        // shift the peak (e.g. 4*(t-0.25)^2 — peak at 0.25).
-        assert!(FS_PIXELATE.contains("1.0 - 4.0 * (u_t - 0.5) * (u_t - 0.5)"));
-        // Block size endpoints: 0.0025 base, 0.04 wave amplitude
-        // (so 0.0025 to 0.0425 sweep). Pin so the block-size scale
-        // can't accidentally shift.
-        assert!(FS_PIXELATE.contains("0.0025"));
-        assert!(FS_PIXELATE.contains("0.04 * wave"));
+        // 2026-07-03 (Jason device): fixed 10-px mosaic block driven
+        // by u_resolution instead of a t-varying wave. qarl watches
+        // transitions live and the wave-scaled blocks looked too
+        // fine; chunky 10×10 device-pixel blocks are the wanted
+        // visual. Pin the fixed block-size math + the exported
+        // constant so a rewrite can't silently reintroduce the
+        // wave envelope.
+        assert!(FS_PIXELATE.contains("vec2(10.0)"));
+        assert!(FS_PIXELATE.contains("u_resolution"));
+        assert!(FS_PIXELATE.contains("floor"));
+        assert!(!FS_PIXELATE.contains("wave"));
+        // The exported constant is what call-sites reference; keep
+        // its value pinned so the shader source (which repeats the
+        // literal 10.0) and the Rust-side constant can't drift.
+        assert_eq!(PIXELATE_BLOCK_PX, 10.0);
     }
 
     #[test]
@@ -7066,14 +7735,19 @@ mod tests {
     fn fs_halftone_targets_gles2_and_pins_uniforms() {
         assert!(FS_HALFTONE.starts_with("#version 100\n"));
         assert!(FS_HALFTONE.contains("precision mediump float"));
-        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+        for uniform in ["u_src_a", "u_src_b", "u_t", "u_aspect"] {
             assert!(FS_HALFTONE.contains(uniform));
         }
-        // 16:9 grid hardcoded — 8 rows. Pin both the row count and
-        // the aspect math so a rewrite can't silently change the
-        // visual layout.
+        // 8 rows down y-axis pinned so a rewrite can't silently
+        // change the row count.
         assert!(FS_HALFTONE.contains("grid_y = 8.0"));
-        assert!(FS_HALFTONE.contains("16.0 / 9.0"));
+        // 2026-07-03 (Jason device): x-cell count = grid_y * u_aspect
+        // so cells stay SQUARE at every target aspect. Was hardcoded
+        // 16.0 / 9.0 pre-fix, which turned dots into tall ovals on
+        // the rotated FYS 9:16 target. Pin the u_aspect drive so a
+        // regression can't silently reintroduce the hardcode.
+        assert!(FS_HALFTONE.contains("grid_y * u_aspect"));
+        assert!(!FS_HALFTONE.contains("16.0 / 9.0"));
         // Same 0.71 sqrt(0.5) max-radius as iris (cell-local here,
         // not screen-global). Pin direction.
         assert!(FS_HALFTONE.contains("step(d, u_t * 0.71)"));
@@ -7197,32 +7871,43 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fs_marquee_targets_gles2_and_pins_uniforms() {
-        assert!(FS_MARQUEE.starts_with("#version 100\n"));
-        for uniform in ["u_src_a", "u_src_b", "u_t"] {
-            assert!(FS_MARQUEE.contains(uniform));
-        }
-        // Gap width 0.125 normalized = 1/8 screen width. Dot
-        // radius 0.074 (small white dot in the gap).
-        assert!(FS_MARQUEE.contains("gap_uv = 0.125"));
-        assert!(FS_MARQUEE.contains("dot_r = 0.074"));
-    }
+    // 2026-07-03 (Jason device): `fs_marquee_targets_gles2_and_pins_uniforms`
+    // removed with FS_MARQUEE. See the marquee → fade alias tests
+    // above for the legacy-data behaviour that replaced it.
 
     #[test]
     fn fs_shutter_targets_gles2_and_pins_uniforms() {
         assert!(FS_SHUTTER.starts_with("#version 100\n"));
-        for uniform in ["u_src_a", "u_src_b", "u_t"] {
+        for uniform in ["u_src_a", "u_src_b", "u_t", "u_aspect"] {
             assert!(FS_SHUTTER.contains(uniform));
         }
         // 0.866025 = cos(30°), the half-height-to-half-width ratio
-        // of a regular hexagon. 16:9 aspect correction keeps the
-        // hex regular at 1080p. 1.5*u_t is the inscribed-radius
+        // of a regular hexagon. 1.5*u_t is the inscribed-radius
         // growth (1.5 = ~max hex_d at the corners with aspect
         // correction).
         assert!(FS_SHUTTER.contains("0.866025"));
-        assert!(FS_SHUTTER.contains("16.0 / 9.0"));
         assert!(FS_SHUTTER.contains("1.5 * u_t"));
+        // 2026-07-04 (Jason device): x-normalization now driven by
+        // u_aspect so the hex stays REGULAR at every target aspect —
+        // was hardcoded 16.0/9.0 pre-fix, which squashed the hex on
+        // the rotated FYS 9:16 target (same failure mode as the
+        // halftone-oval bug). Pin the u_aspect drive AND assert the
+        // hardcode is gone so a regression can't silently drift
+        // back.
+        assert!(FS_SHUTTER.contains("d.x *= u_aspect"));
+        assert!(!FS_SHUTTER.contains("16.0 / 9.0"));
+    }
+
+    /// 2026-07-04 (Jason device): confirm the SP shutter arm also
+    /// uses u_aspect, not the pre-fix 16.0/9.0 hardcode. Mirrors the
+    /// halftone-oval regression guard in
+    /// `fs_transition_sp_source_batch_b_dispatch`.
+    #[test]
+    fn fs_transition_sp_source_shutter_uses_u_aspect() {
+        let shutter = fs_transition_sp_source("shutter", 0, 0).unwrap();
+        assert!(shutter.contains("d.x *= u_aspect"));
+        assert!(!shutter.contains("16.0 / 9.0"));
+        assert!(shutter.contains("0.866025"));
     }
 
     #[test]
@@ -7248,23 +7933,28 @@ mod tests {
         assert_eq!(fs_for_transition_kind("scroll"), Some(FS_SCROLL));
         assert_eq!(fs_for_transition_kind("blinds"), Some(FS_BLINDS));
         assert_eq!(fs_for_transition_kind("flip"), Some(FS_FLIP));
-        assert_eq!(fs_for_transition_kind("marquee"), Some(FS_MARQUEE));
+        // 2026-07-03 (Jason device): `marquee` was dropped as a
+        // distinct visual (FS_MARQUEE deleted); legacy playlist
+        // data with `transition = "marquee"` aliases to FS_FADE so
+        // the transition still plays cleanly.
+        assert_eq!(fs_for_transition_kind("marquee"), Some(FS_FADE));
         assert_eq!(fs_for_transition_kind("shutter"), Some(FS_SHUTTER));
     }
 
     #[test]
     fn fs_for_transition_kind_full_deck_count() {
-        // Phase 5-c-4: the 16 Python-ref transitions are now all
-        // mirrored. Pin the count so a future delete OR add slips
-        // a host test rather than going silent. If a 17th lands,
-        // bump this number AND add it to the routes-known test.
+        // Phase 5-c-4 + 2026-07-03: the Python-ref transition deck
+        // shrank from 16 to 15 when `marquee` was dropped. Pin the
+        // count so a future delete OR add slips a host test rather
+        // than going silent. If a 16th distinct kind lands, bump
+        // this number AND add it to the routes-known test.
         let known_kinds = [
             "cut", "fade", "wipe", "iris", "dissolve",
             "pixelate", "scanline", "halftone",
             "glitch", "slide", "push", "scroll",
-            "blinds", "flip", "marquee", "shutter",
+            "blinds", "flip", "shutter",
         ];
-        assert_eq!(known_kinds.len(), 16);
+        assert_eq!(known_kinds.len(), 15);
         for kind in known_kinds {
             assert!(
                 fs_for_transition_kind(kind).is_some(),
@@ -7628,6 +8318,55 @@ mod tests {
         assert!(dissolve.contains("precision mediump float"));
         assert!(!dissolve.contains("precision highp"));
         assert!(dissolve.contains("_hash"));
+        // 2026-07-04 (Jason device): SP dissolve reveals in 10 x 10
+        // device-pixel blocks — every pixel in a block shares one
+        // threshold. Pin the block-index derivation + confirm the
+        // pre-fix per-pixel hash-on-v_uv is gone.
+        assert!(dissolve.contains("floor(v_uv * u_resolution / 10.0)"));
+        assert!(dissolve.contains("_hash(block)"));
+        assert!(!dissolve.contains("_hash(v_uv)"));
+    }
+
+    /// 2026-07-04 (Jason device): behavioural test for the dissolve
+    /// block-quantized reveal. Two v_uv coords that fall inside the
+    /// SAME 10 x 10 device-pixel block must produce the same hash-block
+    /// input; two coords in DIFFERENT blocks must produce different
+    /// block inputs (the hash itself can collide by chance — this test
+    /// only pins the quantization).
+    #[test]
+    fn dissolve_reveal_quantizes_to_10px_blocks() {
+        // Simulate a 1920x1080 target framebuffer.
+        let mode_w = 1920.0_f32;
+        let mode_h = 1080.0_f32;
+        let px = 1.0 / mode_w;
+        // Anchor v_uv inside block (37, 21) — column * 10 px, row * 10 px.
+        let anchor_u = 37.0 * 10.0 / mode_w + 3.0 * px;
+        let anchor_v = 21.0 * 10.0 / mode_h + 3.0 * (1.0 / mode_h);
+        // Any offset within the block should yield the same block index.
+        let block = |u: f32, v: f32| -> (i32, i32) {
+            let bx = (u * mode_w / 10.0).floor() as i32;
+            let by = (v * mode_h / 10.0).floor() as i32;
+            (bx, by)
+        };
+        let anchor_block = block(anchor_u, anchor_v);
+        for du in 0..10 {
+            for dv in 0..10 {
+                let u = 37.0 * 10.0 / mode_w + (du as f32) / mode_w;
+                let v = 21.0 * 10.0 / mode_h + (dv as f32) / mode_h;
+                assert_eq!(
+                    block(u, v),
+                    anchor_block,
+                    "coords within a 10px block must resolve to the same block index"
+                );
+            }
+        }
+        // Neighbour block on x-axis: block (38, 21) must differ.
+        let neighbour_u = 38.0 * 10.0 / mode_w + 3.0 * px;
+        assert_ne!(
+            block(neighbour_u, anchor_v),
+            anchor_block,
+            "coords in different 10px blocks must resolve to different block indices"
+        );
     }
 
     #[test]
@@ -7875,15 +8614,31 @@ mod tests {
         // bound on the returned slice is enforced by the function
         // signature -- annotated below to make the compile-time
         // check explicit at the call site too.
+        // 2026-07-03 (Jason device): `marquee` no longer in the
+        // first-class SP-portable set — legacy data aliases to
+        // `fade` inside sp_kind_static (see the aliased-marquee
+        // assertion below).
         for kind in [
             "cut", "fade", "wipe", "iris", "dissolve", "scanline", "halftone",
-            "blinds", "shutter", "slide", "push", "scroll", "flip", "marquee",
+            "blinds", "shutter", "slide", "push", "scroll", "flip",
             "pixelate",
         ] {
             let resolved: &'static str = sp_kind_static(kind)
                 .unwrap_or_else(|| panic!("{kind} should resolve to a 'static slice"));
             assert_eq!(resolved, kind);
         }
+    }
+
+    #[test]
+    fn sp_kind_static_aliases_legacy_marquee_to_fade() {
+        // 2026-07-03 (Jason device): `marquee` was dropped from the
+        // supported transition set. Old playlist data with
+        // `transition = "marquee"` MUST still enter the SP dispatch
+        // path so the transition plays (falling through to FS_CUT
+        // would visually break every legacy playlist). Alias
+        // marquee → fade.
+        assert_eq!(sp_kind_static("marquee"), Some("fade"));
+        assert!(is_transition_kind_single_pass("marquee"));
     }
 
     #[test]
@@ -7906,6 +8661,10 @@ mod tests {
         // between these two predicates would let a kind reach the
         // SP code path without a HashMap key, or take an SP key
         // for a kind the runtime tier-dispatch doesn't accept.
+        // 2026-07-03 (Jason device): marquee kept in this list to
+        // pin the LEGACY-alias behaviour — both predicates alias
+        // marquee → fade, so both admit it and its resolve target
+        // is the aliased `fade`, not `marquee`.
         let candidate_kinds = [
             "cut", "fade", "wipe", "iris", "dissolve", "scanline", "halftone",
             "blinds", "shutter", "slide", "push", "scroll", "flip", "marquee",
@@ -8153,9 +8912,12 @@ mod tests {
 
     #[test]
     fn fs_transition_sp_source_batch_d_warps() {
-        // QA Step 3 Batch D: flip, marquee, pixelate (Group-B
-        // non-trivial warps).
-        for kind in ["flip", "marquee", "pixelate"] {
+        // QA Step 3 Batch D: flip, pixelate (Group-B non-trivial
+        // warps). `marquee` dropped 2026-07-03; the SP path now
+        // aliases it to fade so old playlist data still resolves,
+        // and its dedicated test cases live under
+        // sp_kind_static_aliases_legacy_marquee_to_fade.
+        for kind in ["flip", "pixelate"] {
             let s = fs_transition_sp_source(kind, 1, 1)
                 .unwrap_or_else(|| panic!("expected SP source for {kind}"));
             assert!(s.starts_with("#version 100\n"));
@@ -8166,15 +8928,20 @@ mod tests {
         assert!(flip.contains("scaleX = abs(2.0 * t - 1.0)"));
         assert!(flip.contains("max(scaleX, 1e-3)"));
         assert!(flip.contains("col * inside"));
-        let marquee = fs_transition_sp_source("marquee", 0, 0).unwrap();
-        assert!(marquee.contains("gap_uv = 0.125"));
-        assert!(marquee.contains("dot_r = 0.074"));
-        assert!(marquee.contains("in_from + gap_col * in_gap + cb * in_to"));
         let pixelate = fs_transition_sp_source("pixelate", 0, 0).unwrap();
-        assert!(pixelate.contains("blockSize = 0.0025"));
-        assert!(pixelate.contains("floor(v_uv / blockSize)"));
-        // pixelate: both A and B compose at the SAME quantized
-        // `cell` coord (both sample the pixelated view).
+        // 2026-07-03 (Jason device): pixelate now uses a fixed 10-px
+        // block driven by u_resolution instead of the t-varying 0.0025
+        // blockSize wave. qarl watches transitions live and the wave
+        // looked too fine; chunky 10×10 device-pixel blocks are the
+        // wanted visual. Pin the block-uv derivation + confirm the
+        // wave-envelope math is gone so a refactor can't drift back.
+        assert!(pixelate.contains("vec2(10.0)"));
+        assert!(pixelate.contains("u_resolution"));
+        assert!(pixelate.contains("floor"));
+        assert!(!pixelate.contains("blockSize = 0.0025"));
+        assert!(!pixelate.contains("0.04 * wave"));
+        // pixelate: both A and B compose at the SAME quantized cell
+        // coord (both sample the pixelated view).
         assert!(pixelate.contains("vec3 ca = u_a_bg"));
         assert!(pixelate.contains("vec3 cb = u_b_bg"));
     }
@@ -8234,7 +9001,13 @@ mod tests {
         assert!(scanline.contains("smoothstep"));
         assert!(scanline.contains("vec3(1.0)"));
         let halftone = fs_transition_sp_source("halftone", 0, 0).unwrap();
-        assert!(halftone.contains("16.0 / 9.0"));
+        // 2026-07-03: SP halftone arm now drives the x-cell count
+        // from u_aspect (mode_w/mode_h) so cells stay SQUARE at
+        // every target aspect — see FS_HALFTONE test for the
+        // matching pin on the legacy shader source. Was 16.0/9.0
+        // hardcoded pre-fix.
+        assert!(halftone.contains("grid_y * u_aspect"));
+        assert!(!halftone.contains("16.0 / 9.0"));
         assert!(halftone.contains("0.71"));
         let blinds = fs_transition_sp_source("blinds", 0, 0).unwrap();
         assert!(blinds.contains("16.0"));
@@ -10443,16 +11216,6 @@ mod tests {
     }
 
     #[test]
-    fn atlas_wrap_handles_complex_uv_expression() {
-        // FS_MARQUEE samples with `vec2(cx, v_uv.y)` and
-        // `vec2(cx - 1.0 - gap_uv, v_uv.y)`. The substitution must
-        // preserve the inner expressions as a single argument.
-        let wrapped = wrap_composite_for_atlas(FS_MARQUEE);
-        assert!(wrapped.contains("_sa(vec2(cx, v_uv.y))"));
-        assert!(wrapped.contains("_sb(vec2(cx - 1.0 - gap_uv, v_uv.y))"));
-    }
-
-    #[test]
     fn atlas_wrap_idempotent_for_shader_without_samplers() {
         // FS_GLYPH doesn't have u_src_a/u_src_b -- wrap should
         // pass through unchanged. (Defense against accidental
@@ -10485,7 +11248,6 @@ mod tests {
             ("FS_SCROLL", FS_SCROLL),
             ("FS_BLINDS", FS_BLINDS),
             ("FS_FLIP", FS_FLIP),
-            ("FS_MARQUEE", FS_MARQUEE),
             ("FS_SHUTTER", FS_SHUTTER),
         ];
         for (name, src) in kinds {

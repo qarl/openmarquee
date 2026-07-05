@@ -61,6 +61,24 @@ pub struct PlaybackState {
     /// blend; when its duration elapses, to_slide promotes to
     /// current and pending clears.
     pub pending: Option<TransitionContext>,
+    /// 2026-07-04 (Jason device H2 arc): PreloadSlide-gated signal
+    /// to `paint_and_present_one_frame_for_slide`. When Some(vid),
+    /// the slide-hold paint glCopyTexImage2D's the currently-bound
+    /// framebuffer's composited color attachment into
+    /// `session.last_video_paint_composite_tex` — the "last
+    /// already-displayed frame" used by
+    /// `paint_and_present_one_transition_frame` as the H2-safe
+    /// side-A frozen-entry visual (zero V4L2 activity on side A
+    /// at transition time → no 2nd decoder open → no r97 codec-
+    /// contention deferral on the incoming preload). Set by the
+    /// PreloadSlide IPC arm when the current slide is video-
+    /// bearing; cleared on BeginTransition (transition has taken
+    /// over, no more slide-hold paints for the outgoing) and on
+    /// BeginSlide (new slide is current). Value = the outgoing
+    /// video_id (Video slide's own id OR TextOverVideo's bg-video
+    /// slide id) — matches the poster_a_video_id shape so the
+    /// transition side can look up the slot by that key.
+    pub capture_composite_video_id: Option<Uuid>,
     /// PR3 (2026-06-27) onboarding system card overlay. Set by
     /// RenderSystemCard, cleared by ClearSystemCard or ttl_ms
     /// expiry. When Some, the paint loop draws the card on top

@@ -598,6 +598,40 @@ pub struct EglSession<'a> {
     /// bypass that reads this texture instead of re-feeding the
     /// outgoing decoder.
     transition_still_a_tex: Option<glow::NativeTexture>,
+    /// 2026-07-04 (Jason device): session-cached RGBA texture
+    /// containing the freshly-decoded first frame of the incoming
+    /// (B) side's video, uploaded from the `CapturedNv12Frame` the
+    /// preload worker captured during its handoff drain. Replaces
+    /// the (potentially days-stale) poster.png fallback as the
+    /// frozen-entry visual during video→video transitions.
+    ///
+    /// Shape: `(source_video_id, tex, w, h)`. The `source_video_id`
+    /// invalidates the cache when a new transition targets a
+    /// different B-side video (free tex + re-upload). Slot is
+    /// populated at the FIRST paint tick of a transition where the
+    /// caller passed a `preloaded_first_frame_b` reference AND
+    /// the slot was either empty or held a different video_id.
+    /// Freed at session teardown + on invalidation.
+    transition_preloaded_first_frame_b_tex:
+        Option<(uuid::Uuid, glow::NativeTexture, u32, u32)>,
+    /// 2026-07-04 (Jason device H2 arc): "last already-displayed
+    /// frame" for the outgoing side of the next transition. Captured
+    /// by `paint_and_present_one_frame_for_slide` at end of the
+    /// slide-hold paint, gated by `PlaybackState.capture_composite_
+    /// video_id` (set by the PreloadSlide IPC arm during the ~1s
+    /// preload-lead window before a transition; NOT full-time — a
+    /// 6-12% GPU overhead on a 24fps at-budget sign is not
+    /// acceptable). Consumed by `paint_and_present_one_transition_
+    /// frame` as the H2-safe `SideAPlan::UseCachedComposite`
+    /// source: zero V4L2 activity on side A at transition time
+    /// → no 2nd outgoing decoder open → no r97 codec-contention
+    /// deferral on the incoming preload → pr38's preloaded-first-
+    /// frame path continues to work.
+    ///
+    /// Shape: `(source_video_id, tex, mode_w, mode_h)`. Freed on
+    /// session teardown.
+    last_video_paint_composite_tex:
+        Option<(uuid::Uuid, glow::NativeTexture, u32, u32)>,
     /// r102.2: dims the cached transition_fbo_a/b were
     /// allocated against. Invalidates the cache on mode change
     /// (HDMI hot-plug, rotation flip). `None` while the cache
@@ -1027,6 +1061,8 @@ where
         transition_fbo_b: None,
         transition_tex_b: None,
         transition_still_a_tex: None,
+        transition_preloaded_first_frame_b_tex: None,
+        last_video_paint_composite_tex: None,
         transition_fbo_dims: None,
         // CMA-arc 2026-06-22 RANK 3: idle-free timestamps. Stamped
         // by ensure_transition_fbo_pair + ensure_bake_atlas; read
@@ -1333,6 +1369,18 @@ where
             gl.delete_texture(tex);
         }
         if let Some(tex) = session.transition_still_a_tex.take() {
+            gl.delete_texture(tex);
+        }
+        // 2026-07-04: preloaded first-frame RGBA texture. Freed on
+        // session teardown so slot's video_id / dims don't survive
+        // into a next session.
+        if let Some((_vid, tex, _, _)) = session.transition_preloaded_first_frame_b_tex.take() {
+            gl.delete_texture(tex);
+        }
+        // 2026-07-04 H2 arc: last-video-paint composite (side-A
+        // frozen-entry source). Same teardown shape as the pr38
+        // preloaded_first_frame slot above.
+        if let Some((_vid, tex, _, _)) = session.last_video_paint_composite_tex.take() {
             gl.delete_texture(tex);
         }
         session.transition_fbo_dims = None;
@@ -3970,6 +4018,11 @@ pub fn render_video_slide_in_session(
             &mut state.next_sample_idx,
             &mut state.frames_decoded,
             &state.decoder,
+            // 2026-07-04 (Jason device H2 arc): standalone reel
+            // preview path — no PreloadSlide signal machinery,
+            // never captures. Pass None; paint fn skips the
+            // glCopyTexImage2D cost.
+            None,
         )?;
         let elapsed = frame_start.elapsed();
         if elapsed < frame_budget {
@@ -4086,6 +4139,12 @@ pub fn render_transition_any_endpoint_in_session(
             // path never uses poster frozen-entry — always live-
             // decode. Pass None for both poster ids.
             None,
+            None,
+            // 2026-07-04: standalone reel doesn't participate in
+            // the preload-first-frame path (no IPC-side preload
+            // worker, no `cache.preloaded_first_frames` map to
+            // read from). Pass None; the paint helper falls
+            // through to its existing live-decode branch.
             None,
         )?;
         let elapsed = frame_start.elapsed();
@@ -4406,6 +4465,15 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
+    // 2026-07-04 (Jason device H2 arc): when `Some(vid)`, capture
+    // the currently-bound framebuffer's composited color attachment
+    // into `session.last_video_paint_composite_tex` at end of paint
+    // (before eglSwapBuffers). Gated by the PreloadSlide-set
+    // `PlaybackState.capture_composite_video_id` — caller passes
+    // Some only when the signal is active AND matches this slide's
+    // outgoing video_id. See `SideAPlan::UseCachedComposite`
+    // consumer in `paint_and_present_one_transition_frame`.
+    capture_composite_for: Option<uuid::Uuid>,
 ) -> Result<()> {
     use glow::HasContext;
     // CMA-arc 2026-06-22 RANK 3: same idle-FBO free as the
@@ -4579,6 +4647,30 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         }
         let bake_us = t_bake.elapsed().as_micros();
 
+        // 2026-07-04 (Jason device H2 arc — geometry fix): capture
+        // the LOGICAL composite BEFORE the rotation present pass.
+        // Post-fix qarl reported top-half-black frames; QA
+        // diagnosed the source: `copy_tex_image_2d(mode_w, mode_h)`
+        // read from the POST-rotation default fb (physical dims
+        // = swapped mode dims on rotated panels), so on a portrait
+        // (rotation=90/270) sign the read exceeded the fb's height
+        // and returned undefined bytes for the excess rows. Fix:
+        // source from the LOGICAL composite here — either
+        // `scene_fbo` (rotated / non-identity) or default fb
+        // (identity + rotation=0). At this point in the fn (before
+        // the rotation present pass at Step 3 below), the LOGICAL
+        // composite is what's bound. Source dims here equal
+        // (mode_w, mode_h) — the size the transition side's
+        // UseCachedComposite blit expects.
+        unsafe {
+            capture_last_video_paint_composite(
+                session,
+                capture_composite_for,
+                H2CaptureSite::TextOverVideoCached,
+                mode_w,
+                mode_h,
+            )?
+        };
         // Step 3 (rotation case): present scene FBO -> default fb
         // with CURRENT brightness/gamma/rotation. Honors settings
         // changes even on cached paint.
@@ -4819,6 +4911,21 @@ pub fn paint_and_present_one_text_over_video_slide_frame(
         }
     }
 
+    // 2026-07-04 (Jason device H2 arc — geometry fix): capture the
+    // LOGICAL composite BEFORE the rotation present pass. See the
+    // capture-site comment in the cached-blit path above for the
+    // full rationale (post-rotation default fb is physical dims;
+    // sourcing mode dims from it exceeds the fb bounds on rotated
+    // targets and produces the "top half black" symptom).
+    unsafe {
+        capture_last_video_paint_composite(
+            session,
+            capture_composite_for,
+            H2CaptureSite::TextOverVideoLive,
+            mode_w,
+            mode_h,
+        )?
+    };
     // Step 3: present pass through scene FBO if rotated/non-
     // identity. Mirrors paint_and_present_one_frame_for_slide.
     let t_present = std::time::Instant::now();
@@ -5266,6 +5373,12 @@ pub fn paint_and_present_one_video_slide_frame(
     next_sample_idx: &mut usize,
     frames_decoded: &mut usize,
     decoder: &crate::v4l2::Decoder,
+    // 2026-07-04 (Jason device H2 arc): capture-composite arg.
+    // Same shape + semantics as
+    // paint_and_present_one_text_over_video_slide_frame's arg;
+    // see that fn's docs. For pure-Video slides, the video_id
+    // matches the slide's own id.
+    capture_composite_for: Option<uuid::Uuid>,
 ) -> Result<()> {
     // CMA-arc 2026-06-22 RANK 3: idle-free at video-slide hold
     // entry. THIS IS THE WEDGE-REEL PATH (3-video crossfade
@@ -5358,6 +5471,20 @@ pub fn paint_and_present_one_video_slide_frame(
         t_phase.elapsed().as_nanos() as u64,
     );
     let t_phase = std::time::Instant::now();
+    // 2026-07-04 (Jason device H2 arc — geometry fix): capture the
+    // LOGICAL composite BEFORE the rotation present pass on the
+    // pure-video path too. Same rotation-vs-mode dim mismatch
+    // rationale as the text-over-video paths above.
+    let (mode_w_cap, mode_h_cap) = (session.mode_w as u32, session.mode_h as u32);
+    unsafe {
+        capture_last_video_paint_composite(
+            session,
+            capture_composite_for,
+            H2CaptureSite::VideoSlide,
+            mode_w_cap,
+            mode_h_cap,
+        )?
+    };
     // FYS bug 5: rotated route -- present the logical scene FBO onto
     // the panel-native default fb with the rotating present pass.
     if let Some((_fbo, tex)) = scene_fbo_handle {
@@ -5404,6 +5531,220 @@ pub fn paint_and_present_one_video_slide_frame(
 /// drmModeAddFB, page-flip commit, shift scanout_current ->
 /// scanout_prev. Caller must have ALREADY dropped the Frame +
 /// incremented frames_decoded.
+/// 2026-07-04 (Jason device H2 arc): capture the currently-bound
+/// framebuffer's composited color attachment into
+/// `session.last_video_paint_composite_tex`. Called at end of a
+/// video-bearing slide-hold paint, RIGHT BEFORE eglSwapBuffers,
+/// gated by the PreloadSlide signal.
+///
+/// Cost: one `glCopyTexImage2D` at mode dims (~2-4ms at 720p on
+/// bcm2835). Only fires when `capture_composite_for` is `Some(vid)`
+/// (i.e. the PreloadSlide-set `PlaybackState.capture_composite_
+/// video_id` matched THIS slide's video id at ipc dispatch time).
+///
+/// Reuses an existing slot texture if it matches the current
+/// `vid` AND is sized to the current mode; otherwise frees the
+/// stale entry and creates a fresh one. The texture is a plain
+/// RGBA8 sized to `(mode_w, mode_h)` — the same shape the
+/// transition side's `run_blit_pass` expects for
+/// `SideAPlan::UseCachedComposite`.
+///
+/// GLES2-safe (no READ_FRAMEBUFFER dance; `copy_tex_image_2d`
+/// sources from whatever is bound to `GL_FRAMEBUFFER`).
+/// 2026-07-04 (Jason device H2 arc — instrumented pass): seq
+/// counter for the env-gated PNG dump path. Wraps at
+/// `H2_DUMP_RING_SIZE` so `/var/tmp` doesn't fill on a long soak.
+#[cfg(target_os = "linux")]
+static H2_DUMP_SEQ: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(target_os = "linux")]
+const H2_DUMP_RING_SIZE: u32 = 20;
+
+/// 2026-07-04 (Jason device H2 arc — instrumented): capture-site
+/// tag for the log marker. Runtime callers pass the paint-fn name
+/// so QA can grep which of the three call sites fired.
+#[cfg(target_os = "linux")]
+#[derive(Copy, Clone, Debug)]
+enum H2CaptureSite {
+    VideoSlide,
+    TextOverVideoCached,
+    TextOverVideoLive,
+    TransitionBlit,
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn capture_last_video_paint_composite(
+    session: &mut EglSession,
+    capture_composite_for: Option<uuid::Uuid>,
+    site: H2CaptureSite,
+    source_fb_w: u32,
+    source_fb_h: u32,
+) -> Result<()> {
+    use glow::HasContext;
+    let Some(vid) = capture_composite_for else {
+        return Ok(());
+    };
+    let mode_w = session.mode_w as u32;
+    let mode_h = session.mode_h as u32;
+    let rotation = session.rotation;
+    let gl = session.gl;
+    // Query the currently-bound GL_FRAMEBUFFER so the log line names
+    // the actual source of the copy_tex_image_2d read. `0` means the
+    // default framebuffer (window-system surface). Nonzero = a user-
+    // created FBO (scene_fbo, cached_pair_a/b, bake atlas, etc).
+    let bound_fbo = gl.get_parameter_i32(glow::FRAMEBUFFER_BINDING);
+    // QA-mandated (2026-07-04) diagnostic line: bound_fbo + its dims
+    // + mode dims + rotation + site tag. Lets QA grep for
+    // "h2_composite_capture ... rotation=90 fb_dims=1280x720 mode=720x1280"
+    // and confirm the geometry mismatch class without needing a
+    // PNG. Emitted on every capture attempt (light — one per
+    // slide-hold paint during the ~1s PreloadSlide-armed window).
+    eprintln!(
+        "[perf] h2_composite_capture site={:?} vid={} bound_fbo={} fb_dims={}x{} \
+         mode={}x{} rotation={} slot_dims_match={}",
+        site,
+        &vid.to_string()[..8],
+        bound_fbo,
+        source_fb_w,
+        source_fb_h,
+        mode_w,
+        mode_h,
+        rotation,
+        matches!(
+            session.last_video_paint_composite_tex,
+            Some((slot_vid, _, w, h)) if slot_vid == vid && w == mode_w && h == mode_h,
+        ),
+    );
+    // 2026-07-04 (Jason device H2 arc — geometry fix): copy dims
+    // must be the MIN of the source framebuffer's dims and the
+    // mode dims — reading (mode_w × mode_h) from a physically-
+    // smaller default fb (post-rotation present pass) reads
+    // BEYOND the fb bounds → the "top half of the frame is
+    // black" symptom qarl reported. Callers are responsible for
+    // routing the capture through the LOGICAL composite FBO
+    // (scene_fbo when rotated / non-identity; default fb when
+    // identity + rotation=0) BEFORE the rotation present pass,
+    // so `source_fb_w/h` should always equal or exceed
+    // `mode_w/h`. Belt-and-suspenders clamp here so a future
+    // caller mis-wire won't produce black output — it'll produce
+    // a smaller-region capture that will at least be legible.
+    let copy_w = std::cmp::min(source_fb_w, mode_w);
+    let copy_h = std::cmp::min(source_fb_h, mode_h);
+    // Reuse existing slot if it matches the vid AND is sized to
+    // the current mode. Otherwise free + create fresh.
+    let reuse = matches!(
+        session.last_video_paint_composite_tex,
+        Some((slot_vid, _, w, h)) if slot_vid == vid && w == mode_w && h == mode_h,
+    );
+    let dest_tex = if reuse {
+        session
+            .last_video_paint_composite_tex
+            .expect("guarded above")
+            .1
+    } else {
+        if let Some((_, stale_tex, _, _)) = session.last_video_paint_composite_tex.take() {
+            gl.delete_texture(stale_tex);
+        }
+        let tex = gl
+            .create_texture()
+            .map_err(|e| anyhow!("H2 last-composite create_texture: {e}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        session.last_video_paint_composite_tex = Some((vid, tex, mode_w, mode_h));
+        tex
+    };
+    // copy_tex_image_2d sources from currently bound
+    // GL_FRAMEBUFFER's color attachment (the composited frame).
+    gl.bind_texture(glow::TEXTURE_2D, Some(dest_tex));
+    gl.copy_tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA,
+        0,
+        0,
+        copy_w as i32,
+        copy_h as i32,
+        0,
+    );
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    // Env-gated PNG dump (2026-07-04 QA-mandated). When
+    // OPENMARQUEE_H2_DUMP_COMPOSITE=1, glReadPixels the currently-
+    // bound framebuffer into an RGBA byte buffer + encode PNG at
+    // /var/tmp/h2-composite-<site>-<vid8>-<seq>.png. Wraps at
+    // H2_DUMP_RING_SIZE (20) so a long soak doesn't fill disk.
+    // OFF by default (env unset → zero cost beyond the getenv
+    // check).
+    if std::env::var_os("OPENMARQUEE_H2_DUMP_COMPOSITE").is_some() {
+        let seq = H2_DUMP_SEQ
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % H2_DUMP_RING_SIZE;
+        let mut pixels: Vec<u8> = vec![0u8; (copy_w * copy_h * 4) as usize];
+        gl.read_pixels(
+            0,
+            0,
+            copy_w as i32,
+            copy_h as i32,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelPackData::Slice(pixels.as_mut_slice()),
+        );
+        // GL's origin is bottom-left; PNG wants top-down. Flip.
+        let stride = (copy_w * 4) as usize;
+        let mut flipped: Vec<u8> = vec![0u8; pixels.len()];
+        for row in 0..(copy_h as usize) {
+            let src_off = row * stride;
+            let dst_off = (copy_h as usize - 1 - row) * stride;
+            flipped[dst_off..dst_off + stride]
+                .copy_from_slice(&pixels[src_off..src_off + stride]);
+        }
+        let path = format!(
+            "/var/tmp/h2-composite-{:?}-{}-{:02}.png",
+            site,
+            &vid.to_string()[..8],
+            seq,
+        );
+        match std::fs::File::create(&path) {
+            Ok(file) => {
+                let mut enc = png::Encoder::new(std::io::BufWriter::new(file), copy_w, copy_h);
+                enc.set_color(png::ColorType::Rgba);
+                enc.set_depth(png::BitDepth::Eight);
+                match enc.write_header() {
+                    Ok(mut writer) => {
+                        if let Err(e) = writer.write_image_data(&flipped) {
+                            eprintln!(
+                                "[perf] h2_dump_write_err path={} err={:#}",
+                                path, e,
+                            );
+                        } else {
+                            eprintln!(
+                                "[perf] h2_dump_wrote path={} dims={}x{} bytes={}",
+                                path,
+                                copy_w,
+                                copy_h,
+                                flipped.len(),
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[perf] h2_dump_header_err path={} err={:#}",
+                        path, e,
+                    ),
+                }
+            }
+            Err(e) => eprintln!(
+                "[perf] h2_dump_create_err path={} err={:#}",
+                path, e,
+            ),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn finish_video_slide_swap_and_commit(
     session: &mut EglSession,
@@ -5511,6 +5852,157 @@ pub fn paint_one_image_slide_for_capture(
     Ok(())
 }
 
+/// 2026-07-04 (Jason device): upload a `CapturedNv12Frame` from the
+/// preload worker's handoff drain into an RGBA texture on the GPU
+/// and return it. Same NV12 → RGBA path as
+/// `bake_video_slide_to_current_fbo`'s MMAP branch: Y goes into a
+/// LUMINANCE tex, UV goes into a LUMINANCE_ALPHA tex, then
+/// `run_nv12_blit_pass` cover-fits the frame into a scratch FBO
+/// bound to a fresh RGBA destination texture sized to the panel's
+/// mode. Callers stash the returned RGBA tex in
+/// `session.transition_preloaded_first_frame_b_tex` and re-blit it
+/// as the frozen-entry visual on every transition tick — replacing
+/// the (potentially stale) disk poster.png fallback that the
+/// c3.2.2 poster fast-path was previously sourcing 100% of the
+/// time on the Jason device.
+///
+/// The Y and UV source textures + scratch FBO are one-shot: they
+/// exist only for this single upload call and are deleted before
+/// return. The RGBA destination texture is the caller's to manage.
+unsafe fn upload_preloaded_first_frame_b(
+    session: &mut EglSession,
+    mode_w: u32,
+    mode_h: u32,
+    frame: &crate::video_decode::CapturedNv12Frame,
+) -> Result<glow::NativeTexture> {
+    use glow::HasContext;
+    let gl = session.gl;
+    let f_w = frame.width;
+    let f_h = frame.height;
+    // Destination RGBA texture: sized to the panel mode so the
+    // subsequent frozen-entry blit_pass_quad is a cheap texture-
+    // to-texture copy.
+    let dest_tex = gl
+        .create_texture()
+        .map_err(|e| anyhow!("preloaded_first_frame_b create dest_tex: {e}"))?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(dest_tex));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA as i32,
+        mode_w as i32,
+        mode_h as i32,
+        0,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        None,
+    );
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    let dest_fbo = gl
+        .create_framebuffer()
+        .map_err(|e| { gl.delete_texture(dest_tex); anyhow!("preloaded_first_frame_b create dest_fbo: {e}") })?;
+    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(dest_fbo));
+    gl.framebuffer_texture_2d(
+        glow::FRAMEBUFFER,
+        glow::COLOR_ATTACHMENT0,
+        glow::TEXTURE_2D,
+        Some(dest_tex),
+        0,
+    );
+    if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.delete_framebuffer(dest_fbo);
+        gl.delete_texture(dest_tex);
+        return Err(anyhow!("preloaded_first_frame_b dest_fbo not complete"));
+    }
+    // Y plane → LUMINANCE tex + UV plane → LUMINANCE_ALPHA tex;
+    // mirrors the MMAP branch in `bake_video_slide_to_current_fbo`.
+    let y_tex = gl
+        .create_texture()
+        .map_err(|e| { gl.bind_framebuffer(glow::FRAMEBUFFER, None); gl.delete_framebuffer(dest_fbo); gl.delete_texture(dest_tex); anyhow!("preloaded_first_frame_b Y tex: {e}") })?;
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, Some(y_tex));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::LUMINANCE as i32,
+        f_w as i32,
+        f_h as i32,
+        0,
+        glow::LUMINANCE,
+        glow::UNSIGNED_BYTE,
+        Some(&frame.y),
+    );
+    let uv_tex = match gl.create_texture() {
+        Ok(t) => t,
+        Err(e) => {
+            gl.delete_texture(y_tex);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(dest_fbo);
+            gl.delete_texture(dest_tex);
+            return Err(anyhow!("preloaded_first_frame_b UV tex: {e}"));
+        }
+    };
+    gl.active_texture(glow::TEXTURE1);
+    gl.bind_texture(glow::TEXTURE_2D, Some(uv_tex));
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::LUMINANCE_ALPHA as i32,
+        (f_w / 2) as i32,
+        (f_h / 2) as i32,
+        0,
+        glow::LUMINANCE_ALPHA,
+        glow::UNSIGNED_BYTE,
+        Some(&frame.uv),
+    );
+    gl.active_texture(glow::TEXTURE0);
+    // Cover-fit into the panel-sized dest FBO.
+    gl.viewport(0, 0, mode_w as i32, mode_h as i32);
+    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+    gl.clear(glow::COLOR_BUFFER_BIT);
+    // Reviewer fix (2026-07-04 concern 1a): `?` on cover_quad_vbo
+    // would bubble past the cleanup below and leak all four GL
+    // objects (y_tex, uv_tex, dest_fbo, dest_tex). Match instead
+    // and free everything before returning Err.
+    let cover_vbo = match cover_quad_vbo(gl, f_w, f_h, mode_w, mode_h) {
+        Ok(v) => v,
+        Err(e) => {
+            gl.delete_texture(y_tex);
+            gl.delete_texture(uv_tex);
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.delete_framebuffer(dest_fbo);
+            gl.delete_texture(dest_tex);
+            return Err(e).context("preloaded_first_frame_b cover_quad_vbo");
+        }
+    };
+    let blit_result = run_nv12_blit_pass(gl, cover_vbo, y_tex, uv_tex, frame.y_crop_max);
+    gl.delete_texture(y_tex);
+    gl.delete_texture(uv_tex);
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+    gl.delete_framebuffer(dest_fbo);
+    if let Err(e) = blit_result {
+        gl.delete_texture(dest_tex);
+        return Err(e).context("preloaded_first_frame_b run_nv12_blit_pass");
+    }
+    Ok(dest_tex)
+}
+
 /// v1-spec-delta #9 (slice d) -- one-frame transition paint
 /// for the IPC dispatcher's Advance(PaintTransition) branch.
 /// Bakes both slide_a and slide_b into FBOs (per-call, no
@@ -5581,6 +6073,18 @@ pub fn paint_and_present_one_transition_frame(
     // strategy at all; it always live-decodes.
     poster_a_video_id: Option<uuid::Uuid>,
     poster_b_video_id: Option<uuid::Uuid>,
+    // 2026-07-04 (Jason device): freshly-decoded NV12 first frame
+    // for the incoming (B) side, captured by the preload worker's
+    // handoff drain. When Some, uploads to a session-cached RGBA
+    // texture on tick 1 and takes precedence over the disk poster
+    // as the frozen-entry visual. See
+    // `transition_preloaded_first_frame_b_tex` docs on `EglSession`
+    // for the cache-slot lifecycle. Caller (ipc_main.rs
+    // PaintTransition arm) removes from `cache.preloaded_first_
+    // frames` on lookup so a single transition consumes the
+    // capture exactly once; subsequent ticks receive `None` here
+    // and paint from the cached RGBA texture in the session slot.
+    preloaded_first_frame_b: Option<&crate::video_decode::CapturedNv12Frame>,
 ) -> Result<()> {
     // r110 stage 3 commit 3.2.1 (2026-06-11): cache-or-load
     // posters for both endpoints at function entry. The
@@ -5623,7 +6127,7 @@ pub fn paint_and_present_one_transition_frame(
             }
             _ => None,
         };
-    let poster_b_texture: Option<(glow::NativeTexture, u32, u32)> =
+    let poster_b_texture_disk: Option<(glow::NativeTexture, u32, u32)> =
         match (content_root, poster_b_video_id) {
             (Some(root), Some(vid)) => {
                 match unsafe { ensure_poster_cached(session, root, vid) } {
@@ -5639,9 +6143,79 @@ pub fn paint_and_present_one_transition_frame(
             }
             _ => None,
         };
+    // 2026-07-04 (Jason device): if the preload worker captured a
+    // fresh NV12 first frame for the incoming side, upload it to a
+    // session-cached RGBA texture and use that as `poster_b_texture`
+    // in preference to the (potentially stale) disk poster.png.
+    // Cache-slot lifecycle:
+    //   - slot Some, video_id matches → reuse (subsequent ticks)
+    //   - slot Some, different video_id → free + upload fresh
+    //   - slot None, bytes Some → upload (tick 1 of new transition)
+    //   - slot None, bytes None → nothing to do (fall through to disk poster)
+    // The uploaded texture stays in the slot for the whole transition
+    // window so ticks 2..N don't re-upload — poster fast-path uses
+    // it via a cheap run_blit_pass_quad each tick, identical to how
+    // disk-poster texture is consumed today.
+    if let Some((slot_vid, tex, _, _)) = session.transition_preloaded_first_frame_b_tex {
+        if Some(slot_vid) != poster_b_video_id {
+            // Different transition target: free stale slot.
+            unsafe { session.gl.delete_texture(tex); }
+            session.transition_preloaded_first_frame_b_tex = None;
+        }
+    }
+    if session.transition_preloaded_first_frame_b_tex.is_none() {
+        if let (Some(frame), Some(vid)) = (preloaded_first_frame_b, poster_b_video_id) {
+            let m_w = session.mode_w as u32;
+            let m_h = session.mode_h as u32;
+            match unsafe { upload_preloaded_first_frame_b(session, m_w, m_h, frame) } {
+                Ok(tex) => {
+                    // Reviewer fix (2026-07-04 concern 1b): `dest_tex`
+                    // inside `upload_preloaded_first_frame_b` was
+                    // created at mode_w x mode_h with the NV12
+                    // cover-fit already baked in — it is a mode-
+                    // sized RGBA texture, not a native-frame-sized
+                    // one. Store the MODE dims so the downstream
+                    // poster-fast-path's `cover_quad_vbo(poster_w,
+                    // poster_h, mode_w, mode_h)` degenerates to an
+                    // identity fit instead of a second cover-fit
+                    // (which on non-square-aspect displays would
+                    // squash the already-fit image to the center
+                    // strip). Only visible when frame dims differ
+                    // from mode dims (e.g. rotated portrait target).
+                    session.transition_preloaded_first_frame_b_tex = Some((
+                        vid, tex, m_w, m_h,
+                    ));
+                    eprintln!(
+                        "[perf] preloaded_first_frame_b_uploaded video_id={} native_dims={}x{} slot_dims={}x{}",
+                        vid, frame.width, frame.height, m_w, m_h,
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[perf] preloaded_first_frame_b_upload_err video_id={} err={:#}",
+                        vid, e,
+                    );
+                }
+            }
+        }
+    }
+    // Precedence: preloaded fresh first-frame > disk poster.
+    let poster_b_texture: Option<(glow::NativeTexture, u32, u32)> = session
+        .transition_preloaded_first_frame_b_tex
+        .map(|(_, tex, w, h)| (tex, w, h))
+        .or(poster_b_texture_disk);
+    // Whether the current poster_b_texture came from the preloaded
+    // fresh-decode path (true) or the on-disk poster.png cache
+    // (false). The c3.3.1 poster_source_event signal (which triggers
+    // a 1080p decoder recreate on the next BeginSlide) fires ONLY
+    // when the on-disk poster was actually sourced — a preloaded
+    // fresh first frame means the decoder just delivered a real
+    // frame, so no recreate is warranted.
+    let poster_b_is_preloaded_first_frame =
+        session.transition_preloaded_first_frame_b_tex.is_some();
     // c3.2.1: locals defined but not yet read by bake_a/bake_b.
     // c3.2.2 wires the sourcing logic.
-    let _ = (poster_a_texture, poster_b_texture);
+    let _ = (poster_a_texture, poster_b_texture, poster_b_is_preloaded_first_frame);
     use glow::HasContext;
     // r102.1.1 (2026-06-09): V3D BO leak probe. Throttle to
     // FIRST and LAST tick of each transition so QA can bracket
@@ -5799,16 +6373,45 @@ pub fn paint_and_present_one_transition_frame(
     // stale still (e.g. back-to-back BeginTransition without an
     // intervening Slide hold -- BeginTransition handler frees
     // anyway, so this is theoretically dead, but cheap).
-    let snapshot_eligible = matches!(
-        &endpoint_a,
-        TransitionEndpoint::Video { .. }
-    ) && matches!(
-        &endpoint_b,
-        TransitionEndpoint::Video { .. } | TransitionEndpoint::TextOverVideo { .. }
-    );
+    // 2026-07-04 (Jason device H2 arc): project the runtime
+    // `TransitionEndpoint` variants to `EndpointKind` so the pure
+    // decision layer in hdmi_logic.rs can key on kind without
+    // touching any &mut V4L2 state. `is_snapshot_eligible` here
+    // is called with the widened endpoint_a set (Video |
+    // TextOverVideo) matching the pure-fn definition in
+    // hdmi_logic.rs.
+    use crate::hdmi_logic::{
+        decide_side_a_plan, decide_side_b_plan, is_snapshot_eligible,
+        unpin_target_for_endpoint_a, EndpointKind, SideAInputs, SideAPlan,
+        SideBInputs, SideBPlan, UnpinTarget,
+    };
+    let endpoint_a_kind = match &endpoint_a {
+        TransitionEndpoint::Text(_) => EndpointKind::Text,
+        TransitionEndpoint::Image(_) => EndpointKind::Image,
+        TransitionEndpoint::Video { .. } => EndpointKind::Video,
+        TransitionEndpoint::TextOverVideo { .. } => EndpointKind::TextOverVideo,
+    };
+    let endpoint_b_kind = match &endpoint_b {
+        TransitionEndpoint::Text(_) => EndpointKind::Text,
+        TransitionEndpoint::Image(_) => EndpointKind::Image,
+        TransitionEndpoint::Video { .. } => EndpointKind::Video,
+        TransitionEndpoint::TextOverVideo { .. } => EndpointKind::TextOverVideo,
+    };
+    let snapshot_eligible = is_snapshot_eligible(endpoint_a_kind, endpoint_b_kind);
     if !snapshot_eligible {
         free_transition_still_a_tex(session);
     }
+    // 2026-07-04 (Jason device H2 arc): does the last-video-paint
+    // composite slot hold a matching frame for THIS transition's
+    // outgoing? Matches by Uuid — slot's `source_video_id` must
+    // equal the current `poster_a_video_id` (Video's own id OR
+    // TextOverVideo's bg-video slide id). Populated by the
+    // slide-hold paint during the PreloadSlide-armed window
+    // preceding this BeginTransition.
+    let cached_composite_present_for_this_endpoint = matches!(
+        (session.last_video_paint_composite_tex, poster_a_video_id),
+        (Some((slot_vid, _, _, _)), Some(cur_vid)) if slot_vid == cur_vid,
+    );
 
     // Ok(true) = transition frame painted + ready to present;
     // Ok(false) = FYS bug C skip (a video endpoint had no frame
@@ -5967,17 +6570,76 @@ pub fn paint_and_present_one_transition_frame(
         // V4L2 feeds (snapshot blit). r97 deferred-preload +
         // side-B Path B retry still active as the ceiling
         // guard + cold-start fallback.
-        let use_still_a_now = snapshot_eligible
-            && cached_pair_a.is_some()
-            && session.transition_still_a_tex.is_some();
-        // Poster on A is suppressed when snapshot_eligible
-        // (snapshot is the strictly-better source for
-        // outgoing). Non-eligible cases (e.g. TextOverVideo
-        // on A) keep the existing poster path verbatim.
-        let use_poster_a_now = use_poster_a
-            && cached_pair_a.is_some()
-            && !snapshot_eligible;
-        let (fbo_a, tex_a) = if use_poster_a_now {
+        // 2026-07-04 (Jason device H2 arc): all side-A source-
+        // selection is now driven by the pure `decide_side_a_plan`
+        // from hdmi_logic.rs. Runtime bools below are 1:1 with
+        // SideAPlan variants; the plan_tests mod exhaustively
+        // pins the truth table (see the h2_* tests) so
+        // TextOverVideo endpoint_a can NEVER land on a Bake
+        // variant — compile-checked by the enum + covered by
+        // the exhaustive-loop regression test.
+        let side_a_plan = decide_side_a_plan(SideAInputs {
+            snapshot_eligible,
+            endpoint_a_kind,
+            cached_composite_present_for_this_endpoint,
+            still_a_present: session.transition_still_a_tex.is_some(),
+            cached_pair_a_present: cached_pair_a.is_some(),
+            poster_a_present: poster_a_texture.is_some(),
+        });
+        let use_cached_composite_a_now = side_a_plan == SideAPlan::UseCachedComposite;
+        let use_still_a_now = side_a_plan == SideAPlan::UseStill;
+        let use_poster_a_now = side_a_plan == SideAPlan::UsePoster;
+        let should_bake_a_and_capture = side_a_plan == SideAPlan::BakeAndCapture;
+        let should_skip_a = side_a_plan == SideAPlan::Skip;
+        // Emit the tick-1 journal marker QA asked for. Plan is
+        // constant across ticks 2..N so once is sufficient; the
+        // marker lets QA correlate side_a_plan=UseCachedComposite
+        // firing WITH side_b_plan=UsePreloadedSlot/UploadPreloaded
+        // Input on the sign log — both signals green together
+        // guards against the pr37/pr38/f4ec9501 whack-a-mole.
+        if progress < 0.05 {
+            eprintln!(
+                "[perf] side_a_plan={:?} side_b_plan_hint=pending endpoint_a_kind={:?} \
+                 endpoint_b_kind={:?} snapshot_eligible={} cached_composite_hit={} \
+                 progress={:.3}",
+                side_a_plan, endpoint_a_kind, endpoint_b_kind,
+                snapshot_eligible, cached_composite_present_for_this_endpoint,
+                progress,
+            );
+        }
+        // If the plan is Skip, bail early: no side-A source is
+        // available (rare — TextOverVideo with no cached composite,
+        // no still, no poster). Caller returns Ok(false) so the
+        // tick doesn't paint.
+        if should_skip_a {
+            crate::hdmi_logic::warn_paint_transition_skip(
+                kind, progress, "side_a_plan_skip",
+            );
+            return Ok(false);
+        }
+        // Silence unused-variable warnings on the plan bits we
+        // haven't wired into their own branch below yet. Both
+        // BakeAndCapture / BakeOnly land in the shared `else` bake
+        // path since the pure-fn already gated their eligibility;
+        // the `should_bake_a_and_capture` flag guides the
+        // subsequent snapshot-capture block.
+        let _ = should_bake_a_and_capture;
+        let (fbo_a, tex_a) = if use_cached_composite_a_now {
+            // H2-safe side-A source: blit the previously-captured
+            // slide-hold composite into the cached transition
+            // FBO_A. Zero V4L2 activity on side A this tick.
+            let (_vid, composite_tex, _tex_w, _tex_h) = session
+                .last_video_paint_composite_tex
+                .expect("guarded by cached_composite_present_for_this_endpoint");
+            let (fbo, tex) = cached_pair_a.expect("guarded by cached_pair_a_present");
+            use glow::HasContext;
+            session.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            session.gl.viewport(0, 0, mode_w_u32 as i32, mode_h_u32 as i32);
+            session.gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            session.gl.clear(glow::COLOR_BUFFER_BIT);
+            run_blit_pass(session.gl, composite_tex)?;
+            (fbo, tex)
+        } else if use_poster_a_now {
             let (poster_tex, poster_w, poster_h) = poster_a_texture.expect("guarded above");
             let (fbo, tex) = cached_pair_a.expect("guarded above");
             use glow::HasContext;
@@ -6096,7 +6758,15 @@ pub fn paint_and_present_one_transition_frame(
         //
         // Frees: BeginSlide / BeginTransition / Advance-after-
         // Slide-paint hooks in ipc_main.rs handle lifecycle.
-        if snapshot_eligible
+        // 2026-07-04 (Jason device H2 arc): snapshot-capture site
+        // gated on `side_a_plan == BakeAndCapture` (the ONLY plan
+        // that leaves a freshly-baked live-decode frame in fbo_a).
+        // Pre-H2-fix the gate was `snapshot_eligible &&
+        // !still_a_present`, which fired whenever the plan was
+        // BakeAndCapture BUT ALSO whenever poster/still had just
+        // been consumed (spurious captures of stale/poster
+        // content). The pure-fn gate is tighter + kind-safe.
+        if should_bake_a_and_capture
             && cached_pair_a.is_some()
             && session.transition_still_a_tex.is_none()
         {
@@ -6154,8 +6824,25 @@ pub fn paint_and_present_one_transition_frame(
             // borrow ended at the inputs_a match (the bake call
             // released the inner reborrows), so a fresh `&`
             // borrow is fine here.
-            if let TransitionEndpoint::Video { decoder, .. } = &endpoint_a {
-                decoder.unpin_egl_refs();
+            // 2026-07-04 (Jason device H2 arc): unpin dispatch
+            // driven by the pure `unpin_target_for_endpoint_a`.
+            // Returns `Decoder` for Video, `BgDecoder` for
+            // TextOverVideo (though TextOverVideo can never reach
+            // BakeAndCapture per the H2 invariant), and `None`
+            // otherwise. Compile-checked by the exhaustive
+            // `unpin_target_matches_bake_endpoint_kind` test.
+            match unpin_target_for_endpoint_a(endpoint_a_kind, side_a_plan) {
+                UnpinTarget::Decoder => {
+                    if let TransitionEndpoint::Video { decoder, .. } = &endpoint_a {
+                        decoder.unpin_egl_refs();
+                    }
+                }
+                UnpinTarget::BgDecoder => {
+                    if let TransitionEndpoint::TextOverVideo { bg_decoder, .. } = &endpoint_a {
+                        bg_decoder.unpin_egl_refs();
+                    }
+                }
+                UnpinTarget::None => {}
             }
         }
         // r94 Path B (2026-06-08): consumer-side deadline-poll.
@@ -6235,6 +6922,33 @@ pub fn paint_and_present_one_transition_frame(
         } else {
             None
         };
+        // 2026-07-04 (Jason device H2 arc): compute the side-B
+        // plan via the pure `decide_side_b_plan` for the tick-1
+        // journal marker. The runtime dispatch below still uses
+        // the existing `use_poster_b` boolean (behavior unchanged
+        // from pr38) — the plan is derived from the SAME inputs so
+        // the two agree by construction. Emitting the marker at
+        // tick 1 lets QA correlate side_a_plan=UseCachedComposite
+        // firing WITH side_b_plan=UsePreloadedSlot/UploadPreloaded
+        // Input in the sign log (both signals green together).
+        let side_b_plan = decide_side_b_plan(SideBInputs {
+            endpoint_b_kind,
+            preloaded_slot_present_for_this_endpoint: matches!(
+                (session.transition_preloaded_first_frame_b_tex, poster_b_video_id),
+                (Some((slot_vid, _, _, _)), Some(cur_vid)) if slot_vid == cur_vid,
+            ),
+            preloaded_input_present: preloaded_first_frame_b.is_some(),
+            poster_b_disk_present: poster_b_texture_disk.is_some(),
+            cached_pair_b_present: cached_pair_b.is_some(),
+        });
+        if progress < 0.05 {
+            eprintln!(
+                "[perf] side_b_plan={:?} endpoint_b_kind={:?} progress={:.3}",
+                side_b_plan, endpoint_b_kind, progress,
+            );
+        }
+        let _ = side_b_plan;
+        let _: SideBPlan;  // keep the type reference so unused-import doesn't trip
         // r110 stage 3 commit 3.2.2: poster fast-path for bake_b
         // (mirrors bake_a's poster fast-path above; same FROZEN
         // ENTRY contract). When endpoint_b is video-bearing AND
@@ -6300,15 +7014,26 @@ pub fn paint_and_present_one_transition_frame(
             }
             // r110 c3.3.1 (subagent BLOCKER-1 fix): only signal
             // recreate for 1080p posters. See bake_a comment.
+            // 2026-07-04 (Jason device): additional gate — do NOT
+            // signal recreate when `poster_b_texture` came from a
+            // freshly-decoded preloaded first frame. The c3.3.1
+            // recreate is a workaround for stale posters causing
+            // a wedged live decoder on 1080p reels; when we're
+            // sourcing a live first frame, the decoder just
+            // delivered a real frame at drain time so there's no
+            // stale-poster wedge to work around.
             if let Some(vid) = poster_b_video_id {
-                if poster_w >= 1920 || poster_h >= 1080 {
+                if (poster_w >= 1920 || poster_h >= 1080)
+                    && !poster_b_is_preloaded_first_frame
+                {
                     poster_source_event(vid);
                 }
             }
             eprintln!(
-                "[perf] poster_b_sourced progress={:.3} dims={}x{} signal_set={}",
+                "[perf] poster_b_sourced progress={:.3} dims={}x{} signal_set={} preloaded_first_frame={}",
                 progress, poster_w, poster_h,
-                poster_w >= 1920 || poster_h >= 1080,
+                (poster_w >= 1920 || poster_h >= 1080) && !poster_b_is_preloaded_first_frame,
+                poster_b_is_preloaded_first_frame,
             );
             (fbo, tex)
         } else { let mut bake_b_iterations: u32 = 0;
@@ -6478,7 +7203,7 @@ pub fn paint_and_present_one_transition_frame(
         // allocate-and-delete codepath unchanged so QA can A/B at
         // deploy time.
         let program_cache_enabled = crate::v4l2::is_transition_program_cache_enabled();
-        let (program, a_pos, a_uv, u_src_a, u_src_b, u_t, u_aspect) = if program_cache_enabled {
+        let (program, a_pos, a_uv, u_src_a, u_src_b, u_t, u_aspect, u_resolution) = if program_cache_enabled {
             let cached = match cached_legacy_transition_program(session.gl, fs) {
                 Ok(c) => c,
                 Err(e) => {
@@ -6494,6 +7219,7 @@ pub fn paint_and_present_one_transition_frame(
                 cached.u_src_b,
                 cached.u_t,
                 cached.u_aspect,
+                cached.u_resolution,
             )
         } else {
             // Legacy per-tick path (kill-switch fallback). Mirrors
@@ -6525,7 +7251,8 @@ pub fn paint_and_present_one_transition_frame(
             let u_src_b = session.gl.get_uniform_location(program, "u_src_b");
             let u_t = session.gl.get_uniform_location(program, "u_t");
             let u_aspect = session.gl.get_uniform_location(program, "u_aspect");
-            (program, a_pos, a_uv, u_src_a, u_src_b, u_t, u_aspect)
+            let u_resolution = session.gl.get_uniform_location(program, "u_resolution");
+            (program, a_pos, a_uv, u_src_a, u_src_b, u_t, u_aspect, u_resolution)
         };
         // r102.3: VBO from per-session cache when enabled (single
         // 64-byte fullscreen-quad buffer reused across every
@@ -6633,6 +7360,15 @@ pub fn paint_and_present_one_transition_frame(
         session.gl.uniform_1_f32(
             u_aspect.as_ref(),
             (mode_w_u32 as f32) / (mode_h_u32 as f32),
+        );
+        // 2026-07-03 (Jason device): u_resolution for FS_PIXELATE's
+        // fixed-size mosaic block. No-op on shaders that don't
+        // declare it. Same LOGICAL dims as u_aspect (session.mode_w
+        // / session.mode_h are already swapped for 90/270 rotation).
+        session.gl.uniform_2_f32(
+            u_resolution.as_ref(),
+            mode_w_u32 as f32,
+            mode_h_u32 as f32,
         );
         session.gl.enable_vertex_attrib_array(a_pos);
         session.gl.vertex_attrib_pointer_f32(a_pos, 2, glow::FLOAT, false, 16, 0);
@@ -7162,6 +7898,13 @@ pub fn capture_sb_transition_mid_to_png(
                 ccp.u_aspect.as_ref(),
                 (mode_w as f32) / (mode_h as f32),
             );
+            // 2026-07-03: u_resolution for FS_PIXELATE's fixed-size
+            // mosaic. Same LOGICAL dims as u_aspect.
+            gl.uniform_2_f32(
+                ccp.u_resolution.as_ref(),
+                mode_w as f32,
+                mode_h as f32,
+            );
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             let stride = (4 * std::mem::size_of::<f32>()) as i32;
             gl.enable_vertex_attrib_array(ccp.a_pos);
@@ -7355,6 +8098,8 @@ fn capture_legacy_3pass_transition_mid_to_png(
             // r96: u_aspect for the iris arm. None for shaders that
             // don't declare it (silent no-op bind).
             let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+            // 2026-07-03: u_resolution for pixelate arm.
+            let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
 
             // Textured-quad VBO with full-screen NDC + identity UV.
             // Same vertex layout as VS_TEXTURED_QUAD callers across
@@ -7391,6 +8136,11 @@ fn capture_legacy_3pass_transition_mid_to_png(
                 gl.uniform_1_f32(
                     u_aspect.as_ref(),
                     (mode_w as f32) / (mode_h as f32),
+                );
+                gl.uniform_2_f32(
+                    u_resolution.as_ref(),
+                    mode_w as f32,
+                    mode_h as f32,
                 );
 
                 let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -7617,6 +8367,12 @@ pub fn capture_fullres_transition_mid_to_png(
                 gl.uniform_1_f32(
                     ccp.u_aspect.as_ref(),
                     (mode_w as f32) / (mode_h as f32),
+                );
+                // 2026-07-03: u_resolution for pixelate arm.
+                gl.uniform_2_f32(
+                    ccp.u_resolution.as_ref(),
+                    mode_w as f32,
+                    mode_h as f32,
                 );
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                 let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -10746,12 +11502,18 @@ pub fn render_fade_composite(
             // test stays uniform. FS_FADE doesn't declare it; the
             // bind below is a no-op.
             let u_aspect = gl.get_uniform_location(program, "u_aspect");
+            let u_resolution = gl.get_uniform_location(program, "u_resolution");
             gl.uniform_1_i32(u_src_a.as_ref(), 0);
             gl.uniform_1_i32(u_src_b.as_ref(), 1);
             gl.uniform_1_f32(u_t.as_ref(), t);
             gl.uniform_1_f32(
                 u_aspect.as_ref(),
                 (mode_w as f32) / (mode_h as f32),
+            );
+            gl.uniform_2_f32(
+                u_resolution.as_ref(),
+                mode_w as f32,
+                mode_h as f32,
             );
 
             let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -11013,6 +11775,8 @@ fn render_transition_animated_in_session(
         // r96: u_aspect for the iris arm. None for shaders that
         // don't declare it (silent no-op bind).
         let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        // 2026-07-03: u_resolution for pixelate arm.
+        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
 
         // -- Per-frame loop. The loop body is wrapped in an IIFE so
         // the cleanup_static call below runs UNCONDITIONALLY even
@@ -11168,6 +11932,12 @@ fn render_transition_animated_in_session(
                 gl.uniform_1_f32(
                     u_aspect.as_ref(),
                     (mode_w_u32 as f32) / (mode_h_u32 as f32),
+                );
+                // 2026-07-03: u_resolution for pixelate arm.
+                gl.uniform_2_f32(
+                    u_resolution.as_ref(),
+                    mode_w_u32 as f32,
+                    mode_h_u32 as f32,
                 );
 
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
@@ -11545,6 +12315,7 @@ fn render_transition_single_pass_in_session(
         let a_uv = csp.a_uv;
         let u_t_loc = csp.u_t.clone();
         let u_aspect_loc = csp.u_aspect.clone();
+        let u_resolution_loc = csp.u_resolution.clone();
         let u_a_bg_loc = csp.u_a_bg.clone();
         let u_b_bg_loc = csp.u_b_bg.clone();
         let u_a_tex_locs = &csp.u_a_tex_locs;
@@ -11604,6 +12375,13 @@ fn render_transition_single_pass_in_session(
                     gl.uniform_1_f32(
                         u_aspect_loc.as_ref(),
                         (mode_w_u32 as f32) / (mode_h_u32 as f32),
+                    );
+                    // 2026-07-03: u_resolution for pixelate arm.
+                    // Same LOGICAL dims as u_aspect.
+                    gl.uniform_2_f32(
+                        u_resolution_loc.as_ref(),
+                        mode_w_u32 as f32,
+                        mode_h_u32 as f32,
                     );
                     gl.uniform_3_f32(
                         u_a_bg_loc.as_ref(),
@@ -12207,6 +12985,12 @@ fn render_transition_scissored_bake_in_session(
                     gl.uniform_1_f32(
                         active_ccp.u_aspect.as_ref(),
                         (mode_w_u32 as f32) / (mode_h_u32 as f32),
+                    );
+                    // 2026-07-03: u_resolution for pixelate arm.
+                    gl.uniform_2_f32(
+                        active_ccp.u_resolution.as_ref(),
+                        mode_w_u32 as f32,
+                        mode_h_u32 as f32,
                     );
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
                     let stride = (4 * std::mem::size_of::<f32>()) as i32;
@@ -13047,6 +13831,12 @@ pub(crate) struct CachedLegacyTransitionProgram {
     /// shaders don't declare it so this resolves to None for
     /// most kinds and the bind is a silent no-op.
     pub u_aspect: Option<glow::NativeUniformLocation>,
+    /// 2026-07-03 (Jason device): u_resolution = (width, height) in
+    /// device pixels. Bound alongside u_aspect on every draw site;
+    /// FS_PIXELATE uses it to convert its fixed 10 px block into
+    /// UV space. Resolves to None for shaders that don't declare
+    /// it (silent no-op bind).
+    pub u_resolution: Option<glow::NativeUniformLocation>,
 }
 
 std::thread_local! {
@@ -13088,6 +13878,7 @@ pub(crate) fn cached_legacy_transition_program(
         let u_src_b = unsafe { gl.get_uniform_location(program, "u_src_b") };
         let u_t = unsafe { gl.get_uniform_location(program, "u_t") };
         let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
         let entry = CachedLegacyTransitionProgram {
             program,
             a_pos,
@@ -13096,6 +13887,7 @@ pub(crate) fn cached_legacy_transition_program(
             u_src_b,
             u_t,
             u_aspect,
+            u_resolution,
         };
         cache.insert(key, entry);
         Ok(entry)
@@ -13133,6 +13925,11 @@ struct CachedSpProgram {
     /// displays. Other SP shaders declare the uniform but GLSL drops
     /// it as unused.
     u_aspect: Option<glow::NativeUniformLocation>,
+    /// 2026-07-03 (Jason device): u_resolution = (mode_w, mode_h).
+    /// FS_PIXELATE uses it to keep its mosaic at a fixed
+    /// device-pixel size across resolutions. Silent no-op on
+    /// arms that don't declare it.
+    u_resolution: Option<glow::NativeUniformLocation>,
     u_a_bg: Option<glow::NativeUniformLocation>,
     u_b_bg: Option<glow::NativeUniformLocation>,
     u_a_tex_locs: [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE],
@@ -13185,6 +13982,7 @@ fn cached_transition_sp_program(
         // declared in the header but dropped by the GLSL optimizer
         // when unused), and bind_uniform_1f tolerates None silently.
         let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
         let u_a_bg = unsafe { gl.get_uniform_location(program, "u_a_bg") };
         let u_b_bg = unsafe { gl.get_uniform_location(program, "u_b_bg") };
         let resolve_slots = |prefix: &str, n: usize| -> [Option<glow::NativeUniformLocation>; SINGLE_PASS_MAX_LAYERS_PER_SLIDE] {
@@ -13202,6 +14000,7 @@ fn cached_transition_sp_program(
             a_uv,
             u_t,
             u_aspect,
+            u_resolution,
             u_a_bg,
             u_b_bg,
             u_a_tex_locs: resolve_slots("u_a_tex", n_a),
@@ -14014,10 +14813,13 @@ fn prewarm_shader_programs(session: &EglSession) {
     // prewarm_sp_session at line 11998 handles that in the reel
     // path; sidecar IPC paint goes through this path instead and
     // relies on the SP cache being populated lazily on first use.
+    // 2026-07-03 (Jason device): `marquee` removed. The pre-warm
+    // list is iterated linearly; no downstream code indexes into it
+    // by ordinal, so the N → N-1 shrink is safe.
     const TRANSITION_KINDS: &[&str] = &[
         "cut", "fade", "wipe", "iris", "dissolve", "pixelate", "scanline",
         "halftone", "glitch", "slide", "push", "scroll", "blinds", "flip",
-        "marquee", "shutter",
+        "shutter",
     ];
     for kind in TRANSITION_KINDS {
         // Composite path: skip kinds the runtime intentionally avoids
@@ -14670,6 +15472,10 @@ struct CachedCompositeProgram {
     /// kinds whose FS doesn't declare u_aspect (silent no-op
     /// bind).
     u_aspect: Option<glow::NativeUniformLocation>,
+    /// 2026-07-03 (Jason device): u_resolution = (mode_w, mode_h).
+    /// Used by the pixelate arm to convert its fixed 10 px block
+    /// into UV. Silent no-op on other kinds.
+    u_resolution: Option<glow::NativeUniformLocation>,
     u_a_xform: Option<glow::NativeUniformLocation>,
     u_b_xform: Option<glow::NativeUniformLocation>,
 }
@@ -14707,6 +15513,7 @@ fn cached_composite_program(gl: &glow::Context, kind: &str) -> Result<CachedComp
         // transition shaders). None for kinds whose FS doesn't
         // declare it; gl.uniform_1_f32(None, _) is a no-op.
         let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
         let u_a_xform = unsafe { gl.get_uniform_location(program, "u_a_xform") };
         let u_b_xform = unsafe { gl.get_uniform_location(program, "u_b_xform") };
         let ccp = CachedCompositeProgram {
@@ -14717,6 +15524,7 @@ fn cached_composite_program(gl: &glow::Context, kind: &str) -> Result<CachedComp
             u_src_b,
             u_t,
             u_aspect,
+            u_resolution,
             u_a_xform,
             u_b_xform,
         };
@@ -14784,6 +15592,7 @@ fn cached_cut_composite_program(
         // r96: u_aspect kept for shape parity with cached_composite_program.
         // FS_CUT_A/FS_CUT_B don't declare u_aspect, so this resolves to None.
         let u_aspect = unsafe { gl.get_uniform_location(program, "u_aspect") };
+        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
         let u_a_xform = unsafe { gl.get_uniform_location(program, "u_a_xform") };
         let u_b_xform = unsafe { gl.get_uniform_location(program, "u_b_xform") };
         let ccp = CachedCompositeProgram {
@@ -14794,6 +15603,7 @@ fn cached_cut_composite_program(
             u_src_b,
             u_t,
             u_aspect,
+            u_resolution,
             u_a_xform,
             u_b_xform,
         };
