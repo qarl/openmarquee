@@ -1064,6 +1064,19 @@ class TestSystemCardOnTransition:
         kinds = [c.get("kind") for c in pub.render_calls]
         assert kinds == ["CONNECTING", "CONNECTED"]
 
+    def test_linger_connected_card_uses_real_mdns_url(self, tmp_path: Path, monkeypatch):
+        # boot-identity-card 2026-07-06: the CONNECTED (LINGER) card
+        # shows the device's real hostname-derived URL, not a hardcoded
+        # openmarquee.local.
+        monkeypatch.setenv("OPENMARQUEE_MDNS_HOSTNAME", "jasonssign1")
+        pub = _RecordingSystemCardPublisher()
+        sup = self._make(tmp_path, pub)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        connected = [c for c in pub.render_calls if c.get("kind") == "CONNECTED"]
+        assert connected, "expected a CONNECTED card on LINGER"
+        assert connected[-1]["address"] == "http://jasonssign1.local"
+
     def test_linger_to_online_clears_card(self, tmp_path: Path):
         """Concurrent-regime path to ONLINE — the canonical spec
         path."""

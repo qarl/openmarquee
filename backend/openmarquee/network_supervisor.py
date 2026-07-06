@@ -54,6 +54,12 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+# Only project import: a stdlib-only leaf that derives the device's real
+# mDNS URL (http://<hostname>.local) so the CONNECTED card shows the same
+# hostname-derived address as the boot identity card, not a hardcoded
+# "openmarquee.local". No import cycle (mdns imports os/socket only).
+from openmarquee.mdns import mdns_url
+
 log = logging.getLogger(__name__)
 
 # ============================================================
@@ -1628,7 +1634,7 @@ class NetworkSupervisor:
             # edge. Belt-and-suspenders with the max-lifetime cap.
             return {
                 "kind": "CONNECTED",
-                "address": "openmarquee.local",
+                "address": mdns_url(),
                 "ttl_ms": int(self.config.linger_seconds * 1000),
             }
         if new == SupervisorState.DEGRADED:

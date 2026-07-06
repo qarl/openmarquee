@@ -46,6 +46,7 @@ from openmarquee.dependencies import (
 )
 from openmarquee.dev import router as dev_router
 from openmarquee.fqdn_redirect_middleware import FqdnRedirectMiddleware
+from openmarquee.mdns import mdns_url
 from openmarquee.perf_middleware import PerfMiddleware
 
 # LEVER 2 lazy-imports (2026-06-24): defer openmarquee.seed to first
@@ -323,11 +324,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 name="network-supervisor-observe",
             )
 
-            # PR3 (2026-06-27) BOOT card lifespan side-task: shows
-            # the "openmarquee.local" identity card for ~4 seconds
-            # right after startup so a user watching the sign at
-            # boot learns the device address without needing the
-            # portal.
+            # PR3 (2026-06-27) BOOT card lifespan side-task: shows the
+            # device's real mDNS identity card (http://<hostname>.local
+            # + a QR of that URL) for ~15 seconds right after startup so
+            # a user watching the sign at boot learns the device address
+            # without needing the portal. (boot-identity-card 2026-07-06:
+            # real hostname-derived URL + QR + 15s hold, for the Jason
+            # handover.)
             #
             # PR3 fix-pass B3 (2026-07-01): after the BOOT card auto-
             # clears on its ttl, emit the card that matches the
@@ -348,7 +351,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             # AND `renderer.is_in_fallback` so we never issue a card
             # IPC into a still-warming or already-fallen-back
             # primary.
-            BOOT_TTL_MS = 4000
+            # boot-identity-card 2026-07-06: 15s deliberate hold (was
+            # 4s) so a passer-by has time to read the URL and scan the
+            # QR. Drives BOTH the renderer's ttl auto-clear AND the
+            # sleep before the catch-up card below, so the card is
+            # genuinely on screen for the full window — not merely a
+            # bumped poll timeout.
+            BOOT_TTL_MS = 15000
             READY_POLL_INTERVAL_S = 0.25
             READY_WAIT_TIMEOUT_S = 90.0  # matches systemd TimeoutStartSec
 
@@ -360,7 +369,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 if st == "LINGER":
                     return {
                         "kind": "CONNECTED",
-                        "address": "openmarquee.local",
+                        "address": mdns_url(),
                     }
                 if st == "DEGRADED":
                     return {"kind": "DEGRADED", "variant": "lost"}
@@ -404,12 +413,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 # primary. render_system_card is fail-soft on the
                 # card path per F1; a subprocess blip here just
                 # logs at debug level.
+                boot_url = mdns_url()
                 try:
                     await asyncio.to_thread(
                         renderer.render_system_card,
                         {
                             "kind": "BOOT",
-                            "address": "openmarquee.local",
+                            "address": boot_url,
+                            "qr_payload": boot_url,
                             "ttl_ms": BOOT_TTL_MS,
                         },
                     )
