@@ -287,12 +287,3 @@ export function rasterizeText(text, fontName, sizePx, colorRgba) {
     cache.set(key, result, width * height * 4);
     return result;
 }
-
-/**
- * Clear the rasterized-bitmap cache. Called on settings changes that
- * affect rasterization (font registration, brightness change post-
- * gamma-pass). The next paint repopulates from the wasm side.
- */
-export function clearRasterizeCache() {
-    cache.clear();
-}
