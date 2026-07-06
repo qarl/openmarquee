@@ -503,15 +503,17 @@ pub fn degraded_copy(
 }
 
 fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
-    // BOOT card is centered. Use the full-card-width centering by
-    // anchoring at 0.5 with center alignment for text shapes.
+    // BOOT identity card (boot-identity-card 2026-07-06): centered
+    // monogram + the device's real mDNS URL + a QR of that URL. Text
+    // shapes center via x=0.5 + Align::Center; the QR panel centers by
+    // anchoring its top-left at 0.5 - size/2.
     shapes.push(CardShape::Monogram {
-        top_left: (0.40, 0.30),
+        top_left: (0.40, 0.14),
         tile_size: MONOGRAM_TILE,
     });
     let address = params.address.as_deref().unwrap_or("openmarquee.local");
     shapes.push(CardShape::Text {
-        anchor: (0.50, 0.45),
+        anchor: (0.50, 0.30),
         max_height: 0.05,
         color: ACCENT,
         font: DisplayFont::Mono,
@@ -521,12 +523,26 @@ fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
     let ip = params.ip.as_deref().unwrap_or("");
     if !ip.is_empty() {
         shapes.push(CardShape::Text {
-            anchor: (0.50, 0.56),
+            anchor: (0.50, 0.37),
             max_height: 0.027,
             color: MUTED,
             font: DisplayFont::Mono,
             align: Align::Center,
             text: ip.to_string(),
+        });
+    }
+    // QR of the identity URL. Only emitted when the backend threaded a
+    // non-empty qr_payload — a BOOT card fired without one (legacy /
+    // fallback callers) keeps the pre-feature text-only layout instead
+    // of painting an empty white panel.
+    let qr_payload = params.qr_payload.clone().unwrap_or_default();
+    if !qr_payload.is_empty() {
+        const BOOT_QR_SIZE: f32 = 0.22;
+        shapes.push(CardShape::QrPanel {
+            top_left: (0.5 - BOOT_QR_SIZE / 2.0, 0.44),
+            size: BOOT_QR_SIZE,
+            payload: qr_payload,
+            caption: "Scan to open".to_string(),
         });
     }
     if let Some(hint) = params.boot_hint.as_deref() {
@@ -856,6 +872,37 @@ mod tests {
         assert!(mono.is_some());
         let (mx, _) = mono.unwrap();
         assert!(mx > 0.3, "BOOT monogram should be horizontally centered; got x={}", mx);
+    }
+
+    #[test]
+    fn boot_with_qr_payload_emits_qr_panel() {
+        // boot-identity-card 2026-07-06: the boot card renders a QR of
+        // the identity URL when the backend threads a qr_payload.
+        let mut p = params(SystemCardKind::Boot);
+        p.address = Some("http://jasonssign1.local".to_string());
+        p.qr_payload = Some("http://jasonssign1.local".to_string());
+        let shapes = layout_card(&p);
+        let qr = shapes
+            .iter()
+            .find_map(|s| match s {
+                CardShape::QrPanel { payload, .. } => Some(payload.as_str()),
+                _ => None,
+            })
+            .expect("BOOT must emit a QrPanel when qr_payload is set");
+        assert_eq!(qr, "http://jasonssign1.local");
+    }
+
+    #[test]
+    fn boot_without_qr_payload_omits_qr_panel() {
+        // No payload (legacy / fallback caller) -> text-only card, not
+        // an empty white QR panel.
+        let mut p = params(SystemCardKind::Boot);
+        p.address = Some("http://jasonssign1.local".to_string());
+        let shapes = layout_card(&p);
+        assert!(
+            !shapes.iter().any(|s| matches!(s, CardShape::QrPanel { .. })),
+            "BOOT must NOT emit a QrPanel when qr_payload is absent"
+        );
     }
 
     #[test]

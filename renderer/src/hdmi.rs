@@ -18547,11 +18547,18 @@ fn paint_system_card_qr_panel(
         gl.disable(glow::SCISSOR_TEST);
     }
 
-    // 3. Caption line below the panel. Positioned to fit the 1.9cqw
-    //    caption at ~2% of card width below the panel — matches the
-    //    mockup's `.qcap` spacing.
+    // 3. Caption line below the panel. `size` is a WIDTH fraction and
+    //    the panel is square in pixels, so its height as a fraction of
+    //    the card is `size * (mode_w / mode_h)`. Using bare `size` here
+    //    (pre-2026-07-06 bug) placed the caption INSIDE the panel on a
+    //    16:9 card, painting over the lower QR modules and eating into
+    //    the error-correction budget — surfaced by the boot identity
+    //    card's standalone-centered QR, but SETUP/DEGRADED shared it.
+    //    Aspect-correct so the caption sits just below the real panel
+    //    bottom (~2% of card width of breathing room).
     if !caption.is_empty() {
-        let caption_y = top_left.1 + size + 0.012;
+        let panel_h_frac = size * (mode_w as f32 / mode_h as f32);
+        let caption_y = top_left.1 + panel_h_frac + 0.012;
         paint_system_card_text(
             gl,
             mode_w,

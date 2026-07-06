@@ -6663,7 +6663,8 @@ mod tests {
         let card = state.active_system_card.as_ref().expect("slot set");
         assert!(
             card.qr_cache.is_none(),
-            "kind=BOOT has no qr_payload; cache must be None"
+            "a card fired without a qr_payload (BOOT default here) must \
+             leave the activation QR cache None"
         );
     }
 
