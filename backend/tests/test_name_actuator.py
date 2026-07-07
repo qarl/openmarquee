@@ -230,3 +230,52 @@ class TestApplySignName:
             "avahi:JasonsSign1",
             "hostapd:JasonsSign1",
         ]
+
+
+class TestReconcileHostapdSsidAtBoot:
+    """2026-07-07: boot-time reconcile of the setup-AP SSID from the
+    CURRENT hostname, so an out-of-band rename (hostnamectl direct,
+    bypassing the settings-PUT name-change flow — as on the
+    fireplaceSign -> JasonsSign1 rename) doesn't leave hostapd
+    broadcasting the old name."""
+
+    def test_reconciles_drifted_ssid_to_current_hostname(self, monkeypatch, tmp_path):
+        # The core regression: hostapd stuck on the OLD name while the
+        # hostname is the new name -> reconcile rewrites it.
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "hostapd.conf"
+        conf.write_text("interface=ap0\nssid=fireplaceSign\nchannel=6\n")
+        monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
+        monkeypatch.setattr(name_actuator.socket, "gethostname", lambda: "JasonsSign1")
+        name_actuator.reconcile_hostapd_ssid_at_boot()
+        assert len(spy.calls) == 1
+        subcommand, payload = spy.calls[0]
+        assert subcommand == "hostapd-write-and-restart"
+        assert "ssid=JasonsSign1" in payload.decode("utf-8")
+
+    def test_idempotent_when_ssid_already_matches_hostname(self, monkeypatch, tmp_path):
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "hostapd.conf"
+        conf.write_text("interface=ap0\nssid=JasonsSign1\n")
+        monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
+        monkeypatch.setattr(name_actuator.socket, "gethostname", lambda: "JasonsSign1")
+        name_actuator.reconcile_hostapd_ssid_at_boot()
+        assert spy.calls == []  # no rewrite/restart when already correct
+
+    def test_strips_domain_suffix_from_hostname(self, monkeypatch, tmp_path):
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "hostapd.conf"
+        conf.write_text("ssid=old\n")
+        monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
+        monkeypatch.setattr(name_actuator.socket, "gethostname", lambda: "JasonsSign1.local")
+        name_actuator.reconcile_hostapd_ssid_at_boot()
+        assert "ssid=JasonsSign1" in spy.calls[0][1].decode("utf-8")
+
+    def test_noop_on_empty_hostname(self, monkeypatch, tmp_path):
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "hostapd.conf"
+        conf.write_text("ssid=old\n")
+        monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
+        monkeypatch.setattr(name_actuator.socket, "gethostname", lambda: "")
+        name_actuator.reconcile_hostapd_ssid_at_boot()
+        assert spy.calls == []
