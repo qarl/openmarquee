@@ -5459,6 +5459,27 @@ pub fn effective_font_size_px(
         .max(8.0)
 }
 
+/// #2 boot-card fit-to-width (2026-07-07). `layout_text_to_quads`
+/// X-squishes any line whose natural advance exceeds `box_w_px`, which
+/// horizontally COMPRESSES the glyphs (a long mDNS URL / SSID / address
+/// on the boot + connected cards rendered as a squashed, hard-to-read
+/// line). For single-line label text we instead scale the FONT SIZE
+/// down UNIFORMLY so the line fits the box undistorted.
+///
+/// Given the requested `size_px`, the text's NATURAL (un-squished)
+/// pixel width at that size (`natural_width_px`, e.g. the `.width` of a
+/// `layout_text_to_quads(.., f32::INFINITY, ..)` pass), and the
+/// available `box_w_px`, returns the largest font size ≤ `size_px` at
+/// which the text fits. Never scales UP (a line that already fits keeps
+/// its requested size), floors at 8px so it never vanishes.
+pub fn shrink_font_to_fit_width(size_px: f32, natural_width_px: f32, box_w_px: f32) -> f32 {
+    if natural_width_px > box_w_px && natural_width_px > 0.0 && box_w_px > 0.0 {
+        (size_px * (box_w_px / natural_width_px)).max(8.0)
+    } else {
+        size_px
+    }
+}
+
 /// Horizontal alignment within a layer's box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HAlign {
@@ -10882,6 +10903,44 @@ mod tests {
         // 0-width box: pct math degenerates to 0 → floor at 8.
         let s = effective_font_size_px(None, Some(80.0), 0.0, 1920);
         assert!((s - 8.0).abs() < 1e-3);
+    }
+
+    // -- shrink_font_to_fit_width (#2 boot-card fit-to-width) -----
+    // Fails-before: pre-fix paint_system_card_text passed the real
+    // box_w_px straight to layout_text_to_quads, which X-squished an
+    // over-wide Mono line instead of shrinking the font. This helper
+    // (and its use) did not exist; the URL rendered distorted.
+
+    #[test]
+    fn shrink_fit_leaves_fitting_line_unchanged() {
+        // Natural width already within the box → keep requested size
+        // (never scale UP).
+        let s = shrink_font_to_fit_width(40.0, 300.0, 800.0);
+        assert!((s - 40.0).abs() < 1e-3, "got {s}");
+    }
+
+    #[test]
+    fn shrink_fit_scales_overflowing_line_to_fit() {
+        // Natural 1600px at size 40 in an 800px box → half size (20)
+        // so it fits undistorted (uniform scale, no X-squish).
+        let s = shrink_font_to_fit_width(40.0, 1600.0, 800.0);
+        assert!((s - 20.0).abs() < 1e-3, "got {s}");
+    }
+
+    #[test]
+    fn shrink_fit_floors_at_8px() {
+        // A pathologically long line can't shrink below 8px (stays
+        // legible-ish rather than vanishing).
+        let s = shrink_font_to_fit_width(40.0, 100_000.0, 800.0);
+        assert!((s - 8.0).abs() < 1e-3, "got {s}");
+    }
+
+    #[test]
+    fn shrink_fit_degenerate_widths_keep_requested_size() {
+        // Zero / unknown natural width or zero box → no-op (don't
+        // divide by zero, don't shrink on missing measurement).
+        assert!((shrink_font_to_fit_width(40.0, 0.0, 800.0) - 40.0).abs() < 1e-3);
+        assert!((shrink_font_to_fit_width(40.0, 1600.0, 0.0) - 40.0).abs() < 1e-3);
     }
 
     // -- parse_h_align -------------------------------------------
