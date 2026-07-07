@@ -171,8 +171,8 @@ export function mountPwaInstallPrompt(container, options = {}) {
             "margin: 12px auto",
             "max-width: 480px",
             "padding: 14px 16px",
-            "background: rgba(255, 184, 77, 0.10)",
-            "border: 1px solid rgba(255, 184, 77, 0.35)",
+            "background: rgba(255, 180, 60, 0.10)",
+            "border: 1px solid rgba(255, 180, 60, 0.35)",
             "border-radius: 12px",
             "color: #f2f2f4",
             "font: 500 14px/1.45 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
@@ -185,7 +185,7 @@ export function mountPwaInstallPrompt(container, options = {}) {
         body.style.flex = "1 1 auto";
         const title = win.document.createElement("div");
         title.id = "pwa-install-title";
-        title.style.cssText = "font-weight: 700; color: #ffb84d; margin-bottom: 2px;";
+        title.style.cssText = "font-weight: 700; color: #ffb43c; margin-bottom: 2px;";
         title.textContent = "Add openMarquee to your Home Screen";
         body.appendChild(title);
 
@@ -211,7 +211,7 @@ export function mountPwaInstallPrompt(container, options = {}) {
             installBtn.textContent = "Install";
             installBtn.style.cssText = [
                 "padding: 8px 14px",
-                "background: #ffb84d",
+                "background: #ffb43c",
                 "color: #1a0f00",
                 "border: 0",
                 "border-radius: 8px",

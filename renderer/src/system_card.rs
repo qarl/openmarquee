@@ -30,7 +30,7 @@ pub struct Rgb(pub u8, pub u8, pub u8);
 pub const BG: Rgb = Rgb(0x0e, 0x0e, 0x10); // --bg
 pub const TEXT: Rgb = Rgb(0xe9, 0xe9, 0xec); // --text
 pub const MUTED: Rgb = Rgb(0x8b, 0x8b, 0x92); // --muted
-pub const ACCENT: Rgb = Rgb(0xff, 0xb8, 0x4d); // --accent (amber)
+pub const ACCENT: Rgb = Rgb(0xff, 0xb4, 0x3c); // --om-accent (corrected LED-dot amber)
 pub const ACCENT_INK: Rgb = Rgb(0x1a, 0x0f, 0x00); // --accent-ink
 pub const SUCCESS: Rgb = Rgb(0x5d, 0xd3, 0x9e); // --success (green)
 pub const DANGER: Rgb = Rgb(0xff, 0x6b, 0x6b); // --danger (red)

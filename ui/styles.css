@@ -59,7 +59,7 @@
     --panel-border: #2a2a2f;
     --text: #e9e9ec;
     --muted: #8b8b92;
-    --accent: #ffb84d;
+    --accent: #ffb43c;
     --danger: #ff6b6b;
     --success: #5dd39e;
 }
@@ -127,7 +127,7 @@ header h1 {
 }
 .nav-link.active {
     color: var(--text);
-    background: rgba(255, 184, 77, 0.12);
+    background: rgba(255, 180, 60, 0.12);
     border-left: 2px solid var(--accent);
     padding-left: calc(0.75rem - 2px);
     font-weight: 600;
@@ -304,7 +304,7 @@ header h1 {
 .playlist-browser-tile--selected .playlist-browser-tile-action {
     border-color: var(--accent);
     background: #161616;
-    box-shadow: 0 0 0 2px rgba(255, 184, 77, 0.35);
+    box-shadow: 0 0 0 2px rgba(255, 180, 60, 0.35);
 }
 .playlist-browser-tile-thumb {
     width: 100%;
@@ -491,7 +491,7 @@ header h1 {
     border-color: var(--om-accent);
     box-shadow: 0 16px 36px rgba(0,0,0,.4),
                 0 0 0 1px var(--om-accent),
-                0 0 24px var(--om-accent-glow, rgba(255,184,77,.4));
+                0 0 24px var(--om-accent-glow, rgba(255,180,60,.4));
 }
 
 .track-grip {
@@ -1373,7 +1373,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
 .slide-browser-tile--selected .slide-browser-tile-action {
     border-color: var(--accent);
     background: #161616;
-    box-shadow: 0 0 0 2px rgba(255, 184, 77, 0.35);
+    box-shadow: 0 0 0 2px rgba(255, 180, 60, 0.35);
 }
 .slide-browser-tile-thumb-wrap {
     position: relative;
@@ -1436,7 +1436,7 @@ button.danger { color: var(--danger); border-color: var(--danger); background: t
     position: absolute;
     width: 12px;
     height: 12px;
-    background: var(--om-accent, var(--accent, #ffb84d));
+    background: var(--om-accent, var(--accent, #ffb43c));
     border: 1px solid rgba(0, 0, 0, 0.6);
     border-radius: 2px;
     box-sizing: border-box;
@@ -3211,7 +3211,7 @@ section.live {
 }
 .live-flip-camera:hover { background: rgba(0, 0, 0, 0.75); }
 .live-flip-camera:focus-visible {
-    outline: 2px solid var(--om-accent, var(--accent, #ffb84d));
+    outline: 2px solid var(--om-accent, var(--accent, #ffb43c));
     outline-offset: 2px;
 }
 .live-flip-camera[disabled] { opacity: 0.5; cursor: progress; }
