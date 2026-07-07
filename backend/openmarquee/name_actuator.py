@@ -123,11 +123,12 @@ def _apply_settings_sign_name(name: str) -> None:
     name. Idempotent — no write when already matching. Lazy import keeps
     name_actuator a leaf; fail-soft on load/save error.
 
-    Churn-free: the sign_name validator normalises to a DNS-safe subset
-    but does NOT lowercase, and the hostname is already DNS-safe, so the
-    written value round-trips unchanged (the next reconcile matches +
-    skips). `storage.save` is a plain persist — it does NOT re-trigger
-    the name actuators — so there's no reconcile loop.
+    Churn-free + quarantine-safe: the candidate is built through FULL
+    model validation (see below) so we store the SAME normalised form the
+    next load will produce (the next reconcile matches + skips) and never
+    persist a value that would fail re-validation. `storage.save` is a
+    plain persist — it does NOT re-trigger the name actuators — so there's
+    no reconcile loop.
     """
     try:
         from openmarquee.dependencies import get_settings_storage
@@ -140,10 +141,35 @@ def _apply_settings_sign_name(name: str) -> None:
             exc_info=True,
         )
         return
-    if (settings.sign_name or "") == name:
-        return  # already in sync
+    # Build the candidate through FULL model validation (NOT
+    # model_copy(update=), which bypasses the field validator). This
+    # matters two ways:
+    #   * churn: the sign_name validator normalises (e.g. drops `_`), so
+    #     comparing the VALIDATED candidate to the stored value avoids a
+    #     rewrite-every-boot when a raw hostname leaf differs from its
+    #     normalised form.
+    #   * safety: a hostname that normalises to empty (e.g. "---") raises
+    #     in the validator here -> we SKIP, rather than persisting an
+    #     invalid value that would quarantine settings.json + regenerate
+    #     it from FACTORY DEFAULTS (wiping the AP passphrase, Tailscale
+    #     key, wifi_networks, schedule) on the next load — catastrophic on
+    #     a live handover device.
     try:
-        storage.save(settings.model_copy(update={"sign_name": name}))
+        candidate = type(settings).model_validate(
+            settings.model_dump() | {"sign_name": name}
+        )
+    except Exception:
+        log.debug(
+            "name-actuator: hostname %r not valid as sign_name; skipping "
+            "settings reconcile",
+            name,
+            exc_info=True,
+        )
+        return
+    if candidate.sign_name == settings.sign_name:
+        return  # already in sync (compare the validated/normalised form)
+    try:
+        storage.save(candidate)
     except Exception:
         log.warning(
             "name-actuator: settings sign_name reconcile write failed; next rename / boot retries",

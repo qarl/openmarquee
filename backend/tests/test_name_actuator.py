@@ -329,27 +329,29 @@ class TestReconcileNamesFromHostname:
 
 
 class TestSettingsSignNameReconcile:
-    """The new stored-value surface: sync SystemSettings.sign_name TO the
-    hostname when drifted, no-op when already matching."""
+    """The stored-value surface: sync SystemSettings.sign_name TO the
+    hostname when drifted, no-op when already matching. Uses a REAL
+    SystemSettings so the model_validate-based reconcile (which normalises
+    + rejects exactly like production) is genuinely exercised — a fake
+    with a permissive model_copy would hide the churn + quarantine bugs
+    this path guards against."""
 
     def _install_fake_storage(self, monkeypatch, current):
+        from openmarquee.settings import SystemSettings
+
         saved: list[str] = []
-
-        class _Settings:
-            def __init__(self, sign_name):
-                self.sign_name = sign_name
-
-            def model_copy(self, update):
-                return _Settings(update["sign_name"])
+        loaded = SystemSettings(sign_name=current)
 
         class _Storage:
             def load(self):
-                return _Settings(current)
+                return loaded
 
             def save(self, settings):
                 saved.append(settings.sign_name)
 
-        monkeypatch.setattr("openmarquee.dependencies.get_settings_storage", lambda: _Storage())
+        monkeypatch.setattr(
+            "openmarquee.dependencies.get_settings_storage", lambda: _Storage()
+        )
         return saved
 
     def test_writes_sign_name_when_drifted(self, monkeypatch):
@@ -360,4 +362,29 @@ class TestSettingsSignNameReconcile:
     def test_noop_when_sign_name_already_matches(self, monkeypatch):
         saved = self._install_fake_storage(monkeypatch, current="JasonsSign1")
         name_actuator._apply_settings_sign_name("JasonsSign1")
+        assert saved == []
+
+    def test_noop_when_only_normalisation_differs(self, monkeypatch):
+        # Churn guard: `my_sign` normalises to `mysign` (validator drops
+        # `_`), which EQUALS the stored value → no rewrite-every-boot.
+        # model_copy(update=) skipped the validator and would have
+        # compared raw `my_sign` != `mysign` and rewritten forever.
+        saved = self._install_fake_storage(monkeypatch, current="mysign")
+        name_actuator._apply_settings_sign_name("my_sign")
+        assert saved == []
+
+    def test_persists_normalised_form_not_raw(self, monkeypatch):
+        # When it DOES write, it stores the validated/normalised value
+        # (`Jason_Sign` → `JasonSign`) so the very next boot is a no-op.
+        saved = self._install_fake_storage(monkeypatch, current="fireplaceSign")
+        name_actuator._apply_settings_sign_name("Jason_Sign")
+        assert saved == ["JasonSign"]
+
+    def test_skips_invalid_name_without_quarantining_settings(self, monkeypatch):
+        # Safety guard: `---` normalises to empty → the validator raises →
+        # we SKIP. Persisting it would fail re-validation on the next load
+        # and quarantine settings.json to FACTORY DEFAULTS (wiping the AP
+        # passphrase, Tailscale key, wifi_networks) on a live device.
+        saved = self._install_fake_storage(monkeypatch, current="JasonsSign1")
+        name_actuator._apply_settings_sign_name("---")
         assert saved == []
