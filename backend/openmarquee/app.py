@@ -442,6 +442,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 # card path per F1; a subprocess blip here just
                 # logs at debug level.
                 boot_url = mdns_url()
+                # boot-card 2026-07-07: also show the connected Wi-Fi SSID
+                # so a viewer knows which network to join to reach the URL
+                # (the mDNS URL only resolves on the sign's own network).
+                # None when not yet connected at boot-card time — the
+                # renderer omits the line gracefully.
                 try:
                     await asyncio.to_thread(
                         renderer.render_system_card,
@@ -449,6 +454,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                             "kind": "BOOT",
                             "address": boot_url,
                             "qr_payload": boot_url,
+                            "ssid": supervisor.last_sta_ssid,
                             "ttl_ms": BOOT_TTL_MS,
                         },
                     )

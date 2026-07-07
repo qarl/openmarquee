@@ -18822,7 +18822,7 @@ fn paint_system_card_text(
         crate::system_card::Align::Right => "right",
     };
 
-    let size_px = (max_height * mode_h as f32).max(8.0);
+    let mut size_px = (max_height * mode_h as f32).max(8.0);
 
     // Box covers the card from the anchor x rightward to the right
     // edge (or symmetric for center-aligned). Vertical box is just
@@ -18849,7 +18849,7 @@ fn paint_system_card_text(
         color.0, color.1, color.2
     );
 
-    let layer = crate::content::TextLayer {
+    let mut layer = crate::content::TextLayer {
         text: text.to_string(),
         name: String::from("system-card-text"),
         font_family: Some(family.to_string()),
@@ -18890,6 +18890,29 @@ fn paint_system_card_text(
     };
 
     let box_w_px = layer.r#box.w * mode_w as f32;
+
+    // #2 boot-card fit-to-width (2026-07-07): the Mono label lines
+    // (mDNS URL / SSID / Wi-Fi / address / PIN) are single tokens that
+    // can't word-wrap, so an over-long one would get X-squished by
+    // layout_text_to_quads into a distorted, hard-to-read line. Measure
+    // the natural (un-squished, box=∞) width and shrink the FONT SIZE
+    // uniformly so the widest line fits `box_w_px` undistorted. Prose
+    // (Headline/Body) is left alone — it keeps the normal per-line
+    // X-squish-at-box behavior (layout splits on '\n' only; it never
+    // word-wraps).
+    if matches!(font, crate::system_card::DisplayFont::Mono) {
+        if let Some(natural) =
+            layout_text_to_quads(atlas, &layer.text, size_px, f32::INFINITY, None)
+        {
+            let fitted =
+                crate::hdmi_logic::shrink_font_to_fit_width(size_px, natural.width as f32, box_w_px);
+            if fitted < size_px {
+                size_px = fitted;
+                layer.font_size_px = Some(size_px);
+            }
+        }
+    }
+
     let Some(group) = layout_text_to_quads(atlas, &layer.text, size_px, box_w_px, None) else {
         // Empty / whitespace-only laid out to no ink.
         return Ok(());

@@ -549,6 +549,22 @@ fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
             caption: "Scan to open".to_string(),
         });
     }
+    // Connected Wi-Fi SSID (boot-card 2026-07-07): which network to join
+    // to reach the URL above (the mDNS URL only resolves on the sign's
+    // own network). Omitted when the backend didn't thread one — not yet
+    // connected at boot-card time.
+    if let Some(ssid) = params.ssid.as_deref() {
+        if !ssid.is_empty() {
+            shapes.push(CardShape::Text {
+                anchor: (0.50, 0.88),
+                max_height: 0.03,
+                color: MUTED,
+                font: DisplayFont::Mono,
+                align: Align::Center,
+                text: format!("Wi-Fi: {ssid}"),
+            });
+        }
+    }
     if let Some(hint) = params.boot_hint.as_deref() {
         if !hint.is_empty() {
             shapes.push(CardShape::BootHint {
@@ -906,6 +922,34 @@ mod tests {
         assert!(
             !shapes.iter().any(|s| matches!(s, CardShape::QrPanel { .. })),
             "BOOT must NOT emit a QrPanel when qr_payload is absent"
+        );
+    }
+
+    #[test]
+    fn boot_with_ssid_emits_wifi_line() {
+        // boot-card 2026-07-07: the connected SSID appears as a
+        // "Wi-Fi: <ssid>" line so a viewer knows which network to join
+        // to reach the URL.
+        let mut p = params(SystemCardKind::Boot);
+        p.ssid = Some("NEBULA".to_string());
+        let shapes = layout_card(&p);
+        assert!(
+            shapes
+                .iter()
+                .any(|s| matches!(s, CardShape::Text { text, .. } if text == "Wi-Fi: NEBULA")),
+            "BOOT card must show the connected Wi-Fi SSID line"
+        );
+    }
+
+    #[test]
+    fn boot_without_ssid_omits_wifi_line() {
+        let p = params(SystemCardKind::Boot); // ssid None
+        let shapes = layout_card(&p);
+        assert!(
+            !shapes
+                .iter()
+                .any(|s| matches!(s, CardShape::Text { text, .. } if text.starts_with("Wi-Fi:"))),
+            "BOOT card must omit the Wi-Fi line when no SSID is threaded"
         );
     }
 

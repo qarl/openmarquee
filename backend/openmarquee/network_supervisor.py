@@ -933,6 +933,14 @@ class NetworkSupervisor:
     def current_ap_channel(self) -> int | None:
         return self._current_ap_channel
 
+    @property
+    def last_sta_ssid(self) -> str | None:
+        """SSID of the last STA (station-mode) association, or None if the
+        device hasn't connected to a WiFi network this session. Read by
+        the boot identity card (app.py) to show which network to join to
+        reach the sign's URL."""
+        return self._last_sta_ssid
+
     # P1.2-B take-over state accessors / mutators -----------------
 
     @property
