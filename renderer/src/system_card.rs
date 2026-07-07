@@ -154,7 +154,11 @@ pub struct ActiveSystemCard {
 /// content:
 ///   * SSID: IEEE 802.11 caps SSID at 32 bytes; +8 headroom for
 ///     the preview endpoint's leading-space quirks.
-///   * PIN: 12 bytes fits the widest sane per-boot PIN.
+///   * PIN: 2026-07-07 — this field carries the setup-AP JOIN
+///     credential (SystemSettings.wifi_password), the same value the
+///     QR encodes, NOT a short numeric per-boot PIN. WPA2 passphrases
+///     run 8–63 chars, so the cap is the WPA2 max (63); a 12-byte cap
+///     truncated the real password into an unjoinable string.
 ///   * QR payload: WIFI:T:WPA;S:<32>;P:<63>;; ≈ 128 bytes worst-
 ///     case; 256 gives forward-headroom for future URI schemes.
 ///   * addresses / target_ssid: 128 bytes covers even long mDNS
@@ -162,7 +166,7 @@ pub struct ActiveSystemCard {
 ///   * boot_hint: PR4 reserves this for the rapid-boot line; 96
 ///     bytes fits any localised copy of "Restart 2× more…"
 pub const MAX_SSID_LEN: usize = 40;
-pub const MAX_PIN_LEN: usize = 12;
+pub const MAX_PIN_LEN: usize = 63;
 pub const MAX_QR_PAYLOAD_LEN: usize = 256;
 pub const MAX_ADDRESS_LEN: usize = 128;
 pub const MAX_IP_LEN: usize = 45; // IPv4 or IPv6 (INET6_ADDRSTRLEN is 46 incl. nul)
@@ -943,6 +947,19 @@ mod tests {
         p.pin = Some("1".repeat(MAX_PIN_LEN * 3));
         let clamped = clamp_params(p);
         assert_eq!(clamped.pin.as_deref().unwrap().len(), MAX_PIN_LEN);
+    }
+
+    #[test]
+    fn clamp_params_preserves_full_wpa2_passphrase() {
+        // Regression (2026-07-07): the pin is the setup-AP WPA2
+        // passphrase (up to 63 chars), not a short numeric PIN. A
+        // 63-char password must survive the clamp intact, else the
+        // on-glass credential is truncated + unjoinable.
+        let mut p = params(SystemCardKind::Setup);
+        let passphrase = "p".repeat(63);
+        p.pin = Some(passphrase.clone());
+        let clamped = clamp_params(p);
+        assert_eq!(clamped.pin.as_deref(), Some(passphrase.as_str()));
     }
 
     #[test]

@@ -1655,10 +1655,17 @@ class NetworkSupervisor:
             # unknown_degraded_variant_falls_back_to_lost_copy test)
             # so a variant-less transition still renders sensible
             # copy.
+            # 2026-07-07: the DEGRADED card also instructs "join <ssid>,
+            # PIN <pin>" to rejoin the setup AP, so thread the SAME real
+            # credentials + WiFi-join QR as the SETUP card (they share the
+            # renderer's placeholder fallbacks otherwise).
+            from openmarquee.setup_card import setup_card_credentials
+
             return {
                 "kind": "DEGRADED",
                 "variant": self._last_degraded_variant or "lost",
                 "target_ssid": self._last_sta_ssid,
+                **setup_card_credentials(),
             }
         # Should be unreachable — every non-ONLINE state maps above.
         return {"kind": "SETUP"}

@@ -21,11 +21,23 @@ from __future__ import annotations
 
 import socket
 
+# WIFI: URI special chars that must be backslash-escaped so a value
+# containing one still yields a scannable join code (de-facto MECARD-style
+# WiFi QR spec). The default token_urlsafe password never contains these,
+# so a normal card's QR is byte-identical to firstboot's; escaping only
+# matters for an operator passphrase with e.g. a `;` or `:`.
+_WIFI_QR_SPECIAL = set('\\;,:"')
+
+
+def _wifi_qr_escape(value: str) -> str:
+    return "".join("\\" + ch if ch in _WIFI_QR_SPECIAL else ch for ch in value)
+
 
 def setup_card_credentials() -> dict[str, str]:
-    """`{"ssid": <hostname>, "pin": <wifi_password>}` for a SETUP card,
-    omitting either key when unavailable. Fail-soft: never raises, so a
-    dev host / missing settings just yields the renderer's own
+    """Join credentials for a SETUP / DEGRADED card:
+    `{"ssid": <hostname>, "pin": <wifi_password>, "qr_payload": <WiFi QR>}`,
+    omitting any key whose source is unavailable. Fail-soft: never raises,
+    so a dev host / missing settings just yields the renderer's own
     fallbacks instead of wedging the card path."""
     creds: dict[str, str] = {}
     try:
@@ -42,4 +54,15 @@ def setup_card_credentials() -> dict[str, str]:
             creds["pin"] = password
     except Exception:
         pass
+    # WiFi-join QR the phone camera reads to hop straight onto the setup
+    # AP (the captive portal then auto-opens the setup page). Same
+    # `WIFI:T:WPA;S:…;P:…;;` format as welcome.html / firstboot so both
+    # onboarding paths encode the same thing. Only when we have BOTH the
+    # network name and its password.
+    ssid = creds.get("ssid")
+    pin = creds.get("pin")
+    if ssid and pin:
+        creds["qr_payload"] = (
+            f"WIFI:T:WPA;S:{_wifi_qr_escape(ssid)};P:{_wifi_qr_escape(pin)};;"
+        )
     return creds

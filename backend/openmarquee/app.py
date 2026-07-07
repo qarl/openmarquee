@@ -381,9 +381,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             def _params_for_state(st: str) -> dict | None:
                 if st == "SETUP":
                     # 2026-07-07: thread the real setup-AP join creds
-                    # (ssid = hostname, pin = live WPA2 passphrase) so the
-                    # boot catch-up SETUP card matches the supervisor path
-                    # and shows the actual network + password.
+                    # (ssid = hostname, pin = live WPA2 passphrase, plus a
+                    # WiFi-join QR) so the boot catch-up SETUP card matches
+                    # the supervisor path and shows the actual network +
+                    # password.
                     from openmarquee.setup_card import setup_card_credentials
 
                     return {"kind": "SETUP", **setup_card_credentials()}
@@ -395,7 +396,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                         "address": mdns_url(),
                     }
                 if st == "DEGRADED":
-                    return {"kind": "DEGRADED", "variant": "lost"}
+                    # Same real setup-AP creds as SETUP — the DEGRADED card
+                    # also tells the operator to rejoin the setup network.
+                    from openmarquee.setup_card import setup_card_credentials
+
+                    return {"kind": "DEGRADED", "variant": "lost", **setup_card_credentials()}
                 # ONLINE = AP off, no overlay.
                 return None
 
