@@ -34,6 +34,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import socket
 import threading
 from pathlib import Path
 
@@ -78,6 +79,34 @@ def apply_in_background(name: str) -> threading.Thread:
     thread = threading.Thread(target=_runner, daemon=True)
     thread.start()
     return thread
+
+
+def reconcile_hostapd_ssid_at_boot() -> None:
+    """Idempotently re-derive the setup-AP SSID from the device's CURRENT
+    hostname and rewrite hostapd.conf if it drifted.
+
+    2026-07-07: the settings name-change flow (api_settings PUT) already
+    updates the AP SSID via `apply_sign_name` -> `_apply_hostapd_ssid`.
+    But a rename applied OUT-OF-BAND (e.g. `hostnamectl set-hostname`
+    directly, as on the fireplaceSign -> JasonsSign1 rename) never
+    triggers that flow, so hostapd.conf keeps broadcasting the old name.
+    Running this reconcile once at boot keeps the setup AP following the
+    hostname regardless of which rename path was used — and consistent
+    with the boot card's hostname-derived mDNS URL (`mdns.mdns_url`).
+
+    The hostname is the source of truth here (not `settings.sign_name`):
+    an out-of-band rename leaves settings stale, whereas the hostname is
+    what the device actually is. `_apply_hostapd_ssid` no-ops when the
+    SSID already matches, and returns early when hostapd.conf is absent
+    (dev / non-AP hosts), so this is safe to call on every boot.
+    """
+    try:
+        host = socket.gethostname().strip().split(".")[0]
+    except OSError:
+        return
+    if not host:
+        return
+    _apply_hostapd_ssid(host)
 
 
 # --- individual sub-actuators, each fail-soft ---

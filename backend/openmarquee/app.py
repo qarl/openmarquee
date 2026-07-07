@@ -282,6 +282,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             log.exception("startup CMA sampler autostart failed")
 
+    # 2026-07-07: reconcile the setup-AP SSID from the CURRENT hostname
+    # at boot. The settings name-change flow updates hostapd on a PUT,
+    # but an out-of-band rename (hostnamectl direct — as on the
+    # fireplaceSign -> JasonsSign1 rename) bypasses it and leaves the
+    # setup AP broadcasting the old name. Idempotent + fail-soft; no-ops
+    # on dev hosts without hostapd.conf. Offloaded so the netctl write
+    # doesn't block the startup event loop.
+    if os.environ.get("OPENMARQUEE_DISABLE_AUTOSTART") != "1":
+        try:
+            from openmarquee.name_actuator import reconcile_hostapd_ssid_at_boot
+
+            await asyncio.to_thread(reconcile_hostapd_ssid_at_boot)
+        except Exception:
+            log.exception("startup: setup-AP SSID reconcile failed")
+
     # P1.2-A (2026-06-10) onboarding rework: network supervisor
     # observe-only loop. Polls wpa_supplicant control socket events
     # + periodically queries `iw dev wlan0 info` for STA freq. Drives
