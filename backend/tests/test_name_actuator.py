@@ -349,9 +349,7 @@ class TestSettingsSignNameReconcile:
             def save(self, settings):
                 saved.append(settings.sign_name)
 
-        monkeypatch.setattr(
-            "openmarquee.dependencies.get_settings_storage", lambda: _Storage()
-        )
+        monkeypatch.setattr("openmarquee.dependencies.get_settings_storage", lambda: _Storage())
         return saved
 
     def test_writes_sign_name_when_drifted(self, monkeypatch):

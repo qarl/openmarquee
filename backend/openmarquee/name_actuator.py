@@ -155,13 +155,10 @@ def _apply_settings_sign_name(name: str) -> None:
     #     key, wifi_networks, schedule) on the next load — catastrophic on
     #     a live handover device.
     try:
-        candidate = type(settings).model_validate(
-            settings.model_dump() | {"sign_name": name}
-        )
+        candidate = type(settings).model_validate(settings.model_dump() | {"sign_name": name})
     except Exception:
         log.debug(
-            "name-actuator: hostname %r not valid as sign_name; skipping "
-            "settings reconcile",
+            "name-actuator: hostname %r not valid as sign_name; skipping settings reconcile",
             name,
             exc_info=True,
         )

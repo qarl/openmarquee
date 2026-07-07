@@ -62,7 +62,5 @@ def setup_card_credentials() -> dict[str, str]:
     ssid = creds.get("ssid")
     pin = creds.get("pin")
     if ssid and pin:
-        creds["qr_payload"] = (
-            f"WIFI:T:WPA;S:{_wifi_qr_escape(ssid)};P:{_wifi_qr_escape(pin)};;"
-        )
+        creds["qr_payload"] = f"WIFI:T:WPA;S:{_wifi_qr_escape(ssid)};P:{_wifi_qr_escape(pin)};;"
     return creds

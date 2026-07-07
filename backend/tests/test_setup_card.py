@@ -42,10 +42,7 @@ def test_pin_from_live_wifi_password(monkeypatch):
 def test_qr_payload_encodes_wifi_join(monkeypatch):
     # A phone camera reads this to hop straight onto the setup AP.
     _install_password(monkeypatch, "correcthorse", hostname="JasonsSign1")
-    assert (
-        setup_card_credentials()["qr_payload"]
-        == "WIFI:T:WPA;S:JasonsSign1;P:correcthorse;;"
-    )
+    assert setup_card_credentials()["qr_payload"] == "WIFI:T:WPA;S:JasonsSign1;P:correcthorse;;"
 
 
 def test_qr_payload_escapes_special_chars(monkeypatch):
