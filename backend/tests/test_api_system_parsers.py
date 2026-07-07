@@ -15,8 +15,11 @@ from __future__ import annotations
 from openmarquee.api_system import (
     WifiNetwork,
     _feed_scan_bands_to_supervisor,
+    _nmcli_quality_to_dbm,
     _parse_airport_scan,
     _parse_iw_scan,
+    _parse_nmcli_freq,
+    _parse_nmcli_scan,
 )
 
 # --- iw scan parser ----------------------------------------------------------
@@ -447,3 +450,101 @@ def test_feed_scan_bands_no_op_on_empty_bands(monkeypatch):
     networks = [WifiNetwork(ssid="NoFreq", signal_dbm=-60, freq_mhz=None, band=None)]
     _feed_scan_bands_to_supervisor(networks)
     assert recorder.calls == [{}]
+
+
+# --- nmcli scan parser (2026-07-07: primary path on NM-managed radios) -------
+
+
+# `nmcli -t -f SSID,SIGNAL,FREQ dev wifi` — terse, colon-separated, one
+# line per visible BSS. This is the shape that returned the full list on
+# JasonsSign1 where `iw` returned only the associated BSS (the bug).
+NMCLI_THREE_NETWORKS = "\n".join(
+    [
+        "HomeNet:80:2412 MHz",
+        "NeighborNet:55:2437 MHz",
+        "FarNet:20:5180 MHz",
+        "",  # trailing blank line, as nmcli emits
+    ]
+)
+
+
+def test_nmcli_parses_all_visible_networks():
+    """The core fix: nmcli returns the FULL list (the associated-BSS-only
+    symptom was `iw` on an NM-managed radio, not the parser)."""
+    nets = _parse_nmcli_scan(NMCLI_THREE_NETWORKS)
+    assert [n.ssid for n in nets] == ["HomeNet", "NeighborNet", "FarNet"]
+
+
+def test_nmcli_quality_percent_maps_to_approx_dbm():
+    """SIGNAL is a 0-100 quality %, not dBm; inverted to approx dBm
+    (100 -> -50, 0 -> -100) so the UI's dBm display stays meaningful."""
+    nets = {n.ssid: n for n in _parse_nmcli_scan(NMCLI_THREE_NETWORKS)}
+    assert nets["HomeNet"].signal_dbm == -60  # quality 80 -> 40-100
+    assert nets["FarNet"].signal_dbm == -90  # quality 20 -> 10-100
+
+
+def test_nmcli_sort_strongest_first():
+    """Weakest-first input → strongest-first output (tests the sort, not
+    input-order passthrough)."""
+    nets = _parse_nmcli_scan("Weak:20:2412 MHz\nStrong:90:2437 MHz\n")
+    assert [n.ssid for n in nets] == ["Strong", "Weak"]
+
+
+def test_nmcli_band_from_freq():
+    nets = {n.ssid: n for n in _parse_nmcli_scan(NMCLI_THREE_NETWORKS)}
+    assert nets["HomeNet"].band == "2.4"  # 2412 MHz
+    assert nets["FarNet"].band == "5"  # 5180 MHz
+
+
+def test_nmcli_dedupes_keeping_strongest_signal():
+    """Same SSID on two APs → one entry, strongest signal wins (shared
+    dedupe helper with the iw parser)."""
+    nets = _parse_nmcli_scan("MeshA:30:2412 MHz\nMeshA:70:2437 MHz\n")
+    assert len(nets) == 1
+    assert nets[0].signal_dbm == -65  # from quality 70, not 30
+
+
+def test_nmcli_band_is_2_4_preferred_across_bss():
+    """An SSID on both bands classifies as 2.4 (reachable on the Pi's
+    2.4-only radio) even when the strongest BSS is 5 GHz."""
+    nets = _parse_nmcli_scan("Dual:80:5180 MHz\nDual:40:2412 MHz\n")
+    assert len(nets) == 1
+    assert nets[0].band == "2.4"
+    assert nets[0].freq_mhz == 5180  # signal/freq still from the stronger BSS
+
+
+def test_nmcli_skips_hidden_empty_ssid():
+    nets = _parse_nmcli_scan(":60:2412 MHz\nGoodNet:50:2437 MHz\n")
+    assert [n.ssid for n in nets] == ["GoodNet"]
+
+
+def test_nmcli_unescapes_colon_in_ssid():
+    r"""nmcli terse escapes ':' in SSIDs as '\:'; we un-escape it."""
+    nets = _parse_nmcli_scan(r"My\:Net:60:2412 MHz")
+    assert nets[0].ssid == "My:Net"
+
+
+def test_nmcli_empty_input_returns_empty_list():
+    assert _parse_nmcli_scan("") == []
+
+
+def test_nmcli_quality_to_dbm_edges():
+    assert _nmcli_quality_to_dbm("100") == -50
+    assert _nmcli_quality_to_dbm("0") == -100
+    assert _nmcli_quality_to_dbm("200") == -50  # clamped to 100
+    assert _nmcli_quality_to_dbm("") is None
+    assert _nmcli_quality_to_dbm("garbage") is None
+
+
+def test_nmcli_freq_parses_leading_mhz():
+    assert _parse_nmcli_freq("2412 MHz") == 2412
+    assert _parse_nmcli_freq("5180 MHz") == 5180
+    assert _parse_nmcli_freq("") is None
+
+
+def test_nmcli_band_feed_populates_from_freq():
+    """The record_scan_bands feed is preserved on the nmcli path: band
+    derives from FREQ, so SSIDs with a freq still feed the supervisor."""
+    nets = _parse_nmcli_scan("A:60:2412 MHz\nB:50:5180 MHz\n")
+    bands = {n.ssid: n.band for n in nets if n.band is not None}
+    assert bands == {"A": "2.4", "B": "5"}

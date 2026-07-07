@@ -78,7 +78,7 @@ class WifiNetwork(BaseModel):
 
 class WifiScanResult(BaseModel):
     networks: list[WifiNetwork]
-    source: str  # "iw" | "airport" | "none"
+    source: str  # "nmcli" | "iw" | "airport" | "none"
 
 
 # --- display dim detection ---
@@ -136,13 +136,18 @@ async def scan_wifi() -> WifiScanResult:
     """Best-effort scan of nearby WiFi SSIDs.
 
     Order:
-      1. `iw dev wlan0 scan` (Pi / Linux). Needs CAP_NET_ADMIN; may
-         require the backend to run as root or be granted a capability.
-      2. `airport -s` (macOS — the legacy path; Apple deprecated from
+      1. `nmcli -t -f SSID,SIGNAL,FREQ dev wifi` (NetworkManager) — PRIMARY
+         on NM-managed devices. A raw one-shot `iw` scan on an NM-managed,
+         *connected* wlan0 returns only the associated BSS (1 network),
+         whereas nmcli returns the full list in both the connected and
+         setup-AP states (2026-07-07 fix).
+      2. `iw dev wlan0 scan` (non-NM Linux fallback). Needs CAP_NET_ADMIN;
+         may require the backend to run as root or be granted a capability.
+      3. `airport -s` (macOS — the legacy path; Apple deprecated from
          14.4 onwards and returns empty unless run as root).
-      3. None / "none" source — UI falls back to manual SSID entry.
+      4. None / "none" source — UI falls back to manual SSID entry.
 
-    2026-07-02 (audit 4b close-out): on the `iw` path we also feed the
+    2026-07-02 (audit 4b close-out): on the nmcli / iw paths we also feed the
     per-SSID band table into the NetworkSupervisor's
     `record_scan_bands()` so a subsequent STA_SSID_NOT_FOUND event
     classifies as `not_found_or_5ghz` when the target SSID was only
@@ -151,7 +156,26 @@ async def scan_wifi() -> WifiScanResult:
     the WifiNetwork.band field is None and the classifier stays at
     its default `"not_found"`.
     """
-    # Linux / Pi path.
+    # NetworkManager path — PRIMARY on NM-managed devices (see docstring).
+    if shutil.which("nmcli"):
+        try:
+            out = await asyncio.to_thread(
+                subprocess.run,
+                ["nmcli", "-t", "-f", "SSID,SIGNAL,FREQ", "dev", "wifi"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if out.returncode == 0:
+                networks = _parse_nmcli_scan(out.stdout)
+                if networks:
+                    _feed_scan_bands_to_supervisor(networks)
+                    return WifiScanResult(networks=networks, source="nmcli")
+        except Exception:
+            log.exception("nmcli scan failed")
+
+    # Linux / Pi fallback (non-NM hosts).
     if shutil.which("iw"):
         try:
             # Batch 6.2: iw scan blocks up to 8s; offload so the
@@ -265,37 +289,98 @@ def _parse_iw_scan(output: str) -> list[WifiNetwork]:
                 current_signal = None
                 current_freq_mhz = None
                 continue
-            band = _band_for_freq(current_freq_mhz)
-            existing = networks.get(ssid)
-            if existing is None:
-                networks[ssid] = WifiNetwork(
-                    ssid=ssid,
-                    signal_dbm=current_signal,
-                    freq_mhz=current_freq_mhz,
-                    band=band,
-                )
-            else:
-                # Strongest-signal-wins for signal_dbm + freq_mhz,
-                # but band is 2.4-preferred so an SSID on both bands
-                # classifies as reachable (the Pi's radio is 2.4-only).
-                stronger = current_signal is not None and (
-                    existing.signal_dbm is None or current_signal > existing.signal_dbm
-                )
-                merged_band = existing.band
-                if band == "2.4" or merged_band is None:
-                    merged_band = band or merged_band
-                networks[ssid] = WifiNetwork(
-                    ssid=ssid,
-                    signal_dbm=current_signal if stronger else existing.signal_dbm,
-                    freq_mhz=current_freq_mhz if stronger else existing.freq_mhz,
-                    band=merged_band,
-                )
+            _merge_scanned_bss(networks, ssid, current_signal, current_freq_mhz)
             current_signal = None
             current_freq_mhz = None
+    return _sorted_networks(networks)
+
+
+def _merge_scanned_bss(
+    networks: dict[str, WifiNetwork],
+    ssid: str,
+    signal_dbm: int | None,
+    freq_mhz: int | None,
+) -> None:
+    """Merge one scanned BSS into the SSID-keyed dict. Dedupe policy
+    (shared by the `iw` and `nmcli` parsers): strongest-signal wins for
+    `signal_dbm`/`freq_mhz`; `band` is 2.4-preferred so an SSID visible
+    on both bands classifies as reachable (the Pi's BCM43438 is 2.4 GHz
+    only)."""
+    band = _band_for_freq(freq_mhz)
+    existing = networks.get(ssid)
+    if existing is None:
+        networks[ssid] = WifiNetwork(ssid=ssid, signal_dbm=signal_dbm, freq_mhz=freq_mhz, band=band)
+        return
+    stronger = signal_dbm is not None and (
+        existing.signal_dbm is None or signal_dbm > existing.signal_dbm
+    )
+    merged_band = existing.band
+    if band == "2.4" or merged_band is None:
+        merged_band = band or merged_band
+    networks[ssid] = WifiNetwork(
+        ssid=ssid,
+        signal_dbm=signal_dbm if stronger else existing.signal_dbm,
+        freq_mhz=freq_mhz if stronger else existing.freq_mhz,
+        band=merged_band,
+    )
+
+
+def _sorted_networks(networks: dict[str, WifiNetwork]) -> list[WifiNetwork]:
+    """Sort by signal (strongest first), SSID as a stable tie-break."""
     return sorted(
         networks.values(),
         key=lambda n: (-(n.signal_dbm or -999), n.ssid),
     )
+
+
+def _split_nmcli_terse(line: str) -> list[str]:
+    r"""Split an ``nmcli -t`` line on unescaped ``:`` and unescape the
+    ``\:`` / ``\\`` sequences nmcli emits in terse mode (realistically
+    only SSID values carry them)."""
+    fields = re.split(r"(?<!\\):", line)
+    return [re.sub(r"\\(.)", r"\1", f) for f in fields]
+
+
+def _nmcli_quality_to_dbm(quality: str) -> int | None:
+    """nmcli's ``SIGNAL`` column is a 0-100 link-quality percentage, not
+    dBm. NetworkManager derives that quality from RSSI, so invert it to
+    an approximate dBm (100 -> -50, 0 -> -100) — keeps the UI's dBm
+    display + the strongest-signal dedupe meaningful."""
+    try:
+        q = int(quality)
+    except (TypeError, ValueError):
+        return None
+    q = max(0, min(100, q))
+    return round(q / 2) - 100
+
+
+def _parse_nmcli_freq(freq_field: str) -> int | None:
+    """nmcli ``FREQ`` is e.g. ``"2412 MHz"``; pull the leading MHz int."""
+    m = re.match(r"\s*(\d+)", freq_field or "")
+    return int(m.group(1)) if m else None
+
+
+def _parse_nmcli_scan(output: str) -> list[WifiNetwork]:
+    """Parse ``nmcli -t -f SSID,SIGNAL,FREQ dev wifi`` — one line per
+    visible BSS. Deduped/sorted via the shared helpers; hidden SSIDs
+    (empty field) are dropped, matching the `iw` parser."""
+    networks: dict[str, WifiNetwork] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = _split_nmcli_terse(line)
+        if len(fields) < 3:
+            continue
+        ssid = fields[0].strip()
+        if not ssid:
+            continue
+        _merge_scanned_bss(
+            networks,
+            ssid,
+            _nmcli_quality_to_dbm(fields[1]),
+            _parse_nmcli_freq(fields[2]),
+        )
+    return _sorted_networks(networks)
 
 
 def _band_for_freq(freq_mhz: int | None) -> str | None:

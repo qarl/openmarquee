@@ -57,7 +57,14 @@ async def test_slow_wifi_scan_doesnt_block_concurrent_state_polls(
         # return object) makes the mock forward-safe for any other
         # subprocess consumer a monkey-patched sibling test spawns
         # a thread into.
-        stdout = ""
+        # 2026-07-07: nmcli is now the PRIMARY scan path (returns the full
+        # list where `iw` on an NM-managed radio returned only the
+        # associated BSS). Give the mock a valid `nmcli -t` line so the
+        # scan returns after the ONE (primary) nmcli call — keeping this a
+        # single-slow-subprocess exercise rather than nmcli-empty-then-iw
+        # (two slow calls would oversaturate the executor and delay the
+        # concurrent state poll this test guards).
+        stdout = "TestNet:70:2412 MHz\n"
         stderr = ""
         returncode = 0
         args: list[str] = []
