@@ -1616,7 +1616,15 @@ class NetworkSupervisor:
             # paints a reason banner on the on-glass card. When no
             # variant is set (fresh boot, no prior failure), the
             # card renders as it did before (no banner).
-            params: dict = {"kind": "SETUP"}
+            # 2026-07-07: thread the REAL setup-AP join credentials
+            # (ssid = hostname, pin = the live WPA2 passphrase) so the
+            # card shows the actual network + password instead of the
+            # renderer's hardcoded `openMarquee-Setup` / `----`
+            # placeholders. `setup_card_credentials` is a leaf helper
+            # (fail-soft) so it can't wedge a transition.
+            from openmarquee.setup_card import setup_card_credentials
+
+            params: dict = {"kind": "SETUP", **setup_card_credentials()}
             if self._last_degraded_variant is not None:
                 params["variant"] = self._last_degraded_variant
                 if self._last_sta_ssid is not None:
