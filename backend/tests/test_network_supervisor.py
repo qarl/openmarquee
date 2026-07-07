@@ -472,6 +472,44 @@ class TestNetworkSupervisor:
         sup = self._make(tmp_path)
         assert sup.current_state == SupervisorState.SETUP
 
+    def test_setup_card_params_include_real_ap_credentials(self, tmp_path, monkeypatch):
+        # 2026-07-07: the SETUP card must carry the REAL join creds
+        # (ssid + pin + WiFi-join QR) so it doesn't render the placeholder
+        # openMarquee-Setup / ---- / blank-QR on a fresh onboarding.
+        monkeypatch.setattr(
+            "openmarquee.setup_card.setup_card_credentials",
+            lambda: {
+                "ssid": "JasonsSign1",
+                "pin": "hunter2-passphrase",
+                "qr_payload": "WIFI:T:WPA;S:JasonsSign1;P:hunter2-passphrase;;",
+            },
+        )
+        sup = self._make(tmp_path)
+        params = sup._system_card_params_for_state(SupervisorState.SETUP)
+        assert params["kind"] == "SETUP"
+        assert params["ssid"] == "JasonsSign1"
+        assert params["pin"] == "hunter2-passphrase"
+        assert params["qr_payload"] == "WIFI:T:WPA;S:JasonsSign1;P:hunter2-passphrase;;"
+
+    def test_degraded_card_params_include_real_ap_credentials(self, tmp_path, monkeypatch):
+        # 2026-07-07: the DEGRADED card also instructs "join <ssid>, PIN
+        # <pin>" to rejoin the setup AP, so it must carry the same real
+        # creds + QR (mirrors SETUP; not the renderer placeholders).
+        monkeypatch.setattr(
+            "openmarquee.setup_card.setup_card_credentials",
+            lambda: {
+                "ssid": "JasonsSign1",
+                "pin": "hunter2-passphrase",
+                "qr_payload": "WIFI:T:WPA;S:JasonsSign1;P:hunter2-passphrase;;",
+            },
+        )
+        sup = self._make(tmp_path)
+        params = sup._system_card_params_for_state(SupervisorState.DEGRADED)
+        assert params["kind"] == "DEGRADED"
+        assert params["ssid"] == "JasonsSign1"
+        assert params["pin"] == "hunter2-passphrase"
+        assert params["qr_payload"] == "WIFI:T:WPA;S:JasonsSign1;P:hunter2-passphrase;;"
+
     def test_resumes_from_persisted_state(self, tmp_path: Path):
         # Pre-populate state file.
         state_file = tmp_path / "network-state.json"

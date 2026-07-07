@@ -282,20 +282,22 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         except Exception:
             log.exception("startup CMA sampler autostart failed")
 
-    # 2026-07-07: reconcile the setup-AP SSID from the CURRENT hostname
-    # at boot. The settings name-change flow updates hostapd on a PUT,
-    # but an out-of-band rename (hostnamectl direct — as on the
-    # fireplaceSign -> JasonsSign1 rename) bypasses it and leaves the
-    # setup AP broadcasting the old name. Idempotent + fail-soft; no-ops
-    # on dev hosts without hostapd.conf. Offloaded so the netctl write
-    # doesn't block the startup event loop.
+    # 2026-07-07 (one-name-everywhere, qarl-approved): reconcile EVERY
+    # name surface from the CURRENT hostname at boot — setup-AP SSID,
+    # Tailscale node name, mDNS host-name, stored sign_name. The settings
+    # name-change flow syncs these on a PUT, but an out-of-band rename
+    # (hostnamectl direct — as on fireplaceSign -> JasonsSign1) bypasses
+    # it and leaves surfaces stale. Every sub-actuator is idempotent (a
+    # fully in-sync device changes NOTHING — the Tailscale set is a
+    # strict no-op so the SSH lane is never disturbed) + fail-soft; no-ops
+    # on dev hosts. Offloaded so the netctl writes don't block startup.
     if os.environ.get("OPENMARQUEE_DISABLE_AUTOSTART") != "1":
         try:
-            from openmarquee.name_actuator import reconcile_hostapd_ssid_at_boot
+            from openmarquee.name_actuator import reconcile_names_from_hostname_at_boot
 
-            await asyncio.to_thread(reconcile_hostapd_ssid_at_boot)
+            await asyncio.to_thread(reconcile_names_from_hostname_at_boot)
         except Exception:
-            log.exception("startup: setup-AP SSID reconcile failed")
+            log.exception("startup: name reconcile failed")
 
     # P1.2-A (2026-06-10) onboarding rework: network supervisor
     # observe-only loop. Polls wpa_supplicant control socket events
@@ -378,7 +380,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
             def _params_for_state(st: str) -> dict | None:
                 if st == "SETUP":
-                    return {"kind": "SETUP"}
+                    # 2026-07-07: thread the real setup-AP join creds
+                    # (ssid = hostname, pin = live WPA2 passphrase, plus a
+                    # WiFi-join QR) so the boot catch-up SETUP card matches
+                    # the supervisor path and shows the actual network +
+                    # password.
+                    from openmarquee.setup_card import setup_card_credentials
+
+                    return {"kind": "SETUP", **setup_card_credentials()}
                 if st == "CONNECTING":
                     return {"kind": "CONNECTING"}
                 if st == "LINGER":
@@ -387,7 +396,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                         "address": mdns_url(),
                     }
                 if st == "DEGRADED":
-                    return {"kind": "DEGRADED", "variant": "lost"}
+                    # Same real setup-AP creds as SETUP — the DEGRADED card
+                    # also tells the operator to rejoin the setup network.
+                    from openmarquee.setup_card import setup_card_credentials
+
+                    return {"kind": "DEGRADED", "variant": "lost", **setup_card_credentials()}
                 # ONLINE = AP off, no overlay.
                 return None
 

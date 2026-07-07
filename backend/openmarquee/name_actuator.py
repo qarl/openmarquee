@@ -32,9 +32,12 @@ QA 2026-07-03 sharp-knives constraints honored:
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import re
+import shutil
 import socket
+import subprocess
 import threading
 from pathlib import Path
 
@@ -81,24 +84,25 @@ def apply_in_background(name: str) -> threading.Thread:
     return thread
 
 
-def reconcile_hostapd_ssid_at_boot() -> None:
-    """Idempotently re-derive the setup-AP SSID from the device's CURRENT
-    hostname and rewrite hostapd.conf if it drifted.
+def reconcile_names_from_hostname_at_boot() -> None:
+    """One-name-everywhere boot reconcile (2026-07-07, qarl-approved:
+    "enforce the sync as much as possible"). Re-derive EVERY name surface
+    from the device's CURRENT hostname so an out-of-band rename (e.g.
+    `hostnamectl set-hostname` directly, as on fireplaceSign ->
+    JasonsSign1) never leaves any surface stale.
 
-    2026-07-07: the settings name-change flow (api_settings PUT) already
-    updates the AP SSID via `apply_sign_name` -> `_apply_hostapd_ssid`.
-    But a rename applied OUT-OF-BAND (e.g. `hostnamectl set-hostname`
-    directly, as on the fireplaceSign -> JasonsSign1 rename) never
-    triggers that flow, so hostapd.conf keeps broadcasting the old name.
-    Running this reconcile once at boot keeps the setup AP following the
-    hostname regardless of which rename path was used — and consistent
-    with the boot card's hostname-derived mDNS URL (`mdns.mdns_url`).
-
-    The hostname is the source of truth here (not `settings.sign_name`):
-    an out-of-band rename leaves settings stale, whereas the hostname is
-    what the device actually is. `_apply_hostapd_ssid` no-ops when the
-    SSID already matches, and returns early when hostapd.conf is absent
-    (dev / non-AP hosts), so this is safe to call on every boot.
+    Hostname = source of truth: an out-of-band rename leaves the stored
+    settings value stale, whereas the hostname is what the device
+    actually is (same reasoning as the boot card's hostname-derived mDNS
+    URL, `mdns.mdns_url`). We SKIP hostnamectl (the hostname IS the
+    source) and run the remaining sub-actuators from it:
+      * Tailscale node name    — STRICT no-op when in sync (the tailnet
+        name is the operator's SSH lane; never re-set it needlessly).
+      * mDNS (avahi) host-name — no-op when the conf already matches.
+      * setup-AP SSID (hostapd) — no-op when `ssid=` already matches.
+      * stored SystemSettings.sign_name — no-op when already matching.
+    Each sub-actuator is idempotent + fail-soft, so this is safe to call
+    on every boot; on a fully in-sync device it changes NOTHING.
     """
     try:
         host = socket.gethostname().strip().split(".")[0]
@@ -106,7 +110,68 @@ def reconcile_hostapd_ssid_at_boot() -> None:
         return
     if not host:
         return
+    _apply_tailscale_hostname(host)
+    _apply_avahi_hostname(host)
     _apply_hostapd_ssid(host)
+    _apply_settings_sign_name(host)
+
+
+def _apply_settings_sign_name(name: str) -> None:
+    """Sync the stored SystemSettings.sign_name TO `name` when it has
+    drifted from the hostname (e.g. after an out-of-band rename) so the
+    settings UI + any sign_name consumer agree with the device's actual
+    name. Idempotent — no write when already matching. Lazy import keeps
+    name_actuator a leaf; fail-soft on load/save error.
+
+    Churn-free + quarantine-safe: the candidate is built through FULL
+    model validation (see below) so we store the SAME normalised form the
+    next load will produce (the next reconcile matches + skips) and never
+    persist a value that would fail re-validation. `storage.save` is a
+    plain persist — it does NOT re-trigger the name actuators — so there's
+    no reconcile loop.
+    """
+    try:
+        from openmarquee.dependencies import get_settings_storage
+
+        storage = get_settings_storage()
+        settings = storage.load()
+    except Exception:
+        log.debug(
+            "name-actuator: settings load failed; skipping sign_name reconcile",
+            exc_info=True,
+        )
+        return
+    # Build the candidate through FULL model validation (NOT
+    # model_copy(update=), which bypasses the field validator). This
+    # matters two ways:
+    #   * churn: the sign_name validator normalises (e.g. drops `_`), so
+    #     comparing the VALIDATED candidate to the stored value avoids a
+    #     rewrite-every-boot when a raw hostname leaf differs from its
+    #     normalised form.
+    #   * safety: a hostname that normalises to empty (e.g. "---") raises
+    #     in the validator here -> we SKIP, rather than persisting an
+    #     invalid value that would quarantine settings.json + regenerate
+    #     it from FACTORY DEFAULTS (wiping the AP passphrase, Tailscale
+    #     key, wifi_networks, schedule) on the next load — catastrophic on
+    #     a live handover device.
+    try:
+        candidate = type(settings).model_validate(settings.model_dump() | {"sign_name": name})
+    except Exception:
+        log.debug(
+            "name-actuator: hostname %r not valid as sign_name; skipping settings reconcile",
+            name,
+            exc_info=True,
+        )
+        return
+    if candidate.sign_name == settings.sign_name:
+        return  # already in sync (compare the validated/normalised form)
+    try:
+        storage.save(candidate)
+    except Exception:
+        log.warning(
+            "name-actuator: settings sign_name reconcile write failed; next rename / boot retries",
+            exc_info=True,
+        )
 
 
 # --- individual sub-actuators, each fail-soft ---
@@ -138,9 +203,66 @@ def _apply_hostnamectl(name: str) -> None:
         )
 
 
+def _current_tailscale_hostname() -> str | None:
+    """The device's CURRENT Tailscale node hostname (lowercased), or None
+    when unreadable — tailscale off PATH, tailscaled not up yet at boot,
+    or `status` errored / returned non-JSON.
+
+    Reads `Self.HostName` from `tailscale status --json` (the field
+    `tailscale set --hostname` writes; unprivileged read). Used to make
+    `_apply_tailscale_hostname` strictly idempotent so the boot-time
+    reconcile never re-sets an in-sync tailnet name — that name is the
+    operator's SSH lane.
+    """
+    if not shutil.which("tailscale"):
+        return None
+    try:
+        out = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=_SUBPROCESS_TIMEOUT_S,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        payload = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+    self_node = payload.get("Self")
+    if not isinstance(self_node, dict):
+        return None
+    host = (self_node.get("HostName") or "").strip().lower()
+    return host or None
+
+
 def _apply_tailscale_hostname(name: str) -> None:
-    """Route `tailscale set --hostname <name>` through the netctl
-    socket daemon. 2026-07-03 (QA FIX 1)."""
+    """Route `tailscale set --hostname <name>` through the netctl socket
+    daemon. 2026-07-03 (QA FIX 1).
+
+    2026-07-07 (one-name-everywhere): STRICTLY idempotent — read the
+    current tailnet hostname first and only `set` on genuine drift. The
+    boot-time reconcile calls this every boot; the tailnet name is the
+    operator's SSH lane, so re-setting it (even to the same value) risks
+    a needless re-register / collision suffix. Skip when already in sync
+    OR when the current value can't be read (tailscaled not up yet at
+    boot / transient) — a genuine rename then retries on the next
+    settings PUT or a later boot when tailscale is up. Tailscale
+    lowercases node names, so the compare is case-insensitive.
+    """
+    current = _current_tailscale_hostname()
+    if current is None:
+        log.debug(
+            "name-actuator: tailscale hostname unreadable; skipping set "
+            "(retries on next rename / boot when tailscaled is up)"
+        )
+        return
+    if current == name.strip().lower():
+        return  # already in sync — strict no-op; never touch the SSH lane
+
     from openmarquee.network_supervisor_actuator import _netctl_send
 
     class _TailscaleError(RuntimeError):

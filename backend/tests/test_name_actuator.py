@@ -65,14 +65,36 @@ class TestHostnamectlPath:
 class TestTailscalePath:
     def test_sends_tailscale_set_hostname_via_netctl(self, monkeypatch):
         spy = _install_netctl_spy(monkeypatch)
+        # 2026-07-07: _apply_tailscale_hostname is now strictly idempotent
+        # (reads the current tailnet hostname first). Simulate genuine
+        # drift so the set fires.
+        monkeypatch.setattr(name_actuator, "_current_tailscale_hostname", lambda: "oldname")
         name_actuator._apply_tailscale_hostname("JasonsSign1")
         assert spy.calls == [("tailscale-set-hostname", b"JasonsSign1\n")]
 
     def test_tailscale_fail_soft_on_netctl_error(self, monkeypatch):
         spy = _install_netctl_spy(monkeypatch)
         spy.raise_error = RuntimeError
+        monkeypatch.setattr(name_actuator, "_current_tailscale_hostname", lambda: "oldname")
         name_actuator._apply_tailscale_hostname("JasonsSign1")
         assert spy.calls == [("tailscale-set-hostname", b"JasonsSign1\n")]
+
+    def test_tailscale_strict_noop_when_already_in_sync(self, monkeypatch):
+        """The reconcile calls this every boot; the tailnet name is the
+        operator's SSH lane. When it already matches (case-insensitively)
+        we must NOT re-set it."""
+        spy = _install_netctl_spy(monkeypatch)
+        monkeypatch.setattr(name_actuator, "_current_tailscale_hostname", lambda: "jasonssign1")
+        name_actuator._apply_tailscale_hostname("JasonsSign1")  # case-insensitive
+        assert spy.calls == []
+
+    def test_tailscale_skips_when_hostname_unreadable(self, monkeypatch):
+        """tailscaled not up yet at boot -> can't confirm drift -> skip
+        (retries on the next rename / boot). Never fire a blind set."""
+        spy = _install_netctl_spy(monkeypatch)
+        monkeypatch.setattr(name_actuator, "_current_tailscale_hostname", lambda: None)
+        name_actuator._apply_tailscale_hostname("JasonsSign1")
+        assert spy.calls == []
 
 
 class TestAvahiPath:
@@ -232,50 +254,135 @@ class TestApplySignName:
         ]
 
 
-class TestReconcileHostapdSsidAtBoot:
-    """2026-07-07: boot-time reconcile of the setup-AP SSID from the
-    CURRENT hostname, so an out-of-band rename (hostnamectl direct,
-    bypassing the settings-PUT name-change flow — as on the
-    fireplaceSign -> JasonsSign1 rename) doesn't leave hostapd
-    broadcasting the old name."""
+class TestReconcileNamesFromHostname:
+    """2026-07-07 (one-name-everywhere, qarl-approved): boot reconcile of
+    EVERY name surface from the CURRENT hostname, so an out-of-band
+    rename (hostnamectl direct, bypassing the settings-PUT flow — as on
+    fireplaceSign -> JasonsSign1) doesn't leave any surface stale."""
 
-    def test_reconciles_drifted_ssid_to_current_hostname(self, monkeypatch, tmp_path):
-        # The core regression: hostapd stuck on the OLD name while the
-        # hostname is the new name -> reconcile rewrites it.
+    def _stub_sub_actuators(self, monkeypatch, sink):
+        # Skip hostnamectl entirely (hostname IS the source); record the
+        # rest so we can assert what the reconcile drives.
+        for surface, fn in (
+            ("tailscale", "_apply_tailscale_hostname"),
+            ("avahi", "_apply_avahi_hostname"),
+            ("hostapd", "_apply_hostapd_ssid"),
+            ("settings", "_apply_settings_sign_name"),
+        ):
+            monkeypatch.setattr(name_actuator, fn, lambda n, _s=surface: sink.append((_s, n)))
+        monkeypatch.setattr(
+            name_actuator,
+            "_apply_hostnamectl",
+            lambda n: sink.append(("hostnamectl", n)),
+        )
+
+    def test_calls_every_surface_with_leaf_hostname_skipping_hostnamectl(self, monkeypatch):
+        called: list[tuple[str, str]] = []
+        self._stub_sub_actuators(monkeypatch, called)
+        monkeypatch.setattr(name_actuator.socket, "gethostname", lambda: "JasonsSign1.local")
+        name_actuator.reconcile_names_from_hostname_at_boot()
+        # Tailscale + avahi + hostapd + settings, all from the leaf name;
+        # hostnamectl NOT called (the hostname is the source of truth).
+        assert called == [
+            ("tailscale", "JasonsSign1"),
+            ("avahi", "JasonsSign1"),
+            ("hostapd", "JasonsSign1"),
+            ("settings", "JasonsSign1"),
+        ]
+
+    def test_noop_on_empty_hostname(self, monkeypatch):
+        called: list[tuple[str, str]] = []
+        self._stub_sub_actuators(monkeypatch, called)
+        monkeypatch.setattr(name_actuator.socket, "gethostname", lambda: "")
+        name_actuator.reconcile_names_from_hostname_at_boot()
+        assert called == []
+
+    def test_reconciles_drifted_hostapd_ssid_end_to_end(self, monkeypatch, tmp_path):
+        # The original #4 regression, now via the generalized entrypoint:
+        # hostapd stuck on the OLD name -> rewritten to the hostname.
+        # Other surfaces stubbed so we isolate the hostapd netctl call.
         spy = _install_netctl_spy(monkeypatch)
+        monkeypatch.setattr(name_actuator, "_apply_tailscale_hostname", lambda n: None)
+        monkeypatch.setattr(name_actuator, "_apply_avahi_hostname", lambda n: None)
+        monkeypatch.setattr(name_actuator, "_apply_settings_sign_name", lambda n: None)
         conf = tmp_path / "hostapd.conf"
         conf.write_text("interface=ap0\nssid=fireplaceSign\nchannel=6\n")
         monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
         monkeypatch.setattr(name_actuator.socket, "gethostname", lambda: "JasonsSign1")
-        name_actuator.reconcile_hostapd_ssid_at_boot()
+        name_actuator.reconcile_names_from_hostname_at_boot()
         assert len(spy.calls) == 1
         subcommand, payload = spy.calls[0]
         assert subcommand == "hostapd-write-and-restart"
         assert "ssid=JasonsSign1" in payload.decode("utf-8")
 
-    def test_idempotent_when_ssid_already_matches_hostname(self, monkeypatch, tmp_path):
+    def test_hostapd_idempotent_when_already_matching(self, monkeypatch, tmp_path):
         spy = _install_netctl_spy(monkeypatch)
+        monkeypatch.setattr(name_actuator, "_apply_tailscale_hostname", lambda n: None)
+        monkeypatch.setattr(name_actuator, "_apply_avahi_hostname", lambda n: None)
+        monkeypatch.setattr(name_actuator, "_apply_settings_sign_name", lambda n: None)
         conf = tmp_path / "hostapd.conf"
         conf.write_text("interface=ap0\nssid=JasonsSign1\n")
         monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
         monkeypatch.setattr(name_actuator.socket, "gethostname", lambda: "JasonsSign1")
-        name_actuator.reconcile_hostapd_ssid_at_boot()
-        assert spy.calls == []  # no rewrite/restart when already correct
-
-    def test_strips_domain_suffix_from_hostname(self, monkeypatch, tmp_path):
-        spy = _install_netctl_spy(monkeypatch)
-        conf = tmp_path / "hostapd.conf"
-        conf.write_text("ssid=old\n")
-        monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
-        monkeypatch.setattr(name_actuator.socket, "gethostname", lambda: "JasonsSign1.local")
-        name_actuator.reconcile_hostapd_ssid_at_boot()
-        assert "ssid=JasonsSign1" in spy.calls[0][1].decode("utf-8")
-
-    def test_noop_on_empty_hostname(self, monkeypatch, tmp_path):
-        spy = _install_netctl_spy(monkeypatch)
-        conf = tmp_path / "hostapd.conf"
-        conf.write_text("ssid=old\n")
-        monkeypatch.setattr("openmarquee.name_actuator._HOSTAPD_CONF", conf)
-        monkeypatch.setattr(name_actuator.socket, "gethostname", lambda: "")
-        name_actuator.reconcile_hostapd_ssid_at_boot()
+        name_actuator.reconcile_names_from_hostname_at_boot()
         assert spy.calls == []
+
+
+class TestSettingsSignNameReconcile:
+    """The stored-value surface: sync SystemSettings.sign_name TO the
+    hostname when drifted, no-op when already matching. Uses a REAL
+    SystemSettings so the model_validate-based reconcile (which normalises
+    + rejects exactly like production) is genuinely exercised — a fake
+    with a permissive model_copy would hide the churn + quarantine bugs
+    this path guards against."""
+
+    def _install_fake_storage(self, monkeypatch, current):
+        from openmarquee.settings import SystemSettings
+
+        saved: list[str] = []
+        loaded = SystemSettings(sign_name=current)
+
+        class _Storage:
+            def load(self):
+                return loaded
+
+            def save(self, settings):
+                saved.append(settings.sign_name)
+
+        monkeypatch.setattr("openmarquee.dependencies.get_settings_storage", lambda: _Storage())
+        return saved
+
+    def test_writes_sign_name_when_drifted(self, monkeypatch):
+        saved = self._install_fake_storage(monkeypatch, current="fireplaceSign")
+        name_actuator._apply_settings_sign_name("JasonsSign1")
+        assert saved == ["JasonsSign1"]
+
+    def test_noop_when_sign_name_already_matches(self, monkeypatch):
+        saved = self._install_fake_storage(monkeypatch, current="JasonsSign1")
+        name_actuator._apply_settings_sign_name("JasonsSign1")
+        assert saved == []
+
+    def test_noop_when_only_normalisation_differs(self, monkeypatch):
+        # Churn guard: `my_sign` normalises to `mysign` (validator drops
+        # `_`), which EQUALS the stored value → no rewrite-every-boot.
+        # model_copy(update=) skipped the validator and would have
+        # compared raw `my_sign` != `mysign` and rewritten forever.
+        saved = self._install_fake_storage(monkeypatch, current="mysign")
+        name_actuator._apply_settings_sign_name("my_sign")
+        assert saved == []
+
+    def test_persists_normalised_form_not_raw(self, monkeypatch):
+        # When it DOES write, it stores the validated/normalised value
+        # (`Jason_Sign` → `JasonSign`) so the very next boot is a no-op.
+        saved = self._install_fake_storage(monkeypatch, current="fireplaceSign")
+        name_actuator._apply_settings_sign_name("Jason_Sign")
+        assert saved == ["JasonSign"]
+
+    def test_skips_invalid_name_without_quarantining_settings(self, monkeypatch):
+        # Safety guard: `---` normalises to empty → the validator raises →
+        # we SKIP. Persisting it would fail re-validation on the next load
+        # and quarantine settings.json to FACTORY DEFAULTS (wiping the AP
+        # passphrase, Tailscale key, wifi_networks) on a live device.
+        saved = self._install_fake_storage(monkeypatch, current="JasonsSign1")
+        name_actuator._apply_settings_sign_name("---")
+        assert saved == []
