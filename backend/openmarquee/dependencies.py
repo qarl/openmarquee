@@ -1022,6 +1022,23 @@ def _network_supervisor_singleton():
     # in __init__ has already run — a device that's on-boarded via
     # the portal previously boots straight to its persisted ONLINE.
     supervisor.probe_and_seed_from_existing_connection()
+    # Recovery A1 (2026-07-08): if the operator power-cycled the sign 3x
+    # in rapid succession, the boot-gesture oneshot wrote a "setup"
+    # boot-hint. Consume it AFTER the probe so the operator's explicit
+    # gesture WINS over a probed/persisted ONLINE — force the sign back
+    # into Setup Mode so a phone can reconnect it. Guardrails against a
+    # spurious/idle forced-SETUP: the root clear-timer removes the hint at
+    # +20s (so a later backend restart can't re-force), and re-forcing
+    # SETUP while already in SETUP is a no-op. (The setup-mode 30-min
+    # auto-off timer — a separate PR — adds a further self-heal once it
+    # lands; it is not relied on here.) Fail-soft: no hint / no /run on
+    # dev hosts → no-op.
+    from openmarquee.boot_hint import consume_boot_hint
+
+    if consume_boot_hint() == "setup":
+        from openmarquee.network_supervisor import SupervisorEvent
+
+        supervisor.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
     return supervisor
 
 

@@ -1,0 +1,17 @@
+[Unit]
+# Recovery A1 (2026-07-08): fire the stable-boot clear ~20s after boot.
+# The 20s window IS the definition of "rapid power cycle": a boot cut
+# short before 20s of uptime never reaches the clear, so its increment
+# survives to the next boot; a boot that lasts past 20s clears the
+# counter. 20s comfortably covers the Pi Zero 2 W's boot-to-backend time
+# while staying short enough that an operator deliberately power-cycling
+# won't accidentally let one "settle".
+Description=openMarquee: clear boot-cycle counter 20s after a stable boot
+
+[Timer]
+OnBootSec=20s
+AccuracySec=1s
+Unit=openmarquee-boot-gesture-clear.service
+
+[Install]
+WantedBy=timers.target
