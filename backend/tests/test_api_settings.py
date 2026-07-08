@@ -9,6 +9,7 @@ from openmarquee.app import app
 from openmarquee.content.storage import ContentStorage
 from openmarquee.dependencies import (
     _content_storage_singleton,
+    _network_supervisor_singleton,
     _settings_storage_singleton,
     get_content_storage,
     get_settings_storage,
@@ -38,6 +39,11 @@ def client(storage: SettingsStorage, content_storage: ContentStorage) -> TestCli
         app.dependency_overrides.clear()
         _settings_storage_singleton.cache_clear()
         _content_storage_singleton.cache_clear()
+        # 2026-07-08 (P0-1): the settings PUT now drives the network
+        # supervisor when station creds change, so a full-creds PUT test
+        # that doesn't stub it would touch the shared singleton. Reset it
+        # per test so state can't leak across the session.
+        _network_supervisor_singleton.cache_clear()
 
 
 def test_get_returns_defaults_when_nothing_persisted(client: TestClient):
@@ -491,6 +497,11 @@ def auth_client(
         app.dependency_overrides.clear()
         _settings_storage_singleton.cache_clear()
         _content_storage_singleton.cache_clear()
+        # 2026-07-08 (P0-1): the settings PUT now drives the network
+        # supervisor when station creds change, so a full-creds PUT test
+        # that doesn't stub it would touch the shared singleton. Reset it
+        # per test so state can't leak across the session.
+        _network_supervisor_singleton.cache_clear()
         _auth_storage_singleton.cache_clear()
 
 
@@ -833,3 +844,119 @@ def test_patch_endpoints_404_when_auth_not_configured(auth_client: TestClient):
     # acceptable; the endpoint never gets to run, so 401 is what
     # actually fires.
     assert response.status_code == 401
+
+
+# --- P0-1 (2026-07-08): Settings provisioning drives the state machine ---
+
+
+class _FakeSupervisor:
+    """Records the provisioning calls the settings PATCH should make."""
+
+    def __init__(self, current_state=None):
+        from openmarquee.network_supervisor import SupervisorState
+
+        self.current_state = current_state or SupervisorState.SETUP
+        self.recorded_ssid = "<unset>"
+        self.events = []
+
+    def record_target_ssid(self, ssid):
+        self.recorded_ssid = ssid
+
+    def apply_event(self, event):
+        self.events.append(event)
+
+
+def _stub_wifi_apply(monkeypatch):
+    import openmarquee.wifi_station as wifi_station
+
+    monkeypatch.setattr(wifi_station, "apply_in_background", lambda **kwargs: None)
+
+
+def test_put_wifi_station_creds_drives_supervisor(client: TestClient, monkeypatch):
+    # Saving station creds via Settings must ALSO drive the state machine
+    # (record_target_ssid + HAS_STORED_CREDENTIALS), not just run the nmcli
+    # apply — otherwise SETUP never advances → the AP-teardown + CONNECTING/
+    # LINGER confirmation cards never fire on the first session.
+    from openmarquee.network_supervisor import SupervisorEvent
+
+    _stub_wifi_apply(monkeypatch)
+    fake = _FakeSupervisor()
+    monkeypatch.setattr("openmarquee.dependencies.get_network_supervisor", lambda: fake)
+    resp = client.put(
+        "/api/settings",
+        json={
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "MyHomeWifi",
+            "wifi_station_password": "abcdefgh",
+        },
+    )
+    assert resp.status_code == 200
+    assert fake.recorded_ssid == "MyHomeWifi"
+    assert SupervisorEvent.HAS_STORED_CREDENTIALS in fake.events
+
+
+def test_put_wifi_station_disabled_does_not_drive_supervisor(client: TestClient, monkeypatch):
+    # Guard: no station change / station disabled must NOT fire the
+    # provisioning event.
+    _stub_wifi_apply(monkeypatch)
+    fake = _FakeSupervisor()
+    monkeypatch.setattr("openmarquee.dependencies.get_network_supervisor", lambda: fake)
+    resp = client.put(
+        "/api/settings",
+        json={
+            "wifi_station_enabled": False,
+            "wifi_station_ssid": None,
+            "wifi_station_password": None,
+        },
+    )
+    assert resp.status_code == 200
+    assert fake.recorded_ssid == "<unset>"
+    assert fake.events == []
+
+
+def test_put_wifi_station_supervisor_failure_is_fail_soft(client: TestClient, monkeypatch):
+    # A supervisor hiccup must NOT 500 the PUT — creds are already persisted
+    # + the nmcli apply already ran before the supervisor drive.
+    _stub_wifi_apply(monkeypatch)
+
+    class _BoomSupervisor(_FakeSupervisor):
+        def apply_event(self, event):
+            raise RuntimeError("supervisor down")
+
+    monkeypatch.setattr(
+        "openmarquee.dependencies.get_network_supervisor", lambda: _BoomSupervisor()
+    )
+    resp = client.put(
+        "/api/settings",
+        json={
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "MyHomeWifi",
+            "wifi_station_password": "abcdefgh",
+        },
+    )
+    assert resp.status_code == 200
+    # Creds persisted despite the supervisor failure.
+    assert client.get("/api/settings").json()["wifi_station_ssid"] == "MyHomeWifi"
+
+
+def test_put_wifi_station_creds_do_not_disturb_online_sign(client: TestClient, monkeypatch):
+    # State guard: re-saving station creds while the sign is already ONLINE
+    # must NOT re-fire the provisioning event (that would re-trigger
+    # onboarding on a running sign). The nmcli reconnect + observe loop
+    # handle a network change from ONLINE.
+    from openmarquee.network_supervisor import SupervisorState
+
+    _stub_wifi_apply(monkeypatch)
+    fake = _FakeSupervisor(current_state=SupervisorState.ONLINE)
+    monkeypatch.setattr("openmarquee.dependencies.get_network_supervisor", lambda: fake)
+    resp = client.put(
+        "/api/settings",
+        json={
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "DifferentWifi",
+            "wifi_station_password": "abcdefgh",
+        },
+    )
+    assert resp.status_code == 200
+    assert fake.recorded_ssid == "<unset>"
+    assert fake.events == []
