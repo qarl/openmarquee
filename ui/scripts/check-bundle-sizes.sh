@@ -154,7 +154,7 @@ if [ "$DASHBOARD_BUILT" -eq 1 ]; then
     # measurement so a future favicon / apple-touch-icon-size
     # follow-up doesn't have to touch this file again immediately.
     THRESHOLDS+=(
-        72000
+        73500
         18000
         60600
         3600

@@ -79,6 +79,10 @@ ALLOWLIST = frozenset(
         "hostnamectl-set-hostname",
         "tailscale-set-hostname",
         "avahi-write-and-restart",
+        # 2026-07-08 (recovery cluster A4): operator-triggered device
+        # reboot. `reboot` → `systemctl reboot`; no payload. Guarded by
+        # this allowlist + the bash helper's argv contract.
+        "reboot",
     }
 )
 
