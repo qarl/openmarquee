@@ -62,11 +62,18 @@ def apply_sign_name(name: str) -> None:
     fires early. hostapd + avahi restarts are last because they
     can briefly interrupt the captive-portal AP / mDNS discovery
     respectively.
+
+    2026-07-07 (qarl Option A): a UI rename must also clear the stored
+    tailscale_hostname + sync wifi_ssid so they can't drift from the sign
+    name — otherwise `openmarquee-tailscale.sh` would re-pin a stale
+    tailnet name at the next boot. `_reconcile_stored_name_fields` is
+    fail-soft (its own load/save guard) so it never wedges a rename.
     """
     _apply_hostnamectl(name)
     _apply_tailscale_hostname(name)
     _apply_avahi_hostname(name)
     _apply_hostapd_ssid(name)
+    _reconcile_stored_name_fields(name)
 
 
 def apply_in_background(name: str) -> threading.Thread:
@@ -100,7 +107,10 @@ def reconcile_names_from_hostname_at_boot() -> None:
         name is the operator's SSH lane; never re-set it needlessly).
       * mDNS (avahi) host-name — no-op when the conf already matches.
       * setup-AP SSID (hostapd) — no-op when `ssid=` already matches.
-      * stored SystemSettings.sign_name — no-op when already matching.
+      * stored SystemSettings (sign_name / tailscale_hostname / wifi_ssid)
+        — sign_name follows, tailscale_hostname is CLEARED so Tailscale
+        tracks the OS hostname, wifi_ssid follows (see
+        `_reconcile_stored_name_fields`). No-op when already in sync.
     Each sub-actuator is idempotent + fail-soft, so this is safe to call
     on every boot; on a fully in-sync device it changes NOTHING.
     """
@@ -113,22 +123,35 @@ def reconcile_names_from_hostname_at_boot() -> None:
     _apply_tailscale_hostname(host)
     _apply_avahi_hostname(host)
     _apply_hostapd_ssid(host)
-    _apply_settings_sign_name(host)
+    _reconcile_stored_name_fields(host)
 
 
-def _apply_settings_sign_name(name: str) -> None:
-    """Sync the stored SystemSettings.sign_name TO `name` when it has
-    drifted from the hostname (e.g. after an out-of-band rename) so the
-    settings UI + any sign_name consumer agree with the device's actual
-    name. Idempotent — no write when already matching. Lazy import keeps
-    name_actuator a leaf; fail-soft on load/save error.
+def _reconcile_stored_name_fields(name: str) -> None:
+    """Sync the STORED name-bearing settings fields to the device's current
+    identity `name` (the hostname leaf at boot, or the new sign_name on a
+    UI rename). qarl 2026-07-07 (Option A — "names always follow the sign
+    hostname; a custom override does NOT stick through a rename"):
 
-    Churn-free + quarantine-safe: the candidate is built through FULL
-    model validation (see below) so we store the SAME normalised form the
-    next load will produce (the next reconcile matches + skips) and never
-    persist a value that would fail re-validation. `storage.save` is a
-    plain persist — it does NOT re-trigger the name actuators — so there's
-    no reconcile loop.
+      * sign_name          -> `name` (follows the hostname; the #7 case).
+      * tailscale_hostname -> CLEARED (None). The live rename is done by
+        `tailscale set --hostname=name` (the sub-actuator above / the boot
+        actuator); clearing the STORED field stops `openmarquee-tailscale.sh`
+        re-pinning a stale `--hostname` at the next boot (empty => it omits
+        the flag, so tailscaled keeps the OS-hostname-tracked name). Belt-
+        and-braces: clearing can never point the SSH lane at a stale name,
+        and it defuses a stale stored override (e.g. `fireplacesign` left on
+        a renamed sign).
+      * wifi_ssid          -> `name` (the setup-AP SSID; can't be empty, so
+        it's synced rather than cleared). Capped at the 32-byte SSID max.
+
+    One load + at most one save. Built through FULL model validation (NOT
+    model_copy(update=), which skips the field validators) so we (a) store
+    the normalised form the next load produces — a true no-op next boot —
+    and (b) SKIP-not-persist a value that fails validation, which would
+    quarantine settings.json to FACTORY DEFAULTS (wiping the AP passphrase,
+    Tailscale key, wifi_networks) on the next load — catastrophic on a live
+    handover device. Fail-soft; `storage.save` is a plain persist, so no
+    reconcile loop.
     """
     try:
         from openmarquee.dependencies import get_settings_storage
@@ -137,39 +160,35 @@ def _apply_settings_sign_name(name: str) -> None:
         settings = storage.load()
     except Exception:
         log.debug(
-            "name-actuator: settings load failed; skipping sign_name reconcile",
+            "name-actuator: settings load failed; skipping stored-name reconcile",
             exc_info=True,
         )
         return
-    # Build the candidate through FULL model validation (NOT
-    # model_copy(update=), which bypasses the field validator). This
-    # matters two ways:
-    #   * churn: the sign_name validator normalises (e.g. drops `_`), so
-    #     comparing the VALIDATED candidate to the stored value avoids a
-    #     rewrite-every-boot when a raw hostname leaf differs from its
-    #     normalised form.
-    #   * safety: a hostname that normalises to empty (e.g. "---") raises
-    #     in the validator here -> we SKIP, rather than persisting an
-    #     invalid value that would quarantine settings.json + regenerate
-    #     it from FACTORY DEFAULTS (wiping the AP passphrase, Tailscale
-    #     key, wifi_networks, schedule) on the next load — catastrophic on
-    #     a live handover device.
+    desired = {
+        "sign_name": name,
+        "tailscale_hostname": None,  # empty => Tailscale follows the OS hostname
+        "wifi_ssid": name[:32],  # IEEE 802.11 SSID max is 32 bytes
+    }
     try:
-        candidate = type(settings).model_validate(settings.model_dump() | {"sign_name": name})
+        candidate = type(settings).model_validate(settings.model_dump() | desired)
     except Exception:
         log.debug(
-            "name-actuator: hostname %r not valid as sign_name; skipping settings reconcile",
+            "name-actuator: hostname %r not valid for stored name fields; skipping reconcile",
             name,
             exc_info=True,
         )
         return
-    if candidate.sign_name == settings.sign_name:
-        return  # already in sync (compare the validated/normalised form)
+    if (
+        candidate.sign_name == settings.sign_name
+        and candidate.tailscale_hostname == settings.tailscale_hostname
+        and candidate.wifi_ssid == settings.wifi_ssid
+    ):
+        return  # every stored name field already in sync
     try:
         storage.save(candidate)
     except Exception:
         log.warning(
-            "name-actuator: settings sign_name reconcile write failed; next rename / boot retries",
+            "name-actuator: stored-name reconcile write failed; next rename / boot retries",
             exc_info=True,
         )
 
