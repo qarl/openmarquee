@@ -1664,7 +1664,7 @@ class NetworkSupervisor:
             # so a variant-less transition still renders sensible
             # copy.
             # 2026-07-07: the DEGRADED card also instructs "join <ssid>,
-            # PIN <pin>" to rejoin the setup AP, so thread the SAME real
+            # password <pin>" to rejoin the setup AP, so thread the SAME real
             # credentials + WiFi-join QR as the SETUP card (they share the
             # renderer's placeholder fallbacks otherwise).
             from openmarquee.setup_card import setup_card_credentials
