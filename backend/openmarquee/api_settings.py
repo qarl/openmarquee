@@ -409,6 +409,44 @@ async def set_settings(
             ssid=validated.wifi_station_ssid,
             password=validated.wifi_station_password,
         )
+        # 2026-07-08 (P0-1): drive the network state machine off the
+        # Settings provisioning path too — not just the captive-portal
+        # (api_onboarding.submit_credentials) path. Without this, saving
+        # station creds via Settings applies the nmcli connect but leaves
+        # the supervisor in SETUP, so the AP-teardown + CONNECTING/LINGER
+        # confirmation cards never fire on the first session (they only
+        # self-correct on the next reboot). Mirror submit_credentials:
+        # stamp the target SSID, then fire HAS_STORED_CREDENTIALS
+        # (SETUP → CONNECTING; a no-op from other states). Only when creds
+        # are actually present + station enabled. Fail-soft — a supervisor
+        # hiccup must never 500 the settings PATCH.
+        if (
+            validated.wifi_station_enabled
+            and validated.wifi_station_ssid
+            and validated.wifi_station_password
+        ):
+            try:
+                from openmarquee.dependencies import get_network_supervisor
+                from openmarquee.network_supervisor import SupervisorEvent, SupervisorState
+
+                supervisor = get_network_supervisor()
+                # Only advance from the states where fresh provisioning is
+                # meaningful (SETUP → CONNECTING; DEGRADED = a retry) — mirror
+                # api_onboarding.submit_credentials. From ONLINE/CONNECTING/
+                # LINGER a re-save must NOT re-trigger onboarding; the nmcli
+                # reconnect + the supervisor's own observe loop handle those.
+                if supervisor.current_state in (
+                    SupervisorState.SETUP,
+                    SupervisorState.DEGRADED,
+                ):
+                    supervisor.record_target_ssid(validated.wifi_station_ssid)
+                    supervisor.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+            except Exception:
+                log.warning(
+                    "settings: supervisor provisioning-event dispatch failed; "
+                    "station creds applied but SETUP won't advance until next boot",
+                    exc_info=True,
+                )
     # 2026-07-03 (qarl handover B1): wifi_networks change → run
     # the nmcli reconcile in a background thread. Compare the
     # normalised model dumps so a re-save that didn't actually touch
