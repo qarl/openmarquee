@@ -1,0 +1,35 @@
+[Unit]
+# Recovery A1 (2026-07-08): the "3× power-cycle → Setup Mode" gesture.
+# This oneshot INCREMENTS the on-disk boot-cycle counter early at boot,
+# before the backend starts, and writes the tmpfs setup boot-hint once
+# the counter reaches the threshold. The companion
+# openmarquee-boot-gesture-clear.timer zeroes the counter ~20s later on
+# a stable boot, so only rapid (interrupted-before-settle) power cycles
+# accumulate. See system/openmarquee-boot-gesture.sh for the full design.
+Description=openMarquee: count boot cycles for the 3x power-cycle Setup gesture
+# Run AFTER tmpfiles has created /run/openmarquee (so the hint lands in a
+# dir the backend can traverse) and after local filesystems are mounted
+# (the counter lives on /var). Run BEFORE whatever starts the backend so
+# the hint exists when the supervisor reads it at startup. NOTE: the
+# backend is NOT enabled at boot (install.sh) — the stability-promoter
+# starts it via `systemctl start`, so it isn't in the boot transaction
+# and a bare `Before=openmarquee-backend.service` would be inert. Order
+# before the PROMOTER (the unit actually in the boot transaction) to make
+# the hint-before-read guarantee real; keep the backend line as intent.
+After=systemd-tmpfiles-setup.service local-fs.target
+Before=openmarquee-stability-promoter.service openmarquee-backend.service
+RequiresMountsFor=/var
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/openmarquee/system/openmarquee-boot-gesture.sh increment
+# Nothing Requires= this unit, so a failure never blocks boot (the
+# gesture is a convenience, not a critical path).
+StandardOutput=journal
+StandardError=journal
+# ~30-line shell; cap RSS as defense-in-depth.
+MemoryMax=32M
+
+[Install]
+WantedBy=multi-user.target

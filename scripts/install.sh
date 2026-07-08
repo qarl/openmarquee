@@ -307,6 +307,8 @@ for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tail
             openmarquee-cma-watchdog.service openmarquee-cma-watchdog.timer \
             openmarquee-best-wifi.service openmarquee-best-wifi.timer \
             openmarquee-wifi-powersave-off.service \
+            openmarquee-boot-gesture.service \
+            openmarquee-boot-gesture-clear.service openmarquee-boot-gesture-clear.timer \
             openmarquee-backend-failure-handler.service \
             openmarquee-stability-promoter.service; do
     SRC="${OPT_DIR}/system/${unit}"
@@ -333,6 +335,7 @@ say "Ensure +x on system/*.sh helpers"
 for sh_helper in openmarquee-ap0-setup.sh openmarquee-firstboot.sh openmarquee-tailscale.sh \
                  openmarquee-cma-watchdog.sh openmarquee-best-wifi.sh \
                  openmarquee-wifi-powersave-off.sh \
+                 openmarquee-boot-gesture.sh \
                  stability-promoter.sh; do
     SH_PATH="${OPT_DIR}/system/${sh_helper}"
     if [ "$DRY_RUN" -eq 1 ] || [ -f "$SH_PATH" ]; then
@@ -1390,6 +1393,16 @@ run systemctl enable openmarquee-best-wifi.timer
 # enable unconditionally. See docs/onboarding-rework-plan.md §A
 # contributor #2 + §D item #4.
 run systemctl enable openmarquee-wifi-powersave-off.service
+
+# Recovery A1 (2026-07-08): the "3x power-cycle → Setup Mode" gesture.
+# Enable the increment oneshot (WantedBy=multi-user.target — runs early
+# every boot to count cycles + write the setup hint at threshold) and the
+# clear timer (WantedBy=timers.target — zeroes the counter ~20s into a
+# stable boot so ordinary reboots never accumulate). The clear .service
+# is triggered by its timer, not enabled directly. See
+# system/openmarquee-boot-gesture.sh for the full design.
+run systemctl enable openmarquee-boot-gesture.service
+run systemctl enable openmarquee-boot-gesture-clear.timer
 
 # r38c CMA-pressure watchdog -- timer fires the oneshot every 60s,
 # oneshot reads /proc/meminfo and restarts openmarquee-backend.service

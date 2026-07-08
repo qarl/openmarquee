@@ -1,0 +1,21 @@
+[Unit]
+# Recovery A1 (2026-07-08): stable-boot marker. Fired ~20s after boot by
+# openmarquee-boot-gesture-clear.timer; zeroes the boot-cycle counter and
+# removes any consumed setup hint. A boot that reaches this point is
+# "stable", so ordinary reboots (however many) never accumulate toward
+# the 3x-power-cycle threshold — only power cuts BEFORE this window do.
+Description=openMarquee: clear the boot-cycle counter after a stable boot
+# Hold the clear until THIS boot's increment oneshot has finished, so a
+# slow boot (notably an fsck-after-hard-power-pull, which is exactly this
+# feature's operating context) can't fire the +20s clear BEFORE the
+# increment and silently drift the effective threshold down. The
+# increment's RemainAfterExit=yes keeps it "active" so this dep is
+# satisfied immediately on the normal fast path.
+After=openmarquee-boot-gesture.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/openmarquee/system/openmarquee-boot-gesture.sh clear
+StandardOutput=journal
+StandardError=journal
+MemoryMax=32M
