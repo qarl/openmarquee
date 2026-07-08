@@ -532,6 +532,57 @@ async def test_observe_loop_fires_linger_timer_expired_when_window_elapses(
 
 
 @pytest.mark.asyncio
+async def test_observe_loop_fires_setup_mode_timer_expired_when_window_elapses(
+    tmp_path: Path, monkeypatch
+):
+    """Recovery (2026-07-08): the observe loop polls
+    supervisor.check_setup_mode_timeout() each tick + fires
+    SETUP_MODE_TIMER_EXPIRED (SETUP → ONLINE) once the operator-requested
+    setup-mode window elapses.
+
+    Deterministic (no wall-clock race): setup_mode_auto_off_seconds=0.0
+    means `elapsed >= 0.0` is True on the FIRST poll after arming — the
+    monotonic clock only ever advances — regardless of CPU load, so this
+    can't flake the way a tiny-but-nonzero window could.
+    """
+
+    async def _fake_create_subprocess_exec(*args, **kwargs):
+        raise FileNotFoundError(2, "No such file or directory", "iw")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    config = SupervisorConfig(
+        state_file=tmp_path / "network-state.json",
+        wpa_ctrl_path=tmp_path / "absent.sock",
+        setup_mode_auto_off_seconds=0.0,
+    )
+    sup = NetworkSupervisor(config=config)
+    # Drive to ONLINE, then operator-request setup mode so the timer is
+    # ARMED (a fresh-boot SETUP would never arm → never auto-exit).
+    sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+    sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
+    sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)
+    sup.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
+    assert sup.current_state == SupervisorState.SETUP
+    assert sup.setup_mode_entered_at is not None
+
+    task = asyncio.create_task(
+        supervisor_observe_loop(
+            sup,
+            wpa_poll_interval_s=0.005,
+            sta_freq_poll_interval_s=0.02,
+        )
+    )
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sup.current_state == SupervisorState.ONLINE
+    assert sup.setup_mode_entered_at is None
+
+
+@pytest.mark.asyncio
 async def test_observe_loop_emits_unavailable_diag_when_iw_missing(tmp_path: Path, monkeypatch):
     """On Mac dev (no iw binary) the boot diagnostic still emits a
     line so QA's journal grep is never silent."""

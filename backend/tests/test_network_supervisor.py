@@ -1050,6 +1050,99 @@ class TestLingerTimer:
             assert sup.linger_entered_at is None, f"state={s} should not seed entered_at"
 
 
+class TestSetupModeTimer:
+    """Recovery (2026-07-08): the setup-mode auto-off timer arms ONLY on
+    an operator-requested entry into SETUP, and the observe loop polls
+    check_setup_mode_timeout() to fire SETUP_MODE_TIMER_EXPIRED (SETUP →
+    ONLINE) after the window (default 30 min) so an operator who walked
+    away without finishing doesn't strand the sign in setup mode.
+    """
+
+    def _make(self, tmp_path, *, setup_mode_auto_off_seconds=1800.0):
+        config = SupervisorConfig(
+            state_file=tmp_path / "network-state.json",
+            setup_mode_auto_off_seconds=setup_mode_auto_off_seconds,
+        )
+        return NetworkSupervisor(config=config)
+
+    def _drive_to_online(self, sup):
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+        sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER
+        sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+        assert sup.current_state == SupervisorState.ONLINE
+
+    def test_arm_on_operator_requested_setup(self, tmp_path: Path):
+        sup = self._make(tmp_path)
+        self._drive_to_online(sup)
+        assert sup.setup_mode_entered_at is None
+        sup.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
+        assert sup.current_state == SupervisorState.SETUP
+        assert sup.setup_mode_entered_at is not None
+
+    def test_no_arm_on_fresh_boot_setup(self, tmp_path: Path):
+        # A device that boots straight into SETUP (no creds) must NOT
+        # auto-exit — there's nothing online to return to.
+        sup = self._make(tmp_path)
+        assert sup.current_state == SupervisorState.SETUP
+        assert sup.setup_mode_entered_at is None
+        assert sup.check_setup_mode_timeout(now=1_000_000.0) is False
+
+    def test_no_arm_on_auth_fail_setup(self, tmp_path: Path):
+        # CONNECTING → SETUP on auth failure is NOT operator-requested,
+        # so the auto-off timer stays disarmed (the portal must stay up
+        # until the operator fixes creds, not time out on its own).
+        sup = self._make(tmp_path)
+        sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+        sup.apply_event(SupervisorEvent.STA_AUTH_FAILED)  # → SETUP
+        assert sup.current_state == SupervisorState.SETUP
+        assert sup.setup_mode_entered_at is None
+        assert sup.check_setup_mode_timeout(now=1_000_000.0) is False
+
+    def test_disarm_on_exit_from_setup(self, tmp_path: Path):
+        sup = self._make(tmp_path)
+        self._drive_to_online(sup)
+        sup.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
+        assert sup.setup_mode_entered_at is not None
+        sup.apply_event(SupervisorEvent.SETUP_MODE_TIMER_EXPIRED)  # → ONLINE
+        assert sup.current_state == SupervisorState.ONLINE
+        assert sup.setup_mode_entered_at is None
+
+    def test_check_false_before_window_true_after(self, tmp_path: Path):
+        sup = self._make(tmp_path, setup_mode_auto_off_seconds=1800.0)
+        self._drive_to_online(sup)
+        sup.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
+        ref = sup.setup_mode_entered_at
+        assert sup.check_setup_mode_timeout(now=ref + 1799.0) is False
+        # +1ms past the boundary to dodge the double-precision edge the
+        # LINGER test documented (>= comparison + monotonic mantissa).
+        assert sup.check_setup_mode_timeout(now=ref + 1800.001) is True
+        assert sup.check_setup_mode_timeout(now=ref + 5000.0) is True
+
+    def test_check_idempotent_after_transition_out(self, tmp_path: Path):
+        sup = self._make(tmp_path, setup_mode_auto_off_seconds=10.0)
+        self._drive_to_online(sup)
+        sup.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
+        ref = sup.setup_mode_entered_at
+        assert sup.check_setup_mode_timeout(now=ref + 10.001) is True
+        # Fire the transition (what the loop would do) → ONLINE.
+        sup.apply_event(SupervisorEvent.SETUP_MODE_TIMER_EXPIRED)
+        assert sup.current_state == SupervisorState.ONLINE
+        # Subsequent polls return False — no longer SETUP, stamp cleared.
+        assert sup.check_setup_mode_timeout(now=ref + 5000.0) is False
+
+    def test_resumed_setup_state_does_not_arm(self, tmp_path: Path):
+        # A reboot has already recovered the sign out of operator-
+        # requested setup mode; a resumed-from-disk SETUP must start
+        # with the timer disarmed (not auto-exit on the next tick).
+        state_file = tmp_path / "network-state.json"
+        save_persisted_state(PersistedState(state=SupervisorState.SETUP), path=state_file)
+        config = SupervisorConfig(state_file=state_file)
+        sup = NetworkSupervisor(config=config)
+        assert sup.current_state == SupervisorState.SETUP
+        assert sup.setup_mode_entered_at is None
+        assert sup.check_setup_mode_timeout(now=1_000_000.0) is False
+
+
 # ============================================================
 # PR3 (2026-06-27) — supervisor system-card publisher on transitions.
 # ============================================================
