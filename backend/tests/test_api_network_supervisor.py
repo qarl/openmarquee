@@ -69,3 +69,51 @@ def test_state_endpoint_is_read_only(client: TestClient):
     assert response.status_code in (404, 405)  # not allowed
     response = client.post("/api/network-supervisor/state", json={"state": "ONLINE"})
     assert response.status_code in (404, 405)
+
+
+# --- A2 (recovery cluster, 2026-07-08): POST enter-setup-mode ---
+
+
+def test_enter_setup_mode_returns_to_setup_from_non_setup(client: TestClient):
+    # Operator drops back to Setup Mode from a running state → SETUP.
+    from openmarquee.dependencies import get_network_supervisor
+    from openmarquee.network_supervisor import SupervisorEvent, SupervisorState
+
+    sup = get_network_supervisor()
+    sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # SETUP → CONNECTING
+    assert sup.current_state == SupervisorState.CONNECTING
+
+    resp = client.post("/api/network-supervisor/enter-setup-mode")
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "SETUP"
+    assert sup.current_state == SupervisorState.SETUP
+
+
+def test_enter_setup_mode_is_noop_from_setup(client: TestClient):
+    # Already in SETUP → harmless no-op, still 200 + SETUP.
+    from openmarquee.dependencies import get_network_supervisor
+    from openmarquee.network_supervisor import SupervisorState
+
+    sup = get_network_supervisor()
+    assert sup.current_state == SupervisorState.SETUP
+    resp = client.post("/api/network-supervisor/enter-setup-mode")
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "SETUP"
+
+
+def test_enter_setup_mode_returns_to_setup_from_online(client: TestClient):
+    # The meaningful recovery path: from ONLINE (AP torn down) → SETUP
+    # brings the portal back. Drive SETUP→CONNECTING→LINGER→ONLINE first.
+    from openmarquee.dependencies import get_network_supervisor
+    from openmarquee.network_supervisor import SupervisorEvent, SupervisorState
+
+    sup = get_network_supervisor()
+    sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # → CONNECTING
+    sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # → LINGER (concurrent regime)
+    sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)  # → ONLINE
+    assert sup.current_state == SupervisorState.ONLINE
+
+    resp = client.post("/api/network-supervisor/enter-setup-mode")
+    assert resp.status_code == 200
+    assert resp.json()["state"] == "SETUP"
+    assert sup.current_state == SupervisorState.SETUP
