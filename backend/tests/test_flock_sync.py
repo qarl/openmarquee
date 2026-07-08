@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -841,6 +842,20 @@ async def test_pull_from_peer_handles_manifest_unreachable(tmp_path: Path):
     await sync.pull_from_peer("offline.ts.net")
 
 
+async def _await_until(predicate, timeout: float = 8.0, interval: float = 0.01) -> bool:
+    """Poll `predicate()` until true, or `timeout` seconds elapse. Returns
+    whether it became true. Deterministic substitute for a fixed sleep + a
+    count assertion: healthy code satisfies the predicate near-instantly, so
+    the generous timeout is never approached; a broken/stalled worker times
+    out cleanly (a real failure), never a load-sensitive flake."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return predicate()
+
+
 @pytest.mark.asyncio
 async def test_pull_worker_ticks_on_interval_and_stops_cleanly(tmp_path: Path):
     ticks: list[str] = []
@@ -855,8 +870,11 @@ async def test_pull_worker_ticks_on_interval_and_stops_cleanly(tmp_path: Path):
 
     worker = PullWorker(sync, interval_seconds=0.05)
     await worker.start()
-    # One tick fires immediately; wait for a second.
-    await asyncio.sleep(0.15)
+    # Deterministic: wait until 2 manifest ticks have fired (the immediate
+    # tick + one interval later) rather than assuming a fixed 0.15s window
+    # is long enough under CI load. Healthy worker reaches 2 in ~1 interval;
+    # a broken/stalled worker times out → clean failure, not a flaky count.
+    await _await_until(lambda: sum(1 for u in ticks if u.endswith("/api/flock/manifest")) >= 2)
     await worker.stop()
 
     # Each tick hits /api/settings (name probe) + /api/flock/manifest.

@@ -3,6 +3,7 @@ import contextlib
 import functools
 import io
 import logging
+import time
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -831,6 +832,20 @@ async def test_stream_slide_render_frame_off_loop_allows_concurrent_progress(
             await counter_task
 
 
+async def _await_until(predicate, timeout: float = 8.0, interval: float = 0.01) -> bool:
+    """Poll `predicate()` until true, or `timeout` seconds elapse. Returns
+    whether it became true. Deterministic substitute for a fixed sleep + a
+    count assertion: healthy code satisfies the predicate near-instantly, so
+    the generous timeout is never approached; broken code times out cleanly
+    (a real failure), never a load-sensitive flake."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return predicate()
+
+
 @pytest.mark.asyncio
 async def test_stream_slide_pumps_frames_to_renderer(renderer, tmp_path, monkeypatch):
     """A StreamSlide in the playlist is intercepted before the IPC
@@ -860,7 +875,12 @@ async def test_stream_slide_pumps_frames_to_renderer(renderer, tmp_path, monkeyp
     slide = StreamSlide(name="live", stream_url="rtsp://h:8554/x", duration_ms=2000)
     loop = _new_loop(renderer, fetch_items=lambda: [slide], read_asset=lambda _id: b"")
     await loop.start()
-    await asyncio.sleep(0.5)
+    # Deterministic: wait until the mock's 5 frames have actually pumped
+    # (poll-until-condition, generous timeout) rather than assuming a fixed
+    # 0.5s window is long enough under CI load. The mock emits exactly 5
+    # frames, so a healthy pump reaches this in a few ms; a broken pump
+    # times out → clean failure, not a load-flaky count.
+    await _await_until(lambda: len(captured) >= 5)
     await loop.stop()
 
     assert len(captured) >= 5

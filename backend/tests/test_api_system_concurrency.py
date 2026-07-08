@@ -87,25 +87,27 @@ async def test_slow_wifi_scan_doesnt_block_concurrent_state_polls(
         # total wall time ≈ slow_seconds + state_time.
         # With asyncio.to_thread the loop interleaves and the fast
         # call returns ~immediately after launch.
-        start = time.perf_counter()
         scan_task = asyncio.create_task(client.get("/api/system/wifi-scan"))
-        # Give the slow task a moment to enter to_thread so the loop
-        # is genuinely free when we ask for state.
+        # Give the slow scan a moment to get scheduled + enter to_thread.
         await asyncio.sleep(0.05)
-        state_start = time.perf_counter()
         state_resp = await client.get("/api/playback/state")
-        state_elapsed = time.perf_counter() - state_start
-        await scan_task  # let it finish so the test cleans up
-        total_elapsed = time.perf_counter() - start
+        # THE invariant — deterministic + wall-clock-free: the fast state
+        # poll returned while the slow (`slow_seconds`) scan was STILL in
+        # flight. If the event loop had been blocked by a synchronous
+        # subprocess.run, the state poll could not have completed until the
+        # scan finished, so `scan_task` would already be done here. Capture
+        # it the instant the state poll returns, before we await the scan.
+        #
+        # (The prior wall-clock assertion `state_elapsed < slow_seconds/2`
+        # flaked on a loaded CI box: the loop wasn't actually blocked, but
+        # scheduling latency pushed the non-blocked poll past the fixed
+        # threshold. Relative ordering is load-immune — the scan sleeps a
+        # full second, orders of magnitude above any scheduling jitter.)
+        scan_still_running = not scan_task.done()
+        await scan_task  # let it finish so the client + test clean up
 
-    # Slow call ran on the executor, so the state call finished
-    # in roughly its own runtime, not slow_seconds later.
     assert state_resp.status_code == 200
-    assert state_elapsed < slow_seconds / 2, (
-        f"state poll waited {state_elapsed * 1000:.0f}ms while a "
-        f"{slow_seconds * 1000:.0f}ms subprocess was in flight -- "
-        "the event loop was blocked"
+    assert scan_still_running, (
+        "state poll didn't return until the slow wifi-scan finished -- the "
+        "event loop was blocked (wifi-scan subprocess not offloaded to a thread)"
     )
-    # Sanity: the slow call actually ran (total >= slow_seconds),
-    # so we know to_thread didn't accidentally skip the work.
-    assert total_elapsed >= slow_seconds * 0.9
