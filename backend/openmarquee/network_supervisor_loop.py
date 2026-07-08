@@ -344,6 +344,16 @@ async def supervisor_observe_loop(
             if supervisor.check_linger_timeout():
                 supervisor.apply_event(_SE.LINGER_TIMER_EXPIRED)
 
+            # 5. Recovery (2026-07-08) setup-mode auto-off timer poll.
+            # apply_event arms `_setup_mode_entered_at` on operator-
+            # requested entry into SETUP; each tick we ask whether the
+            # window (default 30 min) has elapsed and fire
+            # SETUP_MODE_TIMER_EXPIRED (SETUP → ONLINE) if so.
+            # check_setup_mode_timeout is idempotent: it returns False
+            # once the state leaves SETUP, so we can't double-fire.
+            if supervisor.check_setup_mode_timeout():
+                supervisor.apply_event(_SE.SETUP_MODE_TIMER_EXPIRED)
+
             await asyncio.sleep(wpa_poll_interval_s)
     except asyncio.CancelledError:
         log.info("network-supervisor: observe-only loop cancelled; shutting down")

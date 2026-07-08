@@ -909,6 +909,23 @@ class NetworkSupervisor:
         self._linger_entered_at: float | None = (
             time.monotonic() if self._state == SupervisorState.LINGER else None
         )
+        # Recovery (2026-07-08): setup-mode auto-off timer. Armed ONLY
+        # when the operator explicitly requests setup mode from a working
+        # state (see apply_event) — a fresh-boot / auth-fail SETUP has no
+        # auto-exit because there is nothing online to return to. NOT
+        # persisted, and deliberately NOT seeded on resume: SETUP *is* a
+        # persisted state, so a reboot resumes INTO it, but the persisted
+        # record carries no memory of WHY (operator-requested vs
+        # fresh-boot vs auth-fail). Seeding on resume would auto-exit a
+        # fresh-boot/auth-fail SETUP too, stranding a sign with no wifi
+        # (the blank-sign risk). So we conservatively never seed: a
+        # resumed SETUP starts disarmed, and only a live
+        # OPERATOR_REQUESTED_SETUP_MODE arms the timer. The observe loop
+        # polls check_setup_mode_timeout() each tick, mirroring the
+        # LINGER timer above (which DOES seed on resume — but LINGER
+        # wedges the AP-up steady state if it doesn't, whereas SETUP is a
+        # legitimate steady state, so the safe defaults are opposite).
+        self._setup_mode_entered_at: float | None = None
         # P1.2-B (2026-06-10): one-shot hook fired on the FIRST
         # STA_ASSOCIATED after the take-over orchestrator installs
         # it. See set_takeover_associated_hook for the wiring
@@ -1145,6 +1162,34 @@ class NetworkSupervisor:
         # _persist so the side-effects either succeed or the warn
         # diagnostic is already in the ring buffer for QA.
         self._on_transition(prev, new_state)
+        # Recovery: arm the setup-mode auto-off timer ONLY on an
+        # operator-requested entry into SETUP. Done here (not in
+        # _on_transition, which only sees states) because the arm
+        # condition is event-specific: a CONNECTING→SETUP auth-fail or a
+        # fresh-boot SETUP must NOT auto-exit. _on_transition already
+        # disarmed any prior stamp on this transition if we left SETUP.
+        if (
+            event == SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE
+            and new_state == SupervisorState.SETUP
+        ):
+            self._setup_mode_entered_at = time.monotonic()
+            self._emit(
+                "setup_mode_timer",
+                "info",
+                f"armed setup-mode auto-off timer ({self.config.setup_mode_auto_off_seconds:.0f}s)",
+            )
+        elif (
+            event == SupervisorEvent.SETUP_MODE_TIMER_EXPIRED
+            and new_state == SupervisorState.ONLINE
+        ):
+            # Symmetric with the arm emit so QA has a specific grep target
+            # for WHY the sign left setup mode (operator idle past the
+            # window) vs the generic transition line.
+            self._emit(
+                "setup_mode_timer",
+                "info",
+                "setup-mode window elapsed; returning to ONLINE (operator idle)",
+            )
         self._persist()
         # P1.2-B: fire the take-over associated hook on the first
         # STA_ASSOCIATED event after a successful flip. One-shot:
@@ -1554,6 +1599,20 @@ class NetworkSupervisor:
             self._linger_entered_at = None
             self._emit("linger_timer", "info", "disarmed linger timer (left LINGER)")
 
+        # Recovery: setup-mode auto-off timer disarm. The arm lives in
+        # apply_event (it needs the event); the disarm is state-based, so
+        # it belongs here alongside the LINGER disarm. Cleared on ANY exit
+        # from SETUP so a stale stamp can't fire the timer after the sign
+        # already left setup mode. (SETUP_MODE_TIMER_EXPIRED itself moves
+        # SETUP→ONLINE, tripping this branch — hence idempotent.)
+        if (
+            prev == SupervisorState.SETUP
+            and new != SupervisorState.SETUP
+            and self._setup_mode_entered_at is not None
+        ):
+            self._setup_mode_entered_at = None
+            self._emit("setup_mode_timer", "info", "disarmed setup-mode timer (left SETUP)")
+
         # PR3 (2026-06-27) system-card overlay. Every path to ONLINE
         # clears the card (spec §"Onboarding state machine": ONLINE
         # is the AP-off / no-overlay steady state). Every other
@@ -1742,6 +1801,34 @@ class NetworkSupervisor:
         ref = now if now is not None else time.monotonic()
         elapsed = ref - self._linger_entered_at
         return elapsed >= self.config.linger_seconds
+
+    @property
+    def setup_mode_entered_at(self) -> float | None:
+        """time.monotonic() at the operator-requested SETUP entry, or
+        None when the setup-mode auto-off timer isn't armed. Read by the
+        observe loop's check_setup_mode_timeout gate + tests."""
+        return self._setup_mode_entered_at
+
+    def check_setup_mode_timeout(self, *, now: float | None = None) -> bool:
+        """Called by the observe loop each tick. Returns True iff the
+        operator-requested setup-mode window has elapsed and the loop
+        should fire SETUP_MODE_TIMER_EXPIRED (SETUP → ONLINE), returning
+        the sign to normal supervision after the operator walked away
+        without finishing. Idempotent: returns False once the timer is
+        disarmed (any exit from SETUP clears the stamp).
+
+        `now` is `time.monotonic()` by default; tests override it for
+        deterministic timing without sleeps.
+        """
+        if self._setup_mode_entered_at is None:
+            return False
+        if self._state != SupervisorState.SETUP:
+            # Defensive: state changed without clearing the stamp
+            # (shouldn't happen — _on_transition clears on exit).
+            return False
+        ref = now if now is not None else time.monotonic()
+        elapsed = ref - self._setup_mode_entered_at
+        return elapsed >= self.config.setup_mode_auto_off_seconds
 
     def _persist(self) -> None:
         try:
