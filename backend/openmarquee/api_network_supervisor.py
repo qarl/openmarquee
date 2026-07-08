@@ -16,7 +16,11 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 
 from openmarquee.dependencies import get_network_supervisor
-from openmarquee.network_supervisor import NetworkSupervisor, supervisor_to_dict
+from openmarquee.network_supervisor import (
+    NetworkSupervisor,
+    SupervisorEvent,
+    supervisor_to_dict,
+)
 
 router = APIRouter(prefix="/api/network-supervisor", tags=["network-supervisor"])
 
@@ -44,4 +48,18 @@ async def get_state(supervisor: SupervisorDep) -> dict:
             ]
         }
     """
+    return supervisor_to_dict(supervisor)
+
+
+@router.post("/enter-setup-mode")
+async def enter_setup_mode(supervisor: SupervisorDep) -> dict:
+    """A2 (recovery cluster, 2026-07-08): operator-driven Setup Mode
+    re-entry. Fires OPERATOR_REQUESTED_SETUP_MODE so the sign drops back
+    to the captive portal (AP up + SETUP card) from any non-SETUP state —
+    e.g. to re-provision Wi-Fi without a power-cycle. Auth'd via the app's
+    AuthMiddleware (operator action). From SETUP it's a no-op.
+
+    Returns the resulting supervisor state (same shape as GET /state).
+    """
+    supervisor.apply_event(SupervisorEvent.OPERATOR_REQUESTED_SETUP_MODE)
     return supervisor_to_dict(supervisor)
