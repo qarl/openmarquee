@@ -46,7 +46,7 @@ from openmarquee.dependencies import (
 )
 from openmarquee.dev import router as dev_router
 from openmarquee.fqdn_redirect_middleware import FqdnRedirectMiddleware
-from openmarquee.mdns import mdns_url
+from openmarquee.mdns import mdns_url, wlan0_ipv4
 from openmarquee.perf_middleware import PerfMiddleware
 
 # LEVER 2 lazy-imports (2026-06-24): defer openmarquee.seed to first
@@ -444,9 +444,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 boot_url = mdns_url()
                 # boot-card 2026-07-07: also show the connected Wi-Fi SSID
                 # so a viewer knows which network to join to reach the URL
-                # (the mDNS URL only resolves on the sign's own network).
-                # None when not yet connected at boot-card time — the
-                # renderer omits the line gracefully.
+                # (the mDNS URL only resolves on the sign's own network),
+                # plus the wlan0 IP as a fallback when `.local` doesn't
+                # resolve. Both are None when not yet connected at
+                # boot-card time — the renderer omits the line gracefully.
                 try:
                     await asyncio.to_thread(
                         renderer.render_system_card,
@@ -455,6 +456,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                             "address": boot_url,
                             "qr_payload": boot_url,
                             "ssid": supervisor.last_sta_ssid,
+                            "ip": wlan0_ipv4(),
                             "ttl_ms": BOOT_TTL_MS,
                         },
                     )

@@ -273,7 +273,10 @@ fn layout_setup(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
         color: TEXT,
         font: DisplayFont::Mono,
         align: Align::Left,
-        text: format!("Network  {}\nPIN      {}", ssid, pin),
+        // 2026-07-07 (qarl): the join credential is the full WPA2
+        // passphrase, not a short PIN — label it "Password". Columns
+        // re-aligned to the longer label (both values start at col 10).
+        text: format!("Network   {}\nPassword  {}", ssid, pin),
     });
     // Steps.
     shapes.push(CardShape::Text {
@@ -282,7 +285,7 @@ fn layout_setup(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
         color: MUTED,
         font: DisplayFont::Body,
         align: Align::Left,
-        text: "Scan with your phone camera → the setup\npage opens automatically. No camera? Join\nthe network above and enter the PIN."
+        text: "Scan with your phone camera → the setup\npage opens automatically. No camera? Join\nthe network above and enter the password."
             .to_string(),
     });
     // 2026-07-02 (audit 4b close-out): if the supervisor threaded a
@@ -458,7 +461,7 @@ fn layout_degraded(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>)
     let ssid = params.ssid.as_deref().unwrap_or("openMarquee-Setup");
     let pin = params.pin.as_deref().unwrap_or("----");
     let steps = format!(
-        "{sub}\n\nTo fix: join {ssid}, PIN {pin}, re-enter wifi.",
+        "{sub}\n\nTo fix: join {ssid}, password {pin}, re-enter wifi.",
         sub = sub,
         ssid = ssid,
         pin = pin,
@@ -739,7 +742,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(
             kv_text.iter().any(|t| t.contains("MyNet") && t.contains("1234")),
-            "expected SSID + PIN in a mono Text shape; got {:?}",
+            "expected SSID + Password in a mono Text shape; got {:?}",
             kv_text
         );
     }
@@ -938,6 +941,21 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, CardShape::Text { text, .. } if text == "Wi-Fi: NEBULA")),
             "BOOT card must show the connected Wi-Fi SSID line"
+        );
+    }
+
+    #[test]
+    fn boot_with_ip_emits_ip_line() {
+        // boot-card 2026-07-07: the device's wlan0 IP appears beneath the
+        // mDNS URL as a fallback when `.local` doesn't resolve.
+        let mut p = params(SystemCardKind::Boot);
+        p.ip = Some("192.168.1.67".to_string());
+        let shapes = layout_card(&p);
+        assert!(
+            shapes
+                .iter()
+                .any(|s| matches!(s, CardShape::Text { text, .. } if text == "192.168.1.67")),
+            "BOOT card must show the wlan0 IP line when threaded"
         );
     }
 

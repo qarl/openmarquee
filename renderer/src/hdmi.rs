@@ -18892,7 +18892,7 @@ fn paint_system_card_text(
     let box_w_px = layer.r#box.w * mode_w as f32;
 
     // #2 boot-card fit-to-width (2026-07-07): the Mono label lines
-    // (mDNS URL / SSID / Wi-Fi / address / PIN) are single tokens that
+    // (mDNS URL / SSID / Wi-Fi / address / Password) are single tokens that
     // can't word-wrap, so an over-long one would get X-squished by
     // layout_text_to_quads into a distorted, hard-to-read line. Measure
     // the natural (un-squished, box=∞) width and shrink the FONT SIZE
