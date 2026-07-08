@@ -202,29 +202,21 @@ def _draw_dot_matrix_mark(draw: ImageDraw.ImageDraw, box: tuple[int, ...],
                           cx + dot_r, cy + dot_r], fill=ACCENT)
 
 
-def generate_splash() -> str:
-    """Render the stacked-wordmark lockup splash and save splash.png.
+def _lockup_metrics(draw: ImageDraw.ImageDraw, target_lockup_w: int) -> dict:
+    """Size the [ dot-matrix mark ][ gap ][ "OPEN" over "Marquee" ] lockup
+    so the whole group is ``target_lockup_w`` px wide. Returns the fonts,
+    per-glyph tracking, text bboxes and stack/mark dims.
 
-    The lockup is the dashboard sidebar wordmark, left-to-right:
-        [ dot-matrix mark ]  [ gap ]  [ "OPEN" over "Marquee" ]
-    Returns the output path.
+    Pure sizing — uses ``draw`` only for font metrics, so a scratch canvas
+    works. Shared by the splash + the mark-only asset so both are
+    pixel-faithful to the same geometry.
     """
-    # Work supersampled, then downscale once at the end.
-    W, H = SPLASH_W * SS, SPLASH_H * SS
-    img = Image.new("RGB", (W, H), BG)
-    draw = ImageDraw.Draw(img)
-
-    # --- Size the lockup -------------------------------------------------
-    # Render the lockup large + prominent: target ~60% of the 1360px panel
-    # width for the whole [mark + gap + text] group.
-    target_lockup_w = int(SPLASH_W * 0.60 * SS)
-
-    # The stacked text: "Marquee" is the dominant line; "OPEN" is 0.62x its
-    # size, all-caps, monospace, widely tracked (CSS letter-spacing 0.22em).
-    # We pick the "Marquee" font size, derive everything else, then scale
-    # the whole lockup to hit target_lockup_w.
-    marq_size = 132 * SS                     # provisional; rescaled below
-    open_size = round(marq_size * 0.62)      # CSS font-size: 0.62em
+    # "Marquee" is the dominant line; "OPEN" is 0.62x its size, all-caps,
+    # monospace, widely tracked (CSS letter-spacing 0.22em). Pick the
+    # "Marquee" font size, derive everything else, then scale the whole
+    # lockup to hit target_lockup_w.
+    marq_size = 132 * SS  # provisional; rescaled below
+    open_size = round(marq_size * 0.62)  # CSS font-size: 0.62em
 
     marq_font = load_font(marq_size, "sans")
     open_font = load_font(open_size, "mono")
@@ -246,7 +238,7 @@ def generate_splash() -> str:
     open_box = draw.textbbox((0, 0), "OPEN", font=open_font)
     marq_h = marq_box[3] - marq_box[1]
     open_h = open_box[3] - open_box[1]
-    gap_lines = round(open_size * 0.40)      # CSS margin-bottom: 0.4em
+    gap_lines = round(open_size * 0.40)  # CSS margin-bottom: 0.4em
     stack_h = open_h + gap_lines + marq_h
 
     # Mark : gap : text proportions, from the menu CSS. The stacked mark is
@@ -282,46 +274,126 @@ def generate_splash() -> str:
     inner_gap = round(mark_w * (5.0 / 16.0))
     lockup_w = mark_w + inner_gap + text_w
 
-    # --- Place the lockup ------------------------------------------------
-    # Horizontal: centered. Vertical: a bit above center so the spinner
-    # (drawn by the Plymouth script) has room below.
-    lockup_x = (W - lockup_w) // 2
-    lockup_cy = int(H * 0.42)                # vertical center of the lockup
-    stack_top = lockup_cy - stack_h // 2     # top of "OPEN"
+    return {
+        "marq_font": marq_font,
+        "open_font": open_font,
+        "marq_track": marq_track,
+        "open_track": open_track,
+        "marq_box": marq_box,
+        "open_box": open_box,
+        "open_h": open_h,
+        "gap_lines": gap_lines,
+        "stack_h": stack_h,
+        "mark_w": mark_w,
+        "inner_gap": inner_gap,
+        "lockup_w": lockup_w,
+    }
 
+
+def _draw_lockup(
+    draw: ImageDraw.ImageDraw, m: dict, lockup_x: int, stack_top: int
+) -> None:
+    """Draw the dot-matrix mark + "OPEN" over "Marquee" at (lockup_x,
+    stack_top) using the metrics from ``_lockup_metrics``."""
     # --- The dot-matrix mark --------------------------------------------
     mark_radius = 0  # qarl: square corners, not rounded
     # qarl: the mark box bottom aligns with the "Marquee" baseline (the
     # bottom of the "M"), NOT the "q" descender. "M" is a cap with no
     # descender — (inked top of Marquee) + (M bbox bottom - Marquee bbox
     # top) lands exactly on the baseline.
-    m_box = draw.textbbox((0, 0), "M", font=marq_font)
-    mark_bottom = stack_top + open_h + gap_lines + (m_box[3] - marq_box[1])
+    mbb = draw.textbbox((0, 0), "M", font=m["marq_font"])
+    mark_bottom = stack_top + m["open_h"] + m["gap_lines"] + (mbb[3] - m["marq_box"][1])
     _draw_dot_matrix_mark(
         draw,
-        (lockup_x, stack_top, lockup_x + mark_w, mark_bottom),
-        mark_radius)
+        (lockup_x, stack_top, lockup_x + m["mark_w"], mark_bottom),
+        mark_radius,
+    )
 
     # --- The stacked text ------------------------------------------------
     # Left-aligned to the same x, just right of the mark + gap.
-    text_x = lockup_x + mark_w + inner_gap
+    text_x = lockup_x + m["mark_w"] + m["inner_gap"]
 
     # "OPEN": top line, monospace, faded mid-grey, widely tracked. Drawn at
     # the top of the stack (textbbox origin offset removed so it sits flush).
-    open_y = stack_top - open_box[1]
-    _draw_tracked_text(draw, (text_x, open_y), "OPEN",
-                       open_font, TEXT_FADE, open_track)
+    open_y = stack_top - m["open_box"][1]
+    _draw_tracked_text(draw, (text_x, open_y), "OPEN", m["open_font"], TEXT_FADE, m["open_track"])
 
     # "Marquee": bottom line, bold sans, near-white, slightly tight. One
     # uniform color -- the stacked "M" is NOT accent (variant-G call).
-    marq_y = stack_top + open_h + gap_lines - marq_box[1]
-    _draw_tracked_text(draw, (text_x, marq_y), "Marquee",
-                       marq_font, TEXT, marq_track)
+    marq_y = stack_top + m["open_h"] + m["gap_lines"] - m["marq_box"][1]
+    _draw_tracked_text(draw, (text_x, marq_y), "Marquee", m["marq_font"], TEXT, m["marq_track"])
+
+
+def generate_splash() -> str:
+    """Render the stacked-wordmark lockup splash and save splash.png.
+
+    The lockup is the dashboard sidebar wordmark, left-to-right:
+        [ dot-matrix mark ]  [ gap ]  [ "OPEN" over "Marquee" ]
+    Returns the output path.
+    """
+    # Work supersampled, then downscale once at the end.
+    W, H = SPLASH_W * SS, SPLASH_H * SS
+    img = Image.new("RGB", (W, H), BG)
+    draw = ImageDraw.Draw(img)
+
+    # Render the lockup large + prominent: target ~60% of the 1360px panel
+    # width for the whole [mark + gap + text] group.
+    target_lockup_w = int(SPLASH_W * 0.60 * SS)
+    m = _lockup_metrics(draw, target_lockup_w)
+
+    # Horizontal: centered. Vertical: a bit above center so the spinner
+    # (drawn by the Plymouth script) has room below.
+    lockup_x = (W - m["lockup_w"]) // 2
+    lockup_cy = int(H * 0.42)  # vertical center of the lockup
+    stack_top = lockup_cy - m["stack_h"] // 2  # top of "OPEN"
+    _draw_lockup(draw, m, lockup_x, stack_top)
 
     # Downsample to native size with a high-quality filter.
     final = img.resize((SPLASH_W, SPLASH_H), Image.LANCZOS)
     out = os.path.join(OUT_DIR, "splash.png")
     final.save(out)
+    return out
+
+
+def generate_mark() -> str:
+    """Render the wordmark lockup ALONE on a TRANSPARENT, tight-cropped,
+    high-res canvas (mark.png) — the renderer bakes this in and blits it on
+    the boot identity card (2026-07-07, qarl). Same geometry + fonts as the
+    splash lockup, so it is pixel-faithful to the approved splash artwork
+    (no re-approximation). Kept high-res so it stays crisp scaled down for
+    both the portrait panel and a landscape HDMI boot card.
+
+    The LED tile is opaque (its own near-black interior); the "OPEN"/
+    "Marquee" glyphs + mark are drawn over transparency. The boot card's
+    background is the same #0e0e10 as the splash, so the pre-composited
+    faded "OPEN" grey lands identically on-glass.
+    """
+    # Size on a scratch draw (font metrics only), same supersampled target
+    # width as the splash lockup so the glyph proportions match exactly.
+    scratch = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    target_lockup_w = int(SPLASH_W * 0.60 * SS)
+    m = _lockup_metrics(scratch, target_lockup_w)
+
+    # Small transparent margin so the amber border / dot glow isn't clipped.
+    pad = max(1, round(m["stack_h"] * 0.05))
+    canvas = Image.new("RGBA", (m["lockup_w"] + 2 * pad, m["stack_h"] + 2 * pad), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    _draw_lockup(draw, m, pad, pad)
+
+    # Tight-crop to the inked bbox (glow included), then downsample the
+    # supersampled render to a crisp hi-res asset (~1/2 the SS render →
+    # lockup ~1600px wide, ample for portrait + landscape boot cards).
+    bbox = canvas.getbbox()
+    if bbox:
+        canvas = canvas.crop(bbox)
+    down = max(1, SS // 2)
+    if down > 1:
+        canvas = canvas.resize(
+            (max(1, canvas.width // down), max(1, canvas.height // down)),
+            Image.LANCZOS,
+        )
+    out = os.path.join(OUT_DIR, "mark.png")
+    canvas.save(out)
     return out
 
 
@@ -356,6 +428,8 @@ def main() -> None:
     print(f"mono font: {font_path_used('mono')}")
     splash = generate_splash()
     print(f"wrote {splash}")
+    mark = generate_mark()
+    print(f"wrote {mark}")
     spinner = generate_spinner()
     print(f"wrote {spinner}")
 

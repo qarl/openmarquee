@@ -2516,6 +2516,16 @@ where
                 crate::hdmi::free_transition_still_a_tex(session);
             }
 
+            // 2026-07-07: stamp the effective (post-rotation) framebuffer
+            // aspect so a RenderSystemCard handled below lays the BOOT card
+            // out for the CURRENT display (portrait panel vs landscape HDMI).
+            {
+                let (mw, mh) = (session.mode_w(), session.mode_h());
+                if mh > 0 {
+                    state.system_card_aspect = f32::from(mw) / f32::from(mh);
+                }
+            }
+
             let resp = handle_inner_request(req, &mut state, &mut cache, content_root);
 
             // Phase 9 Step 9a: tag the paint kind (if any) BEFORE
@@ -4670,7 +4680,11 @@ fn handle_inner_request(
                 // copy so the returned response params (for
                 // debugging) still reflect the request.
                 let p = crate::system_card::clamp_params(p);
-                let shapes = crate::system_card::layout_card(&p);
+                // Aspect stamped by the IPC loop from the session mode dims
+                // (post-rotation) so the BOOT card picks portrait vs
+                // landscape; 0.0 until the first stamp → layout_boot treats
+                // it as the portrait panel.
+                let shapes = crate::system_card::layout_card(&p, state.system_card_aspect);
                 // ttl_ms=0 collapses to None (until-state-change);
                 // any positive value → absolute Instant deadline.
                 let deadline = p.ttl_ms.and_then(|ttl| {

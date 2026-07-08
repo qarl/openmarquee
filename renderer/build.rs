@@ -315,6 +315,19 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", fonts_dir.display());
 
+    // Boot-card brand mark (2026-07-07): copy the committed real-artwork
+    // wordmark (mark.png, emitted by generate_splash.py) into OUT_DIR so
+    // the renderer `include_bytes!`s it — same bake-into-binary discipline
+    // as the SDF atlases, no runtime file dependency. Copy the explicit
+    // file (NOT a glob — the dir carries macOS AppleDouble `._*` sidecars).
+    let mark_src = manifest_dir
+        .parent()
+        .expect("renderer parent dir")
+        .join("images/openmarquee/stage-openmarquee/01-plymouth-theme/files/openmarquee/mark.png");
+    fs::copy(&mark_src, out_dir.join("mark.png"))
+        .unwrap_or_else(|e| panic!("copy boot-card mark.png from {}: {e}", mark_src.display()));
+    println!("cargo:rerun-if-changed={}", mark_src.display());
+
     let codepoints = bake_codepoints();
     let fonts = collect_fonts(&fonts_dir);
 
