@@ -57,6 +57,13 @@ pub struct PlaybackState {
     /// The slide currently being held / scanned out. None means
     /// the renderer hasn't been given a slide yet.
     pub current: Option<SlideContext>,
+    /// 2026-07-07 — effective (post-rotation) framebuffer aspect
+    /// (width/height), stamped by the IPC loop from the session's
+    /// mode dims. The BOOT system card reads it to pick a portrait
+    /// vs landscape (2-column) layout. Default 0.0 (before the loop
+    /// stamps it); `system_card::layout_boot` treats non-positive as
+    /// the portrait panel, so an unstamped value is safe.
+    pub system_card_aspect: f32,
     /// In-flight transition. When Some, advance() drives the
     /// blend; when its duration elapses, to_slide promotes to
     /// current and pending clears.

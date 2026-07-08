@@ -18322,6 +18322,9 @@ pub fn maybe_paint_system_card_overlay(
                     gl, mode_w, mode_h, *anchor, *max_height, *color, *font, *align, text,
                 )?;
             }
+            CardShape::Image { top_left, height } => {
+                paint_system_card_image(gl, mode_w, mode_h, *top_left, *height)?;
+            }
             CardShape::QrPanel {
                 top_left,
                 size,
@@ -18450,6 +18453,143 @@ pub fn maybe_paint_system_card_overlay(
     rotate_scanout_3_deep(session, card_drm, new_bo, new_fb, "system_card");
 
     Ok(true)
+}
+
+/// The baked boot-card brand mark (the real dot-matrix wordmark artwork,
+/// mark.png) — build.rs copies it into OUT_DIR, we bake it into the binary
+/// (no runtime file dependency, same discipline as the SDF atlases).
+static MARK_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mark.png"));
+
+thread_local! {
+    /// The uploaded mark GL texture + its dims, decoded + uploaded once on
+    /// first paint. A context reopen (rare — rotation only, which rebuilds
+    /// everything) would leave this stale; the short-lived boot card never
+    /// spans a reopen, so a one-shot upload is sufficient. Copy (glow
+    /// texture handles are Copy) so `*borrow()` is cheap.
+    static MARK_TEX: std::cell::RefCell<Option<(glow::NativeTexture, u32, u32)>> =
+        const { std::cell::RefCell::new(None) };
+    /// The mark's quad VBO, created once + reused (re-uploaded each frame
+    /// since the rect can differ per card). Same context-lifetime caveat +
+    /// cache pattern as `TEXTURED_QUAD_VBO`.
+    static MARK_VBO: std::cell::Cell<Option<glow::NativeBuffer>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Decode the baked mark.png to row-flipped RGBA8 (bottom-up, to match the
+/// `VS_TEXTURED_QUAD` `v=0`-at-bottom convention). Returns None on any
+/// decode failure so the card renders without the mark rather than crashing.
+fn decode_mark_rgba() -> Option<(Vec<u8>, u32, u32)> {
+    let decoder = png::Decoder::new(std::io::Cursor::new(MARK_PNG));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let (w, h) = (info.width, info.height);
+    let mut rgba = match info.color_type {
+        png::ColorType::Rgba => {
+            buf.truncate(info.buffer_size());
+            buf
+        }
+        png::ColorType::Rgb => {
+            let mut out = Vec::with_capacity((w * h * 4) as usize);
+            for px in buf[..info.buffer_size()].chunks_exact(3) {
+                out.extend_from_slice(px);
+                out.push(0xff);
+            }
+            out
+        }
+        _ => return None,
+    };
+    crate::hdmi_logic::flip_rgba_rows_in_place(&mut rgba, w, h);
+    Some((rgba, w, h))
+}
+
+/// Blit the baked brand mark (mark.png) as an alpha-blended textured quad.
+/// `top_left` is normalized card space (y-down); `height` is a fraction of
+/// the card HEIGHT — the width is derived from the texture's own aspect so
+/// the artwork is never distorted (matches `system_card::MARK_ASPECT`).
+/// Fail-soft: a decode/upload/draw failure just omits the mark.
+fn paint_system_card_image(
+    gl: &glow::Context,
+    mode_w: u32,
+    mode_h: u32,
+    top_left: (f32, f32),
+    height: f32,
+) -> Result<()> {
+    use glow::HasContext;
+
+    // Decode + upload once, cache the texture.
+    let tex_dims = MARK_TEX.with(|cell| -> Option<(glow::NativeTexture, u32, u32)> {
+        if let Some(t) = *cell.borrow() {
+            return Some(t);
+        }
+        let (rgba, w, h) = decode_mark_rgba()?;
+        let tex = unsafe {
+            let t = gl.create_texture().ok()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA as i32,
+                w as i32, h as i32, 0,
+                glow::RGBA, glow::UNSIGNED_BYTE, Some(&rgba),
+            );
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            t
+        };
+        *cell.borrow_mut() = Some((tex, w, h));
+        Some((tex, w, h))
+    });
+    let Some((tex, tw, th)) = tex_dims else {
+        eprintln!("[system-card] mark.png decode/upload failed; omitting mark");
+        return Ok(());
+    };
+
+    // Undistorted rect: height is a card-height fraction; width follows the
+    // texture aspect, corrected for the card's own aspect.
+    let h_frac = height;
+    let w_frac = h_frac * (mode_h as f32 / mode_w as f32) * (tw as f32 / th as f32);
+    // Normalized top-left (y-down) -> NDC (y-up). Bottom-left vertex carries
+    // UV (0,0); rows were flipped at decode so the image is upright.
+    let x0 = top_left.0 * 2.0 - 1.0;
+    let x1 = (top_left.0 + w_frac) * 2.0 - 1.0;
+    let y0 = 1.0 - (top_left.1 + h_frac) * 2.0;
+    let y1 = 1.0 - top_left.1 * 2.0;
+    let verts: [f32; 16] = [
+        x0, y0, 0.0, 0.0,
+        x1, y0, 1.0, 0.0,
+        x0, y1, 0.0, 1.0,
+        x1, y1, 1.0, 1.0,
+    ];
+
+    // Reuse a cached VBO handle (created once); re-upload the verts each
+    // frame since the rect can differ per card. Avoids per-frame
+    // create/delete churn on the weak Pi GPU.
+    let vbo = MARK_VBO.with(|c| -> Result<glow::NativeBuffer> {
+        if let Some(v) = c.get() {
+            return Ok(v);
+        }
+        let v = unsafe { gl.create_buffer() }
+            .map_err(|e| anyhow!("glGenBuffers(system-card mark): {e}"))?;
+        c.set(Some(v));
+        Ok(v)
+    })?;
+    unsafe {
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let bytes =
+            std::slice::from_raw_parts(verts.as_ptr() as *const u8, std::mem::size_of_val(&verts));
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::DYNAMIC_DRAW);
+
+        gl.enable(glow::BLEND);
+        gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+        let res = run_blit_pass_quad(gl, tex, vbo);
+        gl.disable(glow::BLEND);
+        if let Err(e) = res {
+            eprintln!("[system-card] mark blit failed: {e}");
+        }
+    }
+    Ok(())
 }
 
 /// PR3.1 (2026-07-01) — paint the QR panel using a CACHED QrBitmap

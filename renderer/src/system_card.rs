@@ -71,7 +71,17 @@ pub enum CardShape {
     /// Positioned by `top_left` relative to card; the tile is
     /// square sized `tile_size` (normalized). Word follows the
     /// tile with a small gap.
+    ///
+    /// SUPERSEDED on the BOOT card (2026-07-07) by `Image`, which blits
+    /// the real dot-matrix wordmark artwork (mark.png). Still used by the
+    /// SETUP/CONNECTING/CONNECTED/DEGRADED cards' small corner lockup.
     Monogram { top_left: (f32, f32), tile_size: f32 },
+    /// A baked-in brand-mark image (the real splash wordmark, mark.png),
+    /// blitted as a textured quad. `top_left` is the normalized card
+    /// position; `height` is the image's height as a fraction of the card
+    /// HEIGHT. The paint sizes the width from the texture's own aspect so
+    /// the artwork is never distorted (see `MARK_ASPECT`).
+    Image { top_left: (f32, f32), height: f32 },
     /// The state chip in the top-right corner. Solid-fill color +
     /// label.
     Chip {
@@ -204,10 +214,25 @@ pub fn clamp_params(mut p: RenderSystemCardParams) -> RenderSystemCardParams {
     p
 }
 
-/// PR3 layout entrypoint: turn IPC params into the shape list.
-/// Pure — no GL deps, no time deps; tests pin layout positions per
-/// card kind.
-pub fn layout_card(params: &RenderSystemCardParams) -> Vec<CardShape> {
+/// Aspect ratio (width / height) of the baked mark artwork (mark.png,
+/// 1618×517). The paint sizes the mark image by `height × MARK_ASPECT`, so
+/// the artwork is never distorted; layout uses it to reserve horizontal
+/// room for the mark when placing neighbouring text.
+pub const MARK_ASPECT: f32 = 1618.0 / 517.0;
+
+/// A BOOT card lays out in the landscape (2-column) form when the
+/// framebuffer is wider than tall (aspect > 1). The FYS panel (portrait,
+/// rot90) reports < 1; a landscape HDMI reports > 1. `mode_w`/`mode_h` are
+/// already post-rotation, so this is the effective on-glass aspect.
+fn is_landscape(aspect: f32) -> bool {
+    aspect > 1.0
+}
+
+/// PR3 layout entrypoint: turn IPC params into the shape list. `aspect` is
+/// the effective (post-rotation) framebuffer width/height — the BOOT card
+/// adapts its layout to it (portrait vertical stack vs landscape 2-column).
+/// Pure — no GL deps, no time deps; tests pin layout positions per kind.
+pub fn layout_card(params: &RenderSystemCardParams, aspect: f32) -> Vec<CardShape> {
     let mut shapes = Vec::with_capacity(8);
     shapes.push(CardShape::Background { color: BG });
     match params.kind {
@@ -218,7 +243,7 @@ pub fn layout_card(params: &RenderSystemCardParams) -> Vec<CardShape> {
         SystemCardKind::Connecting => layout_connecting(params, &mut shapes),
         SystemCardKind::Connected => layout_connected(params, &mut shapes),
         SystemCardKind::Degraded => layout_degraded(params, &mut shapes),
-        SystemCardKind::Boot => layout_boot(params, &mut shapes),
+        SystemCardKind::Boot => layout_boot(params, &mut shapes, aspect),
     }
     shapes
 }
@@ -509,55 +534,126 @@ pub fn degraded_copy(
     }
 }
 
-fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
-    // BOOT identity card (boot-identity-card 2026-07-06): centered
-    // monogram + the device's real mDNS URL + a QR of that URL. Text
-    // shapes center via x=0.5 + Align::Center; the QR panel centers by
-    // anchoring its top-left at 0.5 - size/2.
-    shapes.push(CardShape::Monogram {
-        top_left: (0.40, 0.14),
-        tile_size: MONOGRAM_TILE,
-    });
+fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>, aspect: f32) {
+    // BOOT identity card. The real dot-matrix wordmark (mark.png) is
+    // blitted as an Image; the mDNS URL + wlan0 IP + a QR of the URL give a
+    // viewer a way to reach the sign, and the Wi-Fi line names the network.
+    //
+    // Layout adapts to the framebuffer aspect (qarl 2026-07-07):
+    //   * portrait (FYS panel, rot90): centred vertical stack.
+    //   * landscape (HDMI): two columns — identity/URL/IP/Wi-Fi on the
+    //     LEFT, the QR on the RIGHT — to fill the width.
+    // The QR is "square-corrected": QrPanel `size` is a WIDTH fraction but
+    // the paint makes the panel square in PIXELS (h_px = w_px = size*mode_w),
+    // so `size = target_height_frac / aspect` gives a QR that occupies a
+    // fixed fraction of HEIGHT on any aspect (never a giant/tiny square).
+    //
+    // Guard: an unstamped/invalid aspect (0.0 before the IPC loop stamps it,
+    // or NaN/inf) falls back to the FYS portrait panel so the math is safe.
+    let aspect = if aspect.is_finite() && aspect > 0.0 {
+        aspect
+    } else {
+        768.0 / 1360.0
+    };
     let address = params.address.as_deref().unwrap_or("openmarquee.local");
-    shapes.push(CardShape::Text {
-        anchor: (0.50, 0.30),
-        max_height: 0.05,
-        color: ACCENT,
-        font: DisplayFont::Mono,
-        align: Align::Center,
-        text: address.to_string(),
-    });
     let ip = params.ip.as_deref().unwrap_or("");
-    if !ip.is_empty() {
+    let ssid = params.ssid.as_deref().filter(|s| !s.is_empty());
+    let qr_payload = params.qr_payload.clone().unwrap_or_default();
+
+    if is_landscape(aspect) {
+        // ---- Landscape: 2-column ----
+        const COL_X: f32 = 0.07;
+        // Mark: top of the left column. `height` is a fraction of card
+        // height; the paint sizes the width from the artwork aspect so it's
+        // undistorted.
+        let mark_h = 0.18;
+        shapes.push(CardShape::Image { top_left: (COL_X, 0.15), height: mark_h });
+        // URL (accent) + IP + Wi-Fi, left-aligned, stacked below the mark.
         shapes.push(CardShape::Text {
-            anchor: (0.50, 0.37),
-            max_height: 0.027,
-            color: MUTED,
+            anchor: (COL_X, 0.47),
+            max_height: 0.06,
+            color: ACCENT,
+            font: DisplayFont::Mono,
+            align: Align::Left,
+            text: address.to_string(),
+        });
+        if !ip.is_empty() {
+            shapes.push(CardShape::Text {
+                anchor: (COL_X, 0.58),
+                max_height: 0.032,
+                color: MUTED,
+                font: DisplayFont::Mono,
+                align: Align::Left,
+                text: ip.to_string(),
+            });
+        }
+        if let Some(ssid) = ssid {
+            shapes.push(CardShape::Text {
+                anchor: (COL_X, 0.66),
+                max_height: 0.032,
+                color: MUTED,
+                font: DisplayFont::Mono,
+                align: Align::Left,
+                text: format!("Wi-Fi: {ssid}"),
+            });
+        }
+        // QR: right column, vertically centred + square-corrected.
+        if !qr_payload.is_empty() {
+            let qr_h_frac = 0.52;
+            // Cap at the right-column band WIDTH (0.36), not a larger value:
+            // on a near-square landscape (aspect ~1.0-1.3, e.g. a 4:3/5:4
+            // monitor) qr_h_frac/aspect exceeds 0.36, and a wider panel at
+            // qr_x=0.60 would clip past the framebuffer's right edge →
+            // dropped modules → unscannable QR.
+            let qr_size = (qr_h_frac / aspect).min(0.36); // normalized width
+            // Centre the QR within the right column band [0.60, 0.96].
+            let qr_x = 0.60 + ((0.36 - qr_size).max(0.0)) / 2.0;
+            shapes.push(CardShape::QrPanel {
+                top_left: (qr_x, (1.0 - qr_h_frac) / 2.0),
+                size: qr_size,
+                payload: qr_payload,
+                caption: "Scan to open".to_string(),
+            });
+        }
+    } else {
+        // ---- Portrait: centred vertical stack (the FYS-panel layout) ----
+        // Mark centred near the top, sized to ~0.62 of card width (height
+        // derived from the artwork aspect + the panel aspect).
+        let mark_w_frac: f32 = 0.62;
+        let mark_h = (mark_w_frac * aspect / MARK_ASPECT).min(0.16);
+        let mark_w = mark_h * MARK_ASPECT / aspect; // actual width after any clamp
+        shapes.push(CardShape::Image {
+            top_left: ((1.0 - mark_w) / 2.0, 0.10),
+            height: mark_h,
+        });
+        shapes.push(CardShape::Text {
+            anchor: (0.50, 0.30),
+            max_height: 0.05,
+            color: ACCENT,
             font: DisplayFont::Mono,
             align: Align::Center,
-            text: ip.to_string(),
+            text: address.to_string(),
         });
-    }
-    // QR of the identity URL. Only emitted when the backend threaded a
-    // non-empty qr_payload — a BOOT card fired without one (legacy /
-    // fallback callers) keeps the pre-feature text-only layout instead
-    // of painting an empty white panel.
-    let qr_payload = params.qr_payload.clone().unwrap_or_default();
-    if !qr_payload.is_empty() {
-        const BOOT_QR_SIZE: f32 = 0.22;
-        shapes.push(CardShape::QrPanel {
-            top_left: (0.5 - BOOT_QR_SIZE / 2.0, 0.44),
-            size: BOOT_QR_SIZE,
-            payload: qr_payload,
-            caption: "Scan to open".to_string(),
-        });
-    }
-    // Connected Wi-Fi SSID (boot-card 2026-07-07): which network to join
-    // to reach the URL above (the mDNS URL only resolves on the sign's
-    // own network). Omitted when the backend didn't thread one — not yet
-    // connected at boot-card time.
-    if let Some(ssid) = params.ssid.as_deref() {
-        if !ssid.is_empty() {
+        if !ip.is_empty() {
+            shapes.push(CardShape::Text {
+                anchor: (0.50, 0.37),
+                max_height: 0.027,
+                color: MUTED,
+                font: DisplayFont::Mono,
+                align: Align::Center,
+                text: ip.to_string(),
+            });
+        }
+        if !qr_payload.is_empty() {
+            const BOOT_QR_SIZE: f32 = 0.22;
+            shapes.push(CardShape::QrPanel {
+                top_left: (0.5 - BOOT_QR_SIZE / 2.0, 0.44),
+                size: BOOT_QR_SIZE,
+                payload: qr_payload,
+                caption: "Scan to open".to_string(),
+            });
+        }
+        if let Some(ssid) = ssid {
             shapes.push(CardShape::Text {
                 anchor: (0.50, 0.88),
                 max_height: 0.03,
@@ -568,6 +664,7 @@ fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
             });
         }
     }
+    // Rapid-boot hint line (both layouts).
     if let Some(hint) = params.boot_hint.as_deref() {
         if !hint.is_empty() {
             shapes.push(CardShape::BootHint {
@@ -582,6 +679,45 @@ fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Aspect (width/height) fixtures: the FYS panel is portrait (768×1360
+    // rot90), a landscape HDMI is 1920×1080. Both are post-rotation, as
+    // layout_card expects.
+    const PORTRAIT: f32 = 768.0 / 1360.0;
+    const LANDSCAPE: f32 = 1920.0 / 1080.0;
+
+    /// Assert every geometric shape stays within the card [0,1]×[0,1],
+    /// accounting for the aspect-derived real extents: the mark Image's
+    /// width = height·MARK_ASPECT/aspect, and the QrPanel is square in
+    /// PIXELS so its normalized height = size·aspect.
+    fn assert_shapes_in_bounds(shapes: &[CardShape], aspect: f32) {
+        let inb = |v: f32| (-0.002..=1.002).contains(&v);
+        for s in shapes {
+            match s {
+                CardShape::Image { top_left, height } => {
+                    let w = height * MARK_ASPECT / aspect;
+                    assert!(
+                        inb(top_left.0) && inb(top_left.0 + w) && inb(top_left.1) && inb(top_left.1 + height),
+                        "Image out of bounds: tl={top_left:?} h={height} w={w} aspect={aspect}"
+                    );
+                }
+                CardShape::QrPanel { top_left, size, .. } => {
+                    let h = size * aspect;
+                    assert!(
+                        inb(top_left.0) && inb(top_left.0 + size) && inb(top_left.1) && inb(top_left.1 + h),
+                        "QrPanel out of bounds: tl={top_left:?} size={size} h={h} aspect={aspect}"
+                    );
+                }
+                CardShape::Text { anchor, .. } => {
+                    assert!(inb(anchor.0) && inb(anchor.1), "Text anchor out of bounds: {anchor:?}");
+                }
+                CardShape::BootHint { center_bottom, .. } => {
+                    assert!(inb(center_bottom.0) && inb(center_bottom.1), "BootHint out of bounds: {center_bottom:?}");
+                }
+                _ => {}
+            }
+        }
+    }
     use crate::playback::{DegradedVariant, RenderSystemCardParams, SystemCardKind};
 
     fn params(kind: SystemCardKind) -> RenderSystemCardParams {
@@ -608,7 +744,7 @@ mod tests {
             SystemCardKind::Degraded,
             SystemCardKind::Boot,
         ] {
-            let shapes = layout_card(&params(kind));
+            let shapes = layout_card(&params(kind), PORTRAIT);
             assert!(
                 matches!(shapes[0], CardShape::Background { color: BG }),
                 "kind={:?} must emit BG fill at index 0",
@@ -624,7 +760,7 @@ mod tests {
         // render identically to the pre-close-out layout — no
         // DANGER-colored Text shapes anywhere.
         let p = params(SystemCardKind::Setup);
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         assert!(
             !shapes.iter().any(|s| matches!(
                 s,
@@ -639,7 +775,7 @@ mod tests {
         let mut p = params(SystemCardKind::Setup);
         p.variant = Some(DegradedVariant::AuthFail);
         p.target_ssid = Some("HomeWifi".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let banner = shapes
             .iter()
             .find_map(|s| match s {
@@ -659,7 +795,7 @@ mod tests {
         let mut p = params(SystemCardKind::Setup);
         p.variant = Some(DegradedVariant::NotFound);
         p.target_ssid = Some("HomeWifi".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let banner = shapes
             .iter()
             .find_map(|s| match s {
@@ -679,7 +815,7 @@ mod tests {
         let mut p = params(SystemCardKind::Setup);
         p.variant = Some(DegradedVariant::NotFoundOr5ghz);
         p.target_ssid = Some("HomeWifi".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let banner = shapes
             .iter()
             .find_map(|s| match s {
@@ -702,7 +838,7 @@ mod tests {
         // None so no banner paints, even though the variant is set.
         let mut p = params(SystemCardKind::Setup);
         p.variant = Some(DegradedVariant::Lost);
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         assert!(
             !shapes.iter().any(|s| matches!(
                 s,
@@ -716,7 +852,7 @@ mod tests {
     fn setup_carries_qr_payload_through() {
         let mut p = params(SystemCardKind::Setup);
         p.qr_payload = Some("WIFI:T:WPA;S:openMarquee-Setup;P:4827;;".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let qr = shapes
             .iter()
             .find_map(|s| match s {
@@ -732,7 +868,7 @@ mod tests {
         let mut p = params(SystemCardKind::Setup);
         p.ssid = Some("MyNet".to_string());
         p.pin = Some("1234".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let kv_text = shapes
             .iter()
             .filter_map(|s| match s {
@@ -751,7 +887,7 @@ mod tests {
     fn connecting_substitutes_target_ssid_in_headline() {
         let mut p = params(SystemCardKind::Connecting);
         p.target_ssid = Some("CafeWiFi".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let headline = shapes
             .iter()
             .find_map(|s| match s {
@@ -768,7 +904,7 @@ mod tests {
 
     #[test]
     fn connecting_emits_spinner() {
-        let shapes = layout_card(&params(SystemCardKind::Connecting));
+        let shapes = layout_card(&params(SystemCardKind::Connecting), PORTRAIT);
         assert!(
             shapes.iter().any(|s| matches!(s, CardShape::Spinner { .. })),
             "CONNECTING must emit a Spinner shape"
@@ -780,7 +916,7 @@ mod tests {
         let mut p = params(SystemCardKind::Connected);
         p.address = Some("foo.local".to_string());
         p.ip = Some("10.0.0.5".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let mono_texts: Vec<&str> = shapes
             .iter()
             .filter_map(|s| match s {
@@ -796,7 +932,7 @@ mod tests {
     fn connected_omits_ip_shape_when_ip_is_none() {
         let mut p = params(SystemCardKind::Connected);
         p.address = Some("foo.local".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         // No mono Text shape that contains an IP-shaped string.
         let mono_count = shapes
             .iter()
@@ -809,7 +945,7 @@ mod tests {
     fn degraded_lost_variant_headline() {
         let mut p = params(SystemCardKind::Degraded);
         p.variant = Some(DegradedVariant::Lost);
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let headline = shapes
             .iter()
             .find_map(|s| match s {
@@ -824,7 +960,7 @@ mod tests {
     fn degraded_auth_fail_variant_headline() {
         let mut p = params(SystemCardKind::Degraded);
         p.variant = Some(DegradedVariant::AuthFail);
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let headline = shapes
             .iter()
             .find_map(|s| match s {
@@ -840,7 +976,7 @@ mod tests {
         let mut p = params(SystemCardKind::Degraded);
         p.variant = Some(DegradedVariant::NotFoundOr5ghz);
         p.target_ssid = Some("HomeWiFi".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let headline = shapes
             .iter()
             .find_map(|s| match s {
@@ -880,21 +1016,73 @@ mod tests {
     }
 
     #[test]
-    fn boot_omits_chip_and_monogram_centered() {
+    fn boot_omits_chip_and_shows_centered_mark_portrait() {
         let mut p = params(SystemCardKind::Boot);
         p.address = Some("openmarquee.local".to_string());
         p.ip = Some("192.168.1.47".to_string());
-        let shapes = layout_card(&p);
-        // BOOT has no Chip.
+        let shapes = layout_card(&p, PORTRAIT);
+        // BOOT has no Chip, and no legacy Monogram (superseded by Image).
         assert!(!shapes.iter().any(|s| matches!(s, CardShape::Chip { .. })));
-        // Monogram is centered (not at top-left).
-        let mono = shapes.iter().find_map(|s| match s {
-            CardShape::Monogram { top_left, .. } => Some(*top_left),
+        assert!(!shapes.iter().any(|s| matches!(s, CardShape::Monogram { .. })));
+        // The real-artwork mark is present and horizontally centered.
+        let img = shapes.iter().find_map(|s| match s {
+            CardShape::Image { top_left, height } => Some((*top_left, *height)),
             _ => None,
         });
-        assert!(mono.is_some());
-        let (mx, _) = mono.unwrap();
-        assert!(mx > 0.3, "BOOT monogram should be horizontally centered; got x={}", mx);
+        assert!(img.is_some(), "BOOT must blit the mark Image");
+        let ((ix, iy), h) = img.unwrap();
+        // width = h * MARK_ASPECT / aspect; centered => ix ≈ (1-width)/2.
+        let w = h * MARK_ASPECT / PORTRAIT;
+        assert!((ix - (1.0 - w) / 2.0).abs() < 1e-3, "portrait mark not centered; x={ix}");
+        assert!(iy < 0.2, "portrait mark should sit near the top; y={iy}");
+        // All shapes stay within the card bounds.
+        assert_shapes_in_bounds(&shapes, PORTRAIT);
+    }
+
+    #[test]
+    fn boot_landscape_uses_two_columns() {
+        // qarl (b): landscape lays the identity out LEFT, the QR RIGHT.
+        let mut p = params(SystemCardKind::Boot);
+        p.address = Some("http://jasonssign1.local".to_string());
+        p.ip = Some("192.168.1.67".to_string());
+        p.qr_payload = Some("http://jasonssign1.local".to_string());
+        let shapes = layout_card(&p, LANDSCAPE);
+        // Mark image is in the LEFT column (x well under 0.5).
+        let img_x = shapes.iter().find_map(|s| match s {
+            CardShape::Image { top_left, .. } => Some(top_left.0),
+            _ => None,
+        });
+        assert!(img_x.is_some_and(|x| x < 0.2), "landscape mark should be left; x={img_x:?}");
+        // URL text is left-aligned in the left column.
+        let url_left = shapes.iter().any(|s| matches!(s,
+            CardShape::Text { text, align: Align::Left, anchor, .. }
+                if text.contains("jasonssign1") && anchor.0 < 0.2));
+        assert!(url_left, "landscape URL should be left-aligned in the left column");
+        // QR panel is in the RIGHT half.
+        let qr_x = shapes.iter().find_map(|s| match s {
+            CardShape::QrPanel { top_left, .. } => Some(top_left.0),
+            _ => None,
+        });
+        assert!(qr_x.is_some_and(|x| x > 0.5), "landscape QR should be in the right column; x={qr_x:?}");
+        assert_shapes_in_bounds(&shapes, LANDSCAPE);
+    }
+
+    #[test]
+    fn boot_mark_and_qr_square_correct_and_in_bounds_both_aspects() {
+        // The square-corrected QR must stay in bounds on both a portrait
+        // panel and a very wide landscape display (the whole point of the
+        // aspect-adaptive layout).
+        // Includes 1.25 (5:4) + 1.05 — the near-square landscape band where
+        // the QR right-column clamp used to overflow the framebuffer.
+        for aspect in [PORTRAIT, LANDSCAPE, 0.4, 2.4, 1.05, 1.25, 1.44] {
+            let mut p = params(SystemCardKind::Boot);
+            p.address = Some("http://a-very-long-sign-name.local".to_string());
+            p.ip = Some("192.168.100.200".to_string());
+            p.qr_payload = Some("http://a-very-long-sign-name.local".to_string());
+            p.ssid = Some("SomeNetwork-5G".to_string());
+            let shapes = layout_card(&p, aspect);
+            assert_shapes_in_bounds(&shapes, aspect);
+        }
     }
 
     #[test]
@@ -904,7 +1092,7 @@ mod tests {
         let mut p = params(SystemCardKind::Boot);
         p.address = Some("http://jasonssign1.local".to_string());
         p.qr_payload = Some("http://jasonssign1.local".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         let qr = shapes
             .iter()
             .find_map(|s| match s {
@@ -921,7 +1109,7 @@ mod tests {
         // an empty white QR panel.
         let mut p = params(SystemCardKind::Boot);
         p.address = Some("http://jasonssign1.local".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         assert!(
             !shapes.iter().any(|s| matches!(s, CardShape::QrPanel { .. })),
             "BOOT must NOT emit a QrPanel when qr_payload is absent"
@@ -935,7 +1123,7 @@ mod tests {
         // to reach the URL.
         let mut p = params(SystemCardKind::Boot);
         p.ssid = Some("NEBULA".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         assert!(
             shapes
                 .iter()
@@ -950,7 +1138,7 @@ mod tests {
         // mDNS URL as a fallback when `.local` doesn't resolve.
         let mut p = params(SystemCardKind::Boot);
         p.ip = Some("192.168.1.67".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         assert!(
             shapes
                 .iter()
@@ -962,7 +1150,7 @@ mod tests {
     #[test]
     fn boot_without_ssid_omits_wifi_line() {
         let p = params(SystemCardKind::Boot); // ssid None
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         assert!(
             !shapes
                 .iter()
@@ -974,7 +1162,7 @@ mod tests {
     #[test]
     fn boot_hint_reserved_empty_by_default() {
         let p = params(SystemCardKind::Boot);
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         assert!(
             !shapes.iter().any(|s| matches!(s, CardShape::BootHint { .. })),
             "BOOT must NOT emit a BootHint when boot_hint is None (PR4 reserve)"
@@ -985,7 +1173,7 @@ mod tests {
     fn boot_hint_appears_when_set() {
         let mut p = params(SystemCardKind::Boot);
         p.boot_hint = Some("Restart 2× more for Setup Mode".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         assert!(shapes.iter().any(|s| matches!(s, CardShape::BootHint { text, .. } if text.contains("Restart"))));
     }
 
@@ -1070,7 +1258,7 @@ mod tests {
         p.qr_payload = Some("WIFI:T:WPA;S:x;P:1;;".to_string());
         p.ssid = Some("x".to_string());
         p.pin = Some("1".to_string());
-        let shapes = layout_card(&p);
+        let shapes = layout_card(&p, PORTRAIT);
         assert!(shapes.iter().any(|s| matches!(s, CardShape::QrPanel { .. })));
         assert!(shapes.iter().any(|s| matches!(s,
             CardShape::Chip { label, .. } if label == "SETUP MODE"
