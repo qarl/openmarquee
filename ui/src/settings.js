@@ -407,6 +407,36 @@ const SECTION_TEMPLATE = `
                 </div>
             </div>
 
+            <!-- Recovery A4 (2026-07-08): operator-triggered reboot.
+                 Two-step inline confirm (no window.confirm — a native
+                 dialog blocks the captive-portal page). POSTs
+                 /api/system/restart, which crosses to the root netctl
+                 daemon (systemctl reboot). -->
+            <div class="om-card settings-device">
+                <div ${CARD_EYEBROW}>Device</div>
+                <p class="settings-hint" style="margin: 0 0 12px;">
+                    Restart the sign. The screen goes dark briefly and
+                    playback resumes automatically after about a minute.
+                </p>
+                <div class="device-restart-display"
+                     style="display: flex; gap: 8px; align-items: center;">
+                    <button type="button" class="om-btn sm device-restart-btn">Restart device…</button>
+                    <span class="device-restart-status"
+                          role="status" aria-live="polite"
+                          style="font-family: var(--om-mono); color: var(--om-text-dim); font-size: 12px;"></span>
+                </div>
+                <div class="device-restart-confirm" hidden
+                     style="display: grid; gap: 6px; margin-top: 10px;">
+                    <p style="margin: 0; font-size: 13px;">
+                        Restart now? The sign will be unreachable for about a minute.
+                    </p>
+                    <div style="display: flex; gap: 6px;">
+                        <button type="button" class="om-btn primary sm device-restart-go">Restart</button>
+                        <button type="button" class="om-btn sm device-restart-cancel">Cancel</button>
+                    </div>
+                </div>
+            </div>
+
             <!-- qarl 2026-05-12 (arc 3): the explicit "Save settings"
                  submit button is gone -- every field auto-saves on
                  input/change via attachAutoSave (auto-save.js). The
@@ -765,6 +795,64 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         });
     }
     wireChangePasswordCard();
+
+    // Recovery A4 (2026-07-08): two-step inline Restart-device control.
+    // Clicking "Restart device…" reveals an inline confirm (native
+    // window.confirm would block the captive-portal page). Confirming
+    // POSTs /api/system/restart; the backend returns 202 immediately
+    // (systemctl reboot only enqueues) so we show a reconnect hint
+    // rather than waiting on a response the reboot would kill.
+    function wireDeviceRestart() {
+        const btn = container.querySelector(".device-restart-btn");
+        const confirmBox = container.querySelector(".device-restart-confirm");
+        const goBtn = container.querySelector(".device-restart-go");
+        const cancelBtn = container.querySelector(".device-restart-cancel");
+        const status = container.querySelector(".device-restart-status");
+        if (!btn || !confirmBox || !goBtn || !cancelBtn || !status) return;
+
+        function reset() {
+            confirmBox.hidden = true;
+            btn.hidden = false;
+            goBtn.disabled = false;
+            cancelBtn.disabled = false;
+        }
+        btn.addEventListener("click", () => {
+            status.textContent = "";
+            btn.hidden = true;
+            confirmBox.hidden = false;
+        });
+        cancelBtn.addEventListener("click", reset);
+        goBtn.addEventListener("click", async () => {
+            goBtn.disabled = true;
+            cancelBtn.disabled = true;
+            status.textContent = "Restarting…";
+            try {
+                // apiFetch throws on 401 (redirect to login) but returns
+                // the raw Response for other non-2xx, so check .ok for
+                // the 503 the endpoint raises when the netctl daemon is
+                // unreachable.
+                const res = await apiFetch("/api/system/restart", { method: "POST" });
+                if (!res.ok) {
+                    let detail = `HTTP ${res.status}`;
+                    try {
+                        const body = await res.json();
+                        if (body?.detail) detail = body.detail;
+                    } catch { /* non-JSON body; keep the status code */ }
+                    throw new Error(detail);
+                }
+                confirmBox.hidden = true;
+                btn.hidden = true;
+                status.textContent =
+                    "Restarting — this page will reconnect in about a minute.";
+            } catch (err) {
+                // 503 (daemon/socket unavailable) or network error. Let
+                // the operator retry rather than leaving a dead button.
+                status.textContent = `Restart failed: ${err.message}`;
+                reset();
+            }
+        });
+    }
+    wireDeviceRestart();
 
     // Perf-night r2 (2026-05-26): toggle for the corner perf overlay.
     // Settings owns the checkbox state + localStorage write; main.js

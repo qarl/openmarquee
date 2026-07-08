@@ -26,7 +26,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
-from openmarquee import identity, tailscale
+from openmarquee import identity, system_control, tailscale
 
 # LEVER 2 lazy-imports (2026-06-24): auto_render + text_raster pull in
 # Pillow (~5-8 MB RSS) at import time. The two are only referenced in
@@ -586,6 +586,41 @@ async def tailscale_status() -> TailscaleStatusResponse:
             "ipv4": result.get("ipv4"),
             "message": result.get("message"),
         }
+    )
+
+
+class RestartResponse(BaseModel):
+    status: str  # "restarting"
+    message: str
+
+
+@router.post("/restart", response_model=RestartResponse, status_code=202)
+async def restart_device() -> RestartResponse:
+    """Recovery A4: reboot the device.
+
+    Spec §"Settings" future surface `/api/system/restart`. The backend
+    runs under NoNewPrivileges so it can't reboot itself; the reboot is
+    issued by the root netctl daemon (`reboot` subcommand →
+    `systemctl reboot`). `systemctl reboot` only *enqueues* the reboot
+    and returns, so this 202 flushes to the operator's browser before
+    systemd tears the process down.
+
+    The netctl round-trip is a blocking socket call; run it on a worker
+    thread so a concurrent poll isn't stalled. A missing daemon socket
+    (dev host) or daemon error surfaces as 503 rather than a silent
+    no-op.
+    """
+    try:
+        await asyncio.to_thread(system_control.reboot_device)
+    except system_control.SystemControlError as e:
+        log.error("restart failed: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail=f"restart unavailable: {e}",
+        ) from e
+    return RestartResponse(
+        status="restarting",
+        message="Device is rebooting; it will be back in about a minute.",
     )
 
 

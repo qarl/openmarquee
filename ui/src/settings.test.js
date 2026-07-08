@@ -1137,4 +1137,91 @@ describe("mountSettings", () => {
             expect(nebula.password).toBe("<set>");
         });
     });
+
+    describe("device restart (recovery A4)", () => {
+        // Default fetch mock: any GET (e.g. /api/system/info on mount)
+        // resolves to an empty-ok JSON stub; the restart POST is what
+        // each test asserts on.
+        function mockFetch(restartImpl) {
+            return vi.spyOn(globalThis, "fetch").mockImplementation(
+                async (url, init) => {
+                    if (typeof url === "string" && url.includes("/api/system/restart")) {
+                        return restartImpl(url, init);
+                    }
+                    return {
+                        ok: true,
+                        status: 200,
+                        json: async () => ({}),
+                    };
+                },
+            );
+        }
+
+        it("renders a Device card with a Restart button, hidden confirm", async () => {
+            const container = document.createElement("div");
+            mockFetch(() => ({ ok: true, status: 202, json: async () => ({}) }));
+            mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
+            await tick();
+            expect(container.querySelector(".settings-device")).toBeTruthy();
+            expect(container.querySelector(".device-restart-btn")).toBeTruthy();
+            expect(container.querySelector(".device-restart-confirm").hidden).toBe(true);
+        });
+
+        it("Restart button reveals the inline confirm; Cancel restores it", async () => {
+            const container = document.createElement("div");
+            mockFetch(() => ({ ok: true, status: 202, json: async () => ({}) }));
+            mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
+            await tick();
+            const btn = container.querySelector(".device-restart-btn");
+            const confirmBox = container.querySelector(".device-restart-confirm");
+            btn.click();
+            expect(confirmBox.hidden).toBe(false);
+            expect(btn.hidden).toBe(true);
+            container.querySelector(".device-restart-cancel").click();
+            expect(confirmBox.hidden).toBe(true);
+            expect(btn.hidden).toBe(false);
+        });
+
+        it("confirming POSTs /api/system/restart and shows the reconnect hint", async () => {
+            const container = document.createElement("div");
+            const fetchSpy = mockFetch(() => ({
+                ok: true,
+                status: 202,
+                json: async () => ({ status: "restarting", message: "back soon" }),
+            }));
+            mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
+            await tick();
+            container.querySelector(".device-restart-btn").click();
+            container.querySelector(".device-restart-go").click();
+            await tick();
+            const restartCall = fetchSpy.mock.calls.find(
+                ([u]) => typeof u === "string" && u.includes("/api/system/restart"),
+            );
+            expect(restartCall).toBeDefined();
+            expect(restartCall[1].method).toBe("POST");
+            expect(container.querySelector(".device-restart-status").textContent).toMatch(
+                /reconnect/i,
+            );
+            expect(container.querySelector(".device-restart-confirm").hidden).toBe(true);
+        });
+
+        it("surfaces a 503 as an error and restores the confirm controls", async () => {
+            const container = document.createElement("div");
+            mockFetch(() => ({
+                ok: false,
+                status: 503,
+                json: async () => ({ detail: "restart unavailable: netctl socket not found" }),
+            }));
+            mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
+            await tick();
+            container.querySelector(".device-restart-btn").click();
+            container.querySelector(".device-restart-go").click();
+            await tick();
+            const status = container.querySelector(".device-restart-status");
+            expect(status.textContent).toMatch(/restart failed/i);
+            expect(status.textContent).toMatch(/unavailable/i);
+            // Controls are re-enabled so the operator can retry.
+            expect(container.querySelector(".device-restart-go").disabled).toBe(false);
+        });
+    });
 });
