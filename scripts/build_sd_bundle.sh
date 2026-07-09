@@ -204,6 +204,43 @@ fi
 # 2 below handles it with a WARNING + ships without sidecar. Pi can
 # still serve the UI on the Python+DRM path.)
 
+# --- Freshness guard: refuse to bundle STALE built inputs -------------------
+#
+# The bundle ships ui/dist (esbuild output) + the aarch64 renderer
+# binary as PRE-BUILT artifacts — build_sd_bundle does NOT build them.
+# If a source tree is newer than its build output, the operator forgot
+# to rebuild, and the card would silently ship a "missing half" (real
+# 2026-07-09 case: the on-disk dist/*.tar.zst was ~2 months stale and
+# ui/dist PREDATED onboarding.js, so a documented-flow re-flash would
+# have handed Jason a card missing onboarding + boot-card + schedule-tz
+# with nothing to warn the operator). Fail loud, naming the exact
+# command. Uses `find -newer` (POSIX — portable across BSD/macOS + GNU,
+# unlike the GNU-only `-printf`). Test files are excluded — esbuild
+# does not bundle them, so a *.test.js edit doesn't stale the build.
+UI_DIST_REF="$REPO_ROOT/ui/dist/main.js"
+if [ -f "$UI_DIST_REF" ]; then
+    if [ -n "$(find "$REPO_ROOT/ui/src" -type f -name '*.js' \
+                    -not -name '*.test.js' -not -name '._*' \
+                    -newer "$UI_DIST_REF" 2>/dev/null | head -1)" ]; then
+        echo "error: ui/dist is STALE — a ui/src file is newer than ui/dist/main.js." >&2
+        echo "       Run:  (cd ui && npm run build)   then re-run this script." >&2
+        exit 9
+    fi
+    say "  ui/dist freshness OK (no ui/src newer than the build output)"
+fi
+if [ -n "${RUST_BIN_PRE:-}" ]; then
+    if [ -n "$(find "$REPO_ROOT/renderer" -type f \
+                    \( -name '*.rs' -o -name '*.toml' -o -name '*.glsl' \
+                       -o -name '*.vert' -o -name '*.frag' \) \
+                    -not -path '*/target/*' -not -name '._*' \
+                    -newer "$RUST_BIN_PRE" 2>/dev/null | head -1)" ]; then
+        echo "error: aarch64 renderer binary is STALE — a renderer source file is newer than it." >&2
+        echo "       Run:  bash scripts/renderer_cross_build.sh   then re-run this script." >&2
+        exit 9
+    fi
+    say "  renderer binary freshness OK (no renderer source newer than the binary)"
+fi
+
 # --- 1. Code tree (backend, ui-built, scripts, system) ---------------------
 
 say "Copying backend/ to staging (excluding tests + caches + runtime state)"
@@ -529,6 +566,18 @@ SIZE_HUMAN=$(echo "$SIZE" | awk '{
     else if ($1 > 1048576) printf "%.1f MiB", $1/1048576
     else printf "%d B", $1
 }')
+
+# Belt-and-suspenders freshness: the bundle we just wrote must be newer
+# than its built inputs. The pre-flight guards above catch a stale
+# ui/dist / renderer binary before the build; this catches a clock-skew
+# or reused-output pathology where the OUTPUT somehow predates an input.
+for _fresh_in in "$UI_DIST_REF" "${RUST_BIN_PRE:-}"; do
+    if [ -n "$_fresh_in" ] && [ -f "$_fresh_in" ] && [ "$_fresh_in" -nt "$OUTPUT" ]; then
+        echo "error: output bundle is OLDER than input $_fresh_in (stale/reused output?)." >&2
+        echo "       Delete $OUTPUT and re-run this script." >&2
+        exit 9
+    fi
+done
 
 # r37a (2026-05-31): SHA256 sidecar so operators can verify the artifact
 # they pulled matches the artifact this build produced. Per code2 r36

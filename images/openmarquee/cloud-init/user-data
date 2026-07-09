@@ -86,4 +86,24 @@ runcmd:
   # on the redeploy path — this line is the fresh-SD flash belt-
   # and-suspenders per QA's live-verified fix on 2026-07-01.
   - usermod -aG audio openmarquee || echo "warn: usermod audio failed"
-  - bash /opt/openmarquee/scripts/install.sh
+  # Fail-loud guard (2026-07-09): this pi-gen image is a BASE image — it
+  # bakes packages + boot-config + splash but NOT the app code. The code
+  # is delivered by scripts/stage_sd_card.sh, which overlays the bundle
+  # AND overwrites this user-data with the extract-then-install variant.
+  # If someone flashes the BASE image standalone (skipping stage_sd_card),
+  # /opt/openmarquee won't exist. Rather than silently error on a missing
+  # file, say so clearly on the console + leave a marker for post-mortem.
+  - |
+    if [ -x /opt/openmarquee/scripts/install.sh ]; then
+      bash /opt/openmarquee/scripts/install.sh
+    else
+      msg="openMarquee: this is a BASE pi-gen image with NO app code at /opt/openmarquee."
+      msg2="openMarquee: flash the STAGED card instead — build_sd_bundle.sh then stage_sd_card.sh"
+      msg3="openMarquee:   (stage_sd_card overlays the code bundle + the extract-then-install user-data)."
+      echo "$msg";  echo "$msg"  > /dev/console 2>/dev/null || true
+      echo "$msg2"; echo "$msg2" > /dev/console 2>/dev/null || true
+      echo "$msg3"; echo "$msg3" > /dev/console 2>/dev/null || true
+      mkdir -p /var/lib/openmarquee
+      printf 'base-image-flashed-standalone: /opt/openmarquee missing; run stage_sd_card.sh\n' \
+        > /var/lib/openmarquee/.provision-error
+    fi

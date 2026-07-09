@@ -192,3 +192,43 @@ def test_packages_substage_run_sh_is_executable() -> None:
     assert run.exists()
     mode = run.stat().st_mode
     assert mode & stat.S_IXUSR, "00-run.sh must be executable"
+
+
+def test_all_substage_run_scripts_are_git_executable() -> None:
+    """EVERY pi-gen substage *-run.sh must be tracked in git as mode
+    100755. pi-gen (build.sh) SILENTLY skips run scripts without the
+    exec bit, so a 100644 script no-ops its whole substage on a clean
+    checkout — e.g. 02-run.sh bakes cma=320M / gpu_mem=128, so a
+    non-exec 02-run.sh ships an image with the wrong memory split + no
+    splash, with NO build error.
+
+    Regression guard for 2026-07-09, where 01/02/03-run.sh were 100644
+    and shipped skipped on a clean build. Checks the GIT-tracked mode
+    (`git ls-files -s`), NOT the working-tree st_mode — the whole bug
+    was that stale local perms (755 on disk) hid the committed 644, so
+    an st_mode check would have passed locally while CI/clean-checkout
+    silently skipped the substage. The existing st_mode tests above only
+    covered prerun.sh + 00-run.sh, which is why the 01/02/03 gap slipped.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "ls-files", "-s", "--", str(_STAGE_DIR)],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip("git unavailable or not a repo checkout")
+
+    offenders = []
+    for line in result.stdout.splitlines():
+        # "<mode> <sha> <stage>\t<path>"
+        meta, _, path = line.partition("\t")
+        mode = meta.split()[0]
+        if path.endswith("-run.sh") and mode != "100755":
+            offenders.append(f"{path}={mode}")
+    assert not offenders, (
+        "pi-gen substage *-run.sh must be committed 100755 (executable) or "
+        f"pi-gen silently skips the whole substage: {offenders}"
+    )
