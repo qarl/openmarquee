@@ -37,12 +37,22 @@ from openmarquee import identity, system_control, tailscale
 # /perf-stats call IS what materializes the counters too.
 from openmarquee.api import cors_headers_for_origin
 from openmarquee.content.storage import ContentStorage
-from openmarquee.dependencies import get_flock_storage, get_settings_storage
+from openmarquee.dependencies import (
+    get_auth_storage,
+    get_content_storage,
+    get_flock_storage,
+    get_playlist_storage,
+    get_schedule_storage,
+    get_seed_marker_path,
+    get_settings_storage,
+    get_tombstone_storage,
+)
 from openmarquee.flock import FlockStorage
 from openmarquee.perf_middleware import recent_requests
 from openmarquee.playlist import PlaylistStorage
 from openmarquee.schedule import ScheduleStorage
 from openmarquee.settings import SettingsStorage
+from openmarquee.tombstone import TombstoneStorage
 
 log = logging.getLogger(__name__)
 
@@ -621,6 +631,101 @@ async def restart_device() -> RestartResponse:
     return RestartResponse(
         status="restarting",
         message="Device is rebooting; it will be back in about a minute.",
+    )
+
+
+class FactoryResetRequest(BaseModel):
+    # Explicit confirmation token. Bearer auth alone gates WHO can call
+    # this; the token guards against an accidental / mis-routed POST
+    # triggering a destructive wipe. Must equal "factory-reset".
+    confirm: str
+
+
+class FactoryResetResponse(BaseModel):
+    status: str  # "resetting"
+    message: str
+
+
+_FACTORY_RESET_CONFIRM = "factory-reset"
+
+
+@router.post("/factory-reset", response_model=FactoryResetResponse, status_code=202)
+async def factory_reset(
+    body: FactoryResetRequest,
+    settings: SettingsDep,
+    flock: FlockDep,
+    playlist: Annotated[PlaylistStorage, Depends(get_playlist_storage)],
+    schedule: Annotated[ScheduleStorage, Depends(get_schedule_storage)],
+    content: Annotated[ContentStorage, Depends(get_content_storage)],
+    auth: Annotated[object, Depends(get_auth_storage)],
+    tombstone: Annotated[TombstoneStorage, Depends(get_tombstone_storage)],
+    seed_marker: Annotated[Path, Depends(get_seed_marker_path)],
+) -> FactoryResetResponse:
+    """Recovery A3 (DESTRUCTIVE): erase operator data + wifi and reboot
+    into a fresh setup state. Spec §"Settings" future surface
+    `/api/system/factory-reset` — "clears all content + restores
+    defaults."
+
+    Two gates: bearer auth (WHO) + an explicit `confirm` token (guards
+    against an accidental fire). Device IDENTITY (hostname + AP
+    SSID/passphrase) is preserved so the operator's label/QR stays valid.
+
+    The data wipe (backend-owned files + uploaded content) runs first;
+    the privileged wifi teardown + reboot go through the root netctl
+    daemon. Blocking bits run on a worker thread; a missing/erroring
+    daemon socket surfaces as 503 (the data is already wiped, so a manual
+    reboot would still land in the fresh state).
+
+    The wipe returns the device to its true fresh-flash state:
+      - operator content/config: settings, playlist, schedule, flock,
+        network-supervisor state, all uploaded content, tombstones;
+      - the operator password (auth.json) — so a new operator can claim
+        the device via the welcome flow (the current bearer-gated
+        operator is the one triggering this, e.g. for a handover);
+      - the seed marker — so default demo content re-seeds on next boot;
+      - the plaintext wifi-prefill copy at /var/openmarquee (the /etc
+        wpa configs + saved NM profiles are torn down daemon-side).
+    Device identity (hostname, AP SSID/passphrase, firstboot .bootstrapped
+    marker) is deliberately NOT in the set.
+    """
+    if body.confirm != _FACTORY_RESET_CONFIRM:
+        raise HTTPException(
+            status_code=400,
+            detail=f"factory reset requires confirm={_FACTORY_RESET_CONFIRM!r}",
+        )
+    # Network-supervisor persisted state lives outside the storage
+    # objects; wipe it too so the supervisor boots fresh into SETUP.
+    from openmarquee.network_supervisor import DEFAULT_STATE_FILE
+
+    data_files = [
+        settings.path,
+        playlist.path,
+        schedule.path,
+        flock.path,
+        DEFAULT_STATE_FILE,
+        auth.path,
+        tombstone.path,
+        seed_marker,
+        # Plaintext wifi-prefill residue (a readable PSK copy the image
+        # may drop here). The /etc/wpa_supplicant configs are root-owned
+        # and removed daemon-side; this /var copy is backend-writable.
+        Path("/var/openmarquee/wpa_supplicant.conf"),
+    ]
+    try:
+        await asyncio.to_thread(
+            system_control.factory_reset_device,
+            data_files=data_files,
+            content_root=content.root,
+        )
+    except system_control.SystemControlError as e:
+        log.error("factory-reset failed: %s", e)
+        raise HTTPException(
+            status_code=503,
+            detail=f"factory reset unavailable: {e}",
+        ) from e
+    return FactoryResetResponse(
+        status="resetting",
+        message="Factory reset in progress; the sign will erase and restart.",
     )
 
 

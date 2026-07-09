@@ -28,6 +28,11 @@
 #   * systemctl reload/restart/enable/stop on a fixed set of units
 #   * systemctl reboot (recovery A4 — operator-triggered, idempotent:
 #     a spurious reboot is a self-healing event, not a data-loss one)
+#   * factory-reset (recovery A3 — delete saved NM wifi profiles + rm
+#     WPA_CONF/NM_DROP_IN + reboot; DESTRUCTIVE of network config but
+#     scoped: preserves hostapd AP identity + /etc/hostname. The
+#     operator-data wipe happens backend-side before this is invoked;
+#     the API gates it behind an explicit confirm token.)
 # A future operator who wants new privileged operations should add
 # a new subcommand here + extend the sudoers grant; do not generalise
 # this helper to take arbitrary paths.
@@ -88,6 +93,16 @@ Recovery cluster (2026-07-08):
                                     ENQUEUES the transition + returns, so
                                     the backend's HTTP 202 flushes before
                                     teardown.)
+    factory-reset                  Delete saved NM wifi profiles + remove
+                                   wpa/NM-unmanaged config, then reboot
+                                   (A3: the privileged half of a factory
+                                    reset. The backend wipes its own
+                                    operator data first; this tears down
+                                    the network so the sign can't
+                                    auto-reconnect, then reboots into the
+                                    fresh setup state. Device IDENTITY —
+                                    hostapd AP SSID + hostname — is
+                                    PRESERVED. No payload.)
 
 If you need a new privileged operation, add a new subcommand here
 AND extend system/openmarquee-netctl-daemon's ALLOWLIST.
@@ -312,6 +327,46 @@ case "$cmd" in
         # the operator's browser. No payload; no argv beyond the
         # subcommand.
         [ $# -eq 1 ] || usage
+        systemctl reboot
+        ;;
+    factory-reset)
+        # Recovery A3 (2026-07-08): the PRIVILEGED half of a factory
+        # reset. The backend has already wiped its own operator data
+        # (settings / playlists / schedule / flock / content /
+        # network-state) before calling this. Here we tear down the
+        # NETWORK config so the sign can't auto-reconnect to the old
+        # wifi on the next boot, then reboot into the fresh setup state.
+        #
+        # Device IDENTITY is deliberately PRESERVED: hostapd.conf (the AP
+        # SSID + passphrase) and /etc/hostname stay, so the physical
+        # label / QR the operator has remains valid after the reset.
+        #
+        # No payload; no argv beyond the subcommand.
+        [ $# -eq 1 ] || usage
+        # Delete every saved NM wifi connection profile (removes the
+        # /etc/NetworkManager/system-connections/* files so nothing
+        # auto-connects after reboot). Enumerate by UUID, not NAME: UUIDs
+        # are colon-free, so `IFS=:` splits cleanly even when an SSID/
+        # connection name contains a literal ':' (nmcli -t would escape
+        # it as '\:' and mis-split a NAME-based parse). The whole block is
+        # made non-fatal (`|| true`, `read` guarded) so a transient nmcli
+        # error can't trip `set -e` and abort BEFORE the reboot below —
+        # leaving a data-wiped-but-not-rebooted box.
+        if command -v nmcli >/dev/null 2>&1; then
+            nmcli -t -f UUID,TYPE connection show 2>/dev/null \
+                | while IFS=: read -r conn_uuid conn_type; do
+                    if [ "$conn_type" = "802-11-wireless" ] && [ -n "$conn_uuid" ]; then
+                        nmcli connection delete uuid "$conn_uuid" || true
+                    fi
+                done || true
+        fi
+        # Remove the take-over wpa_supplicant config, the bare
+        # wpa_supplicant.conf (a plaintext-PSK wifi-prefill source), and
+        # the NM-unmanaged drop-in so NM resumes managing wlan0 normally
+        # for fresh onboarding after the reboot. All no-ops if absent.
+        rm -f "$WPA_CONF" /etc/wpa_supplicant/wpa_supplicant.conf "$NM_DROP_IN"
+        # Reboot into the wiped setup state (enqueues + returns, so the
+        # daemon can ACK "OK" before teardown — same as `reboot`).
         systemctl reboot
         ;;
     *)

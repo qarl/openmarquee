@@ -435,6 +435,44 @@ const SECTION_TEMPLATE = `
                         <button type="button" class="om-btn sm device-restart-cancel">Cancel</button>
                     </div>
                 </div>
+
+                <!-- Recovery A3 (2026-07-08): factory reset. DESTRUCTIVE —
+                     wipes all content + settings + wifi and restarts into
+                     setup. Guarded by a type-to-confirm (the operator must
+                     type "factory-reset") so a stray click can't erase the
+                     sign; the confirm token is echoed to the API. -->
+                <div class="device-factory-reset"
+                     style="margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--om-hairline, rgba(128,128,128,0.25));">
+                    <p class="settings-hint" style="margin: 0 0 10px; color: #ff8f6b;">
+                        <strong>Factory reset</strong> erases all slides, playlists,
+                        schedules, settings and saved Wi-Fi, then restarts the sign in
+                        setup mode. The sign's name and setup network stay the same.
+                        This can't be undone.
+                    </p>
+                    <div class="device-factory-display"
+                         style="display: flex; gap: 8px; align-items: center;">
+                        <button type="button" class="om-btn sm device-factory-btn">Factory reset…</button>
+                        <span class="device-factory-status"
+                              role="status" aria-live="polite"
+                              style="font-family: var(--om-mono); color: var(--om-text-dim); font-size: 12px;"></span>
+                    </div>
+                    <div class="device-factory-confirm" hidden
+                         style="display: grid; gap: 6px; margin-top: 10px;">
+                        <label class="field om-field" style="margin: 0;">
+                            <span style="font-size: 12px;">Type <code>factory-reset</code> to confirm</span>
+                            <input type="text" class="om-input device-factory-input"
+                                   autocomplete="off" autocapitalize="off" spellcheck="false"
+                                   placeholder="factory-reset">
+                        </label>
+                        <div style="display: flex; gap: 6px;">
+                            <button type="button" class="om-btn primary sm device-factory-go" disabled
+                                    style="background: #c0392b; border-color: #c0392b;">
+                                Erase &amp; restart
+                            </button>
+                            <button type="button" class="om-btn sm device-factory-cancel">Cancel</button>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <!-- qarl 2026-05-12 (arc 3): the explicit "Save settings"
@@ -853,6 +891,70 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         });
     }
     wireDeviceRestart();
+
+    // Recovery A3 (2026-07-08): DESTRUCTIVE factory reset. Type-to-confirm
+    // (must type "factory-reset") so a stray click can't erase the sign;
+    // the same token is POSTed as the API's confirm guard. On success the
+    // sign wipes + reboots, so we show a terminal status rather than
+    // waiting on a response the reboot kills.
+    const FACTORY_CONFIRM = "factory-reset";
+    function wireDeviceFactoryReset() {
+        const btn = container.querySelector(".device-factory-btn");
+        const confirmBox = container.querySelector(".device-factory-confirm");
+        const input = container.querySelector(".device-factory-input");
+        const goBtn = container.querySelector(".device-factory-go");
+        const cancelBtn = container.querySelector(".device-factory-cancel");
+        const status = container.querySelector(".device-factory-status");
+        if (!btn || !confirmBox || !input || !goBtn || !cancelBtn || !status) return;
+
+        function reset() {
+            confirmBox.hidden = true;
+            btn.hidden = false;
+            input.value = "";
+            goBtn.disabled = true;
+            cancelBtn.disabled = false;
+        }
+        btn.addEventListener("click", () => {
+            status.textContent = "";
+            btn.hidden = true;
+            confirmBox.hidden = false;
+            input.focus();
+        });
+        // The Erase button only enables once the exact phrase is typed.
+        input.addEventListener("input", () => {
+            goBtn.disabled = input.value.trim() !== FACTORY_CONFIRM;
+        });
+        cancelBtn.addEventListener("click", reset);
+        goBtn.addEventListener("click", async () => {
+            if (input.value.trim() !== FACTORY_CONFIRM) return;
+            goBtn.disabled = true;
+            cancelBtn.disabled = true;
+            status.textContent = "Erasing…";
+            try {
+                const res = await apiFetch("/api/system/factory-reset", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ confirm: FACTORY_CONFIRM }),
+                });
+                if (!res.ok) {
+                    let detail = `HTTP ${res.status}`;
+                    try {
+                        const b = await res.json();
+                        if (b?.detail) detail = b.detail;
+                    } catch { /* non-JSON body; keep the status code */ }
+                    throw new Error(detail);
+                }
+                confirmBox.hidden = true;
+                btn.hidden = true;
+                status.textContent =
+                    "Erasing and restarting — reconnect to the sign's setup network in a minute.";
+            } catch (err) {
+                status.textContent = `Factory reset failed: ${err.message}`;
+                reset();
+            }
+        });
+    }
+    wireDeviceFactoryReset();
 
     // Perf-night r2 (2026-05-26): toggle for the corner perf overlay.
     // Settings owns the checkbox state + localStorage write; main.js
