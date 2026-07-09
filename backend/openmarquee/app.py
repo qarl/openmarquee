@@ -29,6 +29,7 @@ from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
 from openmarquee.api_system import router as system_router
 from openmarquee.auth_middleware import AuthMiddleware
+from openmarquee.captive_portal_middleware import CaptivePortalMiddleware
 from openmarquee.content.migrations import migrate_050608_bg_to_000000
 from openmarquee.csp_middleware import CSPMiddleware
 from openmarquee.dependencies import (
@@ -596,6 +597,15 @@ app.add_middleware(
     fqdn_resolver=get_self_fqdn,
     settings_resolver=lambda: get_settings_storage().load(),
 )
+
+# P0-1d captive-portal probe redirect. Added AFTER Fqdn so it becomes the
+# OUTER of the two (runtime: ... -> Perf -> CaptivePortal -> Fqdn -> Auth):
+# a phone joining the setup AP fires an OS captive-portal probe (all hosts
+# resolve to us via dnsmasq), and this 302s it to the web UI so the portal
+# auto-opens (spec §4.2). Runs before Fqdn (a probe's external Host must
+# not be Tailscale-rewritten) + before Auth (probes are unauth), but
+# inside Perf so probes are still timed.
+app.add_middleware(CaptivePortalMiddleware)
 
 # Perf middleware -- timestamps each HTTP request, logs slow ones,
 # and pushes records into the in-memory ring exposed at
