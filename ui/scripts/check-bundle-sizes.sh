@@ -67,7 +67,7 @@ DASHBOARD_DIR="$(mktemp -d -t omq-bundle-dashboard-XXXXXX)"
 trap 'rm -rf "$CAPTIVE_DIR" "$DASHBOARD_DIR"' EXIT
 
 "$ESBUILD" \
-    src/welcome.js src/set-password.js src/login.js \
+    src/welcome.js src/set-password.js src/login.js src/onboarding.js \
     --format=esm --bundle --splitting --minify \
     --loader:.wasm=binary \
     --outdir="$CAPTIVE_DIR"
@@ -97,17 +97,21 @@ FILES=(
     "$CAPTIVE_DIR/welcome.js"
     "$CAPTIVE_DIR/login.js"
     "$CAPTIVE_DIR/set-password.js"
+    "$CAPTIVE_DIR/onboarding.js"
     "welcome.html"
     "login.html"
     "set-password.html"
+    "onboarding.html"
 )
 THRESHOLDS=(
     11800
     1130
     1370
+    1350
     5160
     2620
     3020
+    2720
 )
 # Friendly labels for the log so PR authors see relative paths
 # rather than the tmp-dir absolute paths.
@@ -115,9 +119,11 @@ LABELS=(
     "dist-captive/welcome.js"
     "dist-captive/login.js"
     "dist-captive/set-password.js"
+    "dist-captive/onboarding.js"
     "ui/welcome.html"
     "ui/login.html"
     "ui/set-password.html"
+    "ui/onboarding.html"
 )
 
 # Dashboard files (added only if the dashboard build succeeded).

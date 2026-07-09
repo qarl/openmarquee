@@ -39,10 +39,11 @@ def test_every_probe_path_302s_to_portal(probe):
     assert r.headers["location"] == DEFAULT_PORTAL_URL
 
 
-def test_default_portal_url_is_absolute_ap_gateway():
+def test_default_portal_url_is_absolute_ap_gateway_onboarding():
     # Absolute (not "/") keeps the browsing origin on the real device IP
-    # rather than the spoofed probe host — see the module docstring.
-    assert DEFAULT_PORTAL_URL == "http://10.0.0.1/"
+    # rather than the spoofed probe host, and points at the lightweight
+    # unauth wifi-entry page (not the heavy SPA) — see the module docstring.
+    assert DEFAULT_PORTAL_URL == "http://10.0.0.1/onboarding.html"
 
 
 def test_head_probe_also_redirects():

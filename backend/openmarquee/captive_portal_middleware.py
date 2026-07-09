@@ -68,10 +68,16 @@ DEFAULT_PROBE_PATHS: frozenset[str] = frozenset(
     }
 )
 
-# The captive-portal AP gateway (SYSTEM_SPEC §4.1: device at 10.0.0.1).
-# Absolute + env-overridable so part 2 can point it at the dedicated
-# onboarding page and tests can assert a fixed value.
-DEFAULT_PORTAL_URL = os.environ.get("OPENMARQUEE_CAPTIVE_PORTAL_URL", "http://10.0.0.1/")
+# The captive-portal landing on the AP gateway (SYSTEM_SPEC §4.1: device
+# at 10.0.0.1). Points at the unauth wifi-entry onboarding page (P0-1d
+# part 2) — a lightweight standalone page, deliberately NOT the heavy
+# editor SPA, which the iOS Captive Network Assistant mini-browser renders
+# poorly. Absolute (not "/") so the browsing origin stays on the device IP
+# rather than the spoofed probe host, keeping any onboarding client-state
+# usable off-AP. Env-overridable.
+DEFAULT_PORTAL_URL = os.environ.get(
+    "OPENMARQUEE_CAPTIVE_PORTAL_URL", "http://10.0.0.1/onboarding.html"
+)
 
 _PROBE_METHODS = frozenset({"GET", "HEAD"})
 
