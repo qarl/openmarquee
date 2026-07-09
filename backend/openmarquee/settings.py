@@ -397,8 +397,9 @@ class SystemSettings(BaseModel):
 
     timezone: str | None = Field(
         default=None,
-        description="IANA timezone (e.g. America/Los_Angeles). Reserved — playback is "
-        "naive-local today. Lands fully with the schedule zoned-eval work.",
+        description="IANA timezone (e.g. America/Los_Angeles). Drives both the "
+        "on-screen clock and schedule evaluation (a 09:00-17:00 rule fires by "
+        "this wall clock, not the device process clock). Unset → naive local.",
     )
 
     # --- Tailscale (optional remote management) ---

@@ -41,6 +41,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -153,11 +154,54 @@ def evaluate_schedule(now: datetime, schedule: Schedule) -> UUID:
     """Return the playlist id active at `now` per the schedule.
 
     First matching rule wins. Falls back to `default_playlist_id`.
+
+    `now` may be naive (evaluated as-is) or timezone-aware — in which
+    case `matches()` reads the wall-clock IN that zone (`.hour`/`.minute`/
+    `.weekday()` on an aware datetime are the zone-local components). Pass
+    the aware `now` from `schedule_now()` so a 09:00–17:00 rule fires by
+    the operator's configured timezone, not the device's process clock.
     """
     for rule in schedule.rules:
         if rule.matches(now):
             return rule.playlist_id
     return schedule.default_playlist_id
+
+
+def schedule_now(tz_name: str | None, *, base: datetime | None = None) -> datetime:
+    """The `now` to evaluate a schedule against.
+
+    The bug this fixes: schedules were evaluated with a NAIVE
+    process-local `datetime.now()`, so on a handover unit whose clock is
+    UTC a 09:00–17:00 rule fired at 01:00 local. The on-screen clock
+    already renders in the operator's configured IANA `timezone`
+    (SettingsStorage.timezone → `auto_render.resolve_timezone`); this
+    evaluates schedules from that SAME source, so clock and schedule
+    agree. Deliberately does NOT touch the system clock / TZ — the device
+    clock stays local (a hard constraint elsewhere); only the schedule's
+    reference instant is presented in the configured zone.
+
+    When `tz_name` is unset (None/empty), returns a naive process-local
+    `now` — preserving the prior behavior for un-configured devices.
+
+    `base` (an aware or naive instant) is injectable for deterministic
+    tests; production passes None (the live clock). A naive `base` is
+    assumed to be UTC when a zone is applied — the process-local-UTC
+    handover case the fix targets.
+    """
+    if tz_name:
+        # Lazy import: keeps schedule.py free of an auto_render dependency
+        # at module load (and mirrors the clock's tz-coercion exactly —
+        # empty/invalid → UTC with a warn, so a broken settings file
+        # can't wedge the playback loop).
+        from openmarquee.auto_render import resolve_timezone
+
+        tz = resolve_timezone(tz_name)
+        if base is None:
+            return datetime.now(tz)
+        aware = base if base.tzinfo is not None else base.replace(tzinfo=ZoneInfo("UTC"))
+        return aware.astimezone(tz)
+    # No configured timezone: naive process-local, unchanged behavior.
+    return base if base is not None else datetime.now()
 
 
 class ScheduleStorage:

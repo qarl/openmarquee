@@ -19,6 +19,7 @@ from openmarquee.schedule import (
     _coerce_to_schedule,
     _resolve_legacy_name,
     evaluate_schedule,
+    schedule_now,
 )
 
 # A handful of pre-allocated UUIDs to make assertions readable.
@@ -584,3 +585,151 @@ def test_evaluator_ignores_tz_for_now():
     )
     # The rule fires at the *device's* 12:30, regardless of tz value.
     assert evaluate_schedule(datetime(2026, 4, 21, 12, 30), schedule) == PL_LUNCH
+
+
+# --- schedule_now: honor the configured timezone (2026-07-08 fix) ---
+# Bug: schedules were evaluated with a NAIVE process-local datetime.now(),
+# so on a handover unit whose device clock is UTC a 09:00-17:00 rule fired
+# at 01:00 local. The fix evaluates "now" in settings.timezone — the SAME
+# source that drives the on-screen clock — without touching the system TZ.
+
+
+def _nine_to_five(playlist_id: UUID) -> Schedule:
+    return Schedule(
+        rules=[
+            ScheduleRule(
+                name="9to5",
+                days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                start_time="09:00",
+                end_time="17:00",
+                playlist_id=playlist_id,
+                enabled=True,
+            )
+        ],
+        default_playlist_id=DEFAULT_PLAYLIST_ID,
+    )
+
+
+def test_schedule_evaluates_in_configured_timezone_not_process_clock():
+    from zoneinfo import ZoneInfo
+
+    schedule = _nine_to_five(PL_WORKDAY)
+    # 2026-07-08 19:00 UTC (a Wednesday). In America/Los_Angeles that is
+    # 12:00 PDT — NOON, mid-window — but 19:00 is OUTSIDE the 09:00-17:00
+    # window in UTC. This instant separates zoned from naive evaluation.
+    instant = datetime(2026, 7, 8, 19, 0, tzinfo=ZoneInfo("UTC"))
+
+    # FIX (zoned): presented in Pacific it's noon → the 9-5 rule is active.
+    now_pacific = schedule_now("America/Los_Angeles", base=instant)
+    assert evaluate_schedule(now_pacific, schedule) == PL_WORKDAY
+
+    # BEFORE the fix, the caller passed a naive UTC wall-clock (19:00) →
+    # outside the window → the default playlist. Proves the old path was
+    # wrong for a non-UTC operator, and that zoned≠naive here.
+    naive_utc = instant.replace(tzinfo=None)  # naive 19:00
+    assert evaluate_schedule(naive_utc, schedule) == DEFAULT_PLAYLIST_ID
+
+
+def test_schedule_now_falls_back_to_naive_when_timezone_unset():
+    from zoneinfo import ZoneInfo
+
+    schedule = _nine_to_five(PL_WORKDAY)
+    instant = datetime(2026, 7, 8, 19, 0, tzinfo=ZoneInfo("UTC"))
+    naive_base = instant.replace(tzinfo=None)  # naive 19:00, the process clock
+
+    # tz unset (None) → schedule_now returns the naive instant unchanged
+    # (no tzinfo attached), preserving today's behavior for un-configured
+    # devices: 19:00 is outside 09:00-17:00 → default.
+    now_unset = schedule_now(None, base=naive_base)
+    assert now_unset.tzinfo is None
+    assert now_unset == naive_base
+    assert evaluate_schedule(now_unset, schedule) == DEFAULT_PLAYLIST_ID
+
+    # Empty string is treated the same as unset.
+    assert schedule_now("", base=naive_base).tzinfo is None
+
+
+def test_schedule_now_live_returns_aware_in_zone_and_naive_when_unset():
+    # No base = live clock. tz set → aware datetime carrying that zone;
+    # tz unset → naive. (Value is wall-clock-dependent; assert only the
+    # aware/naive shape + the zone key, which is what the fix guarantees.)
+    aware = schedule_now("America/New_York")
+    assert aware.tzinfo is not None
+    assert "New_York" in str(aware.tzinfo)
+    assert schedule_now(None).tzinfo is None
+
+
+def test_active_playlist_id_closure_evaluates_in_configured_timezone(tmp_path: Path, monkeypatch):
+    """End-to-end wiring guard: the REAL active_playlist_id() closure in
+    dependencies.py — the per-slot "which playlist now" preemption probe —
+    must evaluate the schedule in settings.timezone.
+
+    This is the genuine fail-before/pass-after for the bug: pre-fix the
+    closure called evaluate_schedule(datetime.now(), ...) with a naive
+    process-local now, so on a handover unit whose system clock reads UTC
+    a 09:00-17:00 rule returned the WRONG playlist at noon Pacific. The
+    schedule_now unit tests above prove the helper; this drives the actual
+    closure so a future edit dropping the tz can't pass silently.
+    """
+    from zoneinfo import ZoneInfo
+
+    import openmarquee.schedule as schedule_mod
+    from openmarquee import dependencies as deps
+    from openmarquee.settings import SystemSettings
+
+    # Isolate every storage layer: settings/schedule/playlist all resolve
+    # as tmp siblings of the content root, so the singletons read our
+    # fixtures instead of local dev state. (conftest already pins the
+    # renderer to mock, so the loop constructs without touching hardware.)
+    monkeypatch.setenv("OPENMARQUEE_CONTENT_ROOT", str(tmp_path / "content"))
+
+    singletons = (
+        deps._playback_loop_singleton,
+        deps._settings_storage_singleton,
+        deps._schedule_storage_singleton,
+        deps._playlist_storage_singleton,
+        deps._content_storage_singleton,
+        deps._real_renderer_singleton,
+        deps._mock_renderer_singleton,
+    )
+    for s in singletons:
+        s.cache_clear()
+
+    # Freeze the clock at an instant that separates zoned from naive:
+    # 2026-07-08 19:00 UTC = 12:00 PDT (a Wednesday). A device whose
+    # system clock reads UTC exposes 19:00 as its naive local wall-time —
+    # exactly the handover-unit bug scenario.
+    fixed_utc = datetime(2026, 7, 8, 19, 0, 0, tzinfo=ZoneInfo("UTC"))
+
+    class _FrozenNow(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return fixed_utc.replace(tzinfo=None)  # naive 19:00 (UTC-clocked box)
+            return fixed_utc.astimezone(tz)
+
+    monkeypatch.setattr(schedule_mod, "datetime", _FrozenNow)
+
+    deps._schedule_storage_singleton().save(_nine_to_five(PL_WORKDAY))
+
+    def _set_timezone(tz_value: str | None) -> None:
+        ss = deps._settings_storage_singleton()
+        data = ss.load().model_dump()
+        data["timezone"] = tz_value
+        ss.save(SystemSettings.model_validate(data))
+
+    try:
+        # tz = Pacific → 19:00 UTC is noon PDT, inside 09:00-17:00 → the rule.
+        _set_timezone("America/Los_Angeles")
+        deps._playback_loop_singleton.cache_clear()
+        assert deps._playback_loop_singleton()._active_playlist_id_fn() == PL_WORKDAY
+
+        # tz unset → naive 19:00 (the UTC-clocked device's wall time) is
+        # OUTSIDE the window → default. Proves coexistence AND reproduces
+        # the old naive behavior the fix corrects for a non-UTC operator.
+        _set_timezone(None)
+        deps._playback_loop_singleton.cache_clear()
+        assert deps._playback_loop_singleton()._active_playlist_id_fn() == DEFAULT_PLAYLIST_ID
+    finally:
+        for s in singletons:
+            s.cache_clear()
