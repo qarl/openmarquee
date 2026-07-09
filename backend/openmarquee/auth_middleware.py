@@ -63,6 +63,13 @@ _WHITELIST_EXACT: frozenset[str] = frozenset(
         "/login",
         "/login.html",
         "/set-password.html",
+        # P0-1d: captive-portal wifi-entry onboarding page. Unauth like
+        # the other first-run shells — a phone on the setup AP reaches it
+        # (via the captive-portal probe redirect) BEFORE any password /
+        # token exists. Its /dist/onboarding.js is covered by the /dist/
+        # prefix whitelist; the /api/onboarding/* endpoints it calls are
+        # already whitelisted below.
+        "/onboarding.html",
         "/index.html",
         "/spike.html",  # ffmpeg-wasm spike page, exercised by smoke.spec.js
         "/styles.css",  # main stylesheet referenced by index.html

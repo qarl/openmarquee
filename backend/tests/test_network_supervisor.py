@@ -157,6 +157,16 @@ class TestNextState:
             == SupervisorState.ONLINE
         )
 
+    def test_degraded_to_connecting_on_new_stored_credentials(self):
+        # P0-1d: re-onboarding via the captive portal from DEGRADED must
+        # route through CONNECTING so an auth failure reaches the
+        # CONNECTING→SETUP edge (and the portal can surface "wrong
+        # password") instead of silently staying DEGRADED.
+        assert (
+            next_state(SupervisorState.DEGRADED, SupervisorEvent.HAS_STORED_CREDENTIALS)
+            == SupervisorState.CONNECTING
+        )
+
     @pytest.mark.parametrize(
         "from_state",
         [

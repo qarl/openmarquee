@@ -175,6 +175,17 @@ def next_state(
     # transition in both concurrent + mutex regimes.
     if s == SupervisorState.SETUP and e == SupervisorEvent.HAS_STORED_CREDENTIALS:
         return SupervisorState.CONNECTING
+    # DEGRADED → CONNECTING when NEW stored creds arrive (P0-1d: the
+    # operator re-onboards via the captive portal — DEGRADED keeps the AP
+    # up, so the portal is reachable). Without this edge a re-submit from
+    # DEGRADED was a no-op that stayed DEGRADED, so a subsequent auth
+    # failure never reached the CONNECTING→SETUP edge and the portal's
+    # status poll could never surface "wrong password" — it just spun.
+    # Routing through CONNECTING makes the same success/auth-fail
+    # classification apply whether onboarding started from SETUP or
+    # DEGRADED.
+    if s == SupervisorState.DEGRADED and e == SupervisorEvent.HAS_STORED_CREDENTIALS:
+        return SupervisorState.CONNECTING
     # CONNECTING → LINGER (concurrent) or ONLINE (mutex) on
     # successful STA association.
     if s == SupervisorState.CONNECTING and e == SupervisorEvent.STA_ASSOCIATED:
