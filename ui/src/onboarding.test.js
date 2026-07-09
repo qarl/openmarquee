@@ -28,12 +28,15 @@ function makeRoot() {
     return root;
 }
 
-// Deterministic mount: instant wait (no real timers), fetch injected.
+// Deterministic mount: instant wait (no real timers), fetch injected,
+// navigate stubbed so success paths don't try to jsdom-navigate.
 function mount(root, fetchImpl, extra = {}) {
     mountOnboarding(root, {
         fetch: fetchImpl,
         wait: () => Promise.resolve(),
         pollIntervalMs: 0,
+        redirectDelayMs: 0,
+        navigate: () => {},
         ...extra,
     });
 }
@@ -95,7 +98,8 @@ describe("mountOnboarding", () => {
                 }),
             };
         });
-        mount(root, fetchImpl);
+        const navigate = vi.fn();
+        mount(root, fetchImpl, { navigate });
 
         $(root, 'input[name="ssid"]').value = "HomeNet";
         $(root, 'input[name="ssid"]').dispatchEvent(new Event("input"));
@@ -114,6 +118,8 @@ describe("mountOnboarding", () => {
         });
         expect($(root, "[data-status]").textContent).toMatch(/connected to homenet/i);
         expect($(root, "[data-done]").hidden).toBe(false);
+        // Hard auto-redirect to the dashboard fired.
+        expect(navigate).toHaveBeenCalledTimes(1);
     });
 
     it("treats LINGER as connected (the default-regime success state)", async () => {
@@ -132,7 +138,8 @@ describe("mountOnboarding", () => {
                 }),
             };
         });
-        mount(root, fetchImpl);
+        const navigate = vi.fn();
+        mount(root, fetchImpl, { navigate });
         $(root, 'input[name="ssid"]').value = "HomeNet";
         $(root, 'input[name="ssid"]').dispatchEvent(new Event("input"));
         $(root, 'input[name="password"]').value = "goodpassword";
@@ -141,6 +148,9 @@ describe("mountOnboarding", () => {
         for (let i = 0; i < 6; i++) await tick();
         expect($(root, "[data-status]").textContent).toMatch(/connected/i);
         expect($(root, "[data-done]").hidden).toBe(false);
+        // LINGER is a connected state → auto-redirect fires (before the
+        // AP tears down on the LINGER→ONLINE transition).
+        expect(navigate).toHaveBeenCalledTimes(1);
     });
 
     it("times out after maxPolls of CONNECTING and re-enables the form", async () => {
@@ -156,7 +166,8 @@ describe("mountOnboarding", () => {
                 json: async () => ({ state: "CONNECTING", wifi_station_state: "CONNECTING" }),
             };
         });
-        mount(root, fetchImpl, { maxPolls: 3 });
+        const navigate = vi.fn();
+        mount(root, fetchImpl, { maxPolls: 3, navigate });
         $(root, 'input[name="ssid"]').value = "HomeNet";
         $(root, 'input[name="ssid"]').dispatchEvent(new Event("input"));
         $(root, 'input[name="password"]').value = "goodpassword";
@@ -168,6 +179,8 @@ describe("mountOnboarding", () => {
         expect(statusCalls.length).toBe(3);
         expect($(root, "[data-status]").textContent).toMatch(/still trying/i);
         expect($(root, 'button[type="submit"]').disabled).toBe(false);
+        // Never redirect on a non-connected outcome.
+        expect(navigate).not.toHaveBeenCalled();
     });
 
     it("shows an error when the sign drops back to SETUP (bad password)", async () => {
@@ -185,7 +198,8 @@ describe("mountOnboarding", () => {
                 json: async () => ({ state, wifi_station_state: state }),
             };
         });
-        mount(root, fetchImpl);
+        const navigate = vi.fn();
+        mount(root, fetchImpl, { navigate });
 
         $(root, 'input[name="ssid"]').value = "HomeNet";
         $(root, 'input[name="ssid"]').dispatchEvent(new Event("input"));
@@ -197,6 +211,8 @@ describe("mountOnboarding", () => {
         expect($(root, "[data-form-error]").textContent).toMatch(/couldn't connect/i);
         expect($(root, 'button[type="submit"]').disabled).toBe(false);
         expect($(root, "[data-done]").hidden).toBe(true);
+        // A rejected password must NOT redirect.
+        expect(navigate).not.toHaveBeenCalled();
     });
 
     it("surfaces a submit-credentials failure without polling", async () => {

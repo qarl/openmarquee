@@ -32,6 +32,12 @@ export function mountOnboarding(root, options = {}) {
     const wait = options.wait || ((ms) => new Promise((r) => setTimeout(r, ms)));
     const pollIntervalMs = options.pollIntervalMs ?? 1000;
     const maxPolls = options.maxPolls ?? 60;
+    // Hard redirect to the dashboard once connected. Injectable for tests.
+    const navigate = options.navigate || (() => {
+        if (typeof window !== "undefined") window.location.assign("/");
+    });
+    // Brief pause so the operator sees "Connected" before we navigate.
+    const redirectDelayMs = options.redirectDelayMs ?? 1200;
 
     const form = root.querySelector('[data-form="onboarding"]');
     if (!form) return;
@@ -95,8 +101,15 @@ export function mountOnboarding(root, options = {}) {
             }
             const state = body?.state;
             if (TERMINAL_OK.has(state)) {
-                setStatus(`Connected to ${body.wifi_station_ssid || ssid}.`, "ok");
+                setStatus(`Connected to ${body.wifi_station_ssid || ssid}. Taking you to your sign…`, "ok");
+                // Show the manual link too, as a fallback if the auto-
+                // redirect is blocked. Redirect NOW (during LINGER, while
+                // the setup AP is still up) — waiting for full ONLINE would
+                // race the AP teardown and strand the phone on a dead
+                // captive-portal origin.
                 if (doneEl) doneEl.hidden = false;
+                await wait(redirectDelayMs);
+                navigate();
                 return "connected";
             }
             if (state === "SETUP") {
@@ -160,9 +173,20 @@ export function mountOnboarding(root, options = {}) {
     });
 }
 
+import { mountPwaInstallPrompt } from "./pwa-install-prompt.js";
+
 // Auto-mount on the real page (skipped in tests, which import + call
 // mountOnboarding directly against a fixture root).
 if (typeof document !== "undefined") {
     const root = document.querySelector("[data-onboarding-root]");
     if (root) mountOnboarding(root);
+    // PWA "bookmark moment" — mirror welcome.js. Non-fatal: onboarding
+    // MUST keep working even if pwa-install-prompt.js is missing from a
+    // stale captive-portal dist.
+    try {
+        const slot = document.getElementById("pwa-install-slot");
+        if (slot) mountPwaInstallPrompt(slot);
+    } catch (err) {
+        console.warn("pwa install prompt mount failed (non-fatal):", err);
+    }
 }

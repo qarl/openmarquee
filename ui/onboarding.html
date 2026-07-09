@@ -142,6 +142,12 @@
                 Just want to use the sign as-is?
                 <a href="/">Skip — continue without WiFi</a>
             </p>
+
+            <!-- PWA "bookmark moment" (spec §"Finding the device after
+                 onboarding" #2): onboarding.js mounts the install prompt
+                 here so the operator can add the sign to their home
+                 screen. Silent no-op where unsupported. -->
+            <div id="pwa-install-slot" aria-live="polite"></div>
         </section>
     </main>
     <script type="module" src="/dist/onboarding.js"></script>
