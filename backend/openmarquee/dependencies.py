@@ -846,8 +846,6 @@ def get_demo_video_path() -> Path:
 
 @lru_cache
 def _playback_loop_singleton() -> PlaybackLoop:
-    from datetime import datetime
-
     from openmarquee.playback import scheduled_fetch_items
 
     storage = _content_storage_singleton()
@@ -866,11 +864,16 @@ def _playback_loop_singleton() -> PlaybackLoop:
     loop_holder: dict = {}
 
     def fetch():
+        from openmarquee.schedule import schedule_now
+
         active_id, items = scheduled_fetch_items(
             storage,
             playlist_storage,
             schedule_storage,
-            datetime.now(),
+            # Evaluate the schedule in the operator's configured timezone
+            # (same source as the on-screen clock) so a 09:00-17:00 rule
+            # fires by their wall clock, not the device's process clock.
+            schedule_now(settings_storage.load().timezone),
         )
         loop = loop_holder.get("loop")
         if loop is not None:
@@ -887,9 +890,14 @@ def _playback_loop_singleton() -> PlaybackLoop:
         # probe the loop re-evaluates each slot so a schedule switch
         # preempts the running playlist. Just the schedule file read +
         # the pure schedule eval — no content/playlist load.
-        from openmarquee.schedule import evaluate_schedule
+        from openmarquee.schedule import evaluate_schedule, schedule_now
 
-        return evaluate_schedule(datetime.now(), schedule_storage.load())
+        # Same configured-timezone evaluation as fetch() above, so the
+        # "which playlist now" probe agrees with the scheduled fetch.
+        return evaluate_schedule(
+            schedule_now(settings_storage.load().timezone),
+            schedule_storage.load(),
+        )
 
     async def web_screenshot_producer(slide, width: int, height: int) -> bool:
         # Web slide: the screenshot-refresh producer the playback loop
