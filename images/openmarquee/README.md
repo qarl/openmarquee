@@ -61,12 +61,38 @@ Both flows converge on the same end-state: wifi creds in settings.json,
 admin password set, device on operator's home wifi + AP up for
 re-onboarding if needed.
 
-## How to build an image
+## How to build a handover SD card (the 3-step flow)
+
+⚠️ **`build-image.sh` produces a BASE image, not a flashable-standalone one.**
+The pi-gen image bakes the OS + packages + boot-config (`cma=320M`,
+`gpu_mem=128`) + the plymouth splash — but **NOT the app code**. The
+openMarquee code (`/opt/openmarquee`) is delivered by a bundle that
+`stage_sd_card.sh` overlays onto the card, along with the
+extract-then-install `user-data`. Flashing the base image *standalone*
+boots to a device with no app (it will say so on the console + drop a
+`/var/lib/openmarquee/.provision-error` marker — see `cloud-init/user-data`).
+
+The complete handover flow is three steps, **in order**:
 
 ```bash
+# 1. Base image (OS + packages + boot-config + splash), pi-gen in Docker.
 bash scripts/build-image.sh --ssh-key ~/.ssh/id_ed25519.pub
-# → drops /tmp/openmarquee-pi-image-<date>.img.xz
+#    → /tmp/openmarquee-pi-image-<date>.img.xz
+
+# 2. Fresh code bundle. REBUILD ui + renderer FIRST or build_sd_bundle
+#    fails loud (it refuses to ship a stale ui/dist or renderer binary):
+(cd ui && npm run build)
+bash scripts/renderer_cross_build.sh
+bash scripts/build_sd_bundle.sh
+#    → dist/openmarquee-sd-bundle.tar.zst
+
+# 3. Flash the base image to the SD, then overlay the bundle + cloud-init:
+bash scripts/stage_sd_card.sh /Volumes/bootfs      # (or the card's bootfs mount)
 ```
+
+Only after step 3 is the card a complete, self-provisioning openMarquee
+sign. (First boot extracts the bundle to `/opt/openmarquee` and runs
+`install.sh`.)
 
 Phase B legs landed:
 - B.1: pi-gen config (this directory)
