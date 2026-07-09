@@ -1,0 +1,42 @@
+# openMarquee mini renderer — the boot-default video fallback.
+#
+# The smallest possible renderer: gst-launch (v4l2h264dec -> kmssink)
+# looping video, with ZERO shared code with openmarquee-render. Two
+# roles:
+#   1. First-boot / no-backend default so a fresh sign is never DARK.
+#   2. The Layer-3 stability-cap rest-state: when the reboot-loop cap
+#      trips, the promoter leaves mini running instead of the backend.
+#
+# Enabled at boot (install.sh, unconditionally). The stability promoter
+# stops mini before starting the Python backend; backend.service also
+# has `ExecStartPre=-systemctl stop openmarquee-mini.service` so codec
+# ownership (/dev/video10 + DRM master) is handed over race-free.
+#
+# ExecStart is scripts/mini-play.sh, installed to /usr/local/bin. The
+# script self-selects clips: playlist.json -> staged content -> a
+# bundled welcome clip (generalized 2026-07-09, GAP1 — no hardcoded
+# content UUIDs).
+[Unit]
+Description=openMarquee mini renderer (gstreamer looping video boot-default)
+After=multi-user.target
+# Reconcile 2026-07-09: give the never-dark fallback a GENEROUS restart
+# budget instead of systemd's default (~5 starts / 10s). The live
+# captured unit omitted StartLimit* — folding it verbatim would let a
+# burst of transient failures (e.g. OOM-kills of the mini cgroup under
+# memory pressure) latch the unit `failed` in ~10s and never recover
+# until reboot, defeating the whole "sign is never dark" purpose (and
+# in the L3 capped rest-state nothing re-runs it). 10 starts / 60s per
+# the project's StartLimit convention keeps transient failures
+# retrying while still bounding a genuinely terminal loop (e.g. no
+# clips at all) so it can't tight-loop-burn the SD.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mini-play.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
