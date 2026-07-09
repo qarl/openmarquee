@@ -204,9 +204,11 @@ class TextLayer(BaseModel):
     drop_shadow: bool = False
     # Layer opacity, 0–1. Composited by the renderer when < 1.
     opacity: float = Field(default=1.0, ge=0.0, le=1.0)
-    # Vertical anchor INSIDE the box. The current renderer always
-    # center-anchors; editor stores this for forward-compat with
-    # top/bottom layout (next render-side commit).
+    # Vertical anchor INSIDE the box. Honored end-to-end: the renderer
+    # offsets the text block per this field (hdmi.rs draw_text_layer_msdf
+    # → parse_v_align → box_to_ndc_quad, "v1.0 close" 2026-05-30) and the
+    # editor sets it via the "Vertical" control (2026-07-08). The Canvas2D
+    # preview (rasterize.js) mirrors the same placement.
     anchor: Literal["top", "center", "bottom"] = "center"
     # Editor-driven hide toggle (the eye icon on each layer card).
     # Hidden layers are excluded from save-time rasterization so the

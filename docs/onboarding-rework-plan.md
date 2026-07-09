@@ -1,6 +1,7 @@
 # Onboarding rework plan — AP+STA concurrency on Pi Zero 2 W
 
 **Status:** P0 plan, awaiting QA review-in-parallel; P1 work proceeds.
+**Shipped since (2026-07-08 recovery + P0-1d + P1 arc):** P2 captive-portal probe responders (302→portal, PRs #57), the POST-then-associate wifi-entry page (#57), P3 setup-mode 30-min auto-off timer (#54) + re-enter-Setup-Mode API (A2, #51), P5 3×-power-cycle→Setup gesture (#55), P6 Add-to-Home on the onboarding/LINGER landing (#58), plus device restart (#53) + factory reset (#56). Bullets below marked `[SHIPPED]` where done; the crash-loop / 5-boot-factory-reset half of P5 and the STA_SSID_NOT_FOUND→DEGRADED edge remain open.
 **Canonical spec:** `~/project/openmarquee/qa/spec-onboarding-ap-sta-concurrent-2026-06-10.md` (qarl-direct, 2026-06-10).
 **Author:** jimmy:openmarquee-code2 (acting on QA-DISPATCH onboarding-P0).
 
@@ -173,17 +174,18 @@ mutually exclusive — comitup pattern).
 
 Per spec §"Captive portal plumbing":
 
-- POST-then-associate flow: portal form POSTs to
-  `/api/onboarding/submit-credentials`; the API immediately returns
-  a "connecting — this network may blip for a few seconds" page that
-  polls `/api/onboarding/status` every 1s. The supervisor handles
+- **[SHIPPED #57]** POST-then-associate flow: the `onboarding.html` wifi-entry
+  page POSTs `/api/onboarding/submit-credentials`, then polls
+  `/api/onboarding/status` every 1s and reflects the state machine
+  (SETUP→CONNECTING→LINGER/ONLINE, or back to SETUP on a bad password). The supervisor handles
   the actual STA association in the background; status endpoint
   returns the current state-machine state.
-- Captive-portal probe responders: backend handlers for
-  `captive.apple.com/hotspot-detect.html` + Android's
-  `connectivitycheck.gstatic.com/generate_204` redirect to portal
-  (currently they hit dnsmasq's wildcard but the FastAPI app needs
-  to answer with 302→ portal, not 204).
+- **[SHIPPED #57]** Captive-portal probe responders: `CaptivePortalMiddleware`
+  302s the well-known probe paths (`captive.apple.com/hotspot-detect.html`,
+  Android `connectivitycheck.gstatic.com/generate_204`, Windows/Firefox
+  equivalents) to `http://10.0.0.1/onboarding.html`. dnsmasq's wildcard
+  points every host at us; the FastAPI app now answers with the 302 (not a
+  404/401/204) so the OS captive sheet auto-opens the portal.
 - dnsmasq wildcard: already in place (verified §A).
 
 ### P3 — State machine product behavior
@@ -195,9 +197,12 @@ Per spec §"Onboarding state machine":
   bindings (interface stays up but unannounced; the marquee status
   card surface uses the same path to bring it back).
 - DEGRADED entry: AP comes back up, retry STA with backoff.
-- Auto-off timer for AP after manual re-entry (30 min default).
-- Re-enter Setup Mode from the web UI (POST
-  `/api/onboarding/setup-mode-on`).
+- **[SHIPPED #54]** Auto-off timer for AP after manual re-entry (30 min
+  default) — `SETUP_MODE_TIMER_EXPIRED` fires SETUP→ONLINE when an
+  operator-requested setup mode idles past the window.
+- **[SHIPPED #51 (A2)]** Re-enter Setup Mode from the web UI (POST
+  `/api/network-supervisor/enter-setup-mode` — the shipped path; the
+  supervisor fires `OPERATOR_REQUESTED_SETUP_MODE`).
 
 ### P4 — Marquee as status surface
 
@@ -231,9 +236,14 @@ Per spec §"No-button hardware":
   initialization succeeds (guard against crash-loop wiping its own
   config). Background timer resets to 0 after 60s of uptime.
 - Supervisor reads the counter at startup:
-  - 3 boots → enter SETUP without discarding credentials.
+  - **[SHIPPED #55 (A1)]** 3 boots → enter SETUP without discarding
+    credentials (disk counter at `/var/openmarquee/boot-cycle-count` +
+    `openmarquee-boot-gesture-clear.timer` stable-boot reset; the backend
+    consumes the tmpfs `boot-hint` → `OPERATOR_REQUESTED_SETUP_MODE`).
   - 5+ boots → factory reset (discard credentials, return to
-    virgin SETUP).
+    virgin SETUP). *(Open: the 5-boot auto-factory-reset is not wired to
+    the counter; A3 factory reset (#56) is operator-triggered via the API,
+    not boot-count-driven.)*
 - Crash-loop counter SEPARATE from the user-gesture counter,
   separate behavior (enter safe mode, no config wipe).
 - Marquee boot-card text: "Restart 2× more for Setup Mode" when
