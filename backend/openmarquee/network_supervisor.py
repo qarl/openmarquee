@@ -1579,9 +1579,10 @@ class NetworkSupervisor:
         """
         # AP lifecycle. QA cross-lane review (PR2 NIT N1): the
         # entering-ONLINE branch must be gated on STA actually being
-        # associated, otherwise the unwired SETUP_MODE_TIMER_EXPIRED
-        # edge (SETUP -> ONLINE) would tear down the AP without an
-        # STA association = user stranded. The two edges where STA
+        # associated, otherwise the SETUP_MODE_TIMER_EXPIRED edge
+        # (SETUP -> ONLINE) — wired to the setup-mode auto-off timer
+        # since 2026-07-08 — would tear down the AP without an STA
+        # association = user stranded. The two edges where STA
         # is definitely up are LINGER->ONLINE (concurrent regime,
         # STA just associated + grace expired) and CONNECTING/
         # DEGRADED->ONLINE in the mutex regime (STA just

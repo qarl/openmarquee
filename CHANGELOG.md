@@ -15,7 +15,36 @@ time with a deprecation-warning print (e.g. `0.5.0-beta` → `0.5.0b0`,
 literal version string is preserved across all four component
 locations for cross-ecosystem readability.
 
-## [1.0.1] - 2026-06-DD — DRAFT (not yet tagged)
+## [Unreleased]
+
+Work landed after the 1.0.1 draft cutoff (`5c5ff39`, 2026-06-03). Tag
+assignment is qarl's call; grouped here per Keep-a-Changelog.
+
+### Added
+- **Recovery cluster** — operator-triggered device restart
+  (`POST /api/system/restart`, #53) and factory reset
+  (`POST /api/system/factory-reset`, destructive + confirm-token gated,
+  #56), both crossing the privilege boundary via the root netctl daemon;
+  the "3× power-cycle → Setup Mode" boot gesture (disk counter + stable-boot
+  clear timer, #55); the setup-mode 30-minute auto-off timer (#54); and the
+  operator "enter Setup Mode" API (A2, #51).
+- **Captive-portal onboarding (P0-1d)** — a middleware that 302-redirects OS
+  captive-portal probes to the web UI so a phone joining the setup AP
+  auto-opens the portal, plus a new unauth wifi-entry onboarding page that
+  POSTs credentials and polls the supervisor state to completion (#57); a
+  PWA "Add to Home Screen" prompt on the onboarding page and a hard
+  redirect to the dashboard once the sign connects (#58).
+- **Vertical text alignment** — text layers honor a top/center/bottom
+  `anchor` end-to-end; the editor gained a "Vertical" control and the
+  Canvas2D preview matches the renderer's placement (#59). (The renderer
+  already honored `anchor`; the gap was the editor never setting it.)
+
+### Fixed
+- Three flaky timing tests made deterministic (poll-until-condition /
+  event-gated synchronization, no loosened assertions), proven zero-flake
+  under load (#52).
+
+
 
 **DRAFT release notes.** The 1.0.1 tag + RELEASE commit are
 qarl's call. These notes cover everything between `v1.0.0`
