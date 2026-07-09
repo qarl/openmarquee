@@ -214,6 +214,35 @@ describe("paintLayer line-height (Rust-canonical layout)", () => {
         expect(calls[1].y).toBeLessThan(calls[2].y);
     });
 
+    it("vertical anchor top/center/bottom shifts the block (matches renderer valign)", () => {
+        // v1.0 §5.10a: layer.anchor places the text block at the box top,
+        // center, or bottom — mirroring the renderer's box_to_ndc_quad
+        // valign offset. Single line "X": ink extent = ascent(75)+descent(25)
+        // = 100 in a 1000px-tall box (no squish).
+        const baselineFor = (anchor) => {
+            const canvas = makeStubbedCanvas();
+            drawCanvas(canvas, {
+                text: "X",
+                fontSize: 100,
+                box: { x: 0, y: 0, w: 1, h: 1 },
+                anchor,
+            });
+            return canvas._calls[0].y;
+        };
+        const top = baselineFor("top");
+        const center = baselineFor("center");
+        const bottom = baselineFor("bottom");
+        // Monotonic top → bottom.
+        expect(top).toBeLessThan(center);
+        expect(center).toBeLessThan(bottom);
+        // Exact placements: top block-top at box-top (baseline = ascent 75);
+        // center baseline at 525; bottom block-bottom at box-bottom
+        // (baseline = 1000 - descent 25 = 975).
+        expect(top).toBeCloseTo(75, 0);
+        expect(center).toBeCloseTo(525, 0);
+        expect(bottom).toBeCloseTo(975, 0);
+    });
+
     it("uses integer rounding so 1.1 * fontSize is snapped (size=54 → 59)", () => {
         // size 54 * 1.1 = 59.4. Pre-fix used the float; Rust rounds.
         // After fix, line stride is exactly 59 (not 59.4) per

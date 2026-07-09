@@ -267,6 +267,15 @@ const LAYER_GROUP_TEMPLATE = `
             <input type="hidden" class="field-text-align" value="center">
         </div>
         <div class="om-field">
+            <span>Vertical</span>
+            <div class="editor-segmented field-text-anchor-segmented" role="group" aria-label="vertical alignment">
+                <button type="button" data-value="top" aria-pressed="false">Top</button>
+                <button type="button" data-value="center" aria-pressed="true">Middle</button>
+                <button type="button" data-value="bottom" aria-pressed="false">Bottom</button>
+            </div>
+            <input type="hidden" class="field-text-anchor" value="center">
+        </div>
+        <div class="om-field">
             <span>Dynamic Text</span>
             <div class="editor-segmented field-auto-mode-segmented" role="group" aria-label="dynamic source">
                 <button type="button" data-value="" aria-pressed="true">Off</button>
@@ -673,6 +682,9 @@ export function mountEditor(
         fields.autoFormat = fields.autoMode ? fmtEl.value || null : null;
         const textAlignEl = groupEl.querySelector(".field-text-align");
         fields.textAlign = textAlignEl ? textAlignEl.value || "center" : "center";
+        // Vertical anchor (top/center/bottom) inside the layer box.
+        const anchorEl = groupEl.querySelector(".field-text-anchor");
+        fields.anchor = anchorEl ? anchorEl.value || "center" : "center";
         const motionEl = groupEl.querySelector(".field-motion");
         fields.motion = motionEl ? motionEl.value || "static" : "static";
         const blendEl = groupEl.querySelector(".field-blend");
@@ -874,6 +886,22 @@ export function mountEditor(
                     if (textAlignEl.value === value) return;
                     textAlignEl.value = value;
                     refreshSegmentedPressed(textAlignSegEl, value);
+                    syncLayerFromForm(groupEl);
+                    autoSave?.kick();
+                });
+            });
+        }
+
+        // Vertical-anchor segmented control — same pattern as text-align.
+        const anchorSegEl = groupEl.querySelector(".field-text-anchor-segmented");
+        const anchorEl = groupEl.querySelector(".field-text-anchor");
+        if (anchorSegEl && anchorEl) {
+            anchorSegEl.querySelectorAll("button").forEach((btn) => {
+                btn.addEventListener("click", () => {
+                    const value = btn.dataset.value;
+                    if (anchorEl.value === value) return;
+                    anchorEl.value = value;
+                    refreshSegmentedPressed(anchorSegEl, value);
                     syncLayerFromForm(groupEl);
                     autoSave?.kick();
                 });
@@ -1120,6 +1148,13 @@ export function mountEditor(
         refreshSegmentedPressed(
             groupEl.querySelector(".field-text-align-segmented"),
             textAlignVal,
+        );
+        const anchorVal = layer.anchor || "center";
+        const anchorFieldEl = groupEl.querySelector(".field-text-anchor");
+        if (anchorFieldEl) anchorFieldEl.value = anchorVal;
+        refreshSegmentedPressed(
+            groupEl.querySelector(".field-text-anchor-segmented"),
+            anchorVal,
         );
         motionEl.value = layer.motion || "static";
         const blendEl = groupEl.querySelector(".field-blend");
@@ -1519,6 +1554,7 @@ export function mountEditor(
             auto_mode: layer.autoMode || null,
             auto_format: layer.autoMode ? layer.autoFormat || null : null,
             text_align: layer.textAlign || "center",
+            anchor: layer.anchor || "center",
             motion: layer.motion || "static",
             motion_intensity: layer.motionIntensity ?? 50,
             motion_phase: layer.motionPhase ?? 0,
@@ -1663,6 +1699,7 @@ export function mountEditor(
             autoMode: wire?.auto_mode || null,
             autoFormat: wire?.auto_format || null,
             textAlign: wire?.text_align || "center",
+            anchor: wire?.anchor || "center",
             motion: wire?.motion || "static",
             motionIntensity: wire?.motion_intensity ?? 50,
             motionPhase: wire?.motion_phase ?? 0,

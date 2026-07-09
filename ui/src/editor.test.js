@@ -462,6 +462,30 @@ describe("mountEditor — submit flow", () => {
         expect(onSave.mock.calls[0][0].text_layers[0].auto_format).toBe("time_hms");
     });
 
+    it("picking a vertical anchor rides through save as text_layers[].anchor", async () => {
+        // v1.0 §5.10a: the Vertical segmented control (Top/Middle/Bottom)
+        // drives a hidden .field-text-anchor that performSave maps to the
+        // wire `anchor`. The renderer already honors it (parse_v_align);
+        // this closes the editor-side gap.
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue({ id: "x" });
+        const handle = mountEditor(container, { width: 128, height: 96, onSave });
+
+        // Default is center.
+        expect(container.querySelector(".field-text-anchor").value).toBe("center");
+
+        container
+            .querySelector('.field-text-anchor-segmented button[data-value="bottom"]')
+            .click();
+        expect(container.querySelector(".field-text-anchor").value).toBe("bottom");
+
+        container.querySelector(".field-text").value = "Footer line";
+        container.querySelector(".field-text").dispatchEvent(new Event("input"));
+        await handle.flushAutoSave();
+        expect(onSave.mock.calls[0][0].text_layers[0].anchor).toBe("bottom");
+    });
+
     it("switching the auto_mode repopulates the format dropdown with the new options", async () => {
         patchCanvasPrototype();
         const container = document.createElement("div");
@@ -713,6 +737,29 @@ describe("mountEditor — submit flow", () => {
         expect(onSaveExisting).toHaveBeenCalledTimes(1);
         expect(onSave).not.toHaveBeenCalled();
         expect(onSaveExisting.mock.calls[0][0]).toBe("abc");
+    });
+
+    it("loadForEdit hydrates a persisted vertical anchor into the control", async () => {
+        patchCanvasPrototype();
+        const container = document.createElement("div");
+        const handle = mountEditor(container, {
+            width: 128,
+            height: 96,
+            onSave: vi.fn(),
+            onSaveExisting: vi.fn().mockResolvedValue({ id: "abc" }),
+        });
+        await handle.loadForEdit({
+            type: "text_slide",
+            id: "abc",
+            name: "Footer",
+            text_layers: [{ text: "FOOT", anchor: "top" }],
+        });
+        // Hidden input + segmented aria-pressed both reflect the saved value.
+        expect(container.querySelector(".field-text-anchor").value).toBe("top");
+        const pressed = container.querySelector(
+            '.field-text-anchor-segmented button[aria-pressed="true"]',
+        );
+        expect(pressed.dataset.value).toBe("top");
     });
 
     it("dragging the SE handle commits new box dims into the autosave payload (qarl §5.10a fu)", async () => {
