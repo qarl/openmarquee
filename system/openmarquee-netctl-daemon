@@ -83,6 +83,12 @@ ALLOWLIST = frozenset(
         # reboot. `reboot` → `systemctl reboot`; no payload. Guarded by
         # this allowlist + the bash helper's argv contract.
         "reboot",
+        # 2026-07-08 (recovery cluster A3): the privileged half of a
+        # factory reset — delete saved NM wifi profiles + remove
+        # wpa/NM-unmanaged config, then reboot. Preserves AP identity +
+        # hostname. No payload. The destructive operator-data wipe runs
+        # backend-side first; the API gates this behind a confirm token.
+        "factory-reset",
     }
 )
 

@@ -1224,4 +1224,86 @@ describe("mountSettings", () => {
             expect(container.querySelector(".device-restart-go").disabled).toBe(false);
         });
     });
+
+    describe("device factory reset (recovery A3)", () => {
+        function mockFetch(resetImpl) {
+            return vi.spyOn(globalThis, "fetch").mockImplementation(
+                async (url, init) => {
+                    if (typeof url === "string" && url.includes("/api/system/factory-reset")) {
+                        return resetImpl(url, init);
+                    }
+                    return { ok: true, status: 200, json: async () => ({}) };
+                },
+            );
+        }
+
+        async function mountWith(reset) {
+            const container = document.createElement("div");
+            const spy = mockFetch(reset);
+            mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
+            await tick();
+            return { container, spy };
+        }
+
+        it("renders a factory-reset control with the Erase button disabled", async () => {
+            const { container } = await mountWith(() => ({ ok: true, status: 202, json: async () => ({}) }));
+            expect(container.querySelector(".device-factory-btn")).toBeTruthy();
+            expect(container.querySelector(".device-factory-confirm").hidden).toBe(true);
+            expect(container.querySelector(".device-factory-go").disabled).toBe(true);
+        });
+
+        it("Erase stays disabled until the exact phrase is typed", async () => {
+            const { container } = await mountWith(() => ({ ok: true, status: 202, json: async () => ({}) }));
+            container.querySelector(".device-factory-btn").click();
+            const input = container.querySelector(".device-factory-input");
+            const go = container.querySelector(".device-factory-go");
+            input.value = "factory";
+            input.dispatchEvent(new Event("input"));
+            expect(go.disabled).toBe(true);
+            input.value = "factory-reset";
+            input.dispatchEvent(new Event("input"));
+            expect(go.disabled).toBe(false);
+        });
+
+        it("confirming POSTs with the confirm token and shows a terminal status", async () => {
+            const { container, spy } = await mountWith(() => ({
+                ok: true,
+                status: 202,
+                json: async () => ({ status: "resetting" }),
+            }));
+            container.querySelector(".device-factory-btn").click();
+            const input = container.querySelector(".device-factory-input");
+            input.value = "factory-reset";
+            input.dispatchEvent(new Event("input"));
+            container.querySelector(".device-factory-go").click();
+            await tick();
+            const call = spy.mock.calls.find(
+                ([u]) => typeof u === "string" && u.includes("/api/system/factory-reset"),
+            );
+            expect(call).toBeDefined();
+            expect(call[1].method).toBe("POST");
+            expect(JSON.parse(call[1].body)).toEqual({ confirm: "factory-reset" });
+            expect(container.querySelector(".device-factory-status").textContent).toMatch(
+                /erasing and restarting/i,
+            );
+        });
+
+        it("surfaces a failure and restores the controls (disabled until re-typed)", async () => {
+            const { container } = await mountWith(() => ({
+                ok: false,
+                status: 503,
+                json: async () => ({ detail: "factory reset unavailable: netctl socket not found" }),
+            }));
+            container.querySelector(".device-factory-btn").click();
+            const input = container.querySelector(".device-factory-input");
+            input.value = "factory-reset";
+            input.dispatchEvent(new Event("input"));
+            container.querySelector(".device-factory-go").click();
+            await tick();
+            const status = container.querySelector(".device-factory-status");
+            expect(status.textContent).toMatch(/factory reset failed/i);
+            // reset() cleared the input, so Erase is disabled again.
+            expect(container.querySelector(".device-factory-go").disabled).toBe(true);
+        });
+    });
 });
