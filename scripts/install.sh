@@ -925,9 +925,17 @@ if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ]; then
     say "Enable persistent journal"
     JOURNALD_DROPIN="/etc/systemd/journald.conf.d/openmarquee-persistent.conf"
     mkdir -p "$(dirname "$JOURNALD_DROPIN")"
+    # Handover reconcile 2026-07-09 (GAP8): cap the persistent journal
+    # so it can't grow unbounded and fill the SD card (which compounds
+    # the swap pressure GAP7 mitigates). SystemMaxUse bounds the
+    # on-disk journal at /var/log/journal; RuntimeMaxUse bounds the
+    # tmpfs journal before persistence takes over. Folds the live
+    # sign's 99-openmarquee-cap.conf values into this same drop-in.
     cat > "$JOURNALD_DROPIN" <<'JOURNALD_EOF'
 [Journal]
 Storage=persistent
+SystemMaxUse=300M
+RuntimeMaxUse=64M
 JOURNALD_EOF
     mkdir -p /var/log/journal
     # systemd-journal group exists on stock trixie. Resolve by NAME (not
@@ -945,7 +953,40 @@ JOURNALD_EOF
     # effort; failure here is non-fatal (next reboot picks it up anyway).
     systemctl restart systemd-journald 2>/dev/null || true
 elif [ "$DRY_RUN" -eq 1 ]; then
-    say "DRYRUN: would enable persistent journal at /var/log/journal"
+    say "DRYRUN: would enable persistent journal at /var/log/journal (cap 300M/64M)"
+fi
+
+# --- 7c-2. Kernel + watchdog tuning drop-ins --------------------------------
+#
+# Handover reconcile 2026-07-09: fold two deploy-only tuning files into
+# BOTH the pi-gen image and the redeploy path (DST carries $ROOT_PREFIX
+# so the offline build bakes them too); only the live sysctl reload is
+# gated to a real device.
+#   GAP7  vm.swappiness=10                 -> /etc/sysctl.d/
+#         (SD-swap-thrash mitigation for the text reel)
+#   GAP9  cma-watchdog THRESHOLD/COOLDOWN  -> /etc/default/
+#         (reconciled for the 320M pool: THRESHOLD_MB=300)
+
+SWAPPINESS_DST="${ROOT_PREFIX}/etc/sysctl.d/99-openmarquee-swappiness.conf"
+say "Install vm.swappiness=10 drop-in (GAP7)"
+run mkdir -p "$(dirname "$SWAPPINESS_DST")"
+run install -m 0644 "${OPT_DIR}/system/99-openmarquee-swappiness.conf" "$SWAPPINESS_DST"
+
+CMA_WATCHDOG_DEFAULT_DST="${ROOT_PREFIX}/etc/default/openmarquee-cma-watchdog"
+say "Install openmarquee-cma-watchdog default (GAP9: THRESHOLD_MB=300 for 320M pool)"
+run mkdir -p "$(dirname "$CMA_WATCHDOG_DEFAULT_DST")"
+run install -m 0644 "${OPT_DIR}/system/openmarquee-cma-watchdog.default" "$CMA_WATCHDOG_DEFAULT_DST"
+
+# Apply swappiness now on a real device (the build host has no running
+# kernel to sysctl into; the drop-in still applies on the target's next
+# boot regardless). cma-watchdog.default needs no reload — the watchdog
+# sources /etc/default on each timer fire.
+if [ -z "$ROOT_PREFIX" ] && [ "$DRY_RUN" -eq 0 ]; then
+    say "Apply sysctl (vm.swappiness=10)"
+    sysctl --system >/dev/null 2>&1 \
+        || say "  WARN: sysctl --system failed; vm.swappiness applies on next boot"
+elif [ "$DRY_RUN" -eq 1 ]; then
+    say "DRYRUN: would sysctl --system to apply vm.swappiness=10"
 fi
 
 # --- 7d. Boot splash --------------------------------------------------------
