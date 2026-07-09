@@ -304,6 +304,7 @@ fi
 say "Install systemd units"
 run mkdir -p "$SYSTEMD_DIR"
 for unit in openmarquee-backend.service openmarquee-ap0.service openmarquee-tailscale.service \
+            openmarquee-mini.service \
             openmarquee-cma-watchdog.service openmarquee-cma-watchdog.timer \
             openmarquee-best-wifi.service openmarquee-best-wifi.timer \
             openmarquee-wifi-powersave-off.service \
@@ -1392,28 +1393,40 @@ run systemctl mask openmarquee-ap0.service hostapd.service dnsmasq.service || tr
 # this enforces the scenario-B boot config.
 run systemctl disable openmarquee-backend.service || true
 
-# Stability arc Layer 3 (2026-06-23 post-review): ensure mini
-# is enabled-at-boot so the cap "stay on stable mini" rest-state
-# is guaranteed. mini's unit (openmarquee-mini.service) is not
-# in THIS build tree (it ships separately, exists on FYS from a
-# prior install). If the unit file isn't present, log loudly +
-# continue — the promoter's `systemctl stop openmarquee-mini.
-# service` will then no-op (no unit to stop), and the cap
-# rest-state will be empty scanout = DARK sign + alert via
-# journal. Operator must restore mini's unit file from the
-# rollback source.
-if systemctl list-unit-files openmarquee-mini.service >/dev/null 2>&1 \
-    && [ "$(systemctl is-enabled openmarquee-mini.service 2>/dev/null || echo missing)" != "missing" ]; then
-    say "Ensure openmarquee-mini.service enabled-at-boot (boot-default + cap rest-state)"
-    run systemctl enable openmarquee-mini.service || true
+# Stability arc Layer 3 (2026-06-23) + handover reconcile 2026-07-09
+# (GAP1): the mini boot-default chain now ships wholly in-tree. mini's
+# unit (openmarquee-mini.service, copied in §3 above) runs
+# scripts/mini-play.sh, which loops video via gstreamer so a fresh
+# sign is never DARK — both the first-boot default AND the L3 cap
+# "stay on stable mini" rest-state. Install the script + a bundled
+# welcome clip, then enable UNCONDITIONALLY. (Pre-reconcile this only
+# enabled "if already present" because mini lived only on FYS from a
+# prior manual install; now the whole chain is in the repo, so a fresh
+# Jason sign gets it too.)
+MINI_PLAY_DST="${ROOT_PREFIX}/usr/local/bin/mini-play.sh"
+say "Install mini-play.sh (GAP1 boot-default renderer)"
+run mkdir -p "$(dirname "$MINI_PLAY_DST")"
+run install -m 0755 "${OPT_DIR}/scripts/mini-play.sh" "$MINI_PLAY_DST"
+
+# Bundled welcome clip: mini's last-resort fallback when the sign has
+# no playlist/content yet. Sourced from the seed asset (H264 1080p,
+# baked into the image + rsynced on deploy) and copied to a clean
+# canonical path (no spaces) for the gst filesrc. Non-fatal if the
+# source is somehow absent — mini still plays playlist/content when
+# present; only a truly empty sign would then be dark.
+MINI_WELCOME_SRC="${OPT_DIR}/backend/openmarquee/seed_assets/videos/Hearth Fire.mp4"
+MINI_WELCOME_DST="${ROOT_PREFIX}/opt/openmarquee/assets/welcome.mp4"
+if [ -f "$MINI_WELCOME_SRC" ]; then
+    say "Install mini welcome clip -> ${MINI_WELCOME_DST}"
+    run mkdir -p "$(dirname "$MINI_WELCOME_DST")"
+    run install -m 0644 "$MINI_WELCOME_SRC" "$MINI_WELCOME_DST"
 else
-    say "WARNING: openmarquee-mini.service not installed on this system."
-    say "  The L3 cap rest-state requires mini as the safe fallback."
-    say "  Without it: a capped sign goes DARK + journal logs"
-    say "  [stability] reboot_loop_cap_reached but no mini takes over."
-    say "  Action: restore openmarquee-mini.service from rollback or"
-    say "  re-add to /etc/systemd/system + systemctl enable + reboot."
+    say "  WARNING: mini welcome clip source missing (${MINI_WELCOME_SRC});"
+    say "  mini falls back to playlist/content only (empty sign would be DARK)."
 fi
+
+say "Enable openmarquee-mini.service at boot (boot-default + L3 cap rest-state)"
+run systemctl enable openmarquee-mini.service || true
 
 # Stability arc Layer 3 (2026-06-23): enable the post-reboot
 # promoter. Runs once at boot (Type=oneshot), reads the
