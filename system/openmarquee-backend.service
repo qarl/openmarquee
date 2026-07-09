@@ -113,15 +113,34 @@ Environment="OPENMARQUEE_DISABLE_DEV=1"
 # scanout via vc4 HVS instead of per-tick PIL composite. Falls back
 # to MockRenderer at startup if DRM init fails (see app.py lifespan).
 #
-# Phase 7 slice 3 (2026-05-13): the Rust IPC sidecar is opt-in via
-# OPENMARQUEE_RENDERER=rust-sidecar (flip the line below). Default
-# stays `auto` per the Phase 7 migration plan -- operators opt in
-# explicitly after slice-4 playback.py bypass + V4L2 video support
-# both land. The binary lives at /usr/local/bin/openmarquee-render
-# when install.sh has staged it; override with OPENMARQUEE_RENDERER_
-# BINARY if you've put it elsewhere.
-Environment="OPENMARQUEE_RENDERER=auto"
+# Phase 7 slice 3 (2026-05-13): the Rust IPC sidecar renders HDMI
+# scanout. Handover reconcile 2026-07-09 (GAP5): PIN it to
+# `rust-sidecar` (was `auto`), matching the live sign's
+# rust-renderer.conf drop-in. Today `auto` also resolves to the
+# sidecar (output_mode is hdmi-only, default hdmi), so this is
+# functionally equivalent NOW — but pinning makes the intent explicit
+# and future-proofs against a default/output_mode change silently
+# routing the deployed sign to a different renderer. Still
+# AutoFallback-wrapped either way, so a genuine sidecar construction
+# failure (e.g. missing binary) degrades to mock at open rather than
+# crashing playback. The binary lives at /usr/local/bin/
+# openmarquee-render when install.sh has staged it; override with
+# OPENMARQUEE_RENDERER_BINARY if elsewhere.
+Environment="OPENMARQUEE_RENDERER=rust-sidecar"
 Environment="OPENMARQUEE_RENDERER_BINARY=/usr/local/bin/openmarquee-render"
+
+# Handover reconcile 2026-07-09 (GAP5): fold the live sign's two other
+# renderer drop-ins so a fresh build matches the deployed environment.
+# Both pin values that already match the code defaults today (defer /
+# 8.0s) — explicit here so a future default change can't silently move
+# the deployed sign, and so the service is self-documenting.
+#   - PRELOAD_MODE=defer: next-slide preload fires AFTER the current
+#     slide is up (playback.py:115). `max`/`lead` starved the FROM-
+#     buffer on FYS; defer is the validated Pi Zero 2 W setting.
+#   - RENDERER_RESPONSE_TIMEOUT_S=8: IPC op response deadline
+#     (rust_renderer.py:551).
+Environment="OPENMARQUEE_PRELOAD_MODE=defer"
+Environment="OPENMARQUEE_RENDERER_RESPONSE_TIMEOUT_S=8"
 
 # Perf-night r4 (2026-05-26): enable V4L2 DMABUF CAPTURE path so the
 # renderer's bake_video_slide_to_current_fbo imports decoded frames

@@ -1,0 +1,25 @@
+# Override file for openmarquee-cma-watchdog (sourced as
+# /etc/default/openmarquee-cma-watchdog by openmarquee-cma-watchdog.sh).
+# Installed by scripts/install.sh. Handover reconcile 2026-07-09 (GAP9).
+#
+# The watchdog restarts openmarquee-backend when CmaUsed
+# (CmaTotal - CmaFree from /proc/meminfo) crosses THRESHOLD_MB outside
+# the COOLDOWN_SEC window, releasing the renderer's GBM/V4L2/EGLImage/
+# GLES allocations on the CMA pool. It is a defensive backstop (the
+# V3D/CMA leaks are fixed; the 03:00 daily-restart cron is the other
+# belt).
+#
+# THRESHOLD reconciled for the 320M pool (cma=320M, GAP2). History:
+#   - r38c 2026-06-02: 220 on the 256M pool (tripped on benign peaks).
+#   - r59  2026-06-04: 254 on the 256M pool = ~2MB above the ~251.8MB
+#     measured text-over-video peak, ~2MB below the 256M ceiling.
+#   - 2026-07-09: cma bumped 256M -> 320M. Keeping 254 would fire only
+#     ~5MB above steady-state while 66MB of headroom sits unused —
+#     spurious restarts. QA measured the LIVE 320M pool over ~3min of
+#     active text-over-video + crossfade (~70 transitions/30s): peak
+#     CmaUsed 261MB, median ~239MB.
+#   => THRESHOLD_MB=300: 39MB above the measured 261MB peak (no
+#      spurious trips) and 20MB below the 320M pool (still fires
+#      before exhaustion, with room for the timer tick + restart).
+THRESHOLD_MB=300
+COOLDOWN_SEC=1800
