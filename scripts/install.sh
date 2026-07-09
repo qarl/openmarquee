@@ -1140,6 +1140,19 @@ if [ -f "$BOOT_LIB" ]; then
                 || say "  WARNING: config.txt patch skipped (see above)"
             patch_cmdline_txt "${boot_dir}/cmdline.txt" \
                 || say "  WARNING: cmdline.txt patch skipped (see above)"
+            # Handover reconcile 2026-07-09 (GAP2): apply the memory
+            # split on the DEPLOY path too. The pi-gen 02-run.sh burn
+            # path already invokes both (02-run.sh:53-54), but a
+            # redeploy over a live sign was leaving cma/gpu_mem to
+            # whatever the card was flashed with. Both are idempotent
+            # (no-op when gpu_mem=128 / cma=320M already present, which
+            # the live sign has) and guarded so non-zero can't trip
+            # set -e and abort a production redeploy. Takes effect on
+            # next reboot (kernel cmdline / firmware split).
+            patch_config_txt_gpu_mem "${boot_dir}/config.txt" \
+                || say "  WARNING: config.txt gpu_mem patch skipped (see above)"
+            patch_cmdline_txt_cma "${boot_dir}/cmdline.txt" \
+                || say "  WARNING: cmdline.txt cma patch skipped (see above)"
             # Postmortem mitigation #5 (2026-05-23): strip the base
             # Pi OS `cgroup_disable=memory` flag so PSI/cgroup
             # memory accounting + systemd-OOMD become available.
@@ -1157,6 +1170,7 @@ if [ -f "$BOOT_LIB" ]; then
             say "  DRYRUN: would patch config.txt (disable_splash=1) +"
             say "          cmdline.txt (quiet splash plymouth.ignore-serial-consoles)"
             say "          cmdline.txt strip (cgroup_disable=memory)"
+            say "          config.txt gpu_mem=128 + cmdline.txt cma=320M"
             say "          config.txt audio (dtparam=audio=on)"
         fi
     fi

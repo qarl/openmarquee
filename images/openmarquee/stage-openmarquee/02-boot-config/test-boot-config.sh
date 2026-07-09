@@ -277,41 +277,41 @@ md5_after="$(md5sum < "$TMP/g8.txt" 2>/dev/null || md5 < "$TMP/g8.txt" 2>/dev/nu
 check "g8: true no-op (file unchanged byte-for-byte)" "$md5_before" "$md5_after"
 
 # ── patch_cmdline_txt_cma (r110 c3.3.2-followup, 2026-06-11) ────────
-# Sets cma=256M, replacing any prior cma= token, preserving the
+# Sets cma=320M, replacing any prior cma= token, preserving the
 # single-line cmdline.txt invariant. Idempotent.
 
 # Append when no cma= present.
 printf 'console=tty1 root=PARTUUID=abc-02 rootwait\n' > "$TMP/cma1.txt"
 patch_cmdline_txt_cma "$TMP/cma1.txt" >/dev/null
 check "cma1: one line" "1" "$(wc -l < "$TMP/cma1.txt" | tr -d ' ')"
-grep -qw 'cma=256M' "$TMP/cma1.txt" && ok "cma1: cma=256M appended" || bad "cma1: cma=256M missing"
+grep -qw 'cma=320M' "$TMP/cma1.txt" && ok "cma1: cma=320M appended" || bad "cma1: cma=320M missing"
 grep -qw 'root=PARTUUID=abc-02' "$TMP/cma1.txt" && ok "cma1: root= preserved" || bad "cma1: root= lost"
 grep -qw 'rootwait' "$TMP/cma1.txt" && ok "cma1: rootwait preserved" || bad "cma1: rootwait lost"
 
 # Idempotency: re-run is a no-op.
 patch_cmdline_txt_cma "$TMP/cma1.txt" >/dev/null
-check "cma1: re-run no double cma=" "1" "$(grep -ow 'cma=256M' "$TMP/cma1.txt" | wc -l | tr -d ' ')"
+check "cma1: re-run no double cma=" "1" "$(grep -ow 'cma=320M' "$TMP/cma1.txt" | wc -l | tr -d ' ')"
 check "cma1: still one line after re-run" "1" "$(wc -l < "$TMP/cma1.txt" | tr -d ' ')"
 
-# Existing cma=384M is REPLACED with cma=256M.
+# Existing cma=384M is REPLACED with cma=320M.
 printf 'console=tty1 cma=384M root=PARTUUID=x rootwait\n' > "$TMP/cma2.txt"
 patch_cmdline_txt_cma "$TMP/cma2.txt" >/dev/null
 check "cma2: one line" "1" "$(wc -l < "$TMP/cma2.txt" | tr -d ' ')"
-check "cma2: cma=256M present" "1" "$(grep -ow 'cma=256M' "$TMP/cma2.txt" | wc -l | tr -d ' ')"
+check "cma2: cma=320M present" "1" "$(grep -ow 'cma=320M' "$TMP/cma2.txt" | wc -l | tr -d ' ')"
 check "cma2: old cma=384M gone" "0" "$(grep -ow 'cma=384M' "$TMP/cma2.txt" | wc -l | tr -d ' ')"
 grep -qw 'root=PARTUUID=x' "$TMP/cma2.txt" && ok "cma2: root= preserved" || bad "cma2: root= lost"
 
 # Different existing value (cma=512M) also replaced.
 printf 'cma=512M root=PARTUUID=y\n' > "$TMP/cma3.txt"
 patch_cmdline_txt_cma "$TMP/cma3.txt" >/dev/null
-check "cma3: cma=256M present" "1" "$(grep -ow 'cma=256M' "$TMP/cma3.txt" | wc -l | tr -d ' ')"
+check "cma3: cma=320M present" "1" "$(grep -ow 'cma=320M' "$TMP/cma3.txt" | wc -l | tr -d ' ')"
 check "cma3: old cma=512M gone" "0" "$(grep -ow 'cma=512M' "$TMP/cma3.txt" | wc -l | tr -d ' ')"
 
 # Substring-prefix collision: `cma_zone=foo` MUST NOT be stripped.
 printf 'cma_zone=foo cma=384M root=PARTUUID=z\n' > "$TMP/cma4.txt"
 patch_cmdline_txt_cma "$TMP/cma4.txt" >/dev/null
 grep -qw 'cma_zone=foo' "$TMP/cma4.txt" && ok "cma4: cma_zone=foo preserved" || bad "cma4: cma_zone=foo wrongly stripped"
-check "cma4: cma=256M present" "1" "$(grep -ow 'cma=256M' "$TMP/cma4.txt" | wc -l | tr -d ' ')"
+check "cma4: cma=320M present" "1" "$(grep -ow 'cma=320M' "$TMP/cma4.txt" | wc -l | tr -d ' ')"
 check "cma4: old cma=384M gone" "0" "$(grep -ow 'cma=384M' "$TMP/cma4.txt" | wc -l | tr -d ' ')"
 
 # Empty cmdline.txt is REFUSED (same safety as patch_cmdline_txt).
@@ -336,21 +336,21 @@ check "cma6: file untouched on refusal" "$before_cma6" "$after_cma6"
 
 # Multiple existing cma= tokens (paranoid; cmdline shouldn't have
 # this but the function must be safe) — both stripped, single
-# cma=256M appended.
+# cma=320M appended.
 printf 'foo cma=128M bar cma=384M baz\n' > "$TMP/cma7.txt"
 patch_cmdline_txt_cma "$TMP/cma7.txt" >/dev/null
-check "cma7: exactly one cma=256M" "1" "$(grep -ow 'cma=256M' "$TMP/cma7.txt" | wc -l | tr -d ' ')"
+check "cma7: exactly one cma=320M" "1" "$(grep -ow 'cma=320M' "$TMP/cma7.txt" | wc -l | tr -d ' ')"
 check "cma7: cma=128M gone" "0" "$(grep -ow 'cma=128M' "$TMP/cma7.txt" | wc -l | tr -d ' ')"
 check "cma7: cma=384M gone" "0" "$(grep -ow 'cma=384M' "$TMP/cma7.txt" | wc -l | tr -d ' ')"
 grep -qw foo "$TMP/cma7.txt" && ok "cma7: foo preserved" || bad "cma7: foo lost"
 grep -qw bar "$TMP/cma7.txt" && ok "cma7: bar preserved" || bad "cma7: bar lost"
 grep -qw baz "$TMP/cma7.txt" && ok "cma7: baz preserved" || bad "cma7: baz lost"
 
-# CR/LF input collapsed to one line + cma=256M applied.
+# CR/LF input collapsed to one line + cma=320M applied.
 printf 'console=tty1\r\nroot=PARTUUID=q\r\n' > "$TMP/cma8.txt"
 patch_cmdline_txt_cma "$TMP/cma8.txt" >/dev/null
 check "cma8: CR/LF input -> one line" "1" "$(wc -l < "$TMP/cma8.txt" | tr -d ' ')"
-grep -qw 'cma=256M' "$TMP/cma8.txt" && ok "cma8: cma=256M present" || bad "cma8: cma=256M missing"
+grep -qw 'cma=320M' "$TMP/cma8.txt" && ok "cma8: cma=320M present" || bad "cma8: cma=320M missing"
 grep -q 'console=tty1 root=PARTUUID=q' "$TMP/cma8.txt" && ok "cma8: params re-joined" || bad "cma8: params not joined"
 
 if [ "$fail" -eq 0 ]; then

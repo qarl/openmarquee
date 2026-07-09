@@ -43,13 +43,17 @@ patch_cmdline_txt "${boot_dir}/cmdline.txt"
 strip_cmdline_token "cgroup_disable=memory" "${boot_dir}/cmdline.txt"
 # r110 c3.3.2-followup (2026-06-11): bake the GPU memory split
 # into the image defaults so a fresh Jason-class deploy boots
-# with a reloc heap that can allocate a 1080p ril.video_decode
+# with a reloc heap that can allocate a ril.video_decode
 # component. gpu_mem=64 (stock Pi Zero 2 W default) cannot —
 # vchiq ETIME on component create, reloc heap starved at
-# ~17M/44M idle. gpu_mem=128 + cma=256M verified clean booting
-# with reloc 107M/108M free, no ARM-side regression (gpu_mem
-# grows 64M, cma shrinks 128M from a hypothetical 384M baseline,
-# net within budget on 512MB Zero 2 W).
+# ~17M/44M idle. gpu_mem=128 restores enough reloc heap.
+#
+# Handover reconcile 2026-07-09 (GAP2): cma=320M — the validated
+# live-sign value (was 256M on the earlier pi-gen path). Relative
+# to the 384M old default: cma shrinks 64M (frees 64M to ARM) and
+# gpu_mem grows 64M (takes it back), so ARM-side is net unchanged,
+# within budget on a 512MB Zero 2 W. See patch_cmdline_txt_cma in
+# boot-config-lib.sh for the value + idempotency contract.
 patch_config_txt_gpu_mem  "${boot_dir}/config.txt"
 patch_cmdline_txt_cma     "${boot_dir}/cmdline.txt"
 # HDMI audio 2026-07-01 (qarl decision, locked): the vc4hdmi ALSA
