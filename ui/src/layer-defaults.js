@@ -25,6 +25,7 @@ export function defaultLayer() {
         autoMode: null,
         autoFormat: null,
         textAlign: "center",
+        anchor: "center",
         motion: "static",
         motionIntensity: 50,
         motionPhase: 0,

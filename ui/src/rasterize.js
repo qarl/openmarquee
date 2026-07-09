@@ -244,10 +244,35 @@ function paintLayer(ctx, canvas, layer) {
     // pad isn't ink-relevant for centering; it's a 1px halo for
     // outline shaders).
     const totalInkExtent = lastLineExtent + (lines.length - 1) * lineHeight;
-    const boxCenterY = boxY + boxH / 2;
+    // Vertical squish factor: hoisted above the anchor math because the
+    // anchored placement uses the POST-squish (placed) block height.
+    const yScale = totalInkExtent > boxH ? boxH / totalInkExtent : 1;
+    // Vertical placement honors the layer's `anchor` (top/center/bottom),
+    // mirroring the renderer's box_to_ndc_quad valign offset
+    // (hdmi_logic.rs Top:0 / Middle:(box-placed)/2 / Bottom:box-placed) so
+    // the editor preview agrees with on-glass. `placedInkExtent` is the
+    // block height AFTER the fit-to-box squish (== min(totalInkExtent,
+    // boxH)); the block CENTER then sits at box-top+half (top), box-center
+    // (middle), or box-bottom-half (bottom). When squished the three
+    // coincide (the block fills the box), matching the renderer.
+    //
+    // Parity note (conscious accept): the renderer anchors the
+    // PAD-INCLUSIVE glyph bitmap edge to the box edge (bm_h = 2*pad +
+    // ink, pad=1px); this anchors the INK edge. So top/bottom land ~1
+    // image-px closer to the box edge here than on glass — sub-perceptual
+    // (no box edge is drawn to reference it against), new-mode-only;
+    // `center` stays byte-exact vs the prior always-center behavior.
+    const placedInkExtent = totalInkExtent * yScale;
+    const vAnchor = layer.anchor || layer.v_align || "center";
+    const blockCenterY =
+        vAnchor === "top"
+            ? boxY + placedInkExtent / 2
+            : vAnchor === "bottom"
+                ? boxY + boxH - placedInkExtent / 2
+                : boxY + boxH / 2;
     // First-line baseline = top of ink bbox + maxAscent. The ink
-    // bbox top sits at `boxCenter - totalInkExtent/2`.
-    const firstBaselineY = boxCenterY - totalInkExtent / 2 + maxAscent;
+    // bbox top sits at `blockCenter - totalInkExtent/2`.
+    const firstBaselineY = blockCenterY - totalInkExtent / 2 + maxAscent;
 
     // Anchor x depends on textAlign: left = box left, right = box right,
     // center = box center. Canvas's textAlign+x interplay handles the
@@ -258,10 +283,10 @@ function paintLayer(ctx, canvas, layer) {
     else anchorX = boxX + boxW / 2;
     const maxWidth = Math.max(1, boxW);
     // Vertical squish (qarl 2026-05-01 ask #1): when total rendered
-    // text height exceeds box height, scale-y around the box center
+    // text height exceeds box height, scale-y around the block center
     // so lines stay inside. fillText's maxWidth handles horizontal
-    // overflow as before — both axes squish independently.
-    const yScale = totalInkExtent > boxH ? boxH / totalInkExtent : 1;
+    // overflow as before — both axes squish independently. (`yScale` is
+    // computed above, before the anchor math that needs it.)
     // Per-line baseline offset from the line-group's vertical center.
     // Hoisted because both the WASM-path and the fillText-squish path
     // need it; identical expression in both (review nit, Phase 3a).
@@ -329,7 +354,7 @@ function paintLayer(ctx, canvas, layer) {
         const totalInkExtentEff =
             (maxAscentEff + maxDescentEff)
             + (lines.length - 1) * lineHeightEff;
-        const firstBaselineYEff = boxCenterY - totalInkExtentEff / 2 + maxAscentEff;
+        const firstBaselineYEff = blockCenterY - totalInkExtentEff / 2 + maxAscentEff;
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
             if (!line) continue;
@@ -394,7 +419,7 @@ function paintLayer(ctx, canvas, layer) {
         }
     } else {
         ctx.save();
-        ctx.translate(anchorX, boxCenterY);
+        ctx.translate(anchorX, blockCenterY);
         ctx.scale(1, yScale);
         // Draw aligned around (0,0) under the local transform; each
         // line's y-offset is from the centered origin. fillText's
