@@ -85,6 +85,9 @@ pub enum SerializeError {
     },
     /// A geometry parameter is zero / would divide by zero.
     InvalidGeometry(&'static str),
+    /// This config's `wiring_revision` ≠ the blessed fixture's — the mapping
+    /// goldens cannot be trusted against a drifted wiring (design doc §7 C.1).
+    WiringRevisionMismatch { config: String, expected: String },
 }
 
 /// All driver geometry + color config. NOTHING hard-coded (design doc §4). The
@@ -160,6 +163,25 @@ impl ColorlightConfig {
             return Err(SerializeError::GeometryMismatch {
                 canvas: (self.width, self.height),
                 card,
+            });
+        }
+        Ok(())
+    }
+
+    /// Assert this config's wiring revision matches a blessed fixture's.
+    ///
+    /// The Phase-1 golden-conformance harness calls this with the fixture's
+    /// `meta.json` `wiring_revision` BEFORE comparing packets, so a config that
+    /// has drifted from the blessed physical wiring fails LOUDLY rather than
+    /// silently producing a mis-mapped "pass" against a reference for different
+    /// cabling (design doc §7 C.1 — the one way the golden scheme fails quietly).
+    /// The field is inert without a consumer; this is that consumer, landed now
+    /// so the Phase-1 harness slots into pre-built machinery.
+    pub fn check_wiring_revision(&self, expected: &str) -> Result<(), SerializeError> {
+        if self.wiring_revision != expected {
+            return Err(SerializeError::WiringRevisionMismatch {
+                config: self.wiring_revision.clone(),
+                expected: expected.to_string(),
             });
         }
         Ok(())
@@ -399,6 +421,22 @@ mod tests {
         v
     }
 
+    /// Framebuffer whose every pixel is a distinct function of its canvas index —
+    /// used where a solid fill would mask a slice/offset bug (the payload must
+    /// actually differ across a packet boundary for a roundtrip to catch it).
+    fn positional(cfg: &ColorlightConfig) -> Vec<u8> {
+        let n = cfg.width as usize * cfg.height as usize;
+        let mut v = Vec::with_capacity(n * 3);
+        for k in 0..n {
+            v.extend_from_slice(&[
+                (k & 0xff) as u8,
+                ((k >> 8) & 0xff) as u8,
+                ((k >> 16) & 0xff) as u8,
+            ]);
+        }
+        v
+    }
+
     // ── Structure / Layer-1 framing (wiring-INDEPENDENT; safe to assert now) ──
 
     #[test]
@@ -490,6 +528,93 @@ mod tests {
         assert_eq!(&row0[21..24], &[0, 0, 255], "BGR: R in byte 3");
     }
 
+    #[test]
+    fn all_six_color_orders_are_exact_inverses() {
+        // apply() and unapply_color_order() are two separate hand-written 6-arm
+        // tables; only BGR was proven above. Pin every order as an exact inverse so
+        // a future edit to one table can't silently break the loopback's decode
+        // (QA catch #3).
+        let samples = [(10u8, 200, 30), (0, 0, 0), (255, 128, 1), (7, 7, 7)];
+        for order in [
+            ColorOrder::Rgb,
+            ColorOrder::Bgr,
+            ColorOrder::Grb,
+            ColorOrder::Gbr,
+            ColorOrder::Rbg,
+            ColorOrder::Brg,
+        ] {
+            for &(r, g, b) in &samples {
+                let w = order.apply(r, g, b);
+                assert_eq!(
+                    unapply_color_order(order, w[0], w[1], w[2]),
+                    (r, g, b),
+                    "{order:?} apply→unapply not identity"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_identity_lut_maps_the_payload_bytes() {
+        // The gamma_lut path was dead-untested: every other test uses
+        // thinksign_default() → gamma_lut: None, so `t[v]` (and invert_lut in the
+        // loopback) never ran (QA's top catch #1). Build an UNMISTAKABLE table (not
+        // a formula): identity with three overrides, so a byte-exact wire assert
+        // proves a real lookup, not arithmetic that happens to match.
+        let mut cfg = ColorlightConfig::thinksign_default();
+        let mut t: [u8; 256] = core::array::from_fn(|i| i as u8);
+        t[10] = 222;
+        t[200] = 13;
+        t[30] = 99;
+        t[255] = 7; // make the brightness-not-LUT'd assert below actually bite:
+                    // default brightness is 255, so a regression that routed it
+                    // through the LUT would show 7, not 255.
+        cfg.gamma_lut = Some(t);
+        // Input pixel (10, 200, 30) → LUT → (222, 13, 99), RGB order → wire bytes.
+        let frames = serialize_frame(&solid(&cfg, 10, 200, 30), &cfg).unwrap();
+        assert_eq!(
+            &frames[1][21..24],
+            &[222, 13, 99],
+            "each channel routed through the LUT on the wire"
+        );
+        // Brightness/latch must NOT be LUT'd — only the pixel payload is. With
+        // t[255]=7 and brightness=255, this fails if the brightness byte is ever
+        // routed through the table.
+        assert_eq!(frames[0][13], 255, "brightness is not LUT-mapped");
+    }
+
+    #[test]
+    fn all_white_payload_and_brightness_endpoints_are_byte_exact() {
+        // 255 → 0xFF on the wire (no stray clamp/scale) and brightness 0/255
+        // endpoints land exactly (LUT-endpoint / off-by-one guard, QA A.3).
+        let cfg = ColorlightConfig::thinksign_default();
+        let white = serialize_frame(&solid(&cfg, 255, 255, 255), &cfg).unwrap();
+        assert_eq!(
+            &white[1][21..24],
+            &[0xFF, 0xFF, 0xFF],
+            "white pixel is 0xFF on the wire"
+        );
+
+        let mut dark = ColorlightConfig::thinksign_default();
+        dark.brightness = 0;
+        let f0 = serialize_frame(&solid(&dark, 0, 0, 0), &dark).unwrap();
+        assert_eq!(
+            [f0[0][13], f0[0][14], f0[0][15]],
+            [0, 0, 0],
+            "brightness 0 endpoint in the 0x0A packet"
+        );
+        assert_eq!(f0.last().unwrap()[35], 0, "latch carries brightness 0");
+
+        let mut full = ColorlightConfig::thinksign_default();
+        full.brightness = 255;
+        let f255 = serialize_frame(&solid(&full, 0, 0, 0), &full).unwrap();
+        assert_eq!(
+            [f255[0][13], f255[0][14], f255[0][15]],
+            [255, 255, 255],
+            "brightness 255 endpoint"
+        );
+    }
+
     // ── Layer-2 loopback (self-consistency ONLY — not wire correctness) ──
 
     #[test]
@@ -514,6 +639,26 @@ mod tests {
         let fb = solid(&cfg, 10, 200, 30);
         let frames = serialize_frame(&fb, &cfg).unwrap();
         assert_eq!(parse_frames_to_canvas(&frames, &cfg).unwrap(), fb);
+    }
+
+    #[test]
+    fn loopback_roundtrips_through_a_bijective_lut() {
+        // Exercise the invert_lut decode path (dead without a LUT — QA catch #1b).
+        // invert_lut only inverts a BIJECTIVE table, so use v→255-v (a real
+        // non-identity remap, strictly monotone hence bijective). A production
+        // gamma curve has plateaus (non-bijective) and is apply-only — the encode
+        // byte test above covers that; this proves the encode/decode inverse holds
+        // when the LUT is invertible, so the loopback stays trustworthy with a LUT set.
+        let mut cfg = ColorlightConfig::thinksign_default();
+        cfg.gamma_lut = Some(core::array::from_fn(|i| (255 - i) as u8));
+        // A position-dependent pattern so the LUT is exercised across the value range.
+        let fb = positional(&cfg);
+        let frames = serialize_frame(&fb, &cfg).unwrap();
+        assert_eq!(
+            parse_frames_to_canvas(&frames, &cfg).unwrap(),
+            fb,
+            "encode-through-LUT then decode-through-invert-LUT is lossless"
+        );
     }
 
     // ── Layer-3 cadence ──
@@ -542,7 +687,12 @@ mod tests {
         cfg.chain = 20; // 20·32 = 640 px row
         assert_eq!(cfg.row_width_px(), 640);
         assert_eq!(cfg.card_rows(), 32);
-        let frames = serialize_frame(&solid(&cfg, 7, 7, 7), &cfg).unwrap();
+        // Position-dependent payload (NOT a solid): every pixel is distinct, so a
+        // slice off-by-one / duplicate-slice in the split (packet 2 must carry
+        // pixels 497..639, not 496.. or 498..) actually diverges. A solid fill
+        // would round-trip green even with a broken slice (QA catch #2).
+        let fb = positional(&cfg);
+        let frames = serialize_frame(&fb, &cfg).unwrap();
         // Each of the 32 rows splits into ceil(640/497)=2 packets.
         let row_pkts: Vec<&Vec<u8>> = frames.iter().filter(|f| f[12] == OPCODE_ROW).collect();
         assert_eq!(row_pkts.len(), 32 * 2, "each 640px row = 2 packets");
@@ -559,11 +709,18 @@ mod tests {
             (497, 143),
             "offset advances by 497, remainder 143"
         );
-        // And it still round-trips.
+        // Directly pin the slice boundary: packet 2's first payload pixel must be
+        // canvas pixel at card position (row 0, pos 497) — RGB order, no LUT, so the
+        // wire bytes equal the raw fb pixel. An off-by-one lands 496 or 498 here.
+        let (x, y) = card_to_canvas(0, 497, &cfg);
+        let k = y * cfg.width as usize + x;
         assert_eq!(
-            parse_frames_to_canvas(&frames, &cfg).unwrap(),
-            solid(&cfg, 7, 7, 7)
+            &p1[21..24],
+            &fb[k * 3..k * 3 + 3],
+            "packet 2 starts at pixel 497, not 496/498"
         );
+        // And the whole position-dependent frame round-trips bit-exact.
+        assert_eq!(parse_frames_to_canvas(&frames, &cfg).unwrap(), fb);
     }
 
     #[test]
@@ -627,6 +784,22 @@ mod tests {
         let b = serialize_frame(&fb, &cfg).unwrap(); // same original fb
         assert_eq!(a, b, "output depends only on the passed snapshot");
         assert_eq!(fb[0], 5, "serialize must not mutate the input");
+    }
+
+    #[test]
+    fn check_wiring_revision_gates_on_mismatch() {
+        // The wiring_revision field is inert without a consumer; check_wiring_revision
+        // is that consumer (design doc §7 C.1). The Phase-1 golden harness calls it
+        // with the fixture's meta.wiring_revision so a config that drifted from the
+        // blessed cabling FAILS LOUD instead of "passing" against the wrong reference.
+        let cfg = ColorlightConfig::thinksign_default(); // "unblessed-phase0-default"
+        assert!(cfg
+            .check_wiring_revision("unblessed-phase0-default")
+            .is_ok());
+        assert!(matches!(
+            cfg.check_wiring_revision("thinksign-blessed-2026-07-20"),
+            Err(SerializeError::WiringRevisionMismatch { .. })
+        ));
     }
 
     fn solid_for_dims(w: usize, h: usize) -> Vec<u8> {
