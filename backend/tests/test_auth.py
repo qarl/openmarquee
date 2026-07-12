@@ -1238,6 +1238,44 @@ def test_non_media_route_rejects_token_query_param(client: TestClient):
     assert response.status_code == 401
 
 
+def test_thumbnail_route_accepts_token_query_param_but_metadata_does_not(
+    client: TestClient,
+):
+    """2026-07-12 dashboard-dark-thumbnails fix. The 2026-07-02 OOM
+    handover switched dashboard tiles from /asset (full-res PNG) to the
+    JPEG /api/content/{id}/thumbnail endpoint but never added /thumbnail
+    to the query-token allowlist. <img> tiles can't send an
+    Authorization header (only ?token=), so every tile hit
+    _is_media_route()==False → 401 → dark placeholder.
+
+    fail-before: /thumbnail with only ?token= → 401.
+    pass-after: /thumbnail (+ /asset + /video, which must keep working)
+    reach auth → NOT 401 (404 for the unseeded item is fine; only 401 =
+    auth-blocked). SECURITY — must stay narrow: metadata + list routes
+    still reject a query token (query-auth must not leak onto them).
+    """
+    import uuid
+
+    set_resp = client.post(
+        "/api/auth/set-password",
+        json={"password": "hunter2hunter", "password_confirm": "hunter2hunter"},
+    )
+    token = set_resp.json()["token"]
+    bogus = uuid.uuid4()
+
+    # Binary-blob media routes — query token reaches auth. /thumbnail is
+    # the fix; /asset + /video are the coexistence guard.
+    for suffix in ("thumbnail", "asset", "video"):
+        resp = client.get(f"/api/content/{bogus}/{suffix}?token={token}")
+        assert resp.status_code != 401, (
+            f"/{suffix} query-token 401'd (auth gate still closed): {resp.status_code}"
+        )
+
+    # Don't-widen-security: metadata + list stay bearer-only.
+    assert client.get(f"/api/content/{bogus}?token={token}").status_code == 401  # metadata
+    assert client.get(f"/api/content?token={token}").status_code == 401  # list
+
+
 def test_playback_thumbnail_endpoints_whitelisted(client: TestClient):
     """Bug 5 (qarl 2026-05-16): the flock panel renders peer tiles by
     cross-origin GET against /api/playback/current-thumbnail and

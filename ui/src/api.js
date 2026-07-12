@@ -129,8 +129,9 @@ export async function apiFetch(input, init = {}) {
 /**
  * Bug 3+4 (qarl 2026-05-16): append `?token=<bearer>` to a media URL
  * so a bare `<img src>` / `<video src>` reaches the auth-gated
- * `/api/content/{id}/asset` and `/api/content/{id}/video` endpoints.
- * AuthMiddleware accepts the query-param token for those routes
+ * `/api/content/{id}/asset`, `/video`, and `/thumbnail` endpoints
+ * (thumbnail added 2026-07-12 — dashboard tiles use it). AuthMiddleware
+ * accepts the query-param token for those binary-blob routes
  * specifically (see backend/openmarquee/auth_middleware.py).
  *
  * Handles URLs that already have a query string (e.g. `?v=...` cache

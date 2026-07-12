@@ -121,6 +121,12 @@ def test_is_whitelisted_rejects_non_whitelisted_paths(path: str):
         "/api/content/abc-uuid/asset",
         "/api/content/00000000-0000-0000-0000-000000000000/asset",
         "/api/content/some-id/video",
+        # 2026-07-12: dashboard tiles use the JPEG /thumbnail endpoint
+        # (2026-07-02 OOM handover). It's a binary-blob GET like /asset,
+        # so query-token auth must reach it — without this the dashboard
+        # <img> tiles 401'd → dark placeholders.
+        "/api/content/some-id/thumbnail",
+        "/api/content/00000000-0000-0000-0000-000000000000/thumbnail",
     ],
 )
 def test_is_media_route_matches_canonical_binary_suffixes(path: str):
@@ -139,6 +145,7 @@ def test_is_media_route_matches_canonical_binary_suffixes(path: str):
         "/api/content/some-uuid/metadata",
         "/api/content/some-uuid/asset.png",  # ".png" suffix, not "/asset"
         "/api/content/some-uuid/video.mp4",  # ".mp4" suffix, not "/video"
+        "/api/content/some-uuid/thumbnail.jpg",  # ".jpg" suffix, not "/thumbnail"
         "/api/content",  # list route
         "/api/content/",
         # Not under the /api/content/ prefix at all.

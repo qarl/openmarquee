@@ -204,8 +204,18 @@ _WHITELIST_PREFIX: tuple[str, ...] = (
 # Route shape match: prefix is exact, the rest is `/<uuid>/<suffix>`.
 # Suffix gate so we don't accept query-param auth for /api/content
 # (list) or /api/content/{id} (metadata) — only the binary blobs.
+#
+# `/thumbnail` added 2026-07-12: the 2026-07-02 OOM handover switched
+# the dashboard tiles from /asset (full-res PNG, OOM'd the Pi) to the
+# /api/content/{id}/thumbnail JPEG endpoint, but never added it here.
+# <img> tags can't send an Authorization header (only the ?token=
+# query fallback), so every tile hit _is_media_route()==False → 401 →
+# dark placeholder. /thumbnail is the same class as /asset & /video —
+# a binary-blob GET — so it correctly inherits the query-auth
+# no-store/no-referrer hardening; this is NOT a security widening onto
+# list/metadata (those still lack a binary-blob suffix → still 401).
 _MEDIA_ROUTE_PREFIX: str = "/api/content/"
-_MEDIA_ROUTE_SUFFIXES: tuple[str, ...] = ("/asset", "/video")
+_MEDIA_ROUTE_SUFFIXES: tuple[str, ...] = ("/asset", "/video", "/thumbnail")
 
 
 class AuthMiddleware:
