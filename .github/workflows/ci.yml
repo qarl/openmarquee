@@ -39,17 +39,33 @@ jobs:
       - name: pip-audit
         working-directory: backend
         run: pip-audit -r requirements.lock
-      # Stderr is intentionally NOT redirected here: if pip-compile
-      # crashes (e.g. pip-tools / pip version drift like the 2026-05-24
-      # AttributeError trip), the error message lands in the CI log
-      # rather than producing an empty stdout that diffs as "lock fully
-      # deleted" — which is what hid the pip-tools 7.4.1 vs pip 26
-      # incompat from the lock-drift gate for hours.
+      # Scoped to PR-INTRODUCED drift only (a pyproject change without a
+      # matching lock regen), NOT upstream releases. The prior form
+      # (`pip-compile … -o -`) re-resolved every dep to its LATEST version
+      # each run, so ANY upstream release (3 in July 2026 alone: websockets
+      # 16.0→16.1, anyio 4.14.1→4.14.2, …) diffed the lock red even when the
+      # PR never touched deps — a false-positive machine that degrades the
+      # CI signal itself. `--no-upgrade` seeds the resolver from the
+      # committed lock (copied to a scratch file), so already-pinned deps
+      # keep their versions and ONLY a pyproject change forces a re-pin:
+      #   - upstream-only drift → no pin diff → GREEN (the fix)
+      #   - a dep added/removed/version-bumped in pyproject without a regen
+      #     → RED (unchanged from before — the whole value of the gate).
+      #
+      # We diff the pin + `# via` BODY, stripping the auto-generated header
+      # block (it records the `--output-file` path, which now differs).
+      # `set -e` + unredirected stderr preserve the original crash-
+      # visibility contract: a pip-compile / pip-tools crash fails the step
+      # outright (and prints) rather than hiding as a clean diff.
       - name: Lock drift check
         working-directory: backend
         run: |
-          pip-compile --quiet --strip-extras pyproject.toml -o - \
-            | diff -u requirements.lock -
+          set -euo pipefail
+          cp requirements.lock /tmp/lock-check.txt
+          pip-compile --quiet --no-upgrade --strip-extras pyproject.toml -o /tmp/lock-check.txt
+          diff -u \
+            <(sed -n '/^[A-Za-z0-9]/,$p' requirements.lock) \
+            <(sed -n '/^[A-Za-z0-9]/,$p' /tmp/lock-check.txt)
       - name: Pytest
         working-directory: backend
         run: pytest
