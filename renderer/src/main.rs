@@ -40,6 +40,12 @@ mod live_preview;
 mod cea861;
 mod content;
 mod hdmi_logic;
+// Colorlight 5A-75B output backend (Phase 0: pure serializer + tests, host-
+// testable). Not yet wired into the output stage — the Linux AF_PACKET transport
+// + OutputMode::Colorlight land in Phase 2 (design doc §9). #[allow(dead_code)]
+// until then so the unused public serializer doesn't warn in the binary crate.
+#[allow(dead_code)]
+mod colorlight_logic;
 mod ipc_main;
 mod lru;
 mod mem;
