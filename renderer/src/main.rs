@@ -40,12 +40,15 @@ mod live_preview;
 mod cea861;
 mod content;
 mod hdmi_logic;
-// Colorlight 5A-75B output backend (Phase 0: pure serializer + tests, host-
-// testable). Not yet wired into the output stage — the Linux AF_PACKET transport
-// + OutputMode::Colorlight land in Phase 2 (design doc §9). #[allow(dead_code)]
-// until then so the unused public serializer doesn't warn in the binary crate.
+// Colorlight 5A-75B output backend. `colorlight_logic` = the pure byte-exact
+// serializer (Phase 0, host-testable). `colorlight` = the Phase-2 output stage:
+// the RGBA→RGB888 frame pipeline + FrameSink seam (host-testable) and the Linux-only
+// AF_PACKET transport. #[allow(dead_code)] until the OutputMode::Colorlight arm wires
+// them, so the unused public API doesn't warn in the binary crate.
 #[allow(dead_code)]
 mod colorlight_logic;
+#[allow(dead_code)]
+mod colorlight;
 mod ipc_main;
 mod lru;
 mod mem;

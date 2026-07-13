@@ -1,0 +1,420 @@
+//! Colorlight 5A-75B output stage — the glue between the GL frame tap and the wire.
+//!
+//! Mirrors the `hdmi_logic.rs` / `hdmi.rs` split: everything in THIS file except the
+//! Linux-only `RawSocketSink` (added with the OutputMode arm) is pure and runs on the
+//! macOS `cargo test` gate. The byte-exact serializer lives in [`colorlight_logic`];
+//! this module packs the readback and routes serialized frames to a [`FrameSink`].
+//!
+//! Per-frame data flow (design doc §5):
+//! ```text
+//!   GL composite @128x96  →  hdmi::capture_fbo_to_rgba (RGBA8, Y-flipped, owned)
+//!                         →  pack_rgba_topdown_to_rgb888 (drop alpha, no re-flip)
+//!                         →  colorlight_logic::serialize_frame (L2 frames)
+//!                         →  FrameSink::send_frame (AF_PACKET blast / mock)
+//! ```
+//! The `FrameSink` trait is the seam that makes the whole stage testable without a
+//! socket or hardware: the integration test drives a `VecSink` in-process.
+
+use crate::colorlight_logic::{serialize_frame, ColorOrder, ColorlightConfig, SerializeError};
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+/// Output-stage failures. Never panics on bad input (mirrors `SerializeError`).
+#[derive(Debug)]
+pub enum PipelineError {
+    /// The RGBA readback wasn't `width*height*4` bytes (FBO/config size mismatch).
+    ReadbackSize { expected: usize, got: usize },
+    /// The pure serializer rejected the packed RGB888 frame.
+    Serialize(SerializeError),
+    /// The sink failed to emit the frame (socket error, etc.).
+    Sink(std::io::Error),
+}
+
+impl std::fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PipelineError::ReadbackSize { expected, got } => {
+                write!(
+                    f,
+                    "RGBA readback size mismatch: expected {expected} bytes, got {got}"
+                )
+            }
+            PipelineError::Serialize(e) => write!(f, "serialize failed: {e:?}"),
+            PipelineError::Sink(e) => write!(f, "frame sink failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PipelineError {}
+
+impl From<SerializeError> for PipelineError {
+    fn from(e: SerializeError) -> Self {
+        PipelineError::Serialize(e)
+    }
+}
+
+// ── Frame sink ───────────────────────────────────────────────────────────────
+
+/// Consumes the ordered Layer-2 frames for ONE video frame (brightness `0x0A`, the
+/// `0x55` rows, the `0x01` latch). Swapping the transport here — real `AF_PACKET`
+/// vs. an in-process mock — is what makes the output stage testable without a NIC or
+/// hardware (design doc §6 Layer 2 rig).
+pub trait FrameSink {
+    /// Emit all of one video frame's L2 packets, in order.
+    fn send_frame(&mut self, frames: &[Vec<u8>]) -> std::io::Result<()>;
+}
+
+/// Test / dev sink: records every frame's packets in memory. The integration test's
+/// "loopback" per admin's ask #5 (in-process mock).
+#[derive(Default)]
+pub struct VecSink {
+    /// One entry per video frame; each is that frame's ordered L2 packets.
+    pub frames: Vec<Vec<Vec<u8>>>,
+}
+
+impl FrameSink for VecSink {
+    fn send_frame(&mut self, frames: &[Vec<u8>]) -> std::io::Result<()> {
+        self.frames.push(frames.to_vec());
+        Ok(())
+    }
+}
+
+// ── RGBA → RGB888 packer ─────────────────────────────────────────────────────
+
+/// Pack a **top-down** RGBA8 readback into the RGB888 `width*height*3` buffer
+/// [`serialize_frame`] expects, dropping the alpha byte. Writes into `out` (reused
+/// across frames to avoid a per-frame alloc on the Pi Zero 2 W hot loop).
+///
+/// Contract / layering (so the orientation isn't "bit twice", cf. GL-y-up vs
+/// canvas-y-down): the input is ALREADY top-down (row 0 = visual top) because
+/// `hdmi::capture_fbo_to_rgba` flips GL's bottom-up rows during the readback. This
+/// function does **no** Y-flip — the canvas handed to the serializer is "what's on
+/// the glass, row 0 = top", and the wiring transpose is `card_to_canvas`'s job. One
+/// orientation transform per layer.
+pub fn pack_rgba_topdown_to_rgb888(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    out: &mut Vec<u8>,
+) -> Result<(), PipelineError> {
+    let expected = width * height * 4;
+    if rgba.len() != expected {
+        return Err(PipelineError::ReadbackSize {
+            expected,
+            got: rgba.len(),
+        });
+    }
+    out.clear();
+    out.reserve(width * height * 3);
+    for px in 0..(width * height) {
+        let s = px * 4;
+        out.push(rgba[s]);
+        out.push(rgba[s + 1]);
+        out.push(rgba[s + 2]);
+        // rgba[s + 3] (alpha) intentionally dropped.
+    }
+    Ok(())
+}
+
+// ── Output-stage driver ──────────────────────────────────────────────────────
+
+/// Owns the config + sink + a reused RGB scratch buffer. Per frame: pack the RGBA
+/// readback → serialize → send. Host-testable end-to-end with a [`VecSink`]; the
+/// Linux arm wires a real GL tap + AF_PACKET sink to the exact same driver.
+pub struct ColorlightOutput<S: FrameSink> {
+    cfg: ColorlightConfig,
+    sink: S,
+    rgb: Vec<u8>,
+    frames_sent: u64,
+}
+
+impl<S: FrameSink> ColorlightOutput<S> {
+    pub fn new(cfg: ColorlightConfig, sink: S) -> Self {
+        let cap = cfg.width as usize * cfg.height as usize * 3;
+        Self {
+            cfg,
+            sink,
+            rgb: Vec::with_capacity(cap),
+            frames_sent: 0,
+        }
+    }
+
+    /// Push one **top-down** RGBA8 frame (`width*height*4` bytes) through the
+    /// pipeline: pack (drop alpha) → serialize → send.
+    ///
+    /// Stable-snapshot contract (design doc §5/C.1): `serialize_frame` borrows
+    /// `self.rgb` by shared ref and never aliases it; `self.rgb` is freshly packed
+    /// from the caller's owned `rgba` (itself a copy out of `capture_fbo_to_rgba`),
+    /// so there is no mid-frame-tear window.
+    pub fn push_rgba_frame(&mut self, rgba: &[u8]) -> Result<(), PipelineError> {
+        let w = self.cfg.width as usize;
+        let h = self.cfg.height as usize;
+        pack_rgba_topdown_to_rgb888(rgba, w, h, &mut self.rgb)?;
+        let frames = serialize_frame(&self.rgb, &self.cfg)?;
+        self.sink.send_frame(&frames).map_err(PipelineError::Sink)?;
+        self.frames_sent += 1;
+        Ok(())
+    }
+
+    /// Frames successfully pushed (cadence / smoke instrumentation).
+    pub fn frames_sent(&self) -> u64 {
+        self.frames_sent
+    }
+
+    pub fn config(&self) -> &ColorlightConfig {
+        &self.cfg
+    }
+
+    /// Borrow the sink (tests inspect a `VecSink`; the arm never needs this).
+    pub fn sink(&self) -> &S {
+        &self.sink
+    }
+}
+
+// ── Env config (OPENMARQUEE_COLORLIGHT_*) ─────────────────────────────────────
+
+/// Env-var prefix for all Colorlight config (matches the renderer convention).
+const ENV_PREFIX: &str = "OPENMARQUEE_COLORLIGHT_";
+
+/// Read `OPENMARQUEE_COLORLIGHT_*` into a `(ColorlightConfig, iface)` pair.
+///
+/// `IFACE` is required (the transport needs a NIC); every geometry/color field
+/// defaults to the ThinkSIGN target ([`ColorlightConfig::thinksign_default`]) and is
+/// overridable — nothing is hard-coded in the arm (design doc §4). The assembled
+/// geometry is `validate()`d up-front so a bad config fails at startup, not on the
+/// first frame. Returns a human-readable error string on a bad/missing value.
+pub fn config_from_env() -> Result<(ColorlightConfig, String), String> {
+    config_from_getter(|k| std::env::var(k).ok())
+}
+
+/// Testable core of [`config_from_env`]: takes a getter so tests never touch the
+/// process environment (which is global + racy under a parallel test runner).
+fn config_from_getter(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<(ColorlightConfig, String), String> {
+    let iface = get(&key("IFACE"))
+        .ok_or_else(|| format!("{ENV_PREFIX}IFACE is required (the NIC to blast frames on)"))?;
+    if iface.trim().is_empty() {
+        return Err(format!("{ENV_PREFIX}IFACE must not be empty"));
+    }
+
+    let mut cfg = ColorlightConfig::thinksign_default();
+    if let Some(v) = parse_u16(&get, "WIDTH")? {
+        cfg.width = v;
+    }
+    if let Some(v) = parse_u16(&get, "HEIGHT")? {
+        cfg.height = v;
+    }
+    if let Some(v) = parse_u16(&get, "PANEL_W")? {
+        cfg.panel_w = v;
+    }
+    if let Some(v) = parse_u16(&get, "PANEL_H")? {
+        cfg.panel_h = v;
+    }
+    if let Some(v) = parse_u16(&get, "PARALLEL")? {
+        cfg.outputs = v;
+    }
+    if let Some(v) = parse_u16(&get, "CHAIN")? {
+        cfg.chain = v;
+    }
+    if let Some(v) = parse_u8(&get, "BRIGHTNESS")? {
+        cfg.brightness = v;
+    }
+    if let Some(s) = get(&key("COLOR_ORDER")) {
+        cfg.color_order = parse_color_order(&s)?;
+    }
+    if let Some(s) = get(&key("CHAIN_REVERSED")) {
+        cfg.chain_reversed = parse_bool(&s);
+    }
+    if let Some(s) = get(&key("DEST_MAC")) {
+        cfg.dest_mac = parse_mac(&s)?;
+    }
+    if let Some(s) = get(&key("SRC_MAC")) {
+        cfg.src_mac = parse_mac(&s)?;
+    }
+    if let Some(s) = get(&key("WIRING_REVISION")) {
+        cfg.wiring_revision = s;
+    }
+
+    cfg.validate()
+        .map_err(|e| format!("invalid Colorlight geometry from env: {e:?}"))?;
+    Ok((cfg, iface.trim().to_string()))
+}
+
+fn key(suffix: &str) -> String {
+    format!("{ENV_PREFIX}{suffix}")
+}
+
+fn parse_u16(
+    get: &impl Fn(&str) -> Option<String>,
+    suffix: &str,
+) -> Result<Option<u16>, String> {
+    match get(&key(suffix)) {
+        Some(s) => s
+            .trim()
+            .parse::<u16>()
+            .map(Some)
+            .map_err(|_| format!("{ENV_PREFIX}{suffix}: '{s}' is not a u16")),
+        None => Ok(None),
+    }
+}
+
+fn parse_u8(get: &impl Fn(&str) -> Option<String>, suffix: &str) -> Result<Option<u8>, String> {
+    match get(&key(suffix)) {
+        Some(s) => s
+            .trim()
+            .parse::<u8>()
+            .map(Some)
+            .map_err(|_| format!("{ENV_PREFIX}{suffix}: '{s}' is not a u8 (0-255)")),
+        None => Ok(None),
+    }
+}
+
+/// Parse a color-order token (case-insensitive): rgb/bgr/grb/gbr/rbg/brg.
+fn parse_color_order(s: &str) -> Result<ColorOrder, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "rgb" => Ok(ColorOrder::Rgb),
+        "bgr" => Ok(ColorOrder::Bgr),
+        "grb" => Ok(ColorOrder::Grb),
+        "gbr" => Ok(ColorOrder::Gbr),
+        "rbg" => Ok(ColorOrder::Rbg),
+        "brg" => Ok(ColorOrder::Brg),
+        other => Err(format!(
+            "{ENV_PREFIX}COLOR_ORDER: '{other}' not one of rgb/bgr/grb/gbr/rbg/brg"
+        )),
+    }
+}
+
+/// Truthy env values: 1/true/yes/on (case-insensitive); everything else false.
+fn parse_bool(s: &str) -> bool {
+    matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Parse `aa:bb:cc:dd:ee:ff` (also `-`/`.`-separated) into 6 bytes.
+fn parse_mac(s: &str) -> Result<[u8; 6], String> {
+    let parts: Vec<&str> = s.trim().split([':', '-', '.']).collect();
+    if parts.len() != 6 {
+        return Err(format!("MAC '{s}' must be 6 colon/dash-separated hex bytes"));
+    }
+    let mut mac = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        mac[i] =
+            u8::from_str_radix(p, 16).map_err(|_| format!("MAC '{s}': '{p}' is not a hex byte"))?;
+    }
+    Ok(mac)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A deterministic, position-dependent top-down RGBA readback (distinct pixels
+    /// so a slice/orientation bug can't hide behind a solid). Alpha set to a
+    /// distinctive constant so the drop is observable.
+    fn synthetic_rgba(w: usize, h: usize) -> Vec<u8> {
+        let mut v = vec![0u8; w * h * 4];
+        for px in 0..(w * h) {
+            v[px * 4] = (px & 0xff) as u8;
+            v[px * 4 + 1] = ((px >> 8) & 0xff) as u8;
+            v[px * 4 + 2] = ((px >> 4) & 0xff) as u8;
+            v[px * 4 + 3] = 0xA5; // alpha — must not reach the wire
+        }
+        v
+    }
+
+    #[test]
+    fn pack_drops_alpha_keeps_rgb_and_does_not_reflip() {
+        // 2x2, top-down: row 0 = [p0, p1], row 1 = [p2, p3]. The packer must NOT
+        // flip (that was capture_fbo_to_rgba's job) — position is preserved.
+        let rgba = vec![
+            10, 20, 30, 111, 40, 50, 60, 122, // row 0
+            70, 80, 90, 133, 100, 110, 120, 144, // row 1
+        ];
+        let mut out = Vec::new();
+        pack_rgba_topdown_to_rgb888(&rgba, 2, 2, &mut out).unwrap();
+        assert_eq!(
+            out,
+            vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120],
+            "alpha dropped, RGB order + row order preserved, no re-flip"
+        );
+    }
+
+    #[test]
+    fn pack_reuses_the_output_buffer() {
+        // Second pack into the same Vec must not append to the first.
+        let mut out = Vec::new();
+        pack_rgba_topdown_to_rgb888(&[1, 2, 3, 4], 1, 1, &mut out).unwrap();
+        pack_rgba_topdown_to_rgb888(&[9, 8, 7, 6], 1, 1, &mut out).unwrap();
+        assert_eq!(
+            out,
+            vec![9, 8, 7],
+            "buffer cleared + repacked, not appended"
+        );
+    }
+
+    #[test]
+    fn pack_rejects_wrong_size_readback() {
+        let mut out = Vec::new();
+        assert!(matches!(
+            pack_rgba_topdown_to_rgb888(&[0u8; 7], 2, 1, &mut out),
+            Err(PipelineError::ReadbackSize {
+                expected: 8,
+                got: 7
+            })
+        ));
+    }
+
+    /// The integration test (admin ask #5): drive the 128x96 Colorlight output stage
+    /// end-to-end through the in-process mock sink and verify serialized frames flow.
+    #[test]
+    fn output_stage_pushes_serialized_frames_end_to_end() {
+        let cfg = ColorlightConfig::thinksign_default(); // 128x96, transpose-valid
+        let (w, h) = (cfg.width as usize, cfg.height as usize);
+        let rgba = synthetic_rgba(w, h);
+
+        let mut out = ColorlightOutput::new(cfg.clone(), VecSink::default());
+        out.push_rgba_frame(&rgba).unwrap();
+        out.push_rgba_frame(&rgba).unwrap();
+
+        assert_eq!(out.frames_sent(), 2, "two frames pushed");
+        let got = &out.sink().frames;
+        assert_eq!(got.len(), 2, "sink received two video frames");
+
+        // Each frame = the exact serialization of the alpha-stripped canvas.
+        let mut expected_rgb = Vec::new();
+        pack_rgba_topdown_to_rgb888(&rgba, w, h, &mut expected_rgb).unwrap();
+        let expected_frames = serialize_frame(&expected_rgb, &cfg).unwrap();
+        assert_eq!(
+            got[0], expected_frames,
+            "sink got exactly the serialized L2 frames"
+        );
+        assert_eq!(
+            got[1], expected_frames,
+            "frame 2 identical for a static input"
+        );
+
+        // Structurally: brightness + 128 rows + latch.
+        assert_eq!(
+            got[0].len(),
+            1 + cfg.card_rows() + 1,
+            "0x0A + 128x 0x55 + 0x01"
+        );
+    }
+
+    #[test]
+    fn output_stage_surfaces_a_readback_size_mismatch() {
+        let cfg = ColorlightConfig::thinksign_default();
+        let mut out = ColorlightOutput::new(cfg, VecSink::default());
+        // One byte short of 128*96*4 — must error, not panic, and not reach the sink.
+        let bad = vec![0u8; 128 * 96 * 4 - 1];
+        assert!(matches!(
+            out.push_rgba_frame(&bad),
+            Err(PipelineError::ReadbackSize { .. })
+        ));
+        assert_eq!(out.frames_sent(), 0);
+        assert!(
+            out.sink().frames.is_empty(),
+            "nothing emitted on a bad frame"
+        );
+    }
+}
