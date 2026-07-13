@@ -43,7 +43,7 @@ def test_playlist_with_both_items_and_item_ids_emits_no_duplicate_key(
     a, b = uuid4(), uuid4()
     raw = {
         "id": str(uuid4()),
-        "name": "Demo",
+        "name": "Free Your Sign",
         "items": [{"item_id": str(a)}, {"item_id": str(b)}],
         # The echo a prior model_dump_json() wrote alongside `items`.
         "item_ids": [str(a), str(b)],
@@ -258,11 +258,11 @@ def test_v3_dict_keyed_migrates_to_v4_list_with_uuids(tmp_path: Path):
     # Migration-rename: a v3 "default" key the operator never touched
     # gets renamed to DEFAULT_PLAYLIST_NAME on upgrade so the fleet's
     # display names stay uniform across fresh-installs and upgrades.
-    # (2026-05-04: that name is "Demo" -- post-Welcome+Freedom collapse
-    # into the FREE YOUR SIGN demo reel.)
+    # (2026-07-13: that name is "Free Your Sign" -- qarl aligned the name
+    # with the FREE YOUR SIGN reel that's been the default content.)
     from openmarquee.playlist import DEFAULT_PLAYLIST_NAME
 
-    assert default_pl.name == DEFAULT_PLAYLIST_NAME == "Demo"
+    assert default_pl.name == DEFAULT_PLAYLIST_NAME == "Free Your Sign"
     assert default_pl.item_ids == [a]
     # Lunch playlist preserved with its name and a fresh UUID.
     lunch = coll.by_name("lunch")
@@ -290,7 +290,10 @@ def test_v4_envelope_loads_unchanged(tmp_path: Path):
 
 def test_collection_round_trips_via_load_all_save_all(tmp_path: Path):
     storage = PlaylistStorage(tmp_path / "playlist.json")
-    p1 = Playlist(id=DEFAULT_PLAYLIST_ID, name="default", items=[])
+    # Default playlist uses the CURRENT name so the round-trip is identity —
+    # a legacy default name ("default"/"Welcome"/"Demo") would be coerced to
+    # DEFAULT_PLAYLIST_NAME on load; that migration is covered separately.
+    p1 = Playlist(id=DEFAULT_PLAYLIST_ID, name=DEFAULT_PLAYLIST_NAME, items=[])
     p1.append(uuid4())
     p2 = Playlist(name="weekend", items=[])
     p2.append(uuid4())
@@ -300,7 +303,7 @@ def test_collection_round_trips_via_load_all_save_all(tmp_path: Path):
 
     loaded = storage.load_all()
     names = {p.name for p in loaded.playlists}
-    assert names == {"default", "weekend"}
+    assert names == {DEFAULT_PLAYLIST_NAME, "weekend"}
     weekend = loaded.by_name("weekend")
     assert weekend is not None
     assert len(weekend.item_ids) == 2
@@ -870,3 +873,142 @@ def test_playlistitem_cut_default_ms_clamps_to_zero():
     item = PlaylistItem(item_id=uuid4())
     assert item.transition == "cut"
     assert item.transition_ms == 0
+
+
+# --- Default-playlist rename migration (default/Welcome/Demo → "Free Your Sign") ---
+
+
+@pytest.mark.parametrize("legacy_name", ["default", "Welcome", "Demo"])
+def test_v4_default_playlist_legacy_name_coerced_to_current(legacy_name: str):
+    """A v4 device first seeded under an older default name upgrades its
+    DEFAULT_PLAYLIST_ID playlist to the current DEFAULT_PLAYLIST_NAME on load,
+    and flags the migration so the caller persists it. This is the fleet-
+    convergence path for already-deployed devices: their files are v4, so the
+    v2/v3 dict-keyed coercion never fires for them."""
+    from openmarquee.playlist import _coerce_to_collection
+
+    data = {
+        "schema_version": PLAYLIST_SCHEMA_VERSION,
+        "playlists": [
+            {"id": str(DEFAULT_PLAYLIST_ID), "name": legacy_name, "items": []},
+        ],
+    }
+    collection, was_migrated = _coerce_to_collection(data)
+    assert was_migrated is True
+    default_pl = collection.by_id(DEFAULT_PLAYLIST_ID)
+    assert default_pl is not None
+    assert default_pl.name == DEFAULT_PLAYLIST_NAME == "Free Your Sign"
+
+
+def test_v4_default_playlist_already_current_is_not_migrated():
+    """A v4 device already on the blessed name loads untouched — no spurious
+    was_migrated=True (which would rewrite the file on every restart)."""
+    from openmarquee.playlist import _coerce_to_collection
+
+    data = {
+        "schema_version": PLAYLIST_SCHEMA_VERSION,
+        "playlists": [
+            {"id": str(DEFAULT_PLAYLIST_ID), "name": DEFAULT_PLAYLIST_NAME, "items": []},
+        ],
+    }
+    collection, was_migrated = _coerce_to_collection(data)
+    assert was_migrated is False
+    assert collection.by_id(DEFAULT_PLAYLIST_ID).name == DEFAULT_PLAYLIST_NAME
+
+
+def test_v4_rename_is_scoped_to_default_id_only():
+    """The v4 rename touches ONLY the DEFAULT_PLAYLIST_ID playlist — a
+    non-default playlist an operator happened to name 'Demo' keeps its name,
+    and the collection is not flagged as migrated."""
+    from openmarquee.playlist import _coerce_to_collection
+
+    other_id = uuid4()
+    data = {
+        "schema_version": PLAYLIST_SCHEMA_VERSION,
+        "playlists": [
+            {"id": str(DEFAULT_PLAYLIST_ID), "name": DEFAULT_PLAYLIST_NAME, "items": []},
+            {"id": str(other_id), "name": "Demo", "items": []},
+        ],
+    }
+    collection, was_migrated = _coerce_to_collection(data)
+    assert was_migrated is False
+    other = collection.by_id(other_id)
+    assert other is not None and other.name == "Demo"
+
+
+def test_v4_rename_scoped_when_a_non_default_shares_a_legacy_name():
+    """Stronger scoping: the default ITSELF carries a legacy name (so the
+    migration fires) AND a non-default playlist also carries a legacy name.
+    Only the DEFAULT_PLAYLIST_ID playlist flips to DEFAULT_PLAYLIST_NAME; the
+    operator's like-named playlist keeps its name."""
+    from openmarquee.playlist import _coerce_to_collection
+
+    other_id = uuid4()
+    data = {
+        "schema_version": PLAYLIST_SCHEMA_VERSION,
+        "playlists": [
+            {"id": str(DEFAULT_PLAYLIST_ID), "name": "Demo", "items": []},
+            {"id": str(other_id), "name": "Welcome", "items": []},
+        ],
+    }
+    collection, was_migrated = _coerce_to_collection(data)
+    assert was_migrated is True
+    assert collection.by_id(DEFAULT_PLAYLIST_ID).name == DEFAULT_PLAYLIST_NAME
+    other = collection.by_id(other_id)
+    assert other is not None and other.name == "Welcome"
+
+
+def test_v3_only_the_default_key_is_coerced():
+    """The v2/v3 dict-keyed migration coerces ONLY the "default" key (the only
+    name that was ever a v2/v3 default key) to the constant id +
+    DEFAULT_PLAYLIST_NAME. A v4-era display name used as a key ("Welcome"/"Demo")
+    is NOT treated as the default — it stays a regular playlist with a fresh id."""
+    from openmarquee.playlist import _coerce_to_collection
+
+    coll, migrated = _coerce_to_collection(
+        {"schema_version": 3, "playlists": {"default": {"items": []}, "lunch": {"items": []}}}
+    )
+    assert migrated is True
+    default_pl = coll.by_id(DEFAULT_PLAYLIST_ID)
+    assert default_pl is not None
+    assert default_pl.name == DEFAULT_PLAYLIST_NAME == "Free Your Sign"
+    lunch = coll.by_name("lunch")
+    assert lunch is not None and lunch.id != DEFAULT_PLAYLIST_ID
+
+    for non_default_key in ("Demo", "Welcome"):
+        coll, _ = _coerce_to_collection(
+            {"schema_version": 3, "playlists": {non_default_key: {"items": []}}}
+        )
+        kept = coll.by_name(non_default_key)
+        assert kept is not None and kept.id != DEFAULT_PLAYLIST_ID, (
+            f"{non_default_key!r} must NOT be promoted to the default identity"
+        )
+
+
+def test_v3_mixed_dict_does_not_swap_default_identity():
+    """Regression for the v2/v3-widening hazard: a stale mixed dict where an
+    operator playlist is keyed "Demo" (ordered first) and the REAL default is
+    keyed "default". The real default must keep DEFAULT_PLAYLIST_ID and become
+    "Free Your Sign"; the "Demo" playlist keeps its name + a fresh id. Widening
+    the v2/v3 match to the full legacy set would wrongly let "Demo" (first in the
+    dict) claim the default identity."""
+    from openmarquee.playlist import _coerce_to_collection
+
+    user_item, real_item = uuid4(), uuid4()
+    data = {
+        "schema_version": 3,
+        "playlists": {
+            "Demo": {"items": [{"item_id": str(user_item)}]},
+            "default": {"items": [{"item_id": str(real_item)}]},
+        },
+    }
+    collection, was_migrated = _coerce_to_collection(data)
+    assert was_migrated is True
+    default_pl = collection.by_id(DEFAULT_PLAYLIST_ID)
+    assert default_pl is not None
+    assert default_pl.name == DEFAULT_PLAYLIST_NAME
+    assert default_pl.item_ids == [real_item]
+    demo = collection.by_name("Demo")
+    assert demo is not None
+    assert demo.id != DEFAULT_PLAYLIST_ID
+    assert demo.item_ids == [user_item]

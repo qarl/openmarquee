@@ -229,8 +229,8 @@ def seed_if_needed(
             )
 
         # save() coerces the playlist's id + name to DEFAULT_PLAYLIST_ID +
-        # "Demo" — preserves the default-playlist identity while giving
-        # the operator a friendlier display name than "default".
+        # "Free Your Sign" — preserves the default-playlist identity while
+        # giving the operator a friendlier display name than "default".
         playlist_storage.save(playlist)
 
         # The previous Welcome + Freedom 2-playlist split (and its

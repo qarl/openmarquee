@@ -182,7 +182,7 @@ def test_seed_creates_starter_slides_when_fresh(
 def test_seed_default_playlist_contains_the_demo_reel(
     storage: ContentStorage, playlist: PlaylistStorage, marker: Path
 ):
-    """Post-2026-05-04 reel shape: fresh boot → default Demo playlist
+    """Post-2026-05-04 reel shape: fresh boot → default playlist
     holds the full FREE-YOUR-SIGN demo reel, in spec order. The Welcome
     trio + separate Freedom playlist have collapsed into reel slots
     01/02/03 + the rest of the reel. Backgrounds + videos are available
@@ -231,15 +231,15 @@ def test_seed_default_playlist_is_named_demo(
 
     default_pl = playlist.get_by_id(DEFAULT_PLAYLIST_ID)
     assert default_pl is not None
-    assert default_pl.name == DEFAULT_PLAYLIST_NAME == "Demo"
+    assert default_pl.name == DEFAULT_PLAYLIST_NAME == "Free Your Sign"
 
 
 def test_seed_reel_contains_free_your_sign_in_default_playlist(
     storage: ContentStorage, playlist: PlaylistStorage, marker: Path
 ):
     """qarl 2026-05-04 reel collapse: FREE / YOUR / SIGN live as reel
-    slots 01 / 02 / 03 inside the single default Demo playlist. The
-    earlier separate 'Freedom' playlist + Friday-night schedule rule
+    slots 01 / 02 / 03 inside the single default "Free Your Sign" playlist.
+    The earlier separate 'Freedom' playlist + Friday-night schedule rule
     are gone -- the protest-poster beat is now the opening of the reel
     rather than a scheduled side-show."""
     created = seed_if_needed(storage, playlist, marker, width=32, height=32)
@@ -248,12 +248,12 @@ def test_seed_reel_contains_free_your_sign_in_default_playlist(
     fys = [s for s in text_slides if s.text_layers[0].text in {"FREE", "YOUR", "SIGN"}]
     assert {s.text_layers[0].text for s in fys} == {"FREE", "YOUR", "SIGN"}
 
-    # No separate Freedom playlist -- only the default Demo playlist exists.
+    # No separate Freedom playlist -- only the default "Free Your Sign" exists.
     collection = playlist.load_all()
     names = {p.name for p in collection.playlists}
-    assert names == {"Demo"}
+    assert names == {"Free Your Sign"}
 
-    # FREE/YOUR/SIGN appear inside the default Demo playlist.
+    # FREE/YOUR/SIGN appear inside the default "Free Your Sign" playlist.
     default_ids = playlist.load().item_ids
     for s in fys:
         assert s.id in default_ids
@@ -269,7 +269,7 @@ def test_seed_leaves_schedule_unrouted_with_default_pointing_at_demo(
     is gone -- the protest-poster beat is now slots 01/02/03 of the
     reel, so there's no scheduled side-show to route to. Seed writes
     no rules; default_playlist_id stays on DEFAULT_PLAYLIST_ID (the
-    Demo playlist), which the evaluator falls back to at all times."""
+    default playlist), which the evaluator falls back to at all times."""
     from openmarquee.playlist import DEFAULT_PLAYLIST_ID
     from openmarquee.schedule import ScheduleStorage
 
@@ -295,11 +295,11 @@ def test_seed_skips_schedule_rule_when_no_schedule_storage_provided(
     storage: ContentStorage, playlist: PlaylistStorage, marker: Path
 ):
     """schedule_storage is optional -- the seed completes cleanly
-    without one, with the default Demo playlist holding the reel."""
+    without one, with the default playlist holding the reel."""
     from openmarquee.playlist import DEFAULT_PLAYLIST_ID, DEFAULT_PLAYLIST_NAME
 
     seed_if_needed(storage, playlist, marker, width=32, height=32)
-    # No exception raised. Only the default Demo playlist exists.
+    # No exception raised. Only the default playlist exists.
     collection = playlist.load_all()
     assert [p.name for p in collection.playlists] == [DEFAULT_PLAYLIST_NAME]
     default_pl = playlist.get_by_id(DEFAULT_PLAYLIST_ID)
@@ -436,7 +436,7 @@ def test_seed_registers_bundled_backgrounds_over_pillow_fallback(
     assert len(created) >= 8
     bg_names = sorted(s.name for s in created if s.name.endswith("— Background"))
     assert bg_names == ["Midnight — Background", "Parchment — Background"]
-    # The default Demo playlist holds the full demo reel (reel slot
+    # The default playlist holds the full demo reel (reel slot
     # names are "NN · Label"); backgrounds are NOT auto-appended.
     reel_slides = [s for s in created if s.type == "text_slide" and " · " in s.name]
     assert playlist.load().item_ids == [s.id for s in reel_slides]
@@ -556,7 +556,7 @@ def test_seed_registers_demo_video_when_mp4_is_present(
     assert "Demo" in videos[0].name
     # And it round-trips through storage.read_video() — the bytes match.
     assert storage.read_video(videos[0].id) == _FAKE_MP4
-    # Demo video is NOT auto-appended to the default Demo playlist --
+    # Demo video is NOT auto-appended to the default playlist --
     # only the reel slides are. Operator drags the demo into the
     # playlist themselves when they want to show it.
     assert videos[0].id not in playlist.load().item_ids
