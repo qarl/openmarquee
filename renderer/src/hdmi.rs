@@ -7610,6 +7610,152 @@ pub fn capture_fbo_to_rgba(
     Ok(flipped)
 }
 
+/// Headless GBM + EGL + GLES2 bring-up for network output backends (Colorlight).
+///
+/// Pattern A from the surfaceless-EGL spike (`docs/colorlight-egl-spike-2026-07-12.md`
+/// §5): the SAME GBM-device + EGL-context path `with_egl_session` uses
+/// (hdmi.rs:926-1015), but **minus the DRM connector / modeset / page-flip**. A
+/// Colorlight Pi drives the sign over Ethernet and has NO connected HDMI panel, so
+/// `with_egl_session`'s `pick_connector_and_mode` would hard-fail; this path never
+/// enumerates connectors and never scans out.
+///
+/// It creates an off-screen GBM surface at `width`x`height` (`RENDERING` only — the
+/// BO is never handed to KMS, so no `SCANOUT`), makes a GLES2 context current on it,
+/// sets the viewport, and hands `work` the `glow::Context`. `work` paints into the
+/// default framebuffer (FBO 0) and reads it back with
+/// `capture_fbo_to_rgba(gl, None, width, height)` — there is no swap-to-scanout and
+/// nothing is ever page-flipped. `work` typically contains the whole per-frame
+/// output loop (paint → tap → serialize → blast) and runs until termination.
+///
+/// Deliberately a ~40-line near-copy of the proven bring-up rather than a refactor
+/// of `with_egl_session`: keeping it a *new* function leaves the hot HDMI scanout
+/// path byte-for-byte untouched (zero regression risk). Linux-only by virtue of the
+/// whole `hdmi` module being `#[cfg(target_os = "linux")]`.
+pub fn with_headless_egl_gl<F, R>(card: &Card, width: u32, height: u32, work: F) -> Result<R>
+where
+    F: FnOnce(&glow::Context) -> Result<R>,
+{
+    use glow::HasContext;
+    if width == 0 || height == 0 {
+        bail!("headless EGL: width/height must be non-zero (got {width}x{height})");
+    }
+
+    // GBM device off the DRM render fd — no connector/CRTC needed for an
+    // off-screen surface (mirrors hdmi.rs:926-931).
+    let gbm_dev = gbm::Device::new(card.0.try_clone().context("clone DRM fd for GBM")?)
+        .context("gbm_create_device (headless) failed")?;
+    let gbm_dev_ptr: *mut c_void = gbm_dev.as_raw() as *mut c_void;
+    if gbm_dev_ptr.is_null() {
+        bail!("gbm_device raw pointer is null");
+    }
+    // Match the proven scanout path's flag combo (SCANOUT | RENDERING, hdmi.rs:935-942)
+    // even though we never page-flip this BO. Keeping SCANOUT maximizes first-light
+    // success on vc4/Mesa: it's the exact allocation the working HDMI bring-up uses,
+    // so a RENDERING-only surface being rejected as an EGL window surface is a risk we
+    // don't take on hardware we can't test pre-first-light. SCANOUT on an off-screen
+    // BO is harmless — it only constrains buffer placement, and we simply never hand
+    // it to KMS. (If a display-less CRTC-less Pi ever rejects SCANOUT allocation,
+    // dropping to RENDERING-only is the first-light fallback.)
+    let mut gbm_surface = gbm_dev
+        .create_surface::<()>(
+            width,
+            height,
+            GbmFormat::Argb8888,
+            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
+        )
+        .context("gbm_surface_create (headless) failed")?;
+
+    // EGL 1.5 dynamic instance + display from the GBM device (mirrors hdmi.rs:944-956).
+    let egl_lib = unsafe {
+        egl::DynamicInstance::<egl::EGL1_5>::load_required()
+            .map_err(|e| anyhow!("eglDynamicInstance::<EGL1_5>::load_required failed: {e:?}"))?
+    };
+    let display = unsafe {
+        egl_lib
+            .get_display(gbm_dev_ptr as egl::NativeDisplayType)
+            .ok_or_else(|| anyhow!("eglGetDisplay returned NO_DISPLAY"))?
+    };
+    let (egl_major, egl_minor) = egl_lib
+        .initialize(display)
+        .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
+    eprintln!("headless EGL {egl_major}.{egl_minor} at {width}x{height} (Colorlight, no scanout)");
+
+    egl_lib
+        .bind_api(egl::OPENGL_ES_API)
+        .map_err(|e| anyhow!("eglBindAPI(GLES) failed: {e:?}"))?;
+    // Same ARGB8888 + GLES2 config the scanout path chooses (hdmi.rs:974-982).
+    let cfg_attribs = [
+        egl::SURFACE_TYPE,
+        egl::WINDOW_BIT,
+        egl::RED_SIZE,
+        8,
+        egl::GREEN_SIZE,
+        8,
+        egl::BLUE_SIZE,
+        8,
+        egl::ALPHA_SIZE,
+        8,
+        egl::RENDERABLE_TYPE,
+        egl::OPENGL_ES2_BIT,
+        egl::NONE,
+    ];
+    let configs = egl_lib
+        .choose_first_config(display, &cfg_attribs)
+        .map_err(|e| anyhow!("eglChooseConfig failed: {e:?}"))?
+        .ok_or_else(|| anyhow!("no EGL config matched ARGB8888 + GLES2"))?;
+    let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
+    let context = egl_lib
+        .create_context(display, configs, None, &ctx_attribs)
+        .map_err(|e| anyhow!("eglCreateContext failed: {e:?}"))?;
+    let egl_surface = unsafe {
+        let raw_surface = gbm_surface.as_raw_mut() as *mut c_void;
+        egl_lib
+            .create_window_surface(display, configs, raw_surface, None)
+            .map_err(|e| anyhow!("eglCreateWindowSurface failed: {e:?}"))?
+    };
+    egl_lib
+        .make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
+        .map_err(|e| anyhow!("eglMakeCurrent failed: {e:?}"))?;
+
+    let gl = unsafe {
+        glow::Context::from_loader_function(|name| {
+            egl_lib
+                .get_proc_address(name)
+                .map(|fp| fp as *const _)
+                .unwrap_or(ptr::null())
+        })
+    };
+    // Default the viewport to the off-screen surface; the paint closure may
+    // override, but a headless caller shouldn't have to.
+    unsafe {
+        gl.viewport(0, 0, width as i32, height as i32);
+    }
+
+    let result = work(&gl);
+
+    // Teardown at parity with `with_egl_session` (hdmi.rs:1407-1418). The khronos-egl
+    // Context/Surface/Display handles are Copy with no Drop, so unbinding alone would
+    // LEAK them — destroy explicitly (warn-on-Err so `result` still carries the real
+    // cause). Order matters: destroy the EGL surface BEFORE `gbm_surface`'s RAII drop
+    // (below, at scope exit), and this makes the fn safe under any call pattern — a
+    // future reconnect/retry loop that re-invokes it can't accumulate contexts on the
+    // CMA-tight Pi. `gl` (declared last) still drops before `egl_lib`, so its resolved
+    // fn pointers never outlive the dlopen handle.
+    if let Err(e) = egl_lib.make_current(display, None, None, None) {
+        eprintln!("warn: headless EGL eglMakeCurrent(unbind): {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_context(display, context) {
+        eprintln!("warn: headless EGL eglDestroyContext: {e:?}");
+    }
+    if let Err(e) = egl_lib.destroy_surface(display, egl_surface) {
+        eprintln!("warn: headless EGL eglDestroySurface: {e:?}");
+    }
+    if let Err(e) = egl_lib.terminate(display) {
+        eprintln!("warn: headless EGL eglTerminate: {e:?}");
+    }
+    result
+}
+
 /// v1-spec-delta #11 (slice c, 2026-05-08) -- snapshot capture
 /// of a TextSlide to a PNG file. Composition over the slice-a
 /// + slice-b primitives:
