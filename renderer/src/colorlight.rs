@@ -15,7 +15,7 @@
 //! The `FrameSink` trait is the seam that makes the whole stage testable without a
 //! socket or hardware: the integration test drives a `VecSink` in-process.
 
-use crate::colorlight_logic::{serialize_frame, ColorlightConfig, SerializeError};
+use crate::colorlight_logic::{serialize_frame, ColorOrder, ColorlightConfig, SerializeError};
 
 // ── Errors ───────────────────────────────────────────────────────────────────
 
@@ -171,6 +171,141 @@ impl<S: FrameSink> ColorlightOutput<S> {
     }
 }
 
+// ── Env config (OPENMARQUEE_COLORLIGHT_*) ─────────────────────────────────────
+
+/// Env-var prefix for all Colorlight config (matches the renderer convention).
+const ENV_PREFIX: &str = "OPENMARQUEE_COLORLIGHT_";
+
+/// Read `OPENMARQUEE_COLORLIGHT_*` into a `(ColorlightConfig, iface)` pair.
+///
+/// `IFACE` is required (the transport needs a NIC); every geometry/color field
+/// defaults to the ThinkSIGN target ([`ColorlightConfig::thinksign_default`]) and is
+/// overridable — nothing is hard-coded in the arm (design doc §4). The assembled
+/// geometry is `validate()`d up-front so a bad config fails at startup, not on the
+/// first frame. Returns a human-readable error string on a bad/missing value.
+pub fn config_from_env() -> Result<(ColorlightConfig, String), String> {
+    config_from_getter(|k| std::env::var(k).ok())
+}
+
+/// Testable core of [`config_from_env`]: takes a getter so tests never touch the
+/// process environment (which is global + racy under a parallel test runner).
+fn config_from_getter(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<(ColorlightConfig, String), String> {
+    let iface = get(&key("IFACE"))
+        .ok_or_else(|| format!("{ENV_PREFIX}IFACE is required (the NIC to blast frames on)"))?;
+    if iface.trim().is_empty() {
+        return Err(format!("{ENV_PREFIX}IFACE must not be empty"));
+    }
+
+    let mut cfg = ColorlightConfig::thinksign_default();
+    if let Some(v) = parse_u16(&get, "WIDTH")? {
+        cfg.width = v;
+    }
+    if let Some(v) = parse_u16(&get, "HEIGHT")? {
+        cfg.height = v;
+    }
+    if let Some(v) = parse_u16(&get, "PANEL_W")? {
+        cfg.panel_w = v;
+    }
+    if let Some(v) = parse_u16(&get, "PANEL_H")? {
+        cfg.panel_h = v;
+    }
+    if let Some(v) = parse_u16(&get, "PARALLEL")? {
+        cfg.outputs = v;
+    }
+    if let Some(v) = parse_u16(&get, "CHAIN")? {
+        cfg.chain = v;
+    }
+    if let Some(v) = parse_u8(&get, "BRIGHTNESS")? {
+        cfg.brightness = v;
+    }
+    if let Some(s) = get(&key("COLOR_ORDER")) {
+        cfg.color_order = parse_color_order(&s)?;
+    }
+    if let Some(s) = get(&key("CHAIN_REVERSED")) {
+        cfg.chain_reversed = parse_bool(&s);
+    }
+    if let Some(s) = get(&key("DEST_MAC")) {
+        cfg.dest_mac = parse_mac(&s)?;
+    }
+    if let Some(s) = get(&key("SRC_MAC")) {
+        cfg.src_mac = parse_mac(&s)?;
+    }
+    if let Some(s) = get(&key("WIRING_REVISION")) {
+        cfg.wiring_revision = s;
+    }
+
+    cfg.validate()
+        .map_err(|e| format!("invalid Colorlight geometry from env: {e:?}"))?;
+    Ok((cfg, iface.trim().to_string()))
+}
+
+fn key(suffix: &str) -> String {
+    format!("{ENV_PREFIX}{suffix}")
+}
+
+fn parse_u16(get: &impl Fn(&str) -> Option<String>, suffix: &str) -> Result<Option<u16>, String> {
+    match get(&key(suffix)) {
+        Some(s) => s
+            .trim()
+            .parse::<u16>()
+            .map(Some)
+            .map_err(|_| format!("{ENV_PREFIX}{suffix}: '{s}' is not a u16")),
+        None => Ok(None),
+    }
+}
+
+fn parse_u8(get: &impl Fn(&str) -> Option<String>, suffix: &str) -> Result<Option<u8>, String> {
+    match get(&key(suffix)) {
+        Some(s) => s
+            .trim()
+            .parse::<u8>()
+            .map(Some)
+            .map_err(|_| format!("{ENV_PREFIX}{suffix}: '{s}' is not a u8 (0-255)")),
+        None => Ok(None),
+    }
+}
+
+/// Parse a color-order token (case-insensitive): rgb/bgr/grb/gbr/rbg/brg.
+fn parse_color_order(s: &str) -> Result<ColorOrder, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "rgb" => Ok(ColorOrder::Rgb),
+        "bgr" => Ok(ColorOrder::Bgr),
+        "grb" => Ok(ColorOrder::Grb),
+        "gbr" => Ok(ColorOrder::Gbr),
+        "rbg" => Ok(ColorOrder::Rbg),
+        "brg" => Ok(ColorOrder::Brg),
+        other => Err(format!(
+            "{ENV_PREFIX}COLOR_ORDER: '{other}' not one of rgb/bgr/grb/gbr/rbg/brg"
+        )),
+    }
+}
+
+/// Truthy env values: 1/true/yes/on (case-insensitive); everything else false.
+fn parse_bool(s: &str) -> bool {
+    matches!(
+        s.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Parse `aa:bb:cc:dd:ee:ff` (also `-`/`.`-separated) into 6 bytes.
+fn parse_mac(s: &str) -> Result<[u8; 6], String> {
+    let parts: Vec<&str> = s.trim().split([':', '-', '.']).collect();
+    if parts.len() != 6 {
+        return Err(format!(
+            "MAC '{s}' must be 6 colon/dash-separated hex bytes"
+        ));
+    }
+    let mut mac = [0u8; 6];
+    for (i, p) in parts.iter().enumerate() {
+        mac[i] =
+            u8::from_str_radix(p, 16).map_err(|_| format!("MAC '{s}': '{p}' is not a hex byte"))?;
+    }
+    Ok(mac)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +418,124 @@ mod tests {
             out.sink().frames.is_empty(),
             "nothing emitted on a bad frame"
         );
+    }
+
+    // ── env config ──
+
+    fn env_get<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn config_from_getter_defaults_to_thinksign_when_only_iface_set() {
+        let (cfg, iface) =
+            config_from_getter(env_get(&[("OPENMARQUEE_COLORLIGHT_IFACE", "eth0")])).unwrap();
+        assert_eq!(iface, "eth0");
+        let d = ColorlightConfig::thinksign_default();
+        assert_eq!(
+            (
+                cfg.width,
+                cfg.height,
+                cfg.outputs,
+                cfg.chain,
+                cfg.color_order
+            ),
+            (d.width, d.height, d.outputs, d.chain, d.color_order)
+        );
+    }
+
+    #[test]
+    fn config_from_getter_requires_iface() {
+        let err = config_from_getter(env_get(&[])).unwrap_err();
+        assert!(
+            err.contains("IFACE"),
+            "missing IFACE must be named in the error"
+        );
+        assert!(config_from_getter(env_get(&[("OPENMARQUEE_COLORLIGHT_IFACE", "  ")])).is_err());
+    }
+
+    #[test]
+    fn config_from_getter_applies_overrides() {
+        let (cfg, iface) = config_from_getter(env_get(&[
+            ("OPENMARQUEE_COLORLIGHT_IFACE", "eth1"),
+            ("OPENMARQUEE_COLORLIGHT_BRIGHTNESS", "128"),
+            ("OPENMARQUEE_COLORLIGHT_COLOR_ORDER", "BGR"),
+            ("OPENMARQUEE_COLORLIGHT_CHAIN_REVERSED", "yes"),
+            ("OPENMARQUEE_COLORLIGHT_DEST_MAC", "aa:bb:cc:dd:ee:ff"),
+            (
+                "OPENMARQUEE_COLORLIGHT_WIRING_REVISION",
+                "thinksign-blessed-2026-07-20",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(iface, "eth1");
+        assert_eq!(cfg.brightness, 128);
+        assert_eq!(cfg.color_order, ColorOrder::Bgr);
+        assert!(cfg.chain_reversed);
+        assert_eq!(cfg.dest_mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(cfg.wiring_revision, "thinksign-blessed-2026-07-20");
+    }
+
+    #[test]
+    fn config_from_getter_rejects_unparseable_value() {
+        let err = config_from_getter(env_get(&[
+            ("OPENMARQUEE_COLORLIGHT_IFACE", "eth0"),
+            ("OPENMARQUEE_COLORLIGHT_BRIGHTNESS", "over9000"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("BRIGHTNESS"));
+    }
+
+    #[test]
+    fn config_from_getter_rejects_geometry_that_breaks_the_transpose() {
+        // chain=2 → row_width_px = 2*32 = 64 ≠ height 96 → validate() fails at startup.
+        let r = config_from_getter(env_get(&[
+            ("OPENMARQUEE_COLORLIGHT_IFACE", "eth0"),
+            ("OPENMARQUEE_COLORLIGHT_CHAIN", "2"),
+        ]));
+        assert!(
+            r.is_err(),
+            "env geometry violating the remap must fail at startup"
+        );
+    }
+
+    #[test]
+    fn parse_mac_accepts_valid_and_rejects_bad() {
+        assert_eq!(
+            parse_mac("11:22:33:44:55:66").unwrap(),
+            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]
+        );
+        assert_eq!(
+            parse_mac("aa-bb-cc-dd-ee-ff").unwrap(),
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+        );
+        assert!(parse_mac("11:22:33").is_err(), "too few bytes");
+        assert!(parse_mac("gg:22:33:44:55:66").is_err(), "non-hex byte");
+    }
+
+    #[test]
+    fn parse_color_order_covers_all_six_and_rejects_junk() {
+        assert_eq!(parse_color_order("rgb").unwrap(), ColorOrder::Rgb);
+        assert_eq!(parse_color_order("BGR").unwrap(), ColorOrder::Bgr);
+        assert_eq!(parse_color_order(" grb ").unwrap(), ColorOrder::Grb);
+        assert_eq!(parse_color_order("gbr").unwrap(), ColorOrder::Gbr);
+        assert_eq!(parse_color_order("rbg").unwrap(), ColorOrder::Rbg);
+        assert_eq!(parse_color_order("brg").unwrap(), ColorOrder::Brg);
+        assert!(parse_color_order("xyz").is_err());
+    }
+
+    #[test]
+    fn parse_bool_truthy_set() {
+        for t in ["1", "true", "YES", "On"] {
+            assert!(parse_bool(t), "{t} should be truthy");
+        }
+        for fv in ["0", "false", "no", ""] {
+            assert!(!parse_bool(fv), "{fv} should be falsey");
+        }
     }
 }

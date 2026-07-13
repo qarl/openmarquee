@@ -150,7 +150,11 @@ impl ColorlightConfig {
         self.chain as usize * self.panel_w as usize
     }
 
-    fn validate(&self) -> Result<(), SerializeError> {
+    /// Check the geometry is internally consistent + satisfies the transpose remap.
+    /// Called by `serialize_frame` (so a bad config never produces garbage packets)
+    /// and by the Phase-2 `config_from_env` (so a bad env config fails at startup,
+    /// not on the first frame).
+    pub fn validate(&self) -> Result<(), SerializeError> {
         if self.width == 0 || self.height == 0 || self.panel_w == 0 || self.panel_h == 0 {
             return Err(SerializeError::InvalidGeometry("zero dimension"));
         }
