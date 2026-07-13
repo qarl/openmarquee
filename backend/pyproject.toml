@@ -19,7 +19,7 @@ dependencies = [
     # WebRTC stack). Lock to a known-good version; bump
     # intentionally through pip-audit + a fresh lockfile generation
     # rather than letting `>=` drift silently.
-    "pillow==12.2.0",
+    "pillow==12.3.0",
     "aiortc==1.14.0",
     # numpy is a hard dep of stream.py's `frame.to_ndarray(format='rgb24')`.
     # PyAV declares numpy as optional, so without this entry a fresh

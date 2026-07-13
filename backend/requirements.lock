@@ -62,7 +62,7 @@ ifaddr==0.2.0
     # via aioice
 numpy==2.5.1
     # via openmarquee (pyproject.toml)
-pillow==12.2.0
+pillow==12.3.0
     # via openmarquee (pyproject.toml)
 pycparser==3.0
     # via cffi
