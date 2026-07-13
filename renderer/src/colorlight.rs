@@ -547,7 +547,7 @@ mod tests {
 // *testable* correctness lives in the pure section above (packer, driver, config).
 
 #[cfg(target_os = "linux")]
-pub use linux_impl::{link_state, LinkState, RawSocketSink};
+pub use linux_impl::{link_state, paint_first_light_pattern, LinkState, RawSocketSink};
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
@@ -667,4 +667,41 @@ mod linux_impl {
         (state, speed)
     }
 
+    /// A first-light bring-up scene painted into FBO 0 at `w`x`h` (no shaders/VBOs —
+    /// pure `glClear` + `glScissor`, so it can't fail to compile a program on vc4).
+    /// Four quadrant solids (R/G/B/white — reveal orientation, module mapping, and
+    /// channel order at a glance) plus a 1-px white column sweeping horizontally
+    /// (reveals column direction + proves motion/cadence). This is the Phase-2
+    /// stand-in for the content pipeline (wiring the playlist through the same tap is
+    /// the follow-up); it's also genuinely the most useful thing to show qarl first.
+    pub fn paint_first_light_pattern(gl: &glow::Context, w: u32, h: u32, frame: u64) {
+        use glow::HasContext;
+        // GL scissor origin is bottom-left; quadrant positions are in those coords.
+        let (hw, hh) = ((w / 2) as i32, (h / 2) as i32);
+        // (x, y, r, g, b)
+        let quads = [
+            (0, 0, 1.0f32, 0.0, 0.0), // bottom-left  R
+            (hw, 0, 0.0, 1.0, 0.0),   // bottom-right G
+            (0, hh, 0.0, 0.0, 1.0),   // top-left     B
+            (hw, hh, 1.0, 1.0, 1.0),  // top-right    white
+        ];
+        unsafe {
+            gl.disable(glow::SCISSOR_TEST);
+            gl.viewport(0, 0, w as i32, h as i32);
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.enable(glow::SCISSOR_TEST);
+            for (x, y, r, g, b) in quads {
+                gl.scissor(x, y, hw.max(1), hh.max(1));
+                gl.clear_color(r, g, b, 1.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            // Sweeping 1-px white column.
+            let col = (frame % w.max(1) as u64) as i32;
+            gl.scissor(col, 0, 1, h as i32);
+            gl.clear_color(1.0, 1.0, 1.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.disable(glow::SCISSOR_TEST);
+        }
+    }
 }
