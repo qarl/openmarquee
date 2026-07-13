@@ -539,3 +539,132 @@ mod tests {
         }
     }
 }
+// ── Linux-only transport + first-light scene ─────────────────────────────────
+//
+// The socket + link-state + GL paint. Compiled only on Linux (needs libc AF_PACKET
+// / glow); verified via the aarch64 cross-build, exercised at first-light on the Pi.
+// The whole crate's `cargo test` gate on macOS never sees this block, so all
+// *testable* correctness lives in the pure section above (packer, driver, config).
+
+#[cfg(target_os = "linux")]
+pub use linux_impl::{link_state, LinkState, RawSocketSink};
+
+#[cfg(target_os = "linux")]
+mod linux_impl {
+    use super::FrameSink;
+    use std::io;
+    use std::os::unix::io::RawFd;
+
+    /// `ETH_P_ALL` in host order; `libc` doesn't re-export it. Used as the socket
+    /// protocol (as `htons`) — for a send-only SOCK_RAW it just has to be non-zero
+    /// and consistent with `sll_protocol`.
+    const ETH_P_ALL: u16 = 0x0003;
+
+    /// Linux `AF_PACKET`/`SOCK_RAW` sink: blasts each L2 frame straight onto the NIC.
+    /// Requires `CAP_NET_RAW` (root or `setcap cap_net_raw+ep`, design doc §4). Thin
+    /// — every wire byte is already correct out of `serialize_frame`; this only does
+    /// `sendto` per packet. `serialize_frame` emits FULL frames (14-byte eth header
+    /// included), so `SOCK_RAW` sends them verbatim.
+    pub struct RawSocketSink {
+        fd: RawFd,
+        ifindex: i32,
+        iface: String,
+        dest_mac: [u8; 6],
+    }
+
+    impl RawSocketSink {
+        /// Open + resolve the interface index. `dest_mac` should match the config's
+        /// `dest_mac` (it's already in each frame's header; `sll_addr` is belt-and-
+        /// braces for `sendto`).
+        pub fn open(iface: &str, dest_mac: [u8; 6]) -> io::Result<Self> {
+            let cif = std::ffi::CString::new(iface)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "iface name has NUL"))?;
+            // if_nametoindex: 0 == error (unknown interface).
+            let ifindex = unsafe { libc::if_nametoindex(cif.as_ptr()) };
+            if ifindex == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let proto = (ETH_P_ALL.to_be()) as libc::c_int;
+            let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, proto) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                fd,
+                ifindex: ifindex as i32,
+                iface: iface.to_string(),
+                dest_mac,
+            })
+        }
+
+        pub fn iface(&self) -> &str {
+            &self.iface
+        }
+    }
+
+    impl FrameSink for RawSocketSink {
+        fn send_frame(&mut self, frames: &[Vec<u8>]) -> io::Result<()> {
+            for f in frames {
+                let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+                addr.sll_family = libc::AF_PACKET as u16;
+                addr.sll_protocol = ETH_P_ALL.to_be();
+                addr.sll_ifindex = self.ifindex;
+                addr.sll_halen = 6;
+                addr.sll_addr[..6].copy_from_slice(&self.dest_mac);
+                let sent = unsafe {
+                    libc::sendto(
+                        self.fd,
+                        f.as_ptr() as *const libc::c_void,
+                        f.len(),
+                        0,
+                        &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                    )
+                };
+                if sent < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for RawSocketSink {
+        fn drop(&mut self) {
+            if self.fd >= 0 {
+                unsafe {
+                    libc::close(self.fd);
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum LinkState {
+        Up,
+        Down,
+        Unknown,
+    }
+
+    /// Carrier + speed from `/sys/class/net/<if>/{carrier,speed}` (FPP-style, design
+    /// doc §8). Never wedges: a missing/unreadable file → `Unknown` / `None`. The arm
+    /// warns on down/slow but keeps compositing — the link is not load-bearing for the
+    /// renderer, only for pixels reaching the card.
+    pub fn link_state(iface: &str) -> (LinkState, Option<u32>) {
+        let state = match std::fs::read_to_string(format!("/sys/class/net/{iface}/carrier")) {
+            Ok(s) => match s.trim() {
+                "1" => LinkState::Up,
+                "0" => LinkState::Down,
+                _ => LinkState::Unknown,
+            },
+            Err(_) => LinkState::Unknown,
+        };
+        let speed = std::fs::read_to_string(format!("/sys/class/net/{iface}/speed"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| n as u32);
+        (state, speed)
+    }
+
+}
