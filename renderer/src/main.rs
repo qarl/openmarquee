@@ -337,6 +337,11 @@ enum OutputMode {
     /// reach gate. Spec §5: keep reachable; panel-write path
     /// stubbed for v1.
     Ws2812b,
+    /// Colorlight 5A-75B receiver card over raw L2 Ethernet (Phase 2). Headless
+    /// GL composite at the sign's native size → glReadPixels tap → serialize →
+    /// AF_PACKET blast. No DRM scanout; no HDMI connector needed. Config via
+    /// OPENMARQUEE_COLORLIGHT_* (design doc §3/§4).
+    Colorlight,
 }
 
 #[derive(Parser, Debug)]
@@ -2135,6 +2140,90 @@ fn main() -> Result<()> {
                  backend can detect the renderer's reach without panicking on a\n\
                  not-yet-implemented arm."
             );
+        }
+        OutputMode::Colorlight => {
+            // Phase 2: drive qarl's ThinkSIGN over raw L2 Ethernet. Headless GBM+EGL
+            // (Pattern A — no connector/scanout) composites at the sign's native size
+            // into FBO 0; capture_fbo_to_rgba taps it (RGBA8, Y-flipped); the pure
+            // colorlight pipeline packs → serializes → blasts on AF_PACKET. Config +
+            // geometry are entirely env-driven (nothing hard-coded). SIGTERM/SIGINT
+            // (handler installed above) stops the loop cleanly.
+            #[cfg(target_os = "linux")]
+            {
+                let (cfg, iface) = colorlight::config_from_env()
+                    .map_err(|e| anyhow::anyhow!("colorlight config: {e}"))?;
+                eprintln!(
+                    "colorlight output: iface={iface} canvas={}x{} panel={}x{} \
+                     parallel={} chain={} order={:?} brightness={} chain_reversed={} \
+                     wiring_rev={}",
+                    cfg.width,
+                    cfg.height,
+                    cfg.panel_w,
+                    cfg.panel_h,
+                    cfg.outputs,
+                    cfg.chain,
+                    cfg.color_order,
+                    cfg.brightness,
+                    cfg.chain_reversed,
+                    cfg.wiring_revision,
+                );
+                // Link sanity (design §8): warn, never wedge — the renderer keeps
+                // compositing regardless; the card just holds-last / goes dark.
+                let (link, speed) = colorlight::link_state(&iface);
+                eprintln!("colorlight: {iface} link={link:?} speed={speed:?}Mbps");
+                if !matches!(link, colorlight::LinkState::Up) {
+                    eprintln!(
+                        "warn: colorlight: {iface} carrier not up — sending anyway \
+                         (card holds last frame / dark on link loss)"
+                    );
+                }
+                if let Some(s) = speed {
+                    if s < 1000 {
+                        eprintln!(
+                            "warn: colorlight: {iface} link {s}Mbps < 1000 — cadence \
+                             may starve (FPP refuses a sub-gigabit link)"
+                        );
+                    }
+                }
+
+                let (path, card) = open_drm(args.drm_card.as_deref())?;
+                eprintln!("opened DRM device: {}", path.display());
+                let w = cfg.width as u32;
+                let h = cfg.height as u32;
+                hdmi::with_headless_egl_gl(&card, w, h, |gl| -> Result<()> {
+                    let sink = colorlight::RawSocketSink::open(&iface, cfg.dest_mac)
+                        .with_context(|| {
+                            format!("open AF_PACKET socket on {iface} (needs CAP_NET_RAW)")
+                        })?;
+                    let mut out = colorlight::ColorlightOutput::new(cfg.clone(), sink);
+                    eprintln!("colorlight: streaming {w}x{h}; SIGTERM/SIGINT to stop");
+                    let mut frame: u64 = 0;
+                    while !sigterm::is_shutdown_requested() {
+                        colorlight::paint_first_light_pattern(gl, w, h, frame);
+                        let rgba = hdmi::capture_fbo_to_rgba(gl, None, w, h)
+                            .with_context(|| format!("colorlight readback frame {frame}"))?;
+                        out.push_rgba_frame(&rgba)
+                            .map_err(|e| anyhow::anyhow!("colorlight frame {frame}: {e}"))?;
+                        frame += 1;
+                        // Pace ~30 fps (design §2 cadence 20-60Hz; a real link streams
+                        // faster, but the first-light pattern doesn't need it).
+                        std::thread::sleep(std::time::Duration::from_millis(33));
+                    }
+                    eprintln!(
+                        "colorlight: shutdown requested after {} frames",
+                        out.frames_sent()
+                    );
+                    Ok(())
+                })?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = &args;
+                bail!(
+                    "--output colorlight requires Linux (gbm/EGL/AF_PACKET); \
+                     not available on this host"
+                );
+            }
         }
     }
 
