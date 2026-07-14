@@ -1,8 +1,13 @@
 # cloud-init for openMarquee
 
-NoCloud datasource template for first-boot config. Pi-gen drops these
-files into `/boot/firmware/` on the SD image; on first boot cloud-init
-reads them and runs the directives.
+NoCloud datasource template for first-boot config, read from
+`/boot/firmware/` on first boot. This directory is the **base-image**
+template; a normal shipped card is code-staged and
+`scripts/stage_sd_card.sh` writes its own `user-data` variant onto
+`/boot/firmware/` (declaring the same login `openmarquee` user + the same
+`{{SSH_AUTHORIZED_KEYS}}` placeholder). So on a shipped card the SSH key is
+seeded at the staging step; this base template only reaches a standalone
+base flash.
 
 | File | Role |
 | --- | --- |
@@ -11,10 +16,12 @@ reads them and runs the directives.
 
 ## Placeholder substitution
 
-`{{SSH_AUTHORIZED_KEYS}}` must be replaced with the operator's SSH
-public key before flashing. The B.6 `scripts/build-image.sh` wrapper
-will accept `--ssh-key <path>` and do this substitution; until then,
-substitute by hand:
+`{{SSH_AUTHORIZED_KEYS}}` is replaced with the operator's SSH public key.
+On a **shipped (staged) card** this is done by `scripts/stage_sd_card.sh
+--ssh-key <path>` (default `~/.ssh/id_ed25519.pub`, then `id_rsa.pub`),
+which writes the shipped `user-data`. For a **base image**,
+`scripts/build-image.sh --ssh-key <path>` substitutes into this template.
+To substitute by hand:
 
 ```bash
 SSH_KEY=$(cat ~/.ssh/id_ed25519.pub)
