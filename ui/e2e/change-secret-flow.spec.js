@@ -44,6 +44,10 @@ test.beforeEach(async ({ page }) => {
 
 test("wifi-station-password Change… → fill → Save → indicator updates", async ({ page }) => {
     await page.goto("/#/settings");
+    // 2026-07-14 (C3): single-select WiFi modes collapse the non-selected
+    // mode's body. The fresh-device default is Create, so the station
+    // (Join) password field is collapsed until Join is selected — pick it.
+    await page.locator(".field-wifi-station-enabled").check();
     const row = page.locator('.secret-field[data-secret="wifi-station-password"]');
     await expect(row).toBeVisible();
     // Pre-rotation: defaults have wifi_station_password=null -> "Not set".
@@ -63,6 +67,8 @@ test("wifi-station-password Change… → fill → Save → indicator updates", 
 
 test("wifi-station-password Change… with wrong current_password: 401 inline, no redirect", async ({ page }) => {
     await page.goto("/#/settings");
+    // 2026-07-14 (C3): select Join to reveal its collapsed password field.
+    await page.locator(".field-wifi-station-enabled").check();
     const row = page.locator('.secret-field[data-secret="wifi-station-password"]');
     await row.locator(".secret-change-btn").click();
     await row.locator(".secret-current-password").fill("wrong-current-password");

@@ -47,15 +47,11 @@ const SAMPLE = {
 };
 
 describe("mountSettings", () => {
-    it("wifi AP fieldset uses new 'Setup Mode' lifecycle copy (not the old concurrent-AP wording)", async () => {
-        // 2026-07-01 (onboarding audit 4b): the wifi AP field labels
-        // used to describe the OLD concurrent-AP model
-        // ("Access point (captive-portal…)", "Runs concurrently with
-        // the access point on the Pi's single radio…"). The spec
-        // (qa/spec-onboarding-ap-sta-concurrent-2026-06-10.md)
-        // retires that model in favor of a "Setup Mode" that is
-        // normally OFF and turns on automatically when the sign
-        // loses its wifi. This is a copy-regression guard.
+    it("wifi mode fieldsets use single-select 'Create / Join' radio copy", async () => {
+        // 2026-07-14 (qarl): the two WiFi modes were renamed and
+        // converted from concurrent checkboxes to single-select radios.
+        // "Setup Mode" → "Create WiFi Network"; "Join existing WiFi" →
+        // "Join Existing Network". Copy + control-type regression guard.
         const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
             ok: true,
             json: async () => ({}),
@@ -67,20 +63,26 @@ describe("mountSettings", () => {
         });
         await tick();
         const text = container.textContent;
-        // New copy MUST appear.
-        expect(text).toMatch(/Setup Mode/);
-        expect(text).toMatch(
-            /auto-enables when the sign can't reach its wifi/i,
-        );
-        // Old copy MUST NOT appear (retired per spec §"Fallback
-        // position" / audit 4b).
+        // New mode names MUST appear.
+        expect(text).toMatch(/Create WiFi Network/);
+        expect(text).toMatch(/Join Existing Network/);
+        // Old names/copy MUST NOT appear.
+        expect(text).not.toMatch(/Setup Mode/);
+        expect(text).not.toMatch(/Join existing WiFi/);
         expect(text).not.toMatch(/Access point \(captive-portal/i);
         expect(text).not.toMatch(/Runs concurrently with the access point/i);
-        // Field labels use "Setup Mode SSID / password", not "AP …".
+        // Both modes are single-select radios sharing one group.
+        const apRadio = container.querySelector(".field-wifi-ap-enabled");
+        const staRadio = container.querySelector(".field-wifi-station-enabled");
+        expect(apRadio.type).toBe("radio");
+        expect(staRadio.type).toBe("radio");
+        expect(apRadio.name).toBe(staRadio.name);
+        expect(apRadio.name).toBeTruthy();
+        // Field label renamed off "Setup Mode …".
         const ssidLabel = container.querySelector(".field-wifi-ssid")
             ?.closest("label")
             ?.querySelector("span")?.textContent;
-        expect(ssidLabel).toMatch(/Setup Mode SSID/);
+        expect(ssidLabel).toMatch(/Network name \(SSID\)/);
         fetchSpy.mockRestore();
     });
 
@@ -288,7 +290,10 @@ describe("mountSettings", () => {
         expect(onSave.mock.calls[0][0].timezone).toBeNull();
     });
 
-    it("WiFi station fieldset is grayed out when station toggle is off", async () => {
+    it("Join section is collapsed (is-disabled) when Join is not selected", async () => {
+        // 2026-07-14 (qarl): the deselected mode's body is collapsed via
+        // CSS (.is-disabled > :not(legend) { display:none }); the class
+        // toggle is the tested mechanism, the display:none is CSS-only.
         const container = document.createElement("div");
         mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
         await tick();
@@ -297,34 +302,98 @@ describe("mountSettings", () => {
         expect(container.querySelector(".field-wifi-station-ssid").disabled).toBe(true);
     });
 
-    it("enabling the station toggle un-grays its fieldset", async () => {
+    it("selecting Join expands its section (removes is-disabled)", async () => {
         const container = document.createElement("div");
         mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
         await tick();
-        const toggle = container.querySelector(".field-wifi-station-enabled");
-        toggle.checked = true;
-        toggle.dispatchEvent(new Event("change"));
+        const joinRadio = container.querySelector(".field-wifi-station-enabled");
+        joinRadio.checked = true;
+        joinRadio.dispatchEvent(new Event("change"));
         const stationFieldset = container.querySelector(".settings-wifi-station");
         expect(stationFieldset.classList.contains("is-disabled")).toBe(false);
         expect(container.querySelector(".field-wifi-station-ssid").disabled).toBe(false);
     });
 
-    it("refuses to let the operator disable both WiFi modes", async () => {
+    it("WiFi modes are mutually-exclusive radios (selecting one deselects the other)", async () => {
+        // 2026-07-14 (qarl): checkboxes → single-select radios. The old
+        // "can't disable both" guard is gone — a radio group makes the
+        // both-off state structurally unreachable.
         const container = document.createElement("div");
         mount(container, {
             fetchSettings: async () => ({ ...SAMPLE, wifi_station_enabled: false }),
             onSave: vi.fn(),
         });
         await tick();
-        // Only AP is on. Try to turn it off.
-        const apToggle = container.querySelector(".field-wifi-ap-enabled");
-        apToggle.checked = false;
-        apToggle.dispatchEvent(new Event("change"));
-        // Bounced back on.
-        expect(apToggle.checked).toBe(true);
-        expect(container.querySelector(".settings-status").textContent).toMatch(
-            /can't disable both/i,
-        );
+        const apRadio = container.querySelector(".field-wifi-ap-enabled");
+        const staRadio = container.querySelector(".field-wifi-station-enabled");
+        // Fresh device (station off): Create selected, Join not.
+        expect(apRadio.checked).toBe(true);
+        expect(staRadio.checked).toBe(false);
+        // Selecting Join deselects Create (radio-group exclusivity).
+        staRadio.checked = true;
+        staRadio.dispatchEvent(new Event("change"));
+        expect(staRadio.checked).toBe(true);
+        expect(apRadio.checked).toBe(false);
+        // Join expands, Create collapses — is-disabled drives the CSS
+        // collapse (display:none on the deselected mode's body).
+        expect(
+            container.querySelector(".settings-wifi-station").classList.contains("is-disabled"),
+        ).toBe(false);
+        expect(
+            container.querySelector(".settings-wifi-ap").classList.contains("is-disabled"),
+        ).toBe(true);
+    });
+
+    it("collapses a legacy both-modes-enabled device to a single Join selection", async () => {
+        // 2026-07-14 (qarl): the old concurrent regime allowed AP+STA
+        // both on. Under single-select radios, loading such a device
+        // selects Join (station is the more specific intent), and the
+        // next save writes the mutually-exclusive pair — migrating the
+        // device off concurrent mode.
+        const container = document.createElement("div");
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        mount(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                wifi_ap_enabled: true,
+                wifi_station_enabled: true,
+            }),
+            onSave,
+        });
+        await tick();
+        const apRadio = container.querySelector(".field-wifi-ap-enabled");
+        const staRadio = container.querySelector(".field-wifi-station-enabled");
+        expect(staRadio.checked).toBe(true);
+        expect(apRadio.checked).toBe(false);
+        // Saving migrates the concurrent device to Join-only.
+        container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
+        await tick();
+        const p = onSave.mock.calls[0][0];
+        expect(p.wifi_ap_enabled).toBe(false);
+        expect(p.wifi_station_enabled).toBe(true);
+    });
+
+    it("nests the saved-networks list in Join and hides it under Create", async () => {
+        // 2026-07-14 (qarl): the wifi-networks list moved INTO the Join
+        // Existing Network section and is hidden (not just grayed) when
+        // Create WiFi Network is selected — only relevant when joining.
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => ({ ...SAMPLE, wifi_station_enabled: false }),
+            onSave: vi.fn(),
+        });
+        await tick();
+        const networks = container.querySelector(".settings-wifi-networks");
+        const station = container.querySelector(".settings-wifi-station");
+        // Nested inside the Join Existing Network fieldset.
+        expect(station.contains(networks)).toBe(true);
+        // Create selected → list hidden.
+        expect(networks.hidden).toBe(true);
+        // Select Join → list shown.
+        const staRadio = container.querySelector(".field-wifi-station-enabled");
+        staRadio.checked = true;
+        staRadio.dispatchEvent(new Event("change"));
+        expect(networks.hidden).toBe(false);
     });
 
     it("sends all WiFi fields in the save payload", async () => {
@@ -344,7 +413,9 @@ describe("mountSettings", () => {
         container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
         const p = onSave.mock.calls[0][0];
-        expect(p.wifi_ap_enabled).toBe(true);
+        // Single-select: loading with station enabled selects Join, so
+        // the payload is mutually exclusive (AP off, station on).
+        expect(p.wifi_ap_enabled).toBe(false);
         expect(p.wifi_station_enabled).toBe(true);
         expect(p.wifi_station_ssid).toBe("home-net");
         // Batch 20.4: PUT body echoes the sentinel; the backend

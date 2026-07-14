@@ -940,16 +940,15 @@ header h1 {
 .settings-wifi-station legend {
     padding: 0 0.35rem;
 }
-/* Dim just the body — not the legend — so the enable checkbox in the
-   legend stays at full opacity and is visibly clickable even when the
-   section is off. */
+/* 2026-07-14 (qarl): the two WiFi modes are single-select radios — the
+   deselected mode should read as ENTIRELY ABSENT, not merely dimmed.
+   Collapse the whole body (everything but the legend, which holds the
+   radio so the operator can still switch) via display:none. This drives
+   off the same .is-disabled class the JS already toggles per selected
+   mode; the non-selected mode's fieldset collapses to just its radio. */
 .settings-wifi-ap.is-disabled > :not(legend),
 .settings-wifi-station.is-disabled > :not(legend) {
-    opacity: 0.45;
-}
-.settings-wifi-ap.is-disabled input:not([type="checkbox"]),
-.settings-wifi-station.is-disabled input:not([type="checkbox"]) {
-    cursor: not-allowed;
+    display: none;
 }
 
 .settings-tailscale {
