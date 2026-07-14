@@ -27,12 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _CLOUD_INIT_DIR = _REPO_ROOT / "images" / "openmarquee" / "cloud-init"
 _SCRIPTS_DIR = _REPO_ROOT / "scripts"
 _STAGE_SSH_FILES = (
-    _REPO_ROOT
-    / "images"
-    / "openmarquee"
-    / "stage-openmarquee"
-    / "04-ssh-user"
-    / "files"
+    _REPO_ROOT / "images" / "openmarquee" / "stage-openmarquee" / "04-ssh-user" / "files"
 )
 
 
@@ -269,9 +264,7 @@ def test_staged_user_data_no_real_ssh_keys_committed(staged_user_data: str) -> N
 def test_baked_sshd_config_hardening() -> None:
     """The image-baked sshd drop-in enforces key-only, no-root login
     independent of cloud-init."""
-    conf = (
-        _STAGE_SSH_FILES / "etc" / "ssh" / "sshd_config.d" / "openmarquee.conf"
-    ).read_text()
+    conf = (_STAGE_SSH_FILES / "etc" / "ssh" / "sshd_config.d" / "openmarquee.conf").read_text()
     assert "PasswordAuthentication no" in conf
     assert "PubkeyAuthentication yes" in conf
     assert "PermitRootLogin no" in conf
