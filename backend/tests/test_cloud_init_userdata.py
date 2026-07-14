@@ -25,6 +25,15 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _CLOUD_INIT_DIR = _REPO_ROOT / "images" / "openmarquee" / "cloud-init"
+_SCRIPTS_DIR = _REPO_ROOT / "scripts"
+_STAGE_SSH_FILES = (
+    _REPO_ROOT
+    / "images"
+    / "openmarquee"
+    / "stage-openmarquee"
+    / "04-ssh-user"
+    / "files"
+)
 
 
 @pytest.fixture(scope="module")
@@ -204,3 +213,83 @@ def test_meta_data_seed_hostname_matches_pi_gen(meta_data: str) -> None:
     + log hostname in sync principle (feedback_sign_name_sync memo)
     even during the bootcmd window before randomization completes."""
     assert "local-hostname: openmarquee" in meta_data
+
+
+# --- staged user-data (written by stage_sd_card.sh; the variant that
+#     actually ships on a code-staged card — the base image is a
+#     "no app code" base that fail-loud-refuses a standalone flash) ---
+
+
+@pytest.fixture(scope="module")
+def staged_user_data() -> str:
+    """Extract the user-data heredoc stage_sd_card.sh writes onto the card."""
+    text = (_SCRIPTS_DIR / "stage_sd_card.sh").read_text()
+    marker = "cat > \"$BOOTFS/user-data\" <<'EOF'\n"
+    start = text.index(marker) + len(marker)
+    end = text.index("\nEOF\n", start)
+    return text[start:end]
+
+
+def test_staged_user_data_openmarquee_is_login_capable(staged_user_data: str) -> None:
+    """The shipped card's openmarquee must be a LOGIN user (it does double
+    duty as the SSH identity), NOT the old system/nologin service account.
+    Regression guard for the 2026-07-13 SSH-user arc: a nologin openmarquee
+    with no key made SSH-in impossible on shipped cards."""
+    assert "name: openmarquee" in staged_user_data
+    assert "shell: /bin/bash" in staged_user_data
+    assert "/usr/sbin/nologin" not in staged_user_data
+    assert "system: true" not in staged_user_data
+
+
+def test_staged_user_data_carries_quoted_ssh_key_placeholder(staged_user_data: str) -> None:
+    """The shipped user-data must carry the (quoted) SSH key placeholder,
+    which stage_sd_card.sh's --ssh-key handling substitutes. Without it the
+    card boots but is SSH-unreachable (key-only auth)."""
+    assert '"{{SSH_AUTHORIZED_KEYS}}"' in staged_user_data
+
+
+def test_staged_user_data_full_sudo_and_locked_ssh(staged_user_data: str) -> None:
+    assert "sudo: ALL=(ALL) NOPASSWD:ALL" in staged_user_data
+    assert "ssh_pwauth: false" in staged_user_data
+    assert "disable_root: true" in staged_user_data
+
+
+def test_staged_user_data_no_real_ssh_keys_committed(staged_user_data: str) -> None:
+    """No real pubkey may be committed into the staged heredoc — only the
+    placeholder (a committed key would be in git history)."""
+    for prefix in ("ssh-rsa ", "ssh-ed25519 ", "ssh-dss ", "ecdsa-sha2-"):
+        assert prefix not in staged_user_data, (
+            f"real SSH key prefix `{prefix}` in stage_sd_card.sh — only the placeholder belongs"
+        )
+
+
+# --- image-baked SSH/sudo hardening (stage-openmarquee/04-ssh-user) ---
+
+
+def test_baked_sshd_config_hardening() -> None:
+    """The image-baked sshd drop-in enforces key-only, no-root login
+    independent of cloud-init."""
+    conf = (
+        _STAGE_SSH_FILES / "etc" / "ssh" / "sshd_config.d" / "openmarquee.conf"
+    ).read_text()
+    assert "PasswordAuthentication no" in conf
+    assert "PubkeyAuthentication yes" in conf
+    assert "PermitRootLogin no" in conf
+
+
+def test_baked_sudoers_is_full_nopasswd() -> None:
+    sudoers = (_STAGE_SSH_FILES / "etc" / "sudoers.d" / "openmarquee").read_text()
+    assert "openmarquee ALL=(ALL) NOPASSWD:ALL" in sudoers
+
+
+def test_baked_sudoers_matches_canonical_no_drift() -> None:
+    """The image-baked sudoers (stage substage) and the install.sh-applied
+    canonical (system/openmarquee-sudoers) must stay byte-identical — both
+    write /etc/sudoers.d/openmarquee, so drift would mean two devices with
+    different grants depending on the delivery path (image bake vs redeploy)."""
+    baked = (_STAGE_SSH_FILES / "etc" / "sudoers.d" / "openmarquee").read_bytes()
+    canonical = (_REPO_ROOT / "system" / "openmarquee-sudoers").read_bytes()
+    assert baked == canonical, (
+        "images/.../04-ssh-user/files/etc/sudoers.d/openmarquee has drifted from "
+        "system/openmarquee-sudoers — copy the canonical file over it"
+    )
