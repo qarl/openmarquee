@@ -127,23 +127,23 @@ const SECTION_TEMPLATE = `
                     <fieldset class="settings-wifi-ap">
                         <legend>
                             <label class="field-inline">
-                                <input type="checkbox" class="field-wifi-ap-enabled" checked>
-                                Setup Mode (auto-enables when the sign can't reach its wifi)
+                                <input type="radio" name="wifi-mode" value="ap" class="field-wifi-ap-enabled" checked>
+                                Create WiFi Network
                             </label>
                         </legend>
                         <p class="field-hint" style="margin: 4px 0 10px;">
-                            Setup Mode is off during normal use. If the sign loses its home
-                            wifi it turns Setup Mode on automatically so a phone can join
-                            to reconnect it — no cables, no console. Setup Mode turns
-                            itself off again once the sign is back online.
+                            The sign broadcasts its own WiFi network so a phone can connect
+                            directly to set it up — no cables, no console. It also turns its
+                            network on automatically if the sign loses its home wifi, so you
+                            can always reconnect and fix it.
                         </p>
                         <div class="row" style="gap: 10px;">
                             <label class="field om-field" style="flex: 1;">
-                                <span>Setup Mode SSID</span>
+                                <span>Network name (SSID)</span>
                                 <input type="text" class="om-input field-wifi-ssid" maxlength="32">
                             </label>
                             <label class="field om-field secret-field" style="flex: 1;" data-secret="wifi-ap-password">
-                                <span>Setup Mode password (8-63 chars)</span>
+                                <span>Network password (8-63 chars)</span>
                                 <div class="secret-display"
                                      style="display: flex; gap: 8px; align-items: center; padding: 6px 0;">
                                     <span class="secret-status" style="font-family: var(--om-mono); color: var(--om-text-dim); font-size: 12px;"></span>
@@ -153,7 +153,7 @@ const SECTION_TEMPLATE = `
                                     <input type="password" class="om-input secret-current-password"
                                            placeholder="Current login password" autocomplete="current-password">
                                     <input type="password" class="om-input secret-new-value"
-                                           placeholder="New Setup Mode password (8-63 chars)" minlength="8" maxlength="63">
+                                           placeholder="New network password (8-63 chars)" minlength="8" maxlength="63">
                                     <div style="display: flex; gap: 6px;">
                                         <button type="button" class="om-btn primary sm secret-save-btn">Save</button>
                                         <button type="button" class="om-btn sm secret-cancel-btn">Cancel</button>
@@ -168,8 +168,8 @@ const SECTION_TEMPLATE = `
                     <fieldset class="settings-wifi-station">
                         <legend>
                             <label class="field-inline">
-                                <input type="checkbox" class="field-wifi-station-enabled">
-                                Join existing WiFi
+                                <input type="radio" name="wifi-mode" value="station" class="field-wifi-station-enabled">
+                                Join Existing Network
                             </label>
                         </legend>
                         <div class="row" style="gap: 10px;">
@@ -209,9 +209,8 @@ const SECTION_TEMPLATE = `
                         <p class="field-hint" style="margin: 6px 0 0;">
                             The sign uses this network as its primary connection. If it
                             drops off (wrong password, network out of range, router down)
-                            the sign flips to Setup Mode so you can join it directly to
-                            fix things. Disabling both modes isn't allowed — the sign
-                            would be unreachable.
+                            the sign turns its own WiFi network back on so you can join it
+                            directly and fix things.
                         </p>
 
                         <fieldset class="settings-tailscale">
@@ -583,9 +582,10 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     }
     populateTimezoneSelect(tzEl);
 
-    // WiFi enable checkboxes: gray out the matching fieldset when off,
-    // and prevent disabling both (the server validator rejects that too,
-    // but catching it client-side avoids a confusing 422 at save time).
+    // WiFi mode radios (single-select): gray out the non-selected mode's
+    // fieldset and disable its inputs. Exactly one radio is always active,
+    // so the both-off state the server validator rejects is structurally
+    // unreachable here.
     function syncWifiGrayOut() {
         const apOn = apEnabledEl.checked;
         const stationOn = stationEnabledEl.checked;
@@ -638,24 +638,19 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         ws281xOrderWrap.hidden = outputModeEl.value !== "ws281x";
     }
     outputModeEl.addEventListener("change", syncWs281xOrderVisibility);
-    function guardDisableBoth(toggledEl, otherEl) {
-        // If the user just turned off the LAST enabled mode, bounce the
-        // checkbox back on and flash a status message.
-        if (!apEnabledEl.checked && !stationEnabledEl.checked) {
-            toggledEl.checked = true;
-            statusEl.textContent =
-                "Can't disable both WiFi modes — the device wouldn't be reachable.";
-        }
-    }
-    apEnabledEl.addEventListener("change", () => {
-        guardDisableBoth(apEnabledEl, stationEnabledEl);
-        syncWifiGrayOut();
-    });
-    stationEnabledEl.addEventListener("change", () => {
-        guardDisableBoth(stationEnabledEl, apEnabledEl);
+    // qarl 2026-07-14: the two WiFi modes are single-select radios
+    // (name="wifi-mode") — exactly one is active at a time. The radio
+    // group makes the both-off state structurally unreachable, so the
+    // old "can't disable both" guard is gone (the server validator
+    // _check_wifi_has_at_least_one_mode_enabled still backstops it).
+    // A radio 'change' fires only on the newly-selected input, so both
+    // handlers re-sync the whole WiFi + Tailscale gating.
+    function syncWifiMode() {
         syncWifiGrayOut();
         syncTailscaleStationGating();
-    });
+    }
+    apEnabledEl.addEventListener("change", syncWifiMode);
+    stationEnabledEl.addEventListener("change", syncWifiMode);
 
     // Output-mode change: if the current dims match *some* mode's default,
     // the operator hasn't customized — snap to the new mode's default. If
@@ -1039,7 +1034,16 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             rotationEl.value = String(settings.display_rotation ?? 0);
             brightnessEl.value = String(settings.brightness ?? 80);
             gammaEl.value = String(settings.gamma ?? 1.0);
-            apEnabledEl.checked = settings.wifi_ap_enabled !== false; // default on
+            // Single-select radios (qarl 2026-07-14: "only one mode at a
+            // time"). Legacy settings may have BOTH modes enabled (the old
+            // concurrent AP+STA regime); collapse to one selection — prefer
+            // Join when station is enabled, else Create (the fresh-device
+            // default is AP-only). On the next save, collectPayload writes
+            // the mutually-exclusive pair, migrating a concurrent device to
+            // a single mode. Recovery still works: if STA drops, the network
+            // supervisor turns the AP back on regardless of this flag.
+            const wifiJoinSelected = Boolean(settings.wifi_station_enabled);
+            apEnabledEl.checked = !wifiJoinSelected;
             ssidEl.value = settings.wifi_ssid ?? "";
             // Batch 20.4: GET returns "<set>" / null for the 3 secret
             // fields. The hidden inputs hold the wire value verbatim so
@@ -1048,7 +1052,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             // Change-form rotation is a no-op for these fields).
             passwordEl.value = settings.wifi_password ?? "";
             updateSecretIndicator("wifi-ap-password", settings.wifi_password);
-            stationEnabledEl.checked = Boolean(settings.wifi_station_enabled);
+            stationEnabledEl.checked = wifiJoinSelected;
             stationSsidEl.value = settings.wifi_station_ssid ?? "";
             stationPasswordEl.value = settings.wifi_station_password ?? "";
             updateSecretIndicator("wifi-station-password", settings.wifi_station_password);
