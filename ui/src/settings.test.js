@@ -369,6 +369,29 @@ describe("mountSettings", () => {
         expect(p.wifi_station_enabled).toBe(true);
     });
 
+    it("nests the saved-networks list in Join and hides it under Create", async () => {
+        // 2026-07-14 (qarl): the wifi-networks list moved INTO the Join
+        // Existing Network section and is hidden (not just grayed) when
+        // Create WiFi Network is selected — only relevant when joining.
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => ({ ...SAMPLE, wifi_station_enabled: false }),
+            onSave: vi.fn(),
+        });
+        await tick();
+        const networks = container.querySelector(".settings-wifi-networks");
+        const station = container.querySelector(".settings-wifi-station");
+        // Nested inside the Join Existing Network fieldset.
+        expect(station.contains(networks)).toBe(true);
+        // Create selected → list hidden.
+        expect(networks.hidden).toBe(true);
+        // Select Join → list shown.
+        const staRadio = container.querySelector(".field-wifi-station-enabled");
+        staRadio.checked = true;
+        staRadio.dispatchEvent(new Event("change"));
+        expect(networks.hidden).toBe(false);
+    });
+
     it("sends all WiFi fields in the save payload", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);

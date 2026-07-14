@@ -213,6 +213,63 @@ const SECTION_TEMPLATE = `
                             directly and fix things.
                         </p>
 
+                        <!-- 2026-07-03 (qarl handover Phase B2): multi-network
+                             wifi list. The device round-robins these on link
+                             loss so a sign with 3 saved networks (qarl / NEBULA /
+                             admin) auto-recovers when the primary drops.
+                             2026-07-14 (qarl): moved INTO the Join Existing
+                             Network section (was a sibling below Tailscale);
+                             hidden entirely when Create WiFi Network is
+                             selected — the list is only relevant when joining. -->
+                        <fieldset class="settings-wifi-networks">
+                            <legend>Saved networks</legend>
+                            <p class="settings-hint">
+                                Networks the sign can auto-join, in priority order.
+                                The device rotates through them if the current one
+                                drops. New devices adopt any pre-existing NetworkManager
+                                profiles on first boot.
+                            </p>
+                            <ul class="field-wifi-networks-list"
+                                style="list-style: none; padding: 0; margin: 8px 0; display: flex; flex-direction: column; gap: 6px;">
+                                <!-- rendered by renderWifiNetworksList() -->
+                            </ul>
+                            <p class="field-wifi-networks-empty"
+                               hidden
+                               style="margin: 6px 0; color: var(--om-text-dim); font-size: 13px;">
+                                No networks saved yet. Add one below.
+                            </p>
+                            <div class="field-wifi-networks-add"
+                                 style="display: grid; gap: 8px; margin-top: 12px; padding: 10px; background: var(--om-card-bg-2); border-radius: 8px;">
+                                <div style="font-family: var(--om-mono); font-size: 11px; letter-spacing: 0.12em; color: var(--om-text-fade); text-transform: uppercase;">Add network</div>
+                                <div class="row" style="gap: 8px;">
+                                    <label class="field om-field" style="flex: 1;">
+                                        <span>SSID</span>
+                                        <input type="text" class="om-input field-wifi-networks-add-ssid"
+                                               maxlength="32" placeholder="Network name" autocomplete="off">
+                                    </label>
+                                    <label class="field om-field" style="flex: 1;">
+                                        <span>Password</span>
+                                        <!-- No minlength on the DOM node: attachAutoSave gates
+                                             saves on form.reportValidity(), so a partial password
+                                             here would block autosave on ALL other fields until
+                                             cleared. JS handler (see click listener below)
+                                             enforces the 8-63 chars rule at Add time instead. -->
+                                        <input type="password" class="om-input field-wifi-networks-add-password"
+                                               maxlength="63" placeholder="8-63 chars"
+                                               autocomplete="new-password">
+                                    </label>
+                                </div>
+                                <div style="display: flex; gap: 8px; align-items: center;">
+                                    <button type="button" class="om-btn primary sm field-wifi-networks-add-btn">
+                                        Add network
+                                    </button>
+                                    <p class="field-wifi-networks-add-status"
+                                       role="status" aria-live="polite"
+                                       style="margin: 0; color: var(--om-text-dim); font-size: 12px;"></p>
+                                </div>
+                            </div>
+                        </fieldset>
+
                         <fieldset class="settings-tailscale">
                             <legend>
                                 <label class="field-inline">
@@ -277,59 +334,6 @@ const SECTION_TEMPLATE = `
                                 <span>Enable HTTPS on Tailscale FQDN</span>
                             </label>
                         </fieldset>
-                    </fieldset>
-
-                    <!-- 2026-07-03 (qarl handover Phase B2): multi-network
-                         wifi list. The device round-robins these on link
-                         loss so a sign with 3 saved networks (qarl / NEBULA /
-                         admin) auto-recovers when the primary drops. -->
-                    <fieldset class="settings-wifi-networks">
-                        <legend>Wi-Fi networks</legend>
-                        <p class="settings-hint">
-                            Networks the sign can auto-join, in priority order.
-                            The device rotates through them if the current one
-                            drops. New devices adopt any pre-existing NetworkManager
-                            profiles on first boot.
-                        </p>
-                        <ul class="field-wifi-networks-list"
-                            style="list-style: none; padding: 0; margin: 8px 0; display: flex; flex-direction: column; gap: 6px;">
-                            <!-- rendered by renderWifiNetworksList() -->
-                        </ul>
-                        <p class="field-wifi-networks-empty"
-                           hidden
-                           style="margin: 6px 0; color: var(--om-text-dim); font-size: 13px;">
-                            No networks saved yet. Add one below.
-                        </p>
-                        <div class="field-wifi-networks-add"
-                             style="display: grid; gap: 8px; margin-top: 12px; padding: 10px; background: var(--om-card-bg-2); border-radius: 8px;">
-                            <div style="font-family: var(--om-mono); font-size: 11px; letter-spacing: 0.12em; color: var(--om-text-fade); text-transform: uppercase;">Add network</div>
-                            <div class="row" style="gap: 8px;">
-                                <label class="field om-field" style="flex: 1;">
-                                    <span>SSID</span>
-                                    <input type="text" class="om-input field-wifi-networks-add-ssid"
-                                           maxlength="32" placeholder="Network name" autocomplete="off">
-                                </label>
-                                <label class="field om-field" style="flex: 1;">
-                                    <span>Password</span>
-                                    <!-- No minlength on the DOM node: attachAutoSave gates
-                                         saves on form.reportValidity(), so a partial password
-                                         here would block autosave on ALL other fields until
-                                         cleared. JS handler (see click listener below)
-                                         enforces the 8-63 chars rule at Add time instead. -->
-                                    <input type="password" class="om-input field-wifi-networks-add-password"
-                                           maxlength="63" placeholder="8-63 chars"
-                                           autocomplete="new-password">
-                                </label>
-                            </div>
-                            <div style="display: flex; gap: 8px; align-items: center;">
-                                <button type="button" class="om-btn primary sm field-wifi-networks-add-btn">
-                                    Add network
-                                </button>
-                                <p class="field-wifi-networks-add-status"
-                                   role="status" aria-live="polite"
-                                   style="margin: 0; color: var(--om-text-dim); font-size: 12px;"></p>
-                            </div>
-                        </div>
                     </fieldset>
                 </div>
             </div>
@@ -600,6 +604,11 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         container
             .querySelector(".settings-wifi-station")
             .classList.toggle("is-disabled", !stationOn);
+        // 2026-07-14 (qarl): the saved-networks list lives inside the Join
+        // Existing Network section; hide it entirely (not just gray it)
+        // when Create is selected — it's only relevant when joining.
+        const networksFieldset = container.querySelector(".settings-wifi-networks");
+        if (networksFieldset) networksFieldset.hidden = !stationOn;
     }
     // Tailscale section header toggle gates everything below it the
     // same way wifi-ap / wifi-station do. Tailscale also requires wifi
