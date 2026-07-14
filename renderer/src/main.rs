@@ -46,6 +46,13 @@ mod hdmi_logic;
 // until then so the unused public serializer doesn't warn in the binary crate.
 #[allow(dead_code)]
 mod colorlight_logic;
+// HUB75-direct output backend (Phase 0: pure pre-processing + host tests).
+// Not yet wired into the output stage — the Linux GPIO transport (hub75.rs)
+// + OutputMode::Hub75 arm land in later commits of this arc (design doc §9).
+// #[allow(dead_code)] until then so the unused public surface doesn't warn
+// in the binary crate.
+#[allow(dead_code)]
+mod hub75_logic;
 mod ipc_main;
 mod lru;
 mod mem;
