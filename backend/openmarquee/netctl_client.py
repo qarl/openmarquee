@@ -108,3 +108,92 @@ def netctl_send(
         if sock is not None:
             with contextlib.suppress(Exception):
                 sock.close()
+
+
+def netctl_recv_data(
+    subcommand: str,
+    payload: bytes = b"",
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
+    error_cls: type[Exception] = RuntimeError,
+    socket_path: str = DEFAULT_SOCKET_PATH,
+    max_data_bytes: int = 4096,
+) -> bytes:
+    """Invoke a DATA-RETURNING privileged ``subcommand`` and return its
+    payload bytes (Option D, 2026-07-14).
+
+    Unlike ``netctl_send`` (which asserts a bare ``OK`` and returns
+    None), the daemon replies to a data subcommand with ``OK\\n``
+    followed by opaque data bytes. Only subcommands in the daemon's
+    ``DATA_SUBCOMMANDS`` set return data — the sole current member is the
+    read-only ``nm-connection-reveal-secret`` PSK read.
+
+    The parse contract is deliberately TIGHT (this is a privilege
+    boundary): the STATUS is exactly the first line — we split on the
+    FIRST ``\\n`` only, and everything after it is returned verbatim as
+    OPAQUE bytes, NEVER re-interpreted as a command. An ``ERR <msg>``
+    first line raises ``error_cls``; a missing/other first line is a
+    malformed response and also raises. The read is bounded
+    (``max_data_bytes`` plus the short status line) so a runaway daemon
+    can't stream unbounded bytes into the backend.
+
+    Blocking; asyncio callers should wrap in ``asyncio.to_thread(...)``.
+    NEVER log the returned bytes — they may be a secret.
+    """
+    sock: socket.socket | None = None
+    try:
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(timeout_s)
+        except OSError as e:
+            raise error_cls(f"netctl {subcommand}: socket create failed ({e})") from e
+        try:
+            request_line = subcommand.encode("ascii") + b"\n"
+        except UnicodeError as e:
+            raise error_cls(f"netctl {subcommand!r}: subcommand not ASCII ({e})") from e
+        try:
+            sock.connect(socket_path)
+        except FileNotFoundError as e:
+            raise error_cls(f"netctl socket not found at {socket_path}: {e}") from e
+        except OSError as e:
+            raise error_cls(f"netctl socket connect failed: {e}") from e
+        try:
+            sock.sendall(request_line)
+            if payload:
+                sock.sendall(payload)
+            sock.shutdown(socket.SHUT_WR)
+        except OSError as e:
+            raise error_cls(f"netctl {subcommand}: send failed ({e})") from e
+        cap = max_data_bytes + 64  # room for the "OK\n" / "ERR ..." status line
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > cap:
+                    break
+        except TimeoutError as e:
+            raise error_cls(
+                f"netctl {subcommand}: response timed out after {timeout_s:.0f}s"
+            ) from e
+        except OSError as e:
+            raise error_cls(f"netctl {subcommand}: recv failed ({e})") from e
+        raw = b"".join(chunks)
+        # Tight parse: status is EXACTLY the first line; data is the rest.
+        header, sep, data = raw.partition(b"\n")
+        if header == b"OK" and sep:
+            return data[:max_data_bytes]
+        header_text = header.decode("utf-8", errors="replace")
+        if header_text.startswith("ERR "):
+            raise error_cls(f"netctl {subcommand}: {header_text[4:]}")
+        if not raw:
+            raise error_cls(f"netctl {subcommand}: empty response (daemon closed before reply?)")
+        raise error_cls(f"netctl {subcommand}: malformed response {header_text!r}")
+    finally:
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.close()

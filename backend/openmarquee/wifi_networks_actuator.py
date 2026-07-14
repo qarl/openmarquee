@@ -527,6 +527,63 @@ def _log_netctl_failure(op: str, con_name: str, exc: Exception) -> None:
     )
 
 
+class RevealSecretError(RuntimeError):
+    """Raised when the privileged PSK reveal (Option D) fails at the
+    netctl transport/daemon layer — e.g. the socket is unreachable or
+    the connection profile does not exist. The API layer maps this to a
+    5xx/404; it is distinct from 'the profile exists but has no stored
+    secret', which returns None."""
+
+
+def reveal_connection_secret(con_name: str) -> str | None:
+    """Return the plaintext PSK for a saved NM wifi connection via the
+    privileged netctl reveal subcommand (Option D, 2026-07-14).
+
+    The backend runs NoNewPrivileges=true and cannot read NM secrets
+    itself; the root daemon runs the `nmcli -s` read and returns the
+    value. Returns the PSK string, or None when the profile has no
+    stored secret — an open network, OR a profile whose PSK the device
+    never captured (the Layer-A `<hidden>` case). Raises
+    RevealSecretError on a netctl transport/daemon failure (e.g. no such
+    connection).
+
+    SECURITY: exposing a PSK crosses the same privilege boundary as the
+    write path; it is qarl's explicit 2026-07-14 owner decision and is
+    gated behind operator RE-AUTH in the API layer. NEVER log the return
+    value. RevealSecretError carries only the daemon's transport text
+    (nmcli stderr — a con_name + "no such connection"); the PSK itself is
+    emitted by nmcli solely on stdout on success and never reaches an
+    error path or a log line.
+    """
+    from openmarquee.netctl_client import netctl_recv_data
+
+    # Defence-in-depth (the Layer-2 endpoint additionally validates the
+    # con_name against the known-saved-profile set): reject a name that
+    # is empty, contains a newline (the helper's single-line read would
+    # silently truncate it), or begins with '-' (nmcli could parse it as
+    # an option to `connection show` — e.g. --active — rather than a
+    # profile id). We reject rather than prepend `--`, since nmcli's
+    # parser may not honour an end-of-options marker.
+    if not con_name or "\n" in con_name or con_name.startswith("-"):
+        raise RevealSecretError("invalid connection name for secret reveal")
+
+    data = netctl_recv_data(
+        "nm-connection-reveal-secret",
+        (con_name + "\n").encode("utf-8"),
+        timeout_s=_NMCLI_TIMEOUT_S,
+        error_cls=RevealSecretError,
+        max_data_bytes=4096,
+    )
+    # `nmcli -g` emits the bare value + a single trailing newline; an
+    # open / secret-less profile yields an empty line. Strip ONLY the
+    # trailing newline(s) — a WPA2 PSK is printable ASCII 0x20-0x7e (per
+    # the WifiNetworkEntry.password validator) so it never contains a
+    # newline, but it MAY legitimately begin/end with spaces, which must
+    # be preserved.
+    text = data.decode("utf-8", errors="replace").rstrip("\n")
+    return text or None
+
+
 def apply_in_background(
     networks: list[WifiNetworkEntry],
     *,

@@ -76,6 +76,11 @@ ALLOWLIST = frozenset(
         "nm-connection-add-wifi",
         "nm-connection-modify-wifi",
         "nm-connection-delete",
+        # 2026-07-14 (Option D): reveal a saved wifi profile's PSK. The
+        # ONLY data-returning subcommand (see DATA_SUBCOMMANDS below);
+        # read-only nmcli secret read, gated behind operator re-auth in
+        # the API layer.
+        "nm-connection-reveal-secret",
         "hostnamectl-set-hostname",
         "tailscale-set-hostname",
         "avahi-write-and-restart",
@@ -91,6 +96,15 @@ ALLOWLIST = frozenset(
         "factory-reset",
     }
 )
+
+# 2026-07-14 (Option D): subcommands whose helper STDOUT is forwarded to
+# the caller, appended AFTER the "OK\n" status line. This is an EXPLICIT
+# allowlist-within-the-allowlist: every subcommand NOT listed here has
+# its stdout discarded (the historical OK/ERR-only behaviour), so a
+# chatty or compromised helper can never blow arbitrary bytes back
+# through the socket for a command that isn't meant to return data. Only
+# the read-only nm-connection-reveal-secret returns data (a PSK).
+DATA_SUBCOMMANDS = frozenset({"nm-connection-reveal-secret"})
 
 # Belt-and-braces caps per QA dispatch:
 #   "subcommand line read capped, payload size cap (64KB)"
@@ -185,6 +199,26 @@ def main() -> int:
             stderr_text,
         )
         return 1
+
+    if subcommand in DATA_SUBCOMMANDS:
+        # Forward the helper's stdout as an OPAQUE data payload after the
+        # "OK\n" status line. The parse boundary stays tight: the status
+        # is exactly the first line ("OK\n"); the caller reads that line,
+        # then treats everything after the first "\n" as opaque bytes —
+        # never re-interpreting them as a command. Cap the forwarded data
+        # (a PSK is <=63 bytes; the cap just bounds a runaway helper).
+        data = result.stdout[:MAX_PAYLOAD_BYTES]
+        _respond("OK\n")
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+        # Never log the secret bytes themselves — only that a reveal ran.
+        log.info(
+            "ok subcommand=%s payload_bytes=%d data_bytes=%d",
+            subcommand,
+            len(payload),
+            len(data),
+        )
+        return 0
 
     _respond("OK\n")
     log.info("ok subcommand=%s payload_bytes=%d", subcommand, len(payload))
