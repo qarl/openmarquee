@@ -273,6 +273,17 @@ the manual steps to provision a fresh Pi Zero 2 W for openMarquee:
    sudo chown -R openmarquee:openmarquee /opt/openmarquee
    ```
 
+   > **NOTE — this is the MANUAL dev-install path**, where `openmarquee` is a
+   > service-only account and you SSH in as the box's default user (`pi@`, etc.).
+   > **Shipped SD images are different**: pi-gen's `FIRST_USER_NAME=openmarquee`
+   > makes `openmarquee` a login-capable user that does double duty as the
+   > *sole key-only SSH identity* (no `qarl`/`pi` login on customer devices),
+   > with SSH hardening + full passwordless sudo baked by the
+   > `stage-openmarquee/04-ssh-user` substage and a key seeded via
+   > `stage_sd_card.sh --ssh-key`. Don't `--system --no-create-home` on a
+   > shippable image — that would strip openmarquee's home/shell and break
+   > SSH-in.
+
 4. **Copy configs + units + scripts:**
 
    ```

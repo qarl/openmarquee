@@ -111,12 +111,21 @@ MGMT_WIFI_SSID=""
 MGMT_WIFI_PASSWORD=""
 MGMT_WIFI_PASSWORD_FILE=""
 MGMT_WIFI_PASSWORD_INLINE=0
+# 2026-07-13: optional --ssh-key forwarded to stage_sd_card.sh to seed
+# openmarquee's SSH authorized key. If omitted, stage_sd_card auto-detects
+# ~/.ssh/id_ed25519.pub (then id_rsa.pub), so the common case needs nothing.
+SSH_KEY_PATH=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run)
             DRY_RUN=1
             shift
+            ;;
+        --ssh-key)
+            SSH_KEY_PATH="${2:-}"
+            [ -z "$SSH_KEY_PATH" ] && die "--ssh-key requires a value"
+            shift 2
             ;;
         --help|-h)
             # r34: range bumped from 2,55 to 2,66 to keep the new
@@ -541,9 +550,9 @@ fi
 
 info "staging openMarquee bundle to $BOOTFS..."
 if [ "$DRY_RUN" -eq 1 ]; then
-    log "    [DRY-RUN] would run: bash $SCRIPT_DIR/stage_sd_card.sh $BOOTFS"
+    log "    [DRY-RUN] would run: bash $SCRIPT_DIR/stage_sd_card.sh ${SSH_KEY_PATH:+--ssh-key $SSH_KEY_PATH }$BOOTFS"
 else
-    if ! bash "$SCRIPT_DIR/stage_sd_card.sh" "$BOOTFS"; then
+    if ! bash "$SCRIPT_DIR/stage_sd_card.sh" ${SSH_KEY_PATH:+--ssh-key "$SSH_KEY_PATH"} "$BOOTFS"; then
         warn "staging failed. SD card is left mounted at $BOOTFS for inspection."
         warn "Re-run: bash $SCRIPT_DIR/stage_sd_card.sh $BOOTFS"
         warn "After fix, manually: sudo diskutil eject $TARGET"

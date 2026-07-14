@@ -68,19 +68,28 @@ BUNDLE="${OPENMARQUEE_BUNDLE:-$REPO_ROOT/dist/openmarquee-sd-bundle.tar.zst}"
 
 WIFI_PROFILES_DIR=""
 BOOTFS=""
+SSH_KEY_PATH=""
 
 usage() {
     cat >&2 <<EOF
-usage: $0 [--wifi-profiles DIR] <bootfs-mount-path>
+usage: $0 [--wifi-profiles DIR] [--ssh-key PATH] <bootfs-mount-path>
 
   --wifi-profiles DIR   Pre-stage NetworkManager keyfile profiles
                         (*.nmconnection in DIR) so the Pi auto-joins
                         a home wifi on FIRST boot. Optional. If
                         omitted, the device is AP-only.
 
+  --ssh-key PATH        Public key file to seed as openmarquee's SSH
+                        authorized key on the shipped card (single pubkey,
+                        e.g. ~/.ssh/id_ed25519.pub). Default: the first of
+                        ~/.ssh/id_ed25519.pub, ~/.ssh/id_rsa.pub if present.
+                        Without a key the card boots but SSH-in is
+                        impossible (key-only auth) — a loud warning fires.
+
 examples:
     $0 /Volumes/bootfs                                 # macOS, AP-only
     $0 --wifi-profiles ~/wifi-profiles /Volumes/bootfs  # with home-wifi
+    $0 --ssh-key ~/.ssh/id_ed25519.pub /Volumes/bootfs  # seed SSH key
     $0 /run/media/\$USER/bootfs                         # Linux
 EOF
     exit 1
@@ -95,6 +104,15 @@ while [ $# -gt 0 ]; do
             ;;
         --wifi-profiles=*)
             WIFI_PROFILES_DIR="${1#--wifi-profiles=}"
+            shift
+            ;;
+        --ssh-key)
+            [ $# -ge 2 ] || { echo "error: --ssh-key requires a value" >&2; exit 1; }
+            SSH_KEY_PATH="$2"
+            shift 2
+            ;;
+        --ssh-key=*)
+            SSH_KEY_PATH="${1#--ssh-key=}"
             shift
             ;;
         --help|-h)
@@ -116,6 +134,20 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$BOOTFS" ] || usage
+
+# Resolve the SSH key early (before the slow bundle copy): explicit
+# --ssh-key wins, else the first default that exists. It gets substituted
+# into user-data's {{SSH_AUTHORIZED_KEYS}} below so the operator can SSH in
+# as openmarquee (key-only auth — without a key the card is unreachable).
+if [ -z "$SSH_KEY_PATH" ]; then
+    for _cand in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub"; do
+        if [ -f "$_cand" ]; then SSH_KEY_PATH="$_cand"; break; fi
+    done
+fi
+if [ -n "$SSH_KEY_PATH" ] && [ ! -f "$SSH_KEY_PATH" ]; then
+    echo "error: --ssh-key file not found: $SSH_KEY_PATH" >&2
+    exit 1
+fi
 
 # Validate --wifi-profiles arg shape early so a typo doesn't get caught
 # only after the bundle copy (the slow step).
@@ -291,27 +323,34 @@ fi
 cat > "$BOOTFS/user-data" <<'EOF'
 #cloud-config
 
-# Enable + start ssh first so the operator can recover if anything later
-# fails. ssh.service is masked on Pi OS Lite arm64 by default; we have to
-# explicitly `systemctl unmask` before `enable + start`.
+# Lock down SSH: key-only, no password auth, no root login. (The
+# image-baked /etc/ssh/sshd_config.d/openmarquee.conf is the canonical
+# enforcement; these cloud-init toggles are the belt to its suspenders.)
 ssh_pwauth: false
+disable_root: true
 
+# `openmarquee` does double duty — it is the systemd service user AND the
+# sole key-only SSH login identity. pi-gen's FIRST_USER_NAME already created
+# it (login-capable /home/openmarquee, /bin/bash); we re-declare by name to
+# ATTACH the operator's SSH key, full passwordless sudo (operational admin
+# over the SSH login — the service itself runs under NoNewPrivileges and
+# can't sudo), and the render/video groups. NOT a nologin/system account:
+# an operator must be able to SSH in as openmarquee.
 users:
-  - default
   - name: openmarquee
-    system: true
-    shell: /usr/sbin/nologin
-    home: /var/openmarquee
-    homedir: /var/openmarquee
-    # `video` group: required to open /dev/video10 (the bcm2835-codec
-    # H.264 M2M decoder) for VideoSlide rendering on the Rust IPC
-    # route. Device is rooted as `crw-rw---- root video` by udev; only
-    # users in the video group can read/write it. Without this group
-    # membership the rust-sidecar fails at codec open() with EACCES.
-    # `render` group: dri/card permissions for the same renderer path
-    # under tighter Pi OS Lite trixie udev defaults -- doesn't hurt to
-    # include even when card access goes through DRM master grab.
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    # `video`: open /dev/video10 (bcm2835-codec H.264 decoder) for the Rust
+    # IPC VideoSlide route (rooted `crw-rw---- root video`); without it the
+    # sidecar fails codec open() with EACCES. `render`: dri/card perms for
+    # the same path under trixie's tighter udev defaults.
     groups: [video, render]
+    ssh_authorized_keys:
+      # Substituted with the operator's public key by stage_sd_card.sh's
+      # --ssh-key handling below (quoted so an UNsubstituted placeholder is
+      # a literal string cloud-init rejects on the ssh validator — the rest
+      # of user-data still runs, so the device is console-recoverable).
+      - "{{SSH_AUTHORIZED_KEYS}}"
 
 # Phase 4e-a 2026-05-15: NO apt at first boot -- factory-fresh promise
 # means the Pi must boot offline. The 6 packages this used to install
@@ -386,6 +425,32 @@ if [ -n "$WIFI_BOOTCMD_BLOCK" ]; then
     ' "$BOOTFS/user-data" > "$USER_DATA_TMP"
     mv "$USER_DATA_TMP" "$BOOTFS/user-data"
     rm -f "$WIFI_BLOCK_FILE"
+fi
+
+# Seed openmarquee's SSH authorized key into user-data. openmarquee is
+# key-only (ssh_pwauth:false) so WITHOUT this the shipped card is
+# SSH-unreachable. python (not sed) so the key's / + = chars can't collide
+# with a substitution delimiter. Mirrors build-image.sh's substitution.
+if [ -n "$SSH_KEY_PATH" ]; then
+    SSH_KEY_CONTENT="$(cat "$SSH_KEY_PATH")"
+    python3 - "$BOOTFS/user-data" "$SSH_KEY_CONTENT" <<'PY'
+import sys
+path, key = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    body = f.read()
+if "{{SSH_AUTHORIZED_KEYS}}" not in body:
+    sys.exit("stage_sd_card: {{SSH_AUTHORIZED_KEYS}} placeholder missing from user-data")
+body = body.replace("{{SSH_AUTHORIZED_KEYS}}", key.strip())
+with open(path, "w") as f:
+    f.write(body)
+PY
+    echo "==> seeded openmarquee SSH authorized key from $SSH_KEY_PATH"
+else
+    echo "WARNING: no --ssh-key given and no default key found." >&2
+    echo "         The card boots, but SSH-in as openmarquee is IMPOSSIBLE" >&2
+    echo "         (key-only auth). Re-run with --ssh-key ~/.ssh/id_ed25519.pub." >&2
+    echo "         The literal {{SSH_AUTHORIZED_KEYS}} placeholder stays; cloud-init" >&2
+    echo "         rejects it on the ssh validator but still runs the rest." >&2
 fi
 
 if [ -n "$WIFI_PROFILES_DIR" ]; then

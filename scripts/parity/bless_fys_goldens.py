@@ -19,13 +19,14 @@ restart it after (try/finally so it always recovers).
 Assumes:
 - /opt/openmarquee/bin/openmarquee-render is the post-flip binary
   (deployed 2026-05-17 by the gamma-default-flip commit 01d9aeb)
-- ssh qarl@192.168.1.67 has sudo NOPASSWD
+- the BLESS_FYS_PI_HOST target (default qarl@192.168.1.67) has sudo NOPASSWD
 - renderer/tests/fixtures/<UUID>/item.json exists for every UUID
   referenced by a parity_fys_ fixture (the Step 2a snapshots)
 """
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -35,7 +36,11 @@ FIXTURES_JSON = REPO / "scripts" / "parity" / "fixtures.json"
 GOLDEN_DIR = REPO / "renderer" / "tests" / "golden"
 FIXTURE_DIR = REPO / "renderer" / "tests" / "fixtures"
 
-PI_HOST = "qarl@192.168.1.67"
+# SSH target for the FYS parity Pi. Overridable via env so the user@host
+# isn't baked to a personal identity in the code — set BLESS_FYS_PI_HOST
+# (e.g. openmarquee@192.168.1.67) once that device is re-provisioned to the
+# openmarquee SSH user. Default preserved so current access is uninterrupted.
+PI_HOST = os.environ.get("BLESS_FYS_PI_HOST", "qarl@192.168.1.67")
 PI_BIN = "/opt/openmarquee/bin/openmarquee-render"
 PI_CONTENT_ROOT = "/tmp/bless-content"
 PI_GOLDEN_DIR = "/tmp/bless-goldens"

@@ -2,10 +2,19 @@
 # user-data — cloud-init first-boot config for an openMarquee Pi.
 #
 # Cloud-init's NoCloud datasource picks this up from
-# /boot/firmware/user-data on the SD card. The flash tooling (B.6)
+# /boot/firmware/user-data on the SD card. The flash tooling
 # substitutes the {{SSH_AUTHORIZED_KEYS}} placeholder with the
 # operator's public key before flashing; leave it in source as a
 # literal placeholder so unsubstituted files fail loudly.
+#
+# NOTE: this is the BASE-image user-data. A normal SHIPPED card is
+# code-staged, and scripts/stage_sd_card.sh OVERWRITES /boot/firmware/
+# user-data with its own variant (which extracts the code bundle) — that
+# variant ALSO declares the login `openmarquee` user + the same
+# {{SSH_AUTHORIZED_KEYS}} placeholder, and stage_sd_card.sh --ssh-key
+# seeds the key there. So on a shipped card the key comes from the
+# staging step, not this file. This file only reaches a standalone
+# BASE flash (which fail-loud-refuses without the code bundle).
 #
 # What this does on first boot:
 #   1. Assigns a unique hostname (openmarquee-<4-hex>) so multiple
