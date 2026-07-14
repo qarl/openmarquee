@@ -46,6 +46,20 @@ mod hdmi_logic;
 // until then so the unused public serializer doesn't warn in the binary crate.
 #[allow(dead_code)]
 mod colorlight_logic;
+// HUB75-direct output backend. Phase 0 arm-fill wires this into
+// OutputMode::Hub75 (env → config → validated GpioSink diagnostic).
+// The real FFI backend (hzeller rpi-rgb-led-matrix binding) + the
+// GBM+EGL frame source land in Phase 1 (design doc §9).
+//
+// `#[allow(dead_code)]` — Phase-0 surfaces (blit, serialize_frame,
+// gamma_lut, wiring_revision, check_wiring_revision, LUT plumbing)
+// are exercised by the module's own tests but not yet by the arm-
+// fill. Phase 1 will drop this allow when the frame source lands
+// and blit() gets a caller.
+#[allow(dead_code)]
+mod hub75_logic;
+#[allow(dead_code)]
+mod hub75;
 mod ipc_main;
 mod lru;
 mod mem;
@@ -2108,17 +2122,77 @@ fn main() -> Result<()> {
             );
         }
         OutputMode::Hub75 => {
-            // v1-spec-delta #11 (slice e) -- HUB75 64x64 RGB
-            // matrix reach gate per spec §5. Panel-write path
-            // (rgb-matrix-rs / vc4-side bit-banging /
-            // dedicated controller subprocess) is post-v1.
-            eprintln!(
-                "hub75 output -- reach gate only; panel-write path stubbed for v1.\n\
-                 Spec §5: 64x64 RGB matrix at 30 fps over the GPIO HUB75 driver.\n\
-                 This binary build accepts --output hub75 and exits cleanly so the\n\
-                 backend can detect the renderer's reach without panicking on a\n\
-                 not-yet-implemented arm."
-            );
+            // HUB75-direct backend (design doc:
+            // `docs/hub75-direct-backend-design-2026-07-12.md`).
+            //
+            // Phase 0 arm-fill: build the config from
+            // `OPENMARQUEE_HUB75_*` env, construct the `GpioSink`
+            // (which validates the config), emit an operator-visible
+            // diagnostic showing what got wired up, and exit cleanly.
+            //
+            // The frame source (GBM+EGL headless compositing, per
+            // design doc §5) lands in a follow-up commit. Phase 1
+            // links hzeller's `rpi-rgb-led-matrix` behind
+            // `--features hub75-direct` for real GPIO output. Today
+            // the arm proves: env → config → validated sink, so a
+            // deployment can catch config typos BEFORE the FFI wiring
+            // arrives.
+            // Log + exit-clean (NOT bail!) on config errors: a
+            // misconfigured OPENMARQUEE_HUB75_HAT under systemd would
+            // otherwise trip StartLimitBurst=5/10s (project memory
+            // `systemd_start_rate_limit_hazard`) and quarantine the
+            // unit. Operators see the LOUD "hub75 CONFIG ERROR:" line
+            // in journalctl; the process exits 0 so systemd doesn't
+            // cycle. Same pattern the Mock/Ws2812b stub arms use.
+            let cfg = match hub75_logic::Hub75Config::from_env() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("hub75 CONFIG ERROR: env parse failed: {e}");
+                    eprintln!(
+                        "hub75 output: exiting clean (no systemd restart cycle). \
+                         Fix the OPENMARQUEE_HUB75_* env and retry."
+                    );
+                    return Ok(());
+                }
+            };
+            let card_w = cfg.card_width_px();
+            let card_h = cfg.card_height_px();
+            let refresh_ceil = cfg.theoretical_refresh_hz();
+            match hub75::GpioSink::new(cfg) {
+                Ok(sink) => {
+                    eprintln!(
+                        "hub75 output (Phase 0 skeleton, arm-fill only):\n\
+                         \x20 card dims       = {card_w}x{card_h} px (chain·panel_cols × parallel·panel_rows)\n\
+                         \x20 HAT             = {:?}\n\
+                         \x20 pwm_bits        = {} (theoretical refresh ceiling {} Hz)\n\
+                         \x20 color_order     = {:?}\n\
+                         \x20 brightness      = {}% (hzeller percent scale)\n\
+                         \x20 gpio_slowdown   = {}\n\
+                         \x20 limit_refresh   = {} Hz\n\
+                         Config validated OK. Frame source (GBM+EGL compositor) + real\n\
+                         GPIO backend (`rpi-rgb-led-matrix`) land in Phase 1; this build\n\
+                         is a --features-off skeleton so operators can catch config\n\
+                         typos before the FFI wiring arrives. Frames sent: {}.",
+                        sink.config().hat,
+                        sink.config().pwm_bits,
+                        refresh_ceil,
+                        sink.config().color_order,
+                        sink.config().brightness,
+                        sink.config().gpio_slowdown,
+                        sink.config().limit_refresh_hz,
+                        sink.frames_sent(),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("hub75 CONFIG ERROR: sink construction failed: {e}");
+                    eprintln!(
+                        "hub75 output: exiting clean (no systemd restart cycle). \
+                         Config parses but violates Hub75Config::validate() bounds; \
+                         see hub75_logic.rs for the pinned ranges."
+                    );
+                    return Ok(());
+                }
+            }
         }
         OutputMode::Ws2812b => {
             // v1-spec-delta #11 (slice e) -- WS2812B serial-
