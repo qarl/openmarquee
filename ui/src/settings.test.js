@@ -290,7 +290,10 @@ describe("mountSettings", () => {
         expect(onSave.mock.calls[0][0].timezone).toBeNull();
     });
 
-    it("WiFi station fieldset is grayed out when station toggle is off", async () => {
+    it("Join section is collapsed (is-disabled) when Join is not selected", async () => {
+        // 2026-07-14 (qarl): the deselected mode's body is collapsed via
+        // CSS (.is-disabled > :not(legend) { display:none }); the class
+        // toggle is the tested mechanism, the display:none is CSS-only.
         const container = document.createElement("div");
         mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
         await tick();
@@ -299,13 +302,13 @@ describe("mountSettings", () => {
         expect(container.querySelector(".field-wifi-station-ssid").disabled).toBe(true);
     });
 
-    it("enabling the station toggle un-grays its fieldset", async () => {
+    it("selecting Join expands its section (removes is-disabled)", async () => {
         const container = document.createElement("div");
         mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
         await tick();
-        const toggle = container.querySelector(".field-wifi-station-enabled");
-        toggle.checked = true;
-        toggle.dispatchEvent(new Event("change"));
+        const joinRadio = container.querySelector(".field-wifi-station-enabled");
+        joinRadio.checked = true;
+        joinRadio.dispatchEvent(new Event("change"));
         const stationFieldset = container.querySelector(".settings-wifi-station");
         expect(stationFieldset.classList.contains("is-disabled")).toBe(false);
         expect(container.querySelector(".field-wifi-station-ssid").disabled).toBe(false);
@@ -331,7 +334,8 @@ describe("mountSettings", () => {
         staRadio.dispatchEvent(new Event("change"));
         expect(staRadio.checked).toBe(true);
         expect(apRadio.checked).toBe(false);
-        // The station fieldset un-grays; the AP fieldset grays.
+        // Join expands, Create collapses — is-disabled drives the CSS
+        // collapse (display:none on the deselected mode's body).
         expect(
             container.querySelector(".settings-wifi-station").classList.contains("is-disabled"),
         ).toBe(false);
