@@ -1014,7 +1014,17 @@ class TestLingerTimer:
         sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
         sup.apply_event(SupervisorEvent.STA_ASSOCIATED)
         ref = sup.linger_entered_at
-        assert sup.check_linger_timeout(now=ref + 10.0) is True
+        # 2026-07-13 (surfaced by PR #74's CI): pass `ref + 10.001` (not `ref + 10.0`)
+        # for the same double-precision reason the sibling
+        # test_check_returns_true_after_window_elapses fixed on 2026-07-02
+        # (b74d6ad, PR #31). `ref` is `time.monotonic()`; for specific
+        # mantissa bits `(ref + 10.0) - ref` rounds to `9.999999999999972`
+        # (observed on CI at ref=248.165112371), and check_linger_timeout
+        # uses `>=`, so elapsed < linger_seconds returns False → the
+        # `is True` assert flaked. The +1 ms bump is smaller than any
+        # observe-loop tick so the "fires right at the window boundary"
+        # semantic is preserved.
+        assert sup.check_linger_timeout(now=ref + 10.001) is True
         # Fire the transition (what the loop would do).
         sup.apply_event(SupervisorEvent.LINGER_TIMER_EXPIRED)
         assert sup.current_state == SupervisorState.ONLINE
