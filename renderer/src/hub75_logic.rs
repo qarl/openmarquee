@@ -275,6 +275,140 @@ impl Hub75Config {
         }
         Ok(())
     }
+
+    /// Build a config from `OPENMARQUEE_HUB75_*` env vars.
+    ///
+    /// Every field is optional; unset falls back to the
+    /// `fallback_1chain` default. **A set-but-unparseable value
+    /// returns `Err` instead of silently defaulting** — operator
+    /// typos should surface at arm construction, not blur into
+    /// "why isn't my brightness setting taking effect?" hunts.
+    ///
+    /// **Design-doc v2 HW-assertion pin (§12 addendum):** the
+    /// defaults here (`PWM_LSB_NSEC=130`, `GPIO_SLOWDOWN=4`,
+    /// `pwm_bits=8`, `limit_refresh_hz=60`, brightness=100) are the
+    /// hzeller README recommendations for the Pi Zero 2 W + Adafruit
+    /// HAT target. Phase 1 verifies each on real HW; deviations get
+    /// tuned via env, not by editing the defaults here (so the
+    /// fallback stays predictable for future operators).
+    ///
+    /// **Not env-configurable at Phase 0:** `wiring_revision`
+    /// (comes from the physical bring-up fixture at Phase 1, not
+    /// operator config) and `gamma_lut` (needs a file / calibration
+    /// asset; deferred to Phase 1 or beyond).
+    pub fn from_env() -> Result<Self, ConfigParseError> {
+        let mut cfg = Self::fallback_1chain();
+        if let Some(v) = env_var("OPENMARQUEE_HUB75_HAT")? {
+            cfg.hat = match v.as_str() {
+                "regular" => HatMapping::Regular,
+                "adafruit-hat" => HatMapping::AdafruitHat,
+                "adafruit-hat-pwm" => HatMapping::AdafruitHatPwm,
+                other => {
+                    return Err(ConfigParseError {
+                        key: "OPENMARQUEE_HUB75_HAT",
+                        value: other.to_string(),
+                        expected: "regular | adafruit-hat | adafruit-hat-pwm",
+                    });
+                }
+            };
+        }
+        if let Some(v) = parse_env::<u16>("OPENMARQUEE_HUB75_PANEL_ROWS")? {
+            cfg.panel_rows = v;
+        }
+        if let Some(v) = parse_env::<u16>("OPENMARQUEE_HUB75_PANEL_COLS")? {
+            cfg.panel_cols = v;
+        }
+        if let Some(v) = parse_env::<u16>("OPENMARQUEE_HUB75_CHAIN")? {
+            cfg.chain = v;
+        }
+        if let Some(v) = parse_env::<u16>("OPENMARQUEE_HUB75_PARALLEL")? {
+            cfg.parallel = v;
+        }
+        if let Some(v) = parse_env::<u8>("OPENMARQUEE_HUB75_PWM_BITS")? {
+            cfg.pwm_bits = v;
+        }
+        if let Some(v) = parse_env::<u32>("OPENMARQUEE_HUB75_PWM_LSB_NSEC")? {
+            cfg.pwm_lsb_nsec = v;
+        }
+        if let Some(v) = parse_env::<u8>("OPENMARQUEE_HUB75_GPIO_SLOWDOWN")? {
+            cfg.gpio_slowdown = v;
+        }
+        if let Some(v) = parse_env::<u16>("OPENMARQUEE_HUB75_LIMIT_REFRESH_HZ")? {
+            cfg.limit_refresh_hz = v;
+        }
+        if let Some(v) = env_var("OPENMARQUEE_HUB75_COLOR_ORDER")? {
+            cfg.color_order = match v.as_str() {
+                "rgb" => ColorOrder::Rgb,
+                "bgr" => ColorOrder::Bgr,
+                "grb" => ColorOrder::Grb,
+                "gbr" => ColorOrder::Gbr,
+                "rbg" => ColorOrder::Rbg,
+                "brg" => ColorOrder::Brg,
+                other => {
+                    return Err(ConfigParseError {
+                        key: "OPENMARQUEE_HUB75_COLOR_ORDER",
+                        value: other.to_string(),
+                        expected: "rgb | bgr | grb | gbr | rbg | brg",
+                    });
+                }
+            };
+        }
+        if let Some(v) = parse_env::<u8>("OPENMARQUEE_HUB75_BRIGHTNESS")? {
+            cfg.brightness = v;
+        }
+        Ok(cfg)
+    }
+}
+
+/// Parse error from `Hub75Config::from_env`. Set-but-bad values are
+/// surfaced typed so the arm can render a clear operator message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigParseError {
+    pub key: &'static str,
+    pub value: String,
+    pub expected: &'static str,
+}
+
+impl std::fmt::Display for ConfigParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}={:?} could not be parsed (expected {})",
+            self.key, self.value, self.expected
+        )
+    }
+}
+
+impl std::error::Error for ConfigParseError {}
+
+/// Read an env var, returning `Ok(None)` if unset (not an error).
+fn env_var(key: &'static str) -> Result<Option<String>, ConfigParseError> {
+    match std::env::var(key) {
+        Ok(v) => Ok(Some(v)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        // NotUnicode is an operator-config bug — surface it.
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigParseError {
+            key,
+            value: "<non-utf8>".to_string(),
+            expected: "utf-8 string",
+        }),
+    }
+}
+
+/// Read an env var and parse to `T`. Unset → `Ok(None)`; set-but-
+/// unparseable → typed error (NOT silent default).
+fn parse_env<T: std::str::FromStr>(key: &'static str) -> Result<Option<T>, ConfigParseError> {
+    match env_var(key)? {
+        None => Ok(None),
+        Some(s) => match s.parse::<T>() {
+            Ok(v) => Ok(Some(v)),
+            Err(_) => Err(ConfigParseError {
+                key,
+                value: s,
+                expected: std::any::type_name::<T>(),
+            }),
+        },
+    }
 }
 
 // ── Frame preparation ────────────────────────────────────────────────────
@@ -736,6 +870,183 @@ mod tests {
             cfg.validate(),
             Err(SerializeError::ConfigOutOfRange { field: "panel_cols", .. })
         ));
+    }
+
+    // ── from_env / ConfigParseError coverage ─────────────────────────
+    //
+    // `std::env` is process-global, so these tests all touch the SAME
+    // env from multiple threads under `cargo test`'s default parallel
+    // runner. Use a single `#[test]` that serializes the mutations
+    // itself — that costs one test entry but sidesteps the classic
+    // set-env-under-parallel-tests race in a way that a
+    // per-test-mutex still can't guarantee across an entire crate's
+    // test suite (other modules may touch `OPENMARQUEE_*` too).
+
+    fn scoped_env<F: FnOnce()>(pairs: &[(&str, &str)], f: F) {
+        // Snapshot prior values, install restore guard BEFORE mutating
+        // env — so a panic mid-set-loop still restores cleanly and any
+        // pre-existing shell env (unusual but possible for a dev with
+        // OPENMARQUEE_HUB75_* preset) is preserved after the test.
+        struct Restore {
+            prior: Vec<(String, Option<String>)>,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in self.prior.drain(..) {
+                    // SAFETY: single-threaded within scoped_env; other env
+                    // tests must also route through scoped_env.
+                    match v {
+                        Some(orig) => unsafe { std::env::set_var(&k, orig) },
+                        None => unsafe { std::env::remove_var(&k) },
+                    }
+                }
+            }
+        }
+        let prior: Vec<(String, Option<String>)> = pairs
+            .iter()
+            .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        let _restore = Restore { prior };
+        for (k, v) in pairs {
+            // SAFETY: as above — scoped_env callers must not overlap.
+            unsafe {
+                std::env::set_var(k, v);
+            }
+        }
+        f();
+    }
+
+    #[test]
+    fn from_env_full_coverage_single_serialized_test() {
+        // 1) Unset env → defaults match fallback_1chain.
+        scoped_env(&[], || {
+            let cfg = Hub75Config::from_env().unwrap();
+            let d = Hub75Config::fallback_1chain();
+            assert_eq!(cfg.hat, d.hat);
+            assert_eq!(cfg.panel_rows, d.panel_rows);
+            assert_eq!(cfg.panel_cols, d.panel_cols);
+            assert_eq!(cfg.chain, d.chain);
+            assert_eq!(cfg.parallel, d.parallel);
+            assert_eq!(cfg.pwm_bits, d.pwm_bits);
+            assert_eq!(cfg.pwm_lsb_nsec, d.pwm_lsb_nsec);
+            assert_eq!(cfg.gpio_slowdown, d.gpio_slowdown);
+            assert_eq!(cfg.limit_refresh_hz, d.limit_refresh_hz);
+            assert_eq!(cfg.color_order, d.color_order);
+            assert_eq!(cfg.brightness, d.brightness);
+        });
+
+        // 2) All fields overridden with valid values → each parsed.
+        scoped_env(
+            &[
+                ("OPENMARQUEE_HUB75_HAT", "adafruit-hat-pwm"),
+                ("OPENMARQUEE_HUB75_PANEL_ROWS", "64"),
+                ("OPENMARQUEE_HUB75_PANEL_COLS", "64"),
+                ("OPENMARQUEE_HUB75_CHAIN", "2"),
+                ("OPENMARQUEE_HUB75_PARALLEL", "3"),
+                ("OPENMARQUEE_HUB75_PWM_BITS", "10"),
+                ("OPENMARQUEE_HUB75_PWM_LSB_NSEC", "200"),
+                ("OPENMARQUEE_HUB75_GPIO_SLOWDOWN", "2"),
+                ("OPENMARQUEE_HUB75_LIMIT_REFRESH_HZ", "120"),
+                ("OPENMARQUEE_HUB75_COLOR_ORDER", "bgr"),
+                ("OPENMARQUEE_HUB75_BRIGHTNESS", "75"),
+            ],
+            || {
+                let cfg = Hub75Config::from_env().unwrap();
+                assert_eq!(cfg.hat, HatMapping::AdafruitHatPwm);
+                assert_eq!(cfg.panel_rows, 64);
+                assert_eq!(cfg.panel_cols, 64);
+                assert_eq!(cfg.chain, 2);
+                assert_eq!(cfg.parallel, 3);
+                assert_eq!(cfg.pwm_bits, 10);
+                assert_eq!(cfg.pwm_lsb_nsec, 200);
+                assert_eq!(cfg.gpio_slowdown, 2);
+                assert_eq!(cfg.limit_refresh_hz, 120);
+                assert_eq!(cfg.color_order, ColorOrder::Bgr);
+                assert_eq!(cfg.brightness, 75);
+                // Env-overridden config still validates.
+                assert!(cfg.validate().is_ok());
+            },
+        );
+
+        // 3) All six color-order values map correctly.
+        for (env, expected) in [
+            ("rgb", ColorOrder::Rgb),
+            ("bgr", ColorOrder::Bgr),
+            ("grb", ColorOrder::Grb),
+            ("gbr", ColorOrder::Gbr),
+            ("rbg", ColorOrder::Rbg),
+            ("brg", ColorOrder::Brg),
+        ] {
+            scoped_env(&[("OPENMARQUEE_HUB75_COLOR_ORDER", env)], || {
+                assert_eq!(
+                    Hub75Config::from_env().unwrap().color_order,
+                    expected,
+                    "color_order={env}"
+                );
+            });
+        }
+
+        // 4) All three HAT values map correctly.
+        for (env, expected) in [
+            ("regular", HatMapping::Regular),
+            ("adafruit-hat", HatMapping::AdafruitHat),
+            ("adafruit-hat-pwm", HatMapping::AdafruitHatPwm),
+        ] {
+            scoped_env(&[("OPENMARQUEE_HUB75_HAT", env)], || {
+                assert_eq!(
+                    Hub75Config::from_env().unwrap().hat,
+                    expected,
+                    "hat={env}"
+                );
+            });
+        }
+
+        // 5) Bad HAT value → typed error naming the key + expected set.
+        scoped_env(&[("OPENMARQUEE_HUB75_HAT", "bogus")], || {
+            let err = Hub75Config::from_env().unwrap_err();
+            assert_eq!(err.key, "OPENMARQUEE_HUB75_HAT");
+            assert_eq!(err.value, "bogus");
+            assert!(err.expected.contains("adafruit-hat"), "expected: {}", err.expected);
+        });
+
+        // 6) Bad COLOR_ORDER value → typed error.
+        scoped_env(&[("OPENMARQUEE_HUB75_COLOR_ORDER", "xyz")], || {
+            let err = Hub75Config::from_env().unwrap_err();
+            assert_eq!(err.key, "OPENMARQUEE_HUB75_COLOR_ORDER");
+            assert_eq!(err.value, "xyz");
+        });
+
+        // 7) Bad integer value → typed error (NOT silent default).
+        // This is the "operator typo shouldn't hide" contract.
+        scoped_env(&[("OPENMARQUEE_HUB75_CHAIN", "not-a-number")], || {
+            let err = Hub75Config::from_env().unwrap_err();
+            assert_eq!(err.key, "OPENMARQUEE_HUB75_CHAIN");
+            assert_eq!(err.value, "not-a-number");
+        });
+
+        // 8) Display impl includes key + value + expected.
+        let e = ConfigParseError {
+            key: "OPENMARQUEE_HUB75_TEST",
+            value: "bogus".to_string(),
+            expected: "test-expected",
+        };
+        let s = format!("{e}");
+        assert!(s.contains("OPENMARQUEE_HUB75_TEST"), "{s}");
+        assert!(s.contains("bogus"), "{s}");
+        assert!(s.contains("test-expected"), "{s}");
+
+        // 9) Out-of-range value parses cleanly (u8 max = 255) but is
+        // later rejected by validate() → arm-fill sequence
+        // (from_env → validate) surfaces the range violation as
+        // ConfigOutOfRange, not ConfigParseError. Pin the boundary.
+        scoped_env(&[("OPENMARQUEE_HUB75_BRIGHTNESS", "200")], || {
+            let cfg = Hub75Config::from_env().unwrap();
+            assert_eq!(cfg.brightness, 200);
+            assert!(matches!(
+                cfg.validate(),
+                Err(SerializeError::ConfigOutOfRange { field: "brightness", .. })
+            ));
+        });
     }
 
     #[test]
