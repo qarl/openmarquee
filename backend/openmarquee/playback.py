@@ -1474,7 +1474,7 @@ class PlaybackLoop:
                 # advance success at ~30Hz). If the renderer
                 # wedges, advance() either raises or never returns
                 # (in which case the to_thread call blocks), the
-                # ping stops firing, systemd's WatchdogSec=60s
+                # ping stops firing, systemd's WatchdogSec=120s
                 # fires + escalates to FailureAction=reboot. See
                 # `system/openmarquee-backend.service`.
                 sd_notify.notify_watchdog()
