@@ -35,6 +35,7 @@ from openmarquee.live import (
     LiveManager,
     LiveNotActive,
     LiveSession,
+    StreamSourceUnreachable,
     StreamStartRequest,
     WebRtcStartRequest,
 )
@@ -763,22 +764,20 @@ async def test_stream_session_has_no_peer_connection(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_takeover_unreachable_url_does_not_freeze_playlist(tmp_path, monkeypatch):
-    """C2 / finding M1: a stream takeover to a dead/unreachable URL —
-    ffmpeg yields ZERO frames — must NOT leave the session permanently
-    is_active with the playlist frozen on the last frame.
+async def test_stream_takeover_unreachable_url_raises_and_resumes_playlist(tmp_path, monkeypatch):
+    """C2 / finding M1 + QA verify-audit 2026-07-15: a stream takeover to a
+    dead/unreachable URL — ffmpeg yields ZERO frames — must NOT leave the
+    playlist frozen, AND must now fail LOUDLY instead of returning a
+    misleading success that self-closes seconds later.
 
-    The first-frame watchdog (`_watch_for_first_frame`, symmetric to
-    the WebRTC phantom-track watchdog) auto-closes the session after
-    `_PHANTOM_TIMEOUT_SECONDS` of no frames ever rendered; the pump
-    exhausting `frames()` immediately also auto-closes. Either way the
-    session ends up closed and the playlist resumes — never a
-    permanently-frozen sign the operator must manually /stop.
-
-    The watchdog timeout is compressed via monkeypatch so the test
-    runs fast — mirrors `test_phantom_session_watchdog_closes_on_no_
-    track`."""
-    monkeypatch.setattr(LiveSession, "_PHANTOM_TIMEOUT_SECONDS", 0.1)
+    The honest-start gate (`_await_stream_start`) sees the pump exit with no
+    frame and raises StreamSourceUnreachable; LiveManager.start tears the
+    session down (resuming the playlist) and re-raises, so the operator gets
+    an error rather than a phantom session. (Pre-audit this returned a 200
+    and relied on the first-frame watchdog to silently close.)"""
+    # The gate returns as soon as the pump exits (FIRST_COMPLETED), so this
+    # is fast regardless; compress the window to keep the worst case bounded.
+    monkeypatch.setattr(LiveSession, "_STREAM_START_LIVENESS_SECONDS", 2.0)
     # n_frames=0 → the mock ffmpeg emits nothing and exits: the
     # "unreachable URL" failure mode (ffmpeg/ffprobe yields no media).
     _patch_mock_ffmpeg(
@@ -792,27 +791,15 @@ async def test_stream_takeover_unreachable_url_does_not_freeze_playlist(tmp_path
     await loop.start()
     try:
         manager = LiveManager(loop)
-        session_id, _answer = await manager.start(
-            StreamStartRequest(url="rtsp://dead-host:8554/nothing")
-        )
-        session = manager._session
-        assert session is not None and session.id == session_id
-        # The takeover paused the playlist.
-        assert await _wait_until(lambda: loop.is_paused)
-        # The pump runs out of frames immediately (and/or the first-
-        # frame watchdog fires): the session MUST close itself, not
-        # leak as permanently is_active.
-        assert await _wait_until(lambda: session.closed, timeout=2.0), (
-            "session never closed — unreachable-URL takeover froze the playlist"
-        )
-        assert session.closed
+        with pytest.raises(StreamSourceUnreachable):
+            await manager.start(StreamStartRequest(url="rtsp://dead-host:8554/nothing"))
+        # The failed start tore the session down — no phantom session leaked.
         assert not manager.is_active
-        # close() resumed the loop — the playlist is no longer frozen.
-        # `closed` flips True at the START of close(); resume() runs at
-        # its END, after an awaiting subprocess reap — so poll for the
-        # resume rather than reading it synchronously off `closed`.
+        assert manager._session is None
+        # close() resumed the loop — the playlist is not frozen. resume()
+        # runs at the END of close() after a subprocess reap, so poll.
         assert await _wait_until(lambda: not loop.is_paused, timeout=2.0), (
-            "close() did not resume the playlist"
+            "an unreachable-URL takeover left the playlist frozen"
         )
     finally:
         await manager.stop_all()
@@ -1021,18 +1008,36 @@ async def test_session_pause_skips_render_frame(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pause_before_first_frame_does_not_trip_watchdog(tmp_path, monkeypatch):
-    """Regression: pausing within the 10s first-frame watchdog window
-    on a stream-transport takeover MUST NOT auto-close the session.
-    The watchdog measures source-side proof-of-life; a drained-but-
-    paused frame still proves the source is alive. (Subagent review
-    flagged: prior version of the pump set _first_frame_event AFTER
-    the pause gate, so a Pause click before the first render would
-    silently tear down a healthy session 10s later.)"""
+    """Regression: a Pause landing BEFORE the first render on a stream
+    takeover MUST NOT let the first-frame watchdog auto-close the session.
+    The pump sets _first_frame_event at the TOP of its loop (on frame
+    DRAIN), before the pause gate — so a drained-but-not-rendered frame
+    still proves source-side liveness and disarms the watchdog. (Subagent
+    review flagged the original bug: the pump set the event AFTER the pause
+    gate, so a Pause before the first render silently tore down a healthy
+    session 10s later.)
+
+    Driven at the LiveSession level with the session PRE-PAUSED, because the
+    honest-start gate (_await_stream_start, 2026-07-15) now guarantees a
+    frame is drained — event set — before manager.start() returns, so
+    "pause before the first frame" can't be staged through the manager. If
+    the event-set regressed back below the pause gate, a pre-paused source
+    would never set it: start_stream's gate would time out and this test's
+    is_set() assertion would fail. That's the guard."""
     import functools
 
     from openmarquee.stream_consumer import StreamConsumer
     from tests.test_stream_consumer import _write_mock_ffmpeg
 
+    # Leave _PHANTOM_TIMEOUT_SECONDS at its default: a healthy source sets the
+    # proof-of-life event within milliseconds, disarming the watchdog long
+    # before it could fire — so no compression is needed, and none of the
+    # flakiness of a tight watchdog racing the mock's subprocess spawn. The
+    # honest-start liveness window bounds regression detection instead: a
+    # comfortable 3s (vs. the mock's ~30ms emit) so a loaded CI runner can't
+    # spuriously time it out on the healthy path, while the regression path
+    # (event never set) still fails quickly.
+    monkeypatch.setattr(LiveSession, "_STREAM_START_LIVENESS_SECONDS", 3.0)
     frame_size = 8 * 8 * 3 // 2
     mock = _write_mock_ffmpeg(
         tmp_path / "ffmpeg", frame_size=frame_size, n_frames=0, continuous=True
@@ -1046,24 +1051,21 @@ async def test_pause_before_first_frame_does_not_trip_watchdog(tmp_path, monkeyp
     await loop.start()
     manager = LiveManager(loop)
     try:
-        session_id, _ = await manager.start(StreamStartRequest(url="rtsp://laptop:8554/live"))
-        session = manager._session
-        assert session is not None
-        # Pause immediately — within the watchdog's first-frame
-        # measurement window. The source is producing frames (mock
-        # ffmpeg yields continuously) but the pump skips render_frame
-        # so _first_frame_event could go unset on the OLD code path.
-        # With the fix, set() now happens at the TOP of the loop so
-        # any drained frame counts as proof-of-life.
-        await manager.pause(session_id)
-        assert await _wait_until(lambda: session._first_frame_event.is_set())
-        # Wait past the watchdog's typical timeout — the session must
-        # remain open. Even though no render is happening, the watchdog
-        # has been disarmed by the source-side proof-of-life.
+        session = LiveSession(loop)
+        # Pause BEFORE the transport starts: the pump will DRAIN frames but
+        # skip render_frame. The drained frame must STILL set the event.
+        await session.pause()
+        assert session.paused
+        await session.start_stream("rtsp://laptop:8554/live")
+        manager._session = session  # register so stop_all() tears it down
+        # The drained (unrendered) frame set the proof-of-life event...
+        assert session._first_frame_event.is_set()
+        # ...so the watchdog disarmed (its wait returned) and did NOT close
+        # the paused-but-alive session.
         assert session._watchdog_task is not None
         assert await _wait_until(lambda: session._watchdog_task.done())
         await asyncio.sleep(0.3)
-        assert manager.is_active, "first-frame watchdog wrongly closed a paused-but-alive session"
+        assert not session.closed, "first-frame watchdog wrongly closed a paused-but-alive session"
         assert session.paused
     finally:
         await manager.stop_all()
@@ -1225,11 +1227,36 @@ async def test_connection_state_healthy_transitions_do_not_close(tmp_path, monke
 
 def test_phantom_timeout_constants_split_webrtc_vs_stream():
     """Regression-lock on the split-constant design (subagent caught
-    this pre-commit). The WebRTC safety-net was bumped 10s -> 30s
-    when the connectionstatechange handler landed; the STREAM
-    timeout MUST stay at 10s because the stream-transport path has
-    no secondary detector (no PC = no connectionstate). A single
-    shared constant would have silently tripled the stream phantom
-    window."""
+    this pre-commit). The WebRTC safety-net and the stream first-frame
+    watchdog are SEPARATE constants — a single shared one would couple two
+    independently-tuned budgets (the WebRTC path has a fast secondary
+    detector via connectionstatechange; the stream path has none).
+
+    QA verify-audit 2026-07-15: the stream watchdog default was bumped
+    10s -> 75s (and made env-tunable) to sit strictly above the 60s ffprobe
+    budget after probing on the Pi Zero 2 W was found to exceed the old
+    8s/10s budget on VALID sources; the WebRTC safety-net (30s) is unrelated
+    and unchanged. The two must stay distinct — the stream one is no longer
+    the smaller of the pair."""
     assert LiveSession._PHANTOM_TIMEOUT_SECONDS_WEBRTC == 30.0
-    assert LiveSession._PHANTOM_TIMEOUT_SECONDS == 10.0
+    assert LiveSession._PHANTOM_TIMEOUT_SECONDS == 75.0
+    assert LiveSession._PHANTOM_TIMEOUT_SECONDS != LiveSession._PHANTOM_TIMEOUT_SECONDS_WEBRTC
+
+
+def test_stream_timing_budgets_are_env_tunable(monkeypatch):
+    """QA verify-audit 2026-07-15: the honest-start liveness window has a
+    short default (so a valid-but-slow probe doesn't hang the request past
+    it) and, like the first-frame watchdog, is env-tunable. Pins the
+    default + the helper's parse rules (valid override wins; junk / non-
+    positive / unset fall back)."""
+    from openmarquee import live as live_mod
+
+    assert LiveSession._STREAM_START_LIVENESS_SECONDS == 5.0
+    monkeypatch.setenv("X_TEST_LIVENESS", "3.5")
+    assert live_mod._env_positive_float("X_TEST_LIVENESS", 5.0) == 3.5
+    monkeypatch.setenv("X_TEST_LIVENESS", "junk")
+    assert live_mod._env_positive_float("X_TEST_LIVENESS", 5.0) == 5.0
+    monkeypatch.setenv("X_TEST_LIVENESS", "0")
+    assert live_mod._env_positive_float("X_TEST_LIVENESS", 5.0) == 5.0
+    monkeypatch.delenv("X_TEST_LIVENESS", raising=False)
+    assert live_mod._env_positive_float("X_TEST_LIVENESS", 5.0) == 5.0

@@ -54,6 +54,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from collections.abc import AsyncIterator
 from urllib.parse import urlparse
 
@@ -106,12 +107,36 @@ _STDERR_TAIL_BYTES = 8192
 # to SIGKILL.
 _TERMINATE_GRACE_SECONDS = 2.0
 
+
 # How long to wait for ffprobe to report the source stream dimensions
-# before giving up. ffprobe connects to the stream URL and reads
-# enough of the stream to parse the SPS; a few seconds is ample on a
-# LAN, and an unreachable URL is bounded by the caller's
-# connect-timeout anyway.
-_FFPROBE_TIMEOUT_SECONDS = 8.0
+# before giving up. ffprobe connects to the stream URL and reads enough of
+# the stream to parse the SPS.
+#
+# QA verify-audit 2026-07-15 (JasonsSign1): the old 8s budget was too tight
+# for the Pi Zero 2 W — ffprobe measured 11.6s on a LOCAL 720p file and
+# 37-60s on an internet HLS URL, so a VALID stream timed out probing and its
+# session died even though ffmpeg itself decoded fine (a Mux HLS test ran to
+# exit 0). The default is 60s — chosen to clear the measured internet-HLS
+# worst case (~60s) so the JasonsSign1 Mux source probes successfully out of
+# the box; env-tunable DOWN for a LAN-only deployment (a local RTSP camera
+# probes in a couple seconds).
+#
+# INVARIANT: the caller's first-frame watchdog
+# (live.LiveSession._PHANTOM_TIMEOUT_SECONDS, default 75s) MUST stay strictly
+# above this budget, or a slow-but-valid probe gets phantom-closed mid-probe.
+# If you raise OPENMARQUEE_STREAM_FFPROBE_TIMEOUT_SECONDS, raise
+# OPENMARQUEE_STREAM_FIRST_FRAME_TIMEOUT_SECONDS to match.
+def _env_positive_float(name: str, default: float) -> float:
+    """Positive float from env var `name`, else `default` (unset /
+    unparseable / non-positive)."""
+    try:
+        v = float(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
+_FFPROBE_TIMEOUT_SECONDS = _env_positive_float("OPENMARQUEE_STREAM_FFPROBE_TIMEOUT_SECONDS", 60.0)
 
 # Renderer-hardening C2 (finding H2, 2026-05-21): the vc4 GPU's
 # GL_MAX_TEXTURE_SIZE. The Pi's VideoCore IV caps a single 2D texture

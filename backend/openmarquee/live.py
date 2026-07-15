@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID, uuid4
@@ -127,6 +128,34 @@ class LiveNotActive(Exception):
         self.session_id = session_id
 
 
+class StreamSourceUnreachable(Exception):
+    """Raised out of start_stream when a stream-transport source produces
+    no frames and its pump exits within the honest-start window — a dead /
+    unreachable / rejected URL.
+
+    QA verify-audit 2026-07-15: previously such a source still returned a
+    200 + session_id and then self-closed seconds later (the first-frame
+    watchdog fired), so the API lied about success. The route now catches
+    this and returns 502 so the operator learns the URL is bad up front.
+    """
+
+    def __init__(self, stream_url: str):
+        super().__init__(f"stream source produced no frames: {stream_url}")
+        self.stream_url = stream_url
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    """Read a positive float from env var `name`, falling back to `default`
+    on unset / unparseable / non-positive. Lets the stream timing budgets
+    be tuned per-deployment (a LAN RTSP camera vs. an internet HLS URL)
+    without a code change."""
+    try:
+        v = float(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+    return v if v > 0 else default
+
+
 class LiveSession:
     """One takeover feeding the playback engine.
 
@@ -166,12 +195,36 @@ class LiveSession:
     #
     # Stream-transport path: NO peer connection, so the only failure
     # detector is `_watch_for_first_frame` against
-    # `_PHANTOM_TIMEOUT_SECONDS` (10s, unchanged from pre-audit).
-    # Bumping this here would silently triple the stream phantom
-    # window for ffmpeg-source failures, which is out of scope for
-    # the audit (D3 was WebRTC-only).
-    _PHANTOM_TIMEOUT_SECONDS = 10.0
+    # `_PHANTOM_TIMEOUT_SECONDS`.
+    #
+    # QA verify-audit 2026-07-15 (JasonsSign1): the pre-audit stream
+    # budgets — ffprobe 8s (stream_consumer._FFPROBE_TIMEOUT_SECONDS) and
+    # this first-frame watchdog at 10s — were too tight for the Pi Zero
+    # 2 W. ffprobe alone measured 11.6s on a LOCAL 720p file and 37-60s on
+    # an internet HLS URL, so a VALID stream timed out probing (or the 10s
+    # watchdog phantom-closed a source ffmpeg would have decoded fine).
+    #
+    # Default 75s is chosen to sit strictly ABOVE the 60s probe default plus
+    # ffmpeg connect + first-decode headroom, so a slow-but-valid internet
+    # source (probe ~60s, then a few seconds to the first frame) is never
+    # phantom-killed. INVARIANT: this MUST stay > the probe budget — if you
+    # raise OPENMARQUEE_STREAM_FFPROBE_TIMEOUT_SECONDS, raise this env var to
+    # match. Both are env-tunable DOWN for a LAN-only deployment. This
+    # supersedes the earlier "out of scope, D3 was WebRTC-only" note — QA's
+    # audit put it in scope.
+    _PHANTOM_TIMEOUT_SECONDS = _env_positive_float(
+        "OPENMARQUEE_STREAM_FIRST_FRAME_TIMEOUT_SECONDS", 75.0
+    )
     _PHANTOM_TIMEOUT_SECONDS_WEBRTC = 30.0
+    # Honest-start gate (QA verify-audit 2026-07-15): how long start_stream
+    # waits to tell a fast source-death (dead/unreachable/rejected URL →
+    # raise StreamSourceUnreachable → the route returns an honest 502) from
+    # a source merely still connecting (→ return normally, a truthful
+    # "started"; the first-frame watchdog above remains the backstop). Kept
+    # short so a valid-but-slow probe doesn't hang the HTTP request past it.
+    _STREAM_START_LIVENESS_SECONDS = _env_positive_float(
+        "OPENMARQUEE_STREAM_START_LIVENESS_SECONDS", 5.0
+    )
 
     def __init__(self, playback: PlaybackLoop):
         self._playback = playback
@@ -368,6 +421,49 @@ class LiveSession:
         # auto-close so the playlist resumes. Symmetric to the WebRTC
         # phantom-track watchdog armed in start_webrtc().
         self._watchdog_task = asyncio.create_task(self._watch_for_first_frame())
+        # Honest-start contract (QA verify-audit 2026-07-15): don't let the
+        # route return a 200 for a source that immediately dies. Wait a
+        # short bounded window for either the first frame (→ success) or the
+        # pump to exit having produced nothing (dead/unreachable/rejected
+        # URL → raise so LiveManager tears the session down and the route
+        # returns an honest 502). If neither happens the source is still
+        # connecting: return normally (a truthful "started"), with the
+        # first-frame watchdog as the backstop.
+        await self._await_stream_start(stream_url)
+
+    async def _await_stream_start(self, stream_url: str) -> None:
+        """Distinguish a fast source-death from a still-connecting source
+        within `_STREAM_START_LIVENESS_SECONDS`. Raises
+        StreamSourceUnreachable if the pump exits with no frame in that
+        window; returns otherwise (first frame seen = success, or still
+        connecting = a truthful "started"). See start_stream."""
+        first_frame = asyncio.ensure_future(self._first_frame_event.wait())
+        try:
+            await asyncio.wait(
+                {first_frame, self._pump_task},
+                timeout=self._STREAM_START_LIVENESS_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            first_frame.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await first_frame
+        # Order matters: a source that renders exactly one frame then exits
+        # leaves BOTH the event set AND the pump done — the frame makes it a
+        # success, so check that first.
+        if self._first_frame_event.is_set():
+            return
+        pump = self._pump_task
+        if pump is not None and pump.done() and not pump.cancelled():
+            # Pump exited on its OWN (frames() ended with no frame: a dead /
+            # unreachable / rejected URL, or ffmpeg exiting immediately). It
+            # already self-closed the session (pump finally → close());
+            # surface the honest error for LiveManager to propagate. A
+            # CANCELLED pump means a concurrent close()/watchdog teardown
+            # owns the outcome — not ours to relabel, so fall through.
+            raise StreamSourceUnreachable(stream_url)
+        # Still connecting/probing (or a concurrent teardown) — truthful
+        # "started"; the first-frame watchdog remains the backstop.
 
     async def _watch_for_first_track(self) -> None:
         """Phase 12.1 Finding #2: auto-close if no track materializes
@@ -694,9 +790,14 @@ class LiveManager:
             session = LiveSession(self._playback)
             try:
                 answer_sdp = await self._start_session(session, request)
-            except Exception:
-                # Start failed — make sure we don't leak a half-open
-                # transport and that playback resumes if pause fired.
+            except BaseException:
+                # Start failed OR the request was cancelled mid-start — the
+                # honest-start gate can now block for a few seconds, widening
+                # the window where a client disconnect lands here. Either way
+                # tear the session down so we don't leak a half-open transport
+                # with playback stuck paused, then re-raise. BaseException (not
+                # Exception) so an asyncio.CancelledError also triggers the
+                # cleanup instead of orphaning the session.
                 await session.close()
                 raise
             self._session = session
@@ -714,7 +815,10 @@ class LiveManager:
             session = LiveSession(self._playback)
             try:
                 answer_sdp = await self._start_session(session, request)
-            except Exception:
+            except BaseException:
+                # Symmetric with start(): tear down on failure OR cancellation
+                # (CancelledError included) so a cancelled takeover can't leak
+                # a half-open session with playback paused.
                 await session.close()
                 raise
             self._session = session
