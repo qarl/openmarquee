@@ -1687,3 +1687,86 @@ class TestProbeAndSeedFromExistingConnection:
         seeded = sup.probe_and_seed_from_existing_connection(probe_fn=_boom)
         assert seeded is False
         assert sup.current_state == SupervisorState.SETUP
+
+
+class TestActiveWlan0Ssid:
+    """Bug fix 2026-07-15: the boot card must show the LIVE associated
+    SSID (resolved from the active wlan0 profile's 802-11-wireless.ssid),
+    NOT the connection PROFILE NAME and NOT the persisted submit-time
+    target (`last_sta_ssid`). active_wlan0_ssid never reads last_sta_ssid,
+    so it is independent of the target by construction."""
+
+    @staticmethod
+    def _cp(stdout="", returncode=0):
+        import types
+
+        return types.SimpleNamespace(stdout=stdout, returncode=returncode)
+
+    def test_resolves_connection_name_to_actual_ssid(self, monkeypatch):
+        # The active profile is NAMED "openmarquee-mgmt-wifi" but its SSID
+        # is "qarl" — the boot card must show "qarl", not the profile name
+        # (this name-vs-SSID confusion is part of the original bug).
+        import openmarquee.network_supervisor as ns
+
+        monkeypatch.setattr(
+            ns, "_probe_existing_wifi_connection", lambda **k: "openmarquee-mgmt-wifi"
+        )
+        monkeypatch.setattr(ns.shutil, "which", lambda name: "/usr/bin/nmcli")
+
+        def fake_run(args, **kw):
+            # nmcli -g 802-11-wireless.ssid connection show <conn>
+            assert args[:4] == ["nmcli", "-g", "802-11-wireless.ssid", "connection"]
+            assert args[-1] == "openmarquee-mgmt-wifi"
+            return self._cp(stdout="qarl\n", returncode=0)
+
+        monkeypatch.setattr(ns.subprocess, "run", fake_run)
+        assert ns.active_wlan0_ssid() == "qarl"
+
+    def test_none_when_not_connected(self, monkeypatch):
+        import openmarquee.network_supervisor as ns
+
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: None)
+        assert ns.active_wlan0_ssid() is None
+
+    def test_none_when_no_nmcli(self, monkeypatch):
+        import openmarquee.network_supervisor as ns
+
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: "c")
+        monkeypatch.setattr(ns.shutil, "which", lambda name: None)
+        assert ns.active_wlan0_ssid() is None
+
+    def test_none_when_ssid_query_returns_nonzero(self, monkeypatch):
+        import openmarquee.network_supervisor as ns
+
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: "c")
+        monkeypatch.setattr(ns.shutil, "which", lambda name: "/usr/bin/nmcli")
+        monkeypatch.setattr(ns.subprocess, "run", lambda *a, **k: self._cp(stdout="", returncode=1))
+        assert ns.active_wlan0_ssid() is None
+
+    def test_strips_only_trailing_newline_preserving_spaces(self, monkeypatch):
+        import openmarquee.network_supervisor as ns
+
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: "c")
+        monkeypatch.setattr(ns.shutil, "which", lambda name: "/usr/bin/nmcli")
+        monkeypatch.setattr(ns.subprocess, "run", lambda *a, **k: self._cp(stdout="my ssid \n"))
+        assert ns.active_wlan0_ssid() == "my ssid "
+
+    def test_none_when_ssid_empty(self, monkeypatch):
+        import openmarquee.network_supervisor as ns
+
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: "c")
+        monkeypatch.setattr(ns.shutil, "which", lambda name: "/usr/bin/nmcli")
+        monkeypatch.setattr(ns.subprocess, "run", lambda *a, **k: self._cp(stdout="\n"))
+        assert ns.active_wlan0_ssid() is None
+
+    def test_subprocess_error_is_swallowed(self, monkeypatch):
+        import openmarquee.network_supervisor as ns
+
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: "c")
+        monkeypatch.setattr(ns.shutil, "which", lambda name: "/usr/bin/nmcli")
+
+        def boom(*a, **k):
+            raise OSError("nmcli exploded")
+
+        monkeypatch.setattr(ns.subprocess, "run", boom)
+        assert ns.active_wlan0_ssid() is None

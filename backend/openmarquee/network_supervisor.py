@@ -751,6 +751,49 @@ def _probe_existing_wifi_connection(*, timeout_s: float = 5.0) -> str | None:
     return None
 
 
+def active_wlan0_ssid(*, timeout_s: float = 5.0) -> str | None:
+    """Return the SSID wlan0 is CURRENTLY associated with as a station,
+    or None when not connected / not detectable.
+
+    This is the LIVE association read from NetworkManager — unlike the
+    persisted ``NetworkSupervisor.last_sta_ssid``, which is the operator's
+    submit-time TARGET (written before the join is confirmed and never
+    refreshed from the live link, so it can name a stale or not-yet-joined
+    network). The boot card uses THIS so it shows the network the sign is
+    actually on.
+
+    Two steps, both fail-soft (no nmcli / not connected / timeout →
+    None): (1) find the active wlan0 wifi CONNECTION via
+    ``_probe_existing_wifi_connection``; then (2) resolve that profile's
+    real ``802-11-wireless.ssid``. Step 2 is necessary because the
+    connection PROFILE NAME that step 1 returns is NOT the SSID for
+    openmarquee-managed profiles (e.g. name "openmarquee-mgmt-wifi",
+    SSID "qarl") — that name/SSID confusion is part of the bug.
+    """
+    conn = _probe_existing_wifi_connection(timeout_s=timeout_s)
+    if not conn:
+        return None
+    if not shutil.which("nmcli"):
+        return None
+    try:
+        result = subprocess.run(
+            # -g emits the bare value (no "field:" prefix), single line.
+            ["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", conn],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    # A WPA2 SSID may legitimately begin/end with spaces; strip only the
+    # trailing newline nmcli appends.
+    ssid = result.stdout.rstrip("\n")
+    return ssid or None
+
+
 def _split_nmcli_terse_row(line: str) -> list[str]:
     """Split nmcli --terse output on unescaped ':'. nmcli escapes
     embedded colons with '\\:' — an SSID like `Home:Router` shows

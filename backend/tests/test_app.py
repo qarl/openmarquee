@@ -65,3 +65,23 @@ def test_request_validation_422_strips_echoed_input(client):
     # All errors must be JSON-safe AND must NOT echo input bytes.
     for err in body["detail"]:
         assert "input" not in err
+
+
+def test_boot_card_ssid_sourced_from_live_association_not_target():
+    """Regression (2026-07-15, bug 2): the BOOT identity card's Wi-Fi
+    SSID must come from the LIVE wlan0 association (active_wlan0_ssid),
+    NOT the persisted submit-time target (supervisor.last_sta_ssid) —
+    which is written before the join is confirmed and never refreshed,
+    so it can name a stale / not-yet-joined network or a connection
+    profile name. Anti-revert guard on the app.py boot-card wiring.
+    """
+    import inspect
+
+    from openmarquee import app as app_mod
+
+    src = inspect.getsource(app_mod)
+    assert "active_wlan0_ssid" in src, "boot card must read the live SSID"
+    assert '"ssid": live_ssid' in src, "boot card ssid must be the live value"
+    assert '"ssid": supervisor.last_sta_ssid' not in src, (
+        "boot card must NOT be fed the persisted target SSID"
+    )
