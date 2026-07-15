@@ -1072,6 +1072,60 @@ async def test_pause_before_first_frame_does_not_trip_watchdog(tmp_path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_live_pump_feeds_the_systemd_watchdog(tmp_path, monkeypatch):
+    """Regression (QA JasonsSign1 live-fire 2026-07-15): a live takeover
+    PAUSES the playback loop, whose per-advance sd_notify.notify_watchdog()
+    ping is the backend's ONLY systemd WATCHDOG=1 keepalive. So a sustained
+    live session fed NOTHING to systemd and got WatchdogSec-killed (~2min
+    into the no-ping window). The live pump — the active render pipeline
+    during a session — must feed the watchdog itself while the loop is
+    paused. Fail-before: pre-fix the live pump never pinged, so `pings`
+    stays empty after the clear and this times out."""
+    import functools
+
+    from openmarquee import sd_notify
+    from openmarquee.stream_consumer import StreamConsumer
+    from tests.test_stream_consumer import _write_mock_ffmpeg
+
+    pings: list[int] = []
+    # Patch the module attr the live pump resolves at call time (bypasses the
+    # 1Hz throttle so every pump frame is observable here).
+    monkeypatch.setattr(sd_notify, "notify_watchdog", lambda: pings.append(1))
+
+    frame_size = 8 * 8 * 3 // 2
+    mock = _write_mock_ffmpeg(
+        tmp_path / "ffmpeg", frame_size=frame_size, n_frames=0, continuous=True
+    )
+    monkeypatch.setattr(
+        "openmarquee.stream_source.StreamConsumer",
+        functools.partial(StreamConsumer, ffmpeg_bin=mock, source_size=(8, 8)),
+    )
+    loop, _renderer = _empty_loop(tmp_path)
+    await loop.start()
+    manager = LiveManager(loop)
+    try:
+        await manager.start(StreamStartRequest(url="rtsp://laptop:8554/live"))
+        # The takeover paused the playback loop — so from here the ONLY thing
+        # that can ping the watchdog is the live pump.
+        assert await _wait_until(lambda: loop.is_paused)
+        # Reset, then require pings that arrive AFTER the playback loop is
+        # confirmed paused — so they can ONLY be the live pump's. (This
+        # fixture's playlist is empty, so the playback loop never advances +
+        # never pings anyway; the clear just drops the pump's own pre-pause
+        # early pings so provenance is unambiguous.)
+        pings.clear()
+        # The live pump renders the continuous source's frames → it must keep
+        # feeding the watchdog while the playback loop stays paused.
+        assert await _wait_until(lambda: len(pings) >= 1, timeout=2.0), (
+            "live pump did not feed the systemd watchdog while the playback "
+            "loop was paused — a sustained live session would be WatchdogSec-killed"
+        )
+    finally:
+        await manager.stop_all()
+        await loop.stop()
+
+
+@pytest.mark.asyncio
 async def test_session_pause_resume_are_idempotent(tmp_path):
     """Repeated pause/resume on the same session is a no-op without
     error. Tests against a fresh session without a started transport
