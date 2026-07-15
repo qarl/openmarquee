@@ -1126,6 +1126,55 @@ async def test_live_pump_feeds_the_systemd_watchdog(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_live_session_stall_closes_session_not_backend(tmp_path, monkeypatch):
+    """#85 follow-up (QA live-fire 2026-07-15): a mid-stream source STALL —
+    ffmpeg alive but yielding no frames after the first few — must close JUST
+    the live session (playlist resumes), NOT starve the systemd watchdog into
+    a whole-backend restart. The session-scoped stall watchdog fires first.
+    Fail-before: without _watch_for_stall the pump blocks in `async for`
+    forever, the session stays is_active (frozen), and nothing closes it — so
+    the sustained no-ping would WatchdogSec-kill the whole backend."""
+    import functools
+
+    from openmarquee.stream_consumer import StreamConsumer
+    from tests.test_stream_consumer import _write_mock_ffmpeg
+
+    # Compress the stall window so the test is fast (default is 30s).
+    monkeypatch.setattr(LiveSession, "_STREAM_FRAME_STALL_SECONDS", 0.5)
+    frame_size = 8 * 8 * 3 // 2
+    # n_frames=2 THEN hang: two frames drain (so we're past the first-frame
+    # watchdog + honest-start gate), then the source goes quiet — a mid-stream
+    # stall, distinct from the never-a-first-frame case.
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=2, hang=True)
+    monkeypatch.setattr(
+        "openmarquee.stream_source.StreamConsumer",
+        functools.partial(StreamConsumer, ffmpeg_bin=mock, source_size=(8, 8)),
+    )
+    loop, _renderer = _empty_loop(tmp_path)
+    await loop.start()
+    manager = LiveManager(loop)
+    try:
+        session_id, _ = await manager.start(StreamStartRequest(url="rtsp://laptop:8554/live"))
+        session = manager._session
+        assert session is not None and session.id == session_id
+        # Frames flowed then the source went quiet → the stall watchdog closes
+        # JUST the session (the backend — this test process — keeps running).
+        assert await _wait_until(lambda: session.closed, timeout=2.0), (
+            "stall watchdog did not close a mid-stream-stalled session — a "
+            "sustained stall would WatchdogSec-kill the whole backend"
+        )
+        assert not manager.is_active
+        # close() resumed the playlist — session-granularity teardown, not a
+        # device event.
+        assert await _wait_until(lambda: not loop.is_paused, timeout=2.0), (
+            "playlist did not resume after the stalled session closed"
+        )
+    finally:
+        await manager.stop_all()
+        await loop.stop()
+
+
+@pytest.mark.asyncio
 async def test_session_pause_resume_are_idempotent(tmp_path):
     """Repeated pause/resume on the same session is a no-op without
     error. Tests against a fresh session without a started transport

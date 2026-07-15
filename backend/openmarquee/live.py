@@ -31,6 +31,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID, uuid4
@@ -226,6 +227,25 @@ class LiveSession:
     _STREAM_START_LIVENESS_SECONDS = _env_positive_float(
         "OPENMARQUEE_STREAM_START_LIVENESS_SECONDS", 5.0
     )
+    # Mid-stream stall guard (QA follow-up 2026-07-15, #85 scope-out). The
+    # first-frame watchdog above only covers the ZERO-frames-ever case (it
+    # disarms once frames flow). If frames STARTED and then the source stalls
+    # (ffmpeg alive but yielding nothing), no frame drains → the pump's
+    # per-frame WATCHDOG=1 keepalive stops → the systemd WatchdogSec (120s)
+    # eventually restarts the WHOLE backend. This closes JUST the session
+    # (playlist resumes) if no frame drains within the window — well before
+    # the systemd watchdog fires, so a dead source degrades to a session
+    # teardown, not a device event.
+    #
+    # INVARIANT: keep this well below the unit's WatchdogSec=120s
+    # (system/openmarquee-backend.service) so the session closes + the
+    # playlist loop's own watchdog pings resume before systemd fires —
+    # raising the env var to ~120s+ defeats the guard (systemd wins the race).
+    # The 30s default assumes a genuine "live" feed; a legitimately bursty
+    # source that can idle >30s between frames needs the env raised.
+    _STREAM_FRAME_STALL_SECONDS = _env_positive_float(
+        "OPENMARQUEE_STREAM_FRAME_STALL_SECONDS", 30.0
+    )
 
     def __init__(self, playback: PlaybackLoop):
         self._playback = playback
@@ -257,6 +277,12 @@ class LiveSession:
         # the stream URL was dead/unreachable and the watchdog auto-
         # closes — symmetric to the WebRTC phantom-track watchdog.
         self._first_frame_event = asyncio.Event()
+        # Mid-stream stall guard (#85 follow-up): _pump stamps the monotonic
+        # time of the last drained frame; _watch_for_stall closes the session
+        # if it goes stale (no frame within _STREAM_FRAME_STALL_SECONDS). None
+        # until the first frame drains.
+        self._last_frame_at: float | None = None
+        self._stall_watchdog_task: asyncio.Task | None = None
         # Operator-driven pause: when True the pump drains the source
         # but does NOT call render_frame, so DRM scanout holds the
         # last painted frame on glass while the upstream source (VLC
@@ -422,6 +448,11 @@ class LiveSession:
         # auto-close so the playlist resumes. Symmetric to the WebRTC
         # phantom-track watchdog armed in start_webrtc().
         self._watchdog_task = asyncio.create_task(self._watch_for_first_frame())
+        # #85 follow-up (2026-07-15): arm the mid-stream stall guard. Once
+        # frames flow, it closes JUST the session if the source stalls, before
+        # the systemd watchdog would restart the whole backend. Stream-only —
+        # the WebRTC path has its own connectionstatechange detector.
+        self._stall_watchdog_task = asyncio.create_task(self._watch_for_stall())
         # Honest-start contract (QA verify-audit 2026-07-15): don't let the
         # route return a 200 for a source that immediately dies. Wait a
         # short bounded window for either the first frame (→ success) or the
@@ -526,6 +557,43 @@ class LiveSession:
         except asyncio.CancelledError:
             raise
 
+    async def _watch_for_stall(self) -> None:
+        """Mid-stream stall guard (#85 follow-up 2026-07-15): once frames are
+        flowing, close JUST this session if the source goes quiet — ffmpeg
+        alive but yielding nothing — for _STREAM_FRAME_STALL_SECONDS.
+
+        Why this exists on top of the pump's per-frame WATCHDOG=1 ping: a
+        stalled source means no drain → no ping → the systemd WatchdogSec
+        (120s) restarts the WHOLE backend. This fires FIRST (default 30s «
+        120s) and closes only the session, so the playlist resumes and the
+        device stays up. Waits for the first frame before monitoring — the
+        pre-first-frame case is the first-frame watchdog's job (a slow probe
+        must not trip this). Cancellation-safe: close() cancels this task; the
+        CancelledError is re-raised so the cancel completes."""
+        try:
+            await self._first_frame_event.wait()
+            # Poll a fraction of the window so we fire promptly once a stall
+            # crosses the threshold (and stay responsive when a test compresses
+            # the window). Floor at 50ms.
+            check = max(0.05, min(self._STREAM_FRAME_STALL_SECONDS / 4.0, 2.0))
+            while not self._closed:
+                await asyncio.sleep(check)
+                last = self._last_frame_at
+                if self._closed or last is None:
+                    continue
+                if time.monotonic() - last > self._STREAM_FRAME_STALL_SECONDS:
+                    log.warning(
+                        "live: session %s stalled — no frame in %.1fs; closing "
+                        "the session so the playlist resumes (not letting the "
+                        "systemd watchdog restart the whole backend)",
+                        self.id,
+                        self._STREAM_FRAME_STALL_SECONDS,
+                    )
+                    await self.close()
+                    return
+        except asyncio.CancelledError:
+            raise
+
     async def _pump(self) -> None:
         """Drive the source: push each yielded frame to the renderer.
 
@@ -573,6 +641,11 @@ class LiveSession:
                 # set() is idempotent so doing this every frame is
                 # cheap and keeps the pump branch-free. (Moved above
                 # the pause gate 2026-05-24 per subagent review.)
+                # #85 follow-up: stamp the drain time BEFORE setting the event
+                # so _watch_for_stall (which wakes on the event) always sees a
+                # non-None _last_frame_at. Updated on every drained frame incl.
+                # paused ones — it's proof the source is still producing.
+                self._last_frame_at = time.monotonic()
                 self._first_frame_event.set()
                 # QA verify-audit 2026-07-15 (JasonsSign1): feed the systemd
                 # WATCHDOG=1 keepalive from the live pump too. The only other
@@ -703,6 +776,18 @@ class LiveSession:
             self._watchdog_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._watchdog_task
+        # #85 follow-up: same for the mid-stream stall watchdog. Guard the
+        # self-cancel — when a detected stall drives close() from inside
+        # _watch_for_stall, that task IS current_task() and must not cancel +
+        # await itself.
+        if (
+            self._stall_watchdog_task is not None
+            and not self._stall_watchdog_task.done()
+            and asyncio.current_task() is not self._stall_watchdog_task
+        ):
+            self._stall_watchdog_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._stall_watchdog_task
         # Close the source first so its frames() iterator stops, then
         # cancel the pump in case it is blocked mid-read inside the
         # source's iterator (close() alone can't interrupt a pending
