@@ -182,3 +182,87 @@ def test_no_hint_leaves_probed_online(tmp_path: Path, monkeypatch):
         assert sup.current_state == SupervisorState.ONLINE
     finally:
         dependencies._network_supervisor_singleton.cache_clear()
+
+
+# --- Recovery A1 countdown: read_boot_cycle_count + boot_countdown_hint ------
+
+
+def test_read_count_absent_is_zero(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENMARQUEE_BOOT_CYCLE_COUNT_FILE", str(tmp_path / "nope"))
+    assert boot_hint.read_boot_cycle_count() == 0
+
+
+def test_read_count_reads_integer(tmp_path: Path, monkeypatch):
+    count = tmp_path / "boot-cycle-count"
+    monkeypatch.setenv("OPENMARQUEE_BOOT_CYCLE_COUNT_FILE", str(count))
+    for raw, expected in (("1\n", 1), ("2\n", 2), ("  2 \n", 2)):
+        count.write_text(raw)
+        assert boot_hint.read_boot_cycle_count() == expected
+
+
+def test_read_count_corrupt_or_blank_is_zero(tmp_path: Path, monkeypatch):
+    # A torn write (the very power cut we're counting) or garbage must not
+    # crash startup or render a bad countdown — mirror the shell's guard.
+    count = tmp_path / "boot-cycle-count"
+    monkeypatch.setenv("OPENMARQUEE_BOOT_CYCLE_COUNT_FILE", str(count))
+    for raw in ("", "   \n", "abc", "1.5", "0x2"):
+        count.write_text(raw)
+        assert boot_hint.read_boot_cycle_count() == 0
+
+
+def test_read_count_negative_is_zero(tmp_path: Path, monkeypatch):
+    count = tmp_path / "boot-cycle-count"
+    count.write_text("-3\n")
+    monkeypatch.setenv("OPENMARQUEE_BOOT_CYCLE_COUNT_FILE", str(count))
+    assert boot_hint.read_boot_cycle_count() == 0
+
+
+def _set_count(tmp_path: Path, monkeypatch, value: str) -> None:
+    count = tmp_path / "boot-cycle-count"
+    count.write_text(value)
+    monkeypatch.setenv("OPENMARQUEE_BOOT_CYCLE_COUNT_FILE", str(count))
+
+
+def test_countdown_none_on_normal_boot(tmp_path: Path, monkeypatch):
+    _set_count(tmp_path, monkeypatch, "0\n")
+    assert boot_hint.boot_countdown_hint() is None
+
+
+def test_countdown_none_when_count_file_absent(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENMARQUEE_BOOT_CYCLE_COUNT_FILE", str(tmp_path / "nope"))
+    assert boot_hint.boot_countdown_hint() is None
+
+
+def test_countdown_two_more_at_count_1(tmp_path: Path, monkeypatch):
+    _set_count(tmp_path, monkeypatch, "1\n")
+    assert boot_hint.boot_countdown_hint() == "Restart 2× more for Setup Mode"
+
+
+def test_countdown_one_more_at_count_2(tmp_path: Path, monkeypatch):
+    _set_count(tmp_path, monkeypatch, "2\n")
+    assert boot_hint.boot_countdown_hint() == "Restart 1× more for Setup Mode"
+
+
+def test_countdown_none_at_or_above_threshold(tmp_path: Path, monkeypatch):
+    # The oneshot resets the counter to 0 the instant it fires, so a count
+    # >= threshold shouldn't occur — but if a stale file somehow holds one,
+    # show nothing rather than "Restart 0× more".
+    _set_count(tmp_path, monkeypatch, "3\n")
+    assert boot_hint.boot_countdown_hint() is None
+
+
+def test_countdown_respects_threshold_override(tmp_path: Path, monkeypatch):
+    # Threshold tracks the shell oneshot's OPENMARQUEE_BOOT_GESTURE_THRESHOLD
+    # so the "N× more" math always matches the gesture.
+    monkeypatch.setenv("OPENMARQUEE_BOOT_GESTURE_THRESHOLD", "5")
+    _set_count(tmp_path, monkeypatch, "1\n")
+    assert boot_hint.boot_countdown_hint() == "Restart 4× more for Setup Mode"
+    _set_count(tmp_path, monkeypatch, "4\n")
+    assert boot_hint.boot_countdown_hint() == "Restart 1× more for Setup Mode"
+
+
+def test_countdown_bad_threshold_falls_back_to_default(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("OPENMARQUEE_BOOT_GESTURE_THRESHOLD", "garbage")
+    _set_count(tmp_path, monkeypatch, "1\n")
+    # Default threshold 3 → "2× more".
+    assert boot_hint.boot_countdown_hint() == "Restart 2× more for Setup Mode"

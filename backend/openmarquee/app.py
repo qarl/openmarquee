@@ -29,6 +29,7 @@ from openmarquee.api_schedule import router as schedule_router
 from openmarquee.api_settings import router as settings_router
 from openmarquee.api_system import router as system_router
 from openmarquee.auth_middleware import AuthMiddleware
+from openmarquee.boot_hint import boot_countdown_hint
 from openmarquee.captive_portal_middleware import CaptivePortalMiddleware
 from openmarquee.content.migrations import migrate_050608_bg_to_000000
 from openmarquee.csp_middleware import CSPMiddleware
@@ -99,6 +100,30 @@ def _configure_logging() -> None:
 
 
 _configure_logging()
+
+
+def _boot_card_params(*, url: str, ssid: str | None, ip: str | None) -> dict:
+    """Build the BOOT identity-card params.
+
+    Pure over its args plus the on-disk boot-cycle count (read via
+    ``boot_countdown_hint``): a partially-completed 3×-power-cycle recovery
+    gesture adds the "Restart N× more for Setup Mode" countdown line; a normal
+    boot (count 0) omits it entirely. Extracted from the lifespan so the
+    count-file → ``boot_hint`` plumbing is unit-testable without driving the
+    whole startup. The F1-safe emission (non-reconnecting ``render_system_card``
+    IPC) stays at the call site — this is pure data construction only."""
+    params: dict = {
+        "kind": "BOOT",
+        "address": url,
+        "qr_payload": url,
+        "ssid": ssid,
+        "ip": ip,
+        "ttl_ms": 15000,  # == BOOT_TTL_MS used by the catch-up card below
+    }
+    hint = boot_countdown_hint()
+    if hint:
+        params["boot_hint"] = hint
+    return params
 
 
 @asynccontextmanager
@@ -279,16 +304,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 _boot_ssid = await asyncio.to_thread(active_wlan0_ssid)
             except Exception:  # noqa: BLE001
                 _boot_ssid = None
+            # Recovery A1: _boot_card_params folds in the "Restart N× more for
+            # Setup Mode" countdown when the on-disk power-cycle count says the
+            # operator is mid-gesture (count 1 or 2); a normal boot omits it.
             await asyncio.to_thread(
                 get_renderer().render_system_card,
-                {
-                    "kind": "BOOT",
-                    "address": _boot_url,
-                    "qr_payload": _boot_url,
-                    "ssid": _boot_ssid,
-                    "ip": wlan0_ipv4(),
-                    "ttl_ms": 15000,  # == BOOT_TTL_MS used by the catch-up card below
-                },
+                _boot_card_params(url=_boot_url, ssid=_boot_ssid, ip=wlan0_ipv4()),
             )
         except Exception:  # noqa: BLE001
             log.debug("early boot card emit failed", exc_info=True)
