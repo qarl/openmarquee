@@ -449,6 +449,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 # plus the wlan0 IP as a fallback when `.local` doesn't
                 # resolve. Both are None when not yet connected at
                 # boot-card time — the renderer omits the line gracefully.
+                #
+                # 2026-07-15 (bug fix): show the LIVE associated SSID, not
+                # the persisted submit-time TARGET (supervisor.last_sta_ssid).
+                # That target is written at credential-submit BEFORE the join
+                # is confirmed and is never refreshed from the live link, so
+                # it can name a stale / not-yet-joined network — or even a
+                # connection PROFILE NAME rather than the SSID. active_wlan0_ssid
+                # is a fail-soft nmcli read (None when not connected → the
+                # renderer omits the Wi-Fi line), run off-thread.
+                from openmarquee.network_supervisor import active_wlan0_ssid
+
+                try:
+                    live_ssid = await asyncio.to_thread(active_wlan0_ssid)
+                except Exception:  # noqa: BLE001
+                    live_ssid = None
                 try:
                     await asyncio.to_thread(
                         renderer.render_system_card,
@@ -456,7 +471,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                             "kind": "BOOT",
                             "address": boot_url,
                             "qr_payload": boot_url,
-                            "ssid": supervisor.last_sta_ssid,
+                            "ssid": live_ssid,
                             "ip": wlan0_ipv4(),
                             "ttl_ms": BOOT_TTL_MS,
                         },
