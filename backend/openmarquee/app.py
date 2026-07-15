@@ -253,6 +253,45 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     # cycle. If the renderer falls back to Mock during `_loop`, the
     # in-loop gate catches it and refuses to send READY — same cycle.
     if os.environ.get("OPENMARQUEE_DISABLE_AUTOSTART") != "1":
+        # Bug 1 (2026-07-15): publish the boot identity card BEFORE the
+        # playback loop starts, so the FIRST composited frame carries the
+        # card overlay (opaque, full-screen) instead of a bare playlist
+        # slide. `renderer.__enter__()` above already ran RustRenderer.open()
+        # SYNCHRONOUSLY (the ~18s cold-EGL warm-up happens there, not on the
+        # first advance), so this hits a warm, idle renderer + is a fast
+        # slot-set. And card ops are non-demoting AND non-reconnecting
+        # (RustRenderer.render_system_card passes _allow_reconnect=False), so
+        # even a card-IPC timeout can't respawn the subprocess, burn the
+        # reconnect budget, or indirectly demote to Mock — the 2026-07-01 F1
+        # blank-pipeline scenario stays prevented. That safety (one layer
+        # below) is what let us retire the old _wait_for_renderer_ready gate.
+        # SSID/IP: the STA join starts later (supervisor, below), so
+        # active_wlan0_ssid()/wlan0_ipv4() are usually None here → those
+        # lines are omitted; the card's primary URL + QR shows from frame 1,
+        # Wi-Fi/IP populate on a later (catch-up) card once connected.
+        # FUTURE REFINEMENT (deferred, not this PR): two-phase re-publish to
+        # fill in the SSID once STA joins.
+        try:
+            from openmarquee.network_supervisor import active_wlan0_ssid
+
+            _boot_url = mdns_url()
+            try:
+                _boot_ssid = await asyncio.to_thread(active_wlan0_ssid)
+            except Exception:  # noqa: BLE001
+                _boot_ssid = None
+            await asyncio.to_thread(
+                get_renderer().render_system_card,
+                {
+                    "kind": "BOOT",
+                    "address": _boot_url,
+                    "qr_payload": _boot_url,
+                    "ssid": _boot_ssid,
+                    "ip": wlan0_ipv4(),
+                    "ttl_ms": 15000,  # == BOOT_TTL_MS used by the catch-up card below
+                },
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("early boot card emit failed", exc_info=True)
         try:
             await get_playback_loop().start()
         except Exception:
@@ -357,27 +396,21 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             # skip the onboarding overlay just because it never
             # transitioned through a state-change since boot.
             #
-            # PR3 fix-pass F1(b) (2026-07-01): WAIT for the renderer
-            # to be READY (past EGL cold-start, ~18s worst case)
-            # before firing the BOOT card. Emitting during the
-            # cold window used to timeout the render_system_card
-            # IPC → the AutoFallback demoted the shared primary to
-            # Mock → the whole video pipeline blanked on a fresh
-            # Jason boot. Now we watch the playback loop's
-            # `_ready_sent` flag (which flips only after the FIRST
-            # successful renderer.advance() while NOT in fallback)
-            # AND `renderer.is_in_fallback` so we never issue a card
-            # IPC into a still-warming or already-fallen-back
-            # primary.
-            # boot-identity-card 2026-07-06: 15s deliberate hold (was
-            # 4s) so a passer-by has time to read the URL and scan the
-            # QR. Drives BOTH the renderer's ttl auto-clear AND the
-            # sleep before the catch-up card below, so the card is
-            # genuinely on screen for the full window — not merely a
-            # bumped poll timeout.
+            # Bug 1 (2026-07-15): the BOOT card is published SYNCHRONOUSLY
+            # before the playback loop starts (see the autostart block
+            # above) so it covers the first frame. The old F1(b)
+            # (2026-07-01) _wait_for_renderer_ready gate — which delayed the
+            # card until after the first playlist advance to dodge a
+            # cold-EGL card-IPC timeout demoting the primary to Mock — is
+            # RETIRED: the renderer is warm after __enter__, and card ops
+            # are now non-reconnecting (_allow_reconnect=False), so a
+            # card-IPC timeout can no longer respawn the subprocess or
+            # demote. This task now only emits the catch-up card after the
+            # BOOT card's 15s ttl.
+            # boot-identity-card 2026-07-06: 15s deliberate hold so a
+            # passer-by has time to read the URL + scan the QR — it drives
+            # BOTH the renderer's ttl auto-clear AND the catch-up sleep.
             BOOT_TTL_MS = 15000
-            READY_POLL_INTERVAL_S = 0.25
-            READY_WAIT_TIMEOUT_S = 90.0  # matches systemd TimeoutStartSec
 
             def _params_for_state(st: str) -> dict | None:
                 if st == "SETUP":
@@ -405,83 +438,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 # ONLINE = AP off, no overlay.
                 return None
 
-            async def _wait_for_renderer_ready() -> bool:
-                """Poll the playback loop's ready flag + the
-                renderer's fallback state. Returns True once the
-                real (non-fallback) renderer is confirmed painting;
-                False on timeout OR if the renderer is already in
-                fallback (mock — there is no cold-start to wait
-                for, but there is no point firing a card either)."""
-                loop = get_playback_loop()
+            async def _emit_catch_up_card() -> None:
+                # Bug 1 (2026-07-15): the BOOT card is now published
+                # SYNCHRONOUSLY before the playback loop starts (autostart
+                # block above), so it covers the first composited frame.
+                # This task only handles the CATCH-UP card (PR3 fix-pass
+                # B3): after the BOOT card's 15s ttl auto-clears, emit the
+                # card matching the supervisor's CURRENT state so a cold-
+                # boot device doesn't skip the onboarding overlay. No
+                # wait-for-ready gate — card ops are non-demoting AND
+                # non-reconnecting (_allow_reconnect=False), so firing is
+                # F1-safe regardless of renderer state.
                 renderer = get_renderer()
-                elapsed = 0.0
-                while elapsed < READY_WAIT_TIMEOUT_S:
-                    try:
-                        in_fallback = bool(getattr(renderer, "is_in_fallback", False))
-                    except Exception:  # noqa: BLE001
-                        in_fallback = False
-                    if in_fallback:
-                        return False
-                    if getattr(loop, "_ready_sent", False):
-                        return True
-                    await asyncio.sleep(READY_POLL_INTERVAL_S)
-                    elapsed += READY_POLL_INTERVAL_S
-                return False
-
-            async def _emit_boot_and_current_state_card() -> None:
-                renderer = get_renderer()
-                ready = await _wait_for_renderer_ready()
-                if not ready:
-                    log.info(
-                        "system-card boot task: renderer not ready "
-                        "before timeout; skipping BOOT + catch-up card"
-                    )
-                    return
-                # Renderer is READY — safe to fire the BOOT card
-                # without risking a cold-start timeout demoting the
-                # primary. render_system_card is fail-soft on the
-                # card path per F1; a subprocess blip here just
-                # logs at debug level.
-                boot_url = mdns_url()
-                # boot-card 2026-07-07: also show the connected Wi-Fi SSID
-                # so a viewer knows which network to join to reach the URL
-                # (the mDNS URL only resolves on the sign's own network),
-                # plus the wlan0 IP as a fallback when `.local` doesn't
-                # resolve. Both are None when not yet connected at
-                # boot-card time — the renderer omits the line gracefully.
-                #
-                # 2026-07-15 (bug fix): show the LIVE associated SSID, not
-                # the persisted submit-time TARGET (supervisor.last_sta_ssid).
-                # That target is written at credential-submit BEFORE the join
-                # is confirmed and is never refreshed from the live link, so
-                # it can name a stale / not-yet-joined network — or even a
-                # connection PROFILE NAME rather than the SSID. active_wlan0_ssid
-                # is a fail-soft nmcli read (None when not connected → the
-                # renderer omits the Wi-Fi line), run off-thread.
-                from openmarquee.network_supervisor import active_wlan0_ssid
-
-                try:
-                    live_ssid = await asyncio.to_thread(active_wlan0_ssid)
-                except Exception:  # noqa: BLE001
-                    live_ssid = None
-                try:
-                    await asyncio.to_thread(
-                        renderer.render_system_card,
-                        {
-                            "kind": "BOOT",
-                            "address": boot_url,
-                            "qr_payload": boot_url,
-                            "ssid": live_ssid,
-                            "ip": wlan0_ipv4(),
-                            "ttl_ms": BOOT_TTL_MS,
-                        },
-                    )
-                except Exception:  # noqa: BLE001
-                    log.debug("boot card emit failed", exc_info=True)
-
-                # Wait for BOOT to auto-clear (plus a small buffer)
-                # before pushing the current-state card so BOOT is
-                # visible for its full window.
                 await asyncio.sleep(BOOT_TTL_MS / 1000.0 + 0.1)
                 try:
                     state_str = supervisor.current_state.value
@@ -492,8 +460,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                     log.debug("current-state card emit failed", exc_info=True)
 
             asyncio.create_task(  # noqa: RUF006 — fire-and-forget
-                _emit_boot_and_current_state_card(),
-                name="system-card-boot",
+                _emit_catch_up_card(),
+                name="system-card-catch-up",
             )
             # P1.2-B (2026-06-10): take-over evaluation. Env-gated by
             # OPENMARQUEE_NETWORK_TAKEOVER_ENABLED=1 (default OFF

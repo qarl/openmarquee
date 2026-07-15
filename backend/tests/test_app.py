@@ -81,7 +81,9 @@ def test_boot_card_ssid_sourced_from_live_association_not_target():
 
     src = inspect.getsource(app_mod)
     assert "active_wlan0_ssid" in src, "boot card must read the live SSID"
-    assert '"ssid": live_ssid' in src, "boot card ssid must be the live value"
+    # 2026-07-15 (bug 1): the BOOT card is published early (before the
+    # playback loop) from `_boot_ssid = active_wlan0_ssid()`.
+    assert '"ssid": _boot_ssid' in src, "boot card ssid must be the live value"
     assert '"ssid": supervisor.last_sta_ssid' not in src, (
         "boot card must NOT be fed the persisted target SSID"
     )

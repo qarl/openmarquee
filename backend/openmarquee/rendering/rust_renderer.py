@@ -937,8 +937,22 @@ class RustRenderer:
         the preview endpoint awaits its own `asyncio.to_thread` and
         maps a raised exception to HTTP 502 so QA glass-verifies on
         truthful responses.
+
+        F1 non-demoting invariant (2026-07-15) — pass
+        `_allow_reconnect=False`: a system-card op timeout must raise
+        straight to the caller WITHOUT respawning the shared subprocess
+        or spending the shared 3-in-60s reconnect budget. Only playlist
+        paints (advance / begin_slide / begin_transition) may respawn +
+        count toward demotion. This is what makes it safe to fire the
+        boot card EARLY (before the playlist's first paint, to cover the
+        first frame): a card IPC that times out under cold EGL can no
+        longer respawn the subprocess, burn the budget, and thereby
+        indirectly blank the pipeline on the next playlist advance. Do
+        NOT change this without re-verifying the 2026-07-01 F1 cold-EGL
+        blank-pipeline scenario (test in test_rust_renderer.py +
+        test_dependencies.py::TestCardPathDoesNotDemotePrimary).
         """
-        self._send_op("render_system_card", dict(params))
+        self._send_op("render_system_card", dict(params), _allow_reconnect=False)
 
     def clear_system_card(self) -> None:
         """Op 13 (PR3): clear any active system card + return to
@@ -946,8 +960,13 @@ class RustRenderer:
 
         PR3 fix-pass S1 (2026-07-01): raises subprocess-layer errors
         to callers — same rationale as `render_system_card`.
+
+        F1 non-demoting invariant (2026-07-15): `_allow_reconnect=False`
+        for the same reason as `render_system_card` — a card-clear
+        timeout must not respawn the shared subprocess or spend the
+        reconnect budget. See that method's docstring.
         """
-        self._send_op("clear_system_card", None)
+        self._send_op("clear_system_card", None, _allow_reconnect=False)
 
     # ------------------------------------------------------------------
     # Liveness.
