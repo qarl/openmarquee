@@ -1456,6 +1456,70 @@ def test_r74_timeout_triggers_reconnect_path(make_renderer):
         r.close()
 
 
+def test_card_op_timeout_does_not_reconnect_or_respawn(make_renderer):
+    """F1 GATE (2026-07-15, bug 1): a system-card op timeout MUST NOT
+    trigger the reconnect path — no subprocess respawn, no reconnect-
+    budget spend — because RustRenderer.render_system_card passes
+    _allow_reconnect=False.
+
+    This is the provable "a card IPC timeout can't blank the pipeline"
+    property. It is what makes it safe to fire the boot identity card
+    EARLY (before the first playlist paint, so it covers the first
+    frame): a cold-EGL card timeout can no longer respawn the shared
+    subprocess, burn the shared 3-in-60s reconnect budget, and thereby
+    indirectly demote the next playlist advance to Mock — i.e. the
+    2026-07-01 F1 cold-EGL blank-pipeline scenario stays PREVENTED.
+
+    Contrast `test_r74_timeout_triggers_reconnect_path`: a PLAYLIST op
+    (advance) timeout DOES reconnect. That distinction is the whole
+    point — only playlist paints may respawn / count toward demotion.
+    """
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_WEDGE_ON_OP": "render_system_card"},
+        response_timeout_s=0.2,
+        reconnect_max_retries=3,
+        watchdog_enabled=False,
+    )
+    try:
+        r.open()
+        pid_before = r._proc.pid
+        # The card op wedges → times out. With _allow_reconnect=False it
+        # raises the TIMEOUT directly — NOT a RespawnedError (which would
+        # mean a respawn happened) and NOT a reconnect-exhausted error
+        # (which would mean the shared budget was burned).
+        with pytest.raises(RustRendererTimeoutError):
+            r.render_system_card({"kind": "BOOT", "address": "http://x.local"})
+        # NO respawn: the shared subprocess is the SAME process, so the
+        # reconnect budget is intact for genuine playlist-paint failures.
+        assert r._proc is not None, "card timeout must not kill the subprocess"
+        assert r._proc.pid == pid_before, (
+            "card timeout must NOT respawn the shared subprocess "
+            f"(pid {pid_before} -> {r._proc.pid})"
+        )
+    finally:
+        r.close()
+
+
+def test_clear_card_op_timeout_also_does_not_reconnect(make_renderer):
+    """Companion to the F1 gate: clear_system_card is likewise
+    non-reconnecting (_allow_reconnect=False), so a clear timeout can't
+    respawn the shared subprocess either."""
+    r = make_renderer(
+        env_extra={"FAKE_SIDECAR_WEDGE_ON_OP": "clear_system_card"},
+        response_timeout_s=0.2,
+        reconnect_max_retries=3,
+        watchdog_enabled=False,
+    )
+    try:
+        r.open()
+        pid_before = r._proc.pid
+        with pytest.raises(RustRendererTimeoutError):
+            r.clear_system_card()
+        assert r._proc is not None and r._proc.pid == pid_before
+    finally:
+        r.close()
+
+
 def test_r74_slow_but_within_budget_response_does_NOT_time_out(make_renderer):
     """Pre-r74 the proxy waited forever; r74 must wait long enough.
     A 0.1s response with a 1.0s budget MUST succeed, not falsely
