@@ -614,6 +614,45 @@ async def patch_wifi_station_password(
             ssid=latest.wifi_station_ssid,
             password=latest.wifi_station_password,
         )
+        # QA verify-audit 2026-07-15: the ACTUAL Settings UI provisions the
+        # home-WiFi passphrase via THIS PATCH endpoint, not the inline-password
+        # PUT (api_settings.put). The P0-1 (2026-07-08) state-machine wiring was
+        # added only to PUT — so a first-setup / re-provision through the real
+        # UI applied the nmcli connect but left the supervisor in SETUP: the
+        # AP-teardown + CONNECTING/LINGER confirmation cards never fired on the
+        # first session (self-corrects only on the next reboot). Mirror the PUT
+        # / submit_credentials path: stamp the target SSID, then fire
+        # HAS_STORED_CREDENTIALS (SETUP → CONNECTING; a no-op from ONLINE/
+        # CONNECTING/LINGER). Only when creds are actually present + station
+        # enabled. Fail-soft — a supervisor hiccup must never 500 the PATCH.
+        if (
+            latest.wifi_station_enabled
+            and latest.wifi_station_ssid
+            and latest.wifi_station_password
+        ):
+            try:
+                from openmarquee.dependencies import get_network_supervisor
+                from openmarquee.network_supervisor import SupervisorEvent, SupervisorState
+
+                supervisor = get_network_supervisor()
+                # Advance only from states where fresh provisioning is
+                # meaningful (SETUP → CONNECTING; DEGRADED = a retry). From
+                # ONLINE/CONNECTING/LINGER a re-save must NOT re-trigger
+                # onboarding — the nmcli reconnect + the supervisor's own
+                # observe loop handle those.
+                if supervisor.current_state in (
+                    SupervisorState.SETUP,
+                    SupervisorState.DEGRADED,
+                ):
+                    supervisor.record_target_ssid(latest.wifi_station_ssid)
+                    supervisor.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+            except Exception:
+                log.warning(
+                    "settings: supervisor provisioning-event dispatch failed "
+                    "(PATCH station password); creds applied but SETUP won't "
+                    "advance until next boot",
+                    exc_info=True,
+                )
     return response
 
 
