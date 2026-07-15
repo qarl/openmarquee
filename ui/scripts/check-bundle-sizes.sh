@@ -159,8 +159,16 @@ if [ "$DASHBOARD_BUILT" -eq 1 ]; then
     # threshold bump. 1850 = ~4% headroom above the current gz
     # measurement so a future favicon / apple-touch-icon-size
     # follow-up doesn't have to touch this file again immediately.
+    # dist-dashboard/main.js threshold bumped 73500 -> 76000 on 2026-07-14
+    # for Option D (per-network WiFi password reveal, PR #78). The ~176
+    # lines of reveal UI in src/settings.js (bundled into main.js) pushed
+    # the gz size to 74119 (100.8% of the old 73500). Per the baseline
+    # report's threshold policy ("surface as a finding + update the
+    # threshold with justification, do NOT auto-revert") and qarl's owner
+    # approval of the feature, 76000 = ~2.5% headroom above the new
+    # measurement.
     THRESHOLDS+=(
-        73500
+        76000
         18000
         60600
         3600

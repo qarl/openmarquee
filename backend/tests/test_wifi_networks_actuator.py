@@ -20,6 +20,8 @@ Tests spy on:
 
 from __future__ import annotations
 
+import pytest
+
 from openmarquee import wifi_networks_actuator
 from openmarquee.settings import WifiNetworkEntry
 
@@ -475,3 +477,109 @@ class TestApplyWifiNetworks:
         wifi_networks_actuator.apply_wifi_networks(
             [WifiNetworkEntry(ssid="Foo", password="foopw-1234")]
         )
+
+
+class TestRevealConnectionSecret:
+    """Option D (2026-07-14): reveal a saved profile's PSK via the
+    privileged netctl reveal subcommand. These tests stub the transport
+    (openmarquee.netctl_client.netctl_recv_data) — the socket protocol
+    itself is covered in test_netctl_client.py."""
+
+    def test_strips_trailing_newline_from_psk(self, monkeypatch):
+        # nmcli -g emits the value + a trailing newline; the wrapper
+        # strips ONLY the newline.
+        monkeypatch.setattr(
+            "openmarquee.netctl_client.netctl_recv_data",
+            lambda *a, **k: b"hunter2hunter\n",
+        )
+        assert wifi_networks_actuator.reveal_connection_secret("qarl") == "hunter2hunter"
+
+    def test_empty_data_is_none(self, monkeypatch):
+        # Open / secret-less profile (or the Layer-A never-captured case).
+        monkeypatch.setattr("openmarquee.netctl_client.netctl_recv_data", lambda *a, **k: b"\n")
+        assert wifi_networks_actuator.reveal_connection_secret("open") is None
+
+    def test_preserves_significant_trailing_space(self, monkeypatch):
+        # A WPA2 PSK may legitimately begin/end with spaces (printable
+        # ASCII 0x20-0x7e). Only the transport newline is stripped.
+        monkeypatch.setattr(
+            "openmarquee.netctl_client.netctl_recv_data",
+            lambda *a, **k: b"pw with space \n",
+        )
+        assert wifi_networks_actuator.reveal_connection_secret("x") == "pw with space "
+
+    def test_sends_con_name_payload(self, monkeypatch):
+        captured = {}
+
+        def fake(subcommand, payload, **k):
+            captured["subcommand"] = subcommand
+            captured["payload"] = payload
+            return b"secret-1234\n"
+
+        monkeypatch.setattr("openmarquee.netctl_client.netctl_recv_data", fake)
+        wifi_networks_actuator.reveal_connection_secret("my-conn")
+        assert captured["subcommand"] == "nm-connection-reveal-secret"
+        assert captured["payload"] == b"my-conn\n"
+
+    def test_transport_error_propagates(self, monkeypatch):
+        def boom(*a, **k):
+            raise wifi_networks_actuator.RevealSecretError("no such connection")
+
+        monkeypatch.setattr("openmarquee.netctl_client.netctl_recv_data", boom)
+        with pytest.raises(wifi_networks_actuator.RevealSecretError):
+            wifi_networks_actuator.reveal_connection_secret("nope")
+
+    def test_rejects_invalid_con_name_before_transport(self, monkeypatch):
+        # Defence-in-depth guard: empty / newline-bearing / leading-dash
+        # names are rejected BEFORE the netctl call (a leading '-' could
+        # be parsed by nmcli as an option to `connection show`).
+        called = {"n": 0}
+
+        def fake(*a, **k):
+            called["n"] += 1
+            return b"x\n"
+
+        monkeypatch.setattr("openmarquee.netctl_client.netctl_recv_data", fake)
+        for bad in ("", "-active", "--help", "has\nnewline"):
+            with pytest.raises(wifi_networks_actuator.RevealSecretError):
+                wifi_networks_actuator.reveal_connection_secret(bad)
+        # The guard short-circuits before the transport is ever invoked.
+        assert called["n"] == 0
+
+    def test_for_ssid_resolves_con_name_from_nm_enumerate(self, monkeypatch):
+        # ssid -> con_name comes from NetworkManager's OWN enumerate, never
+        # from caller input. Here ssid "qarl" maps to the profile named
+        # "openmarquee-mgmt-wifi" — the name handed to the privileged
+        # reveal, not the ssid.
+        monkeypatch.setattr(
+            "openmarquee.wifi_networks_actuator._list_nm_wifi_connections",
+            lambda: (
+                True,
+                [{"name": "openmarquee-mgmt-wifi", "ssid": "qarl", "iface": "wlan0"}],
+            ),
+        )
+        captured = {}
+
+        def fake(subcommand, payload, **k):
+            captured["payload"] = payload
+            return b"psk-1234\n"
+
+        monkeypatch.setattr("openmarquee.netctl_client.netctl_recv_data", fake)
+        assert wifi_networks_actuator.reveal_secret_for_ssid("qarl") == "psk-1234"
+        assert captured["payload"] == b"openmarquee-mgmt-wifi\n"
+
+    def test_for_ssid_raises_when_no_profile_matches(self, monkeypatch):
+        monkeypatch.setattr(
+            "openmarquee.wifi_networks_actuator._list_nm_wifi_connections",
+            lambda: (True, [{"name": "openmarquee-other", "ssid": "not-qarl"}]),
+        )
+        with pytest.raises(wifi_networks_actuator.RevealSecretError):
+            wifi_networks_actuator.reveal_secret_for_ssid("qarl")
+
+    def test_for_ssid_raises_when_nm_probe_fails(self, monkeypatch):
+        monkeypatch.setattr(
+            "openmarquee.wifi_networks_actuator._list_nm_wifi_connections",
+            lambda: (False, []),
+        )
+        with pytest.raises(wifi_networks_actuator.RevealSecretError):
+            wifi_networks_actuator.reveal_secret_for_ssid("qarl")

@@ -1068,6 +1068,184 @@ describe("mountSettings", () => {
             expect(passwords[2]).toBe("no password");
         });
 
+        // --- Layer 3 (Option D, 2026-07-14): per-network PSK reveal ---
+
+        async function mountOneNetwork(fetchImpl) {
+            const container = document.createElement("div");
+            const fetchSpy = vi
+                .spyOn(globalThis, "fetch")
+                .mockImplementation(fetchImpl);
+            mount(container, {
+                fetchSettings: async () => ({
+                    ...SAMPLE,
+                    wifi_networks: [
+                        {
+                            ssid: "qarl",
+                            password: "<set>",
+                            autoconnect: true,
+                            priority: 0,
+                        },
+                    ],
+                }),
+                onSave: vi.fn(),
+            });
+            await tick();
+            const row = container.querySelector(".field-wifi-networks-item");
+            return { container, row, fetchSpy };
+        }
+
+        function doReveal(row, password) {
+            row.querySelector(".field-wifi-networks-item-reveal").click();
+            row.querySelector(".field-wifi-networks-item-reveal-pw").value = password;
+            row.querySelector(".field-wifi-networks-item-reveal-submit").click();
+        }
+
+        it("renders a Show-password button per saved network", async () => {
+            const { row, fetchSpy } = await mountOneNetwork(async () => ({
+                ok: true,
+                json: async () => ({}),
+            }));
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal"),
+            ).not.toBeNull();
+            fetchSpy.mockRestore();
+        });
+
+        it("Show → re-auth → POSTs the reveal endpoint and shows the PSK", async () => {
+            let captured;
+            const { row, fetchSpy } = await mountOneNetwork(async (url, opts) => {
+                captured = { url, opts };
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({
+                        ssid: "qarl",
+                        stored: true,
+                        password: "s3cr3t-psk",
+                    }),
+                };
+            });
+            doReveal(row, "hunter2hunter");
+            await tick();
+            // Re-auth POST to the per-network reveal endpoint.
+            expect(String(captured.url)).toContain(
+                "/api/settings/network/qarl/reveal-password",
+            );
+            expect(captured.opts.method).toBe("POST");
+            expect(JSON.parse(captured.opts.body).current_password).toBe(
+                "hunter2hunter",
+            );
+            // The PSK is displayed inline.
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal-value")
+                    .textContent,
+            ).toBe("s3cr3t-psk");
+            fetchSpy.mockRestore();
+        });
+
+        it("wrong password surfaces inline (401); no PSK shown", async () => {
+            const { row, fetchSpy } = await mountOneNetwork(async () => ({
+                ok: false,
+                status: 401,
+                json: async () => ({}),
+            }));
+            doReveal(row, "wrong-pw");
+            await tick();
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal-error")
+                    .textContent,
+            ).toMatch(/wrong password/i);
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal-value"),
+            ).toBeNull();
+            fetchSpy.mockRestore();
+        });
+
+        it("stored=false shows 'not stored on-device', not a password", async () => {
+            const { row, fetchSpy } = await mountOneNetwork(async () => ({
+                ok: true,
+                status: 200,
+                json: async () => ({ ssid: "qarl", stored: false, password: null }),
+            }));
+            doReveal(row, "hunter2hunter");
+            await tick();
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal-notstored")
+                    .textContent,
+            ).toMatch(/not stored on-device/i);
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal-value"),
+            ).toBeNull();
+            fetchSpy.mockRestore();
+        });
+
+        it("Cancel returns to idle without revealing", async () => {
+            const { row, fetchSpy } = await mountOneNetwork(async () => ({
+                ok: true,
+                json: async () => ({}),
+            }));
+            const btn = row.querySelector(".field-wifi-networks-item-reveal");
+            btn.click();
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal-pw"),
+            ).not.toBeNull();
+            row.querySelector(".field-wifi-networks-item-reveal-cancel").click();
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal-pw"),
+            ).toBeNull();
+            expect(btn.hidden).toBe(false);
+            fetchSpy.mockRestore();
+        });
+
+        it("Hide clears a revealed PSK from the DOM", async () => {
+            const { row, fetchSpy } = await mountOneNetwork(async () => ({
+                ok: true,
+                status: 200,
+                json: async () => ({ ssid: "qarl", stored: true, password: "s3cr3t" }),
+            }));
+            doReveal(row, "hunter2hunter");
+            await tick();
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal-value"),
+            ).not.toBeNull();
+            row.querySelector(".field-wifi-networks-item-reveal-hide").click();
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal-value"),
+            ).toBeNull();
+            expect(
+                row.querySelector(".field-wifi-networks-item-reveal").hidden,
+            ).toBe(false);
+            fetchSpy.mockRestore();
+        });
+
+        it("Copy writes the revealed PSK to the clipboard", async () => {
+            const writeText = vi.fn().mockResolvedValue(undefined);
+            const orig = navigator.clipboard;
+            Object.defineProperty(navigator, "clipboard", {
+                value: { writeText },
+                configurable: true,
+            });
+            const { row, fetchSpy } = await mountOneNetwork(async () => ({
+                ok: true,
+                status: 200,
+                json: async () => ({
+                    ssid: "qarl",
+                    stored: true,
+                    password: "copy-me-psk",
+                }),
+            }));
+            doReveal(row, "hunter2hunter");
+            await tick();
+            row.querySelector(".field-wifi-networks-item-reveal-copy").click();
+            await tick();
+            expect(writeText).toHaveBeenCalledWith("copy-me-psk");
+            Object.defineProperty(navigator, "clipboard", {
+                value: orig,
+                configurable: true,
+            });
+            fetchSpy.mockRestore();
+        });
+
         it("emits an empty-state hint when no networks are saved", async () => {
             const container = document.createElement("div");
             mount(container, {

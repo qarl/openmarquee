@@ -278,6 +278,27 @@ case "$cmd" in
         [ -n "$con_name" ] || { echo "missing con_name" >&2; exit 2; }
         nmcli connection delete "$con_name"
         ;;
+    nm-connection-reveal-secret)
+        # 2026-07-14 (Option D — WiFi password reveal): print a saved
+        # wifi profile's plaintext PSK to STDOUT. Payload (stdin): one
+        # line, the NM connection name. Runs `nmcli -s -g` (secret
+        # reveal) AS ROOT — the backend (NoNewPrivileges) cannot reveal
+        # NM secrets itself; this is the sanctioned crossing.
+        #
+        # This is the ONLY read-only, data-RETURNING subcommand. `-g`
+        # emits the bare field value (no "field: " prefix); an open
+        # network (no PSK) yields an empty line; a non-existent profile
+        # makes nmcli exit non-zero -> the daemon reports ERR. The
+        # daemon forwards this subcommand's STDOUT to the caller (see
+        # DATA_SUBCOMMANDS there); every other subcommand stays OK/ERR
+        # only, so a chatty helper can never leak stdout. Exposure of
+        # the PSK is gated behind operator RE-AUTH in the API layer +
+        # is qarl's explicit 2026-07-14 owner decision.
+        [ $# -eq 1 ] || usage
+        IFS=$'\n' read -r con_name || true
+        [ -n "$con_name" ] || { echo "missing con_name" >&2; exit 2; }
+        nmcli -s -g 802-11-wireless-security.psk connection show "$con_name"
+        ;;
     hostnamectl-set-hostname)
         # Payload (stdin): one line, the new hostname.
         # The backend has already normalised to DNS-safe chars via

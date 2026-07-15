@@ -83,6 +83,14 @@ LoopDep = Annotated[PlaybackLoop, Depends(get_playback_loop)]
 
 log = logging.getLogger(__name__)
 
+# 2026-07-14 (Option D): a dedicated audit logger for security-sensitive
+# operator actions (currently: WiFi-password reveals). Distinct logger
+# name so it's filterable; routes to journald on the device, giving the
+# operator a "when did I reveal that" retrospection trail. It records the
+# ACTION + SSID + OUTCOME only — NEVER a secret VALUE (auditing the PSK
+# would defeat the containment the reveal flow is meant to preserve).
+_audit_log = logging.getLogger("openmarquee.audit")
+
 
 def _scrubbed_error_summary(exc: Exception) -> str:
     """Return a log-safe summary of a validation exception that does NOT
@@ -621,3 +629,96 @@ async def patch_tailscale_auth_key(
     await _verify_current_password(auth, authorization, payload.current_password)
     new_value = payload.new_value or None
     return _patch_secret_field(storage, "tailscale_auth_key", new_value)
+
+
+# ---------------------------------------------------------------------------
+# Option D (2026-07-14, qarl's owner decision): reveal a saved WiFi
+# network's plaintext PSK, per-network + on-demand. Re-auth-gated on EVERY
+# call (fresh bearer + current password; nothing cached). The action is
+# audit-logged (action + SSID + outcome only, NEVER the PSK). The read
+# crosses the root netctl daemon (the backend is NoNewPrivileges).
+# ---------------------------------------------------------------------------
+
+
+class _RevealPasswordRequest(BaseModel):
+    current_password: str
+
+
+def _audit_reveal(ssid: str, outcome: str) -> None:
+    """Emit one audit line for a WiFi-password reveal attempt. Records the
+    SSID (not a secret — it's the visible network name) + the outcome
+    (revealed / not-stored / denied-unknown-ssid / error). NEVER logs the
+    PSK value."""
+    _audit_log.info("AUDIT wifi-reveal-password ssid=%r outcome=%s", ssid, outcome)
+
+
+@router.post("/network/{ssid}/reveal-password")
+async def reveal_network_password(
+    ssid: str,
+    payload: _RevealPasswordRequest,
+    storage: SettingsDep,
+    auth: AuthDep,
+    authorization: Annotated[str | None, Header()] = None,
+) -> dict[str, Any]:
+    """Reveal the plaintext PSK for ONE saved WiFi network.
+
+    Re-auth-gated on EVERY call (verifies the bearer token AND the
+    operator's current login password; nothing is session-cached — each
+    reveal is a fresh re-auth). The SSID must be one of the operator's
+    own saved networks; this both authorises the call and serves as the
+    known-profile-set check (the SSID is never used to steer nmcli
+    directly — the connection name is resolved from NetworkManager's own
+    enumerate). Every attempt is audit-logged (action + SSID + outcome,
+    never the PSK).
+
+    Returns ``{ssid, stored, password}``:
+      * stored=true, password=<psk> — the device has the PSK.
+      * stored=false, password=null — the profile exists but the device
+        never captured a secret (the Layer-A ``<hidden>`` case) or it's
+        an open network. The UI shows a "not stored on-device" state,
+        distinct from "hidden".
+    """
+    # Audit a failed re-auth too — a secret-reveal endpoint is exactly
+    # where a brute-force attempt should leave a trail. The attacker-
+    # supplied ssid is not a secret; the outcome is 'denied-auth'.
+    try:
+        await _verify_current_password(auth, authorization, payload.current_password)
+    except HTTPException:
+        _audit_reveal(ssid, "denied-auth")
+        raise
+    settings = storage.load()
+    if not any(n.ssid == ssid for n in settings.wifi_networks):
+        _audit_reveal(ssid, "denied-unknown-ssid")
+        raise HTTPException(status_code=404, detail="no such saved network")
+    # Import lazily (matches the actuator's netctl-call pattern) + run the
+    # blocking socket round-trip off the event loop.
+    from openmarquee.wifi_networks_actuator import (
+        RevealSecretError,
+        reveal_secret_for_ssid,
+    )
+
+    try:
+        psk = await asyncio.to_thread(reveal_secret_for_ssid, ssid)
+    except RevealSecretError:
+        # The typed error carries only nmcli transport text (never the
+        # PSK); don't propagate its message to the client.
+        _audit_reveal(ssid, "error")
+        raise HTTPException(
+            status_code=502,
+            detail="could not read the secret from NetworkManager",
+        ) from None
+    except Exception:
+        # Fail CLOSED for any unexpected error on the reveal path: audit +
+        # a clean 502 rather than a raw 500. No PSK is present on an
+        # exception path, so this can't leak — it just keeps the audit
+        # trail complete and the response generic.
+        _audit_reveal(ssid, "error")
+        raise HTTPException(
+            status_code=502,
+            detail="could not read the secret from NetworkManager",
+        ) from None
+    if psk is None:
+        _audit_reveal(ssid, "not-stored")
+        return {"ssid": ssid, "stored": False, "password": None}
+    _audit_reveal(ssid, "revealed")
+    return {"ssid": ssid, "stored": True, "password": psk}
