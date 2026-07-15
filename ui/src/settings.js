@@ -1217,7 +1217,182 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     // PSK. New entries carry the operator-typed plaintext.
     const wifiNetworks = [];
 
+    // Layer 3 (Option D, 2026-07-14, qarl's owner decision): per-network
+    // on-demand PSK reveal. The reveal reads NetworkManager (which holds
+    // the PSK) via the re-auth-gated POST endpoint, so it's offered for
+    // EVERY saved network regardless of the masked indicator (which
+    // reflects settings.json, not NM — an imported Layer-A network shows
+    // "no password" there yet may still have a PSK in NM). Per-row state:
+    // idle -> re-auth prompt -> shown (PSK + copy) OR not-stored OR
+    // error, then back to idle. The reveal is transient; auto-hides so a
+    // PSK doesn't linger on screen, and a list re-render resets it.
+    const REVEAL_AUTO_HIDE_MS = 30_000;
+    // Track pending auto-hide timers across ALL rows so a list re-render
+    // (which detaches rows) can cancel them — otherwise a detached row's
+    // timer would keep its (revealed-PSK) subtree alive in memory until
+    // it fired. renderWifiNetworksList clears these on every rebuild.
+    const revealHideTimers = new Set();
+    function wireNetworkReveal(entry, revealBtn, revealArea, pwEl) {
+        let hideTimer = null;
+        function toIdle() {
+            if (hideTimer) {
+                clearTimeout(hideTimer);
+                revealHideTimers.delete(hideTimer);
+                hideTimer = null;
+            }
+            revealArea.hidden = true;
+            revealArea.innerHTML = "";
+            revealBtn.hidden = false;
+            pwEl.hidden = false;
+        }
+        function showNotStored() {
+            revealArea.innerHTML = "";
+            const msg = document.createElement("div");
+            msg.className = "field-wifi-networks-item-reveal-notstored";
+            msg.style.cssText =
+                "display:flex; gap:8px; align-items:center; margin-top:6px; "
+                + "font-size:12px; color: var(--om-text-dim);";
+            const text = document.createElement("span");
+            text.textContent = "Password not stored on-device.";
+            text.title =
+                "The sign has this network saved but never captured its "
+                + "password, so it can't be shown here.";
+            const okBtn = document.createElement("button");
+            okBtn.type = "button";
+            okBtn.className = "om-btn sm field-wifi-networks-item-reveal-close";
+            okBtn.textContent = "OK";
+            okBtn.addEventListener("click", toIdle);
+            msg.append(text, okBtn);
+            revealArea.appendChild(msg);
+        }
+        function showRevealed(psk) {
+            revealArea.innerHTML = "";
+            const shown = document.createElement("div");
+            shown.className = "field-wifi-networks-item-reveal-shown";
+            shown.style.cssText =
+                "display:flex; gap:8px; align-items:center; flex-wrap:wrap; "
+                + "margin-top:6px;";
+            const pskEl = document.createElement("span");
+            pskEl.className = "field-wifi-networks-item-reveal-value";
+            pskEl.style.cssText =
+                "font-family: var(--om-mono); font-size:13px; word-break:break-all;";
+            pskEl.textContent = psk;
+            const copyBtn = document.createElement("button");
+            copyBtn.type = "button";
+            copyBtn.className = "om-btn sm field-wifi-networks-item-reveal-copy";
+            copyBtn.textContent = "Copy";
+            copyBtn.addEventListener("click", async () => {
+                try {
+                    if (!navigator.clipboard?.writeText) {
+                        copyBtn.textContent = "Copy unavailable";
+                        return;
+                    }
+                    await navigator.clipboard.writeText(psk);
+                    copyBtn.textContent = "Copied";
+                } catch {
+                    copyBtn.textContent = "Copy failed";
+                }
+            });
+            const hideBtn = document.createElement("button");
+            hideBtn.type = "button";
+            hideBtn.className = "om-btn sm field-wifi-networks-item-reveal-hide";
+            hideBtn.textContent = "Hide";
+            hideBtn.addEventListener("click", toIdle);
+            shown.append(pskEl, copyBtn, hideBtn);
+            revealArea.appendChild(shown);
+            // Auto-hide so a revealed PSK doesn't linger on-screen. Track
+            // the timer so a list re-render can cancel it (toIdle keeps the
+            // registry in sync when it fires or is called manually).
+            hideTimer = setTimeout(toIdle, REVEAL_AUTO_HIDE_MS);
+            revealHideTimers.add(hideTimer);
+        }
+        function showPrompt() {
+            revealBtn.hidden = true;
+            pwEl.hidden = true;
+            revealArea.hidden = false;
+            revealArea.innerHTML = "";
+            const promptEl = document.createElement("div");
+            promptEl.className = "field-wifi-networks-item-reveal-form";
+            promptEl.style.cssText =
+                "display:flex; gap:6px; align-items:center; flex-wrap:wrap; "
+                + "margin-top:6px;";
+            const pwInput = document.createElement("input");
+            pwInput.type = "password";
+            pwInput.className = "om-input field-wifi-networks-item-reveal-pw";
+            pwInput.placeholder = "Current login password";
+            pwInput.autocomplete = "current-password";
+            pwInput.style.cssText = "flex:1; min-width:160px;";
+            const submitBtn = document.createElement("button");
+            submitBtn.type = "button";
+            submitBtn.className =
+                "om-btn primary sm field-wifi-networks-item-reveal-submit";
+            submitBtn.textContent = "Reveal";
+            const cancelBtn = document.createElement("button");
+            cancelBtn.type = "button";
+            cancelBtn.className = "om-btn sm field-wifi-networks-item-reveal-cancel";
+            cancelBtn.textContent = "Cancel";
+            const errEl = document.createElement("span");
+            errEl.className = "field-wifi-networks-item-reveal-error";
+            errEl.setAttribute("role", "alert");
+            errEl.setAttribute("aria-live", "polite");
+            errEl.style.cssText = "color:#ff6b6b; font-size:12px; width:100%;";
+            promptEl.append(pwInput, submitBtn, cancelBtn, errEl);
+            revealArea.appendChild(promptEl);
+            pwInput.focus();
+            cancelBtn.addEventListener("click", toIdle);
+            submitBtn.addEventListener("click", async () => {
+                errEl.textContent = "";
+                submitBtn.disabled = true;
+                try {
+                    const response = await apiFetch(
+                        `/api/settings/network/${encodeURIComponent(entry.ssid)}`
+                            + "/reveal-password",
+                        {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                current_password: pwInput.value,
+                            }),
+                            // 401 here = wrong LOGIN password (a re-auth
+                            // signal), not a stale bearer -> surface inline
+                            // rather than redirecting to /login.html.
+                            skipAuth401Redirect: true,
+                        },
+                    );
+                    if (response.status === 401) {
+                        errEl.textContent = "Wrong password.";
+                        submitBtn.disabled = false;
+                        return;
+                    }
+                    if (!response.ok) {
+                        errEl.textContent =
+                            "Couldn't read the password from the sign.";
+                        submitBtn.disabled = false;
+                        return;
+                    }
+                    const data = await response.json();
+                    if (data && data.stored) {
+                        showRevealed(String(data.password ?? ""));
+                    } else {
+                        showNotStored();
+                    }
+                } catch (err) {
+                    // apiFetch throws + redirects on a real 401 (stale
+                    // bearer); otherwise surface the message inline.
+                    errEl.textContent = err?.message || "Network error.";
+                    submitBtn.disabled = false;
+                }
+            });
+        }
+        revealBtn.addEventListener("click", showPrompt);
+    }
+
     function renderWifiNetworksList() {
+        // Cancel any pending reveal auto-hide timers from rows we're about
+        // to detach — otherwise a detached row's timer keeps its (possibly
+        // revealed-PSK) subtree alive in memory until it fires.
+        for (const t of revealHideTimers) clearTimeout(t);
+        revealHideTimers.clear();
         // Rebuild the whole <ul> — the list is small (typically ≤5
         // entries on a device) so full re-render is simpler than
         // diffing.
@@ -1232,9 +1407,12 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             li.className = "field-wifi-networks-item";
             li.dataset.index = String(index);
             li.style.cssText =
-                "display: flex; gap: 10px; align-items: center; "
+                "display: flex; flex-direction: column; align-items: stretch; "
                 + "padding: 8px 10px; border-radius: 6px; "
                 + "background: var(--om-card-bg-2);";
+            const rowEl = document.createElement("div");
+            rowEl.className = "field-wifi-networks-item-row";
+            rowEl.style.cssText = "display: flex; gap: 10px; align-items: center;";
             const ssidEl = document.createElement("span");
             ssidEl.className = "field-wifi-networks-item-ssid";
             ssidEl.style.cssText =
@@ -1245,6 +1423,11 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             pwEl.style.cssText =
                 "font-family: var(--om-mono); font-size: 12px; color: var(--om-text-dim);";
             pwEl.textContent = entry.password ? "password: <set>" : "no password";
+            // Layer 3 (Option D): per-network on-demand PSK reveal.
+            const revealBtn = document.createElement("button");
+            revealBtn.type = "button";
+            revealBtn.className = "om-btn sm field-wifi-networks-item-reveal";
+            revealBtn.textContent = "Show password";
             const removeBtn = document.createElement("button");
             removeBtn.type = "button";
             removeBtn.className = "om-btn sm field-wifi-networks-item-remove";
@@ -1256,9 +1439,12 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                 // trigger attachAutoSave listens for.
                 form.dispatchEvent(new Event("input", { bubbles: true }));
             });
-            li.appendChild(ssidEl);
-            li.appendChild(pwEl);
-            li.appendChild(removeBtn);
+            rowEl.append(ssidEl, pwEl, revealBtn, removeBtn);
+            const revealArea = document.createElement("div");
+            revealArea.className = "field-wifi-networks-item-reveal-area";
+            revealArea.hidden = true;
+            li.append(rowEl, revealArea);
+            wireNetworkReveal(entry, revealBtn, revealArea, pwEl);
             wifiNetworksListEl.appendChild(li);
         });
     }
