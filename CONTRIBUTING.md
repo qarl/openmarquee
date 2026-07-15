@@ -6,6 +6,12 @@ openMarquee is GPLv3 and welcomes contributions. These rules apply equally to ma
 
 openMarquee is a self-contained, offline-capable, no-subscription, no-database, phone-first display controller. Contributions that pull against those constraints (cloud sync, account systems, mandatory internet access, heavyweight runtime dependencies) will be rejected on principle. See [`../DESIGN_BRIEF.md`](../DESIGN_BRIEF.md) and [`../SYSTEM_SPEC.md`](../SYSTEM_SPEC.md) for the full picture — they live in the workspace repo, one directory up from the code.
 
+## Design invariants (structural "do not"s)
+
+Settled decisions enforced structurally in the code. Don't reopen them in a PR without checking with a maintainer first.
+
+- **One brand mark.** openMarquee has exactly ONE brand mark — the dot-matrix wordmark artwork (`mark.png`, accent `#ffb43c`). There is NO "oM" square. Do NOT reintroduce a `CardShape::Monogram`, an oM-tile, or any square-tile-with-oM-glyph on the system cards. The `Monogram` variant + its paint function were **deleted** 2026-07-15 (after the oM square kept recurring) precisely so it can't come back through a re-added emission — the type no longer exists, and Rust's exhaustiveness check enforces it. All cards use `CardShape::Image` → `mark.png`. If you find yourself building something like an oM square, stop and ask.
+
 ## Before you start
 
 For anything non-trivial, open an issue first and we'll talk through the design. Saves you from writing code we can't merge.

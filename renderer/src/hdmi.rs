@@ -18176,7 +18176,7 @@ impl ObjectProps {
 // PR3 (2026-06-27) onboarding system-card MVP paint.
 //
 // Per QA call (b): BG color-fill + text rendering via the existing
-// MSDF stack. Monogram/chip/QR/spinner primitives ship in PR3.1.
+// MSDF stack. Mark-image/chip/QR/spinner primitives ship in PR3.1.
 //
 // The supervisor sends RenderSystemCard which sets
 // state.active_system_card. On each frame, paint_and_present_*
@@ -18213,7 +18213,7 @@ const SYSTEM_CARD_MAX_LIFETIME_S: u64 = 60 * 60;
 ///
 /// PR3 MVP scope: paints Background (glClear) + Text (synthetic
 /// TextLayer through the existing MSDF stack) + QR panel
-/// (scissored glClear-per-module). Monogram / Chip / Spinner /
+/// (scissored glClear-per-module). Image / Chip / Spinner /
 /// Footer / BootHint remain on the skip arm — PR3.1 fidelity.
 pub fn maybe_paint_system_card_overlay(
     state: &mut crate::playback::PlaybackState,
@@ -18343,9 +18343,6 @@ pub fn maybe_paint_system_card_overlay(
                 )?;
             }
             // PR3.1 fidelity primitives.
-            CardShape::Monogram { top_left, tile_size } => {
-                paint_system_card_monogram(gl, mode_w, mode_h, *top_left, *tile_size)?;
-            }
             CardShape::Chip {
                 top_right,
                 label,
@@ -18717,7 +18714,7 @@ fn paint_system_card_qr_panel(
 /// PR3.1 (2026-07-01) — utility: paint a solid-color axis-aligned
 /// rectangle in normalized card-space (0..1). Wraps the scissored-
 /// glClear idiom in one helper so every rect-drawing primitive
-/// (monogram tile, chip pill, footer bar backing) shares the same
+/// (chip pill, footer bar backing) shares the same
 /// coordinate conversion.
 fn paint_system_card_rect(
     gl: &glow::Context,
@@ -18747,59 +18744,6 @@ fn paint_system_card_rect(
         gl.clear(glow::COLOR_BUFFER_BIT);
         gl.disable(glow::SCISSOR_TEST);
     }
-}
-
-/// PR3.1 (2026-07-01) — monogram lockup: solid amber tile with
-/// centered "oM" text + "openMarquee" word to the right of the tile.
-fn paint_system_card_monogram(
-    gl: &glow::Context,
-    mode_w: u32,
-    mode_h: u32,
-    top_left: (f32, f32),
-    tile_size: f32,
-) -> Result<()> {
-    // Amber tile with the "oM" glyphs inside. Corner rounding is
-    // sharp (a rounded-rect shader is out of scope for PR3.1; the
-    // full-fidelity paint layer stays close enough to the mockup
-    // for the sign-across-a-room read).
-    paint_system_card_rect(
-        gl,
-        mode_w,
-        mode_h,
-        top_left.0,
-        top_left.1,
-        tile_size,
-        tile_size,
-        crate::system_card::ACCENT,
-    );
-    // "oM" glyphs, dark accent-ink color, sized to fit the tile.
-    // Vertically nudged so the cap-height sits visually centered.
-    paint_system_card_text(
-        gl,
-        mode_w,
-        mode_h,
-        (top_left.0 + tile_size * 0.15, top_left.1 + tile_size * 0.20),
-        tile_size * 0.60,
-        crate::system_card::ACCENT_INK,
-        crate::system_card::DisplayFont::Headline,
-        crate::system_card::Align::Left,
-        "oM",
-    )?;
-    // Word mark to the right of the tile, cap-height matched to
-    // the tile height for the mockup's balanced lockup.
-    let word_x = top_left.0 + tile_size + 0.013;
-    paint_system_card_text(
-        gl,
-        mode_w,
-        mode_h,
-        (word_x, top_left.1 + tile_size * 0.20),
-        tile_size * 0.55,
-        crate::system_card::TEXT,
-        crate::system_card::DisplayFont::Headline,
-        crate::system_card::Align::Left,
-        "openMarquee",
-    )?;
-    Ok(())
 }
 
 /// PR3.1 (2026-07-01) — state chip: solid-fill amber/green/red
@@ -18850,7 +18794,7 @@ fn paint_system_card_chip(
 /// Dots are drawn as square scissored glClears (the visual size is
 /// small enough that the difference from a proper circle is not
 /// perceptible at panel resolution — same rationale as the sharp-
-/// cornered monogram tile).
+/// cornered chip pill).
 fn paint_system_card_spinner(
     gl: &glow::Context,
     mode_w: u32,
