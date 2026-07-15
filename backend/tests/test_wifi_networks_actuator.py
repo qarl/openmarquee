@@ -545,3 +545,41 @@ class TestRevealConnectionSecret:
                 wifi_networks_actuator.reveal_connection_secret(bad)
         # The guard short-circuits before the transport is ever invoked.
         assert called["n"] == 0
+
+    def test_for_ssid_resolves_con_name_from_nm_enumerate(self, monkeypatch):
+        # ssid -> con_name comes from NetworkManager's OWN enumerate, never
+        # from caller input. Here ssid "qarl" maps to the profile named
+        # "openmarquee-mgmt-wifi" — the name handed to the privileged
+        # reveal, not the ssid.
+        monkeypatch.setattr(
+            "openmarquee.wifi_networks_actuator._list_nm_wifi_connections",
+            lambda: (
+                True,
+                [{"name": "openmarquee-mgmt-wifi", "ssid": "qarl", "iface": "wlan0"}],
+            ),
+        )
+        captured = {}
+
+        def fake(subcommand, payload, **k):
+            captured["payload"] = payload
+            return b"psk-1234\n"
+
+        monkeypatch.setattr("openmarquee.netctl_client.netctl_recv_data", fake)
+        assert wifi_networks_actuator.reveal_secret_for_ssid("qarl") == "psk-1234"
+        assert captured["payload"] == b"openmarquee-mgmt-wifi\n"
+
+    def test_for_ssid_raises_when_no_profile_matches(self, monkeypatch):
+        monkeypatch.setattr(
+            "openmarquee.wifi_networks_actuator._list_nm_wifi_connections",
+            lambda: (True, [{"name": "openmarquee-other", "ssid": "not-qarl"}]),
+        )
+        with pytest.raises(wifi_networks_actuator.RevealSecretError):
+            wifi_networks_actuator.reveal_secret_for_ssid("qarl")
+
+    def test_for_ssid_raises_when_nm_probe_fails(self, monkeypatch):
+        monkeypatch.setattr(
+            "openmarquee.wifi_networks_actuator._list_nm_wifi_connections",
+            lambda: (False, []),
+        )
+        with pytest.raises(wifi_networks_actuator.RevealSecretError):
+            wifi_networks_actuator.reveal_secret_for_ssid("qarl")

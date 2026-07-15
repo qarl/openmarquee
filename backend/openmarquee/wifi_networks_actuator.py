@@ -584,6 +584,29 @@ def reveal_connection_secret(con_name: str) -> str | None:
     return text or None
 
 
+def reveal_secret_for_ssid(ssid: str) -> str | None:
+    """Resolve a saved SSID to its NetworkManager connection name and
+    reveal the PSK via the privileged netctl path (Option D layer 2).
+
+    Returns the PSK, or None when the matching profile has no stored
+    secret (an open network, or the Layer-A never-captured case). Raises
+    RevealSecretError when the NM enumerate probe fails, no NM wifi
+    profile matches the SSID, or the netctl read fails.
+
+    The connection name handed to the privileged reveal is taken from
+    NetworkManager's OWN enumerate output (matched by SSID) — NEVER from
+    caller input — so a caller can't steer the privileged nmcli call at a
+    connection id of their choosing. The API layer separately authorises
+    the SSID against the operator's saved-network set before calling."""
+    probe_ok, existing = _list_nm_wifi_connections()
+    if not probe_ok:
+        raise RevealSecretError("NetworkManager enumerate probe failed")
+    match = next((row for row in existing if row.get("ssid") == ssid), None)
+    if match is None or not match.get("name"):
+        raise RevealSecretError("no NetworkManager profile matches the ssid")
+    return reveal_connection_secret(match["name"])
+
+
 def apply_in_background(
     networks: list[WifiNetworkEntry],
     *,

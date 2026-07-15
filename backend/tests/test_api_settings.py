@@ -1,5 +1,6 @@
 """API surface tests for /api/settings."""
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -960,3 +961,176 @@ def test_put_wifi_station_creds_do_not_disturb_online_sign(client: TestClient, m
     assert resp.status_code == 200
     assert fake.recorded_ssid == "<unset>"
     assert fake.events == []
+
+
+# ---------------------------------------------------------------------------
+# Option D (2026-07-14): POST /api/settings/network/{ssid}/reveal-password
+# — re-auth-gated per-network PSK reveal + audit log (action + ssid + outcome,
+# never the PSK). reveal_secret_for_ssid (the netctl path) is stubbed; the
+# transport itself is covered in test_netctl_client.py / test_netctl_daemon.py.
+# ---------------------------------------------------------------------------
+
+
+def _seed_saved_network(storage: SettingsStorage, ssid: str) -> None:
+    from openmarquee.settings import SystemSettings, WifiNetworkEntry
+
+    storage.save(
+        SystemSettings(wifi_networks=[WifiNetworkEntry(ssid=ssid, password="seed-pw-1234")])
+    )
+
+
+def test_reveal_password_happy_path(auth_client, storage, monkeypatch):
+    _seed_saved_network(storage, "qarl")
+    monkeypatch.setattr(
+        "openmarquee.wifi_networks_actuator.reveal_secret_for_ssid",
+        lambda ssid: "the-real-psk-1234",
+    )
+    token = _configure_auth_for_patch_tests(auth_client)
+    resp = auth_client.post(
+        "/api/settings/network/qarl/reveal-password",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"current_password": "hunter2hunter"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "ssid": "qarl",
+        "stored": True,
+        "password": "the-real-psk-1234",
+    }
+
+
+def test_reveal_password_wrong_current_password_401(auth_client, storage, monkeypatch):
+    _seed_saved_network(storage, "qarl")
+    called = {"n": 0}
+
+    def spy(ssid):
+        called["n"] += 1
+        return "psk"
+
+    monkeypatch.setattr("openmarquee.wifi_networks_actuator.reveal_secret_for_ssid", spy)
+    token = _configure_auth_for_patch_tests(auth_client)
+    resp = auth_client.post(
+        "/api/settings/network/qarl/reveal-password",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"current_password": "wrong-pw"},
+    )
+    assert resp.status_code == 401
+    # Re-auth failed BEFORE any privileged reveal.
+    assert called["n"] == 0
+
+
+def test_reveal_password_no_bearer_401(auth_client, storage):
+    _seed_saved_network(storage, "qarl")
+    _configure_auth_for_patch_tests(auth_client)
+    resp = auth_client.post(
+        "/api/settings/network/qarl/reveal-password",
+        json={"current_password": "hunter2hunter"},
+    )
+    assert resp.status_code == 401
+
+
+def test_reveal_password_unknown_ssid_404(auth_client, storage, monkeypatch):
+    _seed_saved_network(storage, "qarl")
+    called = {"n": 0}
+
+    def spy(ssid):
+        called["n"] += 1
+        return "psk"
+
+    monkeypatch.setattr("openmarquee.wifi_networks_actuator.reveal_secret_for_ssid", spy)
+    token = _configure_auth_for_patch_tests(auth_client)
+    resp = auth_client.post(
+        "/api/settings/network/NOT-A-SAVED-NET/reveal-password",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"current_password": "hunter2hunter"},
+    )
+    assert resp.status_code == 404
+    # Unknown ssid rejected BEFORE the privileged reveal is attempted.
+    assert called["n"] == 0
+
+
+def test_reveal_password_not_stored_returns_null(auth_client, storage, monkeypatch):
+    _seed_saved_network(storage, "qarl")
+    monkeypatch.setattr(
+        "openmarquee.wifi_networks_actuator.reveal_secret_for_ssid",
+        lambda ssid: None,
+    )
+    token = _configure_auth_for_patch_tests(auth_client)
+    resp = auth_client.post(
+        "/api/settings/network/qarl/reveal-password",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"current_password": "hunter2hunter"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"ssid": "qarl", "stored": False, "password": None}
+
+
+def test_reveal_password_netctl_error_502_no_leak(auth_client, storage, monkeypatch):
+    from openmarquee.wifi_networks_actuator import RevealSecretError
+
+    _seed_saved_network(storage, "qarl")
+
+    def boom(ssid):
+        raise RevealSecretError("nmcli: no such connection profile")
+
+    monkeypatch.setattr("openmarquee.wifi_networks_actuator.reveal_secret_for_ssid", boom)
+    token = _configure_auth_for_patch_tests(auth_client)
+    resp = auth_client.post(
+        "/api/settings/network/qarl/reveal-password",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"current_password": "hunter2hunter"},
+    )
+    assert resp.status_code == 502
+    # The transport error text must NOT leak to the client.
+    assert "no such connection" not in resp.text
+
+
+def test_reveal_password_audit_records_action_never_psk(auth_client, storage, monkeypatch, caplog):
+    _seed_saved_network(storage, "qarl")
+    secret = "SUPER-SECRET-PSK-9999"
+    monkeypatch.setattr(
+        "openmarquee.wifi_networks_actuator.reveal_secret_for_ssid",
+        lambda ssid: secret,
+    )
+    token = _configure_auth_for_patch_tests(auth_client)
+    with caplog.at_level(logging.INFO, logger="openmarquee.audit"):
+        resp = auth_client.post(
+            "/api/settings/network/qarl/reveal-password",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"current_password": "hunter2hunter"},
+        )
+    assert resp.status_code == 200
+    # The audit trail records the action + ssid + outcome...
+    assert "wifi-reveal-password" in caplog.text
+    assert "qarl" in caplog.text
+    assert "revealed" in caplog.text
+    # ...but NEVER the PSK value.
+    assert secret not in caplog.text
+
+
+def test_reveal_password_audits_denied_paths(auth_client, storage, monkeypatch, caplog):
+    _seed_saved_network(storage, "qarl")
+    monkeypatch.setattr(
+        "openmarquee.wifi_networks_actuator.reveal_secret_for_ssid",
+        lambda ssid: "psk",
+    )
+    token = _configure_auth_for_patch_tests(auth_client)
+    # Unknown ssid -> 404 + denied-unknown-ssid audit line.
+    with caplog.at_level(logging.INFO, logger="openmarquee.audit"):
+        r1 = auth_client.post(
+            "/api/settings/network/NOT-SAVED/reveal-password",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"current_password": "hunter2hunter"},
+        )
+    assert r1.status_code == 404
+    assert "denied-unknown-ssid" in caplog.text
+    caplog.clear()
+    # Wrong password -> 401 + denied-auth audit line (brute-force trail).
+    with caplog.at_level(logging.INFO, logger="openmarquee.audit"):
+        r2 = auth_client.post(
+            "/api/settings/network/qarl/reveal-password",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"current_password": "WRONG-PASSWORD"},
+        )
+    assert r2.status_code == 401
+    assert "denied-auth" in caplog.text
