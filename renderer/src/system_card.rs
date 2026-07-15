@@ -67,15 +67,13 @@ pub enum CardShape {
     /// renderer paints this first to ensure no playlist content
     /// bleeds through.
     Background { color: Rgb },
-    /// The brand monogram lockup (amber tile + "openMarquee").
-    /// Positioned by `top_left` relative to card; the tile is
-    /// square sized `tile_size` (normalized). Word follows the
-    /// tile with a small gap.
-    ///
-    /// SUPERSEDED on the BOOT card (2026-07-07) by `Image`, which blits
-    /// the real dot-matrix wordmark artwork (mark.png). Still used by the
-    /// SETUP/CONNECTING/CONNECTED/DEGRADED cards' small corner lockup.
-    Monogram { top_left: (f32, f32), tile_size: f32 },
+    // NOTE: there is intentionally NO `Monogram` variant. openMarquee has
+    // ONE brand mark — the dot-matrix wordmark artwork (mark.png). The
+    // old "oM" square (CardShape::Monogram) was DELETED 2026-07-15 by
+    // qarl after it recurred; deleting the variant (not just skipping its
+    // emission) is the structural prevention — a layout physically cannot
+    // re-add it. Use `Image` (below) for the wordmark. See
+    // feedback_no_om_monogram; do NOT reintroduce a monogram/oM-square.
     /// A baked-in brand-mark image (the real splash wordmark, mark.png),
     /// blitted as a textured quad. `top_left` is the normalized card
     /// position; `height` is the image's height as a fraction of the card
@@ -251,19 +249,24 @@ pub fn layout_card(params: &RenderSystemCardParams, aspect: f32) -> Vec<CardShap
 // === Per-kind layouts. All offsets in normalized 0..1 of card
 // width/height. cqw -> normalized: divide by 100. ===
 
-/// Monogram offset on every non-BOOT card (top-left padding).
-const MONOGRAM_TL: (f32, f32) = (0.046, 0.046);
-/// Tile width (4.4cqw).
-const MONOGRAM_TILE: f32 = 0.044;
+/// Brand-mark (dot-matrix wordmark, mark.png) lockup on every non-BOOT
+/// card — top-left, the corner the deleted "oM" monogram used to occupy.
+/// 2026-07-15 (qarl): the mark image replaces the RETIRED
+/// `CardShape::Monogram` everywhere (openMarquee has ONE brand mark — the
+/// wordmark; there is no oM-square. See feedback_no_om_monogram). `height`
+/// is a fraction of card height; the paint sizes the width from
+/// `MARK_ASPECT` so the artwork is never distorted.
+const MARK_TL: (f32, f32) = (0.046, 0.046);
+const MARK_HEIGHT: f32 = 0.05;
 /// Chip top-right offset.
 const CHIP_TR: (f32, f32) = (0.046, 0.046);
 /// Chip's label cap-height (1.7cqw).
 const CHIP_HEIGHT: f32 = 0.017;
 
 fn layout_setup(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
-    shapes.push(CardShape::Monogram {
-        top_left: MONOGRAM_TL,
-        tile_size: MONOGRAM_TILE,
+    shapes.push(CardShape::Image {
+        top_left: MARK_TL,
+        height: MARK_HEIGHT,
     });
     shapes.push(CardShape::Chip {
         top_right: CHIP_TR,
@@ -363,9 +366,9 @@ pub fn setup_reason_copy(
 }
 
 fn layout_connecting(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
-    shapes.push(CardShape::Monogram {
-        top_left: MONOGRAM_TL,
-        tile_size: MONOGRAM_TILE,
+    shapes.push(CardShape::Image {
+        top_left: MARK_TL,
+        height: MARK_HEIGHT,
     });
     shapes.push(CardShape::Chip {
         top_right: CHIP_TR,
@@ -400,9 +403,9 @@ fn layout_connecting(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape
 }
 
 fn layout_connected(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
-    shapes.push(CardShape::Monogram {
-        top_left: MONOGRAM_TL,
-        tile_size: MONOGRAM_TILE,
+    shapes.push(CardShape::Image {
+        top_left: MARK_TL,
+        height: MARK_HEIGHT,
     });
     shapes.push(CardShape::Chip {
         top_right: CHIP_TR,
@@ -456,9 +459,9 @@ fn layout_connected(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>
 }
 
 fn layout_degraded(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>) {
-    shapes.push(CardShape::Monogram {
-        top_left: MONOGRAM_TL,
-        tile_size: MONOGRAM_TILE,
+    shapes.push(CardShape::Image {
+        top_left: MARK_TL,
+        height: MARK_HEIGHT,
     });
     shapes.push(CardShape::Chip {
         top_right: CHIP_TR,
@@ -1021,9 +1024,10 @@ mod tests {
         p.address = Some("openmarquee.local".to_string());
         p.ip = Some("192.168.1.47".to_string());
         let shapes = layout_card(&p, PORTRAIT);
-        // BOOT has no Chip, and no legacy Monogram (superseded by Image).
+        // BOOT has no Chip. (There is no Monogram variant to check for —
+        // it was deleted 2026-07-15; its absence is a COMPILE-TIME
+        // guarantee. See `all_non_boot_cards_emit_the_mark_image`.)
         assert!(!shapes.iter().any(|s| matches!(s, CardShape::Chip { .. })));
-        assert!(!shapes.iter().any(|s| matches!(s, CardShape::Monogram { .. })));
         // The real-artwork mark is present and horizontally centered.
         let img = shapes.iter().find_map(|s| match s {
             CardShape::Image { top_left, height } => Some((*top_left, *height)),
@@ -1037,6 +1041,31 @@ mod tests {
         assert!(iy < 0.2, "portrait mark should sit near the top; y={iy}");
         // All shapes stay within the card bounds.
         assert_shapes_in_bounds(&shapes, PORTRAIT);
+    }
+
+    #[test]
+    fn all_non_boot_cards_emit_the_mark_image() {
+        // 2026-07-15 (qarl): every non-BOOT card shows the ONE brand mark
+        // — the dot-matrix wordmark (mark.png) via CardShape::Image — NOT
+        // an "oM" square. The old CardShape::Monogram was DELETED; its
+        // absence is enforced at COMPILE TIME (the variant no longer
+        // exists), so this test only needs the POSITIVE assertion that
+        // each card kind actually blits the mark Image.
+        for kind in [
+            SystemCardKind::Setup,
+            SystemCardKind::Connecting,
+            SystemCardKind::Connected,
+            SystemCardKind::Degraded,
+        ] {
+            let p = params(kind);
+            let shapes = layout_card(&p, LANDSCAPE);
+            assert!(
+                shapes.iter().any(|s| matches!(s, CardShape::Image { .. })),
+                "{kind:?} card must blit the mark Image (the wordmark), \
+                 not an oM square",
+            );
+            assert_shapes_in_bounds(&shapes, LANDSCAPE);
+        }
     }
 
     #[test]

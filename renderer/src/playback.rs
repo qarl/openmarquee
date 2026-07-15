@@ -445,9 +445,9 @@ pub enum SystemCardKind {
     /// STA lost. Card re-shows the QR + an explanation by cause
     /// (variant: lost | auth_fail | not_found | not_found_or_5ghz).
     Degraded,
-    /// ~4-second boot identity card. Shows the monogram + the
-    /// address/IP + (PR4 follow-up) the rapid-boot hint line when
-    /// the gesture counter is armed.
+    /// ~4-second boot identity card. Shows the brand mark (dot-matrix
+    /// wordmark image) + the address/IP + (PR4 follow-up) the rapid-boot
+    /// hint line when the gesture counter is armed.
     Boot,
     /// PR3 finish-pass (2026-07-01) forward-compat: any unrecognised
     /// `kind` value from a newer backend deserializes to `Unknown`
