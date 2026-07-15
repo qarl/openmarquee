@@ -86,6 +86,26 @@ async def _wait_until(predicate, timeout: float = 3.0, interval: float = 0.01):
     return False
 
 
+def test_ffprobe_timeout_default_and_env_override(monkeypatch):
+    """QA verify-audit 2026-07-15: the ffprobe budget was bumped 8s -> 60s
+    (default) and made env-tunable so a slow Pi Zero 2 W probe (measured
+    11.6s local / 37-60s HLS) isn't cut off on a VALID source — 60s clears
+    the measured internet-HLS worst case. Pins the new default and the
+    helper's parse rules (valid override wins; junk / non-positive / unset
+    fall back)."""
+    from openmarquee import stream_consumer as sc
+
+    assert sc._FFPROBE_TIMEOUT_SECONDS == 60.0  # regression-lock the 8 -> 60 bump
+    monkeypatch.setenv("X_TEST_FFPROBE_TMO", "12.5")
+    assert sc._env_positive_float("X_TEST_FFPROBE_TMO", 60.0) == 12.5
+    monkeypatch.setenv("X_TEST_FFPROBE_TMO", "nope")
+    assert sc._env_positive_float("X_TEST_FFPROBE_TMO", 60.0) == 60.0
+    monkeypatch.setenv("X_TEST_FFPROBE_TMO", "-4")
+    assert sc._env_positive_float("X_TEST_FFPROBE_TMO", 60.0) == 60.0
+    monkeypatch.delenv("X_TEST_FFPROBE_TMO", raising=False)
+    assert sc._env_positive_float("X_TEST_FFPROBE_TMO", 60.0) == 60.0
+
+
 # --- frame yield + EOF -----------------------------------------------------
 
 

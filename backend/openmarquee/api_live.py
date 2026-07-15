@@ -36,6 +36,7 @@ from openmarquee.live import (
     LiveManager,
     LiveNotActive,
     LiveStartBody,
+    StreamSourceUnreachable,
 )
 
 # Low-security-DiD Bundle C item 6 (2026-05-25): on the wire we only
@@ -168,6 +169,19 @@ async def start_live(
                 "active_session_id": str(exc.active_session_id),
             },
         ) from exc
+    except StreamSourceUnreachable as exc:
+        # QA verify-audit 2026-07-15: the stream source produced no frames
+        # and its pump exited within the honest-start window — the URL is
+        # dead / unreachable / rejected. 502 (bad upstream) instead of the
+        # old misleading 200-then-silent-self-close. The offending URL goes
+        # to the backend log, not the wire (it's the operator's own input,
+        # but keep the response minimal + consistent with the class-only
+        # disclosure below).
+        log.warning("live: stream source unreachable: %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "stream_source_unreachable"},
+        ) from exc
     except Exception as exc:
         # SDP parse failure / aiortc raised. 400 since the phone's
         # request is the most likely source of badness.
@@ -228,6 +242,14 @@ async def takeover_live(
     is streaming" warning and tapped Take Over."""
     try:
         session_id, answer = await live.takeover(payload)
+    except StreamSourceUnreachable as exc:
+        # QA verify-audit 2026-07-15: honest 502 for a dead/unreachable
+        # stream source — symmetric with /api/live/start above.
+        log.warning("live: stream source unreachable (takeover): %s", exc)
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "stream_source_unreachable"},
+        ) from exc
     except Exception as exc:
         # 11.2 + Slice 3 (2026-05-23): never reflect the exception
         # message; surface only the class name on the wire. Symmetric

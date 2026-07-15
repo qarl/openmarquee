@@ -651,16 +651,24 @@ def test_start_legacy_body_without_kind_still_works(client: TestClient):
 
 def test_start_stream_returns_session_without_sdp_answer(client: TestClient, monkeypatch, tmp_path):
     """POST /start with a kind=stream body starts a stream takeover and
-    returns a session whose sdp_answer is null (a stream has no SDP)."""
+    returns a session whose sdp_answer is null (a stream has no SDP).
+
+    Injects source_size so the real ffprobe is skipped and the mock ffmpeg
+    delivers frames — the honest-start gate (QA verify-audit 2026-07-15)
+    then sees a first frame and returns success. (Pre-fix this raced a 200
+    out before the real probe against an unreachable host could fail — the
+    very contract bug now closed; the dead-source path is covered by
+    test_start_stream_unreachable_source_returns_502.)"""
     import functools
 
     from openmarquee.stream_consumer import StreamConsumer
     from tests.test_stream_consumer import _write_mock_ffmpeg
 
-    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=8 * 8 * 3, n_frames=2)
+    frame_size = 8 * 8 * 3 // 2  # NV12 for the injected 8x8 source
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=frame_size, n_frames=4)
     monkeypatch.setattr(
         "openmarquee.stream_source.StreamConsumer",
-        functools.partial(StreamConsumer, ffmpeg_bin=mock),
+        functools.partial(StreamConsumer, ffmpeg_bin=mock, source_size=(8, 8)),
     )
 
     response = client.post(
@@ -677,6 +685,41 @@ def test_start_stream_returns_session_without_sdp_answer(client: TestClient, mon
     # no subprocess to clean up).
     stop = client.post("/api/live/stop", json={"session_id": body["session_id"]})
     assert stop.status_code == 204
+
+
+def test_start_stream_unreachable_source_returns_502(client: TestClient, monkeypatch, tmp_path):
+    """QA verify-audit 2026-07-15: a stream source that produces no frames
+    and dies at start must fail HONESTLY (502) — not the old misleading 200
+    + session_id that silently self-closed seconds later.
+
+    A mock ffmpeg with n_frames=0 (emits nothing, exits) + injected
+    source_size (skip the real probe) stands in for a dead/unreachable/
+    rejected URL. The honest-start gate sees the pump exit frameless and
+    raises StreamSourceUnreachable → the route returns 502, and /status
+    stays idle (no phantom session left active)."""
+    import functools
+
+    from openmarquee.live import LiveSession
+    from openmarquee.stream_consumer import StreamConsumer
+    from tests.test_stream_consumer import _write_mock_ffmpeg
+
+    # The gate returns on pump-exit (fast); cap the window so the ambiguous
+    # branch can't stall the request in the unlikely event of a slow exit.
+    monkeypatch.setattr(LiveSession, "_STREAM_START_LIVENESS_SECONDS", 2.0)
+    mock = _write_mock_ffmpeg(tmp_path / "ffmpeg", frame_size=8 * 8 * 3 // 2, n_frames=0)
+    monkeypatch.setattr(
+        "openmarquee.stream_source.StreamConsumer",
+        functools.partial(StreamConsumer, ffmpeg_bin=mock, source_size=(8, 8)),
+    )
+
+    response = client.post(
+        "/api/live/start",
+        json={"kind": "stream", "url": "rtsp://dead-host:8554/nothing"},
+    )
+    assert response.status_code == 502
+    assert response.json()["detail"]["error"] == "stream_source_unreachable"
+    # The failed start tore the session down — no phantom session.
+    assert client.get("/api/live/status").json()["state"] == "idle"
 
 
 # ---- Fork B: pause/resume endpoint contract ----
