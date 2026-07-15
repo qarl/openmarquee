@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 
 # Throttle the per-ping cadence. The playback loop calls advance()
 # ~30 times/second; we don't need to ping systemd at that rate.
-# Pinging once per second is plenty for `WatchdogSec=60s` (60x
+# Pinging once per second is plenty for `WatchdogSec=120s` (120x
 # margin). Throttle reduces syscall volume and lets the
 # heartbeat batch with whatever the kernel is happy to coalesce.
 _THROTTLE_INTERVAL_S = 1.0
