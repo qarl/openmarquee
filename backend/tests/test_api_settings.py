@@ -963,6 +963,168 @@ def test_put_wifi_station_creds_do_not_disturb_online_sign(client: TestClient, m
     assert fake.events == []
 
 
+# --- QA verify-audit 2026-07-15: the SAME wiring on the PATCH endpoint ------
+# The real Settings UI submits the station passphrase via PATCH
+# /api/settings/wifi-station-password, not the inline-password PUT. The P0-1
+# wiring above was only on PUT, so first-setup/re-provision through the UI
+# didn't drive the state machine. These mirror the PUT tests on the PATCH path.
+
+
+def test_patch_wifi_station_password_drives_supervisor(auth_client: TestClient, monkeypatch):
+    """Fail-before/pass-after: rotating the passphrase via the PATCH endpoint
+    the UI actually uses MUST drive the state machine (record_target_ssid +
+    HAS_STORED_CREDENTIALS), or SETUP never advances → the AP overlay never
+    clears on the real path. (The passing PUT test masked this — it exercised
+    a path the UI doesn't use.)"""
+    from openmarquee.network_supervisor import SupervisorEvent
+
+    token = _configure_auth_for_patch_tests(auth_client)
+    _stub_wifi_apply(monkeypatch)
+    fake = _FakeSupervisor()  # starts in SETUP
+    monkeypatch.setattr("openmarquee.dependencies.get_network_supervisor", lambda: fake)
+
+    # Enable station + SSID + an initial password so the PATCH's "station
+    # enabled + password changed" gate is satisfied.
+    resp = auth_client.put(
+        "/api/settings",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "MyHomeWifi",
+            "wifi_station_password": "oldpassw0rd",
+        },
+    )
+    assert resp.status_code == 200
+    # Measure ONLY the PATCH's effect (the setup PUT fires the wiring too —
+    # that's exactly the path this test proves is NOT the only one wired).
+    # The fake's apply_event only records; it does NOT transition
+    # current_state, so it stays SETUP and the setup PUT doesn't "consume"
+    # it. That models production: the real UI sends the passphrase ONLY via
+    # PATCH (the PUT here carries no password in the live flow), so the real
+    # supervisor is genuinely still in SETUP when the PATCH fires.
+    fake.events.clear()
+    fake.recorded_ssid = "<unset>"
+
+    # The real UI path: rotate the passphrase via PATCH.
+    resp = auth_client.patch(
+        "/api/settings/wifi-station-password",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"current_password": "hunter2hunter", "new_value": "newpassw0rd"},
+    )
+    assert resp.status_code == 200
+    # THE GUARD: the PATCH drove the state machine.
+    assert fake.recorded_ssid == "MyHomeWifi"
+    assert SupervisorEvent.HAS_STORED_CREDENTIALS in fake.events
+
+
+def test_patch_wifi_station_password_unchanged_does_not_drive_supervisor(
+    auth_client: TestClient, monkeypatch
+):
+    """Guard: re-PATCHing the SAME password (no change) must NOT fire the
+    provisioning event — mirrors the PUT no-change guard."""
+    token = _configure_auth_for_patch_tests(auth_client)
+    _stub_wifi_apply(monkeypatch)
+    fake = _FakeSupervisor()
+    monkeypatch.setattr("openmarquee.dependencies.get_network_supervisor", lambda: fake)
+
+    auth_client.put(
+        "/api/settings",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "MyHomeWifi",
+            "wifi_station_password": "oldpassw0rd",
+        },
+    )
+    fake.events.clear()
+    fake.recorded_ssid = "<unset>"
+
+    # PATCH the SAME password → the "password changed" gate is False.
+    resp = auth_client.patch(
+        "/api/settings/wifi-station-password",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"current_password": "hunter2hunter", "new_value": "oldpassw0rd"},
+    )
+    assert resp.status_code == 200
+    assert fake.recorded_ssid == "<unset>"
+    assert fake.events == []
+
+
+def test_patch_wifi_station_supervisor_failure_is_fail_soft(auth_client: TestClient, monkeypatch):
+    """A supervisor hiccup must NOT 500 the PATCH — the passphrase is already
+    persisted + the nmcli apply already ran before the supervisor drive.
+    Mirrors the PUT fail-soft guard."""
+    token = _configure_auth_for_patch_tests(auth_client)
+    _stub_wifi_apply(monkeypatch)
+
+    class _BoomSupervisor(_FakeSupervisor):
+        def apply_event(self, event):
+            raise RuntimeError("supervisor down")
+
+    monkeypatch.setattr(
+        "openmarquee.dependencies.get_network_supervisor", lambda: _BoomSupervisor()
+    )
+    auth_client.put(
+        "/api/settings",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "MyHomeWifi",
+            "wifi_station_password": "oldpassw0rd",
+        },
+    )
+
+    resp = auth_client.patch(
+        "/api/settings/wifi-station-password",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"current_password": "hunter2hunter", "new_value": "newpassw0rd"},
+    )
+    # Fail-soft: the PATCH still succeeds despite the supervisor raising.
+    assert resp.status_code == 200
+    # And the passphrase persisted (the supervisor drive runs AFTER the
+    # secret is written), redacted on GET.
+    body = auth_client.get("/api/settings", headers={"Authorization": f"Bearer {token}"}).json()
+    assert body["wifi_station_password"] == "<set>"
+
+
+def test_patch_wifi_station_password_from_online_does_not_drive_supervisor(
+    auth_client: TestClient, monkeypatch
+):
+    """State guard: rotating the passphrase via PATCH while the sign is
+    already ONLINE must NOT re-fire the provisioning event — that would
+    re-trigger onboarding on a running sign. The nmcli reconnect + the
+    supervisor's observe loop handle a network change from ONLINE. Mirrors
+    the PUT ONLINE guard on the PATCH path."""
+    from openmarquee.network_supervisor import SupervisorState
+
+    token = _configure_auth_for_patch_tests(auth_client)
+    _stub_wifi_apply(monkeypatch)
+    fake = _FakeSupervisor(current_state=SupervisorState.ONLINE)
+    monkeypatch.setattr("openmarquee.dependencies.get_network_supervisor", lambda: fake)
+
+    auth_client.put(
+        "/api/settings",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "wifi_station_enabled": True,
+            "wifi_station_ssid": "MyHomeWifi",
+            "wifi_station_password": "oldpassw0rd",
+        },
+    )
+    fake.events.clear()
+    fake.recorded_ssid = "<unset>"
+
+    resp = auth_client.patch(
+        "/api/settings/wifi-station-password",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"current_password": "hunter2hunter", "new_value": "newpassw0rd"},
+    )
+    assert resp.status_code == 200
+    # ONLINE → the state gate blocks the re-onboard.
+    assert fake.recorded_ssid == "<unset>"
+    assert fake.events == []
+
+
 # ---------------------------------------------------------------------------
 # Option D (2026-07-14): POST /api/settings/network/{ssid}/reveal-password
 # — re-auth-gated per-network PSK reveal + audit log (action + ssid + outcome,
