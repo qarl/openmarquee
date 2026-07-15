@@ -70,6 +70,7 @@ if TYPE_CHECKING:
 # Module-load-time symbols (LiveAlreadyActive, LiveNotActive, LiveManager,
 # LiveStartBody, LiveSession) stay top-level for api_live.py's import.
 
+from openmarquee import sd_notify
 from openmarquee.playback import PlaybackLoop
 
 log = logging.getLogger(__name__)
@@ -573,6 +574,17 @@ class LiveSession:
                 # cheap and keeps the pump branch-free. (Moved above
                 # the pause gate 2026-05-24 per subagent review.)
                 self._first_frame_event.set()
+                # QA verify-audit 2026-07-15 (JasonsSign1): feed the systemd
+                # WATCHDOG=1 keepalive from the live pump too. The only other
+                # notify_watchdog() calls are the playback loop's per-advance
+                # pings (playback.py) — but a live takeover PAUSES that loop,
+                # so for a sustained session nothing pinged systemd and the
+                # backend got WatchdogSec-killed (~2min in). A drained frame is
+                # proof-of-life whether we render it or (paused) discard it;
+                # throttled to 1/sec inside sd_notify. A genuine render wedge
+                # still trips the watchdog — the pump is serial (drain→render→
+                # drain), so a hung render_frame stops the next drain + ping.
+                sd_notify.notify_watchdog()
                 # Operator pause gate: drain the frame so the upstream
                 # source (ffmpeg / WebRTC track) doesn't backpressure,
                 # but skip the render call so DRM scanout holds the
