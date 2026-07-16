@@ -1296,3 +1296,142 @@ def test_reveal_password_audits_denied_paths(auth_client, storage, monkeypatch, 
         )
     assert r2.status_code == 401
     assert "denied-auth" in caplog.text
+
+
+# ── qarl 2026-07-16: Settings Join section showed a BLANK SSID on a sign
+# that was sitting on NEBULA. Root cause: /wifi-station-state answered
+# only from wifi_station.current_state() — the in-memory APPLIER status,
+# seeded solely by an apply() in THIS process. A sign that booted
+# already-connected never ran one, so it reported idle/None while happily
+# associated. These pin the fix: the endpoint must ALSO report the LIVE
+# association (active_wlan0_ssid), the same source the boot card uses.
+
+
+def _idle_applier(monkeypatch):
+    """Applier state deliberately EMPTY (idle / ssid=None) — the
+    already-connected-at-boot case, where no apply() ran in this process."""
+    from openmarquee import wifi_station
+
+    monkeypatch.setattr(
+        wifi_station,
+        "current_state",
+        lambda: wifi_station.WifiStationState(state="idle", detail=None, ssid=None),
+    )
+
+
+def test_wifi_station_state_reports_live_connected_ssid(client, monkeypatch):
+    """NON-VACUITY: the applier state is idle/None here. If the endpoint
+    regresses to answering from the applier, connected_ssid goes None and
+    this fails. It can only pass by doing the live read."""
+    from openmarquee import network_supervisor
+
+    _idle_applier(monkeypatch)
+    monkeypatch.setattr(network_supervisor, "active_wlan0_ssid_probe", lambda **_: (True, "NEBULA"))
+
+    res = client.get("/api/settings/wifi-station-state")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["connected_ssid"] == "NEBULA", (
+        "must surface the LIVE association even when no apply ran this process"
+    )
+    assert body["connected_probe_ok"] is True
+    # The applier fields keep their own meaning — not overwritten.
+    assert body["state"] == "idle"
+    assert body["ssid"] is None
+
+
+def test_wifi_station_state_live_ssid_is_not_the_applier_target(client, monkeypatch):
+    """The two answers must stay DISTINCT. A connecting attempt targeting
+    GUEST while wlan0 is still on NEBULA must report both truthfully —
+    catches a 'fix' that just aliases one field onto the other."""
+    from openmarquee import network_supervisor, wifi_station
+
+    monkeypatch.setattr(
+        wifi_station,
+        "current_state",
+        lambda: wifi_station.WifiStationState(state="connecting", detail=None, ssid="GUEST"),
+    )
+    monkeypatch.setattr(network_supervisor, "active_wlan0_ssid_probe", lambda **_: (True, "NEBULA"))
+
+    body = client.get("/api/settings/wifi-station-state").json()
+    assert body["ssid"] == "GUEST", "applier target must stay the attempt's target"
+    assert body["connected_ssid"] == "NEBULA", "live read must stay the live link"
+
+
+def test_wifi_station_state_unreadable_link_reports_probe_not_ok(client, monkeypatch):
+    """A probe that could not READ the link reports probe_ok False.
+
+    LOAD-BEARING: a failed probe must be distinguishable from a real "not
+    connected". Collapsing the two makes a slow-but-connected Pi report
+    "Not connected" — the very bug class this endpoint exists to fix."""
+    from openmarquee import network_supervisor
+
+    _idle_applier(monkeypatch)
+    monkeypatch.setattr(network_supervisor, "active_wlan0_ssid_probe", lambda **_: (False, None))
+
+    res = client.get("/api/settings/wifi-station-state")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["connected_ssid"] is None
+    assert body["connected_probe_ok"] is False
+
+
+def test_wifi_station_state_probe_ok_true_when_genuinely_not_connected(client, monkeypatch):
+    """The OTHER side of the unknown/not-connected split: a probe that ran
+    and found no association is a REAL answer (probe_ok True, ssid None) —
+    the UI may say 'Not connected' only for this shape."""
+    from openmarquee import network_supervisor
+
+    _idle_applier(monkeypatch)
+    monkeypatch.setattr(network_supervisor, "active_wlan0_ssid_probe", lambda **_: (True, None))
+
+    body = client.get("/api/settings/wifi-station-state").json()
+    assert body["connected_ssid"] is None
+    assert body["connected_probe_ok"] is True
+
+
+def test_wifi_station_state_no_nmcli_is_unknown_not_disconnected(client, monkeypatch):
+    """END-TO-END through the REAL probe — the test that catches the bug a
+    stubbed probe cannot.
+
+    Sacred review (2026-07-16) proved the pre-fix endpoint wrong here: it
+    called active_wlan0_ssid, which fails SOFT to None for a missing nmcli
+    (it never raises), so the `except` never fired and probe_ok stayed
+    True → a sign on NEBULA with a wedged/absent nmcli rendered "Not
+    connected". Stubbing the probe cannot catch that; only driving the
+    real failure mode can. No nmcli is a REACHABLE state, not a fiction."""
+    from openmarquee import network_supervisor
+
+    _idle_applier(monkeypatch)
+    # The real, reachable failure mode: nmcli is not on PATH.
+    monkeypatch.setattr(network_supervisor.shutil, "which", lambda _name: None)
+
+    res = client.get("/api/settings/wifi-station-state")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["connected_ssid"] is None
+    assert body["connected_probe_ok"] is False, (
+        "an unreadable link must report UNKNOWN; claiming probe_ok here is "
+        "what made a connected sign render 'Not connected'"
+    )
+
+
+def test_wifi_station_state_probe_uses_default_timeout(client, monkeypatch):
+    """REGRESSION LOCK: an earlier draft pinned timeout_s=2.0 while the
+    boot card uses the 5.0 default — an aggressive override turns a
+    slow-but-connected Pi into a false 'not connected'. `lambda **_:`
+    stubs silently SWALLOW a reintroduced override, so record the kwargs
+    and assert none were passed."""
+    from openmarquee import network_supervisor
+
+    _idle_applier(monkeypatch)
+    seen: dict[str, object] = {}
+
+    def _record(**kwargs):
+        seen.update(kwargs)
+        return True, "NEBULA"
+
+    monkeypatch.setattr(network_supervisor, "active_wlan0_ssid_probe", _record)
+
+    client.get("/api/settings/wifi-station-state")
+    assert seen == {}, f"probe must use its own default timeout, got overrides: {seen}"
