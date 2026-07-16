@@ -46,6 +46,13 @@ mod hdmi_logic;
 // until then so the unused public serializer doesn't warn in the binary crate.
 #[allow(dead_code)]
 mod colorlight_logic;
+// Colorlight 5A-75B TRANSPORT layer (Phase-1 prep, hardware-independent).
+// FrameSink trait + VecSink + StubPacketSink + encode_to_sink glue. The
+// real AF_PACKET-backed sink lands as a #[cfg(target_os = "linux")]
+// PacketSink swap on Phase-1 hardware day. #[allow(dead_code)] until the
+// pipeline seam (separate follow-up PR) picks the sink up.
+#[allow(dead_code)]
+mod colorlight;
 // HUB75-direct output backend. Phase 0 arm-fill wires this into
 // OutputMode::Hub75 (env → config → validated GpioSink diagnostic).
 // The real FFI backend (hzeller rpi-rgb-led-matrix binding) + the
