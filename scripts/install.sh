@@ -517,6 +517,45 @@ else
     say "       To wire up: apt install cron && re-run install.sh"
 fi
 
+# --- 3e. WiFi AP-deauth-recovery watchdog (cron.d + script PAIR) -------------
+#
+# deploy-hygiene 2026-07-16 (P2-d). QA's 2026-07-16 08:13 JasonsSign1 probe
+# confirmed the AP-deauth-recovery watchdog (30s cadence, THRESHOLD=2, dates to
+# the 2026-05-23 wedge) is PRESENT + actively firing on the fielded sign — but
+# NOTHING in the repo installed it: it was hand-placed once during the wedge
+# remediation. pi-gen doesn't stage it and no install.sh path promoted it, so a
+# fresh SD burn (JasonsSign2) would SILENTLY lack it. This makes install.sh the
+# durable install path — same reproducibility gap the mini-play.sh install below
+# closed for the boot-default renderer, and the live one of the two orphaned
+# system/ files flagged in docs/deploy-hygiene-audit-2026-07-16.md §5.
+#
+# COUPLED PAIR (like the netctl helper+daemon): the cron.d drop-in fires
+# `/usr/local/bin/wifi-watchdog.sh` via flock, so the two must install together
+# and stay in lockstep — a version-skewed pair (new cadence + old script, or
+# vice versa) must not be possible. Guard installs BOTH-or-NEITHER. Installed
+# UNCONDITIONALLY (not gated by --system-only): OS-level config, so a full
+# deploy.sh AND a targeted `install.sh --system-only` (via sync-system-to-sign.sh)
+# both land it. cron.service is already enabled by §3d above; cron.d requires
+# owner-root mode <=0644 (same as the §3c daily-restart drop-in).
+WIFI_WATCHDOG_SCRIPT_SRC="${OPT_DIR}/scripts/wifi-watchdog.sh"
+WIFI_WATCHDOG_SCRIPT_DST="${ROOT_PREFIX}/usr/local/bin/wifi-watchdog.sh"
+WIFI_WATCHDOG_CRON_SRC="${OPT_DIR}/system/openmarquee-wifi-watchdog"
+WIFI_WATCHDOG_CRON_DST="${ROOT_PREFIX}/etc/cron.d/openmarquee-wifi-watchdog"
+say "Install WiFi AP-deauth-recovery watchdog (cron.d + script pair)"
+if [ "$DRY_RUN" -eq 1 ] || { [ -f "$WIFI_WATCHDOG_SCRIPT_SRC" ] && [ -f "$WIFI_WATCHDOG_CRON_SRC" ]; }; then
+    # Script first, then the cron.d that invokes it — so the target exists
+    # before crond can fire the drop-in on its next scan.
+    run mkdir -p "$(dirname "$WIFI_WATCHDOG_SCRIPT_DST")"
+    run install -m 0755 "$WIFI_WATCHDOG_SCRIPT_SRC" "$WIFI_WATCHDOG_SCRIPT_DST"
+    run mkdir -p "$(dirname "$WIFI_WATCHDOG_CRON_DST")"
+    run install -m 0644 -o root -g root "$WIFI_WATCHDOG_CRON_SRC" "$WIFI_WATCHDOG_CRON_DST"
+else
+    # Coupled: if EITHER source is missing, install NEITHER (never leave a
+    # cron.d drop-in pointing at an absent script, or a script with no trigger).
+    say "  wifi-watchdog pair source(s) missing; skip both (coupled install)"
+    say "    (script: ${WIFI_WATCHDOG_SCRIPT_SRC}; cron: ${WIFI_WATCHDOG_CRON_SRC})"
+fi
+
 # --- 2. Python venv ---------------------------------------------------------
 #
 # r29 (2026-05-31): runs AFTER sections 3, 3a, 3b — see the meta-comment
