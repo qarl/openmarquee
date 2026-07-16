@@ -53,6 +53,16 @@ mod colorlight_logic;
 // pipeline seam (separate follow-up PR) picks the sink up.
 #[allow(dead_code)]
 mod colorlight;
+// Colorlight COMPOSITOR layer — Phase-1 prep (hardware-independent).
+// Compositor trait + CpuCompositor (tiny_skia-backed test-pattern
+// rasterizer) + PNG-dump helper. The real GBM+EGL Pattern A compositor
+// lands as a sibling HeadlessGpuCompositor : Compositor in PR #B0.5
+// (behind #[cfg(target_os = "linux")]), pairing with a shared
+// egl_bringup refactor of hdmi.rs. #[allow(dead_code)] until the
+// OutputMode::Colorlight arm-fill (later commit of this arc) picks
+// the compositor up.
+#[allow(dead_code)]
+mod colorlight_compositor;
 // HUB75-direct output backend. Phase 0 arm-fill wires this into
 // OutputMode::Hub75 (env → config → validated GpioSink diagnostic).
 // The real FFI backend (hzeller rpi-rgb-led-matrix binding) + the
