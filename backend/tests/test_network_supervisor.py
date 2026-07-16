@@ -1709,7 +1709,9 @@ class TestActiveWlan0Ssid:
         import openmarquee.network_supervisor as ns
 
         monkeypatch.setattr(
-            ns, "_probe_existing_wifi_connection", lambda **k: "openmarquee-mgmt-wifi"
+            ns,
+            "_probe_existing_wifi_connection_ex",
+            lambda **k: (True, "openmarquee-mgmt-wifi"),
         )
         monkeypatch.setattr(ns.shutil, "which", lambda name: "/usr/bin/nmcli")
 
@@ -1725,20 +1727,20 @@ class TestActiveWlan0Ssid:
     def test_none_when_not_connected(self, monkeypatch):
         import openmarquee.network_supervisor as ns
 
-        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: None)
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection_ex", lambda **k: (True, None))
         assert ns.active_wlan0_ssid() is None
 
     def test_none_when_no_nmcli(self, monkeypatch):
         import openmarquee.network_supervisor as ns
 
-        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: "c")
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection_ex", lambda **k: (True, "c"))
         monkeypatch.setattr(ns.shutil, "which", lambda name: None)
         assert ns.active_wlan0_ssid() is None
 
     def test_none_when_ssid_query_returns_nonzero(self, monkeypatch):
         import openmarquee.network_supervisor as ns
 
-        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: "c")
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection_ex", lambda **k: (True, "c"))
         monkeypatch.setattr(ns.shutil, "which", lambda name: "/usr/bin/nmcli")
         monkeypatch.setattr(ns.subprocess, "run", lambda *a, **k: self._cp(stdout="", returncode=1))
         assert ns.active_wlan0_ssid() is None
@@ -1746,7 +1748,7 @@ class TestActiveWlan0Ssid:
     def test_strips_only_trailing_newline_preserving_spaces(self, monkeypatch):
         import openmarquee.network_supervisor as ns
 
-        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: "c")
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection_ex", lambda **k: (True, "c"))
         monkeypatch.setattr(ns.shutil, "which", lambda name: "/usr/bin/nmcli")
         monkeypatch.setattr(ns.subprocess, "run", lambda *a, **k: self._cp(stdout="my ssid \n"))
         assert ns.active_wlan0_ssid() == "my ssid "
@@ -1754,7 +1756,7 @@ class TestActiveWlan0Ssid:
     def test_none_when_ssid_empty(self, monkeypatch):
         import openmarquee.network_supervisor as ns
 
-        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: "c")
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection_ex", lambda **k: (True, "c"))
         monkeypatch.setattr(ns.shutil, "which", lambda name: "/usr/bin/nmcli")
         monkeypatch.setattr(ns.subprocess, "run", lambda *a, **k: self._cp(stdout="\n"))
         assert ns.active_wlan0_ssid() is None
@@ -1762,7 +1764,7 @@ class TestActiveWlan0Ssid:
     def test_subprocess_error_is_swallowed(self, monkeypatch):
         import openmarquee.network_supervisor as ns
 
-        monkeypatch.setattr(ns, "_probe_existing_wifi_connection", lambda **k: "c")
+        monkeypatch.setattr(ns, "_probe_existing_wifi_connection_ex", lambda **k: (True, "c"))
         monkeypatch.setattr(ns.shutil, "which", lambda name: "/usr/bin/nmcli")
 
         def boom(*a, **k):

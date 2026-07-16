@@ -172,9 +172,34 @@ const SECTION_TEMPLATE = `
                                 Join Existing Network
                             </label>
                         </legend>
+                        <!-- qarl 2026-07-16: the sign was sitting on NEBULA while
+                             this section rendered a BLANK SSID box. Actual cause:
+                             the box below binds to the PERSISTED
+                             settings.wifi_station_ssid, which is seeded ONLY by
+                             captive-portal onboarding (api_onboarding
+                             submit_credentials). A sign provisioned via the
+                             saved-networks/supervisor path never gets it written
+                             — that path doesn't touch the field — so the box
+                             renders blank on a sign that is happily connected.
+                             The row above shows the LIVE association instead.
+                             This row answers "what are we actually on?" from the
+                             LIVE association, the same source the boot card uses,
+                             and the box below is prefilled from it. -->
+                        <p class="field-wifi-connected-row settings-hint"
+                           style="margin: 0 0 10px; display: flex; gap: 8px; align-items: baseline;">
+                            <span>Currently connected:</span>
+                            <span class="field-wifi-connected-ssid om-mono"
+                                  role="status" aria-live="polite"
+                                  style="color: var(--om-accent); font-size: 13px;">—</span>
+                        </p>
+                        <p class="settings-hint" style="margin: 0 0 10px;">
+                            Pick a saved network or type one below to join it now.
+                            Networks you add to <strong>Saved networks</strong> are
+                            auto-joined later without asking.
+                        </p>
                         <div class="row" style="gap: 10px;">
                             <label class="field om-field" style="flex: 1;">
-                                <span>WiFi SSID</span>
+                                <span>Join this network</span>
                                 <select class="om-pulldown om-pulldown-cased field-wifi-station-ssid-picker">
                                     <option value="__other__">(type manually)</option>
                                 </select>
@@ -1580,6 +1605,64 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     // preserved for devtools / journald correlation; operator gets a
     // visible breadcrumb so the "(type manually)" fallback doesn't
     // read as a missing feature.
+    /**
+     * Show the network wlan0 is CURRENTLY associated with, and seed the
+     * Join box with it.
+     *
+     * Reads /api/settings/wifi-station-state. `connected_ssid` is the
+     * LIVE association (active_wlan0_ssid) — NOT the applier's `ssid`
+     * (that's the last submitted TARGET) and NOT the persisted
+     * `wifi_station_ssid` (which nothing writes — the actual cause of
+     * qarl's blank box).
+     *
+     * THREE distinct answers, never conflated:
+     *   connected_probe_ok && ssid  -> that network
+     *   connected_probe_ok && !ssid -> "Not connected" (a real answer)
+     *   !connected_probe_ok         -> "Unknown" (we could not tell)
+     * Rendering unknown as "Not connected" on a connected sign would
+     * reproduce the bug this fixes.
+     */
+    async function refreshConnectedSsid() {
+        const el = container.querySelector(".field-wifi-connected-ssid");
+        if (!el) return;
+        try {
+            const res = await apiFetch("/api/settings/wifi-station-state");
+            if (!res.ok) {
+                // Don't leave a PRIOR success standing: on a rescan after
+                // the sign drops off wifi, a stale "NEBULA" would assert a
+                // state we just failed to verify.
+                el.textContent = "Unknown";
+                return;
+            }
+            const data = await res.json();
+            const ssid = data?.connected_ssid;
+            // Three states, and the split is the point: only a probe that
+            // ANSWERED may produce "Not connected". An unreadable link is
+            // "Unknown" — asserting not-connected on a sign we couldn't
+            // read is the bug this row exists to kill.
+            if (!data?.connected_probe_ok) {
+                el.textContent = "Unknown";
+                return;
+            }
+            if (typeof ssid === "string" && ssid) {
+                el.textContent = ssid;
+                // Prefill the Join box so the section stops showing an
+                // empty field on a connected sign. Only when the operator
+                // hasn't typed their own target — never clobber input.
+                if (stationSsidEl && !stationSsidEl.value.trim()) {
+                    stationSsidEl.value = ssid;
+                }
+            } else {
+                el.textContent = "Not connected";
+            }
+        } catch (err) {
+            // Same reasoning as the !res.ok path: never let a previous
+            // answer stand in for one we couldn't get.
+            el.textContent = "Unknown";
+            console.debug("[settings] connected-ssid probe failed:", err);
+        }
+    }
+
     function surfaceWifiScanError(reason) {
         console.debug("[settings] wifi-scan failed:", reason);
         const status = container.querySelector(".settings-wifi-status");
@@ -1598,6 +1681,16 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             status.textContent = "";
             status.hidden = true;
         }
+        // qarl 2026-07-16: also refresh the LIVE connected SSID + seed
+        // the Join box from it. The box binds to a persisted setting
+        // nothing writes, so it rendered blank on a sign happily joined
+        // to NEBULA.
+        // AWAITED, not fire-and-forget: populateWifiScan reads
+        // stationSsidEl.value into currentSsid below to sync the picker.
+        // Racing the prefill against that read leaves the box showing
+        // NEBULA while the picker says "(type manually)" whenever the
+        // scan (a real nmcli rescan) happens to answer first.
+        await refreshConnectedSsid();
         try {
             const res = await apiFetch("/api/system/wifi-scan");
             if (!res.ok) {

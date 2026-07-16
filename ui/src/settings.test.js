@@ -1556,3 +1556,217 @@ describe("mountSettings", () => {
         });
     });
 });
+
+// ── qarl 2026-07-16: the Join section rendered a BLANK SSID box while the
+// sign was sitting on NEBULA, which read as "not connected" and made the
+// whole section nonsense. The Join fields are a REQUEST (what to join
+// next), not a status readout — so the section now shows the LIVE
+// association separately, from the same source the boot card uses.
+describe("Settings → Join Existing Network — currently-connected SSID", () => {
+    function mountWithStationState(stationBody) {
+        const container = document.createElement("div");
+        vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+            const u = String(url);
+            if (u.includes("/api/settings/wifi-station-state")) {
+                return { ok: true, status: 200, json: async () => stationBody };
+            }
+            // Everything else (wifi-scan, info, tailscale…) → empty-ok.
+            return { ok: true, status: 200, json: async () => ({}) };
+        });
+        mount(container, { fetchSettings: async () => SAMPLE, onSave: async () => {} });
+        return container;
+    }
+
+    it("shows the LIVE connected SSID even when no join was submitted", async () => {
+        // NON-VACUITY: the applier fields are the already-connected-at-boot
+        // shape (idle / ssid null) — the exact state that rendered blank.
+        // Only reading connected_ssid can make this pass.
+        const container = mountWithStationState({
+            state: "idle",
+            detail: null,
+            ssid: null,
+            connected_ssid: "NEBULA",
+            connected_probe_ok: true,
+        });
+        await tick();
+        await tick();
+        const el = container.querySelector(".field-wifi-connected-ssid");
+        expect(el).toBeTruthy();
+        expect(el.textContent).toBe("NEBULA");
+        // qarl's literal complaint: the Join box must stop being blank.
+        expect(container.querySelector(".field-wifi-station-ssid").value).toBe(
+            "NEBULA",
+        );
+    });
+
+    it("says Not connected (never blank) when there is no association", async () => {
+        // A blank box is what made this 'crazy' — an absent answer must
+        // state itself.
+        const container = mountWithStationState({
+            state: "idle",
+            detail: null,
+            ssid: null,
+            connected_ssid: null,
+            connected_probe_ok: true,
+        });
+        await tick();
+        await tick();
+        const el = container.querySelector(".field-wifi-connected-ssid");
+        expect(el.textContent).toBe("Not connected");
+    });
+
+    it("shows the LIVE link, not the in-flight join target", async () => {
+        // Mid-join to GUEST while still on NEBULA: the indicator answers
+        // "what are we on", so it must say NEBULA — not the target.
+        const container = mountWithStationState({
+            state: "connecting",
+            detail: null,
+            ssid: "GUEST",
+            connected_ssid: "NEBULA",
+            connected_probe_ok: true,
+        });
+        await tick();
+        await tick();
+        expect(
+            container.querySelector(".field-wifi-connected-ssid").textContent,
+        ).toBe("NEBULA");
+    });
+});
+
+
+describe("Settings → Join — unknown must never masquerade as Not connected", () => {
+    it("says Unknown when the live probe could not answer", async () => {
+        // A failed nmcli probe returns connected_ssid null WITH
+        // probe_ok false. Rendering that as "Not connected" on a sign
+        // that IS connected is the bug this row exists to prevent.
+        const container = document.createElement("div");
+        vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+            if (String(url).includes("/api/settings/wifi-station-state")) {
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({
+                        state: "idle",
+                        detail: null,
+                        ssid: null,
+                        connected_ssid: null,
+                        connected_probe_ok: false,
+                    }),
+                };
+            }
+            return { ok: true, status: 200, json: async () => ({}) };
+        });
+        mount(container, { fetchSettings: async () => SAMPLE, onSave: async () => {} });
+        await tick();
+        await tick();
+        expect(
+            container.querySelector(".field-wifi-connected-ssid").textContent,
+        ).toBe("Unknown");
+    });
+});
+
+describe("Settings → Join — the prefill must never clobber operator input", () => {
+    function stateFetch(body) {
+        return vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+            const u = String(url);
+            if (u.includes("/api/settings/wifi-station-state")) {
+                return { ok: true, status: 200, json: async () => body };
+            }
+            if (u.includes("/api/system/wifi-scan")) {
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({ networks: [{ ssid: "NEBULA", signal_dbm: -50 }] }),
+                };
+            }
+            return { ok: true, status: 200, json: async () => ({}) };
+        });
+    }
+
+    it("leaves a TYPED ssid alone when a rescan prefills", async () => {
+        // The dispatch's named safety property. populateWifiScan is bound
+        // to the Rescan button, so "type MYNET -> click rescan" is a real
+        // user path; without the guard the prefill overwrites MYNET with
+        // the live NEBULA under the operator's cursor.
+        const container = document.createElement("div");
+        stateFetch({
+            state: "idle",
+            detail: null,
+            ssid: null,
+            connected_ssid: "NEBULA",
+            connected_probe_ok: true,
+        });
+        mount(container, { fetchSettings: async () => SAMPLE, onSave: async () => {} });
+        await tick();
+        await tick();
+
+        const box = container.querySelector(".field-wifi-station-ssid");
+        box.value = "MYNET";
+        container.querySelector(".settings-wifi-rescan").click();
+        await tick();
+        await tick();
+        await tick();
+
+        expect(box.value).toBe("MYNET");
+    });
+
+    it("DOES prefill when the operator has typed nothing", async () => {
+        // Control for the test above: proves the guard isn't just
+        // suppressing the prefill outright (which would pass the
+        // clobber test vacuously while breaking qarl's actual ask).
+        const container = document.createElement("div");
+        stateFetch({
+            state: "idle",
+            detail: null,
+            ssid: null,
+            connected_ssid: "NEBULA",
+            connected_probe_ok: true,
+        });
+        mount(container, { fetchSettings: async () => SAMPLE, onSave: async () => {} });
+        await tick();
+        await tick();
+
+        expect(container.querySelector(".field-wifi-station-ssid").value).toBe("NEBULA");
+    });
+});
+
+describe("Settings → Join — a failed probe must not leave a stale answer", () => {
+    it("falls back to Unknown when a later probe fails after a success", async () => {
+        // Sign on NEBULA -> indicator reads NEBULA -> wifi drops ->
+        // operator clicks rescan -> request fails. Leaving "NEBULA" up
+        // asserts a state we just failed to verify.
+        const container = document.createElement("div");
+        let fail = false;
+        vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+            const u = String(url);
+            if (u.includes("/api/settings/wifi-station-state")) {
+                if (fail) return { ok: false, status: 503, json: async () => ({}) };
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({
+                        state: "idle",
+                        detail: null,
+                        ssid: null,
+                        connected_ssid: "NEBULA",
+                        connected_probe_ok: true,
+                    }),
+                };
+            }
+            return { ok: true, status: 200, json: async () => ({ networks: [] }) };
+        });
+        mount(container, { fetchSettings: async () => SAMPLE, onSave: async () => {} });
+        await tick();
+        await tick();
+        const el = container.querySelector(".field-wifi-connected-ssid");
+        expect(el.textContent).toBe("NEBULA");
+
+        fail = true;
+        container.querySelector(".settings-wifi-rescan").click();
+        await tick();
+        await tick();
+        await tick();
+
+        expect(el.textContent).toBe("Unknown");
+    });
+});

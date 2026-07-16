@@ -186,18 +186,56 @@ def _redact_secrets(dump: dict[str, Any]) -> dict[str, Any]:
 
 @router.get("/wifi-station-state")
 async def get_wifi_station_state() -> dict[str, Any]:
-    """Return the in-memory station-mode applier status. The UI polls
-    this after submitting a PUT/PATCH so the operator sees connecting
-    -> connected | failed transitions without a page reload.
+    """Return the station-mode status for the Settings Join section.
 
-    Shape: {state, detail, ssid}. `state` is one of
-    'idle' / 'connecting' / 'connected' / 'failed' / 'disabled'.
+    Shape: {state, detail, ssid, connected_ssid, connected_probe_ok}.
+    Called by settings.js on panel load and on each Rescan click (it is
+    not polled; `state`/`detail` currently have no UI consumer).
+
+    Two DIFFERENT questions, deliberately kept apart:
+
+    * `state` / `detail` / `ssid` — the in-memory APPLIER status: what
+      the last apply() *in this process* was doing. `ssid` is that
+      attempt's TARGET, not the live link. Right answer to "how is the
+      join I just submitted going?"; wrong answer to "what are we on?"
+      (a sign that booted already-connected never ran an apply, so it
+      reports idle/None while happily associated).
+
+    * `connected_ssid` — the LIVE association, read fresh from
+      NetworkManager, same source the boot card uses so the two
+      surfaces can't disagree about what network the sign is on.
+
+    * `connected_probe_ok` — whether that live read actually ANSWERED.
+      Load-bearing: a null `connected_ssid` is ambiguous between
+      "definitely not connected" and "we couldn't tell", and rendering
+      the latter as "Not connected" on a sign that IS connected is the
+      bug class this endpoint exists to avoid. False => the caller must
+      say "unknown", never "not connected".
+
+    This reads `active_wlan0_ssid_probe`, NOT `active_wlan0_ssid`: the
+    latter fails soft to None for no-nmcli / timeout / non-zero rc as
+    well as for genuinely-not-connected, so it cannot answer the
+    probe_ok question at all. The blocking nmcli call runs off the event
+    loop at the probe's own default timeout (matching the boot card — an
+    aggressive override would turn a slow-but-connected Pi into a false
+    "not connected").
     """
     state = wifi_station.current_state()
+    connected_ssid: str | None = None
+    connected_probe_ok = False
+    try:
+        from openmarquee.network_supervisor import active_wlan0_ssid_probe
+
+        connected_probe_ok, connected_ssid = await asyncio.to_thread(active_wlan0_ssid_probe)
+    except Exception:  # noqa: BLE001 - fail-soft: the applier fields still answer
+        log.debug("wifi-station-state: live SSID probe raised", exc_info=True)
+        connected_probe_ok, connected_ssid = False, None
     return {
         "state": state.state,
         "detail": state.detail,
         "ssid": state.ssid,
+        "connected_ssid": connected_ssid,
+        "connected_probe_ok": connected_probe_ok,
     }
 
 

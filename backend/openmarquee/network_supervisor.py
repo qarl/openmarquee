@@ -720,8 +720,30 @@ def _probe_existing_wifi_connection(*, timeout_s: float = 5.0) -> str | None:
     `timeout_s` bounds the subprocess so a wedged nmcli can't stall
     supervisor construction indefinitely.
     """
+    # Thin wrapper over _probe_existing_wifi_connection_ex -- ONE copy of
+    # the nmcli device-status logic, collapsed to this function's original
+    # None-for-both-failure-and-not-connected contract.
+    _probe_ok, conn = _probe_existing_wifi_connection_ex(timeout_s=timeout_s)
+    return conn
+
+
+def _probe_existing_wifi_connection_ex(*, timeout_s: float = 5.0) -> tuple[bool, str | None]:
+    """(probe_ok, connection_name) sibling of ``_probe_existing_wifi_connection``.
+
+    ``_probe_existing_wifi_connection`` returns None for BOTH "nmcli says
+    wlan0 is not connected" and "nmcli could not be asked" — a conflation
+    that is fine for its callers (they treat None as "don't skip
+    onboarding") but NOT for a UI indicator: rendering "Not connected" on
+    a sign that is happily on NEBULA, merely because nmcli timed out, is
+    the exact class of lie the Settings indicator exists to avoid.
+
+    probe_ok=False  -> we could not read the link (no nmcli / timeout /
+                       OSError / non-zero rc). Say nothing about state.
+    probe_ok=True   -> nmcli answered. ``connection`` is the active wlan0
+                       profile name, or None when genuinely not connected.
+    """
     if not shutil.which("nmcli"):
-        return None
+        return False, None
     try:
         result = subprocess.run(
             ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"],
@@ -731,24 +753,52 @@ def _probe_existing_wifi_connection(*, timeout_s: float = 5.0) -> str | None:
             check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return None
+        return False, None
     if result.returncode != 0:
-        return None
+        return False, None
     for line in result.stdout.splitlines():
         parts = _split_nmcli_terse_row(line)
         if len(parts) < 4:
             continue
         device, dev_type, state, connection = parts[0], parts[1], parts[2], parts[3]
-        # DEVICE is stable "wlan0" on Pi OS; TYPE stays "wifi"; STATE
-        # is "connected" only when NM has an IP + carrier. An empty
-        # CONNECTION column means no active profile (e.g. hotspot AP
-        # would show as its own connection name — filtered by the
-        # SSID probe below, but nmcli only exposes an AP profile as
-        # DEVICE=wlan0 if the operator ran ap-mode, which we ignore
-        # by requiring a real CONNECTION name here anyway).
         if device == "wlan0" and dev_type == "wifi" and state == "connected" and connection:
-            return connection
-    return None
+            return True, connection
+    # nmcli answered and no connected wlan0 row was present: genuinely off.
+    return True, None
+
+
+def active_wlan0_ssid_probe(*, timeout_s: float = 5.0) -> tuple[bool, str | None]:
+    """(probe_ok, ssid) — the un-conflated form of ``active_wlan0_ssid``.
+
+    Same live read, but distinguishes "nmcli answered and wlan0 is not
+    associated" (True, None) from "we could not read the link" (False,
+    None). ``active_wlan0_ssid`` is a thin wrapper over this and keeps its
+    original fail-soft None-for-both contract for its existing callers
+    (the boot card, supervisor seeding).
+    """
+    probe_ok, conn = _probe_existing_wifi_connection_ex(timeout_s=timeout_s)
+    if not probe_ok:
+        return False, None
+    if conn is None:
+        return True, None
+    if not shutil.which("nmcli"):
+        return False, None
+    try:
+        result = subprocess.run(
+            ["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", conn],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False, None
+    if result.returncode != 0:
+        return False, None
+    ssid = result.stdout.rstrip("\n")
+    # nmcli resolved the profile but the SSID field is empty: we asked and
+    # got a real (if useless) answer -- report probe_ok with no ssid.
+    return True, (ssid or None)
 
 
 def active_wlan0_ssid(*, timeout_s: float = 5.0) -> str | None:
@@ -770,28 +820,13 @@ def active_wlan0_ssid(*, timeout_s: float = 5.0) -> str | None:
     openmarquee-managed profiles (e.g. name "openmarquee-mgmt-wifi",
     SSID "qarl") — that name/SSID confusion is part of the bug.
     """
-    conn = _probe_existing_wifi_connection(timeout_s=timeout_s)
-    if not conn:
-        return None
-    if not shutil.which("nmcli"):
-        return None
-    try:
-        result = subprocess.run(
-            # -g emits the bare value (no "field:" prefix), single line.
-            ["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", conn],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return None
-    if result.returncode != 0:
-        return None
-    # A WPA2 SSID may legitimately begin/end with spaces; strip only the
-    # trailing newline nmcli appends.
-    ssid = result.stdout.rstrip("\n")
-    return ssid or None
+    # Thin wrapper over active_wlan0_ssid_probe so the two can never
+    # drift. Collapses (probe_ok, ssid) back to this function's original
+    # fail-soft contract: None for BOTH "not connected" and "couldn't
+    # tell". Callers needing that distinction (the Settings indicator)
+    # must call active_wlan0_ssid_probe directly.
+    _probe_ok, ssid = active_wlan0_ssid_probe(timeout_s=timeout_s)
+    return ssid
 
 
 def _split_nmcli_terse_row(line: str) -> list[str]:
