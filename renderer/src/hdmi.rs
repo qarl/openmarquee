@@ -923,96 +923,42 @@ where
         .ok_or_else(|| anyhow!("no CRTC available for encoder {:?}", encoder_handle))?;
     eprintln!("using encoder {:?} crtc {:?}", encoder_handle, crtc_handle);
 
-    let gbm_dev = gbm::Device::new(card.0.try_clone().context("clone DRM fd for GBM")?)
-        .context("gbm_create_device failed")?;
-    let gbm_dev_ptr: *mut c_void = gbm_dev.as_raw() as *mut c_void;
-    if gbm_dev_ptr.is_null() {
-        bail!("gbm_device raw pointer is null");
-    }
-    // FYS bug 5 -- the scanout buffer is PANEL-NATIVE, so the GBM +
-    // EGL surfaces are created at PHYSICAL dims, never the logical
-    // (possibly swapped) dims.
-    let mut gbm_surface = gbm_dev
-        .create_surface::<()>(
-            phys_w as u32,
-            phys_h as u32,
-            GbmFormat::Argb8888,
-            BufferObjectFlags::SCANOUT | BufferObjectFlags::RENDERING,
-        )
-        .context("gbm_surface_create failed")?;
-
-    let egl_lib = unsafe {
-        egl::DynamicInstance::<egl::EGL1_5>::load_required().map_err(|e| {
-            anyhow!("eglDynamicInstance::<EGL1_5>::load_required failed: {e:?}")
-        })?
-    };
-    let display = unsafe {
-        egl_lib
-            .get_display(gbm_dev_ptr as egl::NativeDisplayType)
-            .ok_or_else(|| anyhow!("eglGetDisplay returned NO_DISPLAY"))?
-    };
-    let (egl_major, egl_minor) = egl_lib
-        .initialize(display)
-        .map_err(|e| anyhow!("eglInitialize failed: {e:?}"))?;
-    eprintln!("EGL {}.{}", egl_major, egl_minor);
-    // Flip-race fix D (2026-06-22): startup log of advertised EGL
-    // extensions so QA can confirm EGL_KHR_fence_sync is present
-    // (rotate_scanout_3_deep uses it for the per-slot per-buffer
-    // sync; if absent the rotation degenerates to no-sync and the
-    // snap-back race may reappear).
-    match egl_lib.query_string(Some(display), egl::EXTENSIONS) {
-        Ok(cs) => eprintln!(
-            "EGL_EXTENSIONS: {}",
-            cs.to_str().unwrap_or("<non-utf8>"),
-        ),
-        Err(e) => eprintln!("warn: eglQueryString(EGL_EXTENSIONS) failed: {e:?}"),
-    }
-
-    egl_lib
-        .bind_api(egl::OPENGL_ES_API)
-        .map_err(|e| anyhow!("eglBindAPI(GLES) failed: {e:?}"))?;
-    let cfg_attribs = [
-        egl::SURFACE_TYPE, egl::WINDOW_BIT,
-        egl::RED_SIZE, 8, egl::GREEN_SIZE, 8, egl::BLUE_SIZE, 8, egl::ALPHA_SIZE, 8,
-        egl::RENDERABLE_TYPE, egl::OPENGL_ES2_BIT, egl::NONE,
-    ];
-    let configs = egl_lib
-        .choose_first_config(display, &cfg_attribs)
-        .map_err(|e| anyhow!("eglChooseConfig failed: {e:?}"))?
-        .ok_or_else(|| anyhow!("no EGL config matched ARGB8888 + GLES2"))?;
-    let ctx_attribs = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
-    let context = egl_lib
-        .create_context(display, configs, None, &ctx_attribs)
-        .map_err(|e| anyhow!("eglCreateContext failed: {e:?}"))?;
-    let egl_surface = unsafe {
-        let raw_surface = gbm_surface.as_raw_mut() as *mut c_void;
-        egl_lib
-            .create_window_surface(display, configs, raw_surface, None)
-            .map_err(|e| anyhow!("eglCreateWindowSurface failed: {e:?}"))?
-    };
-    egl_lib
-        .make_current(display, Some(egl_surface), Some(egl_surface), Some(context))
-        .map_err(|e| anyhow!("eglMakeCurrent failed: {e:?}"))?;
-
-    // eglSwapInterval(0) (2026-05-09 QA Phase 2): pair with
-    // DRM_MODE_PAGE_FLIP_ASYNC so eglSwapBuffers does NOT wait
-    // for vsync to release a back buffer. Default EGL behaviour
-    // is interval=1 (vsync-lock), which on vc4 + GBM means
-    // 16.67ms quantization on swap returns even though the
-    // kernel page-flip is async. Setting interval=0 hands buffer
-    // management to the kernel/driver and lets us pace at
-    // arbitrary 33.3ms (or finer) intervals via clock_nanosleep.
-    // Tearing is still bounded -- the ASYNC page-flip already
-    // accepts the (sub-vblank) tear window.
-    if let Err(e) = egl_lib.swap_interval(display, 0) {
-        eprintln!("warn: eglSwapInterval(0) failed: {e:?}; defaulting to vsync-locked swap");
-    }
-
-    let gl = unsafe {
-        glow::Context::from_loader_function(|name| {
-            egl_lib.get_proc_address(name).map(|fp| fp as *const _).unwrap_or(ptr::null())
-        })
-    };
+    // r117 (2026-07-15) — the GBM+EGL bring-up dance moved to the
+    // shared `crate::egl_bringup` primitive (PR #B0.5 refactor)
+    // so `colorlight_gpu_compositor::HeadlessGpuCompositor` can call
+    // the same code path without duplication.  `for_drm_scanout`
+    // preset is byte-identical to what this function used inline
+    // pre-refactor (Argb8888 + SCANOUT|RENDERING + swap_interval(0));
+    // any observable behavior change here would be a regression.
+    //
+    // Destructured into individual locals so downstream code
+    // (~500 lines below using `&gl`, `&egl_lib`, `context`,
+    // `display`, etc.) keeps its original shape — the refactor
+    // is a lift of the bring-up + teardown ONLY, not a rewrite
+    // of `with_egl_session`.  Teardown stays inline below (see
+    // `warn:` clauses matching `crate::egl_bringup::tear_down_egl`)
+    // so hdmi.rs can continue to interleave EGL cleanup with its
+    // content-cache teardown as needed.
+    let handles = crate::egl_bringup::bring_up_egl(
+        &crate::egl_bringup::EglBringUpSpec::for_drm_scanout(phys_w as u32, phys_h as u32),
+        card,
+    )?;
+    // Local declaration order matters: Rust drops locals in
+    // REVERSE-declaration order at scope exit.  `_gbm_dev` MUST
+    // outlive `gbm_surface` (surface holds a WeakPtr into the
+    // device; destroying the device before the surface leaves the
+    // surface's Drop calling `gbm_surface_destroy` against a dead
+    // device — driver-defined behavior).  Pre-refactor hdmi.rs
+    // declared gbm_dev first + gbm_surface second (pre-refactor
+    // lines 926 + 935), which drops surface → device.  We preserve
+    // that order here — declare `_gbm_dev` FIRST so it drops LAST.
+    let _gbm_dev = handles._gbm_dev;
+    let egl_lib = handles.egl_lib;
+    let display = handles.display;
+    let context = handles.context;
+    let egl_surface = handles.egl_surface;
+    let mut gbm_surface = handles.gbm_surface;
+    let gl = handles.gl;
 
     let mut session = EglSession {
         egl_lib: &egl_lib,
@@ -1402,8 +1348,13 @@ where
     drop(session);
 
     // Cleanup — unconditional, warn-on-Err so the original cause
-    // propagates via `work_result?`. gbm_surface and gbm_dev drop
-    // via their RAII Drop impls when this scope exits.
+    // propagates via `work_result?`.  Inline (not calling
+    // `crate::egl_bringup::tear_down_egl`) so future work that
+    // interleaves EGL cleanup with content-cache teardown keeps
+    // this shape available.  The bring-up moved to the shared
+    // primitive; teardown stayed here for that reason.  Behavior
+    // MUST match `crate::egl_bringup::tear_down_egl` line-for-line
+    // — any divergence is a bug.
     if let Err(e) = egl_lib.make_current(display, None, None, None) {
         eprintln!("warn: eglMakeCurrent(unbind): {e:?}");
     }

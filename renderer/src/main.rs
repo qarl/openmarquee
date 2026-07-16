@@ -39,6 +39,12 @@ mod image_slide_tex;
 mod live_preview;
 mod cea861;
 mod content;
+// Shared GBM+EGL bring-up / tear-down primitive.  Two callers as of
+// PR #B0.5: hdmi.rs (DRM scanout path) + colorlight_gpu_compositor.rs
+// (headless Pattern A).  Linux-only; the module is cfg-gated because
+// its transitive deps (drm/gbm/EGL) are Linux-only.
+#[cfg(target_os = "linux")]
+mod egl_bringup;
 mod hdmi_logic;
 // Colorlight 5A-75B output backend (Phase 0: pure serializer + tests, host-
 // testable). Not yet wired into the output stage — the Linux AF_PACKET transport
