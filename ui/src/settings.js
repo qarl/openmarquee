@@ -539,6 +539,14 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     const statusEl = container.querySelector(".settings-status");
 
     const signNameEl = container.querySelector(".field-sign-name");
+    // qarl 2026-07-16: renaming the sign is DESTRUCTIVE -- sign_name drives
+    // hostnamectl, the tailnet node name, the setup-AP SSID and the mDNS
+    // host-name. This panel autosaves the whole payload on any input event,
+    // so a tab loaded before an out-of-band rename would re-submit the OLD
+    // name when the operator nudged an unrelated slider, renaming the sign
+    // backward. Only send sign_name once the operator has actually edited
+    // THIS field; the server keeps the stored name when it's absent.
+    let signNameDirty = false;
     const deviceIdEl = container.querySelector(".field-device-id");
     const deviceIdRow = container.querySelector(".field-device-id-row");
     const outputModeEl = container.querySelector(".field-output-mode");
@@ -1060,6 +1068,10 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                 deviceIdRow.hidden = true;
             }
             signNameEl.value = settings.sign_name ?? "";
+            // A fresh load re-syncs the field to the server's truth, so
+            // whatever the operator typed before is gone -- and so is any
+            // reason to submit it.
+            signNameDirty = false;
             ensureSelectValue(outputModeEl, settings.output_mode);
             outputModeEl.value = settings.output_mode ?? "hdmi";
             // Defaults match the backend (HDMI output → 1920×1080) so
@@ -1514,8 +1526,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     });
 
     function collectPayload() {
-        return {
-            sign_name: signNameEl.value,
+        const payload = {
             output_mode: outputModeEl.value,
             display_width: Number(widthEl.value),
             display_height: Number(heightEl.value),
@@ -1546,7 +1557,23 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             // checkbox.checked is the canonical source of truth.
             tailscale_https_enabled: tsHttpsEnabledEl.checked,
         };
+        // OMITTED unless the operator edited the name: absence tells the
+        // server to keep the stored value. See the dirty-flag note at the
+        // signNameEl declaration -- sending a stale name here renames the
+        // device.
+        if (signNameDirty) {
+            payload.sign_name = signNameEl.value;
+        }
+        return payload;
     }
+
+    // Only a genuine edit of the name field arms the rename. Bound to
+    // `input`, so it fires for typing, paste and undo -- but never for the
+    // programmatic `signNameEl.value = ...` in refresh(), which is what
+    // makes the stale-tab autosave harmless.
+    signNameEl.addEventListener("input", () => {
+        signNameDirty = true;
+    });
 
     // qarl 2026-05-12 (arc 3): drop the explicit "Save settings" button
     // and route all field changes through attachAutoSave's debounced
@@ -1559,7 +1586,23 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         validate: () => form.reportValidity() ? "" : "Fix the highlighted field.",
         save: async () => {
             const payload = collectPayload();
+            const sentName = payload.sign_name;
             await onSave(payload);
+            // Disarm once the rename is actually persisted. Without this the
+            // dirty flag latches for the life of the page (refresh() is only
+            // called by the secret-change modal), so ONE name edit would put
+            // the name back into every later autosave -- and an out-of-band
+            // rename between them would be undone by the next brightness
+            // nudge. That's the same backward-rename bug, just a narrower
+            // window.
+            //
+            // The value check guards a keystroke that lands DURING the
+            // in-flight PUT: clearing unconditionally would drop the newer
+            // name from the next payload and the rename would silently never
+            // save.
+            if ("sign_name" in payload && signNameEl.value === sentName) {
+                signNameDirty = false;
+            }
             // Tell the rest of the app the settings changed. main.js
             // re-mounts the editor + uploader panels with fresh dims
             // so the canvas size matches the operator's new display
