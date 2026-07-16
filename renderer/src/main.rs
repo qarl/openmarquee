@@ -49,8 +49,9 @@ mod colorlight_logic;
 // Colorlight 5A-75B TRANSPORT layer (Phase-1 prep, hardware-independent).
 // FrameSink trait + VecSink + StubPacketSink + encode_to_sink glue. The
 // real AF_PACKET-backed sink lands as a #[cfg(target_os = "linux")]
-// PacketSink swap on Phase-1 hardware day. #[allow(dead_code)] until the
-// pipeline seam (separate follow-up PR) picks the sink up.
+// PacketSink swap on Phase-1 hardware day.  #[allow(dead_code)] on
+// Phase-0-only surfaces (StubPacketSink, FrameSink::send_frames batch
+// path) exercised by tests but not yet by the arm-fill.
 #[allow(dead_code)]
 mod colorlight;
 // Colorlight COMPOSITOR layer — Phase-1 prep (hardware-independent).
@@ -58,9 +59,9 @@ mod colorlight;
 // rasterizer) + PNG-dump helper. The real GBM+EGL Pattern A compositor
 // lands as a sibling HeadlessGpuCompositor : Compositor in PR #B0.5
 // (behind #[cfg(target_os = "linux")]), pairing with a shared
-// egl_bringup refactor of hdmi.rs. #[allow(dead_code)] until the
-// OutputMode::Colorlight arm-fill (later commit of this arc) picks
-// the compositor up.
+// egl_bringup refactor of hdmi.rs.  #[allow(dead_code)] on Phase-0-only
+// surfaces (produce_rgba direct access, pattern accessor) exercised by
+// tests but not yet by the arm-fill.
 #[allow(dead_code)]
 mod colorlight_compositor;
 // HUB75-direct output backend. Phase 0 arm-fill wires this into
@@ -361,6 +362,15 @@ enum OutputMode {
     /// panel reach gate. Spec §5: keep reachable; panel-write
     /// path stubbed for v1.
     Hub75,
+    /// Colorlight 5A-75B receiver-card backend (Phase-1 prep).
+    /// Retrofit-EMC-tier path: HUB75 sign chassis + Colorlight
+    /// receiver card, driven by our Pi over raw L2 Ethernet.
+    /// Phase 0 arm-fill emits a diagnostic + optional PNG dump
+    /// of a `CpuCompositor` test pattern; the real GBM+EGL
+    /// compositor lands as PR #B0.5; the live-loop wiring +
+    /// real AF_PACKET `PacketSink` lands as PR #B1. See
+    /// `docs/colorlight-backend-design-2026-07-12.md`.
+    Colorlight,
     /// v1-spec-delta #11 (slice e) -- WS2812B serial-RGB strip
     /// reach gate. Spec §5: keep reachable; panel-write path
     /// stubbed for v1.
@@ -374,6 +384,14 @@ struct Args {
     /// scaffolded for the standalone mode that comes after pixels-on-screen.
     #[arg(long, value_enum, default_value_t = OutputMode::Hdmi)]
     output: OutputMode,
+
+    /// Dump ONE composited `CpuCompositor` frame to this PNG path and exit
+    /// cleanly (Mac dev PNG-out mode; only fires under `--output colorlight`).
+    /// Test pattern selected via `OPENMARQUEE_COLORLIGHT_TEST_PATTERN`
+    /// (default `solid-black`; see the arm-fill diagnostic for the accepted set).
+    /// PR-B0 discipline: hardware-independent, no GPU / GBM / EGL required.
+    #[arg(long)]
+    colorlight_dump_png: Option<PathBuf>,
 
     /// SDF arc slice B -- which AA path the MSDF fragment shaders use.
     /// Default `fixed` is empirically required: vc4 (Pi Zero 2 W /
@@ -2139,8 +2157,11 @@ fn main() -> Result<()> {
             );
         }
         OutputMode::Hub75 => {
-            // HUB75-direct backend (design doc:
-            // `docs/hub75-direct-backend-design-2026-07-12.md`).
+            // HUB75-direct backend.  Design doc lives on branch
+            // `task/hub75-direct-phase0-2026-07-12` (was originally
+            // authored there; not on main).  The Phase-1 FFI wire-up
+            // (rpi-rgb-led-matrix binding + GBM+EGL frame source)
+            // was queued as the follow-up to PR #75.
             //
             // Phase 0 arm-fill: build the config from
             // `OPENMARQUEE_HUB75_*` env, construct the `GpioSink`
@@ -2206,6 +2227,118 @@ fn main() -> Result<()> {
                         "hub75 output: exiting clean (no systemd restart cycle). \
                          Config parses but violates Hub75Config::validate() bounds; \
                          see hub75_logic.rs for the pinned ranges."
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        OutputMode::Colorlight => {
+            // Colorlight 5A-75B backend arm-fill (Phase-1 prep).
+            // Design doc: `docs/colorlight-backend-design-2026-07-12.md`.
+            //
+            // This is a --features-off skeleton: produces ONE frame
+            // through `CpuCompositor` → `encode_to_sink(VecSink)` and
+            // emits a diagnostic showing the pipeline is wired,
+            // OR (with `--colorlight-dump-png <path>`) writes that
+            // one frame to disk as a PNG for visual iteration on
+            // macOS without hardware.  Exits 0 in every case — a
+            // config typo becomes a loud journalctl line, NOT a
+            // systemd StartLimitBurst quarantine (memory ref
+            // `systemd_start_rate_limit_hazard`; same discipline
+            // as the Hub75 arm above).
+            //
+            // The frame source (real GBM+EGL headless compositor,
+            // Pattern A per design doc §5) is queued for PR #B0.5
+            // as a sibling `HeadlessGpuCompositor : Compositor`.
+            // The live-loop wiring + real AF_PACKET `PacketSink`
+            // is queued for PR #B1.  This arm's purpose is to
+            // prove the WHOLE architecture (compositor →
+            // encode_to_sink → FrameSink) is testable end-to-end
+            // on macOS today.
+            let pattern = match std::env::var("OPENMARQUEE_COLORLIGHT_TEST_PATTERN")
+                .ok()
+                .as_deref()
+            {
+                None | Some("") | Some("solid-black") => {
+                    colorlight_compositor::TestPattern::SolidBlack
+                }
+                Some("solid-white") => colorlight_compositor::TestPattern::SolidWhite,
+                Some("solid-red") => colorlight_compositor::TestPattern::SolidRed,
+                Some("solid-green") => colorlight_compositor::TestPattern::SolidGreen,
+                Some("solid-blue") => colorlight_compositor::TestPattern::SolidBlue,
+                Some("checkerboard") => {
+                    colorlight_compositor::TestPattern::Checkerboard8
+                }
+                Some("gradient") => colorlight_compositor::TestPattern::Gradient,
+                Some(other) => {
+                    eprintln!(
+                        "colorlight CONFIG ERROR: OPENMARQUEE_COLORLIGHT_TEST_PATTERN={other:?} \
+                         not recognized (expected one of: solid-black, solid-white, \
+                         solid-red, solid-green, solid-blue, checkerboard, gradient)."
+                    );
+                    eprintln!("colorlight output: exiting clean; fix the env and retry.");
+                    return Ok(());
+                }
+            };
+            use colorlight_compositor::Compositor as _;
+            let mut compositor = colorlight_compositor::CpuCompositor::card_default(pattern);
+            let card_w = compositor.card_width_px();
+            let card_h = compositor.card_height_px();
+            let fb = match colorlight_compositor::Compositor::produce_frame(&mut compositor) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("colorlight CONFIG ERROR: compositor produce_frame failed: {e}");
+                    eprintln!("colorlight output: exiting clean; see stderr for details.");
+                    return Ok(());
+                }
+            };
+            // Optional PNG dump for Mac dev iteration.  Fires
+            // regardless of whether the encode-to-sink step
+            // succeeds so an operator inspecting the compositor
+            // output can always get a PNG.
+            if let Some(dump_path) = args.colorlight_dump_png.as_ref() {
+                match colorlight_compositor::write_rgb888_png(&fb, card_w, card_h, dump_path)
+                {
+                    Ok(()) => eprintln!(
+                        "colorlight PNG dump: wrote {}x{} {:?} → {}",
+                        card_w,
+                        card_h,
+                        pattern,
+                        dump_path.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "colorlight PNG dump FAILED for {}: {}",
+                        dump_path.display(),
+                        e
+                    ),
+                }
+            }
+            // Prove the full pipeline: compositor → encoder → VecSink.
+            let cfg = colorlight_logic::ColorlightConfig::thinksign_default();
+            let mut sink = colorlight::VecSink::new();
+            match colorlight::encode_to_sink(&fb, &cfg, &mut sink) {
+                Ok(frame_count) => {
+                    eprintln!(
+                        "colorlight output (Phase 0 skeleton, arm-fill only):\n\
+                         \x20 compositor       = CpuCompositor (tiny_skia)\n\
+                         \x20 test pattern     = {:?}\n\
+                         \x20 card dims        = {}x{} px (canvas 128w x 96h; card native 96w x 128t transposed)\n\
+                         \x20 encoder          = colorlight_logic::serialize_frame\n\
+                         \x20 sink             = VecSink (in-memory recorder)\n\
+                         \x20 frames encoded   = {} (expect 130 = 1 brightness + 128 rows + 1 latch)\n\
+                         Whole pipeline reachable end-to-end on macOS.  Real GBM+EGL\n\
+                         compositor (Pattern A) lands as PR #B0.5.  Real AF_PACKET\n\
+                         PacketSink + live-loop wiring lands as PR #B1.  For visual\n\
+                         iteration on macOS pass --colorlight-dump-png <path>.",
+                        pattern, card_w, card_h, frame_count
+                    );
+                }
+                Err(e) => {
+                    eprintln!("colorlight CONFIG ERROR: encode_to_sink failed: {e}");
+                    eprintln!(
+                        "colorlight output: exiting clean; the encoder rejected the \
+                         compositor output — check `ColorlightConfig` dims match the \
+                         compositor's card_width_px x card_height_px."
                     );
                     return Ok(());
                 }
