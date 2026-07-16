@@ -40,10 +40,28 @@ PY
 )"
 
 if [ "$ENABLED" != "1" ]; then
-    echo "tailscale: disabled in settings — leaving alone"
-    # If we're disabled but tailscaled was running from a previous boot,
-    # bring it down so the node doesn't linger on the tailnet.
-    tailscale logout || true
+    echo "tailscale: disabled in settings — leaving the node alone"
+    # 2026-07-16 (qarl): this used to `tailscale logout` here, to stop a
+    # node lingering on the tailnet after being disabled. That is a very
+    # sharp knife pointed at the one lane we use to reach a sign we can't
+    # physically touch, and it fires on the say-so of a JSON field that
+    # has been wrong in three separate ways this week:
+    #   * until /api/system/tailscale/up started persisting it, the ONLY
+    #     writer was the Settings checkbox echoing its own value back on
+    #     save — so a sign whose operator clicked Enable but never ticked
+    #     and saved that box read False here and got logged out on its
+    #     first reboot. (Existing signs hold True precisely because someone
+    #     did tick it once, long ago.)
+    #   * the Settings checkbox is disabled until the station radio is on,
+    #     and that radio was itself wrong on an NM-provisioned sign, so
+    #     the field could not be set to True through the UI at all;
+    #   * a stale browser tab autosaving an unticked box would flip it
+    #     back to False under a working node.
+    # "The field said false" is exactly how a sign ends up unreachable,
+    # so we no longer act destructively on it. Disabling is now the
+    # operator's explicit act via `tailscale down` / the Tailscale admin
+    # console — the authority that actually owns that decision — rather
+    # than a boot script inferring it from settings.json.
     exit 0
 fi
 

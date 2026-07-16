@@ -547,6 +547,14 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     // backward. Only send sign_name once the operator has actually edited
     // THIS field; the server keeps the stored name when it's absent.
     let signNameDirty = false;
+    // qarl 2026-07-16: same treatment for the Tailscale toggle, and for the
+    // same reason -- it is a DESTRUCTIVE echo. `tailscale_enabled` gates
+    // `openmarquee-tailscale.service` at every boot, so a stale tab
+    // autosaving an unticked box would take a working node off the tailnet
+    // (i.e. off qarl's support lane) without anyone touching the toggle.
+    // Only send it once the operator has actually clicked it; the server
+    // keeps the stored value when it's absent.
+    let tsEnabledDirty = false;
     const deviceIdEl = container.querySelector(".field-device-id");
     const deviceIdRow = container.querySelector(".field-device-id-row");
     const outputModeEl = container.querySelector(".field-output-mode");
@@ -626,6 +634,35 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     // fieldset and disable its inputs. Exactly one radio is always active,
     // so the both-off state the server validator rejects is structurally
     // unreachable here.
+    function stationConfigExists() {
+        // What actually backs "Join": a saved network, or the legacy
+        // ssid+password pair. Mirrors the server's own notion of STA-active
+        // (settings.py `_check_wifi_has_at_least_one_mode_enabled`:
+        // `sta_active = bool(self.wifi_networks) or self.wifi_station_enabled`,
+        // whose legacy sub-clause then demands ssid+password when there are
+        // no networks).
+        return wifiNetworks.length > 0 || Boolean(stationSsidEl.value.trim());
+    }
+
+    function fallBackToApWhenStationIsUnbacked() {
+        // Removing the LAST saved network while the Join radio is on leaves
+        // `wifi_ap_enabled=false, wifi_station_enabled=true, wifi_networks=[]`
+        // with no legacy creds -- which the server rejects (correctly: that
+        // config has no way to reach the sign at all), so every autosave would
+        // 422 with no obvious way out. Before the radio was derived from
+        // wifi_networks this couldn't happen, because the radio was stuck on
+        // Create regardless of reality.
+        //
+        // The sign genuinely has no station config now, and AP is what it
+        // falls back to, so say so in the UI rather than let the operator
+        // stare at a failing save.
+        if (stationEnabledEl.checked && !stationConfigExists()) {
+            stationEnabledEl.checked = false;
+            apEnabledEl.checked = true;
+            syncWifiGrayOut();
+        }
+    }
+
     function syncWifiGrayOut() {
         const apOn = apEnabledEl.checked;
         const stationOn = stationEnabledEl.checked;
@@ -675,7 +712,13 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         tsEnabledEl.disabled = !stationOn;
         syncTailscaleGrayOut();
     }
-    tsEnabledEl.addEventListener("change", syncTailscaleGrayOut);
+    tsEnabledEl.addEventListener("change", () => {
+        // Only a real click arms it. syncWifiGrayOut()'s programmatic
+        // `disabled` writes and refresh()'s `checked` write don't fire
+        // `change`, which is what keeps a stale tab harmless.
+        tsEnabledDirty = true;
+        syncTailscaleGrayOut();
+    });
     // Reveal the WS2812B-only ordering control when the operator picks
     // that output mode; hide otherwise so it doesn't clutter HDMI / HUB75.
     function syncWs281xOrderVisibility() {
@@ -1072,6 +1115,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             // whatever the operator typed before is gone -- and so is any
             // reason to submit it.
             signNameDirty = false;
+            tsEnabledDirty = false;
             ensureSelectValue(outputModeEl, settings.output_mode);
             outputModeEl.value = settings.output_mode ?? "hdmi";
             // Defaults match the backend (HDMI output → 1920×1080) so
@@ -1085,12 +1129,31 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             // Single-select radios (qarl 2026-07-14: "only one mode at a
             // time"). Legacy settings may have BOTH modes enabled (the old
             // concurrent AP+STA regime); collapse to one selection — prefer
-            // Join when station is enabled, else Create (the fresh-device
-            // default is AP-only). On the next save, collectPayload writes
-            // the mutually-exclusive pair, migrating a concurrent device to
-            // a single mode. Recovery still works: if STA drops, the network
-            // supervisor turns the AP back on regardless of this flag.
-            const wifiJoinSelected = Boolean(settings.wifi_station_enabled);
+            // Join when the sign HAS a station config, else Create (the
+            // fresh-device default is AP-only). On the next save,
+            // collectPayload writes the mutually-exclusive pair, migrating a
+            // concurrent device to a single mode. Recovery still works: if
+            // STA drops, the network supervisor turns the AP back on
+            // regardless of this flag.
+            //
+            // qarl 2026-07-16: "i moved it from create a network to join a
+            // network, even though i'm pretty sure it's joined to the NEBULA
+            // network." He was reporting a WRONG RADIO. `wifi_station_enabled`
+            // is written only by captive-portal onboarding and by
+            // POST /settings/wifi-prefill (which has no caller) — the
+            // saved-networks/NM-import path never sets it. So a sign
+            // provisioned that way showed "Create WiFi Network" while sitting
+            // on NEBULA, and syncWifiGrayOut hid the entire saved-networks
+            // list behind it.
+            //
+            // `wifi_networks` is the real evidence of a station config, so
+            // derive from the SAME expression the server already treats as
+            // "STA active" (settings.py `_check_wifi_has_at_least_one_mode_enabled`:
+            // `bool(self.wifi_networks) or self.wifi_station_enabled`) rather
+            // than from the legacy intent flag alone.
+            const wifiJoinSelected =
+                Boolean(settings.wifi_networks?.length) ||
+                Boolean(settings.wifi_station_enabled);
             apEnabledEl.checked = !wifiJoinSelected;
             ssidEl.value = settings.wifi_ssid ?? "";
             // Batch 20.4: GET returns "<set>" / null for the 3 secret
@@ -1473,6 +1536,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             removeBtn.addEventListener("click", () => {
                 wifiNetworks.splice(index, 1);
                 renderWifiNetworksList();
+                fallBackToApWhenStationIsUnbacked();
                 // Fire autosave: the form-level input event is the
                 // trigger attachAutoSave listens for.
                 form.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1551,7 +1615,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             })),
             ws281x_pixel_order: ws281xOrderEl.value || "row_major",
             timezone: tzEl.value || null,
-            tailscale_enabled: tsEnabledEl.checked,
             tailscale_auth_key: tsAuthKeyEl.value || null,
             // r53: HTTPS toggle. The field is bool (not nullable);
             // checkbox.checked is the canonical source of truth.
@@ -1563,6 +1626,9 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         // device.
         if (signNameDirty) {
             payload.sign_name = signNameEl.value;
+        }
+        if (tsEnabledDirty) {
+            payload.tailscale_enabled = tsEnabledEl.checked;
         }
         return payload;
     }
@@ -1587,6 +1653,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         save: async () => {
             const payload = collectPayload();
             const sentName = payload.sign_name;
+            const sentTsEnabled = payload.tailscale_enabled;
             await onSave(payload);
             // Disarm once the rename is actually persisted. Without this the
             // dirty flag latches for the life of the page (refresh() is only
@@ -1602,6 +1669,12 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             // save.
             if ("sign_name" in payload && signNameEl.value === sentName) {
                 signNameDirty = false;
+            }
+            if (
+                "tailscale_enabled" in payload &&
+                tsEnabledEl.checked === sentTsEnabled
+            ) {
+                tsEnabledDirty = false;
             }
             // Tell the rest of the app the settings changed. main.js
             // re-mounts the editor + uploader panels with fresh dims

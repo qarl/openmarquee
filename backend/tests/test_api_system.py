@@ -591,3 +591,106 @@ def test_clear_system_card_preview_requires_auth(client_auth_engaged: TestClient
     """Companion 401 pin for the clear-preview endpoint."""
     response = client_auth_engaged.post("/api/system/clear-system-card-preview")
     assert response.status_code == 401
+
+
+# ── 2026-07-16 (F2, handover-blocker): clicking Enable Tailscale brought the
+# node up for THAT BOOT ONLY. `openmarquee-tailscale.service` reads
+# `tailscale_enabled` from settings.json on every boot, and NOTHING in the
+# repo ever wrote that field except the Settings checkbox echoing itself — so
+# a sign whose operator enabled Tailscale but never ticked-and-saved the box
+# read False and got taken back off the tailnet on its first reboot. Worse,
+# the checkbox is disabled until the station radio is on, and that radio was
+# itself wrong on an NM-provisioned sign, so there was no path to True at all.
+# Scenario: Jason unboxes the sign, enables Tailscale, it works, he reboots,
+# and we lose remote support to a customer's device.
+
+
+def _tailscale_stub(tmp_path, monkeypatch):
+    import stat as _stat
+
+    stub = tmp_path / "tailscale"
+    stub.write_text(
+        "#!/usr/bin/env bash\necho 'visit https://login.tailscale.com/a/teststub42' >&2\nsleep 30\n"
+    )
+    stub.chmod(stub.stat().st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+    monkeypatch.setenv("OPENMARQUEE_TAILSCALE_BIN", str(stub))
+    return stub
+
+
+def test_tailscale_up_persists_enabled_so_it_survives_a_reboot(
+    client: TestClient, tmp_path, monkeypatch
+):
+    """THE FIX. Enabling must outlive the process that enabled it."""
+    assert client.get("/api/settings").json()["tailscale_enabled"] is False, (
+        "precondition: a fresh sign defaults to disabled"
+    )
+    _tailscale_stub(tmp_path, monkeypatch)
+
+    assert client.post("/api/system/tailscale/up").status_code == 200
+
+    assert client.get("/api/settings").json()["tailscale_enabled"] is True, (
+        "the boot unit reads this field; without it the node is logged off on the next reboot"
+    )
+
+
+def test_tailscale_up_does_not_persist_enabled_when_the_spawn_errors(
+    client: TestClient, monkeypatch
+):
+    """CONTROL: proves the write is gated on the spawn actually working,
+    not just unconditionally stamped by the endpoint."""
+    monkeypatch.setenv("OPENMARQUEE_TAILSCALE_BIN", "/nonexistent/tailscale")
+
+    res = client.post("/api/system/tailscale/up")
+
+    assert res.status_code == 200
+    assert res.json()["state"] == "error"
+    assert client.get("/api/settings").json()["tailscale_enabled"] is False, (
+        "a failed enable must not claim the sign is on the tailnet"
+    )
+
+
+def test_tailscale_up_preserves_other_settings(client: TestClient, tmp_path, monkeypatch):
+    """The persist path builds a full model; make sure it doesn't drop or
+    factory-reset neighbouring values (model_copy(update=) would skip the
+    validators — the settings.json quarantine hazard)."""
+    body = client.get("/api/settings").json()
+    body["brightness"] = 37
+    body["sign_name"] = "jasonssign1"
+    assert client.put("/api/settings", json=body).status_code == 200
+    _tailscale_stub(tmp_path, monkeypatch)
+
+    client.post("/api/system/tailscale/up")
+
+    after = client.get("/api/settings").json()
+    assert after["tailscale_enabled"] is True
+    assert after["brightness"] == 37
+    assert after["sign_name"] == "jasonssign1"
+
+
+def test_tailscale_up_persists_enabled_when_the_node_is_already_authenticated(
+    client: TestClient, tmp_path, monkeypatch
+):
+    """`tailscale up` on an already-registered node exits 0 WITHOUT printing
+    an auth URL, which start_up reports as state="error". Keying the persist
+    off that alone would skip exactly the sign this fix exists for: up on the
+    tailnet, but with the field False, so the boot unit never provisions
+    `serve` / HTTPS. Re-read the live status and persist anyway."""
+    import stat as _stat
+
+    stub = tmp_path / "tailscale"
+    # Exits 0, prints no auth URL -> start_up's EOF-without-URL branch.
+    stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+    stub.chmod(stub.stat().st_mode | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
+    monkeypatch.setenv("OPENMARQUEE_TAILSCALE_BIN", str(stub))
+
+    async def _authenticated():
+        return {"state": "authenticated", "hostname": "jasonssign1", "ipv4": "100.1.2.3"}
+
+    from openmarquee import tailscale
+
+    monkeypatch.setattr(tailscale, "read_status", _authenticated)
+
+    assert client.post("/api/system/tailscale/up").status_code == 200
+    assert client.get("/api/settings").json()["tailscale_enabled"] is True, (
+        "a node that is already up must still get its intent persisted"
+    )
