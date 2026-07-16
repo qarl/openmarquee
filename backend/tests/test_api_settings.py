@@ -1435,3 +1435,94 @@ def test_wifi_station_state_probe_uses_default_timeout(client, monkeypatch):
 
     client.get("/api/settings/wifi-station-state")
     assert seen == {}, f"probe must use its own default timeout, got overrides: {seen}"
+
+
+# ── qarl 2026-07-16: JasonsSign1 renamed ITSELF backward to fireplaceSign.
+# This PUT is a full-object replace and the Settings panel autosaves the
+# WHOLE payload on any input event, so a tab loaded before an out-of-band
+# rename re-submits the OLD name when the operator touches an unrelated
+# field -- and `previous.sign_name != validated.sign_name` reads that as an
+# intentional rename, firing `hostnamectl set-hostname <old name>` (plus
+# tailnet / AP SSID / mDNS, which follow it). The client now OMITS the field
+# unless the operator edited it; absence means "keep the stored name".
+
+
+def _settings_payload(client, **overrides):
+    """A full PUT body built from the CURRENT settings, as the panel's
+    autosave does -- then mutated. Round-trips the redacted secret
+    sentinels intact, exactly like the UI."""
+    body = client.get("/api/settings").json()
+    body.update(overrides)
+    return body
+
+
+def test_put_without_sign_name_keeps_the_stored_name(client, monkeypatch):
+    """THE BUG. A stale tab omits the name and nudges brightness; the sign
+    must keep the name it has. Fails on the pre-fix code, where an absent
+    key took the Pydantic default and renamed the device."""
+    from openmarquee import name_actuator
+
+    renames: list[str] = []
+    monkeypatch.setattr(name_actuator, "apply_in_background", lambda n: renames.append(n))
+
+    client.put("/api/settings", json=_settings_payload(client, sign_name="jasonssign1"))
+    renames.clear()
+
+    body = _settings_payload(client, brightness=42)
+    body.pop("sign_name")  # the operator never touched the name field
+    res = client.put("/api/settings", json=body)
+
+    assert res.status_code == 200
+    assert res.json()["sign_name"] == "jasonssign1", "the stored name must survive"
+    assert res.json()["brightness"] == 42, "the edit the operator DID make must land"
+    assert renames == [], (
+        "no rename actuator may fire for a save that never carried a name -- "
+        "this is what put hostnamectl on the path of a brightness slider"
+    )
+
+
+def test_put_with_a_changed_sign_name_still_renames(client, monkeypatch):
+    """CONTROL: the guard must not suppress renames outright, which would
+    pass the test above vacuously while breaking rename-via-Settings."""
+    from openmarquee import name_actuator
+
+    renames: list[str] = []
+    monkeypatch.setattr(name_actuator, "apply_in_background", lambda n: renames.append(n))
+
+    res = client.put("/api/settings", json=_settings_payload(client, sign_name="jasonssign1"))
+
+    assert res.status_code == 200
+    assert res.json()["sign_name"] == "jasonssign1"
+    assert renames == ["jasonssign1"], "an explicit rename must still actuate"
+
+
+def test_put_without_sign_name_does_not_mint_a_random_name(client, monkeypatch):
+    """The asymmetry worth pinning: for every OTHER field an absent key
+    means "take the Pydantic default". sign_name's default is
+    `default_factory=_default_sign_name`, which mints a FRESH RANDOM
+    `Sign<3-hex>` on every call -- so without the guard, omission wouldn't
+    just reset the name, it would rename the device to a different random
+    name on every single save. Absence must mean "keep previous"."""
+    import re
+
+    from openmarquee import name_actuator
+
+    renames: list[str] = []
+    monkeypatch.setattr(name_actuator, "apply_in_background", lambda n: renames.append(n))
+    client.put("/api/settings", json=_settings_payload(client, sign_name="jasonssign1"))
+    renames.clear()
+
+    body = _settings_payload(client)
+    body.pop("sign_name")
+    res = client.put("/api/settings", json=body)
+
+    name = res.json()["sign_name"]
+    assert name == "jasonssign1"
+    # Assert the FACTORY never ran, not merely that the name is unchanged:
+    # an earlier draft compared against `.default`, which is
+    # PydanticUndefined for a default_factory field -- a tautology that
+    # could never fail.
+    assert not re.fullmatch(r"Sign[0-9A-F]{3}", name), (
+        f"omitting sign_name minted a random default name: {name!r}"
+    )
+    assert renames == []

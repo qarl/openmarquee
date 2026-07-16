@@ -258,8 +258,13 @@ describe("mountSettings", () => {
 
         // Mutate a couple of fields and save.
         container.querySelector(".field-brightness").value = "42";
-        container.querySelector(".field-sign-name").value = "Kitchen";
-        container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
+        const nameEl = container.querySelector(".field-sign-name");
+        nameEl.value = "Kitchen";
+        // Dispatch on the FIELD, as a real edit does (the event bubbles to
+        // the form, which is what kicks autosave). sign_name only rides
+        // along when the operator actually edited it -- see the stale-tab
+        // tests below.
+        nameEl.dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
 
         expect(onSave).toHaveBeenCalledTimes(1);
@@ -1777,5 +1782,114 @@ describe("Settings → Join — a failed probe must not leave a stale answer", (
         await tick();
 
         expect(el.textContent).toBe("Unknown");
+    });
+});
+
+describe("Settings → renaming the sign is never a side effect", () => {
+    // qarl 2026-07-16: JasonsSign1 renamed ITSELF backward to fireplaceSign.
+    // sign_name drives hostnamectl + the tailnet node name + the setup-AP
+    // SSID + the mDNS host-name, and this panel autosaves the WHOLE payload
+    // on any input event -- so a tab loaded before an out-of-band rename
+    // re-submitted the OLD name the moment the operator touched an
+    // unrelated field.
+    function mountWith(signName, onSave) {
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => ({ ...SAMPLE, sign_name: signName }),
+            onSave,
+        });
+        return container;
+    }
+
+    it("omits sign_name when the operator touched only an unrelated field", async () => {
+        // THE BUG, exactly: the tab still holds "fireplacesign"; the sign is
+        // now "jasonssign1"; the operator nudges brightness. The name must
+        // NOT ride along -- absence tells the server to keep the stored one.
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        const container = mountWith("fireplacesign", onSave);
+        await tick();
+
+        const brightness = container.querySelector(".field-brightness");
+        brightness.value = "42";
+        brightness.dispatchEvent(new Event("input", { bubbles: true }));
+        await tick();
+
+        expect(onSave).toHaveBeenCalledTimes(1);
+        const payload = onSave.mock.calls[0][0];
+        expect("sign_name" in payload).toBe(false);
+        // the edit the operator DID make must still save
+        expect(payload.brightness).toBe(42);
+    });
+
+    it("sends sign_name when the operator actually edits the name", async () => {
+        // CONTROL for the test above: proves the guard doesn't just suppress
+        // renames outright, which would pass the stale-tab test vacuously
+        // while breaking qarl's rename-via-Settings workflow.
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        const container = mountWith("fireplacesign", onSave);
+        await tick();
+
+        const nameEl = container.querySelector(".field-sign-name");
+        nameEl.value = "jasonssign1";
+        nameEl.dispatchEvent(new Event("input", { bubbles: true }));
+        await tick();
+
+        const payload = onSave.mock.calls[0][0];
+        expect(payload.sign_name).toBe("jasonssign1");
+    });
+
+    it("stops sending sign_name once the rename has been saved", async () => {
+        // The dirty flag must DISARM after a successful save. If it latched
+        // for the life of the page, one name edit would re-arm the rename on
+        // every later autosave -- so an out-of-band rename followed by a
+        // brightness nudge would undo itself. Same bug, narrower window.
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        const container = mountWith("fireplacesign", onSave);
+        await tick();
+
+        const nameEl = container.querySelector(".field-sign-name");
+        nameEl.value = "jasonssign1";
+        nameEl.dispatchEvent(new Event("input", { bubbles: true }));
+        await tick();
+        expect(onSave.mock.calls[0][0].sign_name).toBe("jasonssign1");
+
+        const brightness = container.querySelector(".field-brightness");
+        brightness.value = "42";
+        brightness.dispatchEvent(new Event("input", { bubbles: true }));
+        await tick();
+
+        const latest = onSave.mock.calls[onSave.mock.calls.length - 1][0];
+        expect("sign_name" in latest).toBe(false);
+    });
+
+    it("stops sending sign_name again after a refresh re-syncs the field", async () => {
+        // A reload pulls the server's truth back into the box, so whatever
+        // the operator had typed is gone -- and with it any reason to submit
+        // a name. Without this reset the dirty flag latches on for the life
+        // of the page and every later autosave re-arms the rename.
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        const container = document.createElement("div");
+        const handle = mount(container, {
+            fetchSettings: async () => ({ ...SAMPLE, sign_name: "fireplacesign" }),
+            onSave,
+        });
+        await tick();
+
+        const nameEl = container.querySelector(".field-sign-name");
+        nameEl.value = "typed-then-abandoned";
+        nameEl.dispatchEvent(new Event("input", { bubbles: true }));
+        await tick();
+        expect(onSave.mock.calls[0][0].sign_name).toBe("typed-then-abandoned");
+
+        await handle.refresh();
+        await tick();
+
+        const brightness = container.querySelector(".field-brightness");
+        brightness.value = "7";
+        brightness.dispatchEvent(new Event("input", { bubbles: true }));
+        await tick();
+
+        const latest = onSave.mock.calls[onSave.mock.calls.length - 1][0];
+        expect("sign_name" in latest).toBe(false);
     });
 });

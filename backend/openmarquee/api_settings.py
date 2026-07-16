@@ -361,6 +361,37 @@ async def set_settings(
     for key in SECRET_FIELDS:
         if payload.get(key) == SECRET_SENTINEL:
             payload[key] = getattr(previous, key)
+    # 2026-07-16 (qarl, JasonsSign1 renamed itself backward to
+    # fireplaceSign): an ABSENT `sign_name` means "the operator did not
+    # touch the name field", so keep the stored value.
+    #
+    # This PUT is a full-object replace and the panel autosaves the WHOLE
+    # payload on any input event, so a tab loaded before an out-of-band
+    # rename holds the OLD name and re-submits it when the operator
+    # touches an unrelated field. `previous.sign_name != validated.
+    # sign_name` then reads as an intentional rename and fires
+    # `hostnamectl set-hostname <old name>` (plus tailnet / AP SSID /
+    # mDNS, which all follow it). Nudging a brightness slider on a stale
+    # tab renamed the sign backward -- that is the journal's
+    # `hostname changed from "JasonsSign1" to "fireplaceSign"`.
+    #
+    # The server cannot tell a stale echo from a deliberate rename by
+    # value alone, so the CLIENT now omits the field unless the operator
+    # edited it, and absence is the signal. Same shape as the secret
+    # sentinel above: a value the UI is only carrying, not authoring, is
+    # replaced by the stored one. Note the asymmetry with every other
+    # field here -- absence normally means "take the Pydantic default",
+    # which for sign_name would be a rename to the default name.
+    #
+    # The two halves are COUPLED, not belt-and-braces: an old client still
+    # sends the key, so this branch never fires for it and the stale-echo
+    # rename still lands -- the client half is what fixes the bug, and this
+    # is what makes the new client's omission safe. The skew that bites is
+    # the inverse: a cached NEW bundle against a rolled-back backend omits
+    # the field and `default_factory=_default_sign_name` mints a random
+    # `Sign<3-hex>`. deploy.sh ships both together, so that's rollback-only.
+    if "sign_name" not in payload:
+        payload["sign_name"] = previous.sign_name
     # 2026-07-03 (qarl handover B1): per-entry SECRET_SENTINEL swap
     # for `wifi_networks[i].password`. The UI submits `<set>` for a
     # network whose PSK the operator hasn't retyped (the response was
