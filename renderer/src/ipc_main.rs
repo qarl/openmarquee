@@ -1952,12 +1952,37 @@ where
     R: BufRead,
     W: Write,
 {
-    if params.output != "hdmi" {
+    // PR #B1 (2026-07-16) loosened this gate to accept `colorlight`
+    // in addition to `hdmi`.  Colorlight routes to a dedicated
+    // streaming pump on Linux (see `run_colorlight_stream_pump`);
+    // other targets still bail.
+    if params.output != "hdmi" && params.output != "colorlight" {
         return Err(anyhow!(
-            "output {:?} not supported; only hdmi",
+            "output {:?} not supported; expected `hdmi` or `colorlight`",
             params.output
         ));
     }
+
+    // Colorlight branch — Linux-only (needs raw AF_PACKET); short-
+    // circuits the HDMI-scanout / content_root machinery below.  The
+    // pump is self-paced (no per-Advance IPC) and self-contained
+    // (opens its own PacketSink on the configured NIC + spawns its
+    // own compositor via env).  Exits on SIGTERM.
+    #[cfg(target_os = "linux")]
+    {
+        if params.output == "colorlight" {
+            return run_colorlight_stream_pump(&params);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if params.output == "colorlight" {
+            return Err(anyhow!(
+                "output `colorlight` requires Linux (raw AF_PACKET); not available on this host"
+            ));
+        }
+    }
+
     let content_root = params
         .content_root
         .as_ref()
@@ -2183,6 +2208,288 @@ fn run_external_frame_pump(
                 skipped += 1;
             }
         }
+    }
+}
+
+/// PR #B1 (2026-07-16) — continuous Colorlight streaming pump.
+///
+/// Option S per the admin+prime scope-check: streams
+/// `Compositor`-generated test patterns via the real `PacketSink`
+/// (AF_PACKET) to the Colorlight 5A-75B receiver card at design-doc
+/// §2's default 20 Hz cadence.  Self-paced, single-threaded blocking
+/// per anti-list ("no concurrency in #B1 pump").  Exits on
+/// `crate::sigterm::is_shutdown_requested()`; does NOT read stdin
+/// during the pump (any queued `Close` IPC would be ignored — safe
+/// per Phase-1 discipline; SIGTERM is the clean-exit path).
+///
+/// Env config (all prefixed `OPENMARQUEE_COLORLIGHT_*`, all optional):
+///   - `COMPOSITOR` = `cpu` (default) | `gpu`.  `gpu` picks
+///     `HeadlessGpuCompositor` (Linux Pattern A); if bring-up
+///     fails, LOGS + falls back to `CpuCompositor` so the pump
+///     still starts.  `cpu` is the safer/tested default per
+///     prime's Card-sharing sharpening (fresh `Card::open` risk).
+///   - `IFACE` = network interface name (default `eth0`).
+///   - `TARGET_HZ` = target cadence (default `20`; range clamped
+///     to `5..=60`).
+///   - `PATTERN` = test pattern (default `solid-black`; same
+///     accepted set as the standalone `--output colorlight` arm).
+///   - `DRM_CARD` (from `OpenParams.drm_card` if set, else
+///     `/dev/dri/card0`) — only used when COMPOSITOR=gpu.
+///
+/// Reports every ~5 seconds (100 frames at 20 Hz) to stderr:
+/// frames encoded, bytes on wire, sendmmsg batches, current
+/// cadence measurement.  Operators use this for first-light
+/// sanity + cadence-holding QA.
+///
+/// **What this pump proves at first-light:**
+///   - USB-Ethernet + AF_PACKET socket works
+///   - Colorlight card accepts our encoded bytes
+///   - Card drives HUB75 panel correctly
+///   - Encoder produces bytes matching card protocol
+///   - Cadence sustained without drift
+///
+/// **What this pump does NOT do (deferred to #B2+):**
+///   - Real playlist content on the Colorlight sign (design
+///     conversation, not "one more PR" — see
+///     `colorlight_compositor.rs` §"Scope humility").
+#[cfg(target_os = "linux")]
+fn run_colorlight_stream_pump(params: &OpenParams) -> Result<()> {
+    use crate::colorlight::{encode_to_sink, FrameSink, PacketSink, SinkError};
+    use crate::colorlight_compositor::{Compositor, CpuCompositor, TestPattern};
+    use crate::colorlight_logic::ColorlightConfig;
+    use std::time::{Duration, Instant};
+
+    // ── Parse env config ───────────────────────────────────────
+    let iface = std::env::var("OPENMARQUEE_COLORLIGHT_IFACE")
+        .unwrap_or_else(|_| "eth0".to_string());
+    let target_hz: u32 = std::env::var("OPENMARQUEE_COLORLIGHT_TARGET_HZ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20)
+        .clamp(5, 60);
+    let target_period = Duration::from_micros(1_000_000 / target_hz as u64);
+    let pattern = parse_colorlight_pattern(
+        std::env::var("OPENMARQUEE_COLORLIGHT_PATTERN")
+            .as_deref()
+            .unwrap_or("solid-black"),
+    )?;
+    let compositor_pref = std::env::var("OPENMARQUEE_COLORLIGHT_COMPOSITOR")
+        .unwrap_or_else(|_| "cpu".to_string());
+
+    // ── Build compositor (Box<dyn Compositor>) ─────────────────
+    // CPU default: safer, no Card-sharing risk, works on any Linux.
+    // GPU opt-in: fresh `Card::open` per prime's Card-sharing
+    // sharpening (option i — deterministic scenario, not shared
+    // with HDMI's Card).
+    let (mut compositor, compositor_name): (Box<dyn Compositor>, &'static str) =
+        if compositor_pref == "gpu" {
+            let card_path = params
+                .drm_card
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/dev/dri/card0"));
+            // Fresh Card::open (option i) — deliberately separate
+            // from any HDMI-side Card ownership; documented as the
+            // tested Card-scenario per prime's sharpening.
+            match crate::Card::open(&card_path).and_then(|card| {
+                crate::colorlight_gpu_compositor::HeadlessGpuCompositor::card_default(
+                    pattern, &card,
+                )
+                .map_err(|e| anyhow!("HeadlessGpuCompositor: {e}"))
+            }) {
+                Ok(gpu) => {
+                    eprintln!(
+                        "colorlight pump: HeadlessGpuCompositor (Pattern A) using {}",
+                        card_path.display()
+                    );
+                    (
+                        Box::new(gpu),
+                        "HeadlessGpuCompositor (Pattern A: GBM+EGL+glClear)",
+                    )
+                }
+                Err(e) => {
+                    eprintln!(
+                        "colorlight pump: GPU bring-up via {} failed ({e}); \
+                         falling back to CpuCompositor",
+                        card_path.display()
+                    );
+                    (
+                        Box::new(CpuCompositor::card_default(pattern)),
+                        "CpuCompositor (fallback; GPU bring-up failed)",
+                    )
+                }
+            }
+        } else {
+            (
+                Box::new(CpuCompositor::card_default(pattern)),
+                "CpuCompositor (tiny_skia)",
+            )
+        };
+
+    // ── Open PacketSink ─────────────────────────────────────────
+    // Fatal if this fails — the whole pump is "send bytes on the
+    // wire"; without the socket there's nothing to do.
+    let mut sink = match PacketSink::open_colorlight_default(&iface) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("colorlight pump CONFIG ERROR: PacketSink open failed: {e}");
+            eprintln!(
+                "colorlight pump: exiting clean; check iface={:?} exists + \
+                 CAP_NET_RAW is granted (root, or `setcap cap_net_raw+ep`).",
+                iface
+            );
+            return Ok(());
+        }
+    };
+    let cfg = ColorlightConfig::thinksign_default();
+
+    // ── Startup diagnostic ──────────────────────────────────────
+    eprintln!(
+        "colorlight pump starting:\n\
+         \x20 compositor       = {}\n\
+         \x20 test pattern     = {:?}\n\
+         \x20 iface            = {} (dest MAC {:02x?})\n\
+         \x20 target cadence   = {} Hz ({} µs / frame)\n\
+         \x20 card dims        = {}x{} px\n\
+         Streaming until SIGTERM.  Report interval: every ~5 seconds.",
+        compositor_name,
+        pattern,
+        iface,
+        sink.dest_mac(),
+        target_hz,
+        target_period.as_micros(),
+        compositor.card_width_px(),
+        compositor.card_height_px(),
+    );
+
+    // ── The pump loop ───────────────────────────────────────────
+    // Frame-boundary-only SIGTERM polling (single atomic load,
+    // cheap).  Cadence via sleep-not-spin (matches existing
+    // ipc_main discipline).  Over-budget: skip sleep + log warn
+    // (no silent drop — surface pipeline stress).
+    //
+    // Reporting: every 100 frames (~5s at 20Hz) emit a one-line
+    // status: frames sent, bytes on wire, sendmmsg batches, live
+    // measured cadence.  Operators grep this at first-light.
+    let mut frame_no: u64 = 0;
+    let mut over_budget: u64 = 0;
+    let last_report_at = Instant::now();
+    let mut last_report_frame = 0u64;
+    let mut last_report_time = last_report_at;
+
+    loop {
+        if crate::sigterm::is_shutdown_requested() {
+            eprintln!(
+                "colorlight pump: SIGTERM received at frame {frame_no}; \
+                 exiting clean.  Total frames sent: {}; sendmmsg batches: {}; \
+                 over-budget: {}.",
+                sink.packets_sent(),
+                sink.batches_sent(),
+                over_budget
+            );
+            return Ok(());
+        }
+        let frame_start = Instant::now();
+
+        // Produce → encode → send.  produce_frame failure = the
+        // compositor rejected the pattern (e.g. GPU compositor +
+        // Checkerboard = Backend error); log + skip frame.  encode
+        // failure = geometry mismatch or similar; log + skip.
+        // sink failure = wire issue; log + skip (PartialSend is
+        // the notable case — pump doesn't retry the tail in this
+        // Phase-0 shape; a follow-up could).
+        let fb = match compositor.produce_frame() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("colorlight pump: produce_frame failed at frame {frame_no}: {e}");
+                std::thread::sleep(target_period);
+                continue;
+            }
+        };
+        match encode_to_sink(&fb, &cfg, &mut sink as &mut dyn FrameSink) {
+            Ok(_frame_count) => {}
+            Err(crate::colorlight::EncodeToSinkError::Sink(SinkError::PartialSend {
+                sent,
+                total,
+            })) => {
+                // Load-bearing case — mid-frame partial-send leaves
+                // the card half-latched.  Phase-0 discipline: LOG
+                // LOUD + continue (next full frame will re-latch
+                // the sign).  Follow-up would retry the tail
+                // frames[sent..total] here.
+                eprintln!(
+                    "colorlight pump: PartialSend at frame {frame_no} ({sent}/{total} \
+                     frames delivered; card may show mid-frame glitch until next \
+                     full frame)"
+                );
+            }
+            Err(e) => {
+                eprintln!("colorlight pump: encode_to_sink failed at frame {frame_no}: {e}");
+            }
+        }
+        frame_no += 1;
+
+        // Report every ~5 seconds.
+        if frame_no.wrapping_sub(last_report_frame) >= (target_hz as u64 * 5) {
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_report_time);
+            let frames_in_window = frame_no - last_report_frame;
+            let measured_hz = if elapsed.as_secs_f64() > 0.0 {
+                frames_in_window as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            eprintln!(
+                "colorlight pump: frames={frame_no} packets={} batches={} \
+                 over_budget={over_budget} measured_hz={:.2} (target {target_hz})",
+                sink.packets_sent(),
+                sink.batches_sent(),
+                measured_hz
+            );
+            last_report_frame = frame_no;
+            last_report_time = now;
+        }
+
+        // Cadence: sleep the remainder of the frame budget, else
+        // skip (over budget; log periodically).
+        let elapsed = frame_start.elapsed();
+        match target_period.checked_sub(elapsed) {
+            Some(rest) if !rest.is_zero() => std::thread::sleep(rest),
+            _ => {
+                over_budget += 1;
+                if over_budget % 20 == 1 {
+                    eprintln!(
+                        "colorlight pump: over-budget frame {frame_no} \
+                         (took {:.2}ms; target {:.2}ms) — count now {over_budget}",
+                        elapsed.as_secs_f64() * 1000.0,
+                        target_period.as_secs_f64() * 1000.0,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Parse the `OPENMARQUEE_COLORLIGHT_PATTERN` env into a
+/// `TestPattern` variant.  Same accepted set as the standalone
+/// `--output colorlight` arm.  Unknown values return a config-
+/// error `Err` (pump exits clean at the caller).
+#[cfg(target_os = "linux")]
+fn parse_colorlight_pattern(s: &str) -> Result<crate::colorlight_compositor::TestPattern> {
+    use crate::colorlight_compositor::TestPattern;
+    match s {
+        "" | "solid-black" => Ok(TestPattern::SolidBlack),
+        "solid-white" => Ok(TestPattern::SolidWhite),
+        "solid-red" => Ok(TestPattern::SolidRed),
+        "solid-green" => Ok(TestPattern::SolidGreen),
+        "solid-blue" => Ok(TestPattern::SolidBlue),
+        "checkerboard" => Ok(TestPattern::Checkerboard8),
+        "gradient" => Ok(TestPattern::Gradient),
+        other => Err(anyhow!(
+            "OPENMARQUEE_COLORLIGHT_PATTERN={other:?} not recognized \
+             (expected one of: solid-black, solid-white, solid-red, \
+             solid-green, solid-blue, checkerboard, gradient)"
+        )),
     }
 }
 

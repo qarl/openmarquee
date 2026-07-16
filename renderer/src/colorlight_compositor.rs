@@ -23,13 +23,25 @@
 //! purpose is:
 //!   - deterministic input for encoder/sink round-trip tests,
 //!   - Mac dev PNG-out mode for visual iteration without hardware,
-//!   - a testable stand-in until #B0.5 lands the real GPU compositor,
-//!     and until #B1 wires the live compositor output into the
-//!     paint loop.
+//!   - a testable stand-in for the GPU compositor on non-Linux
+//!     targets (or when the GPU compositor's bring-up fails on
+//!     Linux) — see `colorlight_gpu_compositor::HeadlessGpuCompositor`
+//!     (PR #B0.5) for the Linux GPU sibling behind the same
+//!     `Compositor` trait.
 //!
-//! It is NOT the production compositor. The production compositor is
-//! the existing renderer paint path; #B1 wires ITS output into the
-//! Compositor trait so the Colorlight backend receives real slides.
+//! For **Phase 1**, PR #B1 wires either compositor into a real
+//! `AF_PACKET`-backed streaming pump (`ipc_main.rs::run_colorlight_
+//! stream_pump`) so Colorlight hardware first-light validates the
+//! whole pipeline (compositor → encoder → PacketSink → wire →
+//! receiver card → HUB75 panel).
+//!
+//! Wiring the existing renderer paint pipeline's real-slide output
+//! THROUGH a `Compositor` implementation is a separate architecture
+//! conversation deferred to **#B2+**.  Design-doc §5's Pattern A
+//! already assumes a headless GBM+EGL compositor context distinct
+//! from HDMI's DRM-scanout one; the #B2 conversation is about how
+//! playlist content feeds INTO that headless context, not about
+//! tapping the HDMI paint path.
 
 use tiny_skia::{Color, Paint, PixmapMut, Rect, Transform};
 

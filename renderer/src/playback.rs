@@ -373,9 +373,12 @@ pub enum IpcRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OpenParams {
-    /// Output target name. One of `hdmi` / `mock` / `hub75` /
-    /// `ws2812b` per spec §5. Slice (c) only wires `hdmi`;
-    /// other targets warn-and-bail until their phases land.
+    /// Output target name.  One of `hdmi` / `mock` / `hub75` /
+    /// `ws2812b` / `colorlight` per spec §5.  `hdmi` runs the DRM
+    /// scanout path; `colorlight` runs the continuous streaming pump
+    /// (PR #B1, 2026-07-16 — see `run_colorlight_stream_pump`) via
+    /// AF_PACKET to the Colorlight 5A-75B receiver card.  Other
+    /// targets warn-and-bail until their phases land.
     pub output: String,
     /// Optional DRM card path override. None falls back to
     /// the existing /dev/dri/card{1,0} scan.
