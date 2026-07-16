@@ -18309,6 +18309,15 @@ pub fn maybe_paint_system_card_overlay(
             CardShape::Image { top_left, height } => {
                 paint_system_card_image(gl, mode_w, mode_h, *top_left, *height)?;
             }
+            // Boot-card redesign (qarl mockups 2026-07-16): hairline
+            // rules — the divider + the QR corner brackets. Reuses the
+            // same filled-quad draw Background/Chip already use, so the
+            // new primitive costs one arm here.
+            CardShape::Rule { top_left, size, color } => {
+                paint_system_card_rect(
+                    gl, mode_w, mode_h, top_left.0, top_left.1, size.0, size.1, *color,
+                );
+            }
             CardShape::QrPanel {
                 top_left,
                 size,
@@ -18892,25 +18901,12 @@ fn paint_system_card_text(
 
     let mut size_px = (max_height * mode_h as f32).max(8.0);
 
-    // Box covers the card from the anchor x rightward to the right
-    // edge (or symmetric for center-aligned). Vertical box is just
-    // tall enough for ~6 lines so multi-line text fits.
-    let box_x = anchor.0;
-    let box_y = anchor.1;
-    let box_w = match align {
-        crate::system_card::Align::Center => {
-            let half = box_x.min(1.0 - box_x);
-            (half * 2.0).clamp(0.05, 1.0)
-        }
-        _ => (1.0 - box_x - 0.046).max(0.05),
-    };
-    let box_h = (max_height * 6.0).min(1.0 - box_y).max(max_height);
-    // Shift box_x left by half its width for centered alignment so
-    // the TextLayer's left-anchored box still centers visually.
-    let box_x = match align {
-        crate::system_card::Align::Center => (anchor.0 - box_w / 2.0).max(0.0),
-        _ => box_x,
-    };
+    // Box geometry lives in hdmi_logic (pure + unit-tested): this file is
+    // Linux-cfg-gated, so anything here is invisible to macOS `cargo test`
+    // — which is precisely how the Align::Right box bug reached a review.
+    // See `system_card_text_box` for the per-align contract.
+    let (box_x, box_y, box_w, box_h) =
+        crate::hdmi_logic::system_card_text_box(anchor, align, max_height);
 
     let color_hex = format!(
         "#{:02x}{:02x}{:02x}",

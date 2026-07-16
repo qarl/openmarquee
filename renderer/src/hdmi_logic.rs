@@ -5607,6 +5607,48 @@ pub fn parse_v_align(s: &str) -> VAlign {
 ///
 /// Pure function — split out so a fit-to-box regression flips a
 /// host test, not a Pi visual diff.
+/// The card-text layout box for a `CardShape::Text`, in normalized card
+/// units: `(box_x, box_y, box_w, box_h)`.
+///
+/// Extracted from `hdmi.rs`'s `paint_system_card_text` (2026-07-16) so
+/// the ALIGNMENT CONTRACT is unit-testable — `hdmi.rs` is
+/// `#[cfg(target_os = "linux")]`, so macOS CI never compiles it and a
+/// bug here is invisible to `cargo test`. That is exactly how the
+/// `Align::Right` defect got in: Right had no caller until the boot
+/// card's two-colour URL, silently inherited the Left arm's box
+/// (`[anchor.0, 0.954]`), and right-aligned to 0.954 — painting the
+/// muted `http://` on top of the QR.
+///
+/// The contract each align makes with the caller:
+///   * `Left`   — the run STARTS at `anchor.0` (box runs rightward).
+///   * `Right`  — the run ENDS at `anchor.0` (box runs leftward).
+///   * `Center` — the run is CENTRED on `anchor.0`.
+///
+/// `max_height` is the em (see `CardShape::Text`).
+pub fn system_card_text_box(
+    anchor: (f32, f32),
+    align: crate::system_card::Align,
+    max_height: f32,
+) -> (f32, f32, f32, f32) {
+    use crate::system_card::Align;
+    let box_y = anchor.1;
+    let box_w = match align {
+        Align::Center => {
+            let half = anchor.0.min(1.0 - anchor.0);
+            (half * 2.0).clamp(0.05, 1.0)
+        }
+        Align::Right => anchor.0.max(0.05),
+        Align::Left => (1.0 - anchor.0 - 0.046).max(0.05),
+    };
+    let box_h = (max_height * 6.0).min(1.0 - box_y).max(max_height);
+    let box_x = match align {
+        Align::Center => (anchor.0 - box_w / 2.0).max(0.0),
+        Align::Right => (anchor.0 - box_w).max(0.0),
+        Align::Left => anchor.0,
+    };
+    (box_x, box_y, box_w, box_h)
+}
+
 pub fn box_to_ndc_quad(
     box_x: f32,
     box_y: f32,
@@ -5800,6 +5842,60 @@ where
 
 #[cfg(test)]
 mod tests {
+    // ── system_card_text_box: the ALIGNMENT CONTRACT ──────────────
+    // Extracted from the Linux-gated hdmi.rs so these can actually run
+    // on macOS CI. Align::Right had NO caller until the boot card's
+    // two-colour URL (2026-07-16) and silently inherited Left's box —
+    // right-aligning to the card's right edge (0.954) instead of the
+    // anchor, painting `http://` on top of the QR. Sacred review caught
+    // it; these pin the contract so it can't drift back.
+
+    #[test]
+    fn card_text_box_right_ends_at_the_anchor() {
+        use crate::system_card::Align;
+        // THE regression: the run must END at the anchor, i.e. the box's
+        // RIGHT edge == anchor.0. The old code gave box_x=anchor.0 and
+        // box_w=1-anchor.0-0.046 → right edge 0.954 regardless.
+        for &ax in &[0.2f32, 0.35, 0.5, 0.8] {
+            let (bx, _, bw, _) = system_card_text_box((ax, 0.4), Align::Right, 0.05);
+            assert!(
+                (bx + bw - ax).abs() < 1e-6,
+                "Right box must end at anchor {ax}; got right edge {}",
+                bx + bw
+            );
+            assert!(bx >= 0.0, "Right box must not start off-card: {bx}");
+        }
+    }
+
+    #[test]
+    fn card_text_box_left_starts_at_the_anchor_and_center_centers() {
+        use crate::system_card::Align;
+        // Guard the other two arms so the Right fix didn't disturb them.
+        let (bx, _, _, _) = system_card_text_box((0.07, 0.4), Align::Left, 0.05);
+        assert!((bx - 0.07).abs() < 1e-6, "Left box must start at the anchor");
+        let (bx, _, bw, _) = system_card_text_box((0.5, 0.4), Align::Center, 0.05);
+        assert!(
+            (bx + bw / 2.0 - 0.5).abs() < 1e-6,
+            "Center box must be centred on the anchor"
+        );
+    }
+
+    #[test]
+    fn card_text_box_right_and_left_abut_at_a_shared_anchor() {
+        use crate::system_card::Align;
+        // The two-colour URL's whole trick: a Right run and a Left run
+        // anchored at the SAME point must meet exactly — no gap, no
+        // overlap. (Right's right edge == Left's left edge == anchor.)
+        let split = 0.42f32;
+        let (rbx, _, rbw, _) = system_card_text_box((split, 0.4), Align::Right, 0.05);
+        let (lbx, _, _, _) = system_card_text_box((split, 0.4), Align::Left, 0.05);
+        assert!(
+            (rbx + rbw - lbx).abs() < 1e-6,
+            "right run ends at {} but left run starts at {lbx}",
+            rbx + rbw
+        );
+    }
+
     use super::*;
 
     // 2026-07-04 (Jason device H2 arc): pure-fn tests for the
