@@ -58,7 +58,7 @@ from pathlib import Path
 # mDNS URL (http://<hostname>.local) so the CONNECTED card shows the same
 # hostname-derived address as the boot identity card, not a hardcoded
 # "openmarquee.local". No import cycle (mdns imports os/socket only).
-from openmarquee.mdns import mdns_url
+from openmarquee.mdns import sign_url
 
 log = logging.getLogger(__name__)
 
@@ -1797,9 +1797,23 @@ class NetworkSupervisor:
             # renderer auto-clears if the supervisor is somehow
             # unable to emit ClearSystemCard on the LINGER→ONLINE
             # edge. Belt-and-suspenders with the max-lifetime cap.
+            # qarl 2026-07-16: tailnet name when Tailscale is up, else
+            # .local. CACHE-ONLY: this runs on the EVENT LOOP (apply_event
+            # is sync and supervisor_observe_loop is an asyncio task that
+            # calls it directly), so it must never spawn the ≤4s
+            # tailscaled probe -- that would stall playback + renderer IPC
+            # + HTTP with it. The observe loop awaits get_self_fqdn_online()
+            # off-loop each tick to keep this warm; a cold cache falls back
+            # to .local, which is honest rather than wrong.
+            try:
+                from openmarquee._tailscale_self import cached_self_fqdn_online
+
+                ts_fqdn = cached_self_fqdn_online()
+            except Exception:  # noqa: BLE001
+                ts_fqdn = None
             return {
                 "kind": "CONNECTED",
-                "address": mdns_url(),
+                "address": sign_url(ts_fqdn),
                 "ttl_ms": int(self.config.linger_seconds * 1000),
             }
         if new == SupervisorState.DEGRADED:

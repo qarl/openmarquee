@@ -40,9 +40,34 @@ def mdns_hostname() -> str:
 
 
 def mdns_url() -> str:
-    """``http://<hostname>.local`` — the address shown on the boot
-    identity card and encoded into its QR."""
+    """``http://<hostname>.local`` — the LAN address of the sign."""
     return f"http://{mdns_hostname()}.local"
+
+
+def sign_url(tailscale_fqdn: str | None = None) -> str:
+    """The address the sign advertises on its identity card — text AND QR.
+
+    qarl 2026-07-16: "the boot info card should show the .local address
+    when tailscale isn't active, but it should show the full tailscale
+    name when tailscale is active." Tailscale wins when it's up because
+    the sign is then reachable from any tailnet-authorised device rather
+    than only from the same LAN.
+
+    PURE on purpose. Resolving the FQDN needs a subprocess, and the three
+    card-building call sites live in three different execution contexts
+    (async startup, the event loop, the supervisor thread), so each
+    resolves the FQDN in whatever way is safe for it and passes the
+    result here. That keeps the RULE — and the text/QR agreement the card
+    depends on — in exactly one testable place.
+
+    `tailscale_fqdn` must already be gated on "Tailscale is actually
+    running" (see `_tailscale_self.get_self_fqdn_online`); a bare FQDN
+    survives in tailscaled's output while the node is Stopped, and
+    advertising it then would point at a sign that isn't there.
+    """
+    if tailscale_fqdn:
+        return f"http://{tailscale_fqdn}"
+    return mdns_url()
 
 
 # SIOCGIFADDR: Linux ioctl to read an interface's IPv4. The sockaddr_in

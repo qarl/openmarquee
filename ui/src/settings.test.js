@@ -495,7 +495,7 @@ describe("mountSettings", () => {
         expect(onSave.mock.calls[0][0].display_rotation).toBe(270);
     });
 
-    it("hydrates Tailscale fields + round-trips them to onSave", async () => {
+    it("hydrates Tailscale fields; does NOT round-trip the tailnet hostname", async () => {
         // qarl 2026-05-12 arc 4: the auth-key secret-field UI was
         // replaced by a URL-auth flow (Enable button + status pill +
         // auth-URL inline display). The wire-shape tailscale_auth_key
@@ -519,9 +519,9 @@ describe("mountSettings", () => {
         await tick();
 
         expect(container.querySelector(".field-tailscale-enabled").checked).toBe(true);
-        expect(container.querySelector(".field-tailscale-hostname").value).toBe(
-            "lobby-sign-01",
-        );
+        // qarl 2026-07-16: the tailnet-hostname control is gone -- the
+        // system hostname is the single source of truth.
+        expect(container.querySelector(".field-tailscale-hostname")).toBeNull();
         // Hidden input carries the redacted wire value.
         expect(container.querySelector(".field-tailscale-auth-key").value).toBe("<set>");
         // arc 4: Enable button + state pill + auth box wired into DOM.
@@ -535,12 +535,16 @@ describe("mountSettings", () => {
         await tick();
         const payload = onSave.mock.calls[0][0];
         expect(payload.tailscale_enabled).toBe(true);
-        expect(payload.tailscale_hostname).toBe("lobby-sign-01");
+        // qarl 2026-07-16: tailscale_hostname is NOT round-tripped any more.
+        // A stored value (SAMPLE has "lobby-sign-01" here) must NOT be echoed
+        // back -- re-sending it would re-pin a tailnet name that disagrees
+        // with the system hostname, which is the two-way-sync trap.
+        expect("tailscale_hostname" in payload).toBe(false);
         // PUT body echoes the sentinel intact.
         expect(payload.tailscale_auth_key).toBe("<set>");
     });
 
-    it("sends Tailscale hostname + key as null when cleared", async () => {
+    it("omits the tailnet hostname + sends key as null when cleared", async () => {
         const container = document.createElement("div");
         const onSave = vi.fn().mockResolvedValue(undefined);
         mount(container, {
@@ -549,13 +553,18 @@ describe("mountSettings", () => {
         });
         await tick();
 
-        container.querySelector(".field-tailscale-hostname").value = "  ";
         container.querySelector(".field-tailscale-auth-key").value = "";
         container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
 
         const payload = onSave.mock.calls[0][0];
-        expect(payload.tailscale_hostname).toBeNull();
+        // The PUT is a full-object replace (SystemSettings.model_validate),
+        // so OMITTING tailscale_hostname stores its default -- None -- which
+        // the field documents as "defaults to the operating-system hostname
+        // when unset". That is exactly the unified-hostname behaviour qarl
+        // asked for, and it's why removing the control is a behaviour change
+        // worth pinning rather than a pure UI deletion.
+        expect("tailscale_hostname" in payload).toBe(false);
         expect(payload.tailscale_auth_key).toBeNull();
     });
 

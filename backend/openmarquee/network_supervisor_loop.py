@@ -246,6 +246,23 @@ async def supervisor_observe_loop(
     try:
         while True:
             now = loop.time()
+            # 0. Keep the Tailscale self-FQDN cache warm.
+            #
+            # The system cards this loop publishes (via the sync
+            # apply_event -> _system_card_params_for_state chain, which
+            # runs ON this event loop) read that cache NON-BLOCKINGLY --
+            # they must, because a wedged tailscaled would otherwise stall
+            # this loop, the renderer IPC and HTTP for up to 4s. So the
+            # blocking work happens HERE, where we can await it off-loop.
+            # Cached for 60s, so this is a dict read on all but ~1 tick a
+            # minute. Fail-soft: a failure just leaves the cache cold and
+            # the cards fall back to the .local address.
+            try:
+                from openmarquee._tailscale_self import get_self_fqdn_online
+
+                await get_self_fqdn_online()
+            except Exception:  # noqa: BLE001
+                log.debug("network-supervisor: tailscale fqdn warm failed", exc_info=True)
             # 1. Maintain wpa_supplicant socket.
             if client is None and now >= next_connect_attempt:
                 try:

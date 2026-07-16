@@ -48,7 +48,7 @@ from openmarquee.dependencies import (
 )
 from openmarquee.dev import router as dev_router
 from openmarquee.fqdn_redirect_middleware import FqdnRedirectMiddleware
-from openmarquee.mdns import mdns_url, wlan0_ipv4
+from openmarquee.mdns import sign_url, wlan0_ipv4
 from openmarquee.perf_middleware import PerfMiddleware
 
 # LEVER 2 lazy-imports (2026-06-24): defer openmarquee.seed to first
@@ -297,9 +297,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         # FUTURE REFINEMENT (deferred, not this PR): two-phase re-publish to
         # fill in the SSID once STA joins.
         try:
+            from openmarquee._tailscale_self import get_self_fqdn_online
             from openmarquee.network_supervisor import active_wlan0_ssid
 
-            _boot_url = mdns_url()
+            # qarl 2026-07-16: Tailscale name when the tailnet is up, else
+            # .local. Awaited (not the blocking twin) because we're on the
+            # event loop; fail-soft to .local so a wedged tailscaled can
+            # never cost the sign its identity card.
+            try:
+                _boot_ts_fqdn = await get_self_fqdn_online()
+            except Exception:  # noqa: BLE001
+                _boot_ts_fqdn = None
+            _boot_url = sign_url(_boot_ts_fqdn)
             try:
                 _boot_ssid = await asyncio.to_thread(active_wlan0_ssid)
             except Exception:  # noqa: BLE001
@@ -433,7 +442,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             # BOTH the renderer's ttl auto-clear AND the catch-up sleep.
             BOOT_TTL_MS = 15000
 
-            def _params_for_state(st: str) -> dict | None:
+            # `url` is resolved by the caller: _params_for_state runs ON the
+            # event loop, and resolving the Tailscale FQDN can shell out for
+            # up to 4s against a wedged tailscaled. Passing it in keeps the
+            # blocking probe off the loop AND keeps mdns.sign_url the single
+            # place that decides tailnet-vs-.local.
+            def _params_for_state(st: str, url: str) -> dict | None:
                 if st == "SETUP":
                     # 2026-07-07: thread the real setup-AP join creds
                     # (ssid = hostname, pin = live WPA2 passphrase, plus a
@@ -448,7 +462,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 if st == "LINGER":
                     return {
                         "kind": "CONNECTED",
-                        "address": mdns_url(),
+                        "address": url,
                     }
                 if st == "DEGRADED":
                     # Same real setup-AP creds as SETUP — the DEGRADED card
@@ -474,7 +488,11 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 await asyncio.sleep(BOOT_TTL_MS / 1000.0 + 0.1)
                 try:
                     state_str = supervisor.current_state.value
-                    params = _params_for_state(state_str)
+                    try:
+                        _ts_fqdn = await get_self_fqdn_online()
+                    except Exception:  # noqa: BLE001
+                        _ts_fqdn = None
+                    params = _params_for_state(state_str, sign_url(_ts_fqdn))
                     if params is not None:
                         await asyncio.to_thread(renderer.render_system_card, params)
                 except Exception:  # noqa: BLE001
