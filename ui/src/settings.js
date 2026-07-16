@@ -313,13 +313,17 @@ const SECTION_TEMPLATE = `
                                  spawns 'tailscale up', captures the auth
                                  URL → operator opens it on their phone /
                                  signs in → poll detects authenticated. -->
+                            <!-- qarl 2026-07-16: the tailnet-hostname control is GONE.
+                                 The system hostname is the single source of truth now --
+                                 name_actuator propagates it to Tailscale, avahi, hostapd and
+                                 settings, and reconcile_names_from_hostname_at_boot re-derives
+                                 every surface from it on each backend start. A second,
+                                 TS-specific name control could only ever disagree with that,
+                                 which is the two-way-sync trap that renamed a sign back to
+                                 fireplaceSign. Omitting tailscale_hostname from the PUT leaves
+                                 it None, which the field itself documents as "defaults to the
+                                 operating-system hostname when unset". -->
                             <div class="row" style="gap: 10px; align-items: flex-end;">
-                                <label class="field om-field" style="flex: 1;">
-                                    <span>Hostname on tailnet</span>
-                                    <input type="text" class="om-input field-tailscale-hostname"
-                                           maxlength="63" readonly aria-readonly="true"
-                                           title="Pinned to the device ID. Renaming the display label doesn't churn magic-DNS.">
-                                </label>
                                 <div class="field om-field" style="flex: 1;">
                                     <span class="field-tailscale-state-label">Status</span>
                                     <div style="display: flex; gap: 8px; align-items: center;">
@@ -561,7 +565,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     const wifiRescanBtn = container.querySelector(".settings-wifi-rescan");
     const tzEl = container.querySelector(".field-timezone");
     const tsEnabledEl = container.querySelector(".field-tailscale-enabled");
-    const tsHostnameEl = container.querySelector(".field-tailscale-hostname");
     const tsAuthKeyEl = container.querySelector(".field-tailscale-auth-key");
     const tsHttpsEnabledEl = container.querySelector(
         ".field-tailscale-https-enabled",
@@ -648,7 +651,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         const stationOn = stationEnabledEl.checked;
         const tsOn = tsEnabledEl.checked;
         const bodyEnabled = stationOn && tsOn;
-        tsHostnameEl.disabled = !bodyEnabled;
         tsAuthKeyEl.disabled = !bodyEnabled;
         container
             .querySelector(".settings-tailscale")
@@ -1095,7 +1097,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             // reads tsEnabledEl.checked to decide dim / disabled state, so
             // the wrong class would stick on first paint if this came after.
             tsEnabledEl.checked = Boolean(settings.tailscale_enabled);
-            tsHostnameEl.value = settings.tailscale_hostname ?? "";
             tsAuthKeyEl.value = settings.tailscale_auth_key ?? "";
             // r53: hydrate HTTPS toggle. Model default is True so a
             // legacy settings.json missing the key reads as true here
@@ -1540,7 +1541,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             ws281x_pixel_order: ws281xOrderEl.value || "row_major",
             timezone: tzEl.value || null,
             tailscale_enabled: tsEnabledEl.checked,
-            tailscale_hostname: tsHostnameEl.value.trim() || null,
             tailscale_auth_key: tsAuthKeyEl.value || null,
             // r53: HTTPS toggle. The field is bool (not nullable);
             // checkbox.checked is the canonical source of truth.
