@@ -2826,10 +2826,25 @@ fn draw_text_layer_msdf(
     }
 
     // Stage 3: motion translate.
+    //
+    // qarl 2026-07-16 — PER-LETTER jitter: Shake now offsets each
+    // GLYPH independently (in the per-glyph loop below) instead of
+    // translating the whole laid-out line as a rigid unit. So Shake
+    // deliberately SKIPS this layer-level translate — applying both
+    // would double-move the letters (line drifts + letters jitter).
+    // Every other motion (ticker / bounce / …) is unchanged.
     let box_w_px = (layer.r#box.w * mode_w as f32).max(1.0);
     let box_h_px = (layer.r#box.h * mode_h as f32).max(1.0);
-    let (dx_px, dy_px) =
-        motion_offset_to_px(motion_kind, motion_state, box_w_px, box_h_px, size_px);
+    let per_glyph_shake = if motion_kind == MotionKind::Shake {
+        motion_state.shake
+    } else {
+        None
+    };
+    let (dx_px, dy_px) = if per_glyph_shake.is_some() {
+        (0.0, 0.0)
+    } else {
+        motion_offset_to_px(motion_kind, motion_state, box_w_px, box_h_px, size_px)
+    };
     if dx_px.abs() > 1e-4 || dy_px.abs() > 1e-4 {
         let dx_ndc = (dx_px / mode_w as f32) * 2.0;
         let dy_ndc = -(dy_px / mode_h as f32) * 2.0;
@@ -2888,11 +2903,29 @@ fn draw_text_layer_msdf(
     let tile_copies: &[f32] =
         if is_ticker { &tile_dx_ndc[..] } else { &tile_dx_ndc[..1] };
     for &copy_dx in tile_copies {
-    for q in &group.quads {
-        let xl = to_ndc_x(q.px_left) + copy_dx;
-        let xr = to_ndc_x(q.px_right) + copy_dx;
-        let yt = to_ndc_y(q.px_top);
-        let yb = to_ndc_y(q.px_bottom);
+    for (glyph_index, q) in group.quads.iter().enumerate() {
+        // qarl 2026-07-16 — per-LETTER jitter. For Shake, each glyph
+        // gets its own offset derived from (layer basis, glyph_index)
+        // instead of the line translating as a unit (Stage 3 above is
+        // skipped for Shake). Amplitude is unchanged (±0.5–4 % of
+        // glyph height), so letters jitter next to their neighbours
+        // and the word stays readable. px→NDC conversion mirrors
+        // Stage 3's exactly. Zero for every other motion.
+        let (gdx_ndc, gdy_ndc) = match per_glyph_shake {
+            Some(basis) => {
+                let (ox_norm, oy_norm) =
+                    crate::hdmi_logic::shake_glyph_offset_norm(basis, glyph_index);
+                (
+                    ((ox_norm * size_px) / mode_w as f32) * 2.0,
+                    -(((oy_norm * size_px) / mode_h as f32) * 2.0),
+                )
+            }
+            None => (0.0, 0.0),
+        };
+        let xl = to_ndc_x(q.px_left) + copy_dx + gdx_ndc;
+        let xr = to_ndc_x(q.px_right) + copy_dx + gdx_ndc;
+        let yt = to_ndc_y(q.px_top) + gdy_ndc;
+        let yb = to_ndc_y(q.px_bottom) + gdy_ndc;
         match q.kind {
             GlyphKind::Tofu => {
                 // Per-quad UVs [0, 1] for FS_TOFU's in-rect test.
