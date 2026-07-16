@@ -1,38 +1,30 @@
-//! Colorlight 5A-75B TRANSPORT layer — Phase-1 prep (hardware-independent).
+//! Colorlight 5A-75B TRANSPORT layer.
 //!
 //! `colorlight_logic.rs` is the pure L2 frame encoder (byte-exact, tested).
 //! This module is the transport surface that consumes those frames — the
-//! `FrameSink` trait + concrete implementations. Both host-testable + real
-//! AF_PACKET slot into the same trait, so the encoder → sink pipeline is
-//! provable BEFORE any hardware is present, and Day-1-with-card = swap
-//! `VecSink` for `AF_PACKETSink` behind the same trait.
+//! `FrameSink` trait + concrete implementations. All implementations
+//! satisfy the same trait so the encoder → sink pipeline is testable
+//! on macOS (`VecSink`) and shippable on Linux hardware (`PacketSink`).
 //!
-//! ## What's here (Phase-1 prep, no socket)
+//! ## What's here
 //!
 //! - `FrameSink` — object-safe trait; one `send_frame` per L2 packet, with
-//!   a default `send_frames` batch that real AF_PACKET can override with
-//!   `sendmmsg` when it lands.
+//!   a default `send_frames` batch that `PacketSink` overrides with
+//!   `sendmmsg(2)` for reduced per-frame syscall overhead.
 //! - `VecSink` — records every frame into an in-memory `Vec<Vec<u8>>`, for
-//!   loopback tests + property assertions.
-//! - `StubPacketSink` — structural stand-in for the eventual real
-//!   AF_PACKET-backed sink. Always returns `TransportUnavailable`.
-//!   Compiles cross-platform; exists so the pipeline+dispatch code can
-//!   name a concrete "real transport" sink type before the socket lands
-//!   without a `#[cfg]` fork at every call site.
+//!   loopback tests + property assertions.  Cross-platform.
+//! - `StubPacketSink` — structural stand-in that always returns
+//!   `TransportUnavailable`.  Cross-platform.  Kept alongside the real
+//!   `PacketSink` for host-side dispatch code that wants to name the
+//!   "real transport" type without opening a socket.
+//! - `PacketSink` (`#[cfg(target_os = "linux")]`) — the real AF_PACKET /
+//!   SOCK_RAW transport for the Colorlight receiver card (PR #B1).
+//!   Owns a raw socket bound to the operator-selected NIC via
+//!   `sockaddr_ll`; sends L2 frames via `sendto` (per-frame path) and
+//!   `sendmmsg(2)` (batch path).  RAII Drop closes the socket.
 //! - `encode_to_sink` — the encoder → sink glue helper. Takes an
-//!   `&mut dyn FrameSink` so callers can pick VecSink for tests + the
-//!   real sink for prod behind the same call.
-//!
-//! ## What's NOT here (deferred)
-//!
-//! - Real `AF_PACKET`/`SOCK_RAW` transport (Phase-1 hardware day; see
-//!   `docs/colorlight-backend-design-2026-07-12.md` §9). Will land as a
-//!   `#[cfg(target_os = "linux")]` module — likely a new `PacketSink`
-//!   struct that wraps `libc::sendto` + `sendmmsg` and REPLACES the stub
-//!   pointer-for-pointer.
-//! - The compositor → encoder glue (framebuffer capture off the render
-//!   loop). Separate PR per admin decision — this module is pure additive
-//!   with zero touch to the rendering pipeline.
+//!   `&mut dyn FrameSink` so callers can pick any sink behind the same
+//!   call.
 
 use crate::colorlight_logic::{serialize_frame, ColorlightConfig, SerializeError};
 
@@ -52,6 +44,14 @@ pub enum SinkError {
     /// state. `StubPacketSink` always emits this; a real socket sink
     /// would emit it on `EACCES` / `ENETDOWN` / etc.
     TransportUnavailable(String),
+    /// A `send_frames` batch sent SOME frames but not all — kernel
+    /// short-batched (queue pressure / driver anomaly).  Carries
+    /// counts so the caller can structurally decide whether to
+    /// retry the tail (frames `sent..total`) or accept the
+    /// mid-frame row-latch glitch on the sign.  Load-bearing for
+    /// PacketSink's `sendmmsg` batch path — mid-frame partial
+    /// sends leave the Colorlight card half-updated.
+    PartialSend { sent: usize, total: usize },
 }
 
 impl std::fmt::Display for SinkError {
@@ -59,6 +59,10 @@ impl std::fmt::Display for SinkError {
         match self {
             Self::Malformed(m) => write!(f, "colorlight sink: malformed frame ({m})"),
             Self::TransportUnavailable(m) => write!(f, "colorlight sink: transport unavailable ({m})"),
+            Self::PartialSend { sent, total } => write!(
+                f,
+                "colorlight sink: partial batch send ({sent}/{total} frames delivered; kernel queue pressure or driver anomaly)"
+            ),
         }
     }
 }
@@ -217,6 +221,347 @@ pub fn encode_to_sink(
     Ok(count)
 }
 
+// ── PacketSink — real AF_PACKET / SOCK_RAW transport (Linux-only) ────────
+//
+// The Phase-1 hardware sink.  Opens a raw L2 socket, binds it to the
+// operator-selected NIC by ifindex, and blasts each frame the encoder
+// produces onto the wire.  Frames arrive from `serialize_frame` with
+// the full 14-byte Ethernet header prepended (design-doc §2), so we
+// don't add / mutate any header bytes — kernel just DMAs to the NIC.
+//
+// Discipline notes:
+// - **RAII socket ownership.** `PacketSink::open` returns a `PacketSink`;
+//   `Drop` calls `libc::close(sockfd)`.  Any `?` in caller code releases
+//   the socket cleanly.
+// - **sendmmsg batch path.**  A single `serialize_frame` produces 1
+//   brightness + N rows + 1 latch = up to hundreds of frames per
+//   composited image.  Per-frame `sendto` = per-frame syscall = 4-figure
+//   syscalls/sec at cadence.  `sendmmsg(2)` bundles them into one
+//   syscall; `send_frames` overrides the trait default.
+// - **No `bind(2)`.**  For SOCK_RAW on AF_PACKET, we don't need to bind
+//   the socket — the destination sockaddr_ll on each `sendto` carries
+//   the ifindex.  Fewer failure paths, matches FPP's approach.
+// - **1000 Mbps link requirement.**  Design-doc §2 flags this as a
+//   hard prereq (FPP refuses <1000).  This module does NOT check;
+//   operator is trusted per Phase-0 discipline.  Warn/refuse gate is
+//   a follow-up (would need `/sys/class/net/<if>/speed` read).
+
+#[cfg(target_os = "linux")]
+mod packet_sink {
+    use super::{FrameSink, SinkError};
+    use crate::colorlight_logic::DEFAULT_DEST_MAC;
+    use std::ffi::CString;
+    use std::io;
+    use std::marker::PhantomData;
+    use std::os::unix::io::RawFd;
+
+    /// Real AF_PACKET / SOCK_RAW L2 transport for the Colorlight card.
+    ///
+    /// Owns a raw socket bound to the target NIC (by ifindex).  Each
+    /// `send_frame` = one `sendto(2)`; each `send_frames` = one
+    /// `sendmmsg(2)` (bundled syscall) for a full serialized frame's
+    /// worth of packets.
+    ///
+    /// **Privilege:** the process needs `CAP_NET_RAW` (root or
+    /// `setcap cap_net_raw+ep /path/to/openmarquee-render`).
+    /// Design-doc §4 flagged this.  Constructor returns
+    /// `TransportUnavailable("EPERM ...")` if the socket open is
+    /// denied.
+    ///
+    /// **Thread-safety:** deliberately `!Send + !Sync` (via the
+    /// `PhantomData<*const ()>` marker).  The Colorlight pump is
+    /// single-threaded blocking per admin's #B1 anti-list ("no
+    /// concurrency in #B1 pump").  Any future edit that tries to
+    /// spawn the sink onto a worker thread stops compiling at the
+    /// marker, forcing a scope discussion rather than a silent
+    /// concurrency regression.
+    ///
+    /// **No tests in this module.** Constructor + syscall paths need
+    /// a real Linux + `CAP_NET_RAW` + a valid ifname; CI runs on
+    /// macOS + generic Linux hosts without CAP_NET_RAW.  The pump
+    /// layer (Commit 2) exercises the whole path against Phase-1
+    /// hardware at first-light; end-to-end integration through
+    /// `VecSink` is already covered by PR #88's tests, so the trait
+    /// contract is guarded.
+    #[derive(Debug)]
+    pub struct PacketSink {
+        ifname: String,
+        ifindex: i32,
+        dest_mac: [u8; 6],
+        sockfd: RawFd,
+        packets_sent: u64,
+        batches_sent: u64,
+        /// Compile-time marker: PacketSink owns a raw fd; hoisting
+        /// it across threads without explicit synchronization is
+        /// a footgun.  See struct docstring.
+        _not_send_sync: PhantomData<*const ()>,
+    }
+
+    impl PacketSink {
+        /// Open a raw L2 socket bound to `ifname` for destination MAC
+        /// `dest_mac`.  `ETH_P_ALL` protocol (no filter — we're a
+        /// sender only; the kernel doesn't filter outbound).
+        ///
+        /// Fails cleanly with `TransportUnavailable` if:
+        /// - The ifname doesn't exist (`if_nametoindex` returns 0).
+        /// - The socket open is denied (EPERM = no `CAP_NET_RAW`).
+        /// - Any other syscall error.  Errno is captured in the
+        ///   message so operators can act on it (EACCES / ENODEV /
+        ///   ENETDOWN / etc.).
+        pub fn open(ifname: impl Into<String>, dest_mac: [u8; 6]) -> Result<Self, SinkError> {
+            let ifname = ifname.into();
+
+            // if_nametoindex — returns 0 on error, else the ifindex.
+            let c_ifname = CString::new(ifname.as_bytes()).map_err(|e| {
+                SinkError::TransportUnavailable(format!(
+                    "colorlight PacketSink: ifname {ifname:?} contains NUL: {e}"
+                ))
+            })?;
+            let ifindex = unsafe { libc::if_nametoindex(c_ifname.as_ptr()) };
+            if ifindex == 0 {
+                let err = io::Error::last_os_error();
+                return Err(SinkError::TransportUnavailable(format!(
+                    "colorlight PacketSink: if_nametoindex({ifname:?}) failed: {err}"
+                )));
+            }
+            let ifindex = ifindex as i32;
+
+            // socket(AF_PACKET, SOCK_RAW, 0)
+            // Protocol = 0: we're sender-ONLY; leaving the protocol
+            // filter at 0 means the kernel does NOT enqueue inbound
+            // packets to this socket's receive queue (which we never
+            // read).  ETH_P_ALL would cause every inbound Ethernet
+            // frame on the host to be copied to this socket's rx
+            // buffer — pure book-keeping waste.
+            let sockfd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0) };
+            if sockfd < 0 {
+                let err = io::Error::last_os_error();
+                return Err(SinkError::TransportUnavailable(format!(
+                    "colorlight PacketSink: socket(AF_PACKET, SOCK_RAW) failed: {err} \
+                     (CAP_NET_RAW required — see design-doc §4)"
+                )));
+            }
+
+            // No explicit bind — for SOCK_RAW AF_PACKET sending, the
+            // sockaddr_ll passed to sendto carries the ifindex.
+            // Matches FPP's approach; fewer failure paths.
+
+            Ok(Self {
+                ifname,
+                ifindex,
+                dest_mac,
+                sockfd,
+                packets_sent: 0,
+                batches_sent: 0,
+                _not_send_sync: PhantomData,
+            })
+        }
+
+        /// Colorlight-defaults constructor — uses `DEFAULT_DEST_MAC`
+        /// (`11:22:33:44:55:66`, spec-fixed).
+        pub fn open_colorlight_default(ifname: impl Into<String>) -> Result<Self, SinkError> {
+            Self::open(ifname, DEFAULT_DEST_MAC)
+        }
+
+        /// Total frames successfully sent since construction.
+        #[inline]
+        pub fn packets_sent(&self) -> u64 {
+            self.packets_sent
+        }
+
+        /// Number of `send_frames` batches issued via `sendmmsg`.
+        /// Included for QA cadence sanity: at 20 Hz with 130 frames
+        /// per image, we expect ~20 batches/sec and ~2600 packets/sec.
+        #[inline]
+        pub fn batches_sent(&self) -> u64 {
+            self.batches_sent
+        }
+
+        /// Read-only view of the ifname the socket is bound against.
+        #[inline]
+        pub fn ifname(&self) -> &str {
+            &self.ifname
+        }
+
+        /// Read-only view of the destination MAC every frame will be
+        /// sent to (for operator diagnostics).
+        #[inline]
+        pub fn dest_mac(&self) -> [u8; 6] {
+            self.dest_mac
+        }
+
+        /// Build the `sockaddr_ll` for `sendto` at this sink's ifindex
+        /// + dest MAC.  Called per-`send_frame`; zero-alloc, stack-
+        /// resident.
+        fn sockaddr_ll(&self) -> libc::sockaddr_ll {
+            let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            sll.sll_family = libc::AF_PACKET as u16;
+            // sll_protocol = 0 matches the socket() protocol above
+            // (sender-only, no filter).  The kernel uses the
+            // EtherType in the frame's L2 header (bytes 12-13,
+            // written by `serialize_frame`) for the wire; sll_protocol
+            // is only used for INBOUND filtering.
+            sll.sll_protocol = 0;
+            sll.sll_ifindex = self.ifindex;
+            sll.sll_halen = 6;
+            // sll_addr is 8 bytes; bytes 6-7 stay zeroed from
+            // `mem::zeroed` above — spec-compliant for Ethernet
+            // (halen=6 tells the kernel to look at bytes 0-5 only).
+            sll.sll_addr[..6].copy_from_slice(&self.dest_mac);
+            sll
+        }
+    }
+
+    impl Drop for PacketSink {
+        fn drop(&mut self) {
+            // Warn-on-Err so the "why did close fail?" info survives
+            // even if the caller returned Ok before drop.  Same
+            // discipline as `egl_bringup::tear_down_egl`.
+            let rc = unsafe { libc::close(self.sockfd) };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                eprintln!(
+                    "warn: colorlight PacketSink({}): close({}) failed: {err}",
+                    self.ifname, self.sockfd
+                );
+            }
+        }
+    }
+
+    impl FrameSink for PacketSink {
+        fn send_frame(&mut self, frame: &[u8]) -> Result<(), SinkError> {
+            let sll = self.sockaddr_ll();
+            let n = unsafe {
+                libc::sendto(
+                    self.sockfd,
+                    frame.as_ptr() as *const libc::c_void,
+                    frame.len(),
+                    0,
+                    &sll as *const libc::sockaddr_ll as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                return Err(SinkError::TransportUnavailable(format!(
+                    "colorlight PacketSink({}): sendto failed: {err}",
+                    self.ifname
+                )));
+            }
+            let n = n as usize;
+            if n != frame.len() {
+                // Short-send on a datagram socket = kernel/driver
+                // anomaly (queue pressure, MTU mismatch, some
+                // driver-specific hiccup) — NOT an encoder / frame
+                // shape problem.  Surface as TransportUnavailable
+                // with concrete counts so operators can act on it
+                // (retry / kick the NIC / check MTU).
+                return Err(SinkError::TransportUnavailable(format!(
+                    "colorlight PacketSink({}): sendto short-sent ({}/{} bytes; driver / MTU / queue anomaly)",
+                    self.ifname,
+                    n,
+                    frame.len()
+                )));
+            }
+            self.packets_sent += 1;
+            Ok(())
+        }
+
+        /// Batch send via `sendmmsg(2)` — one syscall for the whole
+        /// frame's worth of packets (typically 130 per image at
+        /// 128×96).  Trivial batches (`frames.len() <= 1`) skip the
+        /// sendmmsg buffer-build overhead and inline the per-frame
+        /// `send_frame` call directly (does NOT dispatch through the
+        /// trait's default `send_frames` — avoids a redundant loop
+        /// layer).
+        ///
+        /// **Partial-send handling:** if the kernel accepts fewer
+        /// messages than requested, returns `SinkError::PartialSend
+        /// { sent, total }` so the pump layer can structurally
+        /// retry the tail (frames `sent..total`) rather than
+        /// leaving the Colorlight card mid-frame with a half-latched
+        /// row buffer.  The `packets_sent` + `batches_sent`
+        /// counters are updated to reflect what actually landed.
+        fn send_frames(&mut self, frames: &[Vec<u8>]) -> Result<(), SinkError> {
+            if frames.len() <= 1 {
+                // Skip sendmmsg setup for a 1-frame batch — inline
+                // the per-frame path directly.
+                for f in frames {
+                    self.send_frame(f)?;
+                }
+                return Ok(());
+            }
+
+            // Build the mmsghdr / iovec / sockaddr_ll arrays.
+            // Everything is stack-lived in this function; sendmmsg
+            // returns before we drop.  sockaddr_ll is the same for
+            // every message (same dest + ifindex), so one instance
+            // is reused via aliased pointer — safe because sendmmsg
+            // reads-only.
+            let sll = self.sockaddr_ll();
+            let mut iovecs: Vec<libc::iovec> = frames
+                .iter()
+                .map(|f| libc::iovec {
+                    iov_base: f.as_ptr() as *mut libc::c_void,
+                    iov_len: f.len(),
+                })
+                .collect();
+            let mut msgs: Vec<libc::mmsghdr> = iovecs
+                .iter_mut()
+                .map(|iov| {
+                    let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
+                    hdr.msg_hdr.msg_name =
+                        &sll as *const libc::sockaddr_ll as *mut libc::c_void;
+                    hdr.msg_hdr.msg_namelen =
+                        std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+                    hdr.msg_hdr.msg_iov = iov as *mut libc::iovec;
+                    hdr.msg_hdr.msg_iovlen = 1;
+                    hdr
+                })
+                .collect();
+
+            let n = unsafe {
+                libc::sendmmsg(
+                    self.sockfd,
+                    msgs.as_mut_ptr(),
+                    msgs.len() as libc::c_uint,
+                    0,
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                return Err(SinkError::TransportUnavailable(format!(
+                    "colorlight PacketSink({}): sendmmsg failed: {err}",
+                    self.ifname
+                )));
+            }
+            let sent = n as usize;
+            if sent != frames.len() {
+                // Partial batch send — update counters to reflect
+                // what actually landed, return `PartialSend` so the
+                // pump layer can structurally decide to retry the
+                // tail (`frames[sent..]`) rather than leave the
+                // Colorlight card with a half-latched row buffer.
+                // The kernel writes per-message `msg_len` in each
+                // mmsghdr for the sent ones; not tracked here (all
+                // 0-return messages are silently unsent).
+                self.packets_sent += sent as u64;
+                self.batches_sent += 1;
+                return Err(SinkError::PartialSend {
+                    sent,
+                    total: frames.len(),
+                });
+            }
+            self.packets_sent += frames.len() as u64;
+            self.batches_sent += 1;
+            Ok(())
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use packet_sink::PacketSink;
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -369,7 +714,7 @@ mod tests {
     // ── SinkError Display ────────────────────────────────────────────
 
     #[test]
-    fn sink_error_display_covers_both_variants() {
+    fn sink_error_display_covers_every_variant() {
         let m = SinkError::Malformed("bad header");
         let s = format!("{m}");
         assert!(s.contains("malformed frame"), "Malformed: {s}");
@@ -379,6 +724,19 @@ mod tests {
         let s = format!("{t}");
         assert!(s.contains("transport unavailable"), "TransportUnavailable: {s}");
         assert!(s.contains("EACCES"), "TransportUnavailable inner: {s}");
+
+        // PartialSend variant added in PR #B1 Commit 1 for the
+        // PacketSink sendmmsg partial-batch path.  Load-bearing on
+        // Colorlight — mid-frame partial sends leave the card half-
+        // latched; pump layer keys on the concrete `sent`/`total`
+        // fields to decide whether to retry the tail.
+        let p = SinkError::PartialSend {
+            sent: 65,
+            total: 130,
+        };
+        let s = format!("{p}");
+        assert!(s.contains("partial batch send"), "PartialSend: {s}");
+        assert!(s.contains("65/130"), "PartialSend inner: {s}");
     }
 
     // ── encode_to_sink ────────────────────────────────────────────────
