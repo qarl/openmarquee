@@ -1,6 +1,6 @@
 [Unit]
 Description=openMarquee netctl per-connection handler
-Documentation=https://github.com/qarl/openmarquee docs/onboarding-rework-plan.md
+Documentation=https://github.com/qarl/openmarquee https://github.com/qarl/openmarquee/blob/main/docs/onboarding-rework-plan.md
 # Bound to the socket unit so a `systemctl stop openmarquee-netctl.socket`
 # stops new connections cleanly and existing instances finish their
 # one-shot work.

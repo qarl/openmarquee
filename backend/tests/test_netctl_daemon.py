@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import io
+import logging
 import pathlib
 
 _DAEMON_PATH = pathlib.Path(__file__).resolve().parents[2] / "system" / "openmarquee-netctl-daemon"
@@ -56,17 +57,40 @@ class _FakeCompleted:
         self.stderr = stderr
 
 
-def _run(mod, request: bytes, *, helper_stdout=b"", helper_rc=0, monkeypatch):
+def _run(mod, request: bytes, *, helper_stdout=b"", helper_rc=0, helper_exc=None, monkeypatch):
     monkeypatch.setattr(mod.sys, "stdin", _FakeStdin(request))
     out = _FakeStdout()
     monkeypatch.setattr(mod.sys, "stdout", out)
-    monkeypatch.setattr(
-        mod.subprocess,
-        "run",
-        lambda *a, **k: _FakeCompleted(returncode=helper_rc, stdout=helper_stdout),
-    )
+
+    def _fake_run(*a, **k):
+        # helper_exc lets a test drive the daemon-INTERNAL failure paths
+        # (FileNotFoundError → helper missing; subprocess.TimeoutExpired →
+        # helper timeout) — those must exit 1, unlike a handled client error.
+        if helper_exc is not None:
+            raise helper_exc
+        return _FakeCompleted(returncode=helper_rc, stdout=helper_stdout)
+
+    monkeypatch.setattr(mod.subprocess, "run", _fake_run)
     rc = mod.main()
     return rc, out.buffer.getvalue()
+
+
+def _capture_warnings(mod, monkeypatch):
+    """Capture the daemon's log records. Its logger sets propagate=False
+    (system-journal path), so pytest's caplog can't see it — install a spy
+    via _setup_journal_logging instead. Returns the (mutable) records list."""
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    spy = logging.getLogger("netctl-daemon-test-spy")
+    spy.handlers = [_Capture()]
+    spy.setLevel(logging.DEBUG)
+    spy.propagate = False
+    monkeypatch.setattr(mod, "_setup_journal_logging", lambda: spy)
+    return records
 
 
 def test_reveal_registered_in_allowlist_and_data_subcommands():
@@ -124,6 +148,73 @@ def test_unknown_subcommand_rejected_before_helper(monkeypatch):
         helper_stdout=b"leak",
         monkeypatch=monkeypatch,
     )
-    assert rc == 1
+    # 2026-07-16 exit-semantics: a rejected unknown subcommand is a HANDLED
+    # client error, not a daemon failure → exit 0 (keeps the per-connection
+    # unit out of `systemctl --failed`). The ERR response + no-leak property
+    # still hold.
+    assert rc == 0
     assert resp.startswith(b"ERR unknown subcommand")
     assert b"leak" not in resp
+
+
+def test_handled_client_errors_exit_0_and_warn(monkeypatch):
+    """Exit-semantics split (2026-07-16), CLIENT-error half: a HANDLED bad
+    request — empty, unknown-subcommand, or oversize — exits 0 so the
+    socket-activated per-connection unit doesn't linger in
+    `systemctl --failed`, while still sending ERR + logging a warning (the
+    audit signal is preserved). Root cause: JasonsSign1's old deployed daemon
+    rejected the (now-allowlisted) `avahi-write-and-restart` and left a
+    failed unit that never cleared."""
+    mod = _load_daemon()
+
+    # empty request
+    records = _capture_warnings(mod, monkeypatch)
+    rc, resp = _run(mod, b"", monkeypatch=monkeypatch)
+    assert rc == 0
+    assert resp.startswith(b"ERR empty request")
+    assert any(r.levelno == logging.WARNING for r in records), "empty: no warning logged"
+
+    # unknown subcommand (the exact JasonsSign1 failure shape)
+    records = _capture_warnings(mod, monkeypatch)
+    rc, resp = _run(mod, b"avahi-write-and-restart-BOGUS\n", monkeypatch=monkeypatch)
+    assert rc == 0
+    assert resp.startswith(b"ERR unknown subcommand")
+    assert any(r.levelno == logging.WARNING for r in records), "unknown: no warning logged"
+
+    # oversize payload (a real allowlisted subcommand + payload over the cap)
+    records = _capture_warnings(mod, monkeypatch)
+    big = b"nm-write-unmanaged-wlan0\n" + b"x" * (mod.MAX_PAYLOAD_BYTES + 1)
+    rc, resp = _run(mod, big, monkeypatch=monkeypatch)
+    assert rc == 0
+    assert resp.startswith(b"ERR payload exceeds")
+    assert any(r.levelno == logging.WARNING for r in records), "oversize: no warning logged"
+
+
+def test_daemon_internal_failures_exit_1(monkeypatch):
+    """Exit-semantics split (2026-07-16), DAEMON-INTERNAL half: genuine
+    breakage (helper missing / timeout / non-zero rc) MUST exit 1 so
+    `systemctl --failed` stays a real "the daemon is broken" signal — the
+    posture fix must NOT collapse these into the client-error 0-exit."""
+    mod = _load_daemon()
+
+    # helper binary missing
+    rc, resp = _run(
+        mod, b"nm-reload\n", helper_exc=FileNotFoundError("no helper"), monkeypatch=monkeypatch
+    )
+    assert rc == 1
+    assert resp.startswith(b"ERR helper not found")
+
+    # helper exits non-zero (the privileged op itself failed)
+    rc, resp = _run(mod, b"nm-reload\n", helper_rc=7, monkeypatch=monkeypatch)
+    assert rc == 1
+    assert resp.startswith(b"ERR helper rc=")
+
+    # helper timeout
+    rc, resp = _run(
+        mod,
+        b"nm-reload\n",
+        helper_exc=mod.subprocess.TimeoutExpired(cmd="helper", timeout=1),
+        monkeypatch=monkeypatch,
+    )
+    assert rc == 1
+    assert resp.startswith(b"ERR helper timed out")
