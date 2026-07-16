@@ -129,7 +129,11 @@ export function drawTextOnly(canvas, item, opts) {
             // layer so motion / blend / opacity metadata stays sourced
             // from the wire shape; only the text content gets resolved.
             const resolved = resolveLayerForDraw(layer);
-            const paint = () => paintLayer(ctx, canvas, resolved, /* fillBox */ null);
+            // `glyphOffset` (per-LETTER shake, qarl 2026-07-16) is
+            // supplied by paintLayerWithMotion for shake layers and
+            // undefined otherwise.
+            const paint = (glyphOffset) =>
+                paintLayer(ctx, canvas, resolved, /* fillBox */ null, glyphOffset);
             if (elapsed === undefined || elapsed === null) {
                 // Static path — current behavior, no motion.
                 paint();
@@ -150,7 +154,7 @@ export function drawTextOnly(canvas, item, opts) {
  * context. `box` defaults to {0.1, 0.1, 0.8, 0.8} when absent.
  * Mirrors `_draw_text_into` on the backend (seed.py).
  */
-function paintLayer(ctx, canvas, layer) {
+function paintLayer(ctx, canvas, layer, fillBox, glyphOffset) {
     const text = layer?.text || "";
     if (!text) return;
     const textColor = layer.text_color || layer.textColor || "#FFFFFF";
@@ -311,11 +315,22 @@ function paintLayer(ctx, canvas, layer) {
     // box). A preview block with emoji can't pixel-match the Rust
     // renderer anyway, so the WASM-parity path has nothing to lose.
     const hasEmoji = lines.some((line) => EMOJI_RE.test(line));
+    // qarl 2026-07-16 (per-LETTER shake): the WASM path rasterizes a
+    // whole LINE to one bitmap and drawImages it, so it cannot carry
+    // per-letter displacement. Shake layers therefore take the
+    // fillText path, which draws char-by-char. Tradeoff, deliberate:
+    // per-char advances drop kerning pairs, so a shaking layer's base
+    // spacing is a hair looser than the WASM/fontdue render — well
+    // inside the "visually approximate, not pixel-identical" preview
+    // lock (docs/text-layer-motion-spec.md Q3), and only for shake.
+    // The device renderer is unaffected: it lays the string out
+    // (kerned) and then offsets the resulting glyph quads.
     const useWasm = (
         colorRgba !== null
         && isWasmReady()
         && isFontRegistered(fontFamily)
         && !hasEmoji
+        && !glyphOffset
     );
 
     if (useWasm) {
@@ -407,6 +422,10 @@ function paintLayer(ctx, canvas, layer) {
             );
         }
     } else if (yScale === 1) {
+        // glyphBase accumulates across lines so per-letter shake
+        // indices are unique for the whole LAYER — mirroring the Rust
+        // path, where `group.quads` spans every line of the layer.
+        let glyphBase = 0;
         for (let i = 0; i < lines.length; i++) {
             drawTextLineWithEffects(
                 ctx,
@@ -414,8 +433,10 @@ function paintLayer(ctx, canvas, layer) {
                 anchorX,
                 firstBaselineY + i * lineHeight,
                 maxWidth,
-                { outline, dropShadow, fontSizePx },
+                // No outer y-scale on this branch → yScaleForOffset 1.
+                { outline, dropShadow, fontSizePx, glyphOffset, glyphBase },
             );
+            glyphBase += [...lines[i]].length;
         }
     } else {
         ctx.save();
@@ -428,6 +449,7 @@ function paintLayer(ctx, canvas, layer) {
         // recentered around the local origin. This squish branch is
         // now only reached when WASM isn't available OR the font
         // isn't registered (Phase 3a removed the yScale==1 WASM gate).
+        let glyphBase = 0;
         for (let i = 0; i < lines.length; i++) {
             drawTextLineWithEffects(
                 ctx,
@@ -435,8 +457,20 @@ function paintLayer(ctx, canvas, layer) {
                 0,
                 firstBaselineLocal + i * lineHeight,
                 maxWidth,
-                { outline, dropShadow, fontSizePx },
+                // This branch draws under ctx.scale(1, yScale); pass it
+                // so per-letter dy compensates and lands as intended
+                // SCREEN pixels (else vertical jitter is damped by
+                // yScale while dx isn't → anisotropic jitter).
+                {
+                    outline,
+                    dropShadow,
+                    fontSizePx,
+                    glyphOffset,
+                    glyphBase,
+                    yScaleForOffset: yScale,
+                },
             );
+            glyphBase += [...lines[i]].length;
         }
         ctx.restore();
     }
@@ -461,6 +495,101 @@ function paintLayer(ctx, canvas, layer) {
  * Outline width scales with font size (~5%) so it stays proportional.
  */
 function drawTextLineWithEffects(ctx, line, x, y, maxWidth, opts) {
+    const { outline, dropShadow, fontSizePx, glyphOffset, glyphBase } = opts;
+    // qarl 2026-07-16 — per-LETTER shake. When the motion wrapper
+    // supplies a glyphOffset, draw the line character-by-character so
+    // each letter can be displaced around its own base position
+    // instead of the whole line translating. Advances come from
+    // measureText (per-char, so kerning pairs are dropped — the
+    // documented approximate-preview tradeoff; see the useWasm gate).
+    // Every effect (outline / drop_shadow) applies per char, so the
+    // ring + shadow travel WITH each letter.
+    if (typeof glyphOffset === "function") {
+        const chars = [...line];
+        const advances = chars.map((ch) => ctx.measureText(ch).width);
+        const sumAdvances = advances.reduce((a, b) => a + b, 0);
+
+        // ── Base-size condense ────────────────────────────────────
+        // The per-line path handed fillText a `maxWidth`, which
+        // horizontally CONDENSES an over-wide run to fit the box. That
+        // clamp is load-bearing, not incidental: seed.py authors the
+        // FYS shake layers at font_size_pct=100 precisely so the text
+        // overflows and gets squished (and the WASM path had its own
+        // min(naturalW, boxW)). Drawing char-by-char bypasses both, so
+        // we reproduce the condense explicitly with an x-scale.
+        //
+        // NOTE this is about the line's BASE SIZE, not about jitter:
+        // qarl 2026-07-16 — "i don't think it's a problem if shake
+        // shakes some letters slightly out of frame. that's expected
+        // and fine." Correct, and honoured — the jitter offsets below
+        // are NOT clamped and nothing clips the box for shake (see
+        // canvas-motion.js "Parity Bug 3"), so letters freely shake out
+        // of frame. Without this condense, though, the word would
+        // render ~4.5x oversize at zero jitter (measured: 7778px into a
+        // 1728px box → ~1.5 letters visible), which is a different
+        // thing entirely from a letter jittering past the edge.
+        const squeeze =
+            maxWidth && sumAdvances > maxWidth ? maxWidth / sumAdvances : 1;
+        const drawnW = sumAdvances * squeeze;
+
+        // Left edge derives from the DRAWN width (post-condense, from
+        // the same unkerned advances the pen uses). Using the kerned
+        // measureText(line) here would sit a centred line right of
+        // centre by (sumAdvances - lineW)/2.
+        const prevAlign = ctx.textAlign;
+        let originX = x;
+        if (prevAlign === "center") originX = x - drawnW / 2;
+        else if (prevAlign === "right" || prevAlign === "end") originX = x - drawnW;
+
+        // Draw under a local x-scale so the glyph SHAPES condense the
+        // way fillText's maxWidth condenses them — not just the pen
+        // positions. yScaleForOffset compensates the caller's outer
+        // ctx.scale(1, yScale) (squish branch) so a dy of N px lands as
+        // N px on SCREEN rather than N*yScale; likewise dx/squeeze.
+        // Without that, jitter goes anisotropic (FYS yScale=0.176 →
+        // vertical damped to ~18% of intent).
+        const yComp = opts.yScaleForOffset && opts.yScaleForOffset > 0
+            ? opts.yScaleForOffset
+            : 1;
+        ctx.textAlign = "left";
+        ctx.save();
+        try {
+            ctx.translate(originX, 0);
+            ctx.scale(squeeze, 1);
+            let pen = 0;
+            for (let c = 0; c < chars.length; c++) {
+                const ch = chars[c];
+                // Whitespace paints nothing — advance the pen but skip
+                // the draw (and don't waste an offset lookup).
+                if (ch.trim() !== "") {
+                    const [dx, dy] = glyphOffset((glyphBase || 0) + c);
+                    drawOneRun(
+                        ctx,
+                        ch,
+                        pen + dx / squeeze,
+                        y + dy / yComp,
+                        undefined,
+                        { outline, dropShadow, fontSizePx },
+                    );
+                }
+                pen += advances[c];
+            }
+        } finally {
+            ctx.restore();
+            ctx.textAlign = prevAlign;
+        }
+        return;
+    }
+    drawOneRun(ctx, line, x, y, maxWidth, opts);
+}
+
+/**
+ * Paint one text run (a whole line, or a single character on the
+ * per-letter shake path) with the outline + drop_shadow effects in
+ * the documented order. Split out of drawTextLineWithEffects so the
+ * per-line and per-char paths share ONE effect implementation.
+ */
+function drawOneRun(ctx, line, x, y, maxWidth, opts) {
     const { outline, dropShadow, fontSizePx } = opts;
     if (outline) {
         const prevStroke = ctx.strokeStyle;
@@ -617,7 +746,8 @@ export function drawCanvas(canvas, state, opts) {
             // matches what the operator sees in preview.
             if (layer?.visible === false) continue;
             const resolved = resolveLayerForDraw(layer);
-            const paint = () => paintLayer(ctx, canvas, resolved);
+            const paint = (glyphOffset) =>
+                paintLayer(ctx, canvas, resolved, /* fillBox */ null, glyphOffset);
             // Per-layer Photoshop blend mode. Canvas natively
             // supports multiply / screen / overlay (W3C compositing).
             // Map to 'source-over' for normal so the editor preview
