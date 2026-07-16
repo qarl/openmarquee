@@ -1,6 +1,6 @@
 [Unit]
 Description=openMarquee netctl privilege-boundary IPC socket
-Documentation=https://github.com/qarl/openmarquee docs/onboarding-rework-plan.md
+Documentation=https://github.com/qarl/openmarquee https://github.com/qarl/openmarquee/blob/main/docs/onboarding-rework-plan.md
 
 [Socket]
 # Per-connection root daemon (Accept=yes) listens at this Unix

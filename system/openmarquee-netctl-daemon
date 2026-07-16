@@ -147,12 +147,22 @@ def main() -> int:
     if not first_line:
         _respond("ERR empty request\n")
         log.warning("rejected empty request")
-        return 1
+        # Exit-code convention (2026-07-16): a HANDLED bad-CLIENT-request
+        # (empty / unknown-subcommand / oversize) is NOT a daemon failure —
+        # the ERR response on the socket + this log.warning ARE the correct
+        # handling, and the daemon returns cleanly to service. So exit 0 to
+        # keep the socket-activated per-connection unit out of
+        # `systemctl --failed`. Only daemon-INTERNAL failures (helper
+        # missing / timeout / rc!=0, below) exit 1 — that is systemd's
+        # genuine "the daemon itself is broken" health signal. This is a
+        # posture fix, NOT an authz change: nothing new is allowed, and the
+        # ERR line + log.warning preserve full client-error visibility.
+        return 0
     subcommand = first_line.rstrip(b"\n").decode("ascii", errors="replace").strip()
     if subcommand not in ALLOWLIST:
         _respond(f"ERR unknown subcommand: {subcommand!r}\n")
         log.warning("rejected unknown subcommand: %r", subcommand)
-        return 1
+        return 0  # handled client-error — see exit-code convention above
 
     # Read remaining bytes as payload (cap at MAX_PAYLOAD_BYTES + 1
     # so we can detect oversize by checking len(payload) >
@@ -165,7 +175,7 @@ def main() -> int:
             subcommand,
             len(payload),
         )
-        return 1
+        return 0  # handled client-error — see exit-code convention above
 
     # Delegate to the existing trusted bash helper. The helper does
     # the actual file writes + systemctl calls + argv-validation +
