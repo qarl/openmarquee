@@ -37,6 +37,18 @@ pub const DANGER: Rgb = Rgb(0xff, 0x6b, 0x6b); // --danger (red)
 pub const QR_BG: Rgb = Rgb(0xff, 0xff, 0xff); // white panel
 pub const QR_FG: Rgb = Rgb(0x00, 0x00, 0x00); // black modules
 
+// Boot-card redesign (qarl mockups, 2026-07-16). The mockup's amber is
+// #ffb84d, but ACCENT above is #ffb43c — the CORRECTED LED-dot amber
+// (see the brand-mark source). Keeping the corrected value rather than
+// regressing to the mockup's older swatch; the difference is a hair of
+// warmth at LED gamma and the mark.png artwork is authored to #ffb43c.
+/// Muted amber for the small-caps section labels ("— REACH THIS SIGN AT").
+pub const ACCENT_DIM: Rgb = Rgb(0xe2, 0x9a, 0x2d); // mockup --accent-dim
+/// Hairline rules: the divider + the QR corner brackets.
+pub const RULE: Rgb = Rgb(0x26, 0x26, 0x2c); // mockup --rule
+/// The bottom footer lockup — dimmest ink on the card.
+pub const FOOTER_DIM: Rgb = Rgb(0x4a, 0x4a, 0x52); // mockup --footer
+
 /// Which display font the layout requests. The GLES2 paint maps
 /// these to the existing font_family_to_filename surface
 /// (Oswald / Bebas Neue / Inter / JetBrains Mono).
@@ -74,6 +86,21 @@ pub enum CardShape {
     // emission) is the structural prevention — a layout physically cannot
     // re-add it. Use `Image` (below) for the wordmark. See
     // feedback_no_om_monogram; do NOT reintroduce a monogram/oM-square.
+    /// A solid axis-aligned rectangle in normalized card units — the
+    /// hairline primitive the redesign needs (qarl mockups 2026-07-16):
+    /// the divider above the tagline, and the QR's corner brackets
+    /// (each bracket = two Rules, one horizontal + one vertical).
+    ///
+    /// Added because the card had no rect/line shape — everything else
+    /// in the redesign reuses Text / Image / QrPanel. Paints as a plain
+    /// filled quad (the same draw Background/Chip already use), so this
+    /// is an additive primitive, not a layout-engine change.
+    ///
+    /// `size` is (width, height) as fractions of card WIDTH and HEIGHT
+    /// respectively. A "line" is just a Rule with one tiny dimension —
+    /// callers use `hairline_*` helpers so thickness stays in PIXELS-ish
+    /// terms on either aspect rather than smearing on one axis.
+    Rule { top_left: (f32, f32), size: (f32, f32), color: Rgb },
     /// A baked-in brand-mark image (the real splash wordmark, mark.png),
     /// blitted as a textured quad. `top_left` is the normalized card
     /// position; `height` is the image's height as a fraction of the card
@@ -89,8 +116,12 @@ pub enum CardShape {
         ink: Rgb,
         text_height: f32,
     },
-    /// A line / multi-line block of text. `max_height` is the
-    /// glyph cap-height in normalized units (one line). `text`
+    /// A line / multi-line block of text. `max_height` is the EM size
+    /// in normalized card-height units (one line) — the paint does
+    /// `size_px = max_height * mode_h` and 1 em on-screen = size_px.
+    /// (Was documented as "cap-height" until 2026-07-16; the impl
+    /// always treated it as the em, and `mono_run_w` trusting the
+    /// comment cost a 37% width over-estimate.) `text`
     /// can contain '\n' for line breaks; layout splits and stacks
     /// with line-height ~1.0.
     Text {
@@ -537,6 +568,121 @@ pub fn degraded_copy(
     }
 }
 
+/// Width of `n` JetBrains-Mono characters as a fraction of card WIDTH,
+/// given `em_h` — the run's `max_height`, a fraction of card HEIGHT.
+///
+/// The pure layout layer has no font metrics (the paint measures via
+/// `layout_text_to_quads`), but Mono is — by definition — a uniform
+/// advance, so a run's width is analytic. JetBrains Mono: unitsPerEm
+/// 1000, advance 600 → advance = 0.600 em.
+///
+/// `max_height` is the EM, not the cap-height: the paint does
+/// `size_px = max_height * mode_h` and hdmi_logic documents "1 em
+/// on-screen = size_px px". (The `CardShape::Text` doc comment said
+/// "cap-height" — a stale doc/impl mismatch, corrected there. Trusting
+/// it cost a 37% over-estimate here: source is the authority.)
+///
+/// Height fractions are of card HEIGHT and width fractions of card
+/// WIDTH, hence the `/ aspect` to cross between the two axes.
+///
+/// Used ONLY to place the two-colour URL's split point (grey `http://`
+/// + amber host). It is not a general text measurer — anything
+/// non-Mono must keep using Align on the paint side. It models the
+/// ADVANCE width; the paint places by the ink bbox, so ~1-2px of
+/// residual is expected and invisible at these sizes.
+pub fn mono_run_w(n: usize, em_h: f32, aspect: f32) -> f32 {
+    const ADV_PER_EM: f32 = 0.600;
+    if !(aspect.is_finite() && aspect > 0.0) {
+        return 0.0;
+    }
+    n as f32 * ADV_PER_EM * em_h / aspect
+}
+
+/// `http://` — the fixed grey prefix of the two-colour URL.
+const URL_SCHEME: &str = "http://";
+
+/// Width the two-colour URL may occupy, as a fraction of card WIDTH.
+const URL_BAND_W_LANDSCAPE: f32 = 0.50; // the left column
+const URL_BAND_W_PORTRAIT: f32 = 0.90; // near-full width, centred
+
+/// Cap-height for an `n`-char Mono run that fits `band_w`, never
+/// exceeding `nominal`.
+///
+/// Splitting the URL into two coloured runs took it off the paint's
+/// single-run fitting path, so the layout must own the fit: a long sign
+/// name (`a-very-long-sign-name.local`) or a narrow panel would
+/// otherwise push the run off-card — the bounds test caught exactly
+/// that (a negative split anchor at aspect 0.4).
+pub fn fit_mono_h(n: usize, nominal: f32, band_w: f32, aspect: f32) -> f32 {
+    let natural = mono_run_w(n, nominal, aspect);
+    if natural > band_w && natural > 0.0 {
+        nominal * (band_w / natural)
+    } else {
+        nominal
+    }
+}
+
+/// Split an address into (scheme, host) for the two-colour URL. The
+/// address the backend hands us is a bare host (`jasonssign1.local`);
+/// the mockup renders a muted `http://` in front of an amber host.
+/// Tolerates an address that already carries a scheme.
+fn split_url(address: &str) -> (&'static str, String) {
+    let host = address
+        .strip_prefix("http://")
+        .or_else(|| address.strip_prefix("https://"))
+        .unwrap_or(address);
+    (URL_SCHEME, host.to_string())
+}
+
+/// Small-caps label text. The card fonts have no letter-spacing knob,
+/// so the mockup's tracked small-caps are approximated by upper-casing
+/// at a small size — the hierarchy reads, the tracking is a hair
+/// tighter than the mockup. Flagged as a known approximation.
+fn small_caps(s: &str) -> String {
+    s.to_uppercase()
+}
+
+/// The QR corner brackets from the mockup: an L at two opposite corners
+/// of the panel, drawn as hairline Rules. `arm` is the bracket arm
+/// length as a fraction of the panel's WIDTH.
+fn qr_brackets(
+    top_left: (f32, f32),
+    size_w: f32,
+    size_h: f32,
+    aspect: f32,
+    shapes: &mut Vec<CardShape>,
+) {
+    let arm = size_w * 0.16;
+    // Hairline: ~2px on a 1080-tall panel, expressed on each axis.
+    let t_h = 0.0022; // thickness as a fraction of HEIGHT
+    let t_w = t_h / aspect.max(0.0001); // same visual thickness on X
+    let (x, y) = top_left;
+    let gap_w = size_w * 0.045;
+    let gap_h = gap_w * aspect;
+    // Top-left L (sits just outside the panel).
+    let lx = x - gap_w;
+    let ly = y - gap_h;
+    shapes.push(CardShape::Rule { top_left: (lx, ly), size: (arm, t_h), color: ACCENT_DIM });
+    shapes.push(CardShape::Rule {
+        top_left: (lx, ly),
+        size: (t_w, arm * aspect),
+        color: ACCENT_DIM,
+    });
+    // Bottom-right L.
+    let rx = x + size_w + gap_w;
+    let ry = y + size_h + gap_h;
+    shapes.push(CardShape::Rule {
+        top_left: (rx - arm, ry - t_h),
+        size: (arm, t_h),
+        color: ACCENT_DIM,
+    });
+    shapes.push(CardShape::Rule {
+        top_left: (rx - t_w, ry - arm * aspect),
+        size: (t_w, arm * aspect),
+        color: ACCENT_DIM,
+    });
+}
+
 fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>, aspect: f32) {
     // BOOT identity card. The real dot-matrix wordmark (mark.png) is
     // blitted as an Image; the mDNS URL + wlan0 IP + a QR of the URL give a
@@ -563,28 +709,78 @@ fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>, asp
     let ssid = params.ssid.as_deref().filter(|s| !s.is_empty());
     let qr_payload = params.qr_payload.clone().unwrap_or_default();
 
+    let (scheme, host) = split_url(address);
+
     if is_landscape(aspect) {
-        // ---- Landscape: 2-column ----
+        // ---- Landscape: 2-column (mockup: /tmp/boot-card-redesign) ----
         const COL_X: f32 = 0.07;
         // Mark: top of the left column. `height` is a fraction of card
         // height; the paint sizes the width from the artwork aspect so it's
-        // undistorted.
-        let mark_h = 0.18;
-        shapes.push(CardShape::Image { top_left: (COL_X, 0.15), height: mark_h });
-        // URL (accent) + IP + Wi-Fi, left-aligned, stacked below the mark.
+        // undistorted. (Wordmark mark.png — NOT the oM monogram: the
+        // mockups draw a monogram tile, but that is a closed decision;
+        // the card uses the one brand mark.)
+        let mark_h = 0.13;
+        shapes.push(CardShape::Image { top_left: (COL_X, 0.09), height: mark_h });
+
+        // "— REACH THIS SIGN AT" — muted-amber small-caps section label.
         shapes.push(CardShape::Text {
-            anchor: (COL_X, 0.47),
-            max_height: 0.06,
+            anchor: (COL_X, 0.30),
+            max_height: 0.022,
+            color: ACCENT_DIM,
+            font: DisplayFont::Mono,
+            align: Align::Left,
+            text: format!("— {}", small_caps("Reach this sign at")),
+        });
+
+        // Two-colour URL: muted `http://` + amber host. Mono is uniform-
+        // advance, so the scheme's width is analytic — right-align the
+        // scheme at the split and left-align the host at the SAME point
+        // and they meet exactly, with the run's left edge landing on COL_X.
+        //
+        // AUTO-FIT: a long sign name (or a narrow aspect) would push the
+        // run past the column, so shrink the cap-height until the whole
+        // `http://host` fits the band. Splitting the URL into two runs
+        // removed the paint's single-run fitting, so the layout owns it.
+        let url_h = fit_mono_h(
+            scheme.len() + host.chars().count(),
+            0.075,
+            URL_BAND_W_LANDSCAPE,
+            aspect,
+        );
+        let split_x = COL_X + mono_run_w(scheme.len(), url_h, aspect);
+        shapes.push(CardShape::Text {
+            anchor: (split_x, 0.40),
+            max_height: url_h,
+            color: MUTED,
+            font: DisplayFont::Mono,
+            align: Align::Right,
+            text: scheme.to_string(),
+        });
+        shapes.push(CardShape::Text {
+            anchor: (split_x, 0.40),
+            max_height: url_h,
             color: ACCENT,
             font: DisplayFont::Mono,
             align: Align::Left,
-            text: address.to_string(),
+            text: host.clone(),
         });
+
+        // Labelled rows: small-caps side-label + value.
+        const LABEL_X: f32 = COL_X;
+        const VALUE_X: f32 = 0.135;
         if !ip.is_empty() {
             shapes.push(CardShape::Text {
-                anchor: (COL_X, 0.58),
-                max_height: 0.032,
+                anchor: (LABEL_X, 0.545),
+                max_height: 0.017,
                 color: MUTED,
+                font: DisplayFont::Mono,
+                align: Align::Left,
+                text: small_caps("Ip"),
+            });
+            shapes.push(CardShape::Text {
+                anchor: (VALUE_X, 0.545),
+                max_height: 0.035,
+                color: TEXT,
                 font: DisplayFont::Mono,
                 align: Align::Left,
                 text: ip.to_string(),
@@ -592,14 +788,48 @@ fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>, asp
         }
         if let Some(ssid) = ssid {
             shapes.push(CardShape::Text {
-                anchor: (COL_X, 0.66),
-                max_height: 0.032,
+                anchor: (LABEL_X, 0.625),
+                max_height: 0.017,
                 color: MUTED,
                 font: DisplayFont::Mono,
                 align: Align::Left,
-                text: format!("Wi-Fi: {ssid}"),
+                text: small_caps("Wi-Fi"),
+            });
+            shapes.push(CardShape::Text {
+                anchor: (VALUE_X, 0.625),
+                max_height: 0.035,
+                color: TEXT,
+                font: DisplayFont::Mono,
+                align: Align::Left,
+                text: ssid.to_string(),
             });
         }
+
+        // Divider above the tagline block.
+        shapes.push(CardShape::Rule {
+            top_left: (COL_X, 0.775),
+            size: (0.33, 0.0018),
+            color: RULE,
+        });
+        // Tagline — the human sentence. The last clause is the promise.
+        shapes.push(CardShape::Text {
+            anchor: (COL_X, 0.815),
+            max_height: 0.024,
+            color: MUTED,
+            font: DisplayFont::Body,
+            align: Align::Left,
+            text: "Scan the code, or type the address into any browser on\nthis network. No app, no cloud, no account.".to_string(),
+        });
+        // Footer lockup.
+        shapes.push(CardShape::Text {
+            anchor: (COL_X, 0.945),
+            max_height: 0.015,
+            color: FOOTER_DIM,
+            font: DisplayFont::Mono,
+            align: Align::Left,
+            text: format!("— {} · {}", small_caps("openmarquee"), small_caps("handmade led sign")),
+        });
+
         // QR: right column, vertically centred + square-corrected.
         if !qr_payload.is_empty() {
             let qr_h_frac = 0.52;
@@ -611,61 +841,177 @@ fn layout_boot(params: &RenderSystemCardParams, shapes: &mut Vec<CardShape>, asp
             let qr_size = (qr_h_frac / aspect).min(0.36); // normalized width
             // Centre the QR within the right column band [0.60, 0.96].
             let qr_x = 0.60 + ((0.36 - qr_size).max(0.0)) / 2.0;
+            let qr_y = (1.0 - qr_h_frac) / 2.0;
+            // "• SCAN TO OPEN" header above the panel.
+            shapes.push(CardShape::Text {
+                anchor: (qr_x + qr_size / 2.0, qr_y - 0.075),
+                max_height: 0.022,
+                color: ACCENT,
+                font: DisplayFont::Mono,
+                align: Align::Center,
+                text: format!("• {}", small_caps("Scan to open")),
+            });
+            qr_brackets((qr_x, qr_y), qr_size, qr_h_frac, aspect, shapes);
             shapes.push(CardShape::QrPanel {
-                top_left: (qr_x, (1.0 - qr_h_frac) / 2.0),
+                top_left: (qr_x, qr_y),
                 size: qr_size,
                 payload: qr_payload,
-                caption: "Scan to open".to_string(),
+                // Caption is drawn as its own Text below (two-tone copy);
+                // the panel's built-in caption stays empty.
+                caption: String::new(),
+            });
+            // Subtitle under the QR.
+            shapes.push(CardShape::Text {
+                anchor: (qr_x + qr_size / 2.0, qr_y + qr_h_frac + 0.06),
+                max_height: 0.022,
+                color: MUTED,
+                font: DisplayFont::Body,
+                align: Align::Center,
+                text: format!("Opens {host} in your browser"),
             });
         }
     } else {
         // ---- Portrait: centred vertical stack (the FYS-panel layout) ----
         // Mark centred near the top, sized to ~0.62 of card width (height
         // derived from the artwork aspect + the panel aspect).
-        let mark_w_frac: f32 = 0.62;
-        let mark_h = (mark_w_frac * aspect / MARK_ASPECT).min(0.16);
+        let mark_w_frac: f32 = 0.52;
+        let mark_h = (mark_w_frac * aspect / MARK_ASPECT).min(0.10);
         let mark_w = mark_h * MARK_ASPECT / aspect; // actual width after any clamp
         shapes.push(CardShape::Image {
-            top_left: ((1.0 - mark_w) / 2.0, 0.10),
+            top_left: ((1.0 - mark_w) / 2.0, 0.045),
             height: mark_h,
         });
-        shapes.push(CardShape::Text {
-            anchor: (0.50, 0.30),
-            max_height: 0.05,
-            color: ACCENT,
-            font: DisplayFont::Mono,
-            align: Align::Center,
-            text: address.to_string(),
-        });
-        if !ip.is_empty() {
+
+        // QR: the hero of the portrait card, with its header + brackets.
+        // All three are guarded together — a card with no qr_payload
+        // shows no "SCAN TO OPEN" promise and no empty brackets, and the
+        // stack below closes up (matches the landscape branch's guard).
+        const BOOT_QR_SIZE: f32 = 0.74; // fraction of WIDTH
+        let qr_y = 0.19;
+        let has_qr = !qr_payload.is_empty();
+        let qr_bottom = if has_qr {
+            let qr_x = 0.5 - BOOT_QR_SIZE / 2.0;
+            let qr_h = BOOT_QR_SIZE * aspect; // panel is square in pixels
+            // "— SCAN TO OPEN —" (em-dashes both sides, centred).
             shapes.push(CardShape::Text {
-                anchor: (0.50, 0.37),
-                max_height: 0.027,
-                color: MUTED,
+                anchor: (0.50, 0.145),
+                max_height: 0.018,
+                color: ACCENT,
                 font: DisplayFont::Mono,
                 align: Align::Center,
-                text: ip.to_string(),
+                text: format!("— {} —", small_caps("Scan to open")),
             });
-        }
-        if !qr_payload.is_empty() {
-            const BOOT_QR_SIZE: f32 = 0.22;
+            qr_brackets((qr_x, qr_y), BOOT_QR_SIZE, qr_h, aspect, shapes);
             shapes.push(CardShape::QrPanel {
-                top_left: (0.5 - BOOT_QR_SIZE / 2.0, 0.44),
+                top_left: (qr_x, qr_y),
                 size: BOOT_QR_SIZE,
                 payload: qr_payload,
-                caption: "Scan to open".to_string(),
+                caption: String::new(),
+            });
+            qr_y + qr_h
+        } else {
+            qr_y
+        };
+
+        // Two-colour URL BELOW the QR (mockup's portrait arrangement).
+        // Centred: the run spans [split - scheme_w, split + host_w], so
+        // centring the WHOLE run puts the split left of centre by half
+        // the difference. Both widths are analytic in Mono.
+        // AUTO-FIT (see fit_mono_h): keeps a long sign name on-card.
+        let url_h = fit_mono_h(
+            scheme.len() + host.chars().count(),
+            0.036,
+            URL_BAND_W_PORTRAIT,
+            aspect,
+        );
+        let scheme_w = mono_run_w(scheme.len(), url_h, aspect);
+        let host_w = mono_run_w(host.chars().count(), url_h, aspect);
+        let split_x = 0.5 - (host_w - scheme_w) / 2.0;
+        let url_y = qr_bottom + 0.055;
+        shapes.push(CardShape::Text {
+            anchor: (split_x, url_y),
+            max_height: url_h,
+            color: MUTED,
+            font: DisplayFont::Mono,
+            align: Align::Right,
+            text: scheme.to_string(),
+        });
+        shapes.push(CardShape::Text {
+            anchor: (split_x, url_y),
+            max_height: url_h,
+            color: ACCENT,
+            font: DisplayFont::Mono,
+            align: Align::Left,
+            text: host.clone(),
+        });
+        shapes.push(CardShape::Text {
+            anchor: (0.50, url_y + 0.037),
+            max_height: 0.017,
+            color: MUTED,
+            font: DisplayFont::Mono,
+            align: Align::Center,
+            text: small_caps("Or type this into any browser"),
+        });
+
+        // Divider, then the two-column IP / WI-FI block.
+        let rule_y = url_y + 0.078;
+        shapes.push(CardShape::Rule {
+            top_left: (0.07, rule_y),
+            size: (0.86, 0.0012),
+            color: RULE,
+        });
+        let row_y = rule_y + 0.028;
+        if !ip.is_empty() {
+            shapes.push(CardShape::Text {
+                anchor: (0.07, row_y),
+                max_height: 0.014,
+                color: MUTED,
+                font: DisplayFont::Mono,
+                align: Align::Left,
+                text: small_caps("Ip address"),
+            });
+            shapes.push(CardShape::Text {
+                anchor: (0.07, row_y + 0.028),
+                max_height: 0.026,
+                color: TEXT,
+                font: DisplayFont::Mono,
+                align: Align::Left,
+                text: ip.to_string(),
             });
         }
         if let Some(ssid) = ssid {
             shapes.push(CardShape::Text {
-                anchor: (0.50, 0.88),
-                max_height: 0.03,
+                anchor: (0.52, row_y),
+                max_height: 0.014,
                 color: MUTED,
                 font: DisplayFont::Mono,
-                align: Align::Center,
-                text: format!("Wi-Fi: {ssid}"),
+                align: Align::Left,
+                text: small_caps("Wi-Fi"),
+            });
+            shapes.push(CardShape::Text {
+                anchor: (0.52, row_y + 0.028),
+                max_height: 0.026,
+                color: TEXT,
+                font: DisplayFont::Mono,
+                align: Align::Left,
+                text: ssid.to_string(),
             });
         }
+
+        // Footer lockup.
+        shapes.push(CardShape::Text {
+            anchor: (0.50, 0.965),
+            max_height: 0.013,
+            color: FOOTER_DIM,
+            font: DisplayFont::Mono,
+            align: Align::Center,
+            text: format!(
+                "{} • {} • {}",
+                small_caps("Handmade led sign"),
+                small_caps("No app"),
+                small_caps("No cloud"),
+            ),
+        });
     }
     // Rapid-boot hint line (both layouts).
     if let Some(hint) = params.boot_hint.as_deref() {
@@ -716,6 +1062,16 @@ mod tests {
                 }
                 CardShape::BootHint { center_bottom, .. } => {
                     assert!(inb(center_bottom.0) && inb(center_bottom.1), "BootHint out of bounds: {center_bottom:?}");
+                }
+                // The redesign's hairline primitive — the divider + the
+                // QR brackets. Without this arm the `_ => {}` fallthrough
+                // left Rule entirely unchecked (sacred review 2026-07-16).
+                CardShape::Rule { top_left, size, .. } => {
+                    assert!(
+                        inb(top_left.0) && inb(top_left.0 + size.0)
+                            && inb(top_left.1) && inb(top_left.1 + size.1),
+                        "Rule out of bounds: tl={top_left:?} size={size:?} aspect={aspect}"
+                    );
                 }
                 _ => {}
             }
@@ -1082,11 +1438,14 @@ mod tests {
             _ => None,
         });
         assert!(img_x.is_some_and(|x| x < 0.2), "landscape mark should be left; x={img_x:?}");
-        // URL text is left-aligned in the left column.
+        // URL host sits in the left column. Redesign (2026-07-16): the URL
+        // is TWO runs — a muted `http://` right-aligned at the split and
+        // the amber host left-aligned at the same split — so assert the
+        // host run, not a single left-aligned address.
         let url_left = shapes.iter().any(|s| matches!(s,
             CardShape::Text { text, align: Align::Left, anchor, .. }
-                if text.contains("jasonssign1") && anchor.0 < 0.2));
-        assert!(url_left, "landscape URL should be left-aligned in the left column");
+                if text.contains("jasonssign1") && anchor.0 < 0.35));
+        assert!(url_left, "landscape URL host should be in the left column");
         // QR panel is in the RIGHT half.
         let qr_x = shapes.iter().find_map(|s| match s {
             CardShape::QrPanel { top_left, .. } => Some(top_left.0),
@@ -1145,20 +1504,167 @@ mod tests {
         );
     }
 
+    // ── Boot-card redesign (qarl mockups, 2026-07-16) ──────────────
+    // The mockups define the design language: em-dash small-caps
+    // labels, a two-colour URL, labelled rows, QR brackets, a divider,
+    // taglines + footer. These pin the elements that make it that
+    // design rather than the old bare stack.
+
+    #[test]
+    fn boot_uses_the_wordmark_image() {
+        // CLOSED-DECISION note: both redesign mockups draw an "oM"
+        // monogram tile in the lockup. openMarquee has ONE brand mark
+        // (the mark.png dot-matrix wordmark), and the `CardShape::
+        // Monogram` VARIANT was deleted outright (qarl, 2026-07-15)
+        // after the monogram kept recurring — so porting that bit of
+        // the mockup is not merely discouraged, it is unrepresentable:
+        // there is no shape to emit. That type-level guarantee is
+        // stronger than any assertion here, so this test just pins the
+        // positive — the card blits the real wordmark on both aspects.
+        for aspect in [PORTRAIT, LANDSCAPE] {
+            let shapes = layout_card(&params(SystemCardKind::Boot), aspect);
+            assert!(
+                shapes.iter().any(|s| matches!(s, CardShape::Image { .. })),
+                "BOOT card must blit the mark.png wordmark (aspect={aspect})"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_url_is_two_coloured_runs_meeting_at_one_split() {
+        // The mockup's URL is a muted `http://` + an amber host. Assert
+        // BOTH runs exist, in DIFFERENT colours, sharing one anchor so
+        // they abut exactly. A single-colour URL (the old design) fails.
+        let mut p = params(SystemCardKind::Boot);
+        p.address = Some("jasonssign1.local".to_string());
+        for aspect in [PORTRAIT, LANDSCAPE] {
+            let shapes = layout_card(&p, aspect);
+            let scheme = shapes.iter().find_map(|s| match s {
+                CardShape::Text { text, color, anchor, align: Align::Right, .. }
+                    if text == "http://" => Some((*color, *anchor)),
+                _ => None,
+            });
+            let host = shapes.iter().find_map(|s| match s {
+                CardShape::Text { text, color, anchor, align: Align::Left, .. }
+                    if text == "jasonssign1.local" => Some((*color, *anchor)),
+                _ => None,
+            });
+            let (scheme_c, scheme_a) = scheme.expect("muted http:// run missing");
+            let (host_c, host_a) = host.expect("amber host run missing");
+            assert_eq!(scheme_c, MUTED, "http:// must be muted (aspect={aspect})");
+            assert_eq!(host_c, ACCENT, "host must be accent (aspect={aspect})");
+            assert_ne!(scheme_c, host_c, "URL must be TWO colours (aspect={aspect})");
+            assert_eq!(
+                scheme_a, host_a,
+                "runs must share the split anchor so they abut (aspect={aspect})"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_url_shrinks_to_stay_on_card() {
+        // Splitting the URL into two runs took it off the paint's
+        // single-run fitting, so the layout fits it. Without this a long
+        // sign name on a narrow panel pushed the split anchor NEGATIVE
+        // (the bounds test caught exactly that at aspect 0.4).
+        let long = "a-very-long-sign-name-that-keeps-going.local";
+        let fitted = fit_mono_h(7 + long.len(), 0.036, URL_BAND_W_PORTRAIT, PORTRAIT);
+        assert!(fitted < 0.036, "a long URL must shrink ({fitted} !< 0.036)");
+        // The fitted run actually fits the band.
+        let w = mono_run_w(7 + long.len(), fitted, PORTRAIT);
+        assert!(w <= URL_BAND_W_PORTRAIT + 1e-4, "fitted URL still overflows: {w}");
+        // NON-VACUITY: fit is not just "always shrink" — a genuinely
+        // short URL keeps its nominal size (7 + 5 chars at the real
+        // portrait aspect is ~0.63 of the band).
+        let short = fit_mono_h(7 + 5, 0.036, URL_BAND_W_PORTRAIT, PORTRAIT);
+        assert_eq!(short, 0.036, "a short URL must keep its nominal size");
+        // And the layout keeps the split anchor ON-CARD for the long
+        // name at the narrow aspect that originally went negative.
+        let mut p = params(SystemCardKind::Boot);
+        p.address = Some(long.to_string());
+        assert_shapes_in_bounds(&layout_card(&p, 0.4), 0.4);
+    }
+
+    #[test]
+    fn boot_has_the_redesign_furniture() {
+        // Header label, labelled rows, divider + QR brackets (Rules),
+        // and the footer lockup — the elements that distinguish the
+        // redesign from the old bare stack.
+        let mut p = params(SystemCardKind::Boot);
+        p.ip = Some("192.168.1.67".to_string());
+        p.ssid = Some("qarl-wifi".to_string());
+        p.qr_payload = Some("http://jasonssign1.local".to_string());
+        for aspect in [PORTRAIT, LANDSCAPE] {
+            let shapes = layout_card(&p, aspect);
+            let texts: Vec<&str> = shapes
+                .iter()
+                .filter_map(|s| match s {
+                    CardShape::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect();
+            let has = |needle: &str| texts.iter().any(|t| t.contains(needle));
+            // Em-dash + small-caps hierarchy.
+            assert!(has("—"), "redesign uses em-dash section labels (aspect={aspect})");
+            assert!(has("SCAN TO OPEN"), "QR needs its small-caps header (aspect={aspect})");
+            assert!(has("IP"), "IP row needs a small-caps label (aspect={aspect})");
+            // Rules: the divider + 4 bracket arms (2 per corner L).
+            let rules = shapes.iter().filter(|s| matches!(s, CardShape::Rule { .. })).count();
+            assert!(rules >= 5, "want divider + 4 bracket arms, got {rules} (aspect={aspect})");
+            // Footer lockup.
+            assert!(
+                has("HANDMADE LED SIGN"),
+                "footer lockup missing (aspect={aspect})"
+            );
+        }
+        // Landscape-only copy from the mockup.
+        let shapes = layout_card(&p, LANDSCAPE);
+        let texts: Vec<&str> = shapes
+            .iter()
+            .filter_map(|s| match s {
+                CardShape::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("REACH THIS SIGN AT")),
+            "landscape needs the REACH THIS SIGN AT label"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("No app, no cloud, no account.")),
+            "landscape needs the tagline promise"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("in your browser")),
+            "landscape needs the QR subtitle"
+        );
+    }
+
     #[test]
     fn boot_with_ssid_emits_wifi_line() {
-        // boot-card 2026-07-07: the connected SSID appears as a
-        // "Wi-Fi: <ssid>" line so a viewer knows which network to join
-        // to reach the URL.
+        // boot-card 2026-07-07: the connected SSID must appear so a viewer
+        // knows which network to join to reach the URL. The INVARIANT is
+        // unchanged; the redesign (2026-07-16) changed the FORM from a
+        // "Wi-Fi: NEBULA" prefix line to a small-caps "WI-FI" side-label
+        // above/beside the bare SSID value. Assert both halves so a
+        // dropped label or a dropped value both fail.
         let mut p = params(SystemCardKind::Boot);
         p.ssid = Some("NEBULA".to_string());
-        let shapes = layout_card(&p, PORTRAIT);
-        assert!(
-            shapes
-                .iter()
-                .any(|s| matches!(s, CardShape::Text { text, .. } if text == "Wi-Fi: NEBULA")),
-            "BOOT card must show the connected Wi-Fi SSID line"
-        );
+        for aspect in [PORTRAIT, LANDSCAPE] {
+            let shapes = layout_card(&p, aspect);
+            assert!(
+                shapes
+                    .iter()
+                    .any(|s| matches!(s, CardShape::Text { text, .. } if text == "NEBULA")),
+                "BOOT card must show the connected SSID value (aspect={aspect})"
+            );
+            assert!(
+                shapes
+                    .iter()
+                    .any(|s| matches!(s, CardShape::Text { text, .. } if text == "WI-FI")),
+                "BOOT card must label the SSID row WI-FI (aspect={aspect})"
+            );
+        }
     }
 
     #[test]
