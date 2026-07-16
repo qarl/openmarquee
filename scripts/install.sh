@@ -27,6 +27,16 @@
 #     bash /opt/openmarquee/scripts/install.sh --dry-run        # print actions
 #     bash /opt/openmarquee/scripts/install.sh --root /tmp/test --dry-run
 #                                                                # test off-device
+#     sudo bash /opt/openmarquee/scripts/install.sh --system-only
+#                                                                # system/ files only
+#
+# --system-only (deploy-hygiene 2026-07-16): install ONLY the system-config
+# sections (systemd units, netctl helpers, hostapd/dnsmasq/NM/udev/sudoers/
+# tmpfiles/avahi/boot-splash/cron + daemon-reload + enable) and SKIP the §2
+# Python venv + pip install (the backend app layer). This is the primitive
+# scripts/sync-system-to-sign.sh uses so the routine low-impact deploy path
+# can refresh system/ files without the heavy venv work — closing the
+# binary-only-deploy drift documented in docs/deploy-hygiene-audit-2026-07-16.md.
 #
 # Dry-run prints each high-level action prefixed with `DRYRUN:`. The
 # --root flag lets the test suite redirect destination paths into a
@@ -59,11 +69,13 @@ fi
 
 DRY_RUN=0
 ROOT_PREFIX=""
+SYSTEM_ONLY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --dry-run)  DRY_RUN=1; shift ;;
-        --root)     ROOT_PREFIX="$2"; shift 2 ;;
+        --dry-run)      DRY_RUN=1; shift ;;
+        --root)         ROOT_PREFIX="$2"; shift 2 ;;
+        --system-only)  SYSTEM_ONLY=1; shift ;;
         --help|-h)
             sed -n '2,30p' "$0"
             exit 0
@@ -382,31 +394,54 @@ RUST_BIN_INSTALLED="${ROOT_PREFIX}/usr/local/bin/openmarquee-render"
 RUST_BIN_TMP="${RUST_BIN_INSTALLED}.new"
 say "Install Rust IPC sidecar binary (opt-in via OPENMARQUEE_RENDERER=rust-sidecar)"
 if [ "$DRY_RUN" -eq 1 ] || [ -f "$RUST_BIN_STAGED" ]; then
-    run mkdir -p "$(dirname "$RUST_BIN_INSTALLED")"
-    # cp to sibling temp path first (no ETXTBSY -- nothing holds the
-    # .new path open). Defensive cleanup of any leftover .new from a
-    # prior failed install run -- `cp` would overwrite it anyway, but
-    # explicit rm makes the intent obvious.
-    run rm -f "$RUST_BIN_TMP" || true
-    if ! run cp "$RUST_BIN_STAGED" "$RUST_BIN_TMP"; then
-        say "ERROR: cp $RUST_BIN_STAGED -> $RUST_BIN_TMP failed."
-        say "  (likely disk-full or permission issue; investigate with:"
-        say "   df -h $(dirname "$RUST_BIN_INSTALLED"); ls -ld $(dirname "$RUST_BIN_INSTALLED"))"
+    # Staging/live REVERT GUARD (deploy-hygiene 2026-07-16). The binary-only
+    # sign-deploy path (qa/deploy-to-sign.sh) writes the LIVE binary
+    # (${RUST_BIN_INSTALLED}) directly and does NOT refresh this staging copy
+    # (${RUST_BIN_STAGED}). Blindly promoting staging→live here would REVERT a
+    # freshly hand-deployed binary to the older staged one — the "different md5
+    # in each path" hazard from docs/deploy-hygiene-audit-2026-07-16.md §4.
+    # Promote ONLY when staging is newer than the installed binary (or the
+    # installed binary is absent). Mirrors the §3 unit-loop's `-nt` freshness
+    # check. --dry-run always proceeds so it still prints the intended actions.
+    # Caveat (same as §3): `-nt` compares mtimes, and staging carries the
+    # build-HOST mtime (rsync -a preserves it) while live carries the Pi-side
+    # promote time. A build host whose clock lags the sign by more than the
+    # build interval could make a genuinely-new staged binary look older and be
+    # skipped (a `say` is logged; deploy.sh does not error). Keep dev host + sign
+    # NTP-synced. The proper belt is deploy-to-sign.sh refreshing staging on a
+    # hand-deploy; this guard is the durable suspenders.
+    if [ "$DRY_RUN" -eq 0 ] && [ -f "$RUST_BIN_INSTALLED" ] && [ ! "$RUST_BIN_STAGED" -nt "$RUST_BIN_INSTALLED" ]; then
+        say "  staged binary ($RUST_BIN_STAGED) is NOT newer than installed"
+        say "  ($RUST_BIN_INSTALLED); skip promote (revert guard)."
+        say "  If unexpected, the /opt staging copy is stale vs a directly-deployed"
+        say "  live binary — run a full deploy.sh (re-cross-build first) to re-stage."
+    else
+        run mkdir -p "$(dirname "$RUST_BIN_INSTALLED")"
+        # cp to sibling temp path first (no ETXTBSY -- nothing holds the
+        # .new path open). Defensive cleanup of any leftover .new from a
+        # prior failed install run -- `cp` would overwrite it anyway, but
+        # explicit rm makes the intent obvious.
         run rm -f "$RUST_BIN_TMP" || true
-        exit 1
-    fi
-    run chmod +x "$RUST_BIN_TMP"
-    # Atomic swap. rename(2) on a same-filesystem dest doesn't touch
-    # the destination's content -- it just re-points the directory
-    # entry. The running backend's exec-mmap stays bound to the old
-    # inode; the old inode is reaped when the backend exits OR is
-    # restarted at §8. No ETXTBSY possible here.
-    if ! run mv -f "$RUST_BIN_TMP" "$RUST_BIN_INSTALLED"; then
-        say "ERROR: mv $RUST_BIN_TMP -> $RUST_BIN_INSTALLED failed."
-        say "  (cross-filesystem rename? both paths must be on the same fs;"
-        say "   check with: df -h $RUST_BIN_TMP $(dirname "$RUST_BIN_INSTALLED"))"
-        run rm -f "$RUST_BIN_TMP" || true
-        exit 1
+        if ! run cp "$RUST_BIN_STAGED" "$RUST_BIN_TMP"; then
+            say "ERROR: cp $RUST_BIN_STAGED -> $RUST_BIN_TMP failed."
+            say "  (likely disk-full or permission issue; investigate with:"
+            say "   df -h $(dirname "$RUST_BIN_INSTALLED"); ls -ld $(dirname "$RUST_BIN_INSTALLED"))"
+            run rm -f "$RUST_BIN_TMP" || true
+            exit 1
+        fi
+        run chmod +x "$RUST_BIN_TMP"
+        # Atomic swap. rename(2) on a same-filesystem dest doesn't touch
+        # the destination's content -- it just re-points the directory
+        # entry. The running backend's exec-mmap stays bound to the old
+        # inode; the old inode is reaped when the backend exits OR is
+        # restarted at §8. No ETXTBSY possible here.
+        if ! run mv -f "$RUST_BIN_TMP" "$RUST_BIN_INSTALLED"; then
+            say "ERROR: mv $RUST_BIN_TMP -> $RUST_BIN_INSTALLED failed."
+            say "  (cross-filesystem rename? both paths must be on the same fs;"
+            say "   check with: df -h $RUST_BIN_TMP $(dirname "$RUST_BIN_INSTALLED"))"
+            run rm -f "$RUST_BIN_TMP" || true
+            exit 1
+        fi
     fi
 else
     say "  no staged binary at ${RUST_BIN_STAGED}; skip (sidecar opt-in unused)"
@@ -486,6 +521,14 @@ fi
 #
 # r29 (2026-05-31): runs AFTER sections 3, 3a, 3b — see the meta-comment
 # above section 3 for the rationale.
+#
+# --system-only (deploy-hygiene 2026-07-16): this whole section — the ONLY
+# app-layer (backend Python) work in install.sh — is skipped for a targeted
+# system/-file resync. Everything else in this script is OS-level config and
+# still runs. See the --system-only note in the header + sync-system-to-sign.sh.
+if [ "$SYSTEM_ONLY" -eq 1 ]; then
+    say "Skip §2 Python venv + pip install (--system-only: system files only)"
+else
 
 VENV_DIR="${OPT_DIR}/venv"
 say "Ensure Python venv at ${VENV_DIR}"
@@ -537,6 +580,7 @@ if [ -f "${OPT_DIR}/backend/requirements.lock" ]; then
     run "${VENV_DIR}/bin/pip" install --upgrade ${PIP_OFFLINE_FLAGS[@]+"${PIP_OFFLINE_FLAGS[@]}"} -r "${OPT_DIR}/backend/requirements.lock"
 fi
 run "${VENV_DIR}/bin/pip" install --upgrade ${PIP_OFFLINE_FLAGS[@]+"${PIP_OFFLINE_FLAGS[@]}"} -e "${OPT_DIR}/backend"
+fi  # end §2 (skipped under --system-only)
 
 # --- 4. hostapd.conf --------------------------------------------------------
 
