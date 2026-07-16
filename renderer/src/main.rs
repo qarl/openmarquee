@@ -60,16 +60,22 @@ mod colorlight_logic;
 // path) exercised by tests but not yet by the arm-fill.
 #[allow(dead_code)]
 mod colorlight;
-// Colorlight COMPOSITOR layer — Phase-1 prep (hardware-independent).
-// Compositor trait + CpuCompositor (tiny_skia-backed test-pattern
-// rasterizer) + PNG-dump helper. The real GBM+EGL Pattern A compositor
-// lands as a sibling HeadlessGpuCompositor : Compositor in PR #B0.5
-// (behind #[cfg(target_os = "linux")]), pairing with a shared
-// egl_bringup refactor of hdmi.rs.  #[allow(dead_code)] on Phase-0-only
-// surfaces (produce_rgba direct access, pattern accessor) exercised by
-// tests but not yet by the arm-fill.
+// Colorlight COMPOSITOR layer — Phase-1 prep. Compositor trait +
+// CpuCompositor (tiny_skia-backed test-pattern rasterizer) + PNG-dump
+// helper.  #[allow(dead_code)] on Phase-0-only surfaces (produce_rgba
+// direct access, pattern accessor) exercised by tests but not yet by
+// the arm-fill.
 #[allow(dead_code)]
 mod colorlight_compositor;
+// Colorlight GPU compositor — Linux-only Pattern A (PR #B0.5 Commit 2).
+// Second implementation of the Compositor trait: shares the GBM+EGL
+// bring-up with hdmi.rs via crate::egl_bringup::HeadlessEgl.  On Linux
+// the arm-fill picks this over CpuCompositor (falls back on bring-up
+// failure). #[allow(dead_code)] on Phase-0-only surfaces (pattern
+// accessor).
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+mod colorlight_gpu_compositor;
 // HUB75-direct output backend. Phase 0 arm-fill wires this into
 // OutputMode::Hub75 (env → config → validated GpioSink diagnostic).
 // The real FFI backend (hzeller rpi-rgb-led-matrix binding) + the
@@ -2287,14 +2293,73 @@ fn main() -> Result<()> {
                 }
             };
             use colorlight_compositor::Compositor as _;
-            let mut compositor = colorlight_compositor::CpuCompositor::card_default(pattern);
+            // Compositor selection (PR #B0.5 swap semantics):
+            //  - On Linux: try `HeadlessGpuCompositor` (real Pattern
+            //    A: GBM+EGL headless + glClear + glReadPixels via
+            //    the shared `egl_bringup` primitive).  If bring-up
+            //    fails (no /dev/dri, no vc4 driver, permission
+            //    denied, etc.), LOG + fall back to `CpuCompositor`
+            //    so the arm still exits 0 with a usable diagnostic.
+            //  - On other targets: `CpuCompositor` unconditionally.
+            //  - Both implement the `Compositor` trait; the arm
+            //    below sees `Box<dyn Compositor>` in either case,
+            //    so the compositor-name diagnostic changes but the
+            //    rest of the arm doesn't fork.
+            let compositor_name: &'static str;
+            let mut compositor: Box<dyn colorlight_compositor::Compositor>;
+            #[cfg(target_os = "linux")]
+            {
+                let card_path = args
+                    .drm_card
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/dev/dri/card0"));
+                let card_result = Card::open(&card_path).and_then(|card| {
+                    colorlight_gpu_compositor::HeadlessGpuCompositor::card_default(
+                        pattern, &card,
+                    )
+                    .map_err(|e| anyhow::anyhow!("HeadlessGpuCompositor: {e}"))
+                });
+                match card_result {
+                    Ok(gpu) => {
+                        compositor_name = "HeadlessGpuCompositor (Pattern A: GBM+EGL+glClear)";
+                        eprintln!(
+                            "colorlight compositor: {compositor_name} using {}",
+                            card_path.display()
+                        );
+                        compositor = Box::new(gpu);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "colorlight compositor: GPU bring-up via {} failed ({e}); \
+                             falling back to CpuCompositor",
+                            card_path.display()
+                        );
+                        compositor_name = "CpuCompositor (fallback; GPU bring-up failed)";
+                        compositor = Box::new(
+                            colorlight_compositor::CpuCompositor::card_default(pattern),
+                        );
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                compositor_name = "CpuCompositor (Mac dev; GBM+EGL Pattern A is Linux-only)";
+                compositor = Box::new(
+                    colorlight_compositor::CpuCompositor::card_default(pattern),
+                );
+            }
             let card_w = compositor.card_width_px();
             let card_h = compositor.card_height_px();
-            let fb = match colorlight_compositor::Compositor::produce_frame(&mut compositor) {
+            let fb = match compositor.produce_frame() {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("colorlight CONFIG ERROR: compositor produce_frame failed: {e}");
-                    eprintln!("colorlight output: exiting clean; see stderr for details.");
+                    eprintln!(
+                        "colorlight output: exiting clean; the compositor could not \
+                         produce a frame — check the pattern is supported by the \
+                         selected compositor (Checkerboard8 / Gradient are \
+                         CpuCompositor-only in Phase 0)."
+                    );
                     return Ok(());
                 }
             };
@@ -2326,17 +2391,16 @@ fn main() -> Result<()> {
                 Ok(frame_count) => {
                     eprintln!(
                         "colorlight output (Phase 0 skeleton, arm-fill only):\n\
-                         \x20 compositor       = CpuCompositor (tiny_skia)\n\
+                         \x20 compositor       = {}\n\
                          \x20 test pattern     = {:?}\n\
                          \x20 card dims        = {}x{} px (canvas 128w x 96h; card native 96w x 128t transposed)\n\
                          \x20 encoder          = colorlight_logic::serialize_frame\n\
                          \x20 sink             = VecSink (in-memory recorder)\n\
                          \x20 frames encoded   = {} (expect 130 = 1 brightness + 128 rows + 1 latch)\n\
-                         Whole pipeline reachable end-to-end on macOS.  Real GBM+EGL\n\
-                         compositor (Pattern A) lands as PR #B0.5.  Real AF_PACKET\n\
+                         Whole pipeline reachable end-to-end.  Real AF_PACKET\n\
                          PacketSink + live-loop wiring lands as PR #B1.  For visual\n\
-                         iteration on macOS pass --colorlight-dump-png <path>.",
-                        pattern, card_w, card_h, frame_count
+                         iteration pass --colorlight-dump-png <path>.",
+                        compositor_name, pattern, card_w, card_h, frame_count
                     );
                 }
                 Err(e) => {
