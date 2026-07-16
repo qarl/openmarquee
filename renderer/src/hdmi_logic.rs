@@ -5173,6 +5173,28 @@ pub struct MotionState {
     pub offset_y_norm: f32,
     pub scale: f32,
     pub alpha_mul: f32,
+    /// Per-GLYPH shake basis — `Some` for `Shake` only, `None` for
+    /// every other mode. See `ShakeBasis` / `shake_glyph_offset_norm`.
+    pub shake: Option<ShakeBasis>,
+}
+
+/// Basis for deriving PER-GLYPH shake offsets (qarl 2026-07-16: the
+/// jitter should move each LETTER independently, not each line as a
+/// rigid unit).
+///
+/// `seed` is the layer's mixed PRNG state for this tick (layer seed ×
+/// phase × 10 Hz tick bucket, captured by `motion_shake` BEFORE it
+/// draws the layer-level sample); `amp` is the clamped amplitude in
+/// glyph-height units. `shake_glyph_offset_norm(basis, glyph_index)`
+/// re-derives an independent offset per letter from that basis.
+///
+/// Carried on `MotionState` rather than threaded as new params so the
+/// per-glyph draw can derive offsets without plumbing `slide_id` +
+/// `tick_seconds` through `paint_slide` and its ~20 call sites.
+#[derive(Debug, Clone, Copy)]
+pub struct ShakeBasis {
+    pub seed: u64,
+    pub amp: f32,
 }
 
 impl MotionState {
@@ -5181,7 +5203,39 @@ impl MotionState {
         offset_y_norm: 0.0,
         scale: 1.0,
         alpha_mul: 1.0,
+        shake: None,
     };
+}
+
+/// Per-GLYPH shake offset in glyph-height units (qarl 2026-07-16).
+///
+/// Each letter jitters independently around its OWN base position
+/// instead of the whole line translating as a unit. Amplitude is the
+/// same `basis.amp` the layer-level shake used, so letters stay close
+/// to their neighbours and the word stays readable — only the
+/// granularity changes.
+///
+/// Seed = layer basis + glyph index — structural identity (parent +
+/// index), never content-derived, matching the seed convention this
+/// same effect established on 2026-05-02. Deterministic: same basis +
+/// index always yields the same offset, so a re-render of the same
+/// tick is byte-identical.
+pub fn shake_glyph_offset_norm(basis: ShakeBasis, glyph_index: usize) -> (f32, f32) {
+    // Mix the index into the layer basis. splitmix64's finalizer (in
+    // gaussian_from_state) avalanches, so adjacent indices decorrelate.
+    let mut state = basis.seed
+        ^ (glyph_index as u64)
+            .wrapping_add(1)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(29);
+    let dx = gaussian_from_state(&mut state);
+    let dy = gaussian_from_state(&mut state);
+    // Same ±1.0 Gaussian clamp as the layer-level draw so a 3-sigma
+    // tail can't fling one letter away from its neighbours.
+    (
+        basis.amp * dx.clamp(-1.0, 1.0),
+        basis.amp * dy.clamp(-1.0, 1.0),
+    )
 }
 
 /// Compute the per-frame motion state for a layer at `tick_seconds`
@@ -5331,6 +5385,10 @@ fn motion_shake(
     let mut state = layer_id_seed
         ^ phase_bits.rotate_left(17)
         ^ tick_index.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    // Capture the mixed seed BEFORE drawing, so per-glyph offsets
+    // derive from the same layer/phase/tick basis (qarl 2026-07-16
+    // per-letter jitter). See `shake_glyph_offset_norm`.
+    let basis_seed = state;
     let dx = gaussian_from_state(&mut state);
     let dy = gaussian_from_state(&mut state);
     // Cap amplitude at ±4 % of glyph height (intensity=100); 0.5 %
@@ -5338,9 +5396,19 @@ fn motion_shake(
     // "±2 %"). Clamp the Gaussian to ±1.0 so a 3-sigma tail can't
     // suddenly throw the layer halfway across the slide.
     let amp = 0.005 + 0.035 * intensity_norm;
+    // The layer-level offsets stay populated as the FALLBACK for the
+    // one path that has no per-layer MotionState: the FBO-bake path
+    // passes `motion_states: None`, so the draw sees
+    // `MotionState::IDENTITY` (shake: None) and takes the old
+    // layer-translate branch — which, with IDENTITY's zero offsets,
+    // is a no-op either way. The live per-glyph draw skips the layer
+    // translate whenever a basis is present, so letters never
+    // double-move. (No other production consumer reads these for
+    // Shake: `motion_offset_to_px`'s Shake arm is now bypassed.)
     MotionState {
         offset_x_norm: amp * dx.clamp(-1.0, 1.0),
         offset_y_norm: amp * dy.clamp(-1.0, 1.0),
+        shake: Some(ShakeBasis { seed: basis_seed, amp }),
         ..MotionState::IDENTITY
     }
 }
@@ -10519,6 +10587,106 @@ mod tests {
         // visible.
         let m = compute_motion_state(MotionKind::Blink, 100, 0.0, 1.0, 0, 0.0625);
         assert!((m.alpha_mul - 1.0).abs() < 1e-6);
+    }
+
+    // ── qarl 2026-07-16: per-LETTER jitter ────────────────────────
+    // The ask: "currently each line jitters on its own. i'd like that
+    // to be each LETTER, jittering around next to its neighbors."
+    // These guard the per-glyph derivation. The load-bearing one is
+    // `shake_glyph_offsets_differ_across_letters` — a test that only
+    // asserted "an offset happened" would pass even if every letter
+    // moved identically (i.e. the old per-line behaviour).
+
+    #[test]
+    fn shake_glyph_offsets_differ_across_letters() {
+        // NON-VACUITY: the whole point is that letters move
+        // INDEPENDENTLY. If per-glyph offsets were identical, the
+        // line would still move as a rigid unit and this test must
+        // fail. Assert every letter in a 12-glyph run gets a
+        // distinct offset pair.
+        let basis = ShakeBasis { seed: 0xC0FF_EE00_1234_5678, amp: 0.04 };
+        let offsets: Vec<(f32, f32)> =
+            (0..12).map(|i| shake_glyph_offset_norm(basis, i)).collect();
+        for i in 0..offsets.len() {
+            for j in (i + 1)..offsets.len() {
+                assert!(
+                    (offsets[i].0 - offsets[j].0).abs() > 1e-9
+                        || (offsets[i].1 - offsets[j].1).abs() > 1e-9,
+                    "glyphs {i} and {j} got identical offsets {:?} — letters \
+                     would move as a rigid line, not per-letter",
+                    offsets[i],
+                );
+            }
+        }
+        // And they must not be trivially zero (a zeroed offset would
+        // also be "all identical" in a degenerate way).
+        assert!(
+            offsets.iter().any(|(x, y)| x.abs() > 1e-6 || y.abs() > 1e-6),
+            "per-glyph offsets were all ~zero — no jitter at all",
+        );
+    }
+
+    #[test]
+    fn shake_glyph_offset_is_deterministic() {
+        // Same basis + index → same offset, so re-rendering one tick
+        // is byte-identical (goldens / parity depend on this).
+        let basis = ShakeBasis { seed: 0xDEAD_BEEF_CAFE_0001, amp: 0.04 };
+        for i in [0usize, 1, 7, 42] {
+            assert_eq!(
+                shake_glyph_offset_norm(basis, i),
+                shake_glyph_offset_norm(basis, i),
+            );
+        }
+    }
+
+    #[test]
+    fn shake_glyph_offset_stays_within_amplitude() {
+        // Letters must stay NEXT TO their neighbours — the offset is
+        // bounded by the same amp the layer-level shake used, so the
+        // word stays readable. Sweep indices + amps.
+        for &amp in &[0.005f32, 0.0225, 0.04] {
+            let basis = ShakeBasis { seed: 0x5EED_0000_0000_BEEF, amp };
+            for i in 0..256 {
+                let (dx, dy) = shake_glyph_offset_norm(basis, i);
+                assert!(dx.abs() <= amp + 1e-6, "dx {dx} exceeds amp {amp} at {i}");
+                assert!(dy.abs() <= amp + 1e-6, "dy {dy} exceeds amp {amp} at {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn shake_glyph_offsets_diverge_across_layers() {
+        // Two layers (different basis seeds) must not produce the
+        // same per-letter sequence — otherwise UNCAGE / YOUR / SIGN
+        // would jitter in lockstep.
+        let a = ShakeBasis { seed: 0xAAAA_AAAA_AAAA_AAAA, amp: 0.04 };
+        let b = ShakeBasis { seed: 0xBBBB_BBBB_BBBB_BBBB, amp: 0.04 };
+        let differs = (0..8).any(|i| shake_glyph_offset_norm(a, i) != shake_glyph_offset_norm(b, i));
+        assert!(differs, "different layers produced identical per-letter jitter");
+    }
+
+    #[test]
+    fn shake_exposes_glyph_basis_and_other_modes_do_not() {
+        // Plumbing guard: the per-glyph draw keys off `state.shake`
+        // being Some. Shake must carry it; every other mode must not
+        // (else they'd wrongly take the per-glyph path).
+        let shake = compute_motion_state(MotionKind::Shake, 85, 0.0, 1.0, 0xABCD, 1.25);
+        let basis = shake.shake.expect("Shake must expose a per-glyph basis");
+        assert!((basis.amp - (0.005 + 0.035 * 0.85)).abs() < 1e-6);
+        for kind in [
+            MotionKind::Static,
+            MotionKind::Ticker,
+            MotionKind::Breathe,
+            MotionKind::Pulse,
+            MotionKind::Bounce,
+            MotionKind::Blink,
+        ] {
+            let m = compute_motion_state(kind, 85, 0.0, 1.0, 0xABCD, 1.25);
+            assert!(
+                m.shake.is_none(),
+                "{kind:?} must not carry a shake basis (would take the per-glyph path)",
+            );
+        }
     }
 
     #[test]
