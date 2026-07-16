@@ -1,4 +1,7 @@
 // @vitest-environment jsdom
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { mountSettings } from "./settings.js";
 
@@ -219,17 +222,53 @@ describe("mountSettings", () => {
         expect(detectBtn.classList.contains("ghost")).toBe(false);
     });
 
-    it("output mode select covers every SYSTEM_SPEC output variant", async () => {
+    it("output mode select offers exactly what the backend accepts", async () => {
+        // COUPLED GUARD -- the test that would have caught the original bug.
+        //
+        // The dropdown offered hdmi/hub75/ws281x/composite while the backend
+        // is `OutputMode = Literal["hdmi"]` and _coerce_legacy_output_mode
+        // silently rewrites the other three back to "hdmi" ON THE PUT. So
+        // picking "HUB75 panel" returned 200, reverted the mode -- and left
+        // the UI's dim-snap persisted at 128x96. An HDMI sign at panel dims,
+        // silent, visible only on the glass.
+        //
+        // Asserting a HARDCODED ["hdmi"] would only fail in one direction,
+        // and the natural way to "fix" that failure is to edit the
+        // expectation -- which restores the bug. So read the Literal out of
+        // the backend and require the two to MATCH. This fails if the
+        // dropdown grows past the Literal (the original bug) AND if the
+        // Literal grows past the dropdown (a phase widening the backend
+        // without re-adding the option). Unfixable except by moving them
+        // together, which is the actual invariant. Precedent for
+        // cross-language static-parse guards: editor-width.test.js parses
+        // styles.css; backend/tests/test_ui_pill_live_collision_guard.py
+        // reads UI source.
+        //
+        // NB a phase widening the Literal must ALSO teach dependencies.py:501
+        // to route the new mode -- it sends any non-hdmi value to
+        // MockRenderer, i.e. a dark sign. This guard can't see that; the
+        // comment on OUTPUT_MODES carries it.
+        // fileURLToPath, not `new URL(..., import.meta.url)`: under the
+        // jsdom transform import.meta.url isn't a file: URL. Same shape as
+        // editor-width.test.js, which static-parses styles.css.
+        const here = dirname(fileURLToPath(import.meta.url));
+        const settingsPy = readFileSync(
+            resolve(here, "..", "..", "backend", "openmarquee", "settings.py"),
+            "utf8",
+        );
+        const literal = settingsPy.match(/^OutputMode = Literal\[(.+)\]$/m);
+        expect(literal, "could not find `OutputMode = Literal[...]` in settings.py").not.toBeNull();
+        const accepted = Array.from(literal[1].matchAll(/"([^"]+)"/g)).map((m) => m[1]);
+        expect(accepted.length, "parsed an empty Literal -- the regex has drifted").toBeGreaterThan(0);
+
         const container = document.createElement("div");
-        mount(container, {
-            fetchSettings: async () => SAMPLE,
-            onSave: vi.fn(),
-        });
+        mount(container, { fetchSettings: async () => SAMPLE, onSave: vi.fn() });
         await tick();
-        const values = Array.from(
+        const offered = Array.from(
             container.querySelectorAll(".field-output-mode option"),
         ).map((o) => o.value);
-        expect(values).toEqual(["hdmi", "hub75", "ws281x", "composite"]);
+
+        expect(offered).toEqual(accepted);
     });
 
     it("preserves a stored timezone value even if Intl doesn't surface it", async () => {
