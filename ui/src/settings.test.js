@@ -2124,3 +2124,42 @@ describe("Settings → removing the last saved network falls back to AP", () => 
         expect(container.querySelector(".field-wifi-station-enabled").checked).toBe(true);
     });
 });
+
+describe("Settings → the setup-AP SSID follows the sign name", () => {
+    // qarl 2026-07-07 (Option A): "names always follow the sign hostname; a
+    // custom override does NOT stick through a rename." The box was editable
+    // anyway, so an operator could rename the setup network, see "Saved",
+    // and get NOTHING: _apply_hostapd_ssid is only ever called with the sign
+    // name or the boot hostname, so the sign kept broadcasting the old SSID
+    // -- and _reconcile_stored_name_fields rewrote the stored value from the
+    // hostname on the next backend start, reverting the box too.
+    it("is readonly, so it can't promise a rename it won't do", async () => {
+        const container = document.createElement("div");
+        mount(container, { fetchSettings: async () => SAMPLE, onSave: async () => {} });
+        await tick();
+
+        const ssid = container.querySelector(".field-wifi-ssid");
+        expect(ssid.readOnly).toBe(true);
+        // Still SHOWN: it's the network you join to set the sign up.
+        expect(ssid.value).toBe("openMarquee-A3F7");
+    });
+
+    it("is not echoed back on save", async () => {
+        // The stored value is owned by the boot reconcile. Echoing a stale
+        // copy would weaken one of the three signals wifi_networks_actuator
+        // uses to recognise + protect the setup-AP profile.
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        const container = document.createElement("div");
+        mount(container, { fetchSettings: async () => SAMPLE, onSave });
+        await tick();
+
+        const brightness = container.querySelector(".field-brightness");
+        brightness.value = "42";
+        brightness.dispatchEvent(new Event("input", { bubbles: true }));
+        await tick();
+
+        const payload = onSave.mock.calls[0][0];
+        expect("wifi_ssid" in payload).toBe(false);
+        expect(payload.brightness).toBe(42);
+    });
+});

@@ -1526,3 +1526,37 @@ def test_put_without_sign_name_does_not_mint_a_random_name(client, monkeypatch):
         f"omitting sign_name minted a random default name: {name!r}"
     )
     assert renames == []
+
+
+def test_put_without_wifi_ssid_keeps_the_reconciled_value(client, monkeypatch):
+    """`wifi_ssid` is the setup-AP SSID and FOLLOWS the sign name -- the boot
+    reconcile rewrites it from the hostname on every backend start (qarl's
+    Option A). The panel's field is readonly now and never sends it, so
+    absence must keep the stored value rather than fall through to the
+    model default and quietly rename the setup network."""
+    from openmarquee import name_actuator
+
+    monkeypatch.setattr(name_actuator, "apply_in_background", lambda n: None)
+    client.put("/api/settings", json=_settings_payload(client, wifi_ssid="jasonssign1"))
+
+    body = _settings_payload(client, brightness=42)
+    body.pop("wifi_ssid")
+    res = client.put("/api/settings", json=body)
+
+    assert res.status_code == 200
+    assert res.json()["wifi_ssid"] == "jasonssign1"
+    assert res.json()["brightness"] == 42
+
+
+def test_put_with_wifi_ssid_still_stores_it(client, monkeypatch):
+    """CONTROL: absence is the signal, not a blanket refusal. The rename path
+    (apply_sign_name -> _reconcile_stored_name_fields) writes this field
+    through the same model, so it must remain settable."""
+    from openmarquee import name_actuator
+
+    monkeypatch.setattr(name_actuator, "apply_in_background", lambda n: None)
+
+    res = client.put("/api/settings", json=_settings_payload(client, wifi_ssid="fireplacesign"))
+
+    assert res.status_code == 200
+    assert res.json()["wifi_ssid"] == "fireplacesign"

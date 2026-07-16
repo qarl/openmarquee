@@ -7,8 +7,12 @@
 //
 // Fields are persisted *now* but several are advisory until later phases
 // wire them into the running system:
-//   - output_mode picks the renderer (Phase 6 HDMI, Phase 8 HUB75, etc.)
-//   - wifi_ssid / wifi_password rewrite hostapd.conf (Phase 7)
+//   - output_mode picks the renderer -- HDMI only today. The backend is
+//     `Literal["hdmi"]` and coerces anything else away, so this dropdown
+//     offers only hdmi (see OUTPUT_MODES).
+//   - wifi_password rewrites hostapd.conf (Phase 7). wifi_ssid does NOT:
+//     the setup-AP SSID follows the SIGN NAME (name_actuator drives
+//     hostapd from it), so the field is derived + readonly.
 //   - brightness / gamma feed the active renderer at playback time
 // See backend/openmarquee/settings.py for the authoritative scope notes.
 
@@ -167,9 +171,27 @@ const SECTION_TEMPLATE = `
                             can always reconnect and fix it.
                         </p>
                         <div class="row" style="gap: 10px;">
+                            <!-- 2026-07-16: READONLY, because editing it never did
+                                 anything and then silently undid itself. The setup-AP
+                                 SSID follows the sign name (qarl 2026-07-07, Option A:
+                                 "names always follow the sign hostname; a custom
+                                 override does NOT stick through a rename"), and the
+                                 boot reconcile enforces that -- name_actuator's
+                                 _reconcile_stored_name_fields rewrites wifi_ssid from
+                                 the hostname on EVERY backend start. Meanwhile nothing
+                                 ever applied a UI-edited value to hostapd.conf:
+                                 _apply_hostapd_ssid is only ever called with the sign
+                                 name or the boot hostname. So the operator renamed the
+                                 setup network, saw "Saved", the sign kept broadcasting
+                                 the old SSID, and the box reverted on the next reboot.
+                                 Showing the derived value is useful (it's the network
+                                 you join to set the sign up); letting someone type into
+                                 it was a lie. Rename the sign to change it. -->
                             <label class="field om-field" style="flex: 1;">
                                 <span>Network name (SSID)</span>
-                                <input type="text" class="om-input field-wifi-ssid" maxlength="32">
+                                <input type="text" class="om-input field-wifi-ssid" maxlength="32"
+                                       readonly aria-readonly="true"
+                                       title="Follows the sign's display name. Rename the sign to change it.">
                             </label>
                             <label class="field om-field secret-field" style="flex: 1;" data-secret="wifi-ap-password">
                                 <span>Network password (8-63 chars)</span>
@@ -1615,7 +1637,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             brightness: Number(brightnessEl.value),
             gamma: Number(gammaEl.value),
             wifi_ap_enabled: apEnabledEl.checked,
-            wifi_ssid: ssidEl.value,
             wifi_password: passwordEl.value,
             wifi_station_enabled: stationEnabledEl.checked,
             wifi_station_ssid: stationSsidEl.value.trim() || null,
