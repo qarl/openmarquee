@@ -23,6 +23,9 @@ non-zero response leaves the caller unharmed.
 
 from __future__ import annotations
 
+import configparser
+from pathlib import Path
+
 from openmarquee import name_actuator
 
 
@@ -147,6 +150,261 @@ class TestAvahiPath:
         monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
         # Must not raise.
         name_actuator._apply_avahi_hostname("JasonsSign1")
+
+
+def _parse_shipped(payload: bytes) -> configparser.ConfigParser:
+    """Parse a payload the actuator shipped to netctl EXACTLY as
+    avahi-daemon would: any assignment outside a group raises, which is
+    the daemon's "Assignment outside group" refusal."""
+    parser = configparser.ConfigParser(strict=False, interpolation=None)
+    parser.read_string(payload.decode("utf-8"))
+    return parser
+
+
+class TestAvahiConfIsAlwaysWellFormed:
+    """2026-07-16 (QA, JasonsSign1): avahi-daemon refused to start —
+    "Assignment outside group in <host-name=jasonssign1>" — so the sign
+    had no mDNS at all. The actuator had written a conf whose entire
+    content was a bare `host-name=` line with no [server] group.
+
+    These pin the payload the actuator SHIPS, parsed the way the daemon
+    reads it. Each drives the real write path via the netctl spy.
+    """
+
+    def test_empty_conf_does_not_produce_a_bare_hostname_line(self, monkeypatch, tmp_path):
+        """THE BUG, exactly. An empty conf hit `conf_text.rstrip() +
+        "\\nhost-name=..."`, and `"".rstrip()` is `""` — so the append WAS
+        the whole file: `"\\nhost-name=jasonssign1\\n"`. host-name on line
+        2, no group anywhere. Fails on the pre-fix code."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("")  # exists, but empty
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+
+        name_actuator._apply_avahi_hostname("jasonssign1")
+
+        assert len(spy.calls) == 1, "an empty conf must still be repaired"
+        _subcommand, payload = spy.calls[0]
+        parser = _parse_shipped(payload)  # raises on "assignment outside group"
+        assert parser.get("server", "host-name") == "jasonssign1"
+
+    def test_conf_with_groups_but_no_hostname_puts_key_in_server(self, monkeypatch, tmp_path):
+        """Pre-fix, the append landed host-name at EOF — inside whatever
+        group happened to be LAST. That parses fine (so a
+        parses-cleanly assertion would MISS it) but configures the wrong
+        group: [reflector].host-name is inert, and <name>.local never
+        resolves. Assert the key's GROUP, not just the file's validity."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("[server]\nallow-interfaces=wlan0\n\n[reflector]\nenable-reflector=no\n")
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+
+        name_actuator._apply_avahi_hostname("jasonssign1")
+
+        _subcommand, payload = spy.calls[0]
+        parser = _parse_shipped(payload)
+        assert parser.get("server", "host-name") == "jasonssign1"
+        assert not parser.has_option("reflector", "host-name"), (
+            "host-name must land in [server], not the file's last group"
+        )
+        # The rest of the conf survives the edit.
+        assert parser.get("server", "allow-interfaces") == "wlan0"
+        assert parser.get("reflector", "enable-reflector") == "no"
+
+    def test_recovers_from_an_already_clobbered_conf(self, monkeypatch, tmp_path):
+        """The self-perpetuating case: once the bare-line conf was on
+        disk, the old regex MATCHED it and substituted in place, so the
+        broken shape survived every subsequent rename. QA's hand-fix
+        would be re-corrupted on the next PUT. This is what closes the
+        loop — the actuator must REPAIR a clobbered conf, not preserve
+        its shape."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("\nhost-name=jasonssign1\n")  # the clobbered shape
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+
+        name_actuator._apply_avahi_hostname("fireplacesign")
+
+        _subcommand, payload = spy.calls[0]
+        parser = _parse_shipped(payload)
+        assert parser.get("server", "host-name") == "fireplacesign"
+
+    def test_template_header_comment_is_not_mistaken_for_config(self, monkeypatch, tmp_path):
+        """The packaged template's commentary contains the literal text
+        `#   1. host-name=openmarquee — announces ...`. Only the real key
+        inside [server] may be rewritten; mangling the prose would be a
+        silent docs regression that no parse check would catch."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text(
+            "# host-name=openmarquee — announces openmarquee.local\n"
+            "\n"
+            "[server]\n"
+            "host-name=openmarquee\n"
+            "allow-interfaces=wlan0\n"
+        )
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+
+        name_actuator._apply_avahi_hostname("jasonssign1")
+
+        _subcommand, payload = spy.calls[0]
+        text = payload.decode("utf-8")
+        assert "# host-name=openmarquee — announces openmarquee.local" in text, (
+            "the header commentary must survive verbatim"
+        )
+        assert _parse_shipped(payload).get("server", "host-name") == "jasonssign1"
+
+    def test_malformed_result_is_never_shipped(self, monkeypatch, tmp_path):
+        """The structural gate. netctl writes our payload VERBATIM and
+        restarts avahi-daemon — it does not validate — so a bad payload
+        takes mDNS down until someone SSHes in. If the renderer is ever
+        broken again, the actuator must refuse to write rather than ship
+        it. Simulates a renderer regression directly."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("[server]\nhost-name=old\n")
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+        # A renderer that reintroduces exactly the 2026-07-16 bug.
+        monkeypatch.setattr(
+            name_actuator,
+            "_substitute_hostname_line",
+            lambda _text, name: f"\nhost-name={name}\n",
+        )
+
+        name_actuator._apply_avahi_hostname("jasonssign1")
+
+        assert spy.calls == [], (
+            "a conf avahi-daemon can't parse must never cross the netctl "
+            "boundary; the existing working conf stays in place"
+        )
+
+    def test_wrong_case_server_group_is_regenerated_not_stranded(self, monkeypatch, tmp_path):
+        """The renderer matches [server] case-insensitively; configparser
+        does not. Without an escape hatch the renderer would happily edit
+        `[Server]` and the gate would then refuse forever -- the renderer
+        is deterministic, so EVERY later reconcile refuses identically and
+        the sign is stranded with no mDNS. The unsound-original path must
+        regenerate instead."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("[Server]\nhost-name=old\n")
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+
+        name_actuator._apply_avahi_hostname("jasonssign1")
+
+        assert len(spy.calls) == 1, "must not strand the sign"
+        _subcommand, payload = spy.calls[0]
+        assert _parse_shipped(payload).get("server", "host-name") == "jasonssign1"
+
+    def test_duplicate_hostname_keys_collapse_to_one(self, monkeypatch, tmp_path):
+        """A stray duplicate host-name in [server] made the gate reject our
+        own output (configparser resolves duplicates to the LAST value), so
+        the rename would no-op forever. Rewrite the first key and drop the
+        rest."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("[server]\nhost-name=old\nallow-interfaces=wlan0\nhost-name=stale\n")
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+
+        name_actuator._apply_avahi_hostname("jasonssign1")
+
+        _subcommand, payload = spy.calls[0]
+        text = payload.decode("utf-8")
+        assert text.count("host-name=") == 1, f"expected exactly one key, got:\n{text}"
+        assert _parse_shipped(payload).get("server", "host-name") == "jasonssign1"
+        assert _parse_shipped(payload).get("server", "allow-interfaces") == "wlan0"
+
+    def test_sound_conf_is_protected_when_renderer_misbehaves(self, monkeypatch, tmp_path):
+        """The escape hatch must NOT become a licence to overwrite. When
+        the on-disk conf is sound (parses + has [server]), avahi is
+        plausibly serving mDNS from it right now -- a bad payload would
+        take a WORKING sign down, so refuse and no-op the rename."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("[server]\nhost-name=old\nallow-interfaces=wlan0\n")
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+        monkeypatch.setattr(
+            name_actuator,
+            "_substitute_hostname_line",
+            lambda _text, name: f"\nhost-name={name}\n",
+        )
+
+        name_actuator._apply_avahi_hostname("jasonssign1")
+
+        assert spy.calls == [], "a working conf must never be gambled away"
+
+    def test_unsound_conf_is_repaired_even_when_renderer_misbehaves(self, monkeypatch, tmp_path):
+        """The other side of the split. When the on-disk conf is ALSO
+        unusable there is no working mDNS to protect, and refusing would
+        strand the sign permanently. Regenerate from the baseline."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("\nhost-name=jasonssign1\n")  # the clobbered shape
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+        monkeypatch.setattr(
+            name_actuator,
+            "_substitute_hostname_line",
+            lambda _text, name: f"\nhost-name={name}\n",
+        )
+
+        name_actuator._apply_avahi_hostname("fireplacesign")
+
+        assert len(spy.calls) == 1, "an unusable conf must be repaired, not preserved"
+        _subcommand, payload = spy.calls[0]
+        assert _parse_shipped(payload).get("server", "host-name") == "fireplacesign"
+
+    def test_repair_at_the_same_name_still_ships(self, monkeypatch, tmp_path):
+        """JasonsSign1's ACTUAL recovery: the clobbered conf already names
+        the sign correctly, so the repair must not be swallowed by the
+        `rewritten == original` skip-the-round-trip early-return. The name
+        is unchanged; the SHAPE is what's broken."""
+        spy = _install_netctl_spy(monkeypatch)
+        conf = tmp_path / "avahi-daemon.conf"
+        conf.write_text("\nhost-name=jasonssign1\n")
+        monkeypatch.setattr("openmarquee.name_actuator._AVAHI_CONF", conf)
+
+        name_actuator._apply_avahi_hostname("jasonssign1")  # SAME name
+
+        assert len(spy.calls) == 1, "the shape repair must ship even at the same name"
+        _subcommand, payload = spy.calls[0]
+        assert _parse_shipped(payload).get("server", "host-name") == "jasonssign1"
+
+    def test_packaged_template_round_trips_byte_identical(self):
+        """NO SPURIOUS RESTARTS. The reconciler runs _apply_avahi_hostname
+        on EVERY backend startup. If rendering an already-correct conf
+        changed so much as a newline, `rewritten == original` would be
+        False and every boot would rewrite the conf + restart
+        avahi-daemon, dropping mDNS briefly on each deploy/restart."""
+        template = Path(__file__).resolve().parents[2] / "system" / "avahi" / "avahi-daemon.conf"
+        text = template.read_text()
+        assert name_actuator._substitute_hostname_line(text, "openmarquee") == text, (
+            "rendering an in-sync conf must be byte-identical or every boot restarts avahi-daemon"
+        )
+
+    def test_fallback_matches_packaged_template_server_keys(self):
+        """DRIFT GUARD. The fallback conf is a hand-written copy of the
+        packaged template's [server] group. If someone adds a key to
+        system/avahi/avahi-daemon.conf, a sign that falls back would
+        silently lose it. Compares against the REAL template file, so
+        the two cannot drift apart unnoticed."""
+        template = Path(__file__).resolve().parents[2] / "system" / "avahi" / "avahi-daemon.conf"
+        assert template.is_file(), f"packaged template missing at {template}"
+
+        packaged = configparser.ConfigParser(strict=False, interpolation=None)
+        packaged.read_string(template.read_text())
+        fallback = configparser.ConfigParser(strict=False, interpolation=None)
+        fallback.read_string(name_actuator._AVAHI_FALLBACK_CONF.format(name="x"))
+
+        # items(), not keys: a key-only compare passes when the template
+        # changes allow-interfaces=wlan0 -> wlan0,eth0, and a fallen-back
+        # sign would silently lose the new value. host-name is excluded --
+        # it's the field this actuator exists to vary.
+        def _server_items(parser):
+            return {k: v for k, v in parser["server"].items() if k != "host-name"}
+
+        assert _server_items(fallback) == _server_items(packaged), (
+            "fallback [server] drifted from the packaged template"
+        )
 
 
 class TestHostapdPath:
