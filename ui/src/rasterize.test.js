@@ -10,7 +10,7 @@
 // preserves bytes.
 
 import { describe, expect, it, vi } from "vitest";
-import { applyBrightnessGamma, drawCanvas } from "./rasterize.js";
+import { applyBrightnessGamma, drawCanvas, drawTextOnly } from "./rasterize.js";
 
 function makeCanvas(width, height, initialPixels) {
     // 4 bytes per pixel (RGBA), filled with initialPixels (a flat
@@ -440,5 +440,193 @@ describe("paintLayer text effects (r51 outline + drop_shadow)", () => {
         });
         expect(canvas2._strokeCalls).toHaveLength(1);
         expect(canvas2._fillCalls[0].shadowOffsetX).toBe(4);
+    });
+});
+
+// ── Per-LETTER shake: base-size condense (qarl 2026-07-16) ─────────
+// Sacred review 2026-07-16 caught this the hard way: the per-char
+// shake path bypasses BOTH horizontal clamps (fillText's maxWidth and
+// the WASM path's min(naturalW, boxW)), and the FYS shake layers are
+// authored font_size_pct=100 *specifically* to overflow and be
+// squished (seed.py:601-603). Without an explicit condense, "UNCAGE"
+// renders ~4.5x oversize (measured 7778px into a 1728px box → ~1.5
+// letters visible). The whole UI suite was green through that bug —
+// the WASM stub pins isWasmReady=false and nothing exercised the
+// clamp. This test exists to fail on exactly that.
+//
+// NOT about jitter: qarl explicitly wants letters to shake out of
+// frame ("that's expected and fine"), and nothing here clamps the
+// offsets — this pins the LINE's base size only.
+function fakeTextCanvas(width, height, charW) {
+    const calls = { fillText: [], scale: [], translate: [] };
+    const ctx = {
+        font: "", textAlign: "center", textBaseline: "middle",
+        fillStyle: "", strokeStyle: "", lineWidth: 1, globalAlpha: 1,
+        shadowOffsetX: 0, shadowOffsetY: 0, shadowBlur: 0, shadowColor: "",
+        globalCompositeOperation: "source-over",
+        save: vi.fn(), restore: vi.fn(),
+        clearRect: vi.fn(), fillRect: vi.fn(),
+        beginPath: vi.fn(), rect: vi.fn(), clip: vi.fn(),
+        drawImage: vi.fn(), strokeText: vi.fn(),
+        translate: vi.fn((x, y) => calls.translate.push([x, y])),
+        scale: vi.fn((x, y) => calls.scale.push([x, y])),
+        // Every char is `charW` wide → an over-wide run is easy to force.
+        measureText: (s) => ({
+            width: [...String(s)].length * charW,
+            actualBoundingBoxAscent: 50,
+            actualBoundingBoxDescent: 12,
+        }),
+        fillText: vi.fn((t, x, y, mw) => calls.fillText.push([t, x, y, mw])),
+    };
+    return { canvas: { width, height, getContext: () => ctx }, ctx, calls };
+}
+
+const SHAKE_ITEM = {
+    id: "fys-uncage",
+    text_layers: [{
+        text: "UNCAGE",
+        motion: "shake",
+        motion_intensity: 100,
+        motion_phase: 0,
+        font_size_pct: 100,
+        font_family: "sans-serif",
+        text_color: "#FFFFFF",
+        box: { x: 0.05, y: 0.3, w: 0.9, h: 0.4 },
+    }],
+};
+
+describe("per-letter shake — base-size condense", () => {
+    it("condenses an over-wide shaking line to the box (x-scale < 1)", () => {
+        // charW=400 → "UNCAGE" (6 chars) = 2400px of advances against a
+        // 0.9*1920 = 1728px box → must condense.
+        const { canvas, calls } = fakeTextCanvas(1920, 1080, 400);
+        drawTextOnly(canvas, SHAKE_ITEM, { elapsed_s: 0.05 });
+        // Per-char draws happened (the shake path ran at all).
+        expect(calls.fillText.length).toBeGreaterThan(1);
+        // The condense x-scale must be applied. Without it the run
+        // draws at full 2400px into a 1728px box (the shipped-bug
+        // shape) and no sub-1 x-scale is ever requested.
+        const squeezes = calls.scale
+            .map(([sx]) => sx)
+            .filter((sx) => sx > 0 && sx < 0.999);
+        expect(squeezes.length).toBeGreaterThan(0);
+        // And it must condense to ~the box, not some arbitrary amount:
+        // 1728/2400 = 0.72.
+        expect(Math.min(...squeezes)).toBeCloseTo(1728 / 2400, 2);
+    });
+
+    it("does NOT condense a line that already fits (x-scale stays 1)", () => {
+        // charW=100 → 600px of advances, well inside the 1728px box.
+        const { canvas, calls } = fakeTextCanvas(1920, 1080, 100);
+        drawTextOnly(canvas, SHAKE_ITEM, { elapsed_s: 0.05 });
+        expect(calls.fillText.length).toBeGreaterThan(1);
+        const squeezes = calls.scale
+            .map(([sx]) => sx)
+            .filter((sx) => sx > 0 && sx < 0.999);
+        expect(squeezes).toEqual([]);
+    });
+});
+
+// The FYS shake layers actually take the SQUISH branch (yScale<1):
+// seed.py:598-608 authors box h=0.2167 with font_size_pct=100, so real
+// Alfa Slab ink (~1642px) vastly exceeds boxH (234px) → yScale ≈ 0.14.
+// The fake above pins a constant ascent, so it only ever exercised the
+// yScale==1 branch — leaving the dy/yScale compensation (which keeps
+// vertical jitter from being damped to ~14% of intent) with NO test.
+// This fake scales ink with the font so the squish branch is reached.
+function fakeSquishCanvas(width, height, charW) {
+    const calls = { fillText: [], scale: [], translate: [] };
+    const ctx = {
+        font: "", textAlign: "center", textBaseline: "middle",
+        fillStyle: "", strokeStyle: "", lineWidth: 1, globalAlpha: 1,
+        shadowOffsetX: 0, shadowOffsetY: 0, shadowBlur: 0, shadowColor: "",
+        globalCompositeOperation: "source-over",
+        save: vi.fn(), restore: vi.fn(),
+        clearRect: vi.fn(), fillRect: vi.fn(),
+        beginPath: vi.fn(), rect: vi.fn(), clip: vi.fn(),
+        drawImage: vi.fn(), strokeText: vi.fn(),
+        translate: vi.fn((x, y) => calls.translate.push([x, y])),
+        scale: vi.fn((x, y) => calls.scale.push([x, y])),
+        measureText(s) {
+            // Ink height tracks the active font size → forces yScale<1.
+            const px = parseFloat(String(this.font)) || 16;
+            return {
+                width: [...String(s)].length * charW,
+                actualBoundingBoxAscent: px * 0.75,
+                actualBoundingBoxDescent: px * 0.25,
+            };
+        },
+        fillText: vi.fn((t, x, y, mw) => calls.fillText.push([t, x, y, mw])),
+    };
+    return { canvas: { width, height, getContext: () => ctx }, ctx, calls };
+}
+
+describe("per-letter shake — squish branch (the FYS-critical path)", () => {
+    // FYS-shaped: short box height forces the yScale<1 squish branch.
+    const FYS_ITEM = {
+        id: "fys-uncage-squish",
+        text_layers: [{
+            text: "UNCAGE",
+            motion: "shake",
+            motion_intensity: 100,
+            motion_phase: 0,
+            font_size_pct: 100,
+            font_family: "sans-serif",
+            text_color: "#FFF1B0",
+            box: { x: 0.05, y: 0.15, w: 0.9, h: 0.2167 },
+        }],
+    };
+
+    it("takes the squish branch and compensates dy so jitter is not damped", () => {
+        // Render the SAME layer + tick two ways so the per-letter dy
+        // values are identical, and only the branch differs:
+        //   control  — constant-ink fake → totalInkExtent < boxH → yScale == 1
+        //   squished — ink tracks font   → totalInkExtent >> boxH → yScale < 1
+        // Under the squish branch's outer ctx.scale(1, yScale), a LOCAL
+        // dy renders as dy*yScale. The fix divides by yScale so the
+        // SCREEN offset matches intent — which shows up as a local y
+        // spread ~1/yScale (≈7x here) LARGER than the control's.
+        // Without the fix the two spreads are equal → this fails.
+        const ctl = fakeTextCanvas(1920, 1080, 100);
+        drawTextOnly(ctl.canvas, FYS_ITEM, { elapsed_s: 0.05 });
+        const sq = fakeSquishCanvas(1920, 1080, 100);
+        drawTextOnly(sq.canvas, FYS_ITEM, { elapsed_s: 0.05 });
+
+        // Guard: control really is un-squished, squished really is.
+        const ctlYScales = ctl.calls.scale.map(([, sy]) => sy).filter((sy) => sy > 0 && sy < 0.999);
+        expect(ctlYScales).toEqual([]);
+        const sqYScales = sq.calls.scale.map(([, sy]) => sy).filter((sy) => sy > 0 && sy < 0.999);
+        expect(sqYScales.length).toBeGreaterThan(0);
+
+        // Guard: both actually drew the same letters (else spreads are
+        // incomparable and the ratio below would be meaningless).
+        const ctlYs = ctl.calls.fillText.map(([, , y]) => y);
+        const sqYs = sq.calls.fillText.map(([, , y]) => y);
+        expect(ctlYs.length).toBeGreaterThan(1);
+        expect(sqYs.length).toBe(ctlYs.length);
+
+        const spread = (ys) => Math.max(...ys) - Math.min(...ys);
+        const ctlSpread = spread(ctlYs);
+        expect(ctlSpread).toBeGreaterThan(0);   // there IS jitter to compare
+        // Measured: compensated spread ≈ 2.99x the control (the exact
+        // ratio is 1/yScale modulated by the integer rounding of dy).
+        // Uncompensated it is EXACTLY 1x (same dy, same branch math) —
+        // verified by mutation: deleting the `yScaleForOffset: yScale`
+        // pass-through drops this from 38.9 to 13 (== control). Assert
+        // 2x: unreachable without the fix, comfortably clear with it.
+        expect(spread(sqYs)).toBeGreaterThan(ctlSpread * 2);
+    });
+
+    it("pins the condensed line's left edge to the box (centring)", () => {
+        // The fake's measureText is linear, so kerned == unkerned and a
+        // drift-right regression can't show up in x directly — pin the
+        // origin instead. The squish branch draws in LOCAL space under
+        // an outer translate(anchorX=960, ...), so an over-wide centred
+        // line (condensed to exactly maxWidth=boxW=1728) must originate
+        // at local -864 → absolute 960-864 = 96 = boxX (0.05*1920).
+        const { canvas, calls } = fakeSquishCanvas(1920, 1080, 400);
+        drawTextOnly(canvas, FYS_ITEM, { elapsed_s: 0.05 });
+        expect(calls.translate).toContainEqual([960, expect.any(Number)]);
+        expect(calls.translate).toContainEqual([-864, 0]);
     });
 });

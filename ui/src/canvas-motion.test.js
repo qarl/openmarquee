@@ -7,6 +7,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+    _shakeTableCountForTest,
     anyLayerAnimated,
     computePhase,
     effectFreq,
@@ -308,7 +309,33 @@ describe("paintLayerWithMotion", () => {
         }
     });
 
-    it("shake at intensity=0 produces no translate (regression)", () => {
+    // ── qarl 2026-07-16: per-LETTER shake ─────────────────────────
+    // Shake no longer ctx.translate's the whole layer — it hands
+    // paintFn a `glyphOffset(glyphIndex)` provider so the text painter
+    // displaces each letter around its own base position (mirrors the
+    // Rust device path). These tests therefore assert on the OFFSET
+    // PROVIDER, not on ctx.translate.
+    //
+    // NON-VACUITY WARNING for future edits: asserting on
+    // `ctx.translate.mock.calls` here would now compare [] to [] and
+    // pass no matter what the offsets do. Capture the provider.
+
+    // Helper: run one shake paint and return its glyphOffset fn.
+    const captureGlyphOffset = (layer, opts) => {
+        let captured = null;
+        const paintFn = vi.fn((glyphOffset) => { captured = glyphOffset; });
+        paintLayerWithMotion(fakeCtx(), fakeCanvas(100, 100), layer, paintFn, opts);
+        return { captured, paintFn };
+    };
+
+    const SHAKE_LAYER = {
+        motion: "shake",
+        motion_intensity: 100,
+        motion_phase: 0.3,
+        box: { x: 0, y: 0, w: 1, h: 1 },
+    };
+
+    it("shake at intensity=0 paints unshaken (no translate, no offset fn)", () => {
         const ctx = fakeCtx();
         const paintFn = vi.fn();
         paintLayerWithMotion(
@@ -317,28 +344,41 @@ describe("paintLayerWithMotion", () => {
             paintFn,
             { elapsed_s: 0.5 },
         );
-        // intensity=0 → no translate call.
         expect(ctx.translate).not.toHaveBeenCalled();
         expect(paintFn).toHaveBeenCalledTimes(1);
+        // No per-glyph provider at intensity 0 — the painter renders
+        // the line unshaken rather than displacing every letter by 0.
+        expect(paintFn.mock.calls[0][0]).toBeUndefined();
     });
 
-    it("shake is deterministic — same layerKey + phase + step → same translate", () => {
-        const layer = {
-            motion: "shake",
-            motion_intensity: 100,
-            motion_phase: 0.3,
-            box: { x: 0, y: 0, w: 1, h: 1 },
-        };
-        const ctxA = fakeCtx();
-        const ctxB = fakeCtx();
-        paintLayerWithMotion(ctxA, fakeCanvas(100, 100), layer, vi.fn(), {
+    it("shake offsets DIFFER per letter (the per-LETTER ask)", () => {
+        // THE load-bearing assertion. If every letter got the same
+        // offset, the line would still move as a rigid unit — exactly
+        // the behaviour qarl asked us to replace — and this must fail.
+        const { captured } = captureGlyphOffset(SHAKE_LAYER, {
             elapsed_s: 0.05, layerKey: "slide-1:0",
         });
-        paintLayerWithMotion(ctxB, fakeCanvas(100, 100), layer, vi.fn(), {
+        expect(typeof captured).toBe("function");
+        const offsets = Array.from({ length: 12 }, (_, i) => captured(i));
+        const unique = new Set(offsets.map(([dx, dy]) => `${dx},${dy}`));
+        // Offsets are rounded to whole px, so a couple of collisions
+        // across 12 letters are legitimate; a RIGID line would collapse
+        // to exactly 1. Require most letters to be independent.
+        expect(unique.size).toBeGreaterThan(6);
+        // And they must not be all-zero (degenerate "no jitter").
+        expect(offsets.some(([dx, dy]) => dx !== 0 || dy !== 0)).toBe(true);
+    });
+
+    it("shake is deterministic — same layerKey + phase + step → same per-letter offsets", () => {
+        const a = captureGlyphOffset(SHAKE_LAYER, {
             elapsed_s: 0.05, layerKey: "slide-1:0",
-        });
-        // Translate calls should be identical.
-        expect(ctxA.translate.mock.calls).toEqual(ctxB.translate.mock.calls);
+        }).captured;
+        const b = captureGlyphOffset(SHAKE_LAYER, {
+            elapsed_s: 0.05, layerKey: "slide-1:0",
+        }).captured;
+        for (let i = 0; i < 8; i++) {
+            expect(a(i)).toEqual(b(i));
+        }
     });
 
     it("shake step-stable frames produce identical translates (r21 memo lock)", () => {
@@ -359,38 +399,54 @@ describe("paintLayerWithMotion", () => {
         // step 0 spans elapsed ∈ [0.000, 0.010). Sample 6 frames
         // (60 fps) inside step 0.
         const elapseds = [0.000, 0.001, 0.003, 0.005, 0.007, 0.009];
-        const translates = elapseds.map((elapsed_s) => {
-            const ctx = fakeCtx();
-            paintLayerWithMotion(ctx, fakeCanvas(100, 100), layer, vi.fn(), {
-                elapsed_s, layerKey: "memo-lock:0",
-            });
-            return ctx.translate.mock.calls[0];
+        // Per-letter (2026-07-16): sample the SAME letters each frame
+        // via the offset provider. Frames inside one step must agree.
+        const perFrame = elapseds.map((elapsed_s) => {
+            let captured = null;
+            paintLayerWithMotion(
+                fakeCtx(), fakeCanvas(100, 100), layer,
+                (glyphOffset) => { captured = glyphOffset; },
+                { elapsed_s, layerKey: "memo-lock:0" },
+            );
+            return [0, 1, 2, 3].map((g) => captured(g));
         });
-        // All 6 frames should produce the IDENTICAL (dx, dy) tuple.
-        const first = translates[0];
-        for (let i = 1; i < translates.length; i++) {
-            expect(translates[i]).toEqual(first);
+        // All 6 frames should produce the IDENTICAL per-letter tuples.
+        const first = perFrame[0];
+        // Guard the assertion itself: if the provider ever returned
+        // nothing, every frame would be [] and this test would pass
+        // vacuously.
+        expect(first).toHaveLength(4);
+        expect(first.every((o) => Array.isArray(o) && o.length === 2)).toBe(true);
+        for (let i = 1; i < perFrame.length; i++) {
+            expect(perFrame[i]).toEqual(first);
         }
     });
 
-    it("shake produces DIFFERENT offsets for different layerKey at the same phase", () => {
-        const layer = {
-            motion: "shake",
-            motion_intensity: 100,
-            motion_phase: 0.3,
-            box: { x: 0, y: 0, w: 1, h: 1 },
-        };
-        const ctxA = fakeCtx();
-        const ctxB = fakeCtx();
-        paintLayerWithMotion(ctxA, fakeCanvas(100, 100), layer, vi.fn(), {
+    it("shake produces DIFFERENT per-letter offsets for different layerKey at the same phase", () => {
+        // Two layers (e.g. UNCAGE vs YOUR) must not jitter in lockstep.
+        const a = captureGlyphOffset(SHAKE_LAYER, {
             elapsed_s: 0.05, layerKey: "slide-1:0",
-        });
-        paintLayerWithMotion(ctxB, fakeCanvas(100, 100), layer, vi.fn(), {
+        }).captured;
+        const b = captureGlyphOffset(SHAKE_LAYER, {
             elapsed_s: 0.05, layerKey: "slide-1:1",  // different layer index
+        }).captured;
+        const seqA = [0, 1, 2, 3, 4, 5].map((g) => a(g));
+        const seqB = [0, 1, 2, 3, 4, 5].map((g) => b(g));
+        // (Tiny chance an individual letter collides; the FNV-1a +
+        // Box-Muller chain makes a whole 6-letter run colliding
+        // essentially impossible for distinct seeds.)
+        expect(seqA).not.toEqual(seqB);
+    });
+
+    it("shake table memo stays bounded with per-letter keys", () => {
+        // The memo key gained a glyphIndex, so entries scale with
+        // letter count. Blow well past the cap and confirm the LRU
+        // holds (a regression here would grow unbounded on a long
+        // shaking line).
+        const { captured } = captureGlyphOffset(SHAKE_LAYER, {
+            elapsed_s: 0.05, layerKey: "bound-check:0",
         });
-        // At least one of the two translate calls (dx, dy) should differ.
-        // (Tiny chance they collide; the FNV-1a + Box-Muller chain makes
-        // that essentially impossible for distinct seeds.)
-        expect(ctxA.translate.mock.calls).not.toEqual(ctxB.translate.mock.calls);
+        for (let g = 0; g < 2000; g++) captured(g);
+        expect(_shakeTableCountForTest()).toBeLessThanOrEqual(512);
     });
 });

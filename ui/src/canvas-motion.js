@@ -48,8 +48,16 @@ export function computePhase(elapsed_s, freq, motion_phase) {
 // Deterministic 32-bit hash → uniform [0, 1). Shake's seed input.
 // Matches motion.py's deterministic-RNG promise: same layer + same
 // motion_phase + same step → same numeric draw across reloads.
-function hashedUniform(layerKey, motionPhase, step) {
-    const s = `${layerKey}:${(motionPhase || 0).toFixed(6)}:${step}`;
+//
+// qarl 2026-07-16 (per-LETTER jitter): `glyphIndex` joins the seed so
+// each letter draws independently. Structural identity (layer + index),
+// mirroring the Rust side's `shake_glyph_offset_norm` seeding — the two
+// engines were never sample-identical (FNV/Box-Muller here vs
+// splitmix64 there; "visually approximate" per the spec Q3 lock), so
+// parity is on SHAPE: same amp curve, same 10 Hz quantization, same
+// per-letter independence.
+function hashedUniform(layerKey, motionPhase, step, glyphIndex) {
+    const s = `${layerKey}:${(motionPhase || 0).toFixed(6)}:${glyphIndex}:${step}`;
     // FNV-1a — small, stable, no library dep.
     let h = 2166136261;
     for (let i = 0; i < s.length; i++) {
@@ -61,9 +69,9 @@ function hashedUniform(layerKey, motionPhase, step) {
 
 // Box-Muller: two uniforms → one Gaussian draw. Matches motion.py's
 // numpy default_rng .normal() shape (mean 0, std 1) for shake offsets.
-function gaussian(layerKey, motionPhase, step) {
-    const u1 = Math.max(1e-9, hashedUniform(layerKey, motionPhase, step * 2));
-    const u2 = hashedUniform(layerKey, motionPhase, step * 2 + 1);
+function gaussian(layerKey, motionPhase, step, glyphIndex) {
+    const u1 = Math.max(1e-9, hashedUniform(layerKey, motionPhase, step * 2, glyphIndex));
+    const u2 = hashedUniform(layerKey, motionPhase, step * 2 + 1, glyphIndex);
     return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
 }
 
@@ -76,17 +84,21 @@ function gaussian(layerKey, motionPhase, step) {
 // (intensity / bh can change between renders without invalidating
 // the cache).
 //
-// Bounded: a slide with N shake layers × M motion_phase variants
-// builds N×M tables; an LRU cap of 32 entries covers realistic
-// scenes (the FYS demo reel's heaviest multi-shake "Panic" slide
-// runs ~6 layers). Oldest insertion-order key evicts on overflow —
+// Bounded LRU. qarl 2026-07-16 (per-LETTER jitter): the key gained a
+// glyphIndex, so a slide now builds N layers × M phases × G glyphs
+// tables instead of N×M. The old cap of 32 would thrash on a single
+// 16-letter line; sized to 512 so the FYS reel's heaviest multi-shake
+// "Panic" slide (~6 layers × ~20 letters = ~120) and the 3-layer
+// UNCAGE / YOUR / SIGN!! slide (~16 letters ≈ 48) both fit with room
+// to spare. Each table is 10 × {dxG, dyG} — 512 entries is ~10k
+// floats, trivial. Oldest insertion-order key evicts on overflow —
 // Map iteration is insertion order, so .keys().next().value gives
 // the oldest.
 const _shakeTables = new Map();
-const _SHAKE_TABLE_MAX = 32;
+const _SHAKE_TABLE_MAX = 512;
 
-function getShakeTable(layerKey, motionPhase) {
-    const tableKey = `${layerKey}:${motionPhase || 0}`;
+function getShakeTable(layerKey, motionPhase, glyphIndex) {
+    const tableKey = `${layerKey}:${motionPhase || 0}:${glyphIndex}`;
     let table = _shakeTables.get(tableKey);
     if (table) return table;
     if (_shakeTables.size >= _SHAKE_TABLE_MAX) {
@@ -98,16 +110,23 @@ function getShakeTable(layerKey, motionPhase) {
     table = new Array(10);
     for (let i = 0; i < 10; i++) {
         table[i] = {
-            dxG: gaussian(layerKey, motionPhase, i),
+            dxG: gaussian(layerKey, motionPhase, i, glyphIndex),
             // The +100000 offset on the dy seed matches the pre-memo
             // call shape in the shake branch — keeps dx and dy
             // independent draws (without the offset, both would seed
             // off step ∈ [0, 9] and dy would equal dx).
-            dyG: gaussian(layerKey, motionPhase, i + 100000),
+            dyG: gaussian(layerKey, motionPhase, i + 100000, glyphIndex),
         };
     }
     _shakeTables.set(tableKey, table);
     return table;
+}
+
+// Test seam: per-glyph re-keying multiplies table count, so the LRU
+// cap matters more than it did. Exposed so canvas-motion.test.js can
+// assert bounding without reaching into module state.
+export function _shakeTableCountForTest() {
+    return _shakeTables.size;
 }
 
 // True if at least one visible layer in `layers` has motion != static.
@@ -241,18 +260,36 @@ export function paintLayerWithMotion(ctx, canvas, layer, paintFn, opts) {
             return;
         }
         if (motion === "shake") {
+            // qarl 2026-07-16 — per-LETTER jitter. Previously this
+            // ctx.translate'd the WHOLE layer, so a line moved as a
+            // rigid unit. Now we hand the paint closure a per-glyph
+            // offset provider and let it displace each letter around
+            // its own base position (mirrors the Rust device path,
+            // which offsets each glyph quad instead of the layer).
+            //
+            // paintFn(glyphOffset) — the text painter applies the
+            // offset per character; a painter that ignores the
+            // argument simply renders unshaken (forward-compatible).
             if (intensity > 0) {
                 const step = Math.floor(phase * 10);
                 const ampPx = (intensity / 100.0) * 0.04 * bh;
-                // Round 21: 10-entry precomputed gaussian table per
-                // (layerKey, motionPhase). Per-frame: one Map.get +
-                // one array index; no string-build, no FNV walk.
-                const { dxG, dyG } = getShakeTable(layerKey, motionPhase)[step];
-                const dx = Math.round(dxG * ampPx / 2);
-                const dy = Math.round(dyG * ampPx / 2);
-                ctx.translate(dx, dy);
+                // Round 21 memo, now per (layerKey, motionPhase,
+                // glyphIndex): per-frame per-letter work is one
+                // Map.get + one array index; no string-build, no FNV
+                // walk. Same amp curve + 10 Hz step as before — only
+                // the granularity changed.
+                const glyphOffset = (glyphIndex) => {
+                    const { dxG, dyG } =
+                        getShakeTable(layerKey, motionPhase, glyphIndex | 0)[step];
+                    return [
+                        Math.round((dxG * ampPx) / 2),
+                        Math.round((dyG * ampPx) / 2),
+                    ];
+                };
+                paintFn(glyphOffset);
+            } else {
+                paintFn();
             }
-            paintFn();
             return;
         }
         // Unknown motion — render as static (forward-compat with
