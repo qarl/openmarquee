@@ -17,17 +17,45 @@ import { attachAutoSave } from "./auto-save.js";
 import { listTimezones, US_COMMON_TIMEZONES } from "./iana-timezones.js";
 import { mountPerfHistogramControl } from "./perf-histogram.js";
 
-const OUTPUT_MODES = [
-    { value: "hdmi", label: "HDMI" },
-    { value: "hub75", label: "HUB75 panel (LED matrix)" },
-    { value: "ws281x", label: "WS2812B / addressable strip" },
-    { value: "composite", label: "Composite / RF (via modulator)" },
-];
+// 2026-07-16: HDMI only, because that is the only value the system will
+// honour. This dropdown used to offer hub75 / ws281x / composite, and
+// picking one did NOTHING except corrupt the sign's dimensions:
+// `settings.output_mode` is `Literal["hdmi"]` and
+// `_coerce_legacy_output_mode` silently rewrites the other three back to
+// "hdmi" on the PUT — while the dim-snap below had already persisted
+// 128x96. Operator picks "HUB75 panel", gets a 200, and ends up with an
+// HDMI sign at 128x96. Silent, and invisible until you look at the glass.
+//
+// NOT because the renderer lacks those modes -- it HAS Hdmi / Mock /
+// Hub75 / Colorlight / Ws2812b (renderer/src/main.rs), and HUB75 has a
+// real config path. The gap is that settings.output_mode is not plumbed to
+// the renderer: nothing on the runtime path passes --output (only the
+// parity scripts do, hardcoded to hdmi), so the sidecar is launched
+// HDMI-only. An option here is a promise the backend cannot keep.
+//
+// output_mode has TWO consumers, and a phase re-adding a mode must satisfy
+// both. api_system._format_mode is only a status string -- but
+// dependencies.py:501 is BEHAVIOURAL:
+//     if settings.output_mode == "hdmi": <rust sidecar>
+//     else:                              <MockRenderer>
+// i.e. any non-hdmi value routes the sign to a mock renderer and the glass
+// goes DARK. So re-adding an option means: widen the Literal, teach
+// dependencies.py to route the new mode, AND restore the option -- in the
+// same change. They must move together or this comes straight back.
+const OUTPUT_MODES = [{ value: "hdmi", label: "HDMI" }];
 
 // Sensible default resolutions per output mode. Native LANDSCAPE dims —
 // `display_rotation` separately handles portrait-mounted installs.
 // HDMI is a placeholder: the real HDMI renderer reads EDID at boot and
 // overrides these; on dev (no monitor attached) the stored value applies.
+// Kept for every mode even though only HDMI is selectable today: these are
+// the dims a mode wants, and half of what a future phase restores when it
+// wires settings.output_mode through to the renderer. The snap listener
+// below is inert meanwhile -- not merely because the select has one option
+// (ensureSelectValue appends an option for any unknown STORED value), but
+// because the backend cannot emit a non-hdmi output_mode to be stored:
+// _coerce_legacy_output_mode rewrites the legacy three at load AND on the
+// PUT. That is what closes the dim-corruption bug.
 const DEFAULT_DIMS = {
     hdmi: { width: 1920, height: 1080 },
     hub75: { width: 128, height: 96 },
@@ -111,13 +139,14 @@ const SECTION_TEMPLATE = `
                             <input type="number" class="om-input field-gamma" min="0.1" max="3.0" step="0.1" required>
                         </label>
                     </div>
-                    <label class="field om-field settings-ws281x-pixel-order-wrap" hidden>
-                        <span>Addressable strip ordering</span>
-                        <select class="om-pulldown om-pulldown-cased field-ws281x-pixel-order">
-                            <option value="row_major">Row-major (wired raster-order)</option>
-                            <option value="serpentine">Serpentine (rows alternate direction)</option>
-                        </select>
-                    </label>
+                    <!-- 2026-07-16: the WS2812B strip-ordering control is GONE.
+                         It was visible only while output_mode === "ws281x", which
+                         can no longer be selected (see OUTPUT_MODES) and could
+                         never be LOADED either -- settings.py coerces that mode to
+                         "hdmi". And the field it wrote is explicitly dropped from
+                         every payload by settings.py's migration "dropped" set, so
+                         the backend has already retired it. It rendered a stored
+                         value that could not exist, on a screen nobody could reach. -->
                 </div>
             </div>
 
@@ -565,10 +594,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
     const detectStatusEl = container.querySelector(".settings-detect-status");
     const brightnessEl = container.querySelector(".field-brightness");
     const gammaEl = container.querySelector(".field-gamma");
-    const ws281xOrderWrap = container.querySelector(
-        ".settings-ws281x-pixel-order-wrap",
-    );
-    const ws281xOrderEl = container.querySelector(".field-ws281x-pixel-order");
     const apEnabledEl = container.querySelector(".field-wifi-ap-enabled");
     const ssidEl = container.querySelector(".field-wifi-ssid");
     const passwordEl = container.querySelector(".field-wifi-password");
@@ -719,12 +744,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         tsEnabledDirty = true;
         syncTailscaleGrayOut();
     });
-    // Reveal the WS2812B-only ordering control when the operator picks
-    // that output mode; hide otherwise so it doesn't clutter HDMI / HUB75.
-    function syncWs281xOrderVisibility() {
-        ws281xOrderWrap.hidden = outputModeEl.value !== "ws281x";
-    }
-    outputModeEl.addEventListener("change", syncWs281xOrderVisibility);
     // qarl 2026-07-14: the two WiFi modes are single-select radios
     // (name="wifi-mode") — exactly one is active at a time. The radio
     // group makes the both-off state structurally unreachable, so the
@@ -1167,7 +1186,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             stationSsidEl.value = settings.wifi_station_ssid ?? "";
             stationPasswordEl.value = settings.wifi_station_password ?? "";
             updateSecretIndicator("wifi-station-password", settings.wifi_station_password);
-            ws281xOrderEl.value = settings.ws281x_pixel_order || "row_major";
             // Hydrate tailscale state BEFORE the sync calls — syncTailscale*
             // reads tsEnabledEl.checked to decide dim / disabled state, so
             // the wrong class would stick on first paint if this came after.
@@ -1195,7 +1213,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             renderWifiNetworksList();
             syncWifiGrayOut();
             syncTailscaleStationGating();
-            syncWs281xOrderVisibility();
             setTimezoneValue(tzEl, settings.timezone || "");
             // Trigger a wifi scan in the background so the dropdown is
             // useful by the time the operator gets to it.
@@ -1613,7 +1630,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                 autoconnect: n.autoconnect !== false,
                 priority: Number(n.priority) || 0,
             })),
-            ws281x_pixel_order: ws281xOrderEl.value || "row_major",
             timezone: tzEl.value || null,
             tailscale_auth_key: tsAuthKeyEl.value || null,
             // r53: HTTPS toggle. The field is bool (not nullable);
