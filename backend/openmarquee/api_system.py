@@ -567,13 +567,65 @@ class TailscaleStatusResponse(BaseModel):
 
 
 @router.post("/tailscale/up", response_model=TailscaleUpResponse)
-async def tailscale_up() -> TailscaleUpResponse:
+async def tailscale_up(storage: SettingsDep) -> TailscaleUpResponse:
     """Start `tailscale up --hostname=<device_id>` without an auth-key
     and return the auth URL Tailscale prints. Operator opens the URL
     in a browser, signs in to Tailscale, and the daemon finishes
-    auth. Caller polls /tailscale/status to detect the transition."""
+    auth. Caller polls /tailscale/status to detect the transition.
+
+    Also PERSISTS `tailscale_enabled=True`. Before 2026-07-16 nothing in
+    the repo ever wrote that field except the Settings checkbox echoing
+    itself, so clicking Enable brought the node up for THIS boot only:
+    `openmarquee-tailscale.service` reads the field at every boot and, on
+    a device that had never had the box ticked and saved, would find it
+    False and take the node back off the tailnet. A brand-new sign had no
+    structural path to a True — the checkbox is disabled until the
+    station radio is on, which was itself wrong on an NM-provisioned
+    sign. Net effect: enable Tailscale, watch it work, reboot, lose it.
+
+    Persisted on a successful SPAWN, not on completed auth: clicking
+    Enable IS the operator's intent, and the only place that could
+    observe the auth transition is the /tailscale/status poll — a GET,
+    which has no business writing settings.
+
+    Caveat on an abandoned sign-in: it leaves intent=True with an
+    unauthenticated node, and `tailscale up` BLOCKS awaiting sign-in
+    (tailscale.start_up's docstring), so the boot unit — Type=oneshot
+    with no TimeoutStartSec — hits systemd's default 90s timeout and
+    fails, holding up multi-user.target for that long. No Restart=, so
+    there's no restart loop; the unit is bounded by TimeoutStartSec below.
+
+    `start_up` reports state="error" for an already-authenticated node
+    too (it exits 0 without printing an auth URL, which hits the
+    EOF-without-URL branch), so the persist can't key off that alone:
+    an operator clicking Enable on a node that is already up is exactly
+    the sign stuck in the broken state this fixes — up, but with the
+    field False, so the boot unit never provisions `serve` / HTTPS.
+    Re-read the live status before deciding.
+    """
     device_id = identity.read_device_id()
     result = await tailscale.start_up(device_id)
+    already_up = False
+    if result["state"] == "error":
+        try:
+            already_up = (await tailscale.read_status())["state"] == "authenticated"
+        except Exception:  # noqa: BLE001 - status is a hint here, not a gate
+            log.debug("tailscale up: status re-read failed", exc_info=True)
+    if result["state"] != "error" or already_up:
+        try:
+            settings = storage.load()
+            if not settings.tailscale_enabled:
+                # model_validate over the full dump, NOT model_copy(update=):
+                # model_copy skips the field validators, and a value that
+                # fails them would quarantine settings.json to factory
+                # defaults on the next load.
+                storage.save(
+                    type(settings).model_validate(
+                        settings.model_dump() | {"tailscale_enabled": True}
+                    )
+                )
+        except Exception:  # noqa: BLE001 - never fail the enable on a save error
+            log.exception("tailscale up: could not persist tailscale_enabled=True")
     return TailscaleUpResponse(
         **{
             "state": result["state"],

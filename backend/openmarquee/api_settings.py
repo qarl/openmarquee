@@ -392,6 +392,15 @@ async def set_settings(
     # `Sign<3-hex>`. deploy.sh ships both together, so that's rollback-only.
     if "sign_name" not in payload:
         payload["sign_name"] = previous.sign_name
+    # Same treatment, same reason (2026-07-16): `tailscale_enabled` gates
+    # openmarquee-tailscale.service at every boot, so a stale tab autosaving
+    # an unticked box would take a working node off the tailnet — the lane we
+    # use to reach signs we cannot physically touch. The client sends it only
+    # when the operator actually clicked the toggle. Absence keeps the stored
+    # value, so an /api/system/tailscale/up that just persisted True can't be
+    # undone by a tab that predates it.
+    if "tailscale_enabled" not in payload:
+        payload["tailscale_enabled"] = previous.tailscale_enabled
     # 2026-07-03 (qarl handover B1): per-entry SECRET_SENTINEL swap
     # for `wifi_networks[i].password`. The UI submits `<set>` for a
     # network whose PSK the operator hasn't retyped (the response was

@@ -539,7 +539,12 @@ describe("mountSettings", () => {
         container.querySelector(".settings-form").dispatchEvent(new Event("input", { bubbles: true }));
         await tick();
         const payload = onSave.mock.calls[0][0];
-        expect(payload.tailscale_enabled).toBe(true);
+        // qarl 2026-07-16: tailscale_enabled is NOT round-tripped either. The
+        // operator never clicked the toggle in this test -- a form-level save
+        // must not carry it, or a stale tab would drop a working node off the
+        // tailnet. Pinned properly in the "stale tab must not take the sign
+        // off the tailnet" block below.
+        expect("tailscale_enabled" in payload).toBe(false);
         // qarl 2026-07-16: tailscale_hostname is NOT round-tripped any more.
         // A stored value (SAMPLE has "lobby-sign-01" here) must NOT be echoed
         // back -- re-sending it would re-pin a tailnet name that disagrees
@@ -1891,5 +1896,192 @@ describe("Settings → renaming the sign is never a side effect", () => {
 
         const latest = onSave.mock.calls[onSave.mock.calls.length - 1][0];
         expect("sign_name" in latest).toBe(false);
+    });
+});
+
+describe("Settings → Join radio reflects the sign's ACTUAL network state", () => {
+    // qarl 2026-07-16: "i moved it from create a network to join a network,
+    // even though i'm pretty sure it's joined to the NEBULA network."
+    // He was reporting a WRONG RADIO. `wifi_station_enabled` is written only
+    // by captive-portal onboarding and by POST /settings/wifi-prefill (which
+    // has no caller); the saved-networks/NM-import path never sets it. So an
+    // NM-provisioned sign showed "Create WiFi Network" while sitting on
+    // NEBULA -- and syncWifiGrayOut HIDES the saved-networks list behind that
+    // radio, so his networks were invisible until he flipped it by hand.
+    const NM_PROVISIONED = {
+        ...SAMPLE,
+        wifi_station_enabled: false, // never written on this path
+        wifi_networks: [{ ssid: "NEBULA", password: "<set>", autoconnect: true, priority: 0 }],
+    };
+
+    it("selects Join when the sign has saved networks but the legacy flag is false", async () => {
+        const container = document.createElement("div");
+        mount(container, { fetchSettings: async () => NM_PROVISIONED, onSave: async () => {} });
+        await tick();
+
+        expect(container.querySelector(".field-wifi-station-enabled").checked).toBe(true);
+        expect(container.querySelector(".field-wifi-ap-enabled").checked).toBe(false);
+    });
+
+    it("shows the saved-networks list instead of hiding it behind a wrong radio", async () => {
+        // The part qarl actually hit: his networks were HIDDEN, not just
+        // mislabelled. syncWifiGrayOut does `networksFieldset.hidden = !stationOn`.
+        const container = document.createElement("div");
+        mount(container, { fetchSettings: async () => NM_PROVISIONED, onSave: async () => {} });
+        await tick();
+
+        expect(container.querySelector(".settings-wifi-networks").hidden).toBe(false);
+    });
+
+    it("does not disable the Tailscale toggle on a sign that IS on a network", async () => {
+        // The F1->F2 chain: the Tailscale checkbox is gated on the station
+        // radio, so a wrong radio made `tailscale_enabled` unsettable — the
+        // field the boot unit reads to decide whether the sign stays on the
+        // tailnet at all.
+        const container = document.createElement("div");
+        mount(container, { fetchSettings: async () => NM_PROVISIONED, onSave: async () => {} });
+        await tick();
+
+        expect(container.querySelector(".field-tailscale-enabled").disabled).toBe(false);
+    });
+
+    it("still selects Create on a genuinely AP-only sign", async () => {
+        // CONTROL: the derivation must not just force Join on. A fresh
+        // out-of-box sign has no networks and no station config.
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                wifi_station_enabled: false,
+                wifi_networks: [],
+            }),
+            onSave: async () => {},
+        });
+        await tick();
+
+        expect(container.querySelector(".field-wifi-ap-enabled").checked).toBe(true);
+        expect(container.querySelector(".settings-wifi-networks").hidden).toBe(true);
+    });
+});
+
+describe("Settings → a stale tab must not take the sign off the tailnet", () => {
+    // Same destructive-echo family as sign_name: `tailscale_enabled` gates
+    // openmarquee-tailscale.service at every boot, so a tab autosaving an
+    // unticked box would drop a working node off qarl's support lane.
+    it("omits tailscale_enabled when the operator never touched the toggle", async () => {
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => ({ ...SAMPLE, tailscale_enabled: true }),
+            onSave,
+        });
+        await tick();
+
+        const brightness = container.querySelector(".field-brightness");
+        brightness.value = "42";
+        brightness.dispatchEvent(new Event("input", { bubbles: true }));
+        await tick();
+
+        const payload = onSave.mock.calls[0][0];
+        expect("tailscale_enabled" in payload).toBe(false);
+    });
+
+    it("sends tailscale_enabled when the operator actually clicks it", async () => {
+        // CONTROL: the guard must not make the toggle inert.
+        //
+        // The sign must have a station config for this to be a real path:
+        // the Tailscale checkbox is disabled while the Join radio is off, so
+        // click() (unlike a synthetic `change`) is a no-op on the bare SAMPLE
+        // — which is the F1->F2 chain in miniature, and why this fixture
+        // carries a network. Tailscale needs internet anyway.
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        const container = document.createElement("div");
+        // ATTACHED to the document on purpose: jsdom only runs a checkbox's
+        // activation behaviour (toggle -> input + change) for a CONNECTED
+        // node. In a detached container click() flips .checked and fires
+        // nothing, so a click-driven test would silently never save. The
+        // panel is in the document in real life; make the test match.
+        document.body.appendChild(container);
+        mount(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                tailscale_enabled: false,
+                wifi_networks: [
+                    { ssid: "NEBULA", password: "<set>", autoconnect: true, priority: 0 },
+                ],
+            }),
+            onSave,
+        });
+        await tick();
+        expect(container.querySelector(".field-tailscale-enabled").disabled).toBe(false);
+
+        // click() fires change + input natively, so this drives the REAL
+        // operator path rather than asserting that synthetic events work.
+        container.querySelector(".field-tailscale-enabled").click();
+        await tick();
+
+        const payload = onSave.mock.calls[onSave.mock.calls.length - 1][0];
+        expect(payload.tailscale_enabled).toBe(true);
+        container.remove();
+    });
+});
+
+describe("Settings → removing the last saved network falls back to AP", () => {
+    it("flips the radio to Create so the save can't 422 forever", async () => {
+        // Deriving the radio from wifi_networks created a new trap: remove the
+        // last network while Join is selected and the payload becomes
+        // ap=false / station=true / networks=[] with no legacy creds, which
+        // the server rejects (that config has no way to reach the sign) --
+        // so every autosave would 422 with no obvious way out. The sign truly
+        // has no station config left, and AP is what it falls back to.
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                wifi_station_enabled: false,
+                wifi_station_ssid: null,
+                wifi_station_password: null,
+                wifi_networks: [
+                    { ssid: "NEBULA", password: "<set>", autoconnect: true, priority: 0 },
+                ],
+            }),
+            onSave,
+        });
+        await tick();
+        expect(container.querySelector(".field-wifi-station-enabled").checked).toBe(true);
+
+        container.querySelector(".field-wifi-networks-item-remove").click();
+        await tick();
+
+        expect(container.querySelector(".field-wifi-ap-enabled").checked).toBe(true);
+        expect(container.querySelector(".field-wifi-station-enabled").checked).toBe(false);
+        const payload = onSave.mock.calls[onSave.mock.calls.length - 1][0];
+        expect(payload.wifi_ap_enabled).toBe(true);
+        expect(payload.wifi_station_enabled).toBe(false);
+        expect(payload.wifi_networks).toEqual([]);
+    });
+
+    it("keeps Join selected while networks remain", async () => {
+        // CONTROL: the fallback must only fire when the list actually empties.
+        const onSave = vi.fn().mockResolvedValue(undefined);
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                wifi_station_enabled: false,
+                wifi_networks: [
+                    { ssid: "NEBULA", password: "<set>", autoconnect: true, priority: 0 },
+                    { ssid: "qarl", password: "<set>", autoconnect: true, priority: 1 },
+                ],
+            }),
+            onSave,
+        });
+        await tick();
+
+        container.querySelector(".field-wifi-networks-item-remove").click();
+        await tick();
+
+        expect(container.querySelector(".field-wifi-station-enabled").checked).toBe(true);
     });
 });

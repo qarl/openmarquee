@@ -539,8 +539,13 @@ def apply_in_background(
         thread = threading.Thread(target=apply_disabled, daemon=True)
     else:
         if not ssid or not password:
-            # Settings validator already rejects this combination, but
-            # belt-and-braces: don't pass None into apply_enabled.
+            # NOT unreachable, despite what this comment used to claim.
+            # The settings validator only demands ssid+password when
+            # `wifi_networks` is EMPTY, so an NM-provisioned sign (networks
+            # present, legacy creds null) validates fine and lands here. And
+            # since 2026-07-16 the Settings radio derives from wifi_networks,
+            # so `enabled=True` with null creds is a ROUTINE payload -- this
+            # guard is what keeps it from touching a working link.
             log.warning(
                 "wifi station: apply_in_background called with enabled=true "
                 "but missing ssid/password; no-op"

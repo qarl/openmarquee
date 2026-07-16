@@ -386,6 +386,30 @@ case "$cmd" in
         # the NM-unmanaged drop-in so NM resumes managing wlan0 normally
         # for fresh onboarding after the reboot. All no-ops if absent.
         rm -f "$WPA_CONF" /etc/wpa_supplicant/wpa_supplicant.conf "$NM_DROP_IN"
+        # 2026-07-16: DETACH FROM THE TAILNET. Factory reset is the
+        # decommission path — a resold / returned / handed-on sign must not
+        # stay on its previous owner's tailnet.
+        #
+        # This used to happen by accident: the wipe deleted settings.json, the
+        # backend recreated it with `tailscale_enabled=False` (the default),
+        # and openmarquee-tailscale.sh's boot-time `tailscale logout` did the
+        # detach. That logout has been removed — it fired on the say-so of a
+        # field that was wrong in several ways and could sever the support
+        # lane to a working sign — so the detach has to live HERE, where it is
+        # an explicit operator act (they typed the confirm phrase) rather than
+        # an inference from a JSON field.
+        #
+        # serve.json is removed too: `tailscale serve --bg` persists there, so
+        # a node that re-authenticates later would otherwise resume serving
+        # this sign's admin UI to the old tailnet. Best-effort (`|| true`):
+        # `logout` needs the control plane and we have just torn down wifi, so
+        # it may not land — same eventual-detach caveat the old boot-script
+        # path had. Non-fatal so it can't trip `set -e` and abort before the
+        # reboot below, leaving a wiped-but-not-rebooted box.
+        if command -v tailscale >/dev/null 2>&1; then
+            tailscale logout || true
+        fi
+        rm -f /var/lib/tailscale/serve.json || true
         # Reboot into the wiped setup state (enqueues + returns, so the
         # daemon can ACK "OK" before teardown — same as `reboot`).
         systemctl reboot

@@ -16,6 +16,17 @@ RemainAfterExit=yes
 User=openmarquee
 Group=openmarquee
 Environment="OPENMARQUEE_SETTINGS_PATH=/var/openmarquee/settings.json"
+# 2026-07-16: bound the bring-up. `tailscale up` BLOCKS awaiting operator
+# sign-in, and /api/system/tailscale/up now persists tailscale_enabled=True
+# when the operator clicks Enable — so an ABANDONED sign-in leaves a sign
+# that wants tailscale but has no auth, and this unit would block on it.
+# Without an explicit timeout that's systemd's 90s default, and since this
+# is WantedBy=multi-user.target a stuck bring-up holds the whole target up
+# for that long on EVERY boot. 30s is well past a healthy bring-up (a
+# registered node is a sub-second no-op) and keeps a half-finished enable
+# from dominating boot. There is no Restart=, so a failure here is a
+# one-shot failure, not a loop — nothing to trip StartLimitBurst.
+TimeoutStartSec=30
 ExecStart=/opt/openmarquee/system/openmarquee-tailscale.sh
 
 [Install]
