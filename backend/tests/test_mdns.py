@@ -95,3 +95,38 @@ def test_wlan0_ipv4_parses_ioctl_result(monkeypatch):
     ifreq[20:24] = _socket.inet_aton("192.168.1.67")
     monkeypatch.setattr(fcntl, "ioctl", lambda *a, **k: bytes(ifreq))
     assert wlan0_ipv4() == "192.168.1.67"
+
+
+# ---- 2026-07-16 (qarl): "the boot info card should show the .local
+# address when tailscale isn't active, but it should show the full
+# tailscale name when tailscale is active."
+
+
+def test_sign_url_prefers_the_tailscale_fqdn_when_present():
+    from openmarquee.mdns import sign_url
+
+    assert sign_url("jasonssign1.tail71c768.ts.net") == "http://jasonssign1.tail71c768.ts.net"
+
+
+def test_sign_url_falls_back_to_mdns_when_tailscale_is_absent(monkeypatch):
+    from openmarquee.mdns import sign_url
+
+    monkeypatch.setenv("OPENMARQUEE_MDNS_HOSTNAME", "JasonsSign1")
+    assert sign_url(None) == "http://jasonssign1.local"
+
+
+def test_sign_url_treats_empty_fqdn_as_absent(monkeypatch):
+    """`get_self_fqdn_online` returns None when the node is down, but a
+    caller threading an empty string through must not produce the
+    unreachable `http://`."""
+    from openmarquee.mdns import sign_url
+
+    monkeypatch.setenv("OPENMARQUEE_MDNS_HOSTNAME", "JasonsSign1")
+    assert sign_url("") == "http://jasonssign1.local"
+
+
+def test_sign_url_default_arg_is_the_mdns_url(monkeypatch):
+    from openmarquee.mdns import mdns_url, sign_url
+
+    monkeypatch.setenv("OPENMARQUEE_MDNS_HOSTNAME", "JasonsSign1")
+    assert sign_url() == mdns_url()

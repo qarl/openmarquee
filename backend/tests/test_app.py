@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -123,3 +125,83 @@ def test_boot_card_includes_setup_countdown_when_mid_gesture(tmp_path, monkeypat
     count_file.write_text("0\n")
     params = _boot_card_params(url="http://x", ssid=None, ip=None)
     assert "boot_hint" not in params
+
+
+# ---- 2026-07-16: boot-card URL single source of truth (naming-guard).
+
+
+def test_boot_card_text_and_qr_are_the_same_url():
+    """SINGLE SOURCE. The card's readable address and its QR payload must
+    come from ONE value. If they ever diverge, the sign prints one URL and
+    encodes another -- and the QR is the whole point of the card (the
+    "bookmark moment": scan it, get the sign). A drift here is invisible
+    on-glass to anyone who doesn't scan AND read."""
+    from openmarquee.app import _boot_card_params
+
+    params = _boot_card_params(url="http://jasonssign1.tail71c768.ts.net", ssid=None, ip=None)
+    assert params["address"] == params["qr_payload"]
+    assert params["address"] == "http://jasonssign1.tail71c768.ts.net"
+
+
+def test_boot_card_url_is_not_derived_from_mdns_directly():
+    """The boot card must route through mdns.sign_url, NOT mdns_url: qarl
+    2026-07-16 wants the tailnet name when Tailscale is up. Reading
+    mdns_url() at a card site would silently pin .local again and no
+    unit test of sign_url would notice."""
+    import inspect
+
+    from openmarquee import app as app_mod
+    from openmarquee import network_supervisor as ns_mod
+
+    for mod in (app_mod, ns_mod):
+        src = inspect.getsource(mod)
+        assert "mdns_url()" not in src, (
+            f"{mod.__name__} must build card URLs via sign_url(), not mdns_url()"
+        )
+        assert "sign_url(" in src, f"{mod.__name__} must use sign_url()"
+
+
+@pytest.mark.asyncio
+async def test_card_building_never_blocks_the_event_loop(tmp_path):
+    """THE HAZARD, tested behaviourally rather than by source-substring.
+
+    An earlier draft called a BLOCKING tailscaled probe from
+    `_system_card_params_for_state`, reasoning that the supervisor had
+    "its own thread". It does not: `supervisor_observe_loop` is an
+    asyncio task that calls the sync `apply_event` directly, so the card
+    params are built ON the event loop and a wedged tailscaled stalled
+    playback, renderer IPC and HTTP for up to 4s.
+
+    The guard written for that draft asserted a substring over app.py --
+    the one module never at risk -- so it passed while the bug shipped.
+    This drives the real transition with a deliberately slow probe and
+    measures the loop instead.
+    """
+    import time as _time
+
+    from openmarquee import _tailscale_self
+    from openmarquee.network_supervisor import (
+        NetworkSupervisor,
+        SupervisorConfig,
+        SupervisorEvent,
+    )
+
+    _tailscale_self.clear_cache()
+
+    def _slow_query():
+        _time.sleep(2.0)  # a wedged tailscaled
+        return "jasonssign1.tail71c768.ts.net", True
+
+    supervisor = NetworkSupervisor(
+        config=SupervisorConfig(state_file=tmp_path / "network-state.json")
+    )
+    with patch.object(_tailscale_self, "_query_self", _slow_query):
+        started = _time.monotonic()
+        supervisor.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)
+        supervisor.apply_event(SupervisorEvent.STA_ASSOCIATED)
+        elapsed = _time.monotonic() - started
+
+    assert elapsed < 0.5, (
+        f"building the CONNECTED card blocked the event loop for {elapsed:.2f}s; "
+        "the card path must read the tailscale FQDN from cache, never probe"
+    )
