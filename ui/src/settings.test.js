@@ -2163,3 +2163,182 @@ describe("Settings → the setup-AP SSID follows the sign name", () => {
         expect(payload.brightness).toBe(42);
     });
 });
+
+describe("Settings → the password row must not call a saved network passwordless", () => {
+    // qarl 2026-07-16 (F6). The indicator reflected only the LEGACY
+    // wifi_station_password, which captive-portal onboarding alone writes --
+    // null on a saved-networks sign, so the row said "Not set". Harmless while
+    // the SSID box beside it was blank (two empty fields read as a FORM), but
+    // PR #100 prefilled that box from the LIVE connection and the pair started
+    // reading as a STATUS report: "Join this network: NEBULA" above "WiFi
+    // password: Not set" says NEBULA has no password. It has one.
+    const ON_NEBULA = {
+        ...SAMPLE,
+        wifi_station_enabled: false,
+        wifi_station_ssid: null,
+        wifi_station_password: null, // legacy pair never written on this path
+        wifi_networks: [
+            { ssid: "NEBULA", password: "<set>", autoconnect: true, priority: 0 },
+        ],
+    };
+
+    function stateFetch(connectedSsid) {
+        return vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+            const u = String(url);
+            if (u.includes("/api/settings/wifi-station-state")) {
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({
+                        state: "idle",
+                        detail: null,
+                        ssid: null,
+                        connected_ssid: connectedSsid,
+                        connected_probe_ok: true,
+                    }),
+                };
+            }
+            return { ok: true, status: 200, json: async () => ({ networks: [] }) };
+        });
+    }
+
+    it("says Set for a saved network, even though the legacy field is null", async () => {
+        stateFetch("NEBULA");
+        const container = document.createElement("div");
+        mount(container, { fetchSettings: async () => ON_NEBULA, onSave: async () => {} });
+        await tick();
+        await tick();
+
+        expect(container.querySelector(".field-wifi-station-ssid").value).toBe("NEBULA");
+        const status = container.querySelector(
+            '.secret-field[data-secret="wifi-station-password"] .secret-status',
+        );
+        expect(status.textContent).toContain("Set");
+        expect(status.textContent).not.toBe("Not set");
+    });
+
+    it("still says Not set for an SSID we have no password for", async () => {
+        // CONTROL: it must not just always claim "Set" -- for a network the
+        // operator is typing fresh, "you haven't entered a password" is the
+        // truth and the row should say so.
+        stateFetch(null);
+        const container = document.createElement("div");
+        mount(container, { fetchSettings: async () => ON_NEBULA, onSave: async () => {} });
+        await tick();
+        await tick();
+
+        const ssid = container.querySelector(".field-wifi-station-ssid");
+        ssid.value = "SomeOtherNet";
+        ssid.dispatchEvent(new Event("input", { bubbles: true }));
+        await tick();
+
+        const status = container.querySelector(
+            '.secret-field[data-secret="wifi-station-password"] .secret-status',
+        );
+        expect(status.textContent).toBe("Not set");
+    });
+});
+
+describe("Settings → password row stays honest as the network list changes", () => {
+    const SAVED = (ssid, password = "<set>") => ({
+        ssid,
+        password,
+        autoconnect: true,
+        priority: 0,
+    });
+    const statusOf = (c) =>
+        c.querySelector('.secret-field[data-secret="wifi-station-password"] .secret-status')
+            .textContent;
+
+    function noProbe() {
+        return vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+            if (String(url).includes("/api/settings/wifi-station-state")) {
+                return {
+                    ok: true,
+                    status: 200,
+                    json: async () => ({
+                        state: "idle",
+                        detail: null,
+                        ssid: null,
+                        connected_ssid: null,
+                        connected_probe_ok: true,
+                    }),
+                };
+            }
+            return { ok: true, status: 200, json: async () => ({ networks: [] }) };
+        });
+    }
+
+    it("says Set on hydrate alone, with no live prefill to rescue it", async () => {
+        // PINS THE ORDERING. syncStationPasswordIndicator reads wifiNetworks,
+        // so it must run AFTER the rebuild in refresh(). Both of the other F6
+        // tests are blind to this: the live-SSID prefill re-syncs afterwards
+        // and masks a too-early call. Here the box is filled from the PERSISTED
+        // wifi_station_ssid and the probe reports nothing, so the hydrate call
+        // is the ONLY syncer -- move it back above the rebuild and this fails.
+        noProbe();
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                wifi_station_ssid: "NEBULA",
+                wifi_station_password: null,
+                wifi_networks: [SAVED("NEBULA")],
+            }),
+            onSave: async () => {},
+        });
+        await tick();
+        await tick();
+
+        expect(container.querySelector(".field-wifi-station-ssid").value).toBe("NEBULA");
+        expect(statusOf(container)).toContain("Set");
+        expect(statusOf(container)).not.toBe("Not set");
+    });
+
+    it("stops saying Set once that network is removed", async () => {
+        // The row would otherwise keep claiming a password for a network that
+        // is GONE -- and the resulting save is rejected by the server, so the
+        // operator gets a failing save next to a row insisting all is well.
+        noProbe();
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                wifi_station_ssid: "NEBULA",
+                wifi_station_password: null,
+                wifi_networks: [SAVED("NEBULA")],
+            }),
+            onSave: async () => {},
+        });
+        await tick();
+        await tick();
+        expect(statusOf(container)).toContain("Set");
+
+        container.querySelector(".field-wifi-networks-item-remove").click();
+        await tick();
+
+        expect(statusOf(container)).toBe("Not set");
+    });
+
+    it("matches an SSID whose stored form has surrounding spaces", async () => {
+        // A WPA2 SSID may legitimately begin/end with spaces and wifi_networks
+        // stores it verbatim, so trimming before the lookup would report a
+        // genuinely-saved network as passwordless -- this bug, for exactly the
+        // SSIDs most likely to confuse someone.
+        noProbe();
+        const container = document.createElement("div");
+        mount(container, {
+            fetchSettings: async () => ({
+                ...SAMPLE,
+                wifi_station_ssid: "NEBULA ",
+                wifi_station_password: null,
+                wifi_networks: [SAVED("NEBULA ")],
+            }),
+            onSave: async () => {},
+        });
+        await tick();
+        await tick();
+
+        expect(statusOf(container)).toContain("Set");
+    });
+});
