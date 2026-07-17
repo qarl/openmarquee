@@ -7,8 +7,15 @@ gamma, and (reserved) timezone.
 This module ships the data model + storage contract only. Several fields
 are *persisted now but acted on later*:
 
-- Changing `wifi_ssid` / `wifi_password` in production needs a hostapd
-  rewrite + restart — that lives in Phase 7. Today we just store.
+- `wifi_password` in production needs a hostapd rewrite + restart — that
+  lives in Phase 7. Today we just store. `wifi_ssid` is NO LONGER in that
+  bucket and hasn't been since 2026-07-03: `name_actuator._apply_hostapd_ssid`
+  rewrites hostapd.conf + restarts it. But it is driven by the SIGN NAME, not
+  by this field — the setup-AP SSID follows the sign name (qarl's Option A),
+  and `_reconcile_stored_name_fields` rewrites `wifi_ssid` from the hostname
+  on drift. So this field is DERIVED state that records what the AP is
+  broadcasting; editing it never did anything, which is why the Settings box
+  is readonly as of 2026-07-16.
 - `output_mode` is HDMI-only on HEAD. Legacy on-disk values from the
   HUB75 / WS2812B / composite era are coerced to "hdmi" on load (see
   `_coerce_legacy_output_mode`); the Rust IPC sidecar owns HDMI scanout

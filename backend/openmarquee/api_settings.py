@@ -401,6 +401,22 @@ async def set_settings(
     # undone by a tab that predates it.
     if "tailscale_enabled" not in payload:
         payload["tailscale_enabled"] = previous.tailscale_enabled
+    # Same again (2026-07-16): `wifi_ssid` is the setup-AP SSID and FOLLOWS
+    # the sign name -- _reconcile_stored_name_fields rewrites it from the
+    # hostname whenever it drifts (qarl's Option A). The field is readonly in
+    # the UI now and the panel no longer sends it, which is what stops a
+    # stale tab echoing an old SSID.
+    #
+    # THIS branch exists for the other direction -- the new client's
+    # OMISSION. Without it an absent key takes the field's plain default,
+    # "openMarquee-SETUP", so a save that never mentioned the network would
+    # silently rename the sign's setup AP away from its reconciled value AND
+    # hand that wrong name to wifi_networks_actuator as `ap_ssid` below,
+    # weakening one of the three signals it uses to recognise (and protect)
+    # the setup-AP NM profile. Not sign_name's random-name trap -- the
+    # default here is a constant -- but a silent rename either way.
+    if "wifi_ssid" not in payload:
+        payload["wifi_ssid"] = previous.wifi_ssid
     # 2026-07-03 (qarl handover B1): per-entry SECRET_SENTINEL swap
     # for `wifi_networks[i].password`. The UI submits `<set>` for a
     # network whose PSK the operator hasn't retyped (the response was
