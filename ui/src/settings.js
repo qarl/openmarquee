@@ -816,6 +816,47 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         "wifi-station-password": "/api/settings/wifi-station-password",
     };
 
+    function syncStationPasswordIndicator() {
+        // qarl 2026-07-16 (F6). This indicator reflected only the LEGACY
+        // `wifi_station_password` field. That field IS written -- by
+        // captive-portal onboarding, by a PUT, and by this row's own
+        // "Change..." PATCH (/api/settings/wifi-station-password) -- but NOT
+        // by the saved-networks/NM path, which is how most signs are
+        // provisioned. So on those signs it is null and the row said
+        // "Not set".
+        //
+        // That was harmless while the SSID box beside it was blank: two empty
+        // fields read as an empty FORM. Then #100 prefilled the SSID box from
+        // the LIVE connection, and the pair started reading as a STATUS
+        // report: "Join this network: NEBULA" directly above "WiFi password:
+        // Not set" says NEBULA HAS NO PASSWORD. It has one -- in
+        // `wifi_networks` -- and that misread is qarl's original complaint
+        // ("the networks do not have their passwords") one layer down.
+        //
+        // So answer the question the pair actually poses: do we hold a PSK for
+        // the SSID currently in the box? A saved network's password USUALLY
+        // arrives redacted as SECRET_SENTINEL, which is a "yes, stored" -- but
+        // not always: an imported Layer-A profile can carry password null and
+        // still have a real PSK in NetworkManager (see renderWifiNetworksList).
+        // The `&& n.password` below makes that case fall through to "Not set",
+        // which understates rather than lies.
+        //
+        // Match the RAW value before the trimmed one: a WPA2 SSID may
+        // legitimately begin or end with spaces, wifi_networks stores it
+        // verbatim (wifi_networks_actuator: "Value MUST NOT be stripped"), and
+        // the prefill writes it into the box untrimmed. Trimming first would
+        // report a genuinely-saved "NEBULA " as passwordless -- reproducing
+        // this very bug for exactly the SSIDs most likely to confuse someone.
+        const raw = stationSsidEl.value;
+        const findSaved = (needle) =>
+            needle ? wifiNetworks.find((n) => n.ssid === needle && n.password) : null;
+        const saved = findSaved(raw) || findSaved(raw.trim());
+        updateSecretIndicator(
+            "wifi-station-password",
+            saved ? saved.password : stationPasswordEl.value || null,
+        );
+    }
+
     function updateSecretIndicator(secretId, wireValue) {
         const row = container.querySelector(
             `.secret-field[data-secret="${secretId}"]`,
@@ -1207,7 +1248,6 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             stationEnabledEl.checked = wifiJoinSelected;
             stationSsidEl.value = settings.wifi_station_ssid ?? "";
             stationPasswordEl.value = settings.wifi_station_password ?? "";
-            updateSecretIndicator("wifi-station-password", settings.wifi_station_password);
             // Hydrate tailscale state BEFORE the sync calls — syncTailscale*
             // reads tsEnabledEl.checked to decide dim / disabled state, so
             // the wrong class would stick on first paint if this came after.
@@ -1233,6 +1273,12 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                 });
             }
             renderWifiNetworksList();
+            // AFTER the wifiNetworks rebuild above, not with the other
+            // station-field hydration: this reads wifiNetworks to answer
+            // "do we hold this SSID's password?", and running it earlier
+            // would search the PREVIOUS refresh's array (empty on first
+            // mount) and report a stored PSK as "Not set".
+            syncStationPasswordIndicator();
             syncWifiGrayOut();
             syncTailscaleStationGating();
             setTimezoneValue(tzEl, settings.timezone || "");
@@ -1576,6 +1622,10 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                 wifiNetworks.splice(index, 1);
                 renderWifiNetworksList();
                 fallBackToApWhenStationIsUnbacked();
+                // The row's answer depends on wifiNetworks, which just
+                // changed: without this, removing the network you're prefilled
+                // to leaves "•••• Set" standing for a network that is GONE.
+                syncStationPasswordIndicator();
                 // Fire autosave: the form-level input event is the
                 // trigger attachAutoSave listens for.
                 form.dispatchEvent(new Event("input", { bubbles: true }));
@@ -1620,6 +1670,8 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
         wifiNetworksAddSsidEl.value = "";
         wifiNetworksAddPasswordEl.value = "";
         renderWifiNetworksList();
+        // Same reason as the Remove path: the row reads wifiNetworks.
+        syncStationPasswordIndicator();
         // Trigger autosave — attachAutoSave listens for input events
         // on any form-descendant field. dispatchEvent 'input' at the
         // form level is the canonical way to kick a save without
@@ -1804,6 +1856,9 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
                 // hasn't typed their own target — never clobber input.
                 if (stationSsidEl && !stationSsidEl.value.trim()) {
                     stationSsidEl.value = ssid;
+                    // The box just changed; re-answer "do we hold this one's
+                    // password?" or the pair reads as "NEBULA has none".
+                    syncStationPasswordIndicator();
                 }
             } else {
                 el.textContent = "Not connected";
@@ -1878,6 +1933,7 @@ export function mountSettings(container, { fetchSettings, onSave, debounceMs }) 
             surfaceWifiScanError(err.message || String(err));
         }
     }
+    stationSsidEl.addEventListener("input", syncStationPasswordIndicator);
     stationSsidPickerEl.addEventListener("change", () => {
         if (stationSsidPickerEl.value === "__other__") {
             stationSsidEl.hidden = false;
