@@ -76,6 +76,18 @@ echo "==> rsync ui/fonts -> $(dirname "$BUILD_DIR")/ui/fonts"
 mkdir -p "$(dirname "$BUILD_DIR")/ui"
 rsync -a --delete "$REPO/ui/fonts/" "$(dirname "$BUILD_DIR")/ui/fonts/"
 
+# Boot-card brand mark (2026-07-07): build.rs copies mark.png from
+# manifest_dir.parent()/images/.../mark.png. The cross-build crate root
+# is /tmp/renderer-build, so build.rs resolves the mark to /tmp/images/…
+# — mirror the ui/fonts sibling sync so the bake finds it. Without this,
+# build.rs panics: "copy boot-card mark.png … No such file or directory".
+# Exclude AppleDouble sidecars + __pycache__ (noise; the mark copy is an
+# explicit file, not a glob).
+echo "==> rsync images/ -> $(dirname "$BUILD_DIR")/images"
+mkdir -p "$(dirname "$BUILD_DIR")/images"
+rsync -a --delete --exclude '._*' --exclude '__pycache__' \
+    "$REPO/images/" "$(dirname "$BUILD_DIR")/images/"
+
 echo "==> cargo zigbuild --target $TARGET --$PROFILE"
 BUILD_FLAGS=""
 [ "$PROFILE" = "release" ] && BUILD_FLAGS="--release"
