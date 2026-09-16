@@ -318,3 +318,110 @@ patch_cmdline_txt_cma() {
     printf '%s %s\n' "$stripped" "cma=320M" > "$file"
     echo "cmdline.txt: set cma=320M (stripped any prior cma= + appended)"
 }
+
+# Ensure `dtoverlay=dwc2` is set in a Pi config.txt, IN PLACE. Idempotent.
+#
+# USB-gadget networking 2026-09-16 (qarl dev device "fireplacesign"):
+# load the dwc2 USB controller so the Pi can present a CDC-ether gadget
+# (usb0) to a host tethered over the USB DATA port. Paired with
+# `modules-load=dwc2,g_ether` in cmdline.txt (patch_cmdline_txt_modules).
+# Gives qarl `ssh openmarquee@fireplacesign.local` over the cable with no
+# wifi/monitor, and is the wired recovery path the Pi Zero 2 W lacks (no
+# onboard ethernet). dwc2 defaults to OTG/`dr_mode=otg`, so the port still
+# works as a USB HOST with an OTG adapter (e.g. a wifi dongle) — g_ether
+# only binds when the ID pin selects PERIPHERAL role, so this coexists
+# with both onboard wlan0 (SDIO, unaffected) and USB-host use.
+#
+# dtoverlay is ADDITIVE (multiple overlays coexist — vc4-kms-v3d, dwc2,
+# …), so — unlike gpu_mem — we do NOT strip other dtoverlay= lines; we
+# only ensure a dwc2 one is present.
+# Behavior:
+#   - an uncommented `dtoverlay=dwc2` line (bare, or with trailing
+#     params like `dtoverlay=dwc2,dr_mode=host`) already present → no-op
+#   - otherwise → APPEND a fresh `[all]` / `dtoverlay=dwc2` block at EOF
+# Explicit `[all]` header pins scope across all model variants regardless
+# of which `[section]` selector was last opened at EOF (same rationale as
+# patch_config_txt_gpu_mem).
+patch_config_txt_dwc2() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        echo "patch_config_txt_dwc2: $file not found" >&2
+        return 1
+    fi
+    # Uncommented dtoverlay=dwc2, either bare-at-EOL or followed by a
+    # `,param` list. The `(,|[[:space:]]*$)` tail stops `dtoverlay=dwc2x`
+    # from matching; the leading `^[[:space:]]*` with no `#` excludes a
+    # commented `#dtoverlay=dwc2`.
+    if grep -qE '^[[:space:]]*dtoverlay[[:space:]]*=[[:space:]]*dwc2([[:space:]]*$|,)' "$file"; then
+        echo "config.txt: dtoverlay=dwc2 already set — no-op"
+        return 0
+    fi
+    printf '\n# openMarquee USB-gadget networking 2026-09-16: load the dwc2\n# USB controller so the Pi presents a CDC-ether gadget (usb0) to a\n# host tethered over the USB data port. Paired with\n# `modules-load=dwc2,g_ether` in cmdline.txt. Explicit [all] header\n# pins scope across all model variants.\n[all]\ndtoverlay=dwc2\n' \
+        >> "$file"
+    echo "config.txt: appended [all]/dtoverlay=dwc2"
+}
+
+# Insert `modules-load=dwc2,g_ether` into a Pi cmdline.txt IMMEDIATELY
+# AFTER the `rootwait` token, IN PLACE. Idempotent.
+#
+# USB-gadget networking 2026-09-16: paired with patch_config_txt_dwc2.
+# g_ether is the legacy CDC-ether gadget driver; loading it (with the
+# dwc2 UDC) at boot makes the Pi enumerate as a USB ethernet device to a
+# tethered host, creating `usb0` on the Pi.
+#
+# ORDER MATTERS: the canonical Pi USB-gadget recipe places
+# `modules-load=dwc2,g_ether` directly after `rootwait`, so this inserts
+# the token at exactly that position rather than appending at EOL.
+#
+# Same DANGER as patch_cmdline_txt — cmdline.txt is a SINGLE line and a
+# stray newline silently drops every param after it, bricking boot. This
+# function therefore:
+#   - reads the whole file and turns every CR/LF into a SPACE, collapses
+#     whitespace runs, trims,
+#   - refuses to write an EMPTY file,
+#   - is idempotent: a re-run finds the exact `modules-load=dwc2,g_ether`
+#     token already present and short-circuits (never double-inserts),
+#   - if `rootwait` is somehow ABSENT (non-stock cmdline), appends the
+#     token at end + warns rather than failing the build — a working
+#     boot without ideal ordering beats a bricked/aborted one.
+patch_cmdline_txt_modules() {
+    local file="$1"
+    local mod="modules-load=dwc2,g_ether"
+    if [ ! -f "$file" ]; then
+        echo "patch_cmdline_txt_modules: $file not found" >&2
+        return 1
+    fi
+    local current
+    current="$(tr '\r\n' '  ' < "$file" | sed 's/[[:space:]]\{1,\}/ /g; s/^ //; s/ $//')"
+    if [ -z "$current" ]; then
+        echo "patch_cmdline_txt_modules: $file is empty — refusing to patch" >&2
+        return 1
+    fi
+    # Idempotency: EXACT field match (awk, not substring) — a token that
+    # already equals `modules-load=dwc2,g_ether` → no-op. Uses a flag +
+    # single END exit: a bare `exit 0` inside the loop still runs the END
+    # block, so an `END{exit 1}` there would clobber the status.
+    if printf '%s\n' "$current" | awk -v m="$mod" \
+        '{for(i=1;i<=NF;i++) if($i==m) f=1} END{exit f?0:1}'; then
+        echo "cmdline.txt: '$mod' already present — no-op"
+        return 0
+    fi
+    # Rebuild the token list, inserting `mod` right after the first
+    # `rootwait` field. If no rootwait, append at end (inserted stays 0).
+    local rebuilt
+    rebuilt="$(printf '%s\n' "$current" | awk -v mod="$mod" '{
+        out=""; inserted=0
+        for (i=1; i<=NF; i++) {
+            out=(out=="") ? $i : out" "$i
+            if ($i=="rootwait" && inserted==0) { out=out" "mod; inserted=1 }
+        }
+        if (inserted==0) out=out" "mod
+        print out
+    }')"
+    printf '%s\n' "$rebuilt" > "$file"
+    if printf '%s\n' "$current" | grep -qw rootwait; then
+        echo "cmdline.txt: inserted '$mod' after rootwait"
+    else
+        echo "cmdline.txt: WARNING rootwait absent — appended '$mod' at end" >&2
+    fi
+}

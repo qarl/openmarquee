@@ -455,7 +455,7 @@ _AVAHI_FALLBACK_CONF = """\
 # that keeps <sign-name>.local resolving.
 [server]
 host-name={name}
-allow-interfaces=wlan0
+allow-interfaces=wlan0,usb0
 """
 """Last-resort baseline when the on-disk conf has no [server] group at
 all (empty file, truncated write, a previous clobber). Mirrors the

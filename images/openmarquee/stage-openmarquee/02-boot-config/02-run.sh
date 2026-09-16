@@ -62,3 +62,14 @@ patch_cmdline_txt_cma     "${boot_dir}/cmdline.txt"
 # uncommented, so bake the same shape into the SD-card image + the
 # redeploy path.
 patch_config_txt_audio    "${boot_dir}/config.txt"
+# USB-gadget networking 2026-09-16 (qarl dev device "fireplacesign"):
+# present a CDC-ether gadget (usb0) to a host tethered over the USB data
+# port so the Pi is reachable as fireplacesign.local over the cable — the
+# wired recovery path the Pi Zero 2 W lacks (no onboard ethernet). Both
+# lines are required: dtoverlay=dwc2 in config.txt loads the controller,
+# modules-load=dwc2,g_ether in cmdline.txt (inserted right after rootwait,
+# order matters) binds the gadget driver. Coexists with onboard wlan0
+# (SDIO) station mode + HDMI. The usb0 address + avahi advertisement are
+# set by substage 05-usb-gadget + system/avahi.
+patch_config_txt_dwc2     "${boot_dir}/config.txt"
+patch_cmdline_txt_modules "${boot_dir}/cmdline.txt"

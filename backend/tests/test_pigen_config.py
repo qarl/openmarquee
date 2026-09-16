@@ -232,3 +232,85 @@ def test_all_substage_run_scripts_are_git_executable() -> None:
         "pi-gen substage *-run.sh must be committed 100755 (executable) or "
         f"pi-gen silently skips the whole substage: {offenders}"
     )
+
+
+# --- USB-gadget networking (dwc2 + g_ether), 2026-09-16 ---
+#
+# The dwc2 gadget lets the Pi be reached as <sign-name>.local over a USB
+# cable (the wired recovery path the Pi Zero 2 W lacks). Two halves, both
+# regression-guarded here at the static level (a loop-mount of the built
+# image is out of scope for a unit test — that lives in the manual
+# build-completeness check documented in images/openmarquee/README.md):
+#   1. boot-config: dtoverlay=dwc2 (config.txt) + modules-load=dwc2,g_ether
+#      right after rootwait (cmdline.txt) — the byte-level patch behavior
+#      is unit-tested by 02-boot-config/test-boot-config.sh.
+#   2. usb0 bring-up: the 05-usb-gadget substage bakes a link-local NM
+#      profile bound to interface-name=usb0.
+# The tests below assert the two halves are actually WIRED (a patch fn
+# that exists but is never CALLED ships nothing — same failure shape as
+# the exec-bit regression above).
+
+_BOOT_CONFIG = _STAGE_DIR / "02-boot-config"
+
+
+def test_boot_config_lib_defines_dwc2_functions() -> None:
+    """boot-config-lib.sh must define the dwc2 config.txt patch and the
+    modules-load cmdline.txt patch, with the exact kernel-side literals."""
+    lib = (_BOOT_CONFIG / "boot-config-lib.sh").read_text()
+    assert "patch_config_txt_dwc2()" in lib, "patch_config_txt_dwc2 not defined"
+    assert "patch_cmdline_txt_modules()" in lib, "patch_cmdline_txt_modules not defined"
+    assert "dtoverlay=dwc2" in lib, "dwc2 overlay literal missing from lib"
+    assert "modules-load=dwc2,g_ether" in lib, "g_ether module literal missing from lib"
+
+
+def test_boot_config_runner_invokes_dwc2() -> None:
+    """02-run.sh (the pi-gen substage runner) must CALL both dwc2 patch
+    functions — defining them isn't enough, an uncalled patch bakes
+    nothing into the image."""
+    runner = (_BOOT_CONFIG / "02-run.sh").read_text()
+    assert "patch_config_txt_dwc2" in runner, (
+        "02-run.sh must call patch_config_txt_dwc2 or the built image ships no dtoverlay=dwc2"
+    )
+    assert "patch_cmdline_txt_modules" in runner, (
+        "02-run.sh must call patch_cmdline_txt_modules or the built image "
+        "ships no modules-load=dwc2,g_ether"
+    )
+
+
+def test_usb_gadget_substage_run_sh_exists() -> None:
+    """The 05-usb-gadget substage must exist (its run.sh is separately
+    checked for git mode 100755 by the substage-exec test above)."""
+    run = _STAGE_DIR / "05-usb-gadget" / "05-run.sh"
+    assert run.exists(), "05-usb-gadget/05-run.sh missing"
+    assert "system-connections" in run.read_text(), (
+        "05-run.sh must install the usb0 NM profile under system-connections"
+    )
+
+
+def test_usb0_nmconnection_is_linklocal_and_bound() -> None:
+    """The baked usb0 profile must bind ONLY to interface-name=usb0 (so it
+    coexists with wlan0) and use link-local addressing (no DHCP server
+    needed; mDNS resolves <sign-name>.local over the cable)."""
+    import configparser
+
+    conn = (
+        _STAGE_DIR
+        / "05-usb-gadget"
+        / "files"
+        / "etc"
+        / "NetworkManager"
+        / "system-connections"
+        / "usb0.nmconnection"
+    )
+    assert conn.exists(), f"missing baked NM profile at {conn}"
+    parser = configparser.ConfigParser(strict=False, interpolation=None)
+    parser.read_string(conn.read_text())
+    assert parser["connection"]["interface-name"] == "usb0", (
+        "usb0 profile must bind to interface-name=usb0 so it can't attach "
+        "to wlan0 / the AP interface"
+    )
+    assert parser["connection"]["type"] == "ethernet"
+    assert parser["ipv4"]["method"] == "link-local", (
+        "usb0 must use link-local IPv4 (169.254/16) — the minimal "
+        "zero-config address the tethered host self-assigns to match"
+    )

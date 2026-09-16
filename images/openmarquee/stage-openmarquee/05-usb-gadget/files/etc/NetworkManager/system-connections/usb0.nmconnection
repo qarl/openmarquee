@@ -1,0 +1,40 @@
+# /etc/NetworkManager/system-connections/usb0.nmconnection
+#
+# openMarquee USB-gadget networking 2026-09-16 (qarl dev device
+# "fireplacesign"). Brings up the CDC-ether gadget interface `usb0`
+# (created by the dwc2 + g_ether modules — see the 02-boot-config
+# substage) whenever the Pi is tethered to a host over the USB DATA
+# port, so it is reachable as <sign-name>.local over the cable with no
+# wifi or monitor. This is the wired recovery path the Pi Zero 2 W lacks
+# (it has no onboard ethernet).
+#
+# ipv4/ipv6 = link-local: both ends self-assign (169.254/16, fe80::/10),
+# no DHCP server needed. mDNS (avahi, advertising on usb0 — see
+# system/avahi/avahi-daemon.conf) makes <sign-name>.local resolve over
+# the link-local address, so `ssh openmarquee@fireplacesign.local` works.
+#
+# interface-name=usb0 binds this profile ONLY to the gadget interface, so
+# it coexists with the onboard wlan0 (SDIO) station-mode + AP profiles —
+# NetworkManager keeps them independent. Baked into the base pi-gen image
+# so USB recovery works even before the app install runs.
+#
+# NM ignores keyfiles that are group/world-readable; the 05-run.sh
+# substage installs this at 0600 root:root.
+[connection]
+id=usb0-gadget
+uuid=9049b2d6-3d7d-4f56-8b03-0a3224f02b1a
+type=ethernet
+interface-name=usb0
+autoconnect=true
+autoconnect-priority=10
+
+[ethernet]
+
+[ipv4]
+method=link-local
+
+[ipv6]
+method=link-local
+addr-gen-mode=default
+
+[proxy]

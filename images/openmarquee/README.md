@@ -94,6 +94,35 @@ Only after step 3 is the card a complete, self-provisioning openMarquee
 sign. (First boot extracts the bundle to `/opt/openmarquee` and runs
 `install.sh`.)
 
+### Reaching the sign over the USB cable (dwc2 gadget)
+
+The image bakes USB-gadget (ethernet-over-USB) networking so the Pi is
+reachable over the USB **data** port with no wifi or monitor — the wired
+recovery path the Pi Zero 2 W lacks (it has no onboard ethernet). Three
+pieces, all in this recipe:
+
+- `02-boot-config` adds `dtoverlay=dwc2` (config.txt) + `modules-load=dwc2,g_ether`
+  (cmdline.txt, right after `rootwait`) → the Pi presents a CDC-ether
+  gadget interface `usb0` to a tethered host.
+- `05-usb-gadget` bakes a NetworkManager profile that brings `usb0` up
+  with a **link-local** address (no DHCP; the host self-assigns to match).
+- `system/avahi/avahi-daemon.conf` advertises on `usb0` too, so mDNS
+  resolves `<sign-name>.local` over the cable.
+
+Plug the Pi's USB **data** port (not the PWR port) into a Mac/Linux host
+and, once the sign is named, `ssh openmarquee@<sign-name>.local` works
+over the cable (e.g. `fireplacesign.local`). This coexists with onboard
+wlan0 station mode + HDMI — `usb0` is a separate interface. dwc2 defaults
+to OTG, so the port still works as a USB host with an OTG adapter (e.g. a
+wifi dongle); `g_ether` only binds in peripheral role. On a sign built
+without a tether in mind this is inert: no host connected → no `usb0`
+carrier → avahi just advertises on wlan0.
+
+The boot-config patch behavior is unit-tested by
+`02-boot-config/test-boot-config.sh`; the wiring (02-run.sh calls the
+patches, the 05-usb-gadget profile is link-local + bound to usb0) is
+guarded by `backend/tests/test_pigen_config.py`.
+
 Phase B legs landed:
 - B.1: pi-gen config (this directory)
 - B.2: cloud-init user-data (cloud-init/)

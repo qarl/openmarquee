@@ -353,6 +353,117 @@ check "cma8: CR/LF input -> one line" "1" "$(wc -l < "$TMP/cma8.txt" | tr -d ' '
 grep -qw 'cma=320M' "$TMP/cma8.txt" && ok "cma8: cma=320M present" || bad "cma8: cma=320M missing"
 grep -q 'console=tty1 root=PARTUUID=q' "$TMP/cma8.txt" && ok "cma8: params re-joined" || bad "cma8: params not joined"
 
+# ── patch_config_txt_dwc2 (USB-gadget networking, 2026-09-16) ──────
+# Ensures dtoverlay=dwc2 is present. Additive (does NOT strip other
+# dtoverlay= lines). Idempotent.
+
+# Append when no dtoverlay=dwc2 present — and existing overlays kept.
+printf '[all]\ndtoverlay=vc4-kms-v3d\n' > "$TMP/dwc1.txt"
+patch_config_txt_dwc2 "$TMP/dwc1.txt" >/dev/null
+check "dwc1: dtoverlay=dwc2 present" "1" "$(grep -cE '^dtoverlay=dwc2$' "$TMP/dwc1.txt")"
+grep -q '^dtoverlay=vc4-kms-v3d$' "$TMP/dwc1.txt" && ok "dwc1: existing overlay preserved (additive)" || bad "dwc1: existing overlay lost"
+
+# Idempotent re-run does NOT double-append.
+patch_config_txt_dwc2 "$TMP/dwc1.txt" >/dev/null
+check "dwc1: no double dwc2 on re-run" "1" "$(grep -cE '^dtoverlay=dwc2$' "$TMP/dwc1.txt")"
+
+# Already present (bare) → true no-op, byte-for-byte unchanged.
+printf '[all]\ndtoverlay=dwc2\n' > "$TMP/dwc2.txt"
+md5_before="$(md5sum < "$TMP/dwc2.txt" 2>/dev/null || md5 < "$TMP/dwc2.txt" 2>/dev/null | awk '{print $NF}')"
+patch_config_txt_dwc2 "$TMP/dwc2.txt" >/dev/null
+md5_after="$(md5sum < "$TMP/dwc2.txt" 2>/dev/null || md5 < "$TMP/dwc2.txt" 2>/dev/null | awk '{print $NF}')"
+check "dwc2: true no-op when already bare-present" "$md5_before" "$md5_after"
+
+# Already present WITH params (dtoverlay=dwc2,dr_mode=host) → no-op,
+# does not append a second bare line.
+printf '[all]\ndtoverlay=dwc2,dr_mode=host\n' > "$TMP/dwc3.txt"
+patch_config_txt_dwc2 "$TMP/dwc3.txt" >/dev/null
+check "dwc3: param form recognized (no bare append)" "0" "$(grep -cE '^dtoverlay=dwc2$' "$TMP/dwc3.txt")"
+check "dwc3: exactly one dwc2 overlay line" "1" "$(grep -cE '^dtoverlay=dwc2' "$TMP/dwc3.txt")"
+
+# Commented-out dtoverlay=dwc2 MUST NOT count as present → append.
+printf '#dtoverlay=dwc2\n' > "$TMP/dwc4.txt"
+patch_config_txt_dwc2 "$TMP/dwc4.txt" >/dev/null
+grep -q '^#dtoverlay=dwc2$' "$TMP/dwc4.txt" && ok "dwc4: commented line preserved" || bad "dwc4: commented line lost"
+check "dwc4: uncommented dwc2 appended" "1" "$(grep -cE '^dtoverlay=dwc2$' "$TMP/dwc4.txt")"
+
+# Substring collision: dtoverlay=dwc2xyz MUST NOT count as present.
+printf '[all]\ndtoverlay=dwc2xyz\n' > "$TMP/dwc5.txt"
+patch_config_txt_dwc2 "$TMP/dwc5.txt" >/dev/null
+grep -q '^dtoverlay=dwc2xyz$' "$TMP/dwc5.txt" && ok "dwc5: dwc2xyz preserved" || bad "dwc5: dwc2xyz lost"
+check "dwc5: real dwc2 overlay appended" "1" "$(grep -cE '^dtoverlay=dwc2$' "$TMP/dwc5.txt")"
+
+# Append pins [all] scope even when a [pi4]-style header was last open.
+printf '[pi4]\nsome_pi4_only=1\n' > "$TMP/dwc6.txt"
+patch_config_txt_dwc2 "$TMP/dwc6.txt" >/dev/null
+last_section="$(awk '/^\[/{sec=$0} /^dtoverlay=dwc2$/{print sec; exit}' "$TMP/dwc6.txt")"
+check "dwc6: [all] scope pinned at dtoverlay=dwc2" "[all]" "$last_section"
+
+# ── patch_cmdline_txt_modules (USB-gadget networking, 2026-09-16) ──
+# Inserts modules-load=dwc2,g_ether immediately after rootwait, keeping
+# the single-line invariant. Idempotent.
+
+# Insert after rootwait, one line, ordering correct.
+printf 'console=tty1 root=PARTUUID=abc-02 rootwait\n' > "$TMP/m1.txt"
+patch_cmdline_txt_modules "$TMP/m1.txt" >/dev/null
+check "m1: one line" "1" "$(wc -l < "$TMP/m1.txt" | tr -d ' ')"
+grep -qw 'modules-load=dwc2,g_ether' "$TMP/m1.txt" && ok "m1: token present" || bad "m1: token missing"
+# The token must sit IMMEDIATELY after rootwait.
+check "m1: modules-load directly after rootwait" "1" \
+    "$(grep -c 'rootwait modules-load=dwc2,g_ether' "$TMP/m1.txt")"
+grep -qw 'root=PARTUUID=abc-02' "$TMP/m1.txt" && ok "m1: root= preserved" || bad "m1: root= lost"
+
+# Idempotency: re-run does not double-insert, still one line.
+patch_cmdline_txt_modules "$TMP/m1.txt" >/dev/null
+check "m1: no double token on re-run" "1" "$(grep -ow 'modules-load=dwc2,g_ether' "$TMP/m1.txt" | wc -l | tr -d ' ')"
+check "m1: still one line after re-run" "1" "$(wc -l < "$TMP/m1.txt" | tr -d ' ')"
+
+# rootwait in the MIDDLE with tokens after it → token inserted between
+# rootwait and the following tokens, nothing lost.
+printf 'console=tty1 rootwait quiet splash cma=320M\n' > "$TMP/m2.txt"
+patch_cmdline_txt_modules "$TMP/m2.txt" >/dev/null
+check "m2: inserted right after rootwait" "1" \
+    "$(grep -c 'rootwait modules-load=dwc2,g_ether quiet splash' "$TMP/m2.txt")"
+grep -qw 'cma=320M' "$TMP/m2.txt" && ok "m2: trailing cma preserved" || bad "m2: trailing cma lost"
+check "m2: one line" "1" "$(wc -l < "$TMP/m2.txt" | tr -d ' ')"
+
+# No rootwait present → appended at end (fallback), still one line, all
+# params preserved.
+printf 'console=tty1 root=PARTUUID=z\n' > "$TMP/m3.txt"
+patch_cmdline_txt_modules "$TMP/m3.txt" >/dev/null 2>&1
+check "m3: one line (no-rootwait fallback)" "1" "$(wc -l < "$TMP/m3.txt" | tr -d ' ')"
+grep -qw 'modules-load=dwc2,g_ether' "$TMP/m3.txt" && ok "m3: token appended at end" || bad "m3: token missing"
+grep -qw 'root=PARTUUID=z' "$TMP/m3.txt" && ok "m3: root= preserved" || bad "m3: root= lost"
+
+# Empty cmdline.txt is REFUSED (same safety as the other cmdline patches).
+: > "$TMP/m4.txt"
+if patch_cmdline_txt_modules "$TMP/m4.txt" >/dev/null 2>&1; then
+    bad "m4: empty cmdline.txt should be refused"
+else
+    ok "m4: empty cmdline.txt refused"
+fi
+
+# CR/LF input collapsed to one line + token inserted after rootwait.
+printf 'console=tty1\r\nrootwait\r\n' > "$TMP/m5.txt"
+patch_cmdline_txt_modules "$TMP/m5.txt" >/dev/null
+check "m5: CR/LF input -> one line" "1" "$(wc -l < "$TMP/m5.txt" | tr -d ' ')"
+check "m5: token after rootwait" "1" "$(grep -c 'rootwait modules-load=dwc2,g_ether' "$TMP/m5.txt")"
+
+# Full-chain ordering guard: the real 02-run.sh call order is
+# patch_cmdline_txt → strip cgroup → cma → modules. The modules token
+# must end up after rootwait AND the single-line invariant must hold
+# with cma=320M still at EOL.
+printf 'console=tty1 root=PARTUUID=w rootwait cgroup_disable=memory\n' > "$TMP/m6.txt"
+patch_cmdline_txt "$TMP/m6.txt" >/dev/null
+strip_cmdline_token "cgroup_disable=memory" "$TMP/m6.txt" >/dev/null
+patch_cmdline_txt_cma "$TMP/m6.txt" >/dev/null
+patch_cmdline_txt_modules "$TMP/m6.txt" >/dev/null
+check "m6: one line after full chain" "1" "$(wc -l < "$TMP/m6.txt" | tr -d ' ')"
+check "m6: modules-load directly after rootwait" "1" "$(grep -c 'rootwait modules-load=dwc2,g_ether' "$TMP/m6.txt")"
+grep -qw 'cma=320M' "$TMP/m6.txt" && ok "m6: cma=320M present" || bad "m6: cma=320M missing"
+grep -qw splash "$TMP/m6.txt" && ok "m6: splash present" || bad "m6: splash missing"
+check "m6: cgroup_disable stripped" "0" "$(grep -cw 'cgroup_disable=memory' "$TMP/m6.txt")"
+
 if [ "$fail" -eq 0 ]; then
     echo "ALL PASS"
 else

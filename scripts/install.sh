@@ -1291,12 +1291,25 @@ if [ -f "$BOOT_LIB" ]; then
             # boot file must not block a production update.
             patch_config_txt_audio "${boot_dir}/config.txt" \
                 || say "  WARNING: config.txt audio patch skipped (see above)"
+            # USB-gadget networking 2026-09-16: apply the dwc2 gadget
+            # boot config on the DEPLOY path too so a redeploy over a
+            # sign (e.g. fireplacesign) gains the USB tether / wired
+            # recovery path. Both idempotent (no-op when already set)
+            # and guarded so non-zero can't trip set -e on a production
+            # redeploy. Takes effect on next reboot. The usb0 address +
+            # avahi advertisement come from the pi-gen 05-usb-gadget
+            # substage + system/avahi (installed above).
+            patch_config_txt_dwc2 "${boot_dir}/config.txt" \
+                || say "  WARNING: config.txt dwc2 patch skipped (see above)"
+            patch_cmdline_txt_modules "${boot_dir}/cmdline.txt" \
+                || say "  WARNING: cmdline.txt modules-load patch skipped (see above)"
         else
             say "  DRYRUN: would patch config.txt (disable_splash=1) +"
             say "          cmdline.txt (quiet splash plymouth.ignore-serial-consoles)"
             say "          cmdline.txt strip (cgroup_disable=memory)"
             say "          config.txt gpu_mem=128 + cmdline.txt cma=320M"
             say "          config.txt audio (dtparam=audio=on)"
+            say "          config.txt dwc2 + cmdline.txt modules-load=dwc2,g_ether"
         fi
     fi
 else

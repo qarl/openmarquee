@@ -174,16 +174,17 @@ def test_dry_run_configures_avahi_mdns(dry_output: str, tmp_path_factory) -> Non
     assert service_file.exists(), f"missing {service_file}"
 
     # (c) avahi-daemon.conf pins host-name=openmarquee + allow-interfaces
-    #     =wlan0. Whitespace-tolerant checks so a future reformat
+    #     =wlan0,usb0. Whitespace-tolerant checks so a future reformat
     #     doesn't false-fail.
     conf_text = daemon_conf.read_text()
     assert "host-name=openmarquee" in conf_text, (
         "avahi-daemon.conf must set host-name=openmarquee so "
         "openmarquee.local resolves regardless of /etc/hostname"
     )
-    assert "allow-interfaces=wlan0" in conf_text, (
-        "avahi-daemon.conf must scope advertisements to wlan0 so "
-        "the AP interface ap0 isn't dual-advertised during SETUP"
+    assert "allow-interfaces=wlan0,usb0" in conf_text, (
+        "avahi-daemon.conf must advertise on wlan0 (STA/home) AND usb0 "
+        "(the USB-gadget interface) so <sign-name>.local resolves over "
+        "the USB cable too — while still excluding ap0 during SETUP"
     )
 
     # (d) openmarquee.service publishes _http._tcp on port 80. Check
