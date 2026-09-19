@@ -94,7 +94,7 @@ runcmd:
   # user is already in the group). install.sh also does this add
   # on the redeploy path — this line is the fresh-SD flash belt-
   # and-suspenders per QA's live-verified fix on 2026-07-01.
-  - usermod -aG audio openmarquee || echo "warn: usermod audio failed"
+  - [ sh, -c, 'usermod -aG audio openmarquee || echo "warn: usermod audio failed"' ]
   # Fail-loud guard (2026-07-09): this pi-gen image is a BASE image — it
   # bakes packages + boot-config + splash but NOT the app code. The code
   # is delivered by scripts/stage_sd_card.sh, which overlays the bundle
