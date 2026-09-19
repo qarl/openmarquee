@@ -104,3 +104,9 @@ ui/fonts/noto-color-emoji-colrv1.ttf
 # interrupted; they're ghost files (listable but not unlinkable). Ignore
 # so they don't pollute `git status`.
 *.partial
+
+# build-image.sh --ssh-key stages the operator's PUBLIC key here transiently
+# (into WORKDIR, which is /tmp) so 04-ssh-user bakes it into the image rootfs.
+# WORKDIR is normally off-tree, but ignore the name as defense-in-depth so a
+# mis-pointed WORKDIR can never commit a staged key file.
+operator-authorized-keys

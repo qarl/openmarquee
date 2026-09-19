@@ -125,6 +125,12 @@ def test_config_locale_is_utf8(config: dict[str, str]) -> None:
         ("iw", "ap0 virtual-interface creation"),
         ("cloud-init", "B.2 first-boot config; not in Pi OS Lite default"),
         (
+            "openssh-server",
+            "base-level sshd for tether-independent recovery (first-light "
+            "hardening 2026-09-19); Pi OS Lite ships it but we pin it so the "
+            "04-ssh-user enable + baked key never rest on a base-image assumption",
+        ),
+        (
             "wireless-tools",
             "Phase C: wifi_prefill.py shells out to iwgetid which lives "
             "in wireless-tools (NOT iw -- different package, modern vs legacy)",
@@ -389,4 +395,42 @@ def test_cloud_init_runner_installs_the_cfg() -> None:
     run = (_CLOUD_INIT / "06-run.sh").read_text()
     assert "/etc/cloud/cloud.cfg.d/99_openmarquee.cfg" in run, (
         "06-run.sh must install 99_openmarquee.cfg into /etc/cloud/cloud.cfg.d"
+    )
+
+
+# --- base-level ssh (first-light hardening 2026-09-19) ---
+#
+# A burned card must be reachable over ssh (home wifi or USB tether) EVEN IF
+# cloud-init never runs — it was the ONLY thing enabling ssh before. Three
+# pieces, all regression-guarded: (1) openssh-server pinned (package list
+# above), (2) 04-ssh-user enables ssh.service at build, (3) build-image.sh
+# --ssh-key bakes the operator key into the rootfs + 04-ssh-user installs it.
+
+_SSH_USER = _STAGE_DIR / "04-ssh-user"
+
+
+def test_ssh_service_enabled_at_base() -> None:
+    """04-run.sh must enable ssh.service in the chroot, so ssh works without
+    cloud-init (previously the only thing that enabled it)."""
+    run = (_SSH_USER / "04-run.sh").read_text()
+    assert "systemctl enable ssh.service" in run, (
+        "04-run.sh must enable ssh.service at base (tether-independent recovery)"
+    )
+
+
+def test_ssh_operator_key_baked_into_rootfs() -> None:
+    """04-run.sh must install the staged operator key into the rootfs
+    authorized_keys when present, and build-image.sh --ssh-key must stage it.
+    Without BOTH, base-enabled ssh has no key to authenticate and recovery is
+    dead if cloud-init hiccups."""
+    run = (_SSH_USER / "04-run.sh").read_text()
+    assert "operator-authorized-keys" in run, (
+        "04-run.sh must consume the staged operator-authorized-keys"
+    )
+    assert "/home/openmarquee/.ssh/authorized_keys" in run, (
+        "04-run.sh must install the key to /home/openmarquee/.ssh/authorized_keys"
+    )
+    build = (_REPO_ROOT / "scripts" / "build-image.sh").read_text()
+    assert "operator-authorized-keys" in build, (
+        "build-image.sh --ssh-key must stage operator-authorized-keys for 04-ssh-user"
     )

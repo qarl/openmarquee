@@ -19,6 +19,7 @@ qrencode
 git
 rsync
 ca-certificates
+openssh-server
 cloud-init
 wireless-regdb
 iw

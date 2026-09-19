@@ -268,9 +268,29 @@ PY
     fi
 else
     say "  no --ssh-key; copying user-data WITHOUT substitution (cloud-init will fail SSH attach)"
-    say "  rerun with --ssh-key ~/.ssh/id_ed25519.pub to fix"
+    say "  NOTE: ssh.service is enabled at base, but with NO baked authorized_keys"
+    say "  and password auth off, this image is SSH-UNREACHABLE. Pass --ssh-key to fix."
+    say "  rerun with --ssh-key ~/.ssh/id_ed25519.pub"
     run cp "${IMAGE_RECIPE_DIR}/cloud-init/user-data" "$CLOUD_INIT_USER_DATA"
 fi
+
+# First-light hardening 2026-09-19: ALSO bake the operator key into the image
+# rootfs (not only cloud-init). Drop it where the 04-ssh-user substage looks
+# (files/operator-authorized-keys); 04-run.sh installs it to
+# /home/openmarquee/.ssh/authorized_keys + enables ssh.service, so ssh-over-
+# wifi / wired recovery works EVEN IF cloud-init hiccups. WORKDIR's
+# stage-openmarquee is re-copied fresh from the repo each run (section 3), so
+# this staged key never persists across runs and is never committed.
+OPERATOR_KEYS_DEST="${WORKDIR}/stage-openmarquee/04-ssh-user/files/operator-authorized-keys"
+if [ -n "$SSH_KEY_PATH" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'DRYRUN: install %s -> %s (baked rootfs authorized_keys)\n' \
+               "$SSH_KEY_PATH" "$OPERATOR_KEYS_DEST"
+    else
+        install -m 0644 "$SSH_KEY_PATH" "$OPERATOR_KEYS_DEST"
+    fi
+fi
+
 run cp "${IMAGE_RECIPE_DIR}/cloud-init/meta-data" \
        "${WORKDIR}/stage-openmarquee/cloud-init/meta-data"
 
