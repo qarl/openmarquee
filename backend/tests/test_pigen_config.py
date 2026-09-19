@@ -261,6 +261,13 @@ def test_boot_config_lib_defines_dwc2_functions() -> None:
     assert "patch_cmdline_txt_modules()" in lib, "patch_cmdline_txt_modules not defined"
     assert "dtoverlay=dwc2" in lib, "dwc2 overlay literal missing from lib"
     assert "modules-load=dwc2,g_ether" in lib, "g_ether module literal missing from lib"
+    # First-light fix 2026-09-19: the gadget MUST be dr_mode=peripheral, not
+    # a bare dwc2 (defaults to otg) and not the stock [cm4] dr_mode=host. The
+    # old presence-only patch shipped no [all] peripheral line at all.
+    assert "dr_mode=peripheral" in lib, (
+        "patch_config_txt_dwc2 must enforce dr_mode=peripheral (first-light fix) — "
+        "a bare dwc2 defaults to otg and the Zero 2 W won't enumerate the gadget"
+    )
 
 
 def test_boot_config_runner_invokes_dwc2() -> None:
@@ -313,4 +320,69 @@ def test_usb0_nmconnection_is_linklocal_and_bound() -> None:
     assert parser["ipv4"]["method"] == "link-local", (
         "usb0 must use link-local IPv4 (169.254/16) — the minimal "
         "zero-config address the tethered host self-assigns to match"
+    )
+
+
+# --- cloud-init enablement + NoCloud seed (first-light fix, 2026-09-19) ---
+#
+# First burned card: cloud-init was apt-installed but never RAN — empty
+# /var/log/cloud-init.log, stock `raspberrypi` hostname, no bundle extract,
+# black screen. Root cause was two gaps, both now owned by the 06-cloud-init
+# substage. As with the dwc2 tests above, these are static wiring guards (a
+# built-image loop-mount is out of scope for a unit test; admin's live
+# serial-console run is the behavioral gate). A patch that exists but is
+# never wired ships nothing.
+
+_CLOUD_INIT = _STAGE_DIR / "06-cloud-init"
+
+
+def test_cloud_init_substage_enables_units() -> None:
+    """06-run.sh must ENABLE the cloud-init systemd units (the gap that
+    caused first-light: installed-but-never-enabled → nothing in
+    multi-user.target.wants) and clear any disable marker. The unit set was
+    renamed across cloud-init versions (trixie ships 24.x), so both the
+    classic and renamed names must be covered by the tolerant enable loop."""
+    run = (_CLOUD_INIT / "06-run.sh").read_text()
+    assert "systemctl enable" in run, "06-run.sh must enable cloud-init units"
+    for unit in (
+        "cloud-init-local.service",
+        "cloud-init.service",
+        "cloud-init-network.service",  # 24.x rename
+        "cloud-config.service",
+        "cloud-final.service",
+    ):
+        assert unit in run, f"06-run.sh must handle the cloud-init unit {unit}"
+    assert "rm -f /etc/cloud/cloud-init.disabled" in run, (
+        "06-run.sh must remove any /etc/cloud/cloud-init.disabled marker"
+    )
+    # Fail-loud if the package somehow isn't present, rather than baking a
+    # silently-non-provisioning image again.
+    assert "no cloud-init units found" in run, (
+        "06-run.sh must fail the build loudly if no cloud-init units exist"
+    )
+
+
+def test_cloud_init_nocloud_cfg_seeds_from_boot_partition() -> None:
+    """The cloud.cfg.d drop-in must force the NoCloud datasource and seed it
+    from the FAT boot partition (bootfs = /boot/firmware on trixie) — Debian
+    cloud-init does NOT auto-seed from there like Ubuntu's Pi images, so the
+    staged user-data/meta-data on the boot partition would never be read.
+    The trailing slash is load-bearing (cloud-init appends user-data etc.)."""
+    cfg = _CLOUD_INIT / "files" / "etc" / "cloud" / "cloud.cfg.d" / "99_openmarquee.cfg"
+    assert cfg.exists(), f"missing NoCloud drop-in at {cfg}"
+    text = cfg.read_text()
+    assert re.search(r"^datasource_list:\s*\[\s*NoCloud\s*\]", text, re.M), (
+        "cfg must force datasource_list: [ NoCloud ]"
+    )
+    assert re.search(r"^\s*seedfrom:\s*file:///boot/firmware/\s*$", text, re.M), (
+        "cfg must seed NoCloud from file:///boot/firmware/ (trailing slash required)"
+    )
+
+
+def test_cloud_init_runner_installs_the_cfg() -> None:
+    """06-run.sh must actually INSTALL the drop-in into the rootfs — a cfg
+    file that ships in the substage but is never copied does nothing."""
+    run = (_CLOUD_INIT / "06-run.sh").read_text()
+    assert "/etc/cloud/cloud.cfg.d/99_openmarquee.cfg" in run, (
+        "06-run.sh must install 99_openmarquee.cfg into /etc/cloud/cloud.cfg.d"
     )

@@ -319,7 +319,8 @@ patch_cmdline_txt_cma() {
     echo "cmdline.txt: set cma=320M (stripped any prior cma= + appended)"
 }
 
-# Ensure `dtoverlay=dwc2` is set in a Pi config.txt, IN PLACE. Idempotent.
+# Ensure `dtoverlay=dwc2,dr_mode=peripheral` is set in [all] scope in a Pi
+# config.txt, IN PLACE. Idempotent. SECTION-AWARE.
 #
 # USB-gadget networking 2026-09-16 (qarl dev device "fireplacesign"):
 # load the dwc2 USB controller so the Pi can present a CDC-ether gadget
@@ -327,38 +328,77 @@ patch_cmdline_txt_cma() {
 # `modules-load=dwc2,g_ether` in cmdline.txt (patch_cmdline_txt_modules).
 # Gives qarl `ssh openmarquee@fireplacesign.local` over the cable with no
 # wifi/monitor, and is the wired recovery path the Pi Zero 2 W lacks (no
-# onboard ethernet). dwc2 defaults to OTG/`dr_mode=otg`, so the port still
-# works as a USB HOST with an OTG adapter (e.g. a wifi dongle) — g_ether
-# only binds when the ID pin selects PERIPHERAL role, so this coexists
-# with both onboard wlan0 (SDIO, unaffected) and USB-host use.
+# onboard ethernet). Coexists with onboard wlan0 (SDIO, unaffected).
 #
-# dtoverlay is ADDITIVE (multiple overlays coexist — vc4-kms-v3d, dwc2,
-# …), so — unlike gpu_mem — we do NOT strip other dtoverlay= lines; we
-# only ensure a dwc2 one is present.
-# Behavior:
-#   - an uncommented `dtoverlay=dwc2` line (bare, or with trailing
-#     params like `dtoverlay=dwc2,dr_mode=host`) already present → no-op
-#   - otherwise → APPEND a fresh `[all]` / `dtoverlay=dwc2` block at EOF
-# Explicit `[all]` header pins scope across all model variants regardless
-# of which `[section]` selector was last opened at EOF (same rationale as
-# patch_config_txt_gpu_mem).
+# FIRST-LIGHT FIX 2026-09-19: we MUST enforce dr_mode=peripheral — not just
+# dwc2 PRESENCE. Two traps this closes:
+#   (1) Stock Trixie config.txt ships `[cm4]` and `[cm5]` sections carrying
+#       `dtoverlay=dwc2,dr_mode=host` (Compute-Module host-port config).
+#       The old presence-only check greps the WHOLE file, matched those
+#       section-scoped lines, and NO-OP'd — so the `[all]` block the Pi
+#       Zero 2 W needs was never appended. Those `[cm*]` lines are inert on
+#       a Zero 2 W AND carry the wrong dr_mode, so they must NOT satisfy
+#       our requirement. We PRESERVE them (legit CM config) but do not let
+#       them fool us.
+#   (2) A bare `dtoverlay=dwc2` defaults to dr_mode=otg; the Zero 2 W data
+#       port does not reliably ID-detect the peripheral role, so the gadget
+#       may not enumerate. dr_mode=peripheral forces it.
+# Behavior: no-op only when exactly one NON-`[cm*]`-scoped dwc2 overlay
+# exists and it sets dr_mode=peripheral. Otherwise: STRIP any non-CM-scoped
+# dwc2 overlay lines (leaving `[cm4]`/`[cm5]` untouched) and APPEND a fresh
+# `[all]` / `dtoverlay=dwc2,dr_mode=peripheral` block. dtoverlay is additive
+# and a later `[all]` entry applies to every model, so this takes effect for
+# the Zero 2 W regardless of the section-scoped CM lines above. Explicit
+# `[all]` header pins scope (same rationale as patch_config_txt_gpu_mem).
 patch_config_txt_dwc2() {
     local file="$1"
     if [ ! -f "$file" ]; then
         echo "patch_config_txt_dwc2: $file not found" >&2
         return 1
     fi
-    # Uncommented dtoverlay=dwc2, either bare-at-EOL or followed by a
-    # `,param` list. The `(,|[[:space:]]*$)` tail stops `dtoverlay=dwc2x`
-    # from matching; the leading `^[[:space:]]*` with no `#` excludes a
-    # commented `#dtoverlay=dwc2`.
-    if grep -qE '^[[:space:]]*dtoverlay[[:space:]]*=[[:space:]]*dwc2([[:space:]]*$|,)' "$file"; then
-        echo "config.txt: dtoverlay=dwc2 already set — no-op"
+    # Section-aware scan: count uncommented dwc2 overlay lines that are NOT
+    # under a `[cm...]` selector, split by whether they set dr_mode=peripheral.
+    # (awk tracks the currently-open [section]; a `[cm4]`/`[cm5]` dwc2,host
+    # line is ignored here so it can't satisfy — or block — our requirement.)
+    local state periph other
+    state="$(awk '
+        BEGIN { sec=""; peripheral=0; other=0 }
+        /^[[:space:]]*\[/ { sec=$0; next }
+        /^[[:space:]]*#/  { next }
+        /^[[:space:]]*dtoverlay[[:space:]]*=[[:space:]]*dwc2([[:space:]]*$|,)/ {
+            if (sec !~ /^[[:space:]]*\[cm[0-9]/) {
+                if ($0 ~ /dr_mode[[:space:]]*=[[:space:]]*peripheral/) peripheral++
+                else other++
+            }
+        }
+        END { print peripheral" "other }
+    ' "$file")"
+    periph="${state% *}"; other="${state#* }"
+    if [ "$periph" = "1" ] && [ "$other" = "0" ]; then
+        echo "config.txt: [all] dtoverlay=dwc2,dr_mode=peripheral already set — no-op"
         return 0
     fi
-    printf '\n# openMarquee USB-gadget networking 2026-09-16: load the dwc2\n# USB controller so the Pi presents a CDC-ether gadget (usb0) to a\n# host tethered over the USB data port. Paired with\n# `modules-load=dwc2,g_ether` in cmdline.txt. Explicit [all] header\n# pins scope across all model variants.\n[all]\ndtoverlay=dwc2\n' \
+    # Strip non-CM-scoped dwc2 overlay lines (preserve [cm4]/[cm5]); then
+    # append the [all] peripheral block. Same-dir mktemp for an intra-fs
+    # atomic mv on boot partitions that span filesystems from /tmp.
+    local tmp
+    tmp="$(mktemp "${file}.dwc2.XXXXXX")"
+    awk '
+        BEGIN { sec="" }
+        /^[[:space:]]*\[/ { sec=$0; print; next }
+        /^[[:space:]]*#/  { print; next }
+        {
+            if ($0 ~ /^[[:space:]]*dtoverlay[[:space:]]*=[[:space:]]*dwc2([[:space:]]*$|,)/ &&
+                sec !~ /^[[:space:]]*\[cm[0-9]/) {
+                next   # drop non-CM dwc2 overlay line
+            }
+            print
+        }
+    ' "$file" > "$tmp"
+    mv "$tmp" "$file"
+    printf '\n# openMarquee USB-gadget networking 2026-09-16 (first-light fix\n# 2026-09-19): CDC-ether gadget (usb0) over the USB data port. dr_mode=\n# peripheral is REQUIRED — a bare dwc2 defaults to otg and the Zero 2 W\n# port does not reliably ID-detect peripheral role; the stock\n# [cm4]/[cm5] dtoverlay=dwc2,dr_mode=host lines are Compute-Module-scoped\n# + wrong for us (preserved above; this [all] line is what applies to the\n# Zero 2 W). Paired with modules-load=dwc2,g_ether in cmdline.txt.\n[all]\ndtoverlay=dwc2,dr_mode=peripheral\n' \
         >> "$file"
-    echo "config.txt: appended [all]/dtoverlay=dwc2"
+    echo "config.txt: set [all]/dtoverlay=dwc2,dr_mode=peripheral (preserved any [cm*] lines)"
 }
 
 # Insert `modules-load=dwc2,g_ether` into a Pi cmdline.txt IMMEDIATELY

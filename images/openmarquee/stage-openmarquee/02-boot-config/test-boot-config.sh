@@ -353,51 +353,96 @@ check "cma8: CR/LF input -> one line" "1" "$(wc -l < "$TMP/cma8.txt" | tr -d ' '
 grep -qw 'cma=320M' "$TMP/cma8.txt" && ok "cma8: cma=320M present" || bad "cma8: cma=320M missing"
 grep -q 'console=tty1 root=PARTUUID=q' "$TMP/cma8.txt" && ok "cma8: params re-joined" || bad "cma8: params not joined"
 
-# ── patch_config_txt_dwc2 (USB-gadget networking, 2026-09-16) ──────
-# Ensures dtoverlay=dwc2 is present. Additive (does NOT strip other
-# dtoverlay= lines). Idempotent.
+# ── patch_config_txt_dwc2 (USB-gadget networking, 2026-09-16;
+#     first-light dr_mode fix 2026-09-19) ─────────────────────────────
+# Enforces exactly one [all]-scoped dtoverlay=dwc2,dr_mode=peripheral.
+# SECTION-AWARE: preserves — and is NOT fooled by — [cm4]/[cm5] dwc2 lines.
 
-# Append when no dtoverlay=dwc2 present — and existing overlays kept.
+# Helper: count uncommented non-[cm*] dwc2 overlay lines whose params
+# include dr_mode=peripheral (the state the fix must converge on).
+periph_count() { awk '
+    /^[[:space:]]*\[/ { sec=$0; next }
+    /^[[:space:]]*#/  { next }
+    /^[[:space:]]*dtoverlay[[:space:]]*=[[:space:]]*dwc2([[:space:]]*$|,)/ {
+        if (sec !~ /^[[:space:]]*\[cm[0-9]/ && $0 ~ /dr_mode=peripheral/) n++
+    }
+    END { print n+0 }
+' "$1"; }
+# Helper: count ALL uncommented non-[cm*] dwc2 overlay lines (any params).
+noncm_dwc2_count() { awk '
+    /^[[:space:]]*\[/ { sec=$0; next }
+    /^[[:space:]]*#/  { next }
+    /^[[:space:]]*dtoverlay[[:space:]]*=[[:space:]]*dwc2([[:space:]]*$|,)/ {
+        if (sec !~ /^[[:space:]]*\[cm[0-9]/) n++
+    }
+    END { print n+0 }
+' "$1"; }
+
+# Append peripheral when no dwc2 present — existing overlays kept.
 printf '[all]\ndtoverlay=vc4-kms-v3d\n' > "$TMP/dwc1.txt"
 patch_config_txt_dwc2 "$TMP/dwc1.txt" >/dev/null
-check "dwc1: dtoverlay=dwc2 present" "1" "$(grep -cE '^dtoverlay=dwc2$' "$TMP/dwc1.txt")"
+check "dwc1: dr_mode=peripheral present" "1" "$(periph_count "$TMP/dwc1.txt")"
+check "dwc1: exactly one [all] dwc2 overlay" "1" "$(noncm_dwc2_count "$TMP/dwc1.txt")"
 grep -q '^dtoverlay=vc4-kms-v3d$' "$TMP/dwc1.txt" && ok "dwc1: existing overlay preserved (additive)" || bad "dwc1: existing overlay lost"
 
 # Idempotent re-run does NOT double-append.
 patch_config_txt_dwc2 "$TMP/dwc1.txt" >/dev/null
-check "dwc1: no double dwc2 on re-run" "1" "$(grep -cE '^dtoverlay=dwc2$' "$TMP/dwc1.txt")"
+check "dwc1: no double dwc2 on re-run" "1" "$(noncm_dwc2_count "$TMP/dwc1.txt")"
+check "dwc1: still exactly one peripheral on re-run" "1" "$(periph_count "$TMP/dwc1.txt")"
 
-# Already present (bare) → true no-op, byte-for-byte unchanged.
-printf '[all]\ndtoverlay=dwc2\n' > "$TMP/dwc2.txt"
+# Already correct ([all] peripheral) → true no-op, byte-for-byte unchanged.
+printf '[all]\ndtoverlay=dwc2,dr_mode=peripheral\n' > "$TMP/dwc2.txt"
 md5_before="$(md5sum < "$TMP/dwc2.txt" 2>/dev/null || md5 < "$TMP/dwc2.txt" 2>/dev/null | awk '{print $NF}')"
 patch_config_txt_dwc2 "$TMP/dwc2.txt" >/dev/null
 md5_after="$(md5sum < "$TMP/dwc2.txt" 2>/dev/null || md5 < "$TMP/dwc2.txt" 2>/dev/null | awk '{print $NF}')"
-check "dwc2: true no-op when already bare-present" "$md5_before" "$md5_after"
+check "dwc2: true no-op when already [all]-peripheral" "$md5_before" "$md5_after"
 
-# Already present WITH params (dtoverlay=dwc2,dr_mode=host) → no-op,
-# does not append a second bare line.
+# A bare [all] dtoverlay=dwc2 (otg default) → REPLACED with peripheral.
+printf '[all]\ndtoverlay=dwc2\n' > "$TMP/dwc2b.txt"
+patch_config_txt_dwc2 "$TMP/dwc2b.txt" >/dev/null
+check "dwc2b: bare [all] dwc2 upgraded to peripheral" "1" "$(periph_count "$TMP/dwc2b.txt")"
+check "dwc2b: exactly one [all] dwc2 (bare stripped)" "1" "$(noncm_dwc2_count "$TMP/dwc2b.txt")"
+
+# THE first-light bug (in-[all] variant): dtoverlay=dwc2,dr_mode=host must
+# be CORRECTED to peripheral (host is wrong for the gadget), not no-op'd.
 printf '[all]\ndtoverlay=dwc2,dr_mode=host\n' > "$TMP/dwc3.txt"
 patch_config_txt_dwc2 "$TMP/dwc3.txt" >/dev/null
-check "dwc3: param form recognized (no bare append)" "0" "$(grep -cE '^dtoverlay=dwc2$' "$TMP/dwc3.txt")"
-check "dwc3: exactly one dwc2 overlay line" "1" "$(grep -cE '^dtoverlay=dwc2' "$TMP/dwc3.txt")"
+check "dwc3: [all] host corrected to peripheral" "1" "$(periph_count "$TMP/dwc3.txt")"
+check "dwc3: exactly one [all] dwc2 line" "1" "$(noncm_dwc2_count "$TMP/dwc3.txt")"
+# Match a real uncommented overlay LINE (not the explanatory comment the
+# fn appends, which mentions the [cm*] dr_mode=host lines).
+grep -qE '^[[:space:]]*dtoverlay[[:space:]]*=[[:space:]]*dwc2,dr_mode=host' "$TMP/dwc3.txt" && bad "dwc3: stale [all] dr_mode=host left behind" || ok "dwc3: [all] host line removed"
 
-# Commented-out dtoverlay=dwc2 MUST NOT count as present → append.
+# THE real-image case (first-light root cause): stock [cm4]/[cm5]
+# dtoverlay=dwc2,dr_mode=host (Compute-Module scoped) must be PRESERVED and
+# must NOT fool the fn into a no-op — an [all] peripheral block still gets
+# appended for the Pi Zero 2 W.
+printf '[cm4]\ndtoverlay=dwc2,dr_mode=host\n[cm5]\ndtoverlay=dwc2,dr_mode=host\n[all]\ndtoverlay=vc4-kms-v3d\n' > "$TMP/dwc3b.txt"
+patch_config_txt_dwc2 "$TMP/dwc3b.txt" >/dev/null
+check "dwc3b: both [cm*] host lines preserved" "2" "$(grep -cE '^dtoverlay=dwc2,dr_mode=host$' "$TMP/dwc3b.txt")"
+check "dwc3b: [all] peripheral appended (not fooled by [cm*])" "1" "$(periph_count "$TMP/dwc3b.txt")"
+check "dwc3b: exactly one non-CM dwc2 line" "1" "$(noncm_dwc2_count "$TMP/dwc3b.txt")"
+# Section-aware: the peripheral line lands under [all], not a [cm*] header.
+periph_section="$(awk '/^\[/{sec=$0} /dtoverlay=dwc2,dr_mode=peripheral/{print sec; exit}' "$TMP/dwc3b.txt")"
+check "dwc3b: peripheral pinned to [all] scope" "[all]" "$periph_section"
+
+# Commented-out dtoverlay=dwc2 MUST NOT count as present → append peripheral.
 printf '#dtoverlay=dwc2\n' > "$TMP/dwc4.txt"
 patch_config_txt_dwc2 "$TMP/dwc4.txt" >/dev/null
 grep -q '^#dtoverlay=dwc2$' "$TMP/dwc4.txt" && ok "dwc4: commented line preserved" || bad "dwc4: commented line lost"
-check "dwc4: uncommented dwc2 appended" "1" "$(grep -cE '^dtoverlay=dwc2$' "$TMP/dwc4.txt")"
+check "dwc4: uncommented peripheral appended" "1" "$(periph_count "$TMP/dwc4.txt")"
 
 # Substring collision: dtoverlay=dwc2xyz MUST NOT count as present.
 printf '[all]\ndtoverlay=dwc2xyz\n' > "$TMP/dwc5.txt"
 patch_config_txt_dwc2 "$TMP/dwc5.txt" >/dev/null
 grep -q '^dtoverlay=dwc2xyz$' "$TMP/dwc5.txt" && ok "dwc5: dwc2xyz preserved" || bad "dwc5: dwc2xyz lost"
-check "dwc5: real dwc2 overlay appended" "1" "$(grep -cE '^dtoverlay=dwc2$' "$TMP/dwc5.txt")"
+check "dwc5: real dwc2 peripheral appended" "1" "$(periph_count "$TMP/dwc5.txt")"
 
 # Append pins [all] scope even when a [pi4]-style header was last open.
 printf '[pi4]\nsome_pi4_only=1\n' > "$TMP/dwc6.txt"
 patch_config_txt_dwc2 "$TMP/dwc6.txt" >/dev/null
-last_section="$(awk '/^\[/{sec=$0} /^dtoverlay=dwc2$/{print sec; exit}' "$TMP/dwc6.txt")"
-check "dwc6: [all] scope pinned at dtoverlay=dwc2" "[all]" "$last_section"
+last_section="$(awk '/^\[/{sec=$0} /dtoverlay=dwc2,dr_mode=peripheral/{print sec; exit}' "$TMP/dwc6.txt")"
+check "dwc6: [all] scope pinned at peripheral line" "[all]" "$last_section"
 
 # ── patch_cmdline_txt_modules (USB-gadget networking, 2026-09-16) ──
 # Inserts modules-load=dwc2,g_ether immediately after rootwait, keeping
