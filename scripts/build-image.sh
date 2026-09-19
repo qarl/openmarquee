@@ -220,6 +220,15 @@ say "Stage stage-openmarquee/ -> ${WORKDIR}/stage-openmarquee/"
 run rm -rf "${WORKDIR}/stage-openmarquee"
 run cp -r "${IMAGE_RECIPE_DIR}/stage-openmarquee" "${WORKDIR}/stage-openmarquee"
 
+# Strip AppleDouble ._* sidecars from the copied tree. The ~/project source
+# lives on the Mountain Duck SFTP mount, which regenerates a ._<name> xattr
+# sidecar for every file; the `cp -r` above drags them into WORKDIR. pi-gen
+# enumerates substage scripts by glob, and a stray EXECUTABLE ._NN-run.sh
+# could be picked up as a substage runner (or a ._file could land in the
+# image rootfs via a substage's files/). WORKDIR is on /tmp (local, not the
+# mount), so a clean strip here stays clean for the rest of the build.
+run find "${WORKDIR}/stage-openmarquee" -name '._*' -delete
+
 # --- 4. Skip desktop stages (3, 4, 5) ---------------------------------------
 
 say "Skip stages 3/4/5 (X11 / LXDE / Recommended)"

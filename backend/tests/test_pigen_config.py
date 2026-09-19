@@ -355,6 +355,10 @@ def test_cloud_init_substage_enables_units() -> None:
     assert "rm -f /etc/cloud/cloud-init.disabled" in run, (
         "06-run.sh must remove any /etc/cloud/cloud-init.disabled marker"
     )
+    assert "cloud-init.target" in run, (
+        "06-run.sh must also enable cloud-init.target (the belt that pulls the "
+        "stage services into multi-user boot)"
+    )
     # Fail-loud if the package somehow isn't present, rather than baking a
     # silently-non-provisioning image again.
     assert "no cloud-init units found" in run, (

@@ -31,6 +31,9 @@ for unit in cloud-init-local.service cloud-init.service \
     has "06-run.sh references unit ${unit}" "$RUN" "${unit}"
 done
 has "06-run.sh calls systemctl enable" "$RUN" 'systemctl enable'
+# The cloud-init.target belt — enabling it pulls the stage services into the
+# multi-user boot even if a service's own [Install] section is unusual.
+has "06-run.sh also enables cloud-init.target" "$RUN" 'systemctl enable cloud-init.target'
 has "06-run.sh removes /etc/cloud/cloud-init.disabled" \
     "$RUN" 'rm -f /etc/cloud/cloud-init\.disabled'
 has "06-run.sh fails loud if no cloud-init units found" \
