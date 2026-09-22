@@ -48,12 +48,17 @@ strip_cmdline_token "cgroup_disable=memory" "${boot_dir}/cmdline.txt"
 # vchiq ETIME on component create, reloc heap starved at
 # ~17M/44M idle. gpu_mem=128 restores enough reloc heap.
 #
-# Handover reconcile 2026-07-09 (GAP2): cma=320M — the validated
-# live-sign value (was 256M on the earlier pi-gen path). Relative
-# to the 384M old default: cma shrinks 64M (frees 64M to ARM) and
-# gpu_mem grows 64M (takes it back), so ARM-side is net unchanged,
-# within budget on a 512MB Zero 2 W. See patch_cmdline_txt_cma in
-# boot-config-lib.sh for the value + idempotency contract.
+# cma=256M (FIRST-LIGHT FIX 2026-09-21). The 2026-07-09 GAP2 bump to
+# cma=320M ("validated live-sign value") bricked a fresh arm64/trixie
+# COLD boot on a 512MB Zero 2 W — it had only ever been validated on a
+# sign that already booted with a smaller CMA, never cold from a pi-gen
+# image. Math on 512MB: gpu_mem=128 -> 384MB ARM; cma=256M -> ~128MB
+# normal (non-CMA) RAM = SAFE. cma=320M -> ~64MB normal = OOM-brick
+# before the framebuffer console (blank HDMI, zero kernel output, solid
+# ACT LED; reproduced on 2 cards, proven config-only by a byte-identical
+# kernel8.img diff vs stock). Do NOT re-bump above 256M without a real
+# cold-boot test. See patch_cmdline_txt_cma in boot-config-lib.sh + the
+# writeup in code/docs/first-light-rootcause-cma-2026-09-21.md.
 patch_config_txt_gpu_mem  "${boot_dir}/config.txt"
 patch_cmdline_txt_cma     "${boot_dir}/cmdline.txt"
 # HDMI audio 2026-07-01 (qarl decision, locked): the vc4hdmi ALSA

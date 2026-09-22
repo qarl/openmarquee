@@ -204,7 +204,7 @@ def test_all_substage_run_scripts_are_git_executable() -> None:
     """EVERY pi-gen substage *-run.sh must be tracked in git as mode
     100755. pi-gen (build.sh) SILENTLY skips run scripts without the
     exec bit, so a 100644 script no-ops its whole substage on a clean
-    checkout — e.g. 02-run.sh bakes cma=320M / gpu_mem=128, so a
+    checkout — e.g. 02-run.sh bakes cma=256M / gpu_mem=128, so a
     non-exec 02-run.sh ships an image with the wrong memory split + no
     splash, with NO build error.
 

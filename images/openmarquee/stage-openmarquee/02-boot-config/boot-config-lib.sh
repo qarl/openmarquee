@@ -125,14 +125,12 @@ strip_cmdline_token() {
 # idle). gpu_mem=128 restores enough firmware reloc heap for the
 # decoder to allocate (paired patch_cmdline_txt_cma below).
 #
-# Handover reconcile 2026-07-09 (GAP2): cma pinned at 320M — the
-# validated LIVE-sign value (supersedes the earlier 256M pi-gen
-# guess). CMA pool drops from 384M (old default) to 320M, freeing
-# 64M back to ARM; gpu_mem grows 64M (64->128) and takes it back,
-# so ARM headroom net is unchanged vs the old split — within
-# budget on a 512MB Zero 2 W. 320M is also less aggressive than
-# the old 384M pool, which starved kernel+userspace+tailscale
-# (see the cma-aggressive-on-pi-zero-2w note).
+# cma is 256M (see patch_cmdline_txt_cma). FIRST-LIGHT FIX
+# 2026-09-21: the 2026-07-09 GAP2 bump to 320M "validated live-sign"
+# value bricked a fresh arm64/trixie COLD boot on a 512MB Zero 2 W
+# (gpu_mem=128 + cma=320M -> ~64MB normal RAM -> early-mem OOM before
+# fbcon). Reverted to 256M -> ~128MB normal RAM = safe. gpu_mem=128
+# is unchanged (needed for the ril.video_decode reloc heap).
 #
 # Behavior:
 #   - exactly ONE `gpu_mem=128` line (uncommented) present →
@@ -195,7 +193,7 @@ patch_config_txt_gpu_mem() {
     # Append fresh [all]/gpu_mem=128 block at EOF — explicit
     # section header pins scope regardless of any prior
     # section selectors above.
-    printf '\n# openMarquee r110 c3.3.2-followup (2026-06-11): bump GPU\n# memory split so the ril.video_decode component can allocate\n# (paired with cma=320M in cmdline.txt).\n# Explicit [all] header pins scope across all model variants.\n[all]\ngpu_mem=128\n' \
+    printf '\n# openMarquee r110 c3.3.2-followup (2026-06-11): bump GPU\n# memory split so the ril.video_decode component can allocate\n# (paired with cma=256M in cmdline.txt; see first-light fix 2026-09-21).\n# Explicit [all] header pins scope across all model variants.\n[all]\ngpu_mem=128\n' \
         >> "$file"
     if [ "$count" -gt "0" ]; then
         echo "config.txt: stripped $count existing gpu_mem= line(s) + appended [all]/gpu_mem=128"
@@ -243,7 +241,7 @@ patch_config_txt_audio() {
     echo "config.txt: appended [all]/dtparam=audio=on"
 }
 
-# Set `cma=320M` in a Pi cmdline.txt, IN PLACE. Idempotent.
+# Set `cma=256M` in a Pi cmdline.txt, IN PLACE. Idempotent.
 #
 # r110 c3.3.2-followup (2026-06-11): paired with
 # patch_config_txt_gpu_mem above. Shrinks the CMA pool from the
@@ -251,11 +249,20 @@ patch_config_txt_audio() {
 # heap bump — together the split frees the firmware reloc heap
 # enough for MMAL video-decode component creation.
 #
-# Handover reconcile 2026-07-09 (GAP2): the value is 320M — the
-# VALIDATED live-sign setting (was 256M on the earlier pi-gen
-# path). 320M is the reconciled pool size the running sign uses;
-# the SD build must match so a fresh burn isn't a different
-# memory split from the deployed system.
+# FIRST-LIGHT FIX 2026-09-21: value REVERTED to 256M. The 320M
+# "validated live-sign" value (Handover reconcile 2026-07-09 GAP2)
+# was only ever validated on a RUNNING sign that had already booted
+# with a smaller CMA — it was NEVER cold-boot-tested from a fresh
+# pi-gen image. On a 512MB Pi Zero 2 W a fresh arm64/trixie image
+# with gpu_mem=128 + cma=320M leaves only ~64MB normal (non-CMA)
+# ARM RAM, so the kernel dies in early memory init BEFORE the
+# framebuffer console: blank HDMI, zero kernel output, solid ACT LED
+# (reproduced on 2 cards 2026-09-19..21; proven config-only by a
+# boot-partition diff — our kernel8.img was BYTE-IDENTICAL to the
+# stock RPi OS image that boots). MATH on 512MB:
+#   gpu_mem=128 -> 384MB ARM; cma=256M -> ~128MB normal RAM = SAFE.
+#   (cma=320M -> ~64MB normal = brick; cma=384M -> even less.)
+# See code/docs/first-light-rootcause-cma-2026-09-21.md.
 #
 # Same DANGER as patch_cmdline_txt — cmdline.txt is a SINGLE
 # line and a stray newline silently drops every param after it,
@@ -265,8 +272,8 @@ patch_config_txt_audio() {
 #     field match (so `cma=512M`, `cma=128M`, etc. all get
 #     replaced — NOT regex substring; a hypothetical token
 #     `cma_zone=foo` would NOT match),
-#   - appends `cma=320M` and exactly ONE trailing newline,
-#   - is idempotent: a re-run finds `cma=320M` and re-runs
+#   - appends `cma=256M` and exactly ONE trailing newline,
+#   - is idempotent: a re-run finds `cma=256M` and re-runs
 #     the strip+append, which is a no-op (same output).
 patch_cmdline_txt_cma() {
     local file="$1"
@@ -304,19 +311,17 @@ patch_cmdline_txt_cma() {
         return 1
     fi
     # Idempotency check: if the BEFORE-strip current already has
-    # cma=320M AND no other cma=*, the stripped+append result is
+    # cma=256M AND no other cma=*, the stripped+append result is
     # identical to current → log no-op + skip the write.
-    local target_only_cma
-    target_only_cma="$current"
-    # Detect: exactly one cma= token AND it equals cma=320M.
+    # Detect: exactly one cma= token AND it equals cma=256M.
     local cma_count
     cma_count="$(printf '%s\n' "$current" | awk '{ c=0; for (i=1;i<=NF;i++) { eq=index($i,"="); key=(eq>0)?substr($i,1,eq-1):$i; if (key=="cma") c++ } print c }')"
-    if [ "$cma_count" = "1" ] && printf '%s\n' "$current" | grep -qw 'cma=320M'; then
-        echo "cmdline.txt: cma=320M already set (exactly one cma= token) — no-op"
+    if [ "$cma_count" = "1" ] && printf '%s\n' "$current" | grep -qw 'cma=256M'; then
+        echo "cmdline.txt: cma=256M already set (exactly one cma= token) — no-op"
         return 0
     fi
-    printf '%s %s\n' "$stripped" "cma=320M" > "$file"
-    echo "cmdline.txt: set cma=320M (stripped any prior cma= + appended)"
+    printf '%s %s\n' "$stripped" "cma=256M" > "$file"
+    echo "cmdline.txt: set cma=256M (stripped any prior cma= + appended)"
 }
 
 # Ensure `dtoverlay=dwc2,dr_mode=peripheral` is set in [all] scope in a Pi
