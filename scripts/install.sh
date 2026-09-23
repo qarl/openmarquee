@@ -1270,7 +1270,7 @@ if [ -f "$BOOT_LIB" ]; then
             # path already invokes both (02-run.sh:53-54), but a
             # redeploy over a live sign was leaving cma/gpu_mem to
             # whatever the card was flashed with. Both are idempotent
-            # (no-op when gpu_mem=128 / cma=320M already present, which
+            # (no-op when gpu_mem=128 / cma=256M already present, which
             # the live sign has) and guarded so non-zero can't trip
             # set -e and abort a production redeploy. Takes effect on
             # next reboot (kernel cmdline / firmware split).
@@ -1307,7 +1307,7 @@ if [ -f "$BOOT_LIB" ]; then
             say "  DRYRUN: would patch config.txt (disable_splash=1) +"
             say "          cmdline.txt (quiet splash plymouth.ignore-serial-consoles)"
             say "          cmdline.txt strip (cgroup_disable=memory)"
-            say "          config.txt gpu_mem=128 + cmdline.txt cma=320M"
+            say "          config.txt gpu_mem=128 + cmdline.txt cma=256M"
             say "          config.txt audio (dtparam=audio=on)"
             say "          config.txt dwc2 + cmdline.txt modules-load=dwc2,g_ether"
         fi

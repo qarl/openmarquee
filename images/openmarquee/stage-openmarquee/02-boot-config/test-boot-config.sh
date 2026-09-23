@@ -362,6 +362,19 @@ check "cma8: CR/LF input -> one line" "1" "$(wc -l < "$TMP/cma8.txt" | tr -d ' '
 grep -qw 'cma=256M' "$TMP/cma8.txt" && ok "cma8: cma=256M present" || bad "cma8: cma=256M missing"
 grep -q 'console=tty1 root=PARTUUID=q' "$TMP/cma8.txt" && ok "cma8: params re-joined" || bad "cma8: params not joined"
 
+# ── Bug 0 (2026-09-22): reinstall must NOT re-brick ────────────────
+# install.sh re-runs patch_cmdline_txt_cma on EVERY (re)install. A card
+# left at the bricking cma=320M (gpu_mem=128 + cma=320M on a 512MB Zero
+# 2 W = ~64MB normal RAM = early-mem OOM, no boot log — cost hours +
+# a card pull 2026-09-19..21) MUST converge to the safe cma=256M with
+# exactly one token, or every reinstall re-bricks the device.
+printf 'console=tty1 root=PARTUUID=b0 rootwait cma=320M\n' > "$TMP/cma_reinstall.txt"
+patch_cmdline_txt_cma "$TMP/cma_reinstall.txt" >/dev/null
+check "cma-reinstall: bricking cma=320M -> exactly one cma=256M" "1" "$(grep -ow 'cma=256M' "$TMP/cma_reinstall.txt" | wc -l | tr -d ' ')"
+check "cma-reinstall: bricking cma=320M removed" "0" "$(grep -ow 'cma=320M' "$TMP/cma_reinstall.txt" | wc -l | tr -d ' ')"
+check "cma-reinstall: still one line" "1" "$(wc -l < "$TMP/cma_reinstall.txt" | tr -d ' ')"
+grep -qw 'root=PARTUUID=b0' "$TMP/cma_reinstall.txt" && ok "cma-reinstall: root= preserved" || bad "cma-reinstall: root= lost"
+
 # ── patch_config_txt_dwc2 (USB-gadget networking, 2026-09-16;
 #     first-light dr_mode fix 2026-09-19) ─────────────────────────────
 # Enforces exactly one [all]-scoped dtoverlay=dwc2,dr_mode=peripheral.
