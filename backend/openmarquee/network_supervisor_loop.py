@@ -29,6 +29,8 @@ import shutil
 
 from openmarquee.network_supervisor import (
     NetworkSupervisor,
+    SupervisorEvent,
+    SupervisorState,
     WpaSupplicantSocketClient,
     parse_wpa_event,
 )
@@ -350,6 +352,21 @@ async def supervisor_observe_loop(
                 freq = await poll_sta_freq_mhz()
                 if freq is not None:
                     supervisor.apply_sta_freq(freq)
+                    # Level-triggered recovery (2026-09-23): a valid STA freq
+                    # means the station IS associated to an AP. If we're stuck
+                    # in DEGRADED (the "Lost the wifi connection" card is up),
+                    # the transient wpa CTRL-EVENT-CONNECTED that would clear
+                    # it may have been MISSED across a wpa-ctrl-socket reconnect
+                    # gap (e.g. after a reboot: wpa restarts, receive_event
+                    # OSErrors, client reconnects, and a single CONNECTED
+                    # emitted in that gap is lost). The card-clear is otherwise
+                    # edge-triggered ONLY on that event, so a missed event =
+                    # a false "wifi lost" card stuck until the 60-min renderer
+                    # cap / a restart. Reconcile off the LEVEL signal we
+                    # already poll: feed STA_ASSOCIATED, which routes
+                    # DEGRADED -> (LINGER ->) ONLINE and clears the card.
+                    if supervisor.current_state == SupervisorState.DEGRADED:
+                        supervisor.apply_event(SupervisorEvent.STA_ASSOCIATED)
                 # Soft log once if `iw` binary is missing (Mac dev).
                 # On Linux/Pi this still hits if wlan0 isn't
                 # associated yet — but `iw` is present, so the exec

@@ -630,3 +630,67 @@ def test_blocking_wpa_calls_are_off_the_event_loop():
     assert "asyncio.to_thread(candidate.connect)" in src, (
         "connect() must run via asyncio.to_thread (off the event loop)"
     )
+
+
+@pytest.mark.asyncio
+async def test_loop_recovers_stuck_degraded_card_via_sta_freq_poll(tmp_path: Path, monkeypatch):
+    """Regression (2026-09-23, handover-class): a DEGRADED 'Lost the wifi
+    connection' card must clear on recovery even when the transient wpa
+    CTRL-EVENT-CONNECTED was MISSED (e.g. across a wpa-ctrl-socket reconnect
+    gap after a reboot). The card-clear was edge-triggered ONLY on that
+    event; the STA-freq poll (the LEVEL signal already run every tick) now
+    reconciles a stuck DEGRADED. FAIL-BEFORE: poll didn't feed the state
+    machine -> stayed DEGRADED forever (card stuck until the 60-min renderer
+    cap / a restart)."""
+
+    class _RecPub:
+        def __init__(self):
+            self.renders: list[dict] = []
+            self.clears = 0
+
+        def render(self, params):
+            self.renders.append(params)
+
+        def clear(self):
+            self.clears += 1
+
+    sup = _make_supervisor(tmp_path)
+    pub = _RecPub()
+    sup.set_system_card_publisher(pub)
+
+    # Drive to DEGRADED with the "lost" card up (ONLINE/LINGER -> STA drop).
+    sup.apply_event(SupervisorEvent.HAS_STORED_CREDENTIALS)  # -> CONNECTING
+    sup.apply_event(SupervisorEvent.STA_ASSOCIATED)  # -> LINGER
+    sup.apply_event(SupervisorEvent.STA_DISCONNECTED)  # -> DEGRADED
+    assert sup.current_state == SupervisorState.DEGRADED
+    assert pub.renders, "reaching DEGRADED should have rendered a system card"
+
+    # Recovery VIA THE POLL ONLY — no wpa CONNECTED event is delivered.
+    socket_client = _MockSocketClient(events=[])
+    monkeypatch.setattr(
+        "openmarquee.network_supervisor_loop.WpaSupplicantSocketClient",
+        lambda *a, **k: socket_client,
+    )
+
+    async def _assoc_freq():
+        return 2462  # valid 2.4GHz freq => STA is associated
+
+    monkeypatch.setattr("openmarquee.network_supervisor_loop.poll_sta_freq_mhz", _assoc_freq)
+
+    task = asyncio.create_task(
+        supervisor_observe_loop(sup, wpa_poll_interval_s=0.01, sta_freq_poll_interval_s=0.01)
+    )
+    for _ in range(40):
+        await asyncio.sleep(0.02)
+        if sup.current_state != SupervisorState.DEGRADED:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # PASS-AFTER: the level-triggered poll reconciled the sign OUT of the
+    # stuck DEGRADED (-> LINGER/ONLINE), so the false "lost wifi" card is
+    # replaced/cleared instead of persisting.
+    assert sup.current_state != SupervisorState.DEGRADED, (
+        "poll-driven recovery must move the sign out of DEGRADED (stuck-card fix)"
+    )
