@@ -79,6 +79,83 @@ def probe_duration_ms_from_bytes(data: bytes) -> int | None:
     """
     if not data:
         return None
+    return _with_temp_mp4(data, probe_duration_ms, "probe_duration_ms_from_bytes")
+
+
+def probe_video_dimensions(path: Path | str) -> tuple[int, int] | None:
+    """Return the (width, height) in pixels of the first video stream at
+    `path` via ffprobe, or None if ffprobe is absent, the call fails, or
+    the file reports no readable video dimensions.
+
+    Never raises — a probe failure returns None (Bug 1b server-side guard,
+    2026-09-22). The caller decides policy on None; the upload guard
+    accepts on None because the device always has ffprobe (it ships with
+    ffmpeg) and the browser ffmpeg.wasm transcode is the primary ≤720p
+    guarantee — None only happens in a degraded/dev env without ffprobe,
+    where failing the upload would be worse than accepting it.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        logger.warning("probe_video_dimensions: ffprobe not on PATH; cannot read dimensions")
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=_FFPROBE_TIMEOUT_S,
+            check=True,
+        )
+    except (subprocess.SubprocessError, OSError):
+        logger.exception("probe_video_dimensions: ffprobe failed for %s", path)
+        return None
+    # csv=p=0 on the first video stream yields a single line "W,H".
+    raw = result.stdout.strip().splitlines()
+    if not raw:
+        logger.warning("probe_video_dimensions: no video stream for %s", path)
+        return None
+    parts = raw[0].split(",")
+    if len(parts) < 2:
+        logger.warning("probe_video_dimensions: unparseable dims for %s (got %r)", path, raw[0])
+        return None
+    try:
+        width = int(parts[0])
+        height = int(parts[1])
+    except ValueError:
+        logger.warning("probe_video_dimensions: non-integer dims for %s (got %r)", path, raw[0])
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return (width, height)
+
+
+def probe_video_dimensions_from_bytes(data: bytes) -> tuple[int, int] | None:
+    """Same as `probe_video_dimensions`, for in-memory bytes (the upload
+    path). Returns None on any failure.
+    """
+    if not data:
+        return None
+    return _with_temp_mp4(data, probe_video_dimensions, "probe_video_dimensions_from_bytes")
+
+
+def _with_temp_mp4(data: bytes, probe, label: str):
+    """Write `data` to a temp .mp4, run `probe(path)`, always clean up.
+
+    ffprobe needs to seek the MP4 `moov` box, which a stdin pipe can't do
+    reliably, so in-memory probes spill to a temp file. Shared by the
+    duration + dimensions byte-probes. Returns None on temp-write failure.
+    """
     tmp_path: str | None = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
@@ -87,13 +164,13 @@ def probe_duration_ms_from_bytes(data: bytes) -> int | None:
             # (e.g. ENOSPC) must still hit the `finally` cleanup below.
             tmp_path = tmp.name
             tmp.write(data)
-        return probe_duration_ms(tmp_path)
+        return probe(tmp_path)
     except OSError:
-        logger.exception("probe_duration_ms_from_bytes: temp write failed")
+        logger.exception("%s: temp write failed", label)
         return None
     finally:
         if tmp_path is not None:
             try:
                 Path(tmp_path).unlink()
             except OSError:
-                logger.warning("probe_duration_ms_from_bytes: temp cleanup failed for %s", tmp_path)
+                logger.warning("%s: temp cleanup failed for %s", label, tmp_path)

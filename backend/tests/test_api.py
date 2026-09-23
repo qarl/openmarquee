@@ -1007,6 +1007,61 @@ def test_post_video_accepts_single_trak_mp4(client: TestClient):
     assert response.status_code == 200, response.json()
 
 
+def test_post_video_rejects_over_720p(client: TestClient, storage: ContentStorage, monkeypatch):
+    """Bug 1b (2026-09-22): the ≤720p cap is a Pi Zero 2 W CMA-safety
+    invariant (1080p exhausts CMA -> renderer crash). The browser
+    ffmpeg.wasm transcode clamps every UI upload, but an API-direct
+    client that bypasses it must still be REJECTED server-side. Probe is
+    monkeypatched so the test is deterministic without ffmpeg on the
+    runner (the real ffprobe path is covered in test_media_probe.py)."""
+    monkeypatch.setattr(
+        "openmarquee.api.probe_video_dimensions_from_bytes",
+        lambda _mp4: (1920, 1080),
+    )
+    response = client.post("/api/content/videos", json=_video_payload())
+    assert response.status_code == 400, response.json()
+    assert "720p" in response.json()["detail"]
+    # No partial state: the guard raises before any storage/playlist write.
+    assert storage.list_all() == []
+
+
+def test_post_video_rejects_over_720p_on_either_axis(client: TestClient, monkeypatch):
+    """Reject if EITHER dimension exceeds the cap — a wide-but-short clip
+    (1400×480) is over the 1280 width cap; a tall portrait (720×1280) is
+    over the 720 height cap. Both are the same oversized CMA frame."""
+    for dims in ((1400, 480), (720, 1280)):
+        monkeypatch.setattr(
+            "openmarquee.api.probe_video_dimensions_from_bytes",
+            lambda _mp4, _d=dims: _d,
+        )
+        response = client.post("/api/content/videos", json=_video_payload())
+        assert response.status_code == 400, f"{dims}: {response.json()}"
+
+
+def test_post_video_accepts_exactly_720p(client: TestClient, monkeypatch):
+    """The cap is inclusive: exactly 1280×720 is accepted."""
+    monkeypatch.setattr(
+        "openmarquee.api.probe_video_dimensions_from_bytes",
+        lambda _mp4: (1280, 720),
+    )
+    response = client.post("/api/content/videos", json=_video_payload())
+    assert response.status_code == 200, response.json()
+
+
+def test_post_video_accepts_when_dims_unprobeable(client: TestClient, monkeypatch):
+    """Fail-open when ffprobe can't read dims (None): the device always
+    ships ffprobe, so None means a degraded/dev env where the browser
+    transcode remains the guarantee. (This is also why the synthetic
+    _fake_mp4 fixtures above — which have no real decodable stream —
+    still pass the guard.)"""
+    monkeypatch.setattr(
+        "openmarquee.api.probe_video_dimensions_from_bytes",
+        lambda _mp4: None,
+    )
+    response = client.post("/api/content/videos", json=_video_payload())
+    assert response.status_code == 200, response.json()
+
+
 def test_post_video_rejects_non_image_thumbnail(client: TestClient):
     payload = _video_payload(
         png_base64=base64.b64encode(b"not a png").decode("ascii"),
@@ -1213,6 +1268,58 @@ def test_put_video_404s_on_unknown_id(client: TestClient):
         },
     )
     assert response.status_code == 404
+
+
+def test_put_video_rejects_over_720p(client: TestClient, storage: ContentStorage, monkeypatch):
+    """Bug 1b: PUT is an API-direct mp4-write path just like POST — a
+    client could POST a compliant clip then PUT a 1080p body. Guard it
+    server-side, and a reject must NOT overwrite the existing bytes."""
+    post = client.post("/api/content/videos", json=_video_payload())
+    item_id = UUID(post.json()["id"])
+    original_mp4 = storage.read_video(item_id)
+    # Only now make the probe report oversized (so the POST above wasn't
+    # itself rejected): the PUT with fresh bytes must be caught.
+    monkeypatch.setattr(
+        "openmarquee.api.probe_video_dimensions_from_bytes",
+        lambda _mp4: (1920, 1080),
+    )
+    response = client.put(
+        f"/api/content/videos/{item_id}",
+        json={
+            "name": "sneaky",
+            "duration_ms": 5000,
+            "png_base64": None,
+            "mp4_base64": base64.b64encode(_fake_mp4() + b"\xab\xcd").decode("ascii"),
+        },
+    )
+    assert response.status_code == 400, response.json()
+    assert "720p" in response.json()["detail"]
+    # No partial state: the stored mp4 is unchanged by the rejected PUT.
+    assert storage.read_video(item_id) == original_mp4
+
+
+def test_put_video_metadata_only_skips_dimension_probe(client: TestClient, monkeypatch):
+    """A metadata-only PUT reuses the already-vetted stored bytes, so it
+    must NOT re-probe/reject — even if the probe would report oversized.
+    Locks the `if payload.mp4_base64:` gate so renames never 400."""
+    post = client.post("/api/content/videos", json=_video_payload())
+    item_id = UUID(post.json()["id"])
+    # If the guard wrongly ran on a metadata-only PUT, this would 400.
+    monkeypatch.setattr(
+        "openmarquee.api.probe_video_dimensions_from_bytes",
+        lambda _mp4: (1920, 1080),
+    )
+    response = client.put(
+        f"/api/content/videos/{item_id}",
+        json={
+            "name": "Renamed",
+            "duration_ms": 8000,
+            "png_base64": None,
+            "mp4_base64": None,
+        },
+    )
+    assert response.status_code == 200, response.json()
+    assert response.json()["name"] == "Renamed"
 
 
 # --- stream (STREAM/VLC slice 8) -------------------------------------------

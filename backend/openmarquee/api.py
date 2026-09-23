@@ -47,7 +47,10 @@ from openmarquee.dependencies import (
 )
 from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync
-from openmarquee.media_probe import probe_duration_ms_from_bytes
+from openmarquee.media_probe import (
+    probe_duration_ms_from_bytes,
+    probe_video_dimensions_from_bytes,
+)
 from openmarquee.playlist import PlaylistStorage, list_full_library
 from openmarquee.stream_consumer import validate_stream_url
 from openmarquee.tombstone import TombstoneStorage
@@ -571,13 +574,53 @@ def _count_video_traks_in_mp4(mp4: bytes) -> int:
         return -1
 
 
+# Bug 1b (2026-09-22): the ≤720p ceiling is a Pi Zero 2 W HARDWARE safety
+# cap — a larger frame exhausts CMA and crashes the renderer. Mirrors the
+# browser transcode target in ui/src/video-upload.js (MAX_VIDEO_W/H).
+_MAX_VIDEO_WIDTH = 1280
+_MAX_VIDEO_HEIGHT = 720
+
+
+def _reject_video_over_cap(mp4: bytes) -> None:
+    """Enforce the ≤720p HARDWARE SAFETY cap (Bug 1b, 2026-09-22).
+
+    A frame larger than 1280×720 exhausts the Pi Zero 2 W's CMA pool and
+    crashes the renderer. The browser ffmpeg.wasm transcode already clamps
+    every UI upload, but that's client-side trust — EVERY server write path
+    that accepts fresh mp4 bytes (POST /videos AND PUT /videos/{id}) must
+    enforce it too, or an API-direct client bypasses the browser and
+    reintroduces the crash. Raises HTTP 400 on an oversized frame.
+
+    Fail-OPEN when ffprobe can't read dims (None): the device always ships
+    ffprobe (it comes with ffmpeg), so None means a degraded/dev env where
+    the browser transcode remains the guarantee — see probe_video_dimensions.
+    """
+    dims = probe_video_dimensions_from_bytes(mp4)
+    if dims is None:
+        return
+    width, height = dims
+    if width > _MAX_VIDEO_WIDTH or height > _MAX_VIDEO_HEIGHT:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"video is {width}×{height}; exceeds the "
+                f"{_MAX_VIDEO_WIDTH}×{_MAX_VIDEO_HEIGHT} (720p) hardware cap. "
+                "Re-encode to ≤720p before uploading."
+            ),
+        )
+
+
 class VideoUpload(BaseModel):
     """Wire format for POST /api/content/videos.
 
     Always H.264 in MP4. Browser-side ffmpeg.wasm caps the transcode at
-    min(source, 1920×1080) to stay inside the Pi Zero 2 W's hardware
-    H.264 decoder envelope; playback further scales down to the current
-    panel dims via ffmpeg's filter graph at decode time.
+    min(source, 1280×720) — a HARDWARE SAFETY cap, not just a preference:
+    a 1080p frame exhausts the Pi Zero 2 W's CMA pool and crashes the
+    renderer (see the first-light CMA arc). The server ALSO rejects any
+    upload over 1280×720 (Bug 1b, 2026-09-22) so an API-direct client
+    that bypasses the browser transcode can't reintroduce the crash.
+    Playback further scales down to the current panel dims via ffmpeg's
+    filter graph at decode time.
     """
 
     name: str
@@ -591,13 +634,14 @@ class VideoUpload(BaseModel):
         max_length=14_000_000,
         description="Thumbnail PNG (first frame).",
     )
-    # 200 MB raw -> ~267 MB base64 cap. 1080p H.264 at typical
-    # bitrates fits this with headroom; oversized uploads 422 at the
-    # validation boundary instead of buffering hundreds of MB into RAM
-    # for nothing.
+    # 200 MB raw -> ~267 MB base64 cap. A ≤720p H.264 clip fits this with
+    # huge headroom; oversized uploads 422 at the validation boundary
+    # instead of buffering hundreds of MB into RAM for nothing. (The
+    # frame-DIMENSION cap of ≤1280×720 is enforced separately in
+    # upload_video via ffprobe — the byte cap is just an anti-DoS bound.)
     mp4_base64: str = Field(
         max_length=270_000_000,
-        description="H.264 MP4 bytes, ≤ 1080p.",
+        description="H.264 MP4 bytes, ≤ 1280×720 (720p hardware cap).",
     )
 
 
@@ -624,6 +668,9 @@ async def upload_video(
 ) -> VideoSlide:
     thumbnail = _decode_png_payload(payload.png_base64)
     mp4 = _decode_mp4_payload(payload.mp4_base64)
+    # Bug 1b: enforce the ≤720p CMA-safety cap server-side (see helper).
+    # Runs BEFORE any storage/playlist write, so a reject leaves no state.
+    _reject_video_over_cap(mp4)
     data = payload.model_dump(exclude={"png_base64", "mp4_base64"})
     # Bug 2 (2026-09-22): derive the slot length from the uploaded media
     # (ffprobe), not the client-supplied default — a video slide should
@@ -1123,6 +1170,13 @@ async def update_video(
         if payload.mp4_base64
         else storage.read_video(item_id)
     )
+    # Bug 1b: a PUT with fresh mp4 bytes is an API-direct write path just
+    # like POST — enforce the ≤720p CMA-safety cap here too (before save),
+    # or an operator/client could POST a compliant clip then PUT a 1080p
+    # body and reintroduce the crash. Reused existing bytes were already
+    # vetted at their original write, so only check when new bytes arrived.
+    if payload.mp4_base64:
+        _reject_video_over_cap(mp4)
     storage.save_video(updated, thumbnail, mp4)
     background.add_task(flock_sync.notify_peers, updated.id, "updated")
     return updated
