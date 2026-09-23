@@ -269,7 +269,13 @@ async def supervisor_observe_loop(
                     candidate = WpaSupplicantSocketClient(
                         ctrl_path=supervisor.config.wpa_ctrl_path,
                     )
-                    candidate.connect()
+                    # Latent-bug fix (2026-09-23): connect() does a blocking
+                    # ATTACH recv (settimeout 0.5s). Run it OFF the event loop
+                    # so it can never stall the playback->renderer IPC (which
+                    # froze the glass ~500ms/tick). to_thread preserves the
+                    # supervisor's behavior — it just moves the blocking I/O
+                    # to a worker thread.
+                    await asyncio.to_thread(candidate.connect)
                     client = candidate
                     supervisor.diagnostics.push(
                         "wpa_supplicant",
@@ -304,7 +310,13 @@ async def supervisor_observe_loop(
             # 2. Drain any pending wpa events.
             if client is not None:
                 try:
-                    raw = client.receive_event()
+                    # Latent-bug fix (2026-09-23): receive_event() does a
+                    # blocking recv (settimeout 0.5s). Run it OFF the event
+                    # loop so a no-event tick (or a stuck reply socket) can
+                    # NEVER block the loop — that block starved the render
+                    # IPC and froze playback ~500ms/tick. Behavior preserved;
+                    # only the blocking I/O moves to a worker thread.
+                    raw = await asyncio.to_thread(client.receive_event)
                 except OSError as e:
                     log.warning(
                         "network-supervisor: wpa receive_event failed (%s); "

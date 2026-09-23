@@ -1772,3 +1772,185 @@ class TestActiveWlan0Ssid:
 
         monkeypatch.setattr(ns.subprocess, "run", boom)
         assert ns.active_wlan0_ssid() is None
+
+
+# ============================================================
+# Latent event-loop-block fix (2026-09-23): the wpa reply socket must
+# bind in a GLOBAL-namespace dir (not PrivateTmp /tmp) or wpa_supplicant
+# can't deliver replies -> 100% recv timeout -> event-loop stall -> the
+# playback freeze. See _wpactrl_bind_base_dir + the loop's to_thread wrap.
+# ============================================================
+
+
+def test_wpactrl_bind_base_dir_prefers_explicit_env(tmp_path, monkeypatch):
+    import openmarquee.network_supervisor as ns
+
+    d = tmp_path / "explicit"
+    d.mkdir()
+    monkeypatch.setenv("OPENMARQUEE_WPACTRL_DIR", str(d))
+    monkeypatch.delenv("OPENMARQUEE_CONTENT_ROOT", raising=False)
+    assert ns._wpactrl_bind_base_dir() == str(d)
+
+
+def test_wpactrl_bind_base_dir_derives_state_dir_from_content_root(tmp_path, monkeypatch):
+    import openmarquee.network_supervisor as ns
+
+    state = tmp_path / "var-openmarquee"
+    (state / "content").mkdir(parents=True)
+    monkeypatch.delenv("OPENMARQUEE_WPACTRL_DIR", raising=False)
+    monkeypatch.setenv("OPENMARQUEE_CONTENT_ROOT", str(state / "content"))
+    # Self-healing: derives the state dir (parent of content root), which
+    # is ReadWritePaths + global-ns on the device, even without the
+    # explicit env deployed.
+    assert ns._wpactrl_bind_base_dir() == str(state)
+
+
+def test_wpactrl_bind_base_dir_none_when_unset(monkeypatch):
+    import openmarquee.network_supervisor as ns
+
+    monkeypatch.delenv("OPENMARQUEE_WPACTRL_DIR", raising=False)
+    monkeypatch.delenv("OPENMARQUEE_CONTENT_ROOT", raising=False)
+    # dev/test with no PrivateTmp sandbox -> None -> system temp is fine.
+    assert ns._wpactrl_bind_base_dir() is None
+
+
+def test_wpactrl_bind_base_dir_ignores_nonexistent_explicit(tmp_path, monkeypatch):
+    import openmarquee.network_supervisor as ns
+
+    monkeypatch.setenv("OPENMARQUEE_WPACTRL_DIR", str(tmp_path / "nope"))
+    monkeypatch.delenv("OPENMARQUEE_CONTENT_ROOT", raising=False)
+    assert ns._wpactrl_bind_base_dir() is None
+
+
+def test_connect_binds_reply_socket_in_resolved_dir_not_tmp(monkeypatch):
+    """Behavioral regression for the PrivateTmp bug: connect() must bind
+    the reply socket under the resolved GLOBAL-ns dir, NOT tempfile's
+    default /tmp. Fails before the fix (mkdtemp() -> /tmp).
+
+    Uses a SHORT socket root (AF_UNIX sun_path is ~104 chars; pytest's
+    tmp_path is already too long on macOS)."""
+    import shutil
+    import socket
+    import tempfile
+    from pathlib import Path
+
+    import openmarquee.network_supervisor as ns
+
+    # Short root so bind_base/<mkdtemp>/ctrl fits in AF_UNIX's sun_path.
+    short_root = Path(tempfile.mkdtemp(prefix="omwt"))
+    try:
+        bind_base = short_root / "s"
+        bind_base.mkdir()
+        monkeypatch.setenv("OPENMARQUEE_WPACTRL_DIR", str(bind_base))
+
+        # Fake wpa_supplicant ctrl DGRAM socket so connect()'s
+        # sock.connect() + ATTACH send succeed (no reply -> ATTACH recv
+        # times out, which connect() suppresses).
+        ctrl_path = short_root / "c"
+        fake_wpa = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        fake_wpa.bind(str(ctrl_path))
+        try:
+            client = ns.WpaSupplicantSocketClient(ctrl_path=ctrl_path)
+            client.connect()
+            try:
+                assert client._local_path is not None
+                # The bound reply path lives under the resolved global-ns dir.
+                assert str(client._local_path).startswith(str(bind_base)), (
+                    f"reply socket bound at {client._local_path}, expected under {bind_base}"
+                )
+                assert client._local_path.exists()
+            finally:
+                client.close()
+        finally:
+            fake_wpa.close()
+    finally:
+        shutil.rmtree(short_root, ignore_errors=True)
+
+
+def _short_socket_root():
+    """A short base dir so bind paths fit AF_UNIX's ~104-char sun_path
+    (pytest tmp_path is too long on macOS)."""
+    import tempfile
+    from pathlib import Path
+
+    return Path(tempfile.mkdtemp(prefix="omwt"))
+
+
+def test_close_rmdirs_owned_socket_dir(monkeypatch):
+    """Leak-fix regression (2026-09-23): close() must rmdir the dir
+    connect() mkdtemp'd, or empty wpactrl-* dirs accumulate under the now
+    PERSISTENT bind base (/var/openmarquee). Fails before the fix."""
+    import shutil
+    import socket
+
+    import openmarquee.network_supervisor as ns
+
+    root = _short_socket_root()
+    try:
+        base = root / "s"
+        base.mkdir()
+        monkeypatch.setenv("OPENMARQUEE_WPACTRL_DIR", str(base))
+        ctrl = root / "c"
+        fake = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        fake.bind(str(ctrl))
+        try:
+            client = ns.WpaSupplicantSocketClient(ctrl_path=ctrl)
+            client.connect()
+            owned_dir = client.local_socket_dir
+            assert owned_dir is not None and owned_dir.exists()
+            client.close()
+            assert not owned_dir.exists(), f"orphaned dir left: {owned_dir}"
+            assert base.exists(), "must not remove the caller/base dir"
+        finally:
+            fake.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_connect_failure_cleans_up_owned_socket_dir(monkeypatch):
+    """Leak-fix regression: a connect() that fails after mkdtemp (e.g. the
+    wpa ctrl socket isn't up — a boot-race retried every 30s) must not
+    orphan the mkdtemp'd dir under the persistent base."""
+    import shutil
+
+    import openmarquee.network_supervisor as ns
+
+    root = _short_socket_root()
+    try:
+        base = root / "s"
+        base.mkdir()
+        monkeypatch.setenv("OPENMARQUEE_WPACTRL_DIR", str(base))
+        # No wpa ctrl socket at this path -> sock.connect() raises.
+        client = ns.WpaSupplicantSocketClient(ctrl_path=root / "does-not-exist")
+        with pytest.raises(OSError):
+            client.connect()
+        leftovers = list(base.glob("openmarquee-wpactrl-*"))
+        assert leftovers == [], f"connect-failure orphaned dirs: {leftovers}"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_injected_socket_dir_is_not_removed(monkeypatch):
+    """close() must NOT rmdir a caller-injected local_socket_dir (only
+    dirs connect() created itself)."""
+    import shutil
+    import socket
+
+    import openmarquee.network_supervisor as ns
+
+    root = _short_socket_root()
+    try:
+        injected = root / "inj"
+        injected.mkdir()
+        ctrl = root / "c"
+        fake = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        fake.bind(str(ctrl))
+        try:
+            client = ns.WpaSupplicantSocketClient(ctrl_path=ctrl, local_socket_dir=injected)
+            client.connect()
+            client.close()
+            assert injected.exists(), "injected dir must survive close()"
+        finally:
+            fake.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)

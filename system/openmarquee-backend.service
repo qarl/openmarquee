@@ -90,6 +90,12 @@ Environment="OPENMARQUEE_PLAYLIST_PATH=/var/openmarquee/playlist.json"
 Environment="OPENMARQUEE_SCHEDULE_PATH=/var/openmarquee/schedules.json"
 Environment="OPENMARQUEE_SETTINGS_PATH=/var/openmarquee/settings.json"
 Environment="OPENMARQUEE_SEED_MARKER_PATH=/var/openmarquee/seeded.json"
+# Latent-bug fix (2026-09-23): bind the wpa_supplicant reply socket in
+# this GLOBAL-namespace, ReadWritePaths dir (NOT PrivateTmp /tmp, which
+# wpa_supplicant's global-ns root process can't deliver replies to). The
+# code also derives this from OPENMARQUEE_CONTENT_ROOT's parent if unset,
+# so the fix holds even if this line isn't redeployed.
+Environment="OPENMARQUEE_WPACTRL_DIR=/var/openmarquee"
 Environment="OPENMARQUEE_DEV_PREVIEW_PATH=/var/openmarquee/preview.png"
 # 19.3 / sweep #10 #6: flock + tombstone paths weren't explicit
 # here; they fell back to dependencies.py's project-root-relative

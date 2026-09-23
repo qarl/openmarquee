@@ -607,3 +607,26 @@ async def test_observe_loop_emits_unavailable_diag_when_iw_missing(tmp_path: Pat
     diag = sup.snapshot_diagnostics()
     unavailable = [e for e in diag if "iw_list_combos=unavailable" in e.message]
     assert len(unavailable) == 1
+
+
+def test_blocking_wpa_calls_are_off_the_event_loop():
+    """Latent-bug regression (2026-09-23): connect() + receive_event()
+    both do a blocking 0.5s recv. On the asyncio loop that starved the
+    playback->renderer IPC and froze the glass ~500ms/tick. They MUST be
+    wrapped in asyncio.to_thread so they can never block the loop —
+    regardless of whether the wpa connect succeeds (which is why the
+    sibling sign only 'worked' via a failing connect). Source-assertion
+    (same shape as the repo's other structural regression locks); fails
+    before the fix, passes after.
+    """
+    import inspect
+
+    from openmarquee import network_supervisor_loop as nsl
+
+    src = inspect.getsource(nsl.supervisor_observe_loop)
+    assert "asyncio.to_thread(client.receive_event)" in src, (
+        "receive_event() must run via asyncio.to_thread (off the event loop)"
+    )
+    assert "asyncio.to_thread(candidate.connect)" in src, (
+        "connect() must run via asyncio.to_thread (off the event loop)"
+    )

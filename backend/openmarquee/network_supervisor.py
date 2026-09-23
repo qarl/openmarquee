@@ -553,6 +553,38 @@ def save_persisted_state(state: PersistedState, path: Path = DEFAULT_STATE_FILE)
 # ============================================================
 
 
+def _wpactrl_bind_base_dir() -> str | None:
+    """Resolve the directory to bind the wpa_supplicant reply socket in.
+
+    Latent-bug fix (2026-09-23): the client binds a local DGRAM reply
+    socket; wpa_supplicant (root, GLOBAL mount namespace) sends replies
+    to that bound path. The backend unit runs `PrivateTmp=true`, so
+    `tempfile.mkdtemp()` (default /tmp) lands in the unit's PRIVATE tmp
+    namespace — wpa_supplicant cannot reach it → every recv() hits the
+    0.5s timeout (100%), which (called on the event loop) froze playback.
+
+    Resolve a GLOBAL-namespace, backend-writable base:
+      1. OPENMARQUEE_WPACTRL_DIR (explicit override; set in the unit).
+      2. else the parent of OPENMARQUEE_CONTENT_ROOT (the state dir,
+         /var/openmarquee — already ReadWritePaths under ProtectSystem=
+         strict + outside PrivateTmp). Deriving from CONTENT_ROOT makes
+         this self-healing even if the unit env isn't redeployed.
+      3. else None → system temp (dev/test, where there is no PrivateTmp
+         sandbox so /tmp is fine).
+    Only returns a dir that exists and is writable; otherwise falls
+    through so mkdtemp uses the system default.
+    """
+    explicit = os.environ.get("OPENMARQUEE_WPACTRL_DIR")
+    if explicit and os.path.isdir(explicit) and os.access(explicit, os.W_OK):
+        return explicit
+    content_root = os.environ.get("OPENMARQUEE_CONTENT_ROOT")
+    if content_root:
+        state_dir = os.path.dirname(os.path.normpath(content_root))
+        if state_dir and os.path.isdir(state_dir) and os.access(state_dir, os.W_OK):
+            return state_dir
+    return None
+
+
 class WpaSupplicantSocketClient:
     """DGRAM client for wpa_supplicant's control socket.
 
@@ -585,32 +617,63 @@ class WpaSupplicantSocketClient:
         self.local_socket_dir = local_socket_dir
         self._sock: socket.socket | None = None
         self._local_path: Path | None = None
+        # True when connect() mkdtemp'd the dir itself (so close()/failure
+        # cleanup may rmdir it). False when the caller injected
+        # local_socket_dir — we never remove a dir we didn't create.
+        self._owns_socket_dir = False
 
     def connect(self) -> None:
         """Open the DGRAM socket + bind to a local path + ATTACH for
         unsolicited events. Raises FileNotFoundError if
         wpa_supplicant isn't running (the ctrl socket doesn't exist).
+
+        NOTE (2026-09-23, latent-bug fix): connect() does a blocking
+        recv (the ATTACH reply, settimeout(0.5)) so it MUST be called
+        off the asyncio event loop (the supervisor loop wraps it in
+        asyncio.to_thread). Called inline it stalls the loop ~0.5s.
         """
         if self._sock is not None:
             return
         if self.local_socket_dir is None:
-            self.local_socket_dir = Path(tempfile.mkdtemp(prefix="openmarquee-wpactrl-"))
+            base = _wpactrl_bind_base_dir()
+            # base=None -> system temp (dev/test). On the device base is a
+            # GLOBAL-namespace, backend-writable dir so wpa_supplicant (root,
+            # global ns) can deliver replies — see _wpactrl_bind_base_dir.
+            self.local_socket_dir = Path(tempfile.mkdtemp(prefix="openmarquee-wpactrl-", dir=base))
+            self._owns_socket_dir = True
         self._local_path = self.local_socket_dir / "ctrl"
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        sock.bind(str(self._local_path))
-        sock.connect(str(self.ctrl_path))
-        sock.settimeout(0.5)
-        # Subscribe to unsolicited events.
-        sock.send(b"ATTACH")
-        with contextlib.suppress(TimeoutError):
-            _reply = sock.recv(4096)  # noqa: F841 — ATTACH reply is OK\n
+        try:
+            sock.bind(str(self._local_path))
+            sock.connect(str(self.ctrl_path))
+            sock.settimeout(0.5)
+            # Subscribe to unsolicited events.
+            sock.send(b"ATTACH")
+            with contextlib.suppress(TimeoutError):
+                _reply = sock.recv(4096)  # noqa: F841 — ATTACH reply is OK
+        except Exception:
+            # Cleanup on failure (e.g. FileNotFoundError when the wpa ctrl
+            # socket isn't up yet — a real boot-race retried every 30s).
+            # Without this the mkdtemp'd dir + bound socket file leak, and
+            # since the bind base is now PERSISTENT (/var/openmarquee, not
+            # the old wiped-on-restart /tmp) they'd accumulate across
+            # reboots on the SD card. Re-raise so the loop's retry logic
+            # runs unchanged.
+            sock.close()
+            self._cleanup_local_socket()
+            raise
         self._sock = sock
 
     def receive_event(self) -> str | None:
-        """Non-blocking poll for one event. Returns None on no event
-        available within the recv timeout. Events come as text like
+        """Poll for one event. Returns None on no event available within
+        the recv timeout. Events come as text like
         `<3>CTRL-EVENT-CONNECTED - Connection to <bssid>...` per
         wpa_supplicant's protocol.
+
+        BLOCKS up to the socket timeout (0.5s) waiting for data — it is
+        NOT non-blocking (the prior docstring was wrong; that is the bug
+        that froze playback when this ran on the event loop). Callers on
+        the asyncio loop MUST wrap this in asyncio.to_thread.
         """
         if self._sock is None:
             return None
@@ -620,15 +683,30 @@ class WpaSupplicantSocketClient:
             return None
         return data.decode("utf-8", errors="replace")
 
+    def _cleanup_local_socket(self) -> None:
+        """Unlink the bound reply-socket file and, if connect() created
+        the containing dir (mkdtemp), rmdir it — so we don't orphan empty
+        dirs under the now-PERSISTENT bind base (/var/openmarquee). Never
+        removes a caller-injected local_socket_dir.
+        """
+        if self._local_path is not None:
+            with contextlib.suppress(OSError):
+                self._local_path.unlink()
+        if self._owns_socket_dir and self.local_socket_dir is not None:
+            with contextlib.suppress(OSError):
+                self.local_socket_dir.rmdir()
+            # Allow a subsequent connect() to mkdtemp a fresh dir.
+            self.local_socket_dir = None
+            self._owns_socket_dir = False
+        self._local_path = None
+
     def close(self) -> None:
         if self._sock is not None:
             with contextlib.suppress(OSError):
                 self._sock.send(b"DETACH")
             self._sock.close()
             self._sock = None
-        if self._local_path is not None and self._local_path.exists():
-            with contextlib.suppress(OSError):
-                self._local_path.unlink()
+        self._cleanup_local_socket()
 
 
 def parse_wpa_event(raw: str) -> tuple[SupervisorEvent | None, dict]:
