@@ -18,8 +18,14 @@
 #     spurious restarts. QA measured the LIVE 320M pool over ~3min of
 #     active text-over-video + crossfade (~70 transitions/30s): peak
 #     CmaUsed 261MB, median ~239MB.
-#   => THRESHOLD_MB=300: 39MB above the measured 261MB peak (no
-#      spurious trips) and 20MB below the 320M pool (still fires
-#      before exhaustion, with room for the timer tick + restart).
-THRESHOLD_MB=300
+#   => was THRESHOLD_MB=300 for the 320M pool. Bug 5 (2026-09-22):
+#      the first-light fix dropped cma back to 256M, which made 300
+#      UNREACHABLE — CmaUsed caps at ~256 < 300, so the watchdog could
+#      NEVER fire (dead safety machinery; it's exactly what should have
+#      caught the 254/256 CMA exhaustion). Switched to POOL-RELATIVE:
+#      fire at THRESHOLD_PCT% of the LIVE CmaTotal, so it auto-tracks
+#      whatever cma= the image ships (90% of 256M = ~230MB, of 320M =
+#      ~288MB) and can't go stale when the pool changes. Set an absolute
+#      THRESHOLD_MB here only to OVERRIDE the pool-relative default.
+THRESHOLD_PCT=90
 COOLDOWN_SEC=1800

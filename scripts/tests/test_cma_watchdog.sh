@@ -14,6 +14,16 @@
 #   6. CmaTotal=0 (kernel without CMA) => cma_used=0, no restart.
 #   7. Override file injects CMA_USED_OVERRIDE_MB => uses that.
 #   8. State file corrupted => treated as no prior restart, restart fires.
+#   9.  Pool-relative (THRESHOLD_MB unset): fires at 90% of the live pool.
+#   10. Pool-relative: below 90% of the live pool => no restart.
+#   11. Bug 5 regression: the OLD absolute THRESHOLD_MB=300 on a 256M pool
+#       CANNOT fire even at 250MB used (proves the watchdog it replaced was
+#       dead) — the pool-relative default (tests 9/10) is what fixes it.
+#   12. Pool-relative auto-adapts: same 90% rule fires on a 320M pool too.
+#   13. Pool-relative + CmaTotal=0 (pool unknown) => no action, no restart.
+#   14. Dead-watchdog hardening: an UNREACHABLE threshold (>= pool ceiling)
+#       emits a loud WARN instead of sitting silently dead — the exact
+#       misconfig class Bug 5 exists to catch.
 #
 # Run:
 #     bash scripts/tests/test_cma_watchdog.sh
@@ -108,7 +118,8 @@ run_watchdog() {
         OVERRIDE_PATH="${OVERRIDE_PATH:-$sandbox/override}" \
         DEFAULTS="${DEFAULTS:-/nonexistent}" \
         SYSTEMCTL="${SYSTEMCTL:-$sandbox/bin/systemctl}" \
-        THRESHOLD_MB="${THRESHOLD_MB:-220}" \
+        THRESHOLD_MB="${THRESHOLD_MB-220}" \
+        THRESHOLD_PCT="${THRESHOLD_PCT-90}" \
         COOLDOWN_SEC="${COOLDOWN_SEC:-1800}" \
         RESTART_TARGET="${RESTART_TARGET:-openmarquee-backend.service}" \
         bash "$TARGET_SCRIPT" 2>&1
@@ -215,6 +226,82 @@ run_watchdog "$SANDBOX"
 assert_eq "exit code" "0" "$EXIT"
 assert_contains "logs trigger" "triggered restart" "$OUT"
 assert_contains "systemctl restart called" "restart --no-block openmarquee-backend.service" "$(cat "$SANDBOX/systemctl-calls.log")"
+rm -rf "$SANDBOX"
+
+# -- Test 9: pool-relative fires at 90% of the live 256M pool ----------------
+echo "Test 9: THRESHOLD_MB unset, 256M pool, cma_used=250MB >= 90% (230MB) => restart fires"
+SANDBOX="$(mk_sandbox)"
+write_meminfo "$SANDBOX/meminfo" 262144 6144  # 256000 kB used = 250 MB, pool 256 MB
+unset MEMINFO_PATH STATE_FILE OVERRIDE_PATH DEFAULTS SYSTEMCTL THRESHOLD_MB THRESHOLD_PCT COOLDOWN_SEC RESTART_TARGET
+THRESHOLD_MB="" run_watchdog "$SANDBOX"
+assert_eq "exit code" "0" "$EXIT"
+assert_contains "logs cma_used" "cma_used=250MB" "$OUT"
+assert_contains "logs pool-relative threshold" "threshold=230MB (90%-of-256MB-pool)" "$OUT"
+assert_contains "logs trigger" "triggered restart" "$OUT"
+assert_contains "systemctl restart called" "restart --no-block openmarquee-backend.service" "$(cat "$SANDBOX/systemctl-calls.log")"
+rm -rf "$SANDBOX"
+
+# -- Test 10: pool-relative, below 90% of the live pool => no restart ---------
+echo "Test 10: THRESHOLD_MB unset, 256M pool, cma_used=200MB < 90% (230MB) => no restart"
+SANDBOX="$(mk_sandbox)"
+write_meminfo "$SANDBOX/meminfo" 262144 57344  # 204800 kB used = 200 MB, pool 256 MB
+unset MEMINFO_PATH STATE_FILE OVERRIDE_PATH DEFAULTS SYSTEMCTL THRESHOLD_MB THRESHOLD_PCT COOLDOWN_SEC RESTART_TARGET
+THRESHOLD_MB="" run_watchdog "$SANDBOX"
+assert_eq "exit code" "0" "$EXIT"
+assert_contains "logs pool-relative threshold" "threshold=230MB (90%-of-256MB-pool)" "$OUT"
+assert_not_contains "no restart fired" "triggering" "$OUT"
+assert_eq "systemctl NOT called" "" "$(cat "$SANDBOX/systemctl-calls.log")"
+rm -rf "$SANDBOX"
+
+# -- Test 11: Bug 5 regression -- the OLD absolute 300 is DEAD on a 256M pool -
+echo "Test 11: absolute THRESHOLD_MB=300 on 256M pool, cma_used=250MB => NEVER fires (dead watchdog)"
+SANDBOX="$(mk_sandbox)"
+write_meminfo "$SANDBOX/meminfo" 262144 6144  # 250 MB used, pool 256 MB (CmaUsed caps at 256 < 300)
+unset MEMINFO_PATH STATE_FILE OVERRIDE_PATH DEFAULTS SYSTEMCTL THRESHOLD_MB THRESHOLD_PCT COOLDOWN_SEC RESTART_TARGET
+THRESHOLD_MB=300 run_watchdog "$SANDBOX"
+assert_eq "exit code" "0" "$EXIT"
+assert_contains "logs cma_used at 250" "cma_used=250MB" "$OUT"
+assert_contains "logs absolute threshold" "threshold=300MB (absolute)" "$OUT"
+assert_not_contains "no restart fired" "triggering" "$OUT"
+assert_eq "systemctl NOT called (proves the pre-Bug-5 watchdog was dead)" "" "$(cat "$SANDBOX/systemctl-calls.log")"
+rm -rf "$SANDBOX"
+
+# -- Test 12: pool-relative auto-adapts to a 320M pool -----------------------
+echo "Test 12: THRESHOLD_MB unset, 320M pool, cma_used=290MB >= 90% (288MB) => restart fires"
+SANDBOX="$(mk_sandbox)"
+write_meminfo "$SANDBOX/meminfo" 327680 30720  # 296960 kB used = 290 MB, pool 320 MB
+unset MEMINFO_PATH STATE_FILE OVERRIDE_PATH DEFAULTS SYSTEMCTL THRESHOLD_MB THRESHOLD_PCT COOLDOWN_SEC RESTART_TARGET
+THRESHOLD_MB="" run_watchdog "$SANDBOX"
+assert_eq "exit code" "0" "$EXIT"
+assert_contains "logs cma_used" "cma_used=290MB" "$OUT"
+assert_contains "logs pool-relative threshold auto-adapts" "threshold=288MB (90%-of-320MB-pool)" "$OUT"
+assert_contains "logs trigger" "triggered restart" "$OUT"
+assert_contains "systemctl restart called" "restart --no-block openmarquee-backend.service" "$(cat "$SANDBOX/systemctl-calls.log")"
+rm -rf "$SANDBOX"
+
+# -- Test 13: pool-relative + CmaTotal=0 => pool unknown, no action ----------
+echo "Test 13: THRESHOLD_MB unset, CmaTotal=0 => pool unknown, no restart"
+SANDBOX="$(mk_sandbox)"
+write_meminfo "$SANDBOX/meminfo" 0 0
+unset MEMINFO_PATH STATE_FILE OVERRIDE_PATH DEFAULTS SYSTEMCTL THRESHOLD_MB THRESHOLD_PCT COOLDOWN_SEC RESTART_TARGET
+THRESHOLD_MB="" run_watchdog "$SANDBOX"
+assert_eq "exit code" "0" "$EXIT"
+assert_contains "logs pool unknown" "pool unknown" "$OUT"
+assert_not_contains "no restart fired" "triggering" "$OUT"
+assert_eq "systemctl NOT called" "" "$(cat "$SANDBOX/systemctl-calls.log")"
+rm -rf "$SANDBOX"
+
+# -- Test 14: unreachable threshold => loud WARN (dead-watchdog hardening) ----
+echo "Test 14: absolute THRESHOLD_MB=300 on 256M pool => UNREACHABLE warning logged"
+SANDBOX="$(mk_sandbox)"
+write_meminfo "$SANDBOX/meminfo" 262144 6144  # 250 MB used, pool 256 MB; 300 > 256 = unreachable
+unset MEMINFO_PATH STATE_FILE OVERRIDE_PATH DEFAULTS SYSTEMCTL THRESHOLD_MB THRESHOLD_PCT COOLDOWN_SEC RESTART_TARGET
+THRESHOLD_MB=300 run_watchdog "$SANDBOX"
+assert_eq "exit code" "0" "$EXIT"
+assert_contains "logs UNREACHABLE warn" "UNREACHABLE" "$OUT"
+assert_contains "warn names ceiling" "threshold 300MB >= CmaTotal 256MB" "$OUT"
+assert_not_contains "no restart fired" "triggering" "$OUT"
+assert_eq "systemctl NOT called" "" "$(cat "$SANDBOX/systemctl-calls.log")"
 rm -rf "$SANDBOX"
 
 # -- Summary ------------------------------------------------------------------

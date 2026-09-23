@@ -11,17 +11,21 @@
 # qa/r38c-cma-pressure-watchdog-2026-06-02.md.
 #
 # Configurable via /etc/default/openmarquee-cma-watchdog:
-#   THRESHOLD_MB=254
+#   THRESHOLD_PCT=90    # fire at 90% of the LIVE CMA pool (default)
 #   COOLDOWN_SEC=1800
+#   THRESHOLD_MB=254    # OPTIONAL absolute override (wins over PCT)
 #
-# r59 (2026-06-04): default raised 220 -> 254 MB for v1.0.1 tag-cut.
-# Empirical CMA peak under text-over-video (post-r48 + r50) is
-# ~251.8 MB on FYS; the 220 default was tripping on benign peaks
-# and triggering spurious backend restarts. 254 sits 2.2 MB above
-# the measured peak and 2 MB below the 256 MB CMA pool reservation,
-# so the watchdog fires BEFORE the kernel allocator hits exhaustion
-# while still allowing normal text-over-video operation. See
-# qa/r59-cma-watchdog-default-decision-2026-06-04.md.
+# Bug 5 (2026-09-22): the threshold is POOL-RELATIVE by default
+# (THRESHOLD_PCT% of the live CmaTotal), NOT a hardcoded MB. History:
+# the absolute value was 254 (r59) on the 256M pool, bumped to 300 when
+# cma went 256M->320M (GAP2, 2026-07-09) — but when the first-light fix
+# dropped cma back to 256M, THAT 300 became a watchdog that can NEVER
+# fire (CmaUsed caps at ~256 < 300) = dead safety machinery. A
+# pool-relative default auto-tracks the pool: 90% of 256M = ~230MB, of
+# 320M = ~288MB — always fires BEFORE exhaustion, whatever cma= ships.
+# An explicit THRESHOLD_MB still wins as an absolute override.
+# See qa/r59-cma-watchdog-default-decision-2026-06-04.md for the
+# original empirical-peak reasoning.
 #
 # Override CmaUsed for testing via /run/openmarquee-cma-watchdog-test:
 #   CMA_USED_OVERRIDE_MB=250
@@ -32,7 +36,15 @@
 
 set -euo pipefail
 
-THRESHOLD_MB="${THRESHOLD_MB:-254}"
+# Bug 5 (2026-09-22): the threshold is POOL-RELATIVE by default — fire at
+# THRESHOLD_PCT% of the LIVE CmaTotal — so it auto-adapts to whatever cma=
+# the image ships (256M, 320M, ...) and can NEVER go stale/dead when the
+# pool size changes. A hardcoded THRESHOLD_MB=300 on a 256M pool can never
+# fire (CmaUsed caps at ~256 < 300) = dead safety machinery. An explicit
+# THRESHOLD_MB (non-empty) still wins as an absolute operator override;
+# empty/unset -> pool-relative via THRESHOLD_PCT.
+THRESHOLD_MB="${THRESHOLD_MB:-}"
+THRESHOLD_PCT="${THRESHOLD_PCT:-90}"
 COOLDOWN_SEC="${COOLDOWN_SEC:-1800}"
 STATE_FILE="${STATE_FILE:-/var/openmarquee/cma-watchdog-state}"
 MEMINFO_PATH="${MEMINFO_PATH:-/proc/meminfo}"
@@ -102,6 +114,22 @@ read_cma_used_mb() {
     printf '%s\n' "$((used_kb / 1024))"
 }
 
+read_cma_total_mb() {
+    # CmaTotal (MB) from MEMINFO_PATH — the size of the CMA pool the
+    # kernel reserved (i.e. the cma= boot value). Missing/unreadable/0
+    # -> 0, which the caller treats as "pool unknown" (no pool-relative
+    # action). Bug 5 (2026-09-22): drives the pool-relative threshold so
+    # the watchdog auto-adapts to whatever cma= the image ships.
+    if [ ! -r "$MEMINFO_PATH" ]; then
+        printf '0\n'
+        return 0
+    fi
+    local total_kb
+    total_kb=$(awk '/^CmaTotal:/ {print $2; exit}' "$MEMINFO_PATH")
+    total_kb="${total_kb:-0}"
+    printf '%s\n' "$((total_kb / 1024))"
+}
+
 read_last_restart_epoch() {
     # State file is one line: "last_restart_epoch=NNNNNNNNN".
     # Unparseable / missing → 0 (treated as "no prior restart").
@@ -141,15 +169,44 @@ trigger_restart() {
 }
 
 main() {
-    local cma_used_mb last_restart_epoch now elapsed
+    local cma_used_mb cma_total_mb effective_mb thr_src last_restart_epoch now elapsed
     cma_used_mb=$(read_cma_used_mb)
+    cma_total_mb=$(read_cma_total_mb)
+
+    # Effective threshold (Bug 5, 2026-09-22): an explicit THRESHOLD_MB is
+    # an absolute operator override; otherwise POOL-RELATIVE — fire at
+    # THRESHOLD_PCT% of the LIVE CmaTotal. Pool-relative auto-adapts to
+    # the shipped cma= and can't go dead (a hardcoded 300 on a 256M pool
+    # never fires). If the pool size is unknown (CmaTotal=0), we can't
+    # compute a pool-relative threshold, so take no action.
+    if [ -n "$THRESHOLD_MB" ]; then
+        effective_mb="$THRESHOLD_MB"
+        thr_src="absolute"
+    elif [ "$cma_total_mb" -le 0 ]; then
+        log "CmaTotal=${cma_total_mb}MB (pool unknown); cannot compute pool-relative threshold; no action"
+        return 0
+    else
+        effective_mb=$((cma_total_mb * THRESHOLD_PCT / 100))
+        thr_src="${THRESHOLD_PCT}%-of-${cma_total_mb}MB-pool"
+    fi
+
+    # Bug 5 hardening: a threshold at/above the pool ceiling can NEVER be
+    # crossed (CmaUsed caps at CmaTotal) = a silently-dead watchdog. That
+    # is the EXACT failure this bug fixes (absolute 300 on a 256M pool).
+    # Make it LOUD in the journal instead of silent, so any future
+    # misconfig (absolute THRESHOLD_MB > pool, or THRESHOLD_PCT >= 100) is
+    # caught rather than sitting dead like the original did.
+    if [ "$cma_total_mb" -gt 0 ] && [ "$effective_mb" -ge "$cma_total_mb" ]; then
+        log "WARN: threshold ${effective_mb}MB >= CmaTotal ${cma_total_mb}MB — UNREACHABLE; watchdog can never fire (check THRESHOLD_MB/THRESHOLD_PCT)"
+    fi
+
     last_restart_epoch=$(read_last_restart_epoch)
     now=$(date +%s)
     elapsed=$((now - last_restart_epoch))
 
-    log "cma_used=${cma_used_mb}MB threshold=${THRESHOLD_MB}MB last_restart=${elapsed}s ago"
+    log "cma_used=${cma_used_mb}MB threshold=${effective_mb}MB (${thr_src}) last_restart=${elapsed}s ago"
 
-    if [ "$cma_used_mb" -lt "$THRESHOLD_MB" ]; then
+    if [ "$cma_used_mb" -lt "$effective_mb" ]; then
         # below threshold; no action.
         return 0
     fi
@@ -159,7 +216,7 @@ main() {
         return 0
     fi
 
-    log "triggered restart (cma_used=${cma_used_mb}MB >= ${THRESHOLD_MB}MB)"
+    log "triggered restart (cma_used=${cma_used_mb}MB >= ${effective_mb}MB, ${thr_src})"
     trigger_restart
 }
 

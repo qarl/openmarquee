@@ -1049,7 +1049,9 @@ fi
 #   GAP7  vm.swappiness=10                 -> /etc/sysctl.d/
 #         (SD-swap-thrash mitigation for the text reel)
 #   GAP9  cma-watchdog THRESHOLD/COOLDOWN  -> /etc/default/
-#         (reconciled for the 320M pool: THRESHOLD_MB=300)
+#         (pool-relative THRESHOLD_PCT=90 per Bug 5, 2026-09-22 — the
+#         old absolute THRESHOLD_MB=300 went dead when cma dropped to
+#         256M; % of the live pool auto-adapts and can't go stale)
 
 SWAPPINESS_DST="${ROOT_PREFIX}/etc/sysctl.d/99-openmarquee-swappiness.conf"
 say "Install vm.swappiness=10 drop-in (GAP7)"
@@ -1057,7 +1059,7 @@ run mkdir -p "$(dirname "$SWAPPINESS_DST")"
 run install -m 0644 "${OPT_DIR}/system/99-openmarquee-swappiness.conf" "$SWAPPINESS_DST"
 
 CMA_WATCHDOG_DEFAULT_DST="${ROOT_PREFIX}/etc/default/openmarquee-cma-watchdog"
-say "Install openmarquee-cma-watchdog default (GAP9: THRESHOLD_MB=300 for 320M pool)"
+say "Install openmarquee-cma-watchdog default (GAP9: pool-relative THRESHOLD_PCT=90, Bug 5)"
 run mkdir -p "$(dirname "$CMA_WATCHDOG_DEFAULT_DST")"
 run install -m 0644 "${OPT_DIR}/system/openmarquee-cma-watchdog.default" "$CMA_WATCHDOG_DEFAULT_DST"
 
@@ -1570,9 +1572,12 @@ run systemctl enable openmarquee-boot-gesture-clear.timer
 
 # r38c CMA-pressure watchdog -- timer fires the oneshot every 60s,
 # oneshot reads /proc/meminfo and restarts openmarquee-backend.service
-# if CmaUsed crosses THRESHOLD_MB (default 254MB per r59; was 220 in
-# r38c, raised for v1.0.1) outside the cooldown window (default 30
-# min). enable + start the timer; the .service is triggered by the
+# if CmaUsed crosses the threshold outside the cooldown window (default
+# 30 min). Bug 5 (2026-09-22): the threshold is now POOL-RELATIVE
+# (THRESHOLD_PCT=90 of the live CmaTotal) instead of an absolute MB, so
+# it auto-adapts to whatever cma= the image ships and can't go dead when
+# the pool changes (the old absolute 300 could never fire on a 256M
+# pool). enable + start the timer; the .service is triggered by the
 # timer and shouldn't be enabled directly.
 # See qa/r59-cma-watchdog-default-decision-2026-06-04.md.
 run systemctl enable openmarquee-cma-watchdog.timer
