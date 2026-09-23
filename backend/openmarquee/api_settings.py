@@ -417,6 +417,28 @@ async def set_settings(
     # default here is a constant -- but a silent rename either way.
     if "wifi_ssid" not in payload:
         payload["wifi_ssid"] = previous.wifi_ssid
+    # 2026-09-23 (display INTENT fields — same trap, same fix as the three
+    # above): the settings panel's collectPayload (ui/src/settings.js)
+    # authors display_width/height/rotation + brightness/gamma as ONE
+    # coupled group — they are the operator's INTENT (how the sign is
+    # physically mounted + tuned), NOT fields where absence should mean
+    # "take the Pydantic default". The 2026-07-16 sweep protected
+    # sign_name/tailscale_enabled/wifi_ssid but MISSED these, so a PUT that
+    # OMITS one (a version-skewed / cached bundle, or any non-panel client)
+    # silently minted the default and reset it — e.g. display_rotation -> 0
+    # (qarl's reported bug: rotation had no visual effect AND reverted after
+    # restart, because the renderer reads the reverted 0 at each Open). The
+    # apply path is correct; this is purely the persist half. Absence now
+    # keeps the stored value, matching the bound-INTENT treatment above.
+    for _intent_field in (
+        "display_width",
+        "display_height",
+        "display_rotation",
+        "brightness",
+        "gamma",
+    ):
+        if _intent_field not in payload:
+            payload[_intent_field] = getattr(previous, _intent_field)
     # 2026-07-03 (qarl handover B1): per-entry SECRET_SENTINEL swap
     # for `wifi_networks[i].password`. The UI submits `<set>` for a
     # network whose PSK the operator hasn't retyped (the response was

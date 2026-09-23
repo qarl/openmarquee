@@ -1560,3 +1560,70 @@ def test_put_with_wifi_ssid_still_stores_it(client, monkeypatch):
 
     assert res.status_code == 200
     assert res.json()["wifi_ssid"] == "fireplacesign"
+
+
+# ============================================================
+# 2026-09-23: display INTENT fields must survive a rotation-omitting PUT.
+# qarl's bug: display_rotation had no visual effect + reverted to 0 after
+# restart. Root cause: api_settings PUT lacked the restore-from-previous
+# guard for the display INTENT group (the 2026-07-16 sweep protected
+# sign_name/tailscale/wifi_ssid but missed these), so a PUT omitting the
+# field minted the Pydantic default 0. The renderer (correctly wired) then
+# reads 0 at each Open -> no rotation. See feedback_ui_binds_intent_...
+# ============================================================
+
+
+def test_put_without_display_rotation_keeps_stored_value(client):
+    """THE reported bug (fail-before/pass-after): a PUT that omits
+    display_rotation must KEEP the stored value, not silently reset to 0."""
+    res = client.put("/api/settings", json=_settings_payload(client, display_rotation=90))
+    assert res.status_code == 200
+    assert res.json()["display_rotation"] == 90
+
+    body = _settings_payload(client, brightness=55)
+    body.pop("display_rotation")  # a client that doesn't carry rotation
+    res = client.put("/api/settings", json=body)
+    assert res.status_code == 200
+    assert res.json()["display_rotation"] == 90, (
+        "omitted display_rotation must keep the stored value, not reset to 0"
+    )
+    assert res.json()["brightness"] == 55, "the edit that WAS made must land"
+    # survives a fresh load (the 'reverts after restart' half)
+    assert client.get("/api/settings").json()["display_rotation"] == 90
+
+
+def test_put_with_changed_display_rotation_still_persists(client):
+    """CONTROL: the guard must not suppress a real rotation change (which
+    would pass the test above vacuously)."""
+    res = client.put("/api/settings", json=_settings_payload(client, display_rotation=270))
+    assert res.status_code == 200
+    assert res.json()["display_rotation"] == 270
+    assert client.get("/api/settings").json()["display_rotation"] == 270
+
+
+def test_put_omitting_display_intent_group_keeps_all_stored_values(client):
+    """CLASS fix: display_width/height/rotation + brightness/gamma are all
+    panel-authored INTENT; a PUT omitting the whole group must keep stored
+    values, not factory-reset (prevents the 'fixed one, neighbour still
+    lies' follow-up)."""
+    saved = _settings_payload(
+        client,
+        display_width=1360,
+        display_height=768,
+        display_rotation=180,
+        brightness=42,
+        gamma=1.5,
+    )
+    assert client.put("/api/settings", json=saved).status_code == 200
+
+    body = _settings_payload(client)
+    for f in ("display_width", "display_height", "display_rotation", "brightness", "gamma"):
+        body.pop(f)
+    res = client.put("/api/settings", json=body)
+    assert res.status_code == 200
+    j = res.json()
+    assert j["display_width"] == 1360
+    assert j["display_height"] == 768
+    assert j["display_rotation"] == 180
+    assert j["brightness"] == 42
+    assert j["gamma"] == 1.5
