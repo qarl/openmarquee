@@ -47,6 +47,7 @@ from openmarquee.dependencies import (
 )
 from openmarquee.flock import FlockStorage
 from openmarquee.flock_sync import FlockSync
+from openmarquee.media_probe import probe_duration_ms_from_bytes
 from openmarquee.playlist import PlaylistStorage, list_full_library
 from openmarquee.stream_consumer import validate_stream_url
 from openmarquee.tombstone import TombstoneStorage
@@ -623,8 +624,19 @@ async def upload_video(
 ) -> VideoSlide:
     thumbnail = _decode_png_payload(payload.png_base64)
     mp4 = _decode_mp4_payload(payload.mp4_base64)
+    data = payload.model_dump(exclude={"png_base64", "mp4_base64"})
+    # Bug 2 (2026-09-22): derive the slot length from the uploaded media
+    # (ffprobe), not the client-supplied default — a video slide should
+    # play for its own length. A probe failure leaves the payload value.
+    # Clamp so a degenerate probe can't 422 the upload: >=100 satisfies
+    # VideoSlide.duration_ms's ge=100 lower bound (it has no upper bound;
+    # 24h is just a sanity ceiling). Putting the value in `data` before
+    # construction re-runs validators, unlike a post-hoc model_copy(update=).
+    probed = probe_duration_ms_from_bytes(mp4)
+    if probed is not None:
+        data["duration_ms"] = max(100, min(probed, 24 * 60 * 60 * 1000))
     try:
-        video = VideoSlide(**payload.model_dump(exclude={"png_base64", "mp4_base64"}))
+        video = VideoSlide(**data)
     except ValidationError as exc:
         raise _validation_error_422(exc) from exc
     storage.save_video(video, thumbnail, mp4)

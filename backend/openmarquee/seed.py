@@ -52,6 +52,7 @@ from openmarquee.content import (
     VideoSlide,
 )
 from openmarquee.content.storage import ContentStorage
+from openmarquee.media_probe import probe_duration_ms
 from openmarquee.playlist import PlaylistStorage
 
 logger = logging.getLogger(__name__)
@@ -61,6 +62,13 @@ logger = logging.getLogger(__name__)
 # just record this on the marker for forensic value; future code could
 # diff versions and top up missing items.
 SEED_VERSION = 1
+
+# Fallback slide length (ms) for a seeded video when ffprobe can't read a
+# real duration (missing ffprobe / unreadable file). Bug 2 (2026-09-22):
+# the real duration is derived via probe_duration_ms; this is only the
+# degraded-path default, NOT the old hardcoded 10_000 (which showed a
+# 4.75s clip for 10s).
+_FALLBACK_VIDEO_DURATION_MS = 5000
 
 
 @dataclass(frozen=True)
@@ -337,9 +345,13 @@ def _seed_bundled_videos(storage: ContentStorage, directory: Path) -> list[Video
         except Exception:
             logger.exception("seed: skipping unreadable video %s", mp4_path)
             continue
+        # Bug 2 (2026-09-22): derive the slot length from the media, not
+        # a hardcoded 10_000. The seed clips are ~4.75s; showing them for
+        # 10s was wrong. Fall back only if ffprobe can't read a duration.
+        duration_ms = probe_duration_ms(mp4_path) or _FALLBACK_VIDEO_DURATION_MS
         slide = VideoSlide(
             name=_title_from_filename(mp4_path.stem) or "Video",
-            duration_ms=10_000,
+            duration_ms=duration_ms,
         )
         storage.save_video(slide, thumbnail, mp4_bytes)
         created.append(slide)

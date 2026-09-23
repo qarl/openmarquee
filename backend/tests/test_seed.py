@@ -2,6 +2,8 @@
 
 import io
 import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -708,3 +710,57 @@ def test_write_marker_rollback_on_replace_failure(
     # (".tmp." matches the new ".tmp.<pid>.<hex>" shape AND any
     # legacy ".tmp" leftovers from older test fixtures).
     assert not any(".tmp" in p.name for p in tmp_path.rglob("*"))
+
+
+# ── Bug 2 (2026-09-22): seeded video duration derived from the media ──
+_HAVE_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
+
+
+def _make_real_mp4(path: Path, seconds: float) -> None:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc=duration={seconds}:size=320x240:rate=10",
+            "-c:v",
+            "libx264",
+            "-profile:v",
+            "main",
+            "-bf",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-y",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+@pytest.mark.skipif(not _HAVE_FFMPEG, reason="ffmpeg/ffprobe not on PATH")
+def test_seed_bundled_video_duration_is_derived_not_hardcoded(storage, tmp_path: Path) -> None:
+    """A seeded video's duration_ms comes from ffprobe on the real media,
+    NOT the old hardcoded 10_000. Fails-before (10_000) / passes-after.
+    Drives the real encode + probe (a mock wouldn't witness the bug)."""
+    from openmarquee.seed import _seed_bundled_videos
+
+    vdir = tmp_path / "vids"
+    vdir.mkdir()
+    _make_real_mp4(vdir / "Hearth Fire.mp4", 2.0)
+    Image.new("RGB", (32, 24), (10, 10, 10)).save(vdir / "Hearth Fire.png")
+
+    created = _seed_bundled_videos(storage, vdir)
+
+    assert len(created) == 1
+    slide = created[0]
+    assert isinstance(slide, VideoSlide)
+    assert slide.duration_ms != 10_000, "regression: seed video duration still hardcoded 10_000"
+    assert abs(slide.duration_ms - 2000) <= 300, (
+        f"expected duration_ms derived ~2000 from the 2s clip, got {slide.duration_ms}"
+    )
