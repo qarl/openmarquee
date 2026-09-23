@@ -10443,7 +10443,13 @@ unsafe fn bake_video_slide_to_current_fbo(
             // measure the per-second V3D delta during a slide-
             // hold (i.e. BETWEEN transitions, where existing
             // probes don't reach).
-            if crate::v4l2::should_emit_steady_state_video_probe(*frames_decoded) {
+            // Bug 3 (2026-09-22): gate the debugfs BO-stats read behind
+            // the kill switch (default OFF). Left ungated it was a ~1 Hz
+            // paint-thread hitch on glass. Throttle first (cheap), env
+            // second (read only when the throttle already fired).
+            if crate::v4l2::should_emit_steady_state_video_probe(*frames_decoded)
+                && crate::v4l2::steady_state_video_probe_enabled()
+            {
                 let phase = if *frames_decoded == 1 {
                     "steady_state_video_paint_first"
                 } else {
@@ -10569,7 +10575,11 @@ unsafe fn bake_video_slide_to_current_fbo(
     // single-video this is what proves it; the path=MMAP tag in
     // the journal answers "does the leak source live in the
     // MMAP fall-through pattern" directly.
-    if crate::v4l2::should_emit_steady_state_video_probe(*frames_decoded) {
+    // Bug 3 (2026-09-22): gate behind the kill switch (default OFF) —
+    // the MMAP twin of the DMABUF probe above. See that site.
+    if crate::v4l2::should_emit_steady_state_video_probe(*frames_decoded)
+        && crate::v4l2::steady_state_video_probe_enabled()
+    {
         let phase = if *frames_decoded == 1 {
             "steady_state_video_paint_first"
         } else {

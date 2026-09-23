@@ -393,12 +393,16 @@ std::thread_local! {
 /// NEVER panics; instrumentation MUST NOT affect renderer
 /// liveness.
 ///
-/// Reads the file fresh on every call; cheap (debugfs read is
-/// ~µs). The renderer runs as `openmarquee` user; debugfs is
-/// root-readable by default on Raspberry Pi OS. If permission
-/// is denied this returns Err and we silently emit defaulted
-/// fields. QA can chmod +r the bo_stats file at deploy time if
-/// needed.
+/// Reads the file fresh on every call. NOTE (Bug 3, 2026-09-22):
+/// this is NOT "~µs" as originally assumed — on real hardware the
+/// bo_stats debugfs read walks the V3D BO list under a driver lock
+/// and is heavy enough to hitch the paint thread at ~1 Hz. Callers
+/// on the steady-state paint path MUST gate on
+/// `steady_state_video_probe_enabled()` (default OFF). The renderer
+/// runs as `openmarquee` user; debugfs is root-readable by default
+/// on Raspberry Pi OS. If permission is denied this returns Err and
+/// we silently emit defaulted fields. QA can chmod +r the bo_stats
+/// file at deploy time if needed.
 pub fn read_v3d_bo_snapshot() -> V3dBoSnapshot {
     use std::io::Write;
     let contents = match std::fs::read_to_string("/sys/kernel/debug/dri/0/bo_stats") {
@@ -450,8 +454,46 @@ pub fn read_v3d_bo_snapshot() -> V3dBoSnapshot {
 /// `count` is `frames_decoded` AFTER the increment for the
 /// current paint. count==0 means the paint produced no frame
 /// (Ok(None) skip) and the probe is skipped.
+///
+/// NOTE: this is the THROTTLE only. Whether the probe actually
+/// runs also requires `steady_state_video_probe_enabled()` — it
+/// is OFF in production by default (Bug 3, below). Call sites gate
+/// on `should_emit_steady_state_video_probe(n) &&
+/// steady_state_video_probe_enabled()` so the env read happens at
+/// most once per second (when the throttle fires), never per frame.
 pub fn should_emit_steady_state_video_probe(count: usize) -> bool {
     count == 1 || (count > 0 && count % 30 == 0)
+}
+
+/// Bug 3 (2026-09-22, qarl real-HW): kill switch for the r103.1
+/// steady-state video-paint V3D-BO probe. **Default OFF.**
+///
+/// The probe (`log_v3d_bos_at_phase_with_path` →
+/// `read_v3d_bo_snapshot`) does a SYNCHRONOUS
+/// `read_to_string("/sys/kernel/debug/dri/0/bo_stats")` on the
+/// PAINT thread. On real hardware that debugfs read walks the
+/// VideoCore/V3D BO list under a driver lock — NOT the "~µs" the
+/// r102.1 comment claimed — so firing it once per second during a
+/// slide-hold produced a visible ~1 Hz frame hitch. It is
+/// leak-hunt instrumentation (r102/r103 V3D-leak arc), not a
+/// production feature, so it must not run on glass by default.
+///
+/// QA re-enables it for a leak-hunt session via
+/// `OPENMARQUEE_V3D_STEADY_PROBE=1` (or on/true/yes/enable[d]).
+/// Mirrors the `scanout_rotate_log_enabled` / transition-cache
+/// kill-switch idiom (env read is cheap because it's reached only
+/// when the throttle already fired, i.e. ~1x/sec).
+pub fn steady_state_video_probe_enabled() -> bool {
+    match std::env::var("OPENMARQUEE_V3D_STEADY_PROBE") {
+        Ok(s) => {
+            let v = s.trim().to_ascii_lowercase();
+            matches!(
+                v.as_str(),
+                "1" | "on" | "true" | "yes" | "enable" | "enabled"
+            )
+        }
+        Err(_) => false,
+    }
 }
 
 /// r103.1 (2026-06-09): emit a `[mem] v3d_bos_at_phase ...` line
@@ -4432,6 +4474,59 @@ mod tests {
                 "count={} (just after a 30-mark) must NOT emit",
                 n + 1,
             );
+        }
+    }
+
+    #[test]
+    fn steady_state_video_probe_defaults_to_off() {
+        // Bug 3 (2026-09-22): the r103.1 V3D-BO probe does a
+        // synchronous debugfs read on the paint thread (~1 Hz hitch
+        // on glass). It is leak-hunt instrumentation and MUST be OFF
+        // in production. Regression lock: env unset => disabled, so
+        // a fresh device never runs the debugfs read on the paint
+        // thread. (Fails if a future change flips the default on.)
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("OPENMARQUEE_V3D_STEADY_PROBE").ok();
+        std::env::remove_var("OPENMARQUEE_V3D_STEADY_PROBE");
+        assert!(
+            !steady_state_video_probe_enabled(),
+            "default (env unset) MUST disable the steady-state V3D probe (Bug 3)",
+        );
+        if let Some(v) = prior {
+            std::env::set_var("OPENMARQUEE_V3D_STEADY_PROBE", v);
+        } else {
+            std::env::remove_var("OPENMARQUEE_V3D_STEADY_PROBE");
+        }
+    }
+
+    #[test]
+    fn steady_state_video_probe_enable_and_disable_values() {
+        let _guard = COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("OPENMARQUEE_V3D_STEADY_PROBE").ok();
+        for on in ["1", "on", "true", "yes", "enable", "enabled", "TRUE", " On "] {
+            std::env::set_var("OPENMARQUEE_V3D_STEADY_PROBE", on);
+            assert!(
+                steady_state_video_probe_enabled(),
+                "value {on:?} must ENABLE the probe (QA leak-hunt opt-in)",
+            );
+        }
+        // Anything that isn't an explicit affirmative stays OFF —
+        // including empty and garbage, so a stray/misspelled value
+        // can't silently re-arm the paint-thread debugfs read.
+        for off in ["0", "off", "false", "no", "disable", "disabled", "", "garbage"] {
+            std::env::set_var("OPENMARQUEE_V3D_STEADY_PROBE", off);
+            assert!(
+                !steady_state_video_probe_enabled(),
+                "value {off:?} must keep the probe DISABLED",
+            );
+        }
+        match prior {
+            Some(v) => std::env::set_var("OPENMARQUEE_V3D_STEADY_PROBE", v),
+            None => std::env::remove_var("OPENMARQUEE_V3D_STEADY_PROBE"),
         }
     }
 
