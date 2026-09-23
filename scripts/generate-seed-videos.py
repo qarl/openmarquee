@@ -18,8 +18,9 @@ which is itself non-trivial). Re-runs are idempotent (skip when both
 {stem}.mp4 and {stem}.png are already present), so resumed runs only
 fill gaps instead of paying for the full set every time.
 
-Requires `ffmpeg` on the maintainer's PATH (used for first-frame
-thumbnail extraction).
+Requires `ffmpeg` on the maintainer's PATH: each clip is normalized to
+the Pi HW-decoder spec (<=1280x720, H.264 Main, no B-frames, yuv420p —
+Bug 1a) and a first-frame thumbnail is extracted.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -62,14 +64,16 @@ PRESETS: list[tuple[str, str]] = [
 API_BASE = "https://api.openai.com/v1"
 MODEL = "sora-2-pro"
 # sora-2-pro landscape sizes: 1280x720 ($0.30/s), 1792x1024 ($0.50/s),
-# 1920x1080 ($0.50/s). 1080p matches the Pi Zero 2 W's H.264 decoder
-# cap exactly — at the seed-asset spend level the extra $0.20/s is
-# worth the headroom and clarity. (sora-2 base only supports up to
-# 1280x720; pro is required for 1080p.)
+# 1920x1080 ($0.50/s). We generate at 1080p for gen quality, then
+# _generate_one NORMALIZES every clip DOWN to <=1280x720 (Bug 1a) — a
+# Pi Zero 2 W can't decode 1080p (maxes CMA + ~2fps). The shipped asset
+# is always <=720p regardless of this gen size. Maintainer cost option:
+# set SIZE="1280x720" ($0.30/s) to skip the downscale — the normalize
+# step still runs (Sora 720p output isn't guaranteed Main/no-B).
 SIZE = "1920x1080"
-SECONDS = "8"        # supported: "4", "8", "12"
+SECONDS = "8"  # supported: "4", "8", "12"
 POLL_INTERVAL_SECONDS = 15
-POLL_TIMEOUT_SECONDS = 900   # 15-minute ceiling per generation
+POLL_TIMEOUT_SECONDS = 900  # 15-minute ceiling per generation
 
 
 def _api_key() -> str:
@@ -115,32 +119,89 @@ def _generate_one(stem: str, prompt: str, dest_mp4: Path, dest_png: Path) -> Non
             raise RuntimeError(f"[{stem}] timeout after {POLL_TIMEOUT_SECONDS}s")
 
     print(f"  [{stem}] GET /videos/{{id}}/content…", flush=True)
-    r = httpx.get(
-        f"{API_BASE}/videos/{vid}/content", headers=headers, timeout=180
-    )
+    r = httpx.get(f"{API_BASE}/videos/{vid}/content", headers=headers, timeout=180)
     if r.status_code >= 300:
         raise RuntimeError(f"GET content {r.status_code}: {r.text[:300]}")
-    dest_mp4.write_bytes(r.content)
-    print(f"  [{stem}] wrote {dest_mp4.name} ({len(r.content)} bytes)")
+    # Bug 1a (2026-09-22): NORMALIZE to the Pi HW-decoder spec instead of
+    # shipping Sora's raw output. Sora returns 1080p, which on a Pi Zero
+    # 2 W maxes CMA (~254/256MB) + runs ~2fps. Re-encode to <=1280x720,
+    # H.264 Main profile, NO B-frames, yuv420p (ref
+    # reference_hw_decoder_encode_requirement). The trailing
+    # scale=trunc(iw/2)*2:trunc(ih/2)*2 forces even W/H — an aspect-
+    # preserving downscale can land on an odd dimension, which yuv420p
+    # rejects. Keeps audio (AAC) since some clips are ambient loops.
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp.write(r.content)
+        raw_path = tmp.name
+    try:
+        # -v error: quiet on success, but ffmpeg's error IS surfaced on
+        # failure (check=True raises) — don't swallow stderr (repo lesson
+        # feedback_never_swallow_stderr_in_ci): a maintainer must see WHY
+        # a re-encode failed.
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                raw_path,
+                "-vf",
+                "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio="
+                "decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "main",
+                "-bf",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                "-movflags",
+                "+faststart",
+                str(dest_mp4),
+            ],
+            check=True,
+        )
+    finally:
+        Path(raw_path).unlink(missing_ok=True)
+    print(
+        f"  [{stem}] wrote {dest_mp4.name} "
+        f"(raw {len(r.content)} B -> normalized <=720p Main/no-B {dest_mp4.stat().st_size} B)"
+    )
 
     # Extract a first-frame thumbnail at t=2s (avoids fade-in black frames).
     subprocess.run(
         [
-            "ffmpeg", "-y", "-i", str(dest_mp4),
-            "-ss", "00:00:02", "-vframes", "1", "-update", "1",
+            "ffmpeg",
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            str(dest_mp4),
+            "-ss",
+            "00:00:02",
+            "-vframes",
+            "1",
+            "-update",
+            "1",
             str(dest_png),
         ],
         check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
     )
     print(f"  [{stem}] wrote {dest_png.name}")
 
 
 def main() -> int:
     if shutil.which("ffmpeg") is None:
-        print("ERROR: ffmpeg not on PATH (needed for thumbnail extraction).",
-              file=sys.stderr)
+        print(
+            "ERROR: ffmpeg not on PATH (needed for the normalize + thumbnail steps).",
+            file=sys.stderr,
+        )
         return 2
 
     project_root = Path(__file__).resolve().parent.parent
@@ -152,8 +213,10 @@ def main() -> int:
         mp4_path = dest_dir / f"{stem}.mp4"
         png_path = dest_dir / f"{stem}.png"
         if (
-            mp4_path.exists() and mp4_path.stat().st_size > 1024
-            and png_path.exists() and png_path.stat().st_size > 1024
+            mp4_path.exists()
+            and mp4_path.stat().st_size > 1024
+            and png_path.exists()
+            and png_path.stat().st_size > 1024
         ):
             print(f"  [{stem}] already present; skipping")
             continue
