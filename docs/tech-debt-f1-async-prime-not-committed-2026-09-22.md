@@ -24,14 +24,25 @@ Bug 4 ("~500 ms reload stall on video loop") reframed to: the intra-hold loop al
 - **preload lands reliably** (≤720p prime is far cheaper than the 1080p prime that produced the ~500 ms figure) → Bug 4 is resolved by Bug 1a; close it. **This debt still stands** (recommit F-1 regardless — admin's explicit instruction — so the next burn isn't exposed).
 - **still stalls** → reconstruct F-1 (async-prime-off-thread + Drop-reaper), profiling-informed.
 
+## Source LOCATED (2026-09-22)
+
+The F-1 source is **committed on `origin/task/perf-gl-2026-06-15`** (deployed to FYS, never merged to main). It searched clean under the name `spawn_async_to_prime_for_begin_slide` because that symbol was a guess — the actual commit is:
+
+- **`e68ecb3`** — `perf-decode F-1 — off-thread V4L2 prime at BeginSlide for cold video paths (kills 1.5-2.6s render-thread freezes)` ← the core F-1.
+- **`445766c`** — `LOAD-NEXT off-thread — F-1 BLOCKER-3 mitigation (cap-frozen WIP carried to ship)`.
+- **`2ead796`** — `eviction-timing fix — evict from-side V4L2 state at end-of-transition` (the free-old / Drop-timing half; ~92% 2-decoder pressure reduction).
+- **`fc2b7e6`** F-3 (gate BeginTransition from-side cache.load on O(1) presence check), **`ff616d9`** F-1 follow-up instrument.
+- Combined-stack siblings on the same branch: **`3af121f`** M-1 (slide_caches → LruMap), **`dccddc0`** W-2 (thread_local env-var cache), **`6de14c3`** Item-1 (bake_offscreen_flush thread_local cache).
+
+**Recommit is a manual PORT, not a cherry-pick.** `origin/task/perf-gl-2026-06-15` is **40 commits ahead / 282 behind** current main (a stale 2026-06-15 renderer base). `e68ecb3` lives in `ipc_main.rs`'s BeginSlide handler, which has been rewritten many times across those 282 commits (r104 serialize-decoders, r104.1 defer-eviction, CMA arc, etc.), so a cherry-pick conflicts hard. It must be re-applied against today's `ipc_main.rs`/`v4l2.rs` shape.
+
 ## Reconstruction plan (when scheduled)
 
-1. **Recover the source.** F-1 was deployed to FYS; the source may exist only as the deployed binary or in an uncommitted worktree/stash from that session. Options, in order:
-   - Search fleet stashes / worktrees / branches for `spawn_async_to_prime_for_begin_slide` or a reaper thread.
-   - Diff the FYS-deployed binary's strings against a tree build (source-pin markers) to confirm which fixes it carries.
-   - If unrecoverable, re-derive from the design: (a) move `prime_video_decoder` for BeginSlide onto a background worker and have the paint thread poll for readiness (never block); (b) hand dropped `DecoderInner`s to a dedicated reaper thread via mpsc so STREAMOFF/REQBUFS/fd-close/EGLImage-destroy never runs on the paint thread. **Preserve the r101 destroy-image-BEFORE-close-fd ordering** in the reaper.
+1. **Source recovered** (above). Read `e68ecb3` + `445766c` + `2ead796` as the design reference; re-apply the shape onto current main: (a) move `prime_video_decoder` for BeginSlide onto a background worker, paint thread polls for readiness (never blocks); (b) move `DecoderInner` drop/eviction off the paint thread (2ead796's end-of-transition timing + a reaper). **Preserve the r101 destroy-image-BEFORE-close-fd ordering.** Cross-check whether M-1/W-2/Item-1 are also still missing from the tree while here.
 2. Regression test: BeginSlide/advance paint-thread time bounded (no synchronous prime/drop on the render thread).
-3. aarch64 cross-build + real-HW verify on the dev Pi (hitch gone) before merge.
+3. aarch64 cross-build + real-HW verify on the dev Pi (freeze gone) before merge.
+
+**Timing:** this is a large, conflict-prone renderer change needing real-HW verify — schedule it as its own task in a deploy window, informed by Bug 4's V4 measurement (if ≤720p preload lands reliably the render-thread-freeze urgency is lower, but admin's call stands: recommit regardless so the next burn isn't exposed). Do NOT rush it as a side-job.
 
 ## Also possibly-drifted (verify during reconstruction)
 
