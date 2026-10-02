@@ -94,12 +94,21 @@ def _slide_to_wire_item(frame, slot_idx: int) -> dict:
     return item
 
 
+class _ParallelStaticServer(socketserver.ThreadingTCPServer):
+    """Threaded, deep accept queue: the harness fetches ~58 resources at
+    once and a single-threaded TCPServer (backlog 5) resets the overflow
+    (net::ERR_SOCKET_NOT_CONNECTED). Same fix as scripts/bake.py."""
+
+    daemon_threads = True
+    request_queue_size = 128
+
+
 def _start_static_server(ui_root: Path) -> tuple[socketserver.TCPServer, int]:
     handler = functools.partial(
         http.server.SimpleHTTPRequestHandler,
         directory=str(ui_root),
     )
-    server = socketserver.TCPServer(
+    server = _ParallelStaticServer(
         ("127.0.0.1", 0), handler, bind_and_activate=True,
     )
     port = server.server_address[1]

@@ -67,6 +67,17 @@ def _load_item(slide_path: Path) -> dict:
     return blob
 
 
+class _ParallelStaticServer(socketserver.ThreadingTCPServer):
+    """Threaded, with a deep accept queue. The harness page fetches ~58
+    resources at once; the old single-threaded TCPServer (listen backlog
+    5) reset the overflow (net::ERR_SOCKET_NOT_CONNECTED), and on a slow
+    filesystem a dropped JS module aborted the module graph -> 10s
+    wait_for_function timeout (QA root-cause 2026-10-02)."""
+
+    daemon_threads = True
+    request_queue_size = 128
+
+
 def _start_static_server(root: Path) -> tuple[socketserver.TCPServer, int]:
     """Serve `root` over localhost so the harness page can resolve
     its ES-module imports -- ES-modules over file:// trigger CORS
@@ -83,7 +94,7 @@ def _start_static_server(root: Path) -> tuple[socketserver.TCPServer, int]:
         http.server.SimpleHTTPRequestHandler,
         directory=str(root),
     )
-    server = socketserver.TCPServer(
+    server = _ParallelStaticServer(
         ("127.0.0.1", 0), handler, bind_and_activate=True
     )
     port = server.server_address[1]

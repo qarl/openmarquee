@@ -103,6 +103,15 @@ def load_item(uuid: str) -> dict:
     return blob["item"] if "item" in blob else blob
 
 
+class _ParallelStaticServer(socketserver.ThreadingTCPServer):
+    """Threaded, deep accept queue: the harness fetches ~58 resources at
+    once and a single-threaded TCPServer (backlog 5) resets the overflow
+    (net::ERR_SOCKET_NOT_CONNECTED). Same fix as scripts/bake.py."""
+
+    daemon_threads = True
+    request_queue_size = 128
+
+
 def _start_static_server(doc_root: Path) -> tuple[socketserver.TCPServer, int]:
     """ES-module imports from file:// hit CORS in headless Chromium.
     Serve REPO root over a localhost HTTP server on a free port so the
@@ -114,7 +123,7 @@ def _start_static_server(doc_root: Path) -> tuple[socketserver.TCPServer, int]:
         directory=str(doc_root),
     )
     # Bind to 0 to grab any free port.
-    server = socketserver.TCPServer(("127.0.0.1", 0), handler, bind_and_activate=True)
+    server = _ParallelStaticServer(("127.0.0.1", 0), handler, bind_and_activate=True)
     port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
