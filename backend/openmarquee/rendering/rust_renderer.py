@@ -84,6 +84,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import select
 import subprocess
 import threading
@@ -94,6 +95,104 @@ from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+# Sidecar line from renderer/src/hdmi.rs `record_present` (itself
+# rate-limited to <=1/s). Totals are the sidecar's cumulative counters.
+_OVER_BUDGET_RE = re.compile(
+    r"^\[perf\] frame over budget: delta_ms=(\d+) in_transition=(\w+) "
+    r"over_budget_total=(\d+) observed_total=(\d+)"
+)
+
+
+class _OverBudgetSummary:
+    """Collapse the sidecar's "[perf] frame over budget" stderr lines
+    into one journal line per window. The sidecar emits at most one such
+    line per second, so the line count understates the damage; the
+    summary instead reports frames over budget / frames observed from
+    the sidecar's own cumulative counters (last - first + 1 across the
+    window), plus the worst SAMPLED delta_ms and the latest totals.
+
+    A window opens on the first matching line and closes once `window_s`
+    has elapsed, checked on EVERY stderr line (`offer` for matching
+    lines, `tick` for the rest) so a burst followed by smooth play is
+    still flushed by the next stderr line of any kind, and by `flush()`
+    at drainer exit. The reported span ends at the last matching line.
+    Not thread-safe; owned by the single stderr-drainer thread.
+    """
+
+    def __init__(
+        self,
+        window_s: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._window_s = window_s
+        self._clock = clock
+        self._reset()
+
+    def _reset(self) -> None:
+        self._start: float | None = None
+        self._last = 0.0
+        self._lines = 0
+        self._worst_ms = 0
+        self._in_transition = 0
+        self._first_over = 0
+        self._first_observed = 0
+        self._over_total = 0
+        self._observed_total = 0
+
+    def offer(self, line: str) -> bool:
+        """Consume `line` if it is an over-budget line (returns True);
+        otherwise leave it for the caller to relay (returns False)."""
+        m = _OVER_BUDGET_RE.match(line)
+        if m is None:
+            return False
+        now = self._clock()
+        over_total = int(m.group(3))
+        observed_total = int(m.group(4))
+        if self._start is None:
+            self._start = now
+            self._first_over = over_total
+            self._first_observed = observed_total
+        self._last = now
+        self._lines += 1
+        self._worst_ms = max(self._worst_ms, int(m.group(1)))
+        if m.group(2) == "true":
+            self._in_transition += 1
+        self._over_total = over_total
+        self._observed_total = observed_total
+        self.tick()
+        return True
+
+    def tick(self) -> None:
+        """Flush if the open window has run `window_s` or longer. Call
+        on every non-matching stderr line too."""
+        if self._start is not None and self._clock() - self._start >= self._window_s:
+            self.flush()
+
+    def flush(self) -> None:
+        """Emit the pending window, if any, and start a fresh one."""
+        if self._start is None:
+            return
+        # Counters are cumulative per sidecar process; max(...,0) guards
+        # a respawn resetting them mid-window (drainers are per-spawn,
+        # so this should not happen, but never log a negative count).
+        frames_over = max(self._over_total - self._first_over + 1, 0)
+        frames_observed = max(self._observed_total - self._first_observed + 1, 0)
+        log.info(
+            "rust-sidecar perf summary: %d of %d frames over budget in %.0fs "
+            "(%d warn lines, worst sampled delta_ms=%d, %d in transition; "
+            "sidecar totals over_budget=%d observed=%d)",
+            frames_over,
+            frames_observed,
+            self._last - self._start,
+            self._lines,
+            self._worst_ms,
+            self._in_transition,
+            self._over_total,
+            self._observed_total,
+        )
+        self._reset()
 
 
 # ============================================================
@@ -1079,6 +1178,7 @@ class RustRenderer:
             # never break the stderr drainer on a perf_stats import
             # issue.
             parse_and_record_perf_line = None  # type: ignore[assignment]
+        over_budget = _OverBudgetSummary()
         try:
             for line in iter(proc.stderr.readline, ""):
                 if not line:
@@ -1096,6 +1196,15 @@ class RustRenderer:
                         # draining (which would dead-lock the
                         # sidecar at the pipe-buffer limit).
                         log.debug("perf_stats parser raised", exc_info=True)
+                # 2026-10-02: the sidecar's per-second "frame over
+                # budget" line was ~58% of all journal volume on the
+                # sign, rotating the 300M persistent journal in ~3
+                # days. Collapse it into a periodic summary (perf_stats
+                # above still sees every line); everything else is
+                # relayed verbatim.
+                if over_budget.offer(clean):
+                    continue
+                over_budget.tick()
                 log.info("rust-sidecar stderr: %s", clean)
         except Exception:
             # Pipe closed on teardown; readline returns "" and the
@@ -1103,6 +1212,10 @@ class RustRenderer:
             # errors on partial UTF-8) are swallowed — we just stop
             # draining; they don't block the main IPC pipe.
             log.debug("stderr drainer exited", exc_info=True)
+        finally:
+            # Flush the partial window so a sidecar death still leaves
+            # its last over-budget stats in the journal.
+            over_budget.flush()
 
     # r4 + r5 + r6 (2026-05-26 perf-night) RESOLVED. The original
     # TODO at this site flagged that `_send_op`'s blocking
